@@ -17,6 +17,7 @@ from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.finalization import FinishCandidateBuilder
 from rag.agent.core.goal_contract import GoalDeliverable, GoalSpec
 from rag.agent.core.human_input import HumanInputResponse
+from rag.agent.core.messages import ModelMessage
 from rag.agent.core.model_request import build_tool_manifest
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.runtime import AgentLoop, LoopEventSink, ModelTurnEnvelope
@@ -423,6 +424,22 @@ async def _message_compaction() -> dict[str, object]:
                 for index in range(6)
             ),
         )
+        state["turn_transcript"] = [
+            ModelMessage(
+                role="user",
+                content="Compact prior messages.",
+            ),
+            *[
+                ModelMessage(
+                    role="assistant" if index % 2 == 0 else "user",
+                    content=(
+                        f"canonical history {index}: "
+                        + (f"token-{index} " * 500)
+                    ),
+                )
+                for index in range(6)
+            ],
+        ]
         result, _ = await _run_loop(
             definition=_definition("compaction", ()),
             registry=_registry(),

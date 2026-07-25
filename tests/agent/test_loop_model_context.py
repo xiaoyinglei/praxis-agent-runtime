@@ -6,12 +6,12 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from pydantic import BaseModel
+from langchain_core.messages import HumanMessage
 
 from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker, PlanUpdate
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
+from rag.agent.core.finalization import FinishCandidateBuilder
 from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
 from rag.agent.core.llm_context import AgentLLMContextAssembler
 from rag.agent.core.llm_providers import (
@@ -33,6 +33,7 @@ from rag.agent.core.model_request import ToolChoiceMode
 from rag.agent.core.observations import StructuredObservation
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.file_manifest import FileManifest, FileManifestEntry
+from rag.agent.loop.runtime import AgentLoop
 from rag.agent.loop.state import (
     LoopState,
     ModelTurnDraft,
@@ -40,9 +41,12 @@ from rag.agent.loop.state import (
     StopHookFeedback,
     create_loop_state,
 )
+from rag.agent.loop.stop_hooks import StopHookRunner
 from rag.agent.memory.compactor import LoopContextCompactor
 from rag.agent.memory.injector import ContextBuilder
-from rag.agent.memory.models import MemoryPolicy, MemoryRef, MessageBatchPayload
+from rag.agent.memory.models import MemoryPolicy
+from rag.agent.tools.executor import ToolExecutor
+from rag.agent.tools.permissions import ToolExecutionContext
 from rag.agent.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -56,7 +60,10 @@ from rag.agent.tools.tool import (
     json_schema_input,
 )
 from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
-from rag.providers.llm_gateway import AgentModelResponse
+from rag.providers.llm_gateway import (
+    AgentModelResponse,
+    LLMContextOverflowError,
+)
 from rag.providers.openai_wire import serialize_openai_request
 from rag.schema.llm import LLMCallStage, LLMStageBudget, LLMUsage
 
@@ -118,29 +125,53 @@ class _RecordingGateway:
         )
 
 
-class _RecordingMemoryStore:
-    def __init__(self) -> None:
-        self.records: list[BaseModel] = []
-
-    def write_tool_output(
+class _OverflowOnceRecordingGateway(_RecordingGateway):
+    async def agenerate_model_request(
         self,
-        payload: BaseModel,
+        **kwargs: object,
+    ) -> AgentModelResponse:
+        if not self.calls:
+            self.calls.append(dict(kwargs))
+            request = kwargs["request"]
+            wire = serialize_openai_request(request)
+            raise LLMContextOverflowError(
+                stage=LLMCallStage.TOOL_DECISION,
+                input_tokens=self.token_accounting.count(
+                    wire.serialized_json
+                ),
+                max_input_tokens=1,
+            )
+        return await super().agenerate_model_request(**kwargs)
+
+
+class _BudgetEnforcingRecordingGateway(_RecordingGateway):
+    async def agenerate_model_request(
+        self,
+        **kwargs: object,
+    ) -> AgentModelResponse:
+        request = kwargs["request"]
+        wire = serialize_openai_request(request)
+        input_tokens = self.token_accounting.count(wire.serialized_json)
+        if input_tokens > self.max_input_tokens:
+            raise LLMContextOverflowError(
+                stage=LLMCallStage.TOOL_DECISION,
+                input_tokens=input_tokens,
+                max_input_tokens=self.max_input_tokens,
+            )
+        return await super().agenerate_model_request(**kwargs)
+
+
+class _NoopCheckpoint:
+    async def save_snapshot(
+        self,
+        state: LoopState,
         *,
-        summary: str,
-        source_tool_call_id: str | None = None,
-        source_tool_name: str | None = None,
-        warnings: list[str] | None = None,
-    ) -> MemoryRef:
-        self.records.append(payload)
-        ref_id = f"mem_{len(self.records)}"
-        return MemoryRef(
-            ref_id=ref_id,
-            path=f".agent_memory/records/{ref_id}.json",
-            summary=summary,
-            source_tool_call_id=source_tool_call_id,
-            source_tool_name=source_tool_name,
-            warnings=list(warnings or []),
-        )
+        reason: str,
+    ) -> None:
+        del state, reason
+
+    async def write_execution_record(self, record: object) -> None:
+        del record
 
 
 def _definition() -> AgentRuntimePolicy:
@@ -279,7 +310,7 @@ async def test_long_session_projects_model_context_without_mutating_history() ->
     transcript = [
         ModelMessage(
             role="assistant" if index % 2 else "user",
-            content=f"message-{index}: " + ("x" * 180),
+            content=f"message-{index}: " + ("dense-token " * 20),
         )
         for index in range(30)
     ]
@@ -300,14 +331,91 @@ async def test_long_session_projects_model_context_without_mutating_history() ->
 
 
 @pytest.mark.anyio
-async def test_loop_provider_proactively_compacts_canonical_transcript_by_policy() -> None:
+async def test_loop_compactor_proactively_reduces_actual_model_request() -> None:
+    baseline_gateway = _RecordingGateway()
+    compacted_gateway = _RecordingGateway()
+    baseline_provider = _provider(
+        baseline_gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    compacted_provider = _provider(
+        compacted_gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    transcript = [
+        ModelMessage(
+            role="user" if index % 2 == 0 else "assistant",
+            content=(
+                f"compact-message-{index}: "
+                + (f"token-{index} " * 500)
+            ),
+        )
+        for index in range(8)
+    ]
+    baseline_state = _state("proactive-transcript-baseline")
+    baseline_state["run_config"] = replace(
+        baseline_state["run_config"],
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=99,
+            max_message_tail_count=2,
+        ),
+    )
+    baseline_state["turn_transcript"] = list(transcript)
+    compacted_state = _state("proactive-transcript-compaction")
+    compacted_state["run_config"] = replace(
+        compacted_state["run_config"],
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=4,
+            max_message_tail_count=2,
+        ),
+    )
+    compacted_state["turn_transcript"] = list(transcript)
+
+    await baseline_provider.next_turn(
+        baseline_state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+    result = LoopContextCompactor().prepare(compacted_state)
+    await compacted_provider.next_turn(
+        compacted_state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    assert result.changed is True
+    assert result.channels == ("turn_transcript",)
+    assert compacted_state["turn_transcript"][0] == transcript[0]
+    baseline_wire = serialize_openai_request(
+        baseline_gateway.calls[0]["request"]
+    ).serialized_json
+    compacted_request = compacted_gateway.calls[0]["request"]
+    compacted_wire = serialize_openai_request(
+        compacted_request
+    ).serialized_json
+    assert len(compacted_wire.encode("utf-8")) < len(
+        baseline_wire.encode("utf-8")
+    )
+    assert compacted_gateway.token_accounting.count(
+        compacted_wire
+    ) < baseline_gateway.token_accounting.count(baseline_wire)
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in compacted_request.messages
+    )
+
+
+@pytest.mark.anyio
+async def test_under_budget_provider_does_not_compact_by_message_count() -> None:
     gateway = _RecordingGateway()
     provider = _provider(
         gateway,
         names=(),
         context_window_tokens=32_768,
     )
-    state = _state("proactive-transcript-compaction")
+    state = _state("provider-count-is-not-proactive-compaction")
     state["run_config"] = replace(
         state["run_config"],
         memory_policy=MemoryPolicy(
@@ -318,9 +426,9 @@ async def test_loop_provider_proactively_compacts_canonical_transcript_by_policy
     transcript = [
         ModelMessage(
             role="user" if index % 2 == 0 else "assistant",
-            content=f"compact-message-{index}",
+            content=f"under-budget-message-{index}",
         )
-        for index in range(7)
+        for index in range(8)
     ]
     state["turn_transcript"] = list(transcript)
 
@@ -331,12 +439,362 @@ async def test_loop_provider_proactively_compacts_canonical_transcript_by_policy
     )
 
     request = gateway.calls[0]["request"]
-    assert state["turn_transcript"] == transcript
-    assert any("context_compaction" in message.content for message in request.messages)
-    assert [message.content for message in request.messages[-2:]] == [
-        "compact-message-5",
-        "compact-message-6",
+    assert not any(
+        '"event_type":"context_compaction"' in message.content
+        for message in request.messages
+    )
+    for message in transcript:
+        assert any(
+            candidate.role == message.role
+            and candidate.content == message.content
+            for candidate in request.messages
+        )
+
+
+@pytest.mark.anyio
+async def test_provider_projects_by_actual_gateway_token_budget() -> None:
+    gateway = _BudgetEnforcingRecordingGateway(max_input_tokens=520)
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=10_000,
+    )
+    state = _state("provider-actual-token-budget")
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="u"),
+        ModelMessage(role="assistant", content="a " * 425),
     ]
+    state["plan_state"].agent_plan = AgentPlan(
+        objective="u",
+        steps=[
+            PlanStep(
+                step_id="step_work",
+                title="Work",
+            )
+        ],
+    )
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    wire = serialize_openai_request(request).serialized_json
+    assert gateway.token_accounting.count(wire) <= 520
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in request.messages
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_loop_avoids_recoverable_actual_token_overflow() -> None:
+    gateway = _BudgetEnforcingRecordingGateway(max_input_tokens=528)
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=10_000,
+    )
+    state = _state("loop-actual-token-budget")
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="u"),
+        ModelMessage(role="assistant", content="a " * 425),
+    ]
+    loop = AgentLoop(
+        definition=_definition(),
+        model_provider=provider,
+        context_manager=LoopContextCompactor(),
+        tool_executor=ToolExecutor({}),
+        registry_snapshot={},
+        execution_context=ToolExecutionContext(),
+        checkpoint_store=_NoopCheckpoint(),  # type: ignore[arg-type]
+        stop_hook_runner=StopHookRunner(hooks=(), max_blocks=3),
+        finish_candidate_builder=FinishCandidateBuilder(),
+    )
+
+    result = await loop.run(state)
+
+    assert result["status"] == "completed"
+    assert result["memory_state"].reactive_compact_used is False
+    assert len(gateway.calls) == 1
+    request = gateway.calls[0]["request"]
+    wire = serialize_openai_request(request).serialized_json
+    assert gateway.token_accounting.count(wire) <= 528
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in request.messages
+    )
+
+
+@pytest.mark.anyio
+async def test_actual_token_projection_handles_no_whitespace_history() -> None:
+    accounting = TokenAccountingService(
+        TokenizerContract(
+            embedding_model_name="gpt-4o-mini",
+            tokenizer_model_name="gpt-4o-mini",
+            chunking_tokenizer_model_name="gpt-4o-mini",
+            tokenizer_backend="tiktoken",
+            max_context_tokens=10_000,
+            prompt_reserved_tokens=0,
+            local_files_only=True,
+        )
+    )
+    gateway = _BudgetEnforcingRecordingGateway(max_input_tokens=1_000)
+    gateway.token_accounting = accounting
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=10_000,
+    )
+    current_user = "CURRENT USER MUST STAY"
+    state = _state("no-whitespace-actual-token-budget")
+    state["current_message"] = current_user
+    state["conversation_history"] = [
+        ModelMessage(role="user", content="initial"),
+        ModelMessage(
+            role="assistant",
+            content="abcdefghijklmno0123456789" * 400,
+        ),
+    ]
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content=current_user),
+    ]
+    loop = AgentLoop(
+        definition=_definition(),
+        model_provider=provider,
+        context_manager=LoopContextCompactor(),
+        tool_executor=ToolExecutor({}),
+        registry_snapshot={},
+        execution_context=ToolExecutionContext(),
+        checkpoint_store=_NoopCheckpoint(),  # type: ignore[arg-type]
+        stop_hook_runner=StopHookRunner(hooks=(), max_blocks=3),
+        finish_candidate_builder=FinishCandidateBuilder(),
+    )
+
+    result = await loop.run(state)
+
+    assert result["status"] == "completed"
+    assert result["memory_state"].reactive_compact_used is False
+    assert len(gateway.calls) == 1
+    request = gateway.calls[0]["request"]
+    wire = serialize_openai_request(request).serialized_json
+    assert gateway.token_accounting.count(wire) <= 1_000
+    assert any(
+        message.role == "user" and message.content == current_user
+        for message in request.messages
+    )
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in request.messages
+    )
+
+
+@pytest.mark.anyio
+async def test_budget_projection_preserves_current_user_and_reduces_request() -> None:
+    baseline_gateway = _RecordingGateway(max_input_tokens=32_000)
+    projected_gateway = _RecordingGateway(max_input_tokens=1_500)
+    baseline_provider = _provider(
+        baseline_gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    projected_provider = _provider(
+        projected_gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    history = [
+        ModelMessage(role="user", content="original session task"),
+        *[
+                ModelMessage(
+                    role="assistant" if index % 2 == 0 else "user",
+                    content=(
+                        f"historical-message-{index}: "
+                        + ("history-token " * 1_000)
+                    ),
+                )
+            for index in range(12)
+        ],
+    ]
+    current_user = "CURRENT USER REQUEST MUST REMAIN EXACT"
+    current_turn = [
+        ModelMessage(role="user", content=current_user),
+        ModelMessage(
+            role="assistant",
+            content=(
+                "current working response "
+                + ("current-token " * 1_000)
+            ),
+        ),
+    ]
+
+    def state_for(run_id: str) -> LoopState:
+        state = _state(run_id)
+        state["run_config"] = replace(
+            state["run_config"],
+            memory_policy=MemoryPolicy(
+                message_compaction_min_count=99,
+                max_message_tail_count=1,
+            ),
+        )
+        state["conversation_history"] = list(history)
+        state["turn_transcript"] = list(current_turn)
+        return state
+
+    await baseline_provider.next_turn(
+        state_for("multi-turn-baseline"),
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+    await projected_provider.next_turn(
+        state_for("multi-turn-projected"),
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    baseline_wire = serialize_openai_request(
+        baseline_gateway.calls[0]["request"]
+    ).serialized_json
+    projected_request = projected_gateway.calls[0]["request"]
+    projected_wire = serialize_openai_request(
+        projected_request
+    ).serialized_json
+    assert any(
+        message.role == "user" and message.content == current_user
+        for message in projected_request.messages
+    )
+    assert len(projected_wire.encode("utf-8")) < len(
+        baseline_wire.encode("utf-8")
+    )
+    assert projected_gateway.token_accounting.count(
+        projected_wire
+    ) < baseline_gateway.token_accounting.count(baseline_wire)
+
+
+@pytest.mark.anyio
+async def test_reactive_compaction_reduces_next_actual_model_request() -> None:
+    gateway = _RecordingGateway()
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    state = _state("reactive-canonical-transcript")
+    state["run_config"] = replace(
+        state["run_config"],
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=99,
+            max_message_tail_count=2,
+            reactive_compact_tail_count=2,
+        ),
+    )
+    state["turn_transcript"] = [
+        ModelMessage(
+            role="user" if index % 2 == 0 else "assistant",
+            content=(
+                f"oversized-message-{index}: "
+                + (f"token-{index} " * 1_000)
+            ),
+        )
+        for index in range(8)
+    ]
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+    baseline_request = gateway.calls[-1]["request"]
+    baseline_wire = serialize_openai_request(baseline_request)
+    baseline_bytes = len(baseline_wire.serialized_json.encode("utf-8"))
+    baseline_tokens = gateway.token_accounting.count(
+        baseline_wire.serialized_json
+    )
+
+    result = LoopContextCompactor().reactive_compact(state)
+
+    assert result.changed is True
+    assert result.channels == ("turn_transcript", "memory_warnings")
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+    compacted_request = gateway.calls[-1]["request"]
+    compacted_wire = serialize_openai_request(compacted_request)
+    compacted_bytes = len(compacted_wire.serialized_json.encode("utf-8"))
+    compacted_tokens = gateway.token_accounting.count(
+        compacted_wire.serialized_json
+    )
+    assert compacted_bytes < baseline_bytes
+    assert compacted_tokens < baseline_tokens
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in compacted_request.messages
+    )
+
+
+@pytest.mark.anyio
+async def test_agent_loop_overflow_retries_with_smaller_actual_request() -> None:
+    gateway = _OverflowOnceRecordingGateway()
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=32_768,
+    )
+    state = _state("real-loop-reactive-overflow")
+    state["run_config"] = replace(
+        state["run_config"],
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=99,
+            max_message_tail_count=2,
+            reactive_compact_tail_count=2,
+        ),
+    )
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="Handle the oversized context."),
+        *[
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=f"loop-message-{index}: " + (f"token-{index} " * 1_000),
+            )
+            for index in range(7)
+        ],
+    ]
+    loop = AgentLoop(
+        definition=_definition(),
+        model_provider=provider,
+        context_manager=LoopContextCompactor(),
+        tool_executor=ToolExecutor({}),
+        registry_snapshot={},
+        execution_context=ToolExecutionContext(),
+        checkpoint_store=_NoopCheckpoint(),  # type: ignore[arg-type]
+        stop_hook_runner=StopHookRunner(hooks=(), max_blocks=3),
+        finish_candidate_builder=FinishCandidateBuilder(),
+    )
+
+    result = await loop.run(state)
+
+    assert result["status"] == "completed"
+    assert len(gateway.calls) == 2
+    first_wire = serialize_openai_request(
+        gateway.calls[0]["request"]
+    ).serialized_json
+    second_wire = serialize_openai_request(
+        gateway.calls[1]["request"]
+    ).serialized_json
+    assert len(second_wire.encode("utf-8")) < len(
+        first_wire.encode("utf-8")
+    )
+    assert gateway.token_accounting.count(
+        second_wire
+    ) < gateway.token_accounting.count(first_wire)
+    assert any(
+        diagnostic.code == "context_overflow_recovered"
+        for diagnostic in result["runtime_diagnostics"]
+    )
 
 
 @pytest.mark.anyio
@@ -611,7 +1069,7 @@ async def test_loop_provider_projects_to_gateway_stage_budget() -> None:
     transcript = [
         ModelMessage(
             role="assistant" if index % 2 else "user",
-            content=f"stage-message-{index}: " + ("x" * 180),
+            content=f"stage-message-{index}: " + ("dense-token " * 90),
         )
         for index in range(30)
     ]
@@ -981,6 +1439,10 @@ def test_task_plan_is_advisory_and_filters_unsupported_tools() -> None:
 
 
 def test_loop_context_compaction_is_observable_before_model_turn() -> None:
+    legacy_messages = [
+        HumanMessage(content=f"legacy message {index}", id=f"msg-{index}")
+        for index in range(4)
+    ]
     state = create_loop_state(
         current_message="Summarize the conversation.",
         run_config=AgentRunConfig(
@@ -991,74 +1453,79 @@ def test_loop_context_compaction_is_observable_before_model_turn() -> None:
                 max_message_tail_count=1,
             ),
         ),
-        messages=[HumanMessage(content=f"message {index}", id=f"msg-{index}") for index in range(4)],
+        messages=legacy_messages,
     )
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="Summarize the conversation."),
+        *[
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=f"canonical-{index}: " + (f"token-{index} " * 500),
+            )
+            for index in range(5)
+        ],
+    ]
 
     result = LoopContextCompactor().prepare(state)
 
     assert result.changed is True
-    assert "messages" in result.channels
-    assert [message.id for message in state["messages"]] == ["msg-3"]
-    assert state["memory_state"].working_summary is not None
+    assert result.channels == ("turn_transcript",)
+    assert state["messages"] == legacy_messages
+    assert state["memory_state"].working_summary is None
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in state["turn_transcript"]
+    )
     assert state["latest_transition"] is not None
     assert state["latest_transition"].reason == "compaction"
-    assert "memory_unavailable" in state["memory_state"].memory_warnings
 
 
-def test_loop_context_snips_messages_without_splitting_tool_pairs() -> None:
+def test_reactive_canonical_compaction_preserves_tool_pairs() -> None:
     tool_call_id = "tc-search"
-    store = _RecordingMemoryStore()
-    state = create_loop_state(
-        current_message="Summarize the conversation.",
-        run_config=AgentRunConfig(
-            turn_id="loop-snip-compaction",
-            llm_budget_total=10_000,
-            memory_policy=MemoryPolicy(
-                message_compaction_min_count=99,
-                snip_compact_threshold=4,
-                snip_keep_head=1,
-                snip_keep_tail=1,
+    state = _state("loop-tool-pair-compaction")
+    state["run_config"] = replace(
+        state["run_config"],
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=99,
+            reactive_compact_tail_count=1,
+        ),
+    )
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="Summarize the conversation."),
+        *[
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=f"old-{index}: " + (f"token-{index} " * 500),
+            )
+            for index in range(4)
+        ],
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=tool_call_id,
+                    name="vector_search",
+                    input={"query": "policy"},
+                ),
             ),
         ),
-        messages=[
-            HumanMessage(content="original task", id="msg-head"),
-            HumanMessage(content="old detail 1", id="msg-old-1"),
-            HumanMessage(content="old detail 2", id="msg-old-2"),
-            AIMessage(
-                content="",
-                id="msg-ai-tool",
-                tool_calls=[
-                    {
-                        "id": tool_call_id,
-                        "name": "vector_search",
-                        "args": {"query": "policy"},
-                    }
-                ],
-            ),
-            ToolMessage(
-                content="search result",
-                id="msg-tool-result",
-                tool_call_id=tool_call_id,
-            ),
-        ],
-    )
+        ModelMessage(
+            role="tool",
+            content="search result",
+            tool_call_id=tool_call_id,
+        ),
+    ]
 
-    result = LoopContextCompactor(store=store).prepare(state)
+    result = LoopContextCompactor().reactive_compact(state)
 
     assert result.changed is True
-    assert [message.id for message in state["messages"]] == [
-        "msg-head",
-        "snip_compact_2",
-        "msg-ai-tool",
-        "msg-tool-result",
+    assert [message.role for message in state["turn_transcript"][-2:]] == [
+        "assistant",
+        "tool",
     ]
-    assert len(store.records) == 1
-    stored = store.records[0]
-    assert isinstance(stored, MessageBatchPayload)
-    assert [message.id for message in stored.messages] == [
-        "msg-old-1",
-        "msg-old-2",
-    ]
+    assert state["turn_transcript"][-2].tool_calls[0].id == tool_call_id
+    assert state["turn_transcript"][-1].tool_call_id == tool_call_id
 
 
 def test_compaction_never_reformats_canonical_tool_results() -> None:

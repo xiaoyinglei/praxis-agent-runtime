@@ -5,7 +5,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
 from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.messages import tool_result_message
+from rag.agent.core.messages import (
+    ModelMessage,
+    canonical_json_text,
+    model_message_payload,
+    tool_result_message,
+)
 from rag.agent.memory.models import (
     ContextBudgetSnapshot,
     ContextSection,
@@ -17,8 +22,6 @@ from rag.agent.tools.tool import ToolResult
 from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 
 if TYPE_CHECKING:
-    from langchain_core.messages import BaseMessage
-
     from rag.agent.loop.state import LoopState
     type ContextState = LoopState
 
@@ -157,7 +160,6 @@ class ContextBuilder:
         add(
             "working_memory",
             self._format_working_memory(
-                ms.working_summary if ms is not None else None,
                 ms.extracted_facts if ms is not None else [],
             ),
         )
@@ -167,7 +169,12 @@ class ContextBuilder:
         )
         add(
             "message_tail",
-            self._format_message_tail(state.get("messages", [])),
+            self._format_message_tail(
+                (
+                    *state.get("conversation_history", []),
+                    *state.get("turn_transcript", []),
+                )
+            ),
         )
         selection = self._select_sections(candidates)
         return InjectedContext(
@@ -430,30 +437,24 @@ class ContextBuilder:
                 return plan
         return state.get("agent_plan")
 
-    def _format_working_memory(self, working_summary: Any, facts: Sequence[Any]) -> str:
-        if working_summary is None and not facts:
+    def _format_working_memory(self, facts: Sequence[Any]) -> str:
+        if not facts:
             return ""
         lines = [
             "Working memory is current-run context, not an authority above retrieved evidence.",
         ]
-        if working_summary is not None:
-            covered = ", ".join(working_summary.covered_message_ids)
-            lines.append(f"summary: {self._one_line(working_summary.summary)}")
-            if covered:
-                lines.append(f"covered_message_ids: {covered}")
-        if facts:
-            lines.append("extracted_facts:")
-            for fact in facts:
-                evidence_ids = ", ".join(fact.evidence_ids)
-                source_ids = ", ".join(fact.source_message_ids)
-                stale = " stale=true" if fact.stale else ""
-                suffix = f"{stale} confidence={fact.confidence:.3g}"
-                lines.append(f"- fact_id={fact.fact_id}{suffix}")
-                lines.append(f"  text: {self._one_line(fact.text)}")
-                if evidence_ids:
-                    lines.append(f"  evidence_ids: {evidence_ids}")
-                if source_ids:
-                    lines.append(f"  source_message_ids: {source_ids}")
+        lines.append("extracted_facts:")
+        for fact in facts:
+            evidence_ids = ", ".join(fact.evidence_ids)
+            source_ids = ", ".join(fact.source_message_ids)
+            stale = " stale=true" if fact.stale else ""
+            suffix = f"{stale} confidence={fact.confidence:.3g}"
+            lines.append(f"- fact_id={fact.fact_id}{suffix}")
+            lines.append(f"  text: {self._one_line(fact.text)}")
+            if evidence_ids:
+                lines.append(f"  evidence_ids: {evidence_ids}")
+            if source_ids:
+                lines.append(f"  source_message_ids: {source_ids}")
         return "\n".join(lines)
 
     @staticmethod
@@ -501,10 +502,13 @@ class ContextBuilder:
             lines.append("memory_warnings: " + ", ".join(dict.fromkeys(warnings)))
         return "\n".join(lines)
 
-    def _format_message_tail(self, messages: Sequence[BaseMessage]) -> str:
+    def _format_message_tail(
+        self,
+        messages: Sequence[ModelMessage],
+    ) -> str:
         if not messages:
             return ""
-        lines = ["Recent message tail:"]
+        lines = ["Canonical conversation transcript:"]
         lines.extend(self._format_message(message) for message in messages)
         return "\n".join(lines)
 
@@ -590,20 +594,10 @@ class ContextBuilder:
         return " ".join(f"{key}={value}" for key, value in values.items() if value not in (None, "", []))
 
     @staticmethod
-    def _format_message(message: BaseMessage) -> str:
-        message_id = message.id or "<no-id>"
-        role = getattr(message, "type", message.__class__.__name__)
-        content = ContextBuilder._one_line(ContextBuilder._message_text(message))
-        return f"- message_id={message_id} role={role} content={content}"
-
-    @staticmethod
-    def _message_text(message: BaseMessage) -> str:
-        content = message.content
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return " ".join(str(part) for part in content)
-        return str(content)
+    def _format_message(message: ModelMessage) -> str:
+        return "- " + canonical_json_text(
+            model_message_payload(message)
+        )
 
     @staticmethod
     def _externalized_tool_output_count(tool_results: Sequence[ToolResult]) -> int:

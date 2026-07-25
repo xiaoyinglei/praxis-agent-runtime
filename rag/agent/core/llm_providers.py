@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, cast
 
 from pydantic import BaseModel, Field
@@ -40,10 +40,12 @@ from rag.agent.skills.runtime import SkillRuntime
 from rag.agent.streaming.events import text_delta
 from rag.agent.tools.selection import select_tools
 from rag.agent.tools.tool import JsonValue, Tool, ToolCallOrigin
-from rag.providers.llm_gateway import LLMGateway
+from rag.providers.llm_gateway import (
+    LLMGateway,
+    model_request_input_text,
+)
 from rag.schema.llm import LLMCallStage
 
-_MODEL_REQUEST_OVERHEAD_TOKENS = 128
 _MAX_WORKING_STATE_GROUNDED_PATHS = 200
 
 
@@ -216,41 +218,47 @@ class LLMLoopModelTurnProvider:
             LLMCallStage.TOOL_DECISION,
             kwargs={"max_tokens": settings.max_output_tokens},
         ).max_input_tokens
-        tool_schema_tokens = self._gateway.token_accounting.count(
-            canonical_json_text(
-                tuple(
-                    tool_definition_payload(tool.definition)
-                    for tool in selected_tools
-                )
+        request_id = (
+            f"{state['run_config'].turn_id}:turn:{state['iteration']}"
+        )
+
+        def request_for(
+            candidate_context: StableModelContext,
+        ) -> ModelRequest:
+            return build_model_request(
+                request_id=request_id,
+                context=candidate_context,
+                selected_tools=selected_tools,
+                settings=settings,
             )
-        )
-        message_input_limit = max(
-            256,
-            min(model_input_limit, stage_input_limit)
-            - tool_schema_tokens
-            - _MODEL_REQUEST_OVERHEAD_TOKENS,
-        )
+
+        def request_input_tokens(
+            candidate_context: StableModelContext,
+        ) -> int:
+            candidate_request = request_for(candidate_context)
+            accounted_input = model_request_input_text(
+                candidate_request,
+                provider=self._provider,
+                supports_native_tools=self._supports_native_tools,
+            )
+            return self._gateway.token_accounting.count(
+                accounted_input
+            )
+
         context = _project_model_context(
             context,
-            max_input_tokens=message_input_limit,
-            message_compaction_min_count=(
-                state["run_config"].memory_policy.message_compaction_min_count
-            ),
-            retained_tail_count=(
-                state["run_config"].memory_policy.max_message_tail_count
-            ),
+            max_input_tokens=min(model_input_limit, stage_input_limit),
             max_summary_chars=(
                 state["run_config"].memory_policy.max_working_summary_chars
             ),
-        )
-        request = build_model_request(
-            request_id=(
-                f"{state['run_config'].turn_id}:turn:{state['iteration']}"
+            protected_tail_start=(
+                len(state["conversation_history"]) - 1
+                if state["conversation_history"]
+                else None
             ),
-            context=context,
-            selected_tools=selected_tools,
-            settings=settings,
+            input_token_count=request_input_tokens,
         )
+        request = request_for(context)
         _record_request_sizes(state, request)
         response = await self._gateway.agenerate_model_request(
             stage=LLMCallStage.TOOL_DECISION,
@@ -341,55 +349,64 @@ def _project_model_context(
     context: StableModelContext,
     *,
     max_input_tokens: int,
-    message_compaction_min_count: int,
-    retained_tail_count: int,
     max_summary_chars: int,
+    protected_tail_start: int | None,
+    input_token_count: Callable[[StableModelContext], int],
 ) -> StableModelContext:
-    """Bound model-visible history without mutating canonical Session history."""
+    """Apply a final measured model-window projection."""
 
-    if not context.transcript:
-        return context
-    maximum_bytes = max_input_tokens * 4
-    visible = (*context.stable_messages, *context.transcript)
-    exceeds_input_budget = _messages_size(visible) > maximum_bytes
-    proactive = len(context.transcript) >= message_compaction_min_count
-    if not proactive and not exceeds_input_budget:
+    current_tokens = input_token_count(context)
+    if (
+        not context.transcript
+        or current_tokens <= max_input_tokens
+    ):
         return context
 
-    tail_start = (
-        max(0, len(context.transcript) - retained_tail_count)
-        if proactive
-        else 0
+    maximum_tail_start = (
+        len(context.transcript)
+        if protected_tail_start is None
+        else min(
+            max(protected_tail_start, 0),
+            len(context.transcript),
+        )
     )
-    if exceeds_input_budget:
-        tail_budget = max(512, maximum_bytes // 2)
-        budget_tail_start = len(context.transcript)
-        used = 0
-        for index in range(len(context.transcript) - 1, -1, -1):
-            size = _message_size(context.transcript[index])
-            if (
-                budget_tail_start < len(context.transcript)
-                and used + size > tail_budget
-            ):
-                break
-            budget_tail_start = index
-            used += size
-        tail_start = max(tail_start, budget_tail_start)
-    tail_start = _extend_tail_for_tool_pair(context.transcript, tail_start)
-    tail = context.transcript[tail_start:]
-    covered = context.transcript[:tail_start]
-    if not covered:
+    if maximum_tail_start <= 0:
         return context
-    summary_limit = min(
-        max_summary_chars,
-        12_000,
-        max(256, maximum_bytes // 4),
+
+    best = context
+    best_tokens = current_tokens
+    summary_limits = _projection_summary_limits(
+        max_summary_chars
     )
-    summary = _deterministic_transcript_summary(
-        covered,
-        max_chars=summary_limit,
-    )
-    return context.compact(summary=summary, retained_tail=tail)
+    for tail_start in range(1, maximum_tail_start + 1):
+        for summary_limit in summary_limits:
+            candidate = context.project_compaction(
+                tail_start=tail_start,
+                max_summary_chars=summary_limit,
+            )
+            if candidate == context:
+                continue
+            candidate_tokens = input_token_count(candidate)
+            if candidate_tokens < best_tokens:
+                best = candidate
+                best_tokens = candidate_tokens
+            if candidate_tokens <= max_input_tokens:
+                return candidate
+    return best
+
+
+def _projection_summary_limits(
+    max_summary_chars: int,
+) -> tuple[int, ...]:
+    current = min(max_summary_chars, 12_000)
+    limits: list[int] = []
+    while current > 80:
+        limits.append(current)
+        current = max(80, current // 2)
+    limits.append(current)
+    if limits[-1] != 1:
+        limits.append(1)
+    return tuple(dict.fromkeys(limits))
 
 
 def _working_state_message(state: LoopState) -> ModelMessage | None:
@@ -506,49 +523,6 @@ def _project_grounded_workspace_paths(
         if len(selected) >= _MAX_WORKING_STATE_GROUNDED_PATHS:
             break
     return tuple(selected)
-
-
-def _extend_tail_for_tool_pair(
-    transcript: tuple[ModelMessage, ...],
-    start: int,
-) -> int:
-    if start <= 0 or start >= len(transcript):
-        return start
-    first = transcript[start]
-    if first.role != "tool" or first.tool_call_id is None:
-        return start
-    for index in range(start - 1, -1, -1):
-        message = transcript[index]
-        if any(call.id == first.tool_call_id for call in message.tool_calls):
-            return index
-    return start
-
-
-def _deterministic_transcript_summary(
-    messages: tuple[ModelMessage, ...],
-    *,
-    max_chars: int,
-) -> str:
-    if not messages:
-        return "Earlier conversation omitted to fit the model context window."
-    lines = [
-        f"{message.role}: {canonical_json_text(model_message_payload(message))}"
-        for message in messages
-    ]
-    summary = "\n".join(lines)
-    if len(summary) <= max_chars:
-        return summary
-    return summary[:max_chars].rstrip() + " [truncated]"
-
-
-def _messages_size(messages: Sequence[ModelMessage]) -> int:
-    return sum(_message_size(message) for message in messages)
-
-
-def _message_size(message: ModelMessage) -> int:
-    return len(
-        canonical_json_text(model_message_payload(message)).encode("utf-8")
-    )
 
 
 def _record_request_sizes(state: LoopState, request: ModelRequest) -> None:

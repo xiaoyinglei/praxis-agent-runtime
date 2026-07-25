@@ -68,6 +68,22 @@ class TokenAccounting(Protocol):
     ) -> str: ...
 
 
+def model_request_input_text(
+    request: ModelRequest,
+    *,
+    provider: str,
+    supports_native_tools: bool,
+) -> str:
+    """Return the exact text accounted by the gateway before provider I/O."""
+
+    if provider in {"mlx", "ollama"} and not supports_native_tools:
+        return render_local_agent_request(
+            request,
+            provider=provider,
+        ).prompt
+    return serialize_openai_request(request).serialized_json
+
+
 class AsyncBudgetLedger(Protocol):
     async def reserve(self, lease_id: str, amount: int) -> bool: ...
     async def commit(self, lease_id: str, actual: int) -> int: ...
@@ -1103,5 +1119,6 @@ __all__ = [
     "StreamChunk",
     "current_llm_budget_ledger",
     "llm_budget_scope",
+    "model_request_input_text",
     "structured_accounted_prompt",
 ]

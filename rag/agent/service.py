@@ -513,6 +513,7 @@ class AgentService:
         self._turn_store.sync_turn_messages(
             run_config.turn_id,
             state["turn_transcript"],
+            compaction_policy=run_config.memory_policy,
         )
         if state["status"] == "paused":
             self._turn_store.mark_paused(run_config.turn_id)
@@ -532,6 +533,7 @@ class AgentService:
         self._turn_store.sync_turn_messages(
             run_config.turn_id,
             state["turn_transcript"],
+            compaction_policy=run_config.memory_policy,
         )
 
     def _interrupt_turn(self, turn_id: str) -> None:
@@ -1055,7 +1057,20 @@ class AgentService:
         elif persisted_turn[: len(checkpoint_turn)] == checkpoint_turn:
             current = persisted_turn
         else:
-            raise RuntimeError(f"Checkpoint and canonical history conflict for Turn {turn_id}")
+            try:
+                self._turn_store.sync_turn_messages(
+                    turn_id,
+                    checkpoint_turn,
+                    compaction_policy=(
+                        state["run_config"].memory_policy
+                    ),
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Checkpoint and canonical history conflict for "
+                    f"Turn {turn_id}"
+                ) from exc
+            current = checkpoint_turn
         initial = ModelMessage(role="user", content=turn.user_message)
         if not current:
             current = (initial,)
