@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -592,6 +596,32 @@ def test_provider_limit_parser_recognizes_groq_tpm_errors(message: str) -> None:
     assert module._provider_error_code(message, "") == "rate_limit"
 
 
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "GROQ_API_KEY is not set. Export it or add it to .env.",
+            "missing_credentials",
+        ),
+        (
+            "httpx.ConnectError: [SSL: CERTIFICATE_VERIFY_FAILED]",
+            "transport_error",
+        ),
+        (
+            "model_provider_failed: request timed out",
+            "request_timeout",
+        ),
+    ],
+)
+def test_provider_error_parser_keeps_pre_runtime_failures_out_of_execution_closure(
+    message: str,
+    expected: str,
+) -> None:
+    module = _load_benchmark_module()
+
+    assert module._provider_error_code("", message) == expected
+
+
 def test_provider_limit_diagnosis_preserves_causes_observed_before_limit() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
@@ -894,6 +924,141 @@ def test_command_cleanup_waits_for_background_process_group(tmp_path: Path) -> N
     assert result.returncode == 0
     assert result.stdout.strip() == "spawned"
     assert result.leftover_processes is False
+
+
+def test_run_command_streams_output_before_process_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_benchmark_module()
+    release_path = tmp_path / "release"
+    stdout_path = tmp_path / "agent.stdout"
+    stderr_path = tmp_path / "agent.stderr"
+    command = (
+        sys.executable,
+        "-c",
+        (
+            "import pathlib, sys, time\n"
+            "release = pathlib.Path(sys.argv[1])\n"
+            "print('first', flush=True)\n"
+            "while not release.exists():\n"
+            "    time.sleep(0.01)\n"
+            "print('second', flush=True)\n"
+        ),
+        str(release_path),
+    )
+    result: list[object] = []
+
+    worker = threading.Thread(
+        target=lambda: result.append(
+            module._run_command(
+                command,
+                cwd=tmp_path,
+                timeout_seconds=10,
+                live_log_paths=(stdout_path, stderr_path),
+                progress_label="agent",
+                heartbeat_seconds=0.05,
+            )
+        )
+    )
+    worker.start()
+    deadline = time.monotonic() + 3
+    while (
+        not stdout_path.is_file()
+        or "first" not in stdout_path.read_text(encoding="utf-8")
+    ):
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    assert worker.is_alive()
+    time.sleep(0.1)
+    release_path.touch()
+    worker.join(timeout=3)
+
+    assert not worker.is_alive()
+    assert len(result) == 1
+    command_result = result[0]
+    assert command_result.stdout == "first\nsecond\n"
+    assert stdout_path.read_text(encoding="utf-8") == command_result.stdout
+    assert stderr_path.read_text(encoding="utf-8") == ""
+    terminal = capsys.readouterr()
+    assert terminal.out == ""
+    assert "[benchmark:agent:stdout] first" in terminal.err
+    assert "[benchmark:agent] still running" in terminal.err
+
+
+def test_run_command_redacts_live_terminal_and_artifact_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_benchmark_module()
+    secret = "sk-benchmark-test-secret"
+    monkeypatch.setenv("BENCHMARK_TEST_API_KEY", secret)
+    stdout_path = tmp_path / "agent.stdout"
+    stderr_path = tmp_path / "agent.stderr"
+
+    result = module._run_command(
+        (
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['BENCHMARK_TEST_API_KEY'], flush=True)",
+        ),
+        cwd=tmp_path,
+        timeout_seconds=10,
+        live_log_paths=(stdout_path, stderr_path),
+        progress_label="agent",
+    )
+
+    terminal = capsys.readouterr()
+    assert result.stdout == f"{secret}\n"
+    assert secret not in terminal.err
+    assert secret not in stdout_path.read_text(encoding="utf-8")
+    assert "[REDACTED]" in terminal.err
+    assert stdout_path.read_text(encoding="utf-8") == "[REDACTED]\n"
+
+
+def test_run_command_interrupt_terminates_process_group(tmp_path: Path) -> None:
+    module = _load_benchmark_module()
+    process_group_path = tmp_path / "process-group"
+    stdout_path = tmp_path / "agent.stdout"
+    stderr_path = tmp_path / "agent.stderr"
+
+    def interrupt_when_started() -> None:
+        deadline = time.monotonic() + 3
+        while not process_group_path.is_file():
+            if time.monotonic() >= deadline:
+                return
+            time.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    interruptor = threading.Thread(target=interrupt_when_started)
+    interruptor.start()
+    process_group: int | None = None
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            module._run_command(
+                (
+                    sys.executable,
+                    "-c",
+                    (
+                        "import os, pathlib, sys, time\n"
+                        "pathlib.Path(sys.argv[1]).write_text(str(os.getpgrp()))\n"
+                        "time.sleep(60)\n"
+                    ),
+                    str(process_group_path),
+                ),
+                cwd=tmp_path,
+                timeout_seconds=120,
+                live_log_paths=(stdout_path, stderr_path),
+                progress_label="agent",
+            )
+        process_group = int(process_group_path.read_text(encoding="utf-8"))
+        assert module._process_group_exists(process_group) is False
+    finally:
+        interruptor.join(timeout=3)
+        if process_group is not None and module._process_group_exists(process_group):
+            os.killpg(process_group, signal.SIGKILL)
 
 
 def test_setup_failure_is_benchmark_invalid_not_runtime_failure(

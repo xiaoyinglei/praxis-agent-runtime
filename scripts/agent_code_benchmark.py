@@ -11,12 +11,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from fnmatch import fnmatch
 from pathlib import Path
+from typing import TextIO
 from uuid import uuid4
 
 _PRIMARY_MODEL = "qwen3_5_9b_mlx_4bit"
@@ -724,8 +726,6 @@ def _pre_provider_limit_diagnosis(
     for marker in (
         "repeated_inspection",
         "repeated_tool_failure",
-        "planning_evidence_required",
-        "planning_required",
         "delivery_stalled",
     ):
         if marker in combined_output:
@@ -805,6 +805,11 @@ def run_task(
             task.setup_command,
             cwd=workspace,
             timeout_seconds=task.budget.timeout_seconds,
+            live_log_paths=(
+                artifact_dir / "setup.stdout",
+                artifact_dir / "setup.stderr",
+            ),
+            progress_label="setup",
         )
         _write_log(artifact_dir / "setup.stdout", setup.stdout)
         _write_log(artifact_dir / "setup.stderr", setup.stderr)
@@ -839,6 +844,11 @@ def run_task(
                 command,
                 cwd=workspace,
                 timeout_seconds=task.budget.timeout_seconds,
+                live_log_paths=(
+                    artifact_dir / "agent.stdout",
+                    artifact_dir / "agent.stderr",
+                ),
+                progress_label="agent",
             )
         else:
             agent = _CommandResult(
@@ -878,6 +888,11 @@ def run_task(
                 task.acceptance_command,
                 cwd=workspace,
                 timeout_seconds=task.budget.timeout_seconds,
+                live_log_paths=(
+                    artifact_dir / "acceptance.stdout",
+                    artifact_dir / "acceptance.stderr",
+                ),
+                progress_label="acceptance",
             )
         except (OSError, subprocess.CalledProcessError, ValueError) as exc:
             acceptance_error = f"{type(exc).__name__}: {exc}"
@@ -986,9 +1001,14 @@ def _run_command(
     *,
     cwd: Path,
     timeout_seconds: int,
+    live_log_paths: tuple[Path, Path] | None = None,
+    progress_label: str = "command",
+    heartbeat_seconds: float = 30.0,
 ) -> _CommandResult:
     if not command:
         return _CommandResult(returncode=0, stdout="", stderr="")
+    if live_log_paths is not None and heartbeat_seconds <= 0:
+        raise ValueError("heartbeat_seconds must be positive")
     try:
         process = subprocess.Popen(
             [str(item) for item in command],
@@ -996,6 +1016,9 @@ def _run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
             start_new_session=True,
         )
     except OSError as exc:
@@ -1003,6 +1026,14 @@ def _run_command(
             returncode=127,
             stdout="",
             stderr=f"{type(exc).__name__}: {exc}",
+        )
+    if live_log_paths is not None:
+        return _stream_command(
+            process,
+            timeout_seconds=timeout_seconds,
+            live_log_paths=live_log_paths,
+            progress_label=progress_label,
+            heartbeat_seconds=heartbeat_seconds,
         )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
@@ -1023,6 +1054,144 @@ def _run_command(
             timed_out=True,
             leftover_processes=leftover,
         )
+    except KeyboardInterrupt:
+        _kill_process_group(process.pid)
+        process.communicate()
+        raise
+
+
+def _stream_command(
+    process: subprocess.Popen[str],
+    *,
+    timeout_seconds: int,
+    live_log_paths: tuple[Path, Path],
+    progress_label: str,
+    heartbeat_seconds: float,
+) -> _CommandResult:
+    stdout_pipe = process.stdout
+    stderr_pipe = process.stderr
+    if stdout_pipe is None or stderr_pipe is None:
+        raise RuntimeError("streamed command requires stdout and stderr pipes")
+
+    stdout_path, stderr_path = live_log_paths
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    output_lock = threading.Lock()
+    try:
+        stdout_log = stdout_path.open("w", encoding="utf-8")
+        stderr_log = stderr_path.open("w", encoding="utf-8")
+    except BaseException:
+        if "stdout_log" in locals():
+            stdout_log.close()
+        _kill_process_group(process.pid)
+        process.communicate()
+        raise
+
+    def emit_status(message: str) -> None:
+        with output_lock:
+            sys.stderr.write(f"[benchmark:{progress_label}] {message}\n")
+            sys.stderr.flush()
+
+    def drain(
+        pipe: TextIO,
+        *,
+        stream_name: str,
+        parts: list[str],
+        log: TextIO,
+    ) -> None:
+        while True:
+            line = pipe.readline()
+            if line == "":
+                break
+            parts.append(line)
+            redacted = _redact_secrets(line)
+            with output_lock:
+                log.write(redacted)
+                log.flush()
+                terminal_line = (
+                    f"[benchmark:{progress_label}:{stream_name}] {redacted}"
+                )
+                if not terminal_line.endswith("\n"):
+                    terminal_line += "\n"
+                sys.stderr.write(terminal_line)
+                sys.stderr.flush()
+        pipe.close()
+
+    readers = (
+        threading.Thread(
+            target=drain,
+            kwargs={
+                "pipe": stdout_pipe,
+                "stream_name": "stdout",
+                "parts": stdout_parts,
+                "log": stdout_log,
+            },
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            kwargs={
+                "pipe": stderr_pipe,
+                "stream_name": "stderr",
+                "parts": stderr_parts,
+                "log": stderr_log,
+            },
+            daemon=True,
+        ),
+    )
+    for reader in readers:
+        reader.start()
+
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    next_heartbeat = started + heartbeat_seconds
+    timed_out = False
+    leftover = False
+    emit_status("started")
+    try:
+        while process.poll() is None:
+            now = time.monotonic()
+            if now >= deadline:
+                timed_out = True
+                emit_status(f"timed out after {timeout_seconds}s; terminating")
+                leftover = _kill_process_group(process.pid)
+                process.wait()
+                break
+            wait_until = min(deadline, next_heartbeat)
+            try:
+                process.wait(timeout=max(0.01, wait_until - now))
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now >= next_heartbeat:
+                    emit_status(
+                        f"still running elapsed={int(now - started)}s"
+                    )
+                    while next_heartbeat <= now:
+                        next_heartbeat += heartbeat_seconds
+        if not timed_out:
+            leftover = _terminate_process_group(process.pid)
+    except KeyboardInterrupt:
+        emit_status("interrupted; terminating process group")
+        _kill_process_group(process.pid)
+        process.wait()
+        raise
+    finally:
+        for reader in readers:
+            reader.join()
+        stdout_log.close()
+        stderr_log.close()
+
+    returncode = 124 if timed_out else int(process.returncode or 0)
+    emit_status(
+        f"finished returncode={returncode} elapsed={int(time.monotonic() - started)}s"
+    )
+    return _CommandResult(
+        returncode=returncode,
+        stdout="".join(stdout_parts),
+        stderr="".join(stderr_parts),
+        timed_out=timed_out,
+        leftover_processes=leftover,
+    )
 
 
 def _terminate_process_group(process_group: int) -> bool:
@@ -1214,6 +1383,38 @@ def _provider_error_code(stdout: str, stderr: str) -> str | None:
         )
     ):
         return "rate_limit"
+    if any(
+        marker in text
+        for marker in (
+            "api_key is not set",
+            "api key is not set",
+            "missing api key",
+            "missing credentials",
+        )
+    ):
+        return "missing_credentials"
+    if any(
+        marker in text
+        for marker in (
+            "request timed out",
+            "request_timeout",
+            "read timeout",
+            "connect timeout",
+        )
+    ):
+        return "request_timeout"
+    if any(
+        marker in text
+        for marker in (
+            "certificate_verify_failed",
+            "connecterror",
+            "connection error",
+            "connection refused",
+            "name or service not known",
+            "temporary failure in name resolution",
+        )
+    ):
+        return "transport_error"
     return None
 
 
@@ -1654,6 +1855,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"benchmark error: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        print("benchmark interrupted", file=sys.stderr)
+        return 130
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return exit_code
 
