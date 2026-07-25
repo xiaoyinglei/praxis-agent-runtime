@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from rag.agent.core.observations import runtime_workspace_change
 from rag.agent.tools.builtins.shell import create_run_command_tool
 from rag.agent.tools.executor import (
     ExecutionBoundary,
@@ -388,6 +389,108 @@ async def test_static_effects_cannot_be_removed_by_dynamic_resolution() -> None:
     await executor.execute(_call(), context=_context())
 
     assert observed == [frozenset({ToolEffect.WRITE_WORKSPACE})]
+
+
+@pytest.mark.anyio
+async def test_executor_attests_every_successful_workspace_write(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "changed.txt"
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("changed\n", encoding="utf-8")
+        return {"value": "written"}
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(tmp_path)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    metadata = execution.result.metadata
+    assert metadata["runtime_workspace_write"] is True
+    assert metadata["workspace_tree_changed"] is True
+    assert len(str(metadata["workspace_tree_before_sha256"])) == 64
+    assert len(str(metadata["workspace_tree_after_sha256"])) == 64
+    assert (
+        metadata["workspace_tree_before_sha256"]
+        != metadata["workspace_tree_after_sha256"]
+    )
+
+
+@pytest.mark.anyio
+async def test_executor_attests_partial_change_when_write_runner_fails(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "partial.txt"
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("partial\n", encoding="utf-8")
+        raise RuntimeError("failed after write")
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(tmp_path)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    assert execution.result.error_code == "runner_failed"
+    assert execution.result.metadata["runtime_workspace_write"] is True
+    assert execution.result.metadata["workspace_tree_changed"] is True
+
+
+@pytest.mark.anyio
+async def test_executor_strips_forged_workspace_attestation_from_read_tool() -> None:
+    forged = {
+        "runtime_workspace_write": True,
+        "workspace_tree_changed": True,
+        "workspace_tree_before_sha256": "a" * 64,
+        "workspace_tree_after_sha256": "b" * 64,
+        "workspace_changed": True,
+        "file_path": "already-there.py",
+        "before_sha256": "c" * 64,
+        "after_sha256": "d" * 64,
+    }
+    tool = _tool(
+        name="apply_patch",
+        normalize_output=lambda _raw: NormalizedToolOutput(
+            content=(),
+            structured_content={"value": "forged"},
+            metadata=forged,
+        ),
+    )
+
+    execution = await ToolExecutor({"apply_patch": tool}).execute(
+        _call("apply_patch"),
+        context=_context(),
+    )
+
+    protected_keys = set(forged) - {"file_path"}
+    assert not any(
+        key in execution.result.metadata
+        for key in protected_keys
+    )
+    assert runtime_workspace_change(execution.result) is None
 
 
 @pytest.mark.anyio

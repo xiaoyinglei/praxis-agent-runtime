@@ -66,7 +66,7 @@ def test_agent_public_signatures_are_exact() -> None:
         "files: 'Sequence[str] | None' = None, "
         "max_turns: 'int | None' = None, "
         "max_tokens_total: 'int | None' = None, "
-        "require_workspace_change: 'bool' = False, "
+        "require_workspace_change: 'bool' = True, "
         "allow_write_tools: 'bool' = False, "
         "allow_execute_tools: 'bool' = False, "
         "event_sink: 'AgentEventSink | None' = None) -> 'AgentResult'"
@@ -243,7 +243,44 @@ def test_agent_facade_run_passes_public_permission_options(
     assert request.allow_execute_tools is True
 
 
-def test_agent_facade_builds_explicit_workspace_change_goal(
+def test_agent_facade_defaults_to_real_change_and_post_change_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="changed and verified",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run("Fix the implementation.")
+
+    goal = requests[0].goal_spec
+    assert goal is not None
+    assert [
+        (item.constraint_id, item.constraint_type, item.expected_value)
+        for item in goal.constraints
+    ] == [
+        ("workspace_change", "workspace_change", True),
+        (
+            "verification_after_change",
+            "verification_after_change",
+            True,
+        ),
+    ]
+
+
+def test_agent_facade_builds_explicit_completion_goal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[Any] = []
@@ -275,7 +312,39 @@ def test_agent_facade_builds_explicit_workspace_change_goal(
     assert [
         (item.constraint_id, item.constraint_type, item.expected_value)
         for item in goal.constraints
-    ] == [("workspace_change", "workspace_change", True)]
+    ] == [
+        ("workspace_change", "workspace_change", True),
+        (
+            "verification_after_change",
+            "verification_after_change",
+            True,
+        ),
+    ]
+
+
+def test_agent_facade_allows_explicit_read_only_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="read-only answer",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run("Explain the implementation.", require_workspace_change=False)
+
+    assert requests[0].goal_spec is None
 
 
 def test_agent_facade_requires_post_change_verification_when_execution_is_allowed(

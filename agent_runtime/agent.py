@@ -79,7 +79,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
-        require_workspace_change: bool = False,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
@@ -106,7 +106,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
-        require_workspace_change: bool = False,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
@@ -209,7 +209,7 @@ class Agent:
                 expected_value=True,
             )
         ]
-        if require_workspace_change and allow_execute_tools:
+        if require_workspace_change:
             goal_constraints.append(
                 GoalConstraint(
                     constraint_id="verification_after_change",
@@ -265,7 +265,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
-        require_workspace_change: bool = False,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
     ) -> AsyncIterator[StreamEvent]:

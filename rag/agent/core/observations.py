@@ -971,17 +971,25 @@ def grounded_workspace_paths(
 def runtime_workspace_change(
     result: ToolResult,
 ) -> tuple[str, str, str] | None:
-    """Return trusted apply_patch path and before/after content hashes."""
+    """Return runtime-owned workspace change evidence."""
 
-    if (
-        result.is_error
-        or result.tool_name != "apply_patch"
-        or result.metadata.get("workspace_changed") is not True
-    ):
+    snapshot = runtime_workspace_snapshot(result)
+    if snapshot is not None:
+        before_sha256, after_sha256 = snapshot
+        if before_sha256 != after_sha256:
+            return ".", before_sha256, after_sha256
+        return None
+
+    # Checkpoints written before executor-owned tree snapshots stored this
+    # apply_patch receipt. Current executions cannot emit these protected keys:
+    # ToolExecutor strips tool-provided claims before returning a ToolResult.
+    if result.is_error or result.tool_name != "apply_patch":
+        return None
+    if result.metadata.get("workspace_changed") is not True:
         return None
     file_path = result.metadata.get("file_path")
-    before_sha256 = result.metadata.get("before_sha256")
-    after_sha256 = result.metadata.get("after_sha256")
+    legacy_before_sha256 = result.metadata.get("before_sha256")
+    legacy_after_sha256 = result.metadata.get("after_sha256")
     normalized_path = (
         _normalize_grounded_workspace_path(file_path)
         if isinstance(file_path, str)
@@ -989,14 +997,33 @@ def runtime_workspace_change(
     )
     if (
         normalized_path is None
-        or not isinstance(before_sha256, str)
+        or not isinstance(legacy_before_sha256, str)
+        or not isinstance(legacy_after_sha256, str)
+        or not _valid_sha256(legacy_before_sha256)
+        or not _valid_sha256(legacy_after_sha256)
+        or legacy_before_sha256 == legacy_after_sha256
+    ):
+        return None
+    return normalized_path, legacy_before_sha256, legacy_after_sha256
+
+
+def runtime_workspace_snapshot(
+    result: ToolResult,
+) -> tuple[str, str] | None:
+    """Return a valid executor-owned before/after workspace snapshot."""
+
+    if result.metadata.get("runtime_workspace_write") is not True:
+        return None
+    before_sha256 = result.metadata.get("workspace_tree_before_sha256")
+    after_sha256 = result.metadata.get("workspace_tree_after_sha256")
+    if (
+        not isinstance(before_sha256, str)
         or not isinstance(after_sha256, str)
         or not _valid_sha256(before_sha256)
         or not _valid_sha256(after_sha256)
-        or before_sha256 == after_sha256
     ):
         return None
-    return normalized_path, before_sha256, after_sha256
+    return before_sha256, after_sha256
 
 
 def _valid_sha256(value: object) -> bool:
@@ -1111,5 +1138,6 @@ __all__ = [
     "StructuredObservation",
     "grounded_workspace_paths",
     "runtime_workspace_change",
+    "runtime_workspace_snapshot",
     "tool_result_progress_error",
 ]

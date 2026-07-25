@@ -25,6 +25,7 @@ from rag.agent.loop.stop_hooks import (
     build_stop_hooks,
 )
 from rag.agent.tools.tool import ToolCall, ToolCallOrigin, ToolResult
+from rag.agent.workspace import workspace_tree_sha256
 
 
 class _StructuredAnswer(BaseModel):
@@ -53,6 +54,19 @@ def _change_metadata(
         "file_path": path,
         "before_sha256": before_sha256,
         "after_sha256": after_sha256,
+    }
+
+
+def _tree_change_metadata(
+    *,
+    before_sha256: str = "c" * 64,
+    after_sha256: str = "d" * 64,
+) -> dict[str, object]:
+    return {
+        "runtime_workspace_write": True,
+        "workspace_tree_changed": before_sha256 != after_sha256,
+        "workspace_tree_before_sha256": before_sha256,
+        "workspace_tree_after_sha256": after_sha256,
     }
 
 
@@ -581,7 +595,24 @@ async def test_workspace_change_goal_rechecks_final_file_content(
 
 
 @pytest.mark.anyio
-async def test_verification_goal_accepts_test_after_latest_workspace_change() -> None:
+@pytest.mark.parametrize(
+    "verification_command",
+    [
+        "pytest --color=yes",
+        "pytest --cov=src",
+        "cargo test --offline",
+        "mypy --check-untyped-defs src",
+        "go test -count=1 ./...",
+        "dotnet test -c Release",
+        "mvn -o test",
+        "mvn test -DskipTests=false",
+        "make -Ctests test",
+        "make -fnotest.mk test",
+    ],
+)
+async def test_verification_goal_accepts_test_after_latest_workspace_change(
+    verification_command: str,
+) -> None:
     goal = GoalSpec(
         original_query="Fix and verify the implementation.",
         constraints=[
@@ -635,7 +666,7 @@ async def test_verification_goal_accepts_test_after_latest_workspace_change() ->
         "verify-1": ToolCall(
             tool_call_id="verify-1",
             tool_name="run_command",
-            arguments={"command": "uv run pytest -q"},
+            arguments={"command": verification_command},
             origin=origin,
         ),
     }
@@ -647,6 +678,370 @@ async def test_verification_goal_accepts_test_after_latest_workspace_change() ->
 
     assert verdict.action == "accept"
     assert verdict.code == "goal_contract_satisfied"
+
+
+@pytest.mark.anyio
+async def test_write_enabled_command_is_a_workspace_change_with_later_verification() -> None:
+    goal = GoalSpec(
+        original_query="Fix and verify the implementation.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            ),
+        ],
+    )
+    origin = ToolCallOrigin(
+        request_id="command-write-request",
+        toolset_revision="command-write-tools",
+        exposed_tool_names=("run_command",),
+    )
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="write-command",
+            tool_name="run_command",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+            metadata=_tree_change_metadata(),
+        ),
+        ToolResult(
+            tool_call_id="verify-command",
+            tool_name="run_command",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+        ),
+    ]
+    state["canonical_tool_calls"] = {
+        "write-command": ToolCall(
+            tool_call_id="write-command",
+            tool_name="run_command",
+            arguments={
+                "command": "printf 'fixed\\n' > src/example.py",
+                "workspace_write": True,
+            },
+            origin=origin,
+        ),
+        "verify-command": ToolCall(
+            tool_call_id="verify-command",
+            tool_name="run_command",
+            arguments={
+                "command": "uv run pytest -q",
+                "workspace_write": False,
+            },
+            origin=origin,
+        ),
+    }
+
+    verdict = await GoalContractStopHook(goal_spec=goal).evaluate(
+        state=state,
+        candidate="Implemented and verified.",
+    )
+
+    assert verdict.action == "accept"
+    assert verdict.code == "goal_contract_satisfied"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "late_write_metadata",
+    [
+        pytest.param(_tree_change_metadata(), id="current-attestation"),
+        pytest.param(
+            {"operation_id": "op_legacy_write"},
+            id="legacy-executed-command",
+        ),
+    ],
+)
+async def test_workspace_write_after_verification_invalidates_stale_success(
+    late_write_metadata: dict[str, object],
+) -> None:
+    goal = GoalSpec(
+        original_query="Fix and verify the implementation.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            ),
+        ],
+    )
+    origin = ToolCallOrigin(
+        request_id="stale-verification-request",
+        toolset_revision="stale-verification-tools",
+        exposed_tool_names=("apply_patch", "run_command"),
+    )
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="patch-1",
+            tool_name="apply_patch",
+            metadata=_change_metadata(),
+        ),
+        ToolResult(
+            tool_call_id="verify-before-write",
+            tool_name="run_command",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+        ),
+        ToolResult(
+            tool_call_id="write-after-verification",
+            tool_name="run_command",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+            metadata=late_write_metadata,
+        ),
+    ]
+    state["canonical_tool_calls"] = {
+        "verify-before-write": ToolCall(
+            tool_call_id="verify-before-write",
+            tool_name="run_command",
+            arguments={"command": "uv run pytest -q"},
+            origin=origin,
+        ),
+        "write-after-verification": ToolCall(
+            tool_call_id="write-after-verification",
+            tool_name="run_command",
+            arguments={
+                "command": "printf 'late change\\n' >> src/example.py",
+                "workspace_write": True,
+            },
+            origin=origin,
+        ),
+    }
+
+    verdict = await GoalContractStopHook(goal_spec=goal).evaluate(
+        state=state,
+        candidate="The earlier verification still passes.",
+    )
+
+    assert verdict.action == "block"
+    assert verdict.detail["unsatisfied_issue_ids"] == [
+        "constraint:verification_after_change"
+    ]
+
+
+@pytest.mark.anyio
+async def test_noop_write_cannot_claim_an_external_later_change(
+    tmp_path: Path,
+) -> None:
+    goal = GoalSpec(
+        original_query="Fix the implementation.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            )
+        ],
+    )
+    baseline = workspace_tree_sha256(tmp_path)
+    assert baseline is not None
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="noop-write",
+            tool_name="run_command",
+            metadata=_tree_change_metadata(
+                before_sha256=baseline,
+                after_sha256=baseline,
+            ),
+        )
+    ]
+    (tmp_path / "external.py").write_text(
+        "changed outside the tool\n",
+        encoding="utf-8",
+    )
+
+    verdict = await GoalContractStopHook(
+        goal_spec=goal,
+        workspace_root=tmp_path,
+    ).evaluate(
+        state=state,
+        candidate="A different process changed the workspace later.",
+    )
+
+    assert verdict.action == "block"
+    assert verdict.detail["unsatisfied_issue_ids"] == [
+        "constraint:workspace_change"
+    ]
+
+
+@pytest.mark.anyio
+async def test_reverted_writes_cannot_claim_an_external_final_change(
+    tmp_path: Path,
+) -> None:
+    goal = GoalSpec(
+        original_query="Fix and verify the implementation.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            ),
+        ],
+    )
+    baseline = workspace_tree_sha256(tmp_path)
+    assert baseline is not None
+    agent_file = tmp_path / "agent.py"
+    agent_file.write_text("changed\n", encoding="utf-8")
+    changed = workspace_tree_sha256(tmp_path)
+    assert changed is not None and changed != baseline
+    agent_file.unlink()
+    reverted = workspace_tree_sha256(tmp_path)
+    assert reverted == baseline
+    (tmp_path / "external.py").write_text(
+        "unrelated external change\n",
+        encoding="utf-8",
+    )
+
+    origin = ToolCallOrigin(
+        request_id="reverted-write-request",
+        toolset_revision="reverted-write-tools",
+        exposed_tool_names=("run_command",),
+    )
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="write",
+            tool_name="run_command",
+            metadata=_tree_change_metadata(
+                before_sha256=baseline,
+                after_sha256=changed,
+            ),
+        ),
+        ToolResult(
+            tool_call_id="revert",
+            tool_name="run_command",
+            metadata=_tree_change_metadata(
+                before_sha256=changed,
+                after_sha256=reverted,
+            ),
+        ),
+        ToolResult(
+            tool_call_id="verify",
+            tool_name="run_command",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+        ),
+    ]
+    state["canonical_tool_calls"] = {
+        "write": ToolCall(
+            tool_call_id="write",
+            tool_name="run_command",
+            arguments={"command": "touch agent.py", "workspace_write": True},
+            origin=origin,
+        ),
+        "revert": ToolCall(
+            tool_call_id="revert",
+            tool_name="run_command",
+            arguments={"command": "rm agent.py", "workspace_write": True},
+            origin=origin,
+        ),
+        "verify": ToolCall(
+            tool_call_id="verify",
+            tool_name="run_command",
+            arguments={"command": "uv run pytest -q"},
+            origin=origin,
+        ),
+    }
+
+    verdict = await GoalContractStopHook(
+        goal_spec=goal,
+        workspace_root=tmp_path,
+    ).evaluate(
+        state=state,
+        candidate="Implemented and verified.",
+    )
+
+    assert verdict.action == "block"
+    assert verdict.detail["unsatisfied_issue_ids"] == [
+        "constraint:workspace_change"
+    ]
+
+
+@pytest.mark.anyio
+async def test_parallel_write_receipts_accept_the_attested_final_state(
+    tmp_path: Path,
+) -> None:
+    goal = GoalSpec(
+        original_query="Update both files.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            )
+        ],
+    )
+    baseline = workspace_tree_sha256(tmp_path)
+    assert baseline is not None
+    (tmp_path / "first.py").write_text("first\n", encoding="utf-8")
+    first_finished = workspace_tree_sha256(tmp_path)
+    assert first_finished is not None
+    (tmp_path / "second.py").write_text("second\n", encoding="utf-8")
+    final = workspace_tree_sha256(tmp_path)
+    assert final is not None
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="parallel-final",
+            tool_name="apply_patch",
+            metadata=_tree_change_metadata(
+                before_sha256=baseline,
+                after_sha256=final,
+            ),
+        ),
+        ToolResult(
+            tool_call_id="parallel-first",
+            tool_name="apply_patch",
+            metadata=_tree_change_metadata(
+                before_sha256=baseline,
+                after_sha256=first_finished,
+            ),
+        ),
+    ]
+
+    verdict = await GoalContractStopHook(
+        goal_spec=goal,
+        workspace_root=tmp_path,
+    ).evaluate(
+        state=state,
+        candidate="Updated both files.",
+    )
+
+    assert verdict.action == "accept"
 
 
 @pytest.mark.anyio
@@ -737,6 +1132,38 @@ async def test_reverted_patch_sequence_is_not_a_net_workspace_change() -> None:
         ("uv run pytest --help", False),
         ("touch verification-marker && uv run pytest -q", False),
         ("uv run pytest -q $(touch verification-marker)", False),
+        ("./pytest", False),
+        ("./mypy src/example.py", False),
+        ("./python-evil -m pytest", False),
+        ("./uv run pytest -q", False),
+        ("./env pytest -q", False),
+        ("env PATH=. pytest", False),
+        ("CI=1 pytest -q", False),
+        ("PYTEST_ADDOPTS=--collect-only pytest -q", False),
+        ("env PYTEST_ADDOPTS=--collect-only pytest -q", False),
+        ("pytest -o addopts=--collect-only", False),
+        ("pytest --override-ini=addopts=--collect-only", False),
+        ("pytest -c pytest-collect.ini", False),
+        ("pytest --setup-only", False),
+        ("go test -list . ./...", False),
+        ("make -n test", False),
+        ("make -q test", False),
+        ("make --touch test", False),
+        ("gradle -m test", False),
+        ("gradle test --dry-run", False),
+        ("gradle test -x test", False),
+        ("nox -l", False),
+        ("nox --list-sessions", False),
+        ("tox -l", False),
+        ("tox -a", False),
+        ("jest --passWithNoTests", False),
+        ("vitest --passWithNoTests", False),
+        ("npm test --if-present", False),
+        ("cargo test --no-run", False),
+        ("mvn test -DskipTests", False),
+        ("mvn test -Dmaven.test.skip=true", False),
+        ("python -m pytest -q", False),
+        ("uv run python -m pytest -q", False),
     ],
 )
 async def test_verification_goal_rejects_non_verification_or_stale_evidence(

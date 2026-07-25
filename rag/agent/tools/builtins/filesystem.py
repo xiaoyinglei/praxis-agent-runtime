@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import difflib
 import fnmatch
-import hashlib
 import os
 import stat
 import tempfile
@@ -28,6 +27,9 @@ from rag.agent.tools.tool import (
 from rag.agent.workspace import WorkspaceRuntime
 
 _INTERNAL_DIRECTORY = ".agent_memory"
+_PROTECTED_VERIFICATION_DIRECTORIES = frozenset(
+    {".venv", "node_modules"}
+)
 _DEFAULT_HIDDEN_DIRECTORIES = frozenset(
     {
         _INTERNAL_DIRECTORY,
@@ -213,8 +215,6 @@ class _ApplyPatchRunResult:
     output: ApplyPatchOutput
     diff: str = ""
     diff_truncated: bool = False
-    before_sha256: str | None = None
-    after_sha256: str | None = None
 
 
 _LIST_INPUT_SCHEMA, _validate_list_input = pydantic_input(ListFilesInput)
@@ -317,7 +317,8 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
             description=(
                 "Edit an existing UTF-8 workspace file by exact text replacement. "
                 "Without replace_all, the old text must occur exactly once. The write "
-                "is atomically installed and does not create new files."
+                "is atomically installed and does not create new files. Verification "
+                "toolchains under .venv and node_modules are read-only."
             ),
             input_schema=_PATCH_INPUT_SCHEMA,
         ),
@@ -344,7 +345,7 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 }
             ),
         ),
-        execution_revision="builtin-apply-patch-v1",
+        execution_revision="builtin-apply-patch-v2-protected-toolchain",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -497,7 +498,26 @@ def _apply_patch(
     workspace: WorkspaceRuntime,
     request: ApplyPatchInput,
 ) -> _ApplyPatchRunResult:
+    requested_path = Path(request.file_path)
+    if any(
+        part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
+        for part in requested_path.parts
+    ):
+        raise PermissionError(
+            "apply_patch cannot modify the verification toolchain"
+        )
     target = _checked_path(workspace, request.file_path)
+    relative = target.relative_to(workspace.root.resolve())
+    if (
+        relative.parts
+        and any(
+            part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
+            for part in relative.parts
+        )
+    ):
+        raise PermissionError(
+            "apply_patch cannot modify the verification toolchain"
+        )
     if not target.is_file():
         return _ApplyPatchRunResult(
             ApplyPatchOutput(
@@ -558,8 +578,6 @@ def _apply_patch(
         ),
         diff=diff,
         diff_truncated=diff_truncated,
-        before_sha256=hashlib.sha256(current.encode("utf-8")).hexdigest(),
-        after_sha256=hashlib.sha256(updated.encode("utf-8")).hexdigest(),
     )
 
 
@@ -662,9 +680,6 @@ def _normalize_apply_patch(raw: object) -> NormalizedToolOutput:
                 "file_path": validated.file_path,
                 "diff": execution.diff,
                 "diff_truncated": execution.diff_truncated,
-                "workspace_changed": True,
-                "before_sha256": execution.before_sha256,
-                "after_sha256": execution.after_sha256,
             },
         )
     return NormalizedToolOutput(

@@ -35,6 +35,18 @@ def test_goal_fingerprint_covers_the_complete_structured_goal() -> None:
     assert goal.fingerprint != changed.fingerprint
 
 
+def test_goal_spec_does_not_advertise_unenforced_success_criteria() -> None:
+    restored = GoalSpec.model_validate(
+        {
+            "original_query": "Implement the requested change.",
+            "success_criteria": ["A legacy free-text criterion."],
+        }
+    )
+
+    assert "success_criteria" not in GoalSpec.model_fields
+    assert "success_criteria" not in restored.model_dump()
+
+
 def test_update_plan_schema_has_no_goal_authority_claims() -> None:
     schema = UpdatePlanInput.model_json_schema()
     step_schema = schema["$defs"]["PlanStepInput"]

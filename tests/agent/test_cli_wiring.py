@@ -62,6 +62,7 @@ class _ModelRegistry:
                 "--allow-write-tools",
                 "--allow-execute-tools",
                 "--require-workspace-change",
+                "--no-require-workspace-change",
                 "--model-session-path",
             ),
             (
@@ -206,11 +207,20 @@ def test_agent_run_forwards_workspace_change_contract(
         task="Fix the implementation.",
         checkpoint_db=tmp_path / "checkpoints.sqlite",
         model_session_path=tmp_path / "model-session.json",
-        require_workspace_change=True,
         non_interactive=True,
     )
 
     assert run_options[0]["require_workspace_change"] is True
+
+    cli_module.agent_run(
+        task="Explain the implementation.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        require_workspace_change=False,
+        non_interactive=True,
+    )
+
+    assert run_options[1]["require_workspace_change"] is False
 
 
 def _result(

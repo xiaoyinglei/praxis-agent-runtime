@@ -36,6 +36,9 @@ _STREAM_TRUNCATION_MARKER = (
     b"\n... output truncated; preserved head and tail ...\n"
 )
 _SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
+_PROTECTED_VERIFICATION_DIRECTORIES = frozenset(
+    {".venv", "node_modules"}
+)
 
 
 class RunCommandInput(BaseModel):
@@ -141,13 +144,14 @@ def create_run_command_tool(
                 "workspace-relative directory. The workspace is read-only by default "
                 "and a private temporary directory is writable. Set "
                 "workspace_write=true to request destructive workspace write access; "
-                ".git remains read-only. Host environment variables and network "
-                "access are disabled. Set network=true to request a separate network "
-                "approval. Timeout or cancellation terminates and reaps the complete "
-                "process group. Commands fail closed before execution when hardlinked "
-                "workspace files could bypass path containment. For implementation "
-                "tasks, locate the affected code before execution and prefer focused "
-                "verification over a full-repository test run."
+                ".git, .venv, and node_modules remain read-only. Host environment "
+                "variables and network access are disabled. Set network=true to "
+                "request a separate network approval. Timeout or cancellation "
+                "terminates and reaps the complete process group. Commands fail "
+                "closed before execution when hardlinked workspace files could "
+                "bypass path containment. For implementation tasks, locate the "
+                "affected code before execution and prefer focused verification "
+                "over a full-repository test run."
             ),
             input_schema=_COMMAND_INPUT_SCHEMA,
         ),
@@ -162,7 +166,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v5-timeout-normalization",
+        execution_revision="builtin-run-command-v6-protected-toolchain",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -440,6 +444,15 @@ def _build_command_sandbox_profile(
         f'    (subpath "{workspace}")\n'
         f'    (require-not (subpath "{temporary}"))\n'
         '    (regex #"/[.][gG][iI][tT]($|/)")))\n'
+        "(deny file-write*\n"
+        "  (require-all\n"
+        f'    (subpath "{workspace}")\n'
+        '    (regex #"/[.][vV][eE][nN][vV]($|/)")))\n'
+        "(deny file-write*\n"
+        "  (require-all\n"
+        f'    (subpath "{workspace}")\n'
+        "    (regex #\"/[nN][oO][dD][eE]_[mM][oO][dD][uU][lL][eE][sS]"
+        '($|/)")))\n'
         f"{network_policy}\n"
     )
 
@@ -488,13 +501,17 @@ def _workspace_sandbox_preflight_issue(
 ) -> tuple[str, str] | None:
     root_path = workspace_root.resolve()
     root = os.fspath(root_path)
-    pending = [(root, False)]
+    pending = [(root, False, False)]
     hardlinks: dict[
         tuple[int, int],
         tuple[int, int, str, bool, bool],
     ] = {}
     while pending:
-        directory, directory_is_git_metadata = pending.pop()
+        (
+            directory,
+            directory_is_git_metadata,
+            directory_is_verification_toolchain,
+        ) = pending.pop()
         try:
             entries = os.scandir(directory)
         except OSError:
@@ -520,6 +537,46 @@ def _workspace_sandbox_preflight_issue(
                     directory_is_git_metadata
                     or entry.name.casefold() == ".git"
                 )
+                entry_is_verification_toolchain = bool(
+                    directory_is_verification_toolchain
+                    or entry.name.casefold()
+                    in _PROTECTED_VERIFICATION_DIRECTORIES
+                )
+                if entry_is_verification_toolchain and is_symlink:
+                    try:
+                        resolved_target = Path(entry.path).resolve()
+                    except (OSError, RuntimeError):
+                        relative = Path(
+                            os.path.relpath(entry.path, root)
+                        ).as_posix()
+                        return (
+                            "workspace_scan_failed",
+                            (
+                                "workspace containment scan failed at "
+                                f"{relative}"
+                            ),
+                        )
+                    if resolved_target.is_relative_to(root_path):
+                        target_relative = resolved_target.relative_to(
+                            root_path
+                        )
+                        if not any(
+                            part.casefold()
+                            in _PROTECTED_VERIFICATION_DIRECTORIES
+                            for part in target_relative.parts
+                        ):
+                            relative = Path(
+                                os.path.relpath(entry.path, root)
+                            ).as_posix()
+                            return (
+                                "workspace_verifier_alias",
+                                (
+                                    "workspace access refused because "
+                                    f"verification toolchain path {relative} "
+                                    "resolves to writable workspace path "
+                                    f"{target_relative.as_posix()}"
+                                ),
+                            )
                 if allow_workspace_write and entry_is_git_metadata and is_symlink:
                     relative = Path(
                         os.path.relpath(entry.path, root)
@@ -535,7 +592,11 @@ def _workspace_sandbox_preflight_issue(
                     continue
                 if is_directory:
                     pending.append(
-                        (entry.path, entry_is_git_metadata)
+                        (
+                            entry.path,
+                            entry_is_git_metadata,
+                            entry_is_verification_toolchain,
+                        )
                     )
                     continue
                 try:
@@ -557,8 +618,8 @@ def _workspace_sandbox_preflight_issue(
                         expected_count,
                         observed_count,
                         first_relative,
-                        seen_git_metadata,
-                        seen_worktree,
+                        seen_protected,
+                        seen_unprotected,
                     ) = hardlinks.get(
                         key,
                         (
@@ -573,8 +634,14 @@ def _workspace_sandbox_preflight_issue(
                         max(expected_count, metadata.st_nlink),
                         observed_count + 1,
                         first_relative,
-                        seen_git_metadata or entry_is_git_metadata,
-                        seen_worktree or not entry_is_git_metadata,
+                        seen_protected
+                        or entry_is_git_metadata
+                        or entry_is_verification_toolchain,
+                        seen_unprotected
+                        or not (
+                            entry_is_git_metadata
+                            or entry_is_verification_toolchain
+                        ),
                     )
                 pointer_kind: Literal["gitdir", "commondir"] | None = None
                 if entry.name.casefold() == ".git":
@@ -628,13 +695,13 @@ def _workspace_sandbox_preflight_issue(
         expected_count,
         observed_count,
         first_relative,
-        seen_git_metadata,
-        seen_worktree,
+        seen_protected,
+        seen_unprotected,
     ) in hardlinks.values():
         if observed_count < expected_count or (
             allow_workspace_write
-            and seen_git_metadata
-            and seen_worktree
+            and seen_protected
+            and seen_unprotected
         ):
             return (
                 "workspace_hardlink_detected",

@@ -121,4 +121,5 @@ async def test_chat_loop_carries_the_previous_turn_automatically(
     assert calls[0][1]["previous_turn_id"] is None
     assert calls[1][1]["previous_turn_id"] == result_ids[0]
     assert calls[0][1]["max_turns"] == 3
+    assert calls[0][1]["require_workspace_change"] is False
     assert isinstance(calls[0][1]["event_sink"], cli._CLIToolEventDisplay)

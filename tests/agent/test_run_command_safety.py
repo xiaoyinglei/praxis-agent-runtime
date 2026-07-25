@@ -311,6 +311,38 @@ async def test_run_command_workspace_write_never_writes_dot_git(
     shutil.which("sandbox-exec") is None,
     reason="Seatbelt sandbox-exec is not available on this platform",
 )
+@pytest.mark.parametrize(
+    "relative_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_run_command_workspace_write_cannot_replace_verifiers(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    verifier = workspace.root / relative_path
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("trusted\n", encoding="utf-8")
+    tool = create_run_command_tool(workspace)
+
+    result = await _run_command(
+        tool,
+        _validated_arguments(
+            tool,
+            command=f"printf hacked > {shlex.quote(relative_path)}",
+            workspace_write=True,
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert verifier.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    shutil.which("sandbox-exec") is None,
+    reason="Seatbelt sandbox-exec is not available on this platform",
+)
 async def test_run_command_workspace_write_never_writes_dot_git_case_variant(
     tmp_path: Path,
 ) -> None:
@@ -607,6 +639,150 @@ async def test_run_command_workspace_write_allows_internal_hardlinks(
 
     assert result.exit_code == 0
     assert source.read_text(encoding="utf-8") == "changed"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    shutil.which("sandbox-exec") is None,
+    reason="Seatbelt sandbox-exec is not available on this platform",
+)
+@pytest.mark.parametrize(
+    "protected_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_run_command_rejects_verifier_hardlink_alias(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    verifier = workspace.root / protected_path
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("trusted\n", encoding="utf-8")
+    alias = workspace.root / "verifier-alias"
+    os.link(verifier, alias)
+    tool = create_run_command_tool(workspace)
+
+    result = await _run_command(
+        tool,
+        _validated_arguments(
+            tool,
+            command="printf replaced > verifier-alias",
+            workspace_write=True,
+        ),
+    )
+
+    assert result.sandbox_error == "workspace_hardlink_detected"
+    assert verifier.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    shutil.which("sandbox-exec") is None,
+    reason="Seatbelt sandbox-exec is not available on this platform",
+)
+@pytest.mark.parametrize(
+    "protected_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_run_command_cannot_follow_verifier_symlink_alias(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    verifier = workspace.root / protected_path
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("trusted\n", encoding="utf-8")
+    alias = workspace.root / "verifier-alias"
+    alias.symlink_to(verifier.relative_to(workspace.root))
+    tool = create_run_command_tool(workspace)
+
+    result = await _run_command(
+        tool,
+        _validated_arguments(
+            tool,
+            command="printf replaced > verifier-alias",
+            workspace_write=True,
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert verifier.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    shutil.which("sandbox-exec") is None,
+    reason="Seatbelt sandbox-exec is not available on this platform",
+)
+@pytest.mark.parametrize(
+    "alias_kind",
+    ["toolchain-directory", "verifier-file"],
+)
+async def test_run_command_rejects_protected_symlink_to_writable_workspace(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    if alias_kind == "toolchain-directory":
+        writable_toolchain = workspace.root / "writable-toolchain"
+        verifier = writable_toolchain / "bin" / "pytest"
+        verifier.parent.mkdir(parents=True)
+        verifier.write_text("trusted\n", encoding="utf-8")
+        (workspace.root / ".venv").symlink_to(
+            writable_toolchain,
+            target_is_directory=True,
+        )
+    else:
+        verifier = workspace.root / "scripts" / "pytest"
+        verifier.parent.mkdir(parents=True)
+        verifier.write_text("trusted\n", encoding="utf-8")
+        alias = workspace.root / ".venv" / "bin" / "pytest"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(verifier)
+    tool = create_run_command_tool(workspace)
+
+    result = await _run_command(
+        tool,
+        _validated_arguments(tool, command="printf ok"),
+    )
+
+    assert result.sandbox_error == "workspace_verifier_alias"
+    assert verifier.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(
+    shutil.which("sandbox-exec") is None,
+    reason="Seatbelt sandbox-exec is not available on this platform",
+)
+@pytest.mark.parametrize(
+    "protected_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_run_command_cannot_create_verifier_hardlink_alias(
+    tmp_path: Path,
+    protected_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    verifier = workspace.root / protected_path
+    verifier.parent.mkdir(parents=True)
+    verifier.write_text("trusted\n", encoding="utf-8")
+    tool = create_run_command_tool(workspace)
+
+    result = await _run_command(
+        tool,
+        _validated_arguments(
+            tool,
+            command=(
+                f"ln {shlex.quote(protected_path)} verifier-alias"
+                " && printf replaced > verifier-alias"
+            ),
+            workspace_write=True,
+        ),
+    )
+
+    assert result.exit_code != 0
+    assert verifier.read_text(encoding="utf-8") == "trusted\n"
 
 
 @pytest.mark.anyio

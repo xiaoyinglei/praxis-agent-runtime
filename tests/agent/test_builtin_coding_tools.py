@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from rag.agent.core.observations import runtime_workspace_change
 from rag.agent.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
@@ -240,12 +241,20 @@ async def test_filesystem_tools_list_read_patch_and_expose_changes_immediately(
     assert "-needle_one()" in patch_diff
     assert "+fresh_symbol()" in patch_diff
     assert patched.result.metadata["diff_truncated"] is False
-    assert patched.result.metadata["workspace_changed"] is True
-    assert len(str(patched.result.metadata["before_sha256"])) == 64
-    assert len(str(patched.result.metadata["after_sha256"])) == 64
+    assert "workspace_changed" not in patched.result.metadata
+    assert "before_sha256" not in patched.result.metadata
+    assert "after_sha256" not in patched.result.metadata
+    assert patched.result.metadata["runtime_workspace_write"] is True
+    assert patched.result.metadata["workspace_tree_changed"] is True
+    assert len(
+        str(patched.result.metadata["workspace_tree_before_sha256"])
+    ) == 64
+    assert len(
+        str(patched.result.metadata["workspace_tree_after_sha256"])
+    ) == 64
     assert (
-        patched.result.metadata["before_sha256"]
-        != patched.result.metadata["after_sha256"]
+        patched.result.metadata["workspace_tree_before_sha256"]
+        != patched.result.metadata["workspace_tree_after_sha256"]
     )
     assert old_search.result.structured_content is not None
     assert old_search.result.structured_content["matches"] == ()
@@ -382,6 +391,77 @@ async def test_apply_patch_rejects_replacement_with_identical_content(
     assert execution.result.error_code == "patch_no_change"
     assert execution.result.metadata.get("workspace_changed") is not True
     assert target.read_text(encoding="utf-8") == "same"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "file_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_apply_patch_cannot_replace_verification_toolchain(
+    tmp_path: Path,
+    file_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    target = workspace.root / file_path
+    target.parent.mkdir(parents=True)
+    target.write_text("trusted\n", encoding="utf-8")
+    tool = _tools_by_name(workspace)["apply_patch"]
+
+    execution = await _execute(
+        tool,
+        {
+            "file_path": file_path,
+            "old_string": "trusted",
+            "new_string": "exit 0",
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert target.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "alias_kind",
+    ["toolchain-directory", "verifier-file"],
+)
+async def test_apply_patch_rejects_protected_symlink_path(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    if alias_kind == "toolchain-directory":
+        writable_toolchain = workspace.root / "writable-toolchain"
+        target = writable_toolchain / "bin" / "pytest"
+        target.parent.mkdir(parents=True)
+        target.write_text("trusted\n", encoding="utf-8")
+        (workspace.root / ".venv").symlink_to(
+            writable_toolchain,
+            target_is_directory=True,
+        )
+    else:
+        target = workspace.root / "scripts" / "pytest"
+        target.parent.mkdir(parents=True)
+        target.write_text("trusted\n", encoding="utf-8")
+        alias = workspace.root / ".venv" / "bin" / "pytest"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(target)
+    tool = _tools_by_name(workspace)["apply_patch"]
+
+    execution = await _execute(
+        tool,
+        {
+            "file_path": ".venv/bin/pytest",
+            "old_string": "trusted",
+            "new_string": "exit 0",
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert target.read_text(encoding="utf-8") == "trusted\n"
 
 
 @pytest.mark.anyio
@@ -773,6 +853,44 @@ async def test_run_command_returns_bounded_structured_process_output(
     assert execution.result.structured_content["timed_out"] is False
     assert execution.result.structured_content["execution_mode"] == "restricted_sandbox"
     assert execution.result.structured_content["network_enabled"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_run_command_workspace_write_emits_runtime_change_evidence(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    target = workspace.root / "source.py"
+    target.write_text("before\n", encoding="utf-8")
+    tool = _tools_by_name(workspace)["run_command"]
+    call = ToolCall(
+        tool_call_id="write-command",
+        tool_name="run_command",
+        arguments={
+            "command": "printf 'after\\n' > source.py",
+            "working_dir": ".",
+            "timeout_seconds": 1,
+            "workspace_write": True,
+        },
+        origin=_origin("run_command"),
+    )
+
+    execution = await ToolExecutor({"run_command": tool}).execute(
+        call,
+        context=ToolExecutionContext(
+            workspace_root=workspace.root,
+            cwd=workspace.root,
+            allow_write_tools=True,
+            allow_execute_tools=True,
+            approved_tool_call_ids=frozenset({call.tool_call_id}),
+        ),
+    )
+
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert execution.result.metadata["runtime_workspace_write"] is True
+    assert execution.result.metadata["workspace_tree_changed"] is True
+    assert runtime_workspace_change(execution.result) is not None
 
 
 @pytest.mark.anyio

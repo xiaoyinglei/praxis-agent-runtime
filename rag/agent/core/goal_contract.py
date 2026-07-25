@@ -70,7 +70,6 @@ class GoalSpec(BaseModel):
     original_query: str
     deliverables: list[GoalDeliverable] = Field(default_factory=list)
     constraints: list[GoalConstraint] = Field(default_factory=list)
-    success_criteria: list[str] = Field(default_factory=list)
     # Accepted only to preserve callers that persisted the former public schema.
     required_outputs: list[str] = Field(default_factory=lambda: ["answer"])
     required_evidence: list[str] = Field(default_factory=list)
