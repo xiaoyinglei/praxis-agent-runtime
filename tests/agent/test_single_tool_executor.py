@@ -33,6 +33,7 @@ from rag.agent.tools.tool import (
     NormalizedToolOutput,
     ResolvedToolUse,
     Tool,
+    ToolApprovalProfile,
     ToolCall,
     ToolCallOrigin,
     ToolContentBlock,
@@ -90,6 +91,7 @@ def _tool(
     concurrency_safe: bool = True,
     max_model_output_bytes: int = 4096,
     execution_revision: str = "1",
+    approval_profile: ToolApprovalProfile | None = None,
 ) -> Tool:
     return Tool(
         definition=ToolDefinition(
@@ -116,6 +118,7 @@ def _tool(
         interrupt_behavior=interrupt_behavior,
         timeout_seconds=timeout_seconds,
         max_model_output_bytes=max_model_output_bytes,
+        approval_profile=approval_profile,
     )
 
 
@@ -636,23 +639,23 @@ def test_sandbox_auto_approval_requires_process_execution() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "execution_revision", "effects"),
+    ("name", "approval_profile", "effects"),
     [
         pytest.param(
             "spoofed",
-            "1",
+            None,
             frozenset({ToolEffect.EXECUTE_PROCESS}),
             id="unverified-tool",
         ),
         pytest.param(
             "run_command",
-            "builtin-run-command-v4-read-only-default",
+            ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
             frozenset({ToolEffect.EXECUTE_PROCESS, ToolEffect.DESTRUCTIVE}),
             id="destructive-effect",
         ),
         pytest.param(
             "run_command",
-            "builtin-run-command-v4-read-only-default",
+            ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
             frozenset(
                 {
                     ToolEffect.EXECUTE_PROCESS,
@@ -665,14 +668,14 @@ def test_sandbox_auto_approval_requires_process_execution() -> None:
 )
 def test_sandbox_auto_approval_rejects_unverified_or_mutating_calls(
     name: str,
-    execution_revision: str,
+    approval_profile: ToolApprovalProfile | None,
     effects: frozenset[ToolEffect],
 ) -> None:
     tool = _tool(
         name,
         static_effects=effects,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
-        execution_revision=execution_revision,
+        approval_profile=approval_profile,
     )
     resolved = ResolvedToolUse(
         effects=effects,

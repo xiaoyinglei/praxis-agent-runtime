@@ -890,6 +890,11 @@ def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
         "interrupt_behavior": tool.interrupt_behavior.value,
         "timeout_seconds": float(tool.timeout_seconds),
         "max_model_output_bytes": tool.max_model_output_bytes,
+        "approval_profile": (
+            tool.approval_profile.value
+            if tool.approval_profile is not None
+            else None
+        ),
     }
 
 

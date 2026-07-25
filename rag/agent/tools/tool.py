@@ -248,6 +248,12 @@ class ToolEffect(StrEnum):
     DESTRUCTIVE = "destructive"
 
 
+class ToolApprovalProfile(StrEnum):
+    """Runtime-owned attestation used by explicit automatic-approval policies."""
+
+    RESTRICTED_READ_ONLY_PROCESS = "restricted_read_only_process"
+
+
 @dataclass(frozen=True, slots=True)
 class ToolTarget:
     kind: str
@@ -1263,6 +1269,7 @@ class Tool:
     interrupt_behavior: InterruptBehavior
     timeout_seconds: float
     max_model_output_bytes: int
+    approval_profile: ToolApprovalProfile | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -1279,6 +1286,11 @@ class Tool:
             raise TypeError("cancellation_mode must be a CancellationMode")
         if not isinstance(self.interrupt_behavior, InterruptBehavior):
             raise TypeError("interrupt_behavior must be an InterruptBehavior")
+        if self.approval_profile is not None and not isinstance(
+            self.approval_profile,
+            ToolApprovalProfile,
+        ):
+            raise TypeError("approval_profile must be a ToolApprovalProfile or None")
         _require_exact_bool(self.idempotent, field_name="idempotent")
         _require_exact_bool(self.concurrency_safe, field_name="concurrency_safe")
         if (

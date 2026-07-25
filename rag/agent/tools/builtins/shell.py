@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from rag.agent.tools.tool import (
     CancellationMode,
@@ -20,6 +20,7 @@ from rag.agent.tools.tool import (
     NormalizedToolOutput,
     ResolvedToolUse,
     Tool,
+    ToolApprovalProfile,
     ToolDefinition,
     ToolEffect,
     ToolTarget,
@@ -29,6 +30,8 @@ from rag.agent.tools.tool import (
 from rag.agent.workspace import WorkspaceRuntime
 
 _MAX_STREAM_BYTES = 16_000
+_MAX_COMMAND_TIMEOUT_SECONDS = 600.0
+_MILLISECONDS_PER_SECOND = 1_000.0
 _STREAM_TRUNCATION_MARKER = (
     b"\n... output truncated; preserved head and tail ...\n"
 )
@@ -51,8 +54,13 @@ class RunCommandInput(BaseModel):
     timeout_seconds: float = Field(
         default=120.0,
         gt=0,
-        le=600.0,
-        description="Per-command timeout before the whole process group is terminated.",
+        le=_MAX_COMMAND_TIMEOUT_SECONDS * _MILLISECONDS_PER_SECOND,
+        description=(
+            "Per-command timeout in seconds before the whole process group is "
+            "terminated; use 120, not 120000. Values from 1000 through 600000 "
+            "are accepted as an unambiguous millisecond form and normalized to "
+            "seconds. The effective maximum is 600 seconds."
+        ),
     )
     network: bool = Field(
         default=False,
@@ -70,6 +78,18 @@ class RunCommandInput(BaseModel):
             "aliases are refused."
         ),
     )
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def normalize_timeout_milliseconds(cls, value: float) -> float:
+        if value <= _MAX_COMMAND_TIMEOUT_SECONDS:
+            return value
+        if value < _MILLISECONDS_PER_SECOND:
+            raise ValueError(
+                "timeout_seconds must be at most 600 seconds; "
+                "millisecond values must be at least 1000"
+            )
+        return value / _MILLISECONDS_PER_SECOND
 
 
 class RunCommandOutput(BaseModel):
@@ -142,13 +162,14 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v4-read-only-default",
+        execution_revision="builtin-run-command-v5-timeout-normalization",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
         interrupt_behavior=InterruptBehavior.CANCEL,
         timeout_seconds=hard_timeout_seconds,
         max_model_output_bytes=150_000,
+        approval_profile=ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
     )
 
 
