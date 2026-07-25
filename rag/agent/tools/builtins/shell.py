@@ -122,7 +122,9 @@ def create_run_command_tool(
                 "access are disabled. Set network=true to request a separate network "
                 "approval. Timeout or cancellation terminates and reaps the complete "
                 "process group. Commands fail closed before execution when hardlinked "
-                "workspace files could bypass path containment."
+                "workspace files could bypass path containment. For implementation "
+                "tasks, locate the affected code before execution and prefer focused "
+                "verification over a full-repository test run."
             ),
             input_schema=_COMMAND_INPUT_SCHEMA,
         ),

@@ -237,8 +237,10 @@ def create_list_files_tool(workspace: WorkspaceRuntime) -> Tool:
             name="list_files",
             description=(
                 "List one workspace directory in deterministic filename order. "
-                "Use glob to narrow entries and limit to bound the result. This tool "
-                "does not recurse; call it again for a returned directory."
+                "This is not a code-search tool; use it when directory layout or an "
+                "unknown filename is the missing fact. Use glob to narrow entries and "
+                "limit to bound the result. This tool does not recurse; call it again "
+                "for a returned directory."
             ),
             input_schema=_LIST_INPUT_SCHEMA,
         ),

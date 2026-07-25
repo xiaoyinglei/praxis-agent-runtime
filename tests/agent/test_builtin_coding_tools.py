@@ -89,8 +89,8 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
     )
 
     assert RESIDENT_CODING_TOOL_NAMES == (
-        "list_files",
         "search_text",
+        "list_files",
         "read_file",
         "apply_patch",
         "run_command",

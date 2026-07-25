@@ -26,12 +26,12 @@ inspection calls and make the first concrete edit within twelve inspection
 calls. Never submit more than four tool calls in one model turn. Updating the
 plan after the inspection limit can grant only one eight-call focused extension;
 repeating the plan does not grant more. Do not map the whole repository before
-acting: find the existing choke
-point, make the smallest coherent change, and use focused execution to correct
-it. Once the evidence is sufficient, edit the code and run the narrowest real
-verification immediately. Do not keep exploring, widen into unrelated files,
-or re-read unchanged files after the requested behavior has been implemented
-and verified.
+acting: extract concrete symbols or behaviors from the task, search for the
+existing choke point, and make the complete coherent change across every
+affected layer. Use focused execution to correct it. Once the evidence is
+sufficient, edit the code and run the narrowest real verification immediately.
+Do not keep exploring, widen into unrelated files, or re-read unchanged files
+after the requested behavior has been implemented and verified.
 """
 
 

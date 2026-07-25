@@ -12,8 +12,8 @@ from rag.agent.tools.tool import Tool
 from rag.agent.workspace import WorkspaceRuntime
 
 RESIDENT_CODING_TOOL_NAMES = (
-    "list_files",
     "search_text",
+    "list_files",
     "read_file",
     "apply_patch",
     "run_command",
@@ -30,8 +30,8 @@ def create_resident_coding_tools(
     """Build the fixed baseline as ordinary Tool values in product order."""
 
     return (
-        create_list_files_tool(workspace),
         create_search_text_tool(workspace),
+        create_list_files_tool(workspace),
         create_read_file_tool(workspace),
         create_apply_patch_tool(workspace),
         create_run_command_tool(

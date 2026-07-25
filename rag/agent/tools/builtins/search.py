@@ -122,13 +122,14 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
         definition=ToolDefinition(
             name="search_text",
             description=(
-                "Search current workspace files without an index. Supports literal or "
-                "regex matching, one file or directory path, an optional glob, bounded "
-                "context lines, and a result limit. Directory searches first diversify "
-                "results across matching files and prioritize product source over "
-                "agent-support directories before filling remaining slots. Symlinks are "
-                "not followed, so every call observes only current in-workspace file "
-                "contents."
+                "Search current workspace files without an index. This is the preferred "
+                "first tool when an implementation task names a symbol, event, API, or "
+                "behavior. Supports literal or regex matching, one file or directory "
+                "path, an optional glob, bounded context lines, and a result limit. "
+                "Directory searches first diversify results across matching files and "
+                "prioritize product source over agent-support directories before filling "
+                "remaining slots. Symlinks are not followed, so every call observes only "
+                "current in-workspace file contents."
             ),
             input_schema=_SEARCH_INPUT_SCHEMA,
         ),
