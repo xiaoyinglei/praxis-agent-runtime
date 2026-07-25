@@ -10,8 +10,7 @@ from rag.agent.core.goal_contract import GoalSpec
 from rag.agent.core.llm_providers import create_loop_model_turn_provider
 from rag.agent.core.llm_registry import ModelResolver
 from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.loop.runtime import ModelTurnProvider
-from rag.agent.loop.state import LoopState, ModelTurnDraft
+from rag.agent.loop.state import LoopState, ModelTurnDraft, ModelTurnProvider
 from rag.agent.skills.runtime import SkillRuntime
 from rag.agent.tools.tool import Tool
 

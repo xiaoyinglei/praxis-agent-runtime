@@ -21,6 +21,7 @@ from rag.agent.tools.tool import (
     Tool,
     ToolDefinition,
     ToolResult,
+    _require_non_empty_string,
     json_schema_output,
 )
 from rag.schema.llm import LLMUsage
@@ -975,15 +976,6 @@ def _ordered_strings(
     for value in result:
         _require_non_empty_string(value, field_name=field_name)
     return result
-
-
-def _require_non_empty_string(value: object, *, field_name: str) -> None:
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
-    if not value:
-        raise ValueError(f"{field_name} must not be empty")
-
-
 def _validate_real_range(
     value: object,
     *,

@@ -14,6 +14,7 @@ from rag.agent.core.model_request import (
     canonical_transcript_revision,
     project_transcript_compaction,
 )
+from rag.agent.loop.substate import _persistent_memory_index_digest
 from rag.agent.memory.models import (
     ContextBudgetSnapshot,
     EvictedStateItem,
@@ -256,7 +257,6 @@ class MessageCompactor:
                 *warnings,
             ]
         # Dual-write to structured memory_state for checkpoint/restore.
-        from rag.agent.core.checkpointing import _digest_text
         memory_state = state["memory_state"]
         update["memory_state"] = memory_state.model_copy(
             update={
@@ -275,7 +275,7 @@ class MessageCompactor:
                 ),
                 "persistent": memory_state.persistent.model_copy(
                     update={
-                        "index_digest": _digest_text(
+                        "index_digest": _persistent_memory_index_digest(
                             state.get("memory_index", "")
                         ),
                         "selected_count": len(
@@ -731,7 +731,6 @@ class LoopContextCompactor:
         state: LoopState,
         state_dict: dict[str, Any],
     ) -> None:
-        from rag.agent.core.checkpointing import _digest_text
         memory_state = state["memory_state"]
         state["memory_state"] = memory_state.model_copy(
             update={
@@ -760,7 +759,7 @@ class LoopContextCompactor:
                 ),
                 "persistent": memory_state.persistent.model_copy(
                     update={
-                        "index_digest": _digest_text(
+                        "index_digest": _persistent_memory_index_digest(
                             state.get("memory_index", "")
                         ),
                         "selected_count": len(

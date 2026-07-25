@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -25,11 +27,114 @@ from rag.agent.loop.state import (
 from rag.agent.tools.tool import ToolContentBlock, ToolResult
 
 
+def _production_source(relative_path: str) -> str:
+    root = Path(__file__).resolve().parents[2]
+    return (root / relative_path).read_text(encoding="utf-8")
+
+
 def _config() -> AgentRunConfig:
     return AgentRunConfig(
         turn_id="test-pr3-cleanup",
         llm_budget_total=100,
     )
+
+
+def test_runtime_helpers_have_one_canonical_owner() -> None:
+    cli_source = _production_source("rag/agent/cli.py")
+    loop_source = _production_source("rag/agent/loop/runtime.py")
+    sink_source = _production_source("rag/agent/streaming/sink.py")
+
+    assert "def _build_model_control_plane(" not in cli_source
+    assert "def _format_public_tool_summary(" not in cli_source
+    assert "class NoopStreamEventSink" not in sink_source
+    for duplicate in (
+        "_stream_turn_start",
+        "_stream_turn_end",
+        "_stream_loop_end",
+        "_stream_tool_use_start",
+        "_stream_tool_use_result",
+        "_stream_tool_use_error",
+        "_stream_compact_layer",
+        "_stream_recovery",
+    ):
+        assert f"def {duplicate}(" not in loop_source
+
+
+def test_substate_does_not_import_its_owner_module() -> None:
+    tree = ast.parse(_production_source("rag/agent/loop/substate.py"))
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "rag.agent.loop.state" not in imports
+
+
+def test_local_runtime_only_type_checks_public_model_contract() -> None:
+    tree = ast.parse(_production_source("agent_runtime/local_runtime.py"))
+    runtime_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "agent_runtime.models" not in runtime_imports
+
+
+def test_memory_digest_does_not_depend_on_checkpointing() -> None:
+    compactor_tree = ast.parse(_production_source("rag/agent/memory/compactor.py"))
+    compactor_imports = {
+        node.module
+        for node in ast.walk(compactor_tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "rag.agent.core.checkpointing" not in compactor_imports
+    assert "def _digest_text(" not in _production_source(
+        "rag/agent/core/checkpointing.py"
+    )
+    assert "def _digest_text(" not in _production_source(
+        "rag/agent/memory/persistent/runtime.py"
+    )
+
+
+def test_model_provider_contracts_do_not_import_loop_implementation() -> None:
+    for relative_path in (
+        "rag/agent/core/llm_providers.py",
+        "rag/agent/core/model_provider_runtime.py",
+    ):
+        tree = ast.parse(_production_source(relative_path))
+        imports = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+
+        assert "rag.agent.loop.runtime" not in imports
+
+
+def test_checkpoint_legacy_alias_does_not_import_public_facade() -> None:
+    tree = ast.parse(_production_source("rag/agent/core/checkpointing.py"))
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "agent_runtime" not in imports
+
+
+def test_json_contract_helpers_are_not_reimplemented_by_consumers() -> None:
+    for relative_path in (
+        "rag/agent/core/messages.py",
+        "rag/agent/core/model_request.py",
+        "rag/agent/tools/selection.py",
+    ):
+        source = _production_source(relative_path)
+        assert "def _thaw_json(" not in source
+        assert "def _require_non_empty_string(" not in source
+        assert "def _require_bool(" not in source
 
 
 _DEPRECATED_FIELDS = frozenset(

@@ -12,6 +12,7 @@ from collections.abc import (
 )
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -73,6 +74,7 @@ from rag.agent.loop.substate import (
     MemoryState,
     PersistentMemorySnapshot,
     PlanState,
+    _persistent_memory_index_digest,
 )
 from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
 from rag.agent.tools.tool import (
@@ -177,10 +179,6 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.core.runtime_diagnostics", "ToolCallMetrics"),
     ("rag.agent.core.runtime_diagnostics", "AgentLatencyProfile"),
     ("rag.agent.core.model_request", "ModelCallRecord"),
-    ("rag.agent.core.tool_execution", "ToolBatchRequest"),
-    ("rag.agent.core.tool_execution", "ToolBatchResult"),
-    ("rag.agent.core.tool_execution", "ToolExecutionRecord"),
-    ("rag.agent.core.tool_execution", "ToolExecutionSummary"),
     ("rag.agent.core.turn_contracts", "ToolCallPlan"),
     ("rag.agent.core.turn_contracts", "ToolManifest"),
     ("rag.agent.core.turn_contracts", "ToolManifestEntry"),
@@ -226,6 +224,7 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.loop.substate", "MemoryState"),
     ("rag.agent.loop.substate", "PersistentMemorySnapshot"),
     ("rag.agent.loop.substate", "PlanState"),
+    ("rag.agent.loop.substate", "StopHookFeedback"),
     ("rag.agent.loop.stop_hooks", "StopHookOutcome"),
     ("rag.agent.loop.stop_hooks", "StopVerdict"),
     ("agent_runtime.planning", "AgentPlan"),
@@ -237,8 +236,6 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.skills.models", "SkillManifest"),
     ("rag.agent.skills.models", "SkillSource"),
     ("rag.agent.skills.models", "SkillState"),
-    ("rag.agent.tools.spec", "ToolError"),
-    ("rag.agent.tools.spec", "ToolResult"),
     ("rag.agent.tools.executor", "ExecutionStatus"),
     ("rag.agent.tools.executor", "ToolExecutionRecord"),
     ("rag.agent.tools.tool", "ArtifactReference"),
@@ -271,7 +268,6 @@ __all__ = [
     "TOOL_CHECKPOINT_FORMAT_VERSION",
     # Migration helpers (used by Tasks 6, 8)
     "_migrate_legacy_state",
-    "_digest_text",
     "_migrate_discovery_candidates",
     "_migrate_discovery_events",
     "_string_list",
@@ -418,8 +414,7 @@ def _checkpoint_type_alias(
     if module_name == "rag.agent.core.context" and type_name == "AgentRunConfig":
         return AgentRunConfig
     if module_name == "rag.agent.planning" and type_name in _LEGACY_PLAN_TYPE_NAMES:
-        from agent_runtime import planning
-
+        planning = import_module("agent_runtime.planning")
         target = getattr(planning, type_name, None)
         return target if isinstance(target, type) else None
     return None
@@ -2126,7 +2121,9 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
             memory_warnings=list(state.get("memory_warnings", [])),
             reactive_compact_used=bool(state.get("reactive_compact_used", False)),
             persistent=PersistentMemorySnapshot(
-                index_digest=_digest_text(state.get("memory_index", "")),
+                index_digest=_persistent_memory_index_digest(
+                    state.get("memory_index", "")
+                ),
                 selected_count=len(state.get("persistent_memories", [])),
             ),
         ),
@@ -2251,16 +2248,6 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
         state.pop(key, None)
 
     return cast(LoopState, state)
-
-
-def _digest_text(text: str, *, max_chars: int = 500) -> str:
-    """Truncate text to a bounded digest for PersistentMemorySnapshot."""
-    stripped = text.strip()
-    if len(stripped) <= max_chars:
-        return stripped
-    return stripped[:max_chars].rstrip() + "..."
-
-
 def _migrate_discovery_candidates(
     raw: list[dict[str, object]],
 ) -> list[DiscoveryCandidate]:

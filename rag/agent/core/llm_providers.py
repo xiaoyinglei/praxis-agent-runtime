@@ -35,8 +35,7 @@ from rag.agent.core.observations import (
 )
 from rag.agent.core.runtime_diagnostics import AgentLatencyProfile
 from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import LoopState, ModelTurnDraft
+from rag.agent.loop.state import LoopState, ModelTurnDraft, ModelTurnEnvelope
 from rag.agent.skills.runtime import SkillRuntime
 from rag.agent.streaming.events import text_delta
 from rag.agent.tools.selection import select_tools

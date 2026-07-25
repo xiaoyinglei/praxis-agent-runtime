@@ -10,7 +10,11 @@ import logging
 from typing import Any
 
 from rag.agent.loop.state import LoopState
-from rag.agent.loop.substate import MemoryState, PersistentMemorySnapshot
+from rag.agent.loop.substate import (
+    MemoryState,
+    PersistentMemorySnapshot,
+    _persistent_memory_index_digest,
+)
 from rag.agent.memory.persistent.consolidator import MemoryConsolidator
 from rag.agent.memory.persistent.extractor import MemoryExtractor
 from rag.agent.memory.persistent.selector import MemorySelector
@@ -154,7 +158,7 @@ class PersistentMemoryRuntime:
         selected_markdown: list[str],
     ) -> None:
         snapshot = PersistentMemorySnapshot(
-            index_digest=_digest_text(index_content),
+            index_digest=_persistent_memory_index_digest(index_content),
             selected_count=len(selected_markdown),
             selected_summaries=[text[:200] for text in selected_markdown],
         )
@@ -165,13 +169,4 @@ class PersistentMemoryRuntime:
             )
         else:
             state["memory_state"] = MemoryState(persistent=snapshot)
-
-
-def _digest_text(text: str, *, max_chars: int = 500) -> str:
-    stripped = text.strip()
-    if len(stripped) <= max_chars:
-        return stripped
-    return stripped[:max_chars].rstrip() + "..."
-
-
 __all__ = ["PersistentMemoryRuntime"]

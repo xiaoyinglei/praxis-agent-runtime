@@ -16,13 +16,13 @@ import yaml
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
-    ModelControlPlane,
     ModelNotAvailableError,
     ModelPolicyError,
     ModelSpec,
     format_model_rows,
 )
-from agent_runtime.result import AgentDiagnostic, AgentResult, AgentToolCall
+from agent_runtime.result import AgentDiagnostic, AgentResult
+from agent_runtime.runtime.builder import build_model_control_plane
 from rag.agent.core.llm_registry import UnknownModelAliasError
 from rag.agent.streaming.events import EventType, StreamEvent
 from rag.agent.turns import (
@@ -204,17 +204,6 @@ def _bounded_cli_text(value: str, *, limit: int = 180) -> str:
     return f"{compact[: limit - 1]}…"
 
 
-def _build_model_control_plane(
-    *,
-    model_alias: str | None = None,
-    session_path: Path | None = None,
-) -> ModelControlPlane:
-    return ModelControlPlane.from_env(
-        initial_model_id=model_alias,
-        session_path=session_path,
-    )
-
-
 def _load_knowledge_config(path: Path | None) -> RAGKnowledgeConfig | None:
     if path is None:
         return None
@@ -375,16 +364,6 @@ def _display_agent_result(
 
     if verbose:
         print(f"状态: {result.status}")
-
-
-def _format_public_tool_summary(
-    tool_calls: Sequence[AgentToolCall],
-) -> str:
-    lines = ["", "─" * 40, "工具执行:"]
-    for tool_call in tool_calls:
-        marker = "✗" if tool_call.is_error else "✓"
-        lines.append(f"  {marker} {tool_call.tool_name}")
-    return "\n".join(lines)
 
 
 def _handle_pause(
@@ -793,7 +772,7 @@ def model_list(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """列出可用模型，并标记当前会话模型。"""
-    control_plane = _build_model_control_plane(session_path=session_path)
+    control_plane = build_model_control_plane(session_path=session_path)
     for line in format_model_rows(
         control_plane.list_models(),
         current_model_id=control_plane.current_model().id,
@@ -809,7 +788,7 @@ def model_current(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示当前会话模型。"""
-    _print_current_model(_build_model_control_plane(session_path=session_path).current_model())
+    _print_current_model(build_model_control_plane(session_path=session_path).current_model())
 
 
 @model_app.command(name="switch")
@@ -821,7 +800,7 @@ def model_switch(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """切换当前模型 session state，不修改 models.yaml。"""
-    control_plane = _build_model_control_plane(session_path=session_path)
+    control_plane = build_model_control_plane(session_path=session_path)
     try:
         spec = control_plane.switch_model(model_id, requested_by="user")
     except (ModelPolicyError, UnknownModelAliasError) as exc:

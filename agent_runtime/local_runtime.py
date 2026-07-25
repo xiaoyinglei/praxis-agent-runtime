@@ -6,10 +6,13 @@ import signal
 import subprocess
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 from urllib.request import urlopen
 
-from agent_runtime.models import ModelSpec
 from rag.agent.core.llm_registry import ModelNotAvailableError
+
+if TYPE_CHECKING:
+    from agent_runtime.models import ModelSpec
 
 
 class LocalRuntimeError(ModelNotAvailableError):

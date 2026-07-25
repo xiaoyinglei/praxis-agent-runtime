@@ -11,7 +11,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 
 from agent_runtime.planning import (
     MAX_PLAN_EVENTS,
@@ -35,11 +35,7 @@ from rag.agent.core.messages import (
     context_event_message,
     tool_result_message,
 )
-from rag.agent.core.model_request import (
-    ModelCallRecord,
-    ModelRequest,
-    build_tool_manifest,
-)
+from rag.agent.core.model_request import build_tool_manifest
 from rag.agent.core.observations import (
     ObservationBatch,
     ObservationExtractor,
@@ -58,14 +54,27 @@ from rag.agent.loop.state import (
     LoopTransition,
     LoopTransitionReason,
     ModelTurn,
-    ModelTurnDraft,
+    ModelTurnEnvelope,
+    ModelTurnProvider,
     PendingToolCall,
     append_loop_diagnostic,
     replace_latest_transition,
 )
 from rag.agent.loop.stop_hooks import StopHookOutcome, StopHookRunner
 from rag.agent.memory.compactor import LoopCompactionResult
-from rag.agent.streaming.events import EventType, StreamEvent, next_sequence
+from rag.agent.streaming.events import (
+    EventType,
+    StreamEvent,
+    compact_layer,
+    loop_end,
+    next_sequence,
+    recovery_event,
+    tool_use_error,
+    tool_use_result,
+    tool_use_start,
+    turn_end,
+    turn_start,
+)
 from rag.agent.streaming.sink import StreamEventSink
 from rag.agent.tools.builtins.planning import UpdatePlanInput
 from rag.agent.tools.executor import ToolExecutionRecord, ToolExecutor
@@ -122,30 +131,6 @@ def _append_turn_messages(
         *state.get("turn_transcript", []),
         *messages,
     ]
-
-
-class ModelTurnEnvelope(BaseModel):
-    """Optional provider metadata surrounding one accepted draft."""
-
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
-    draft: ModelTurnDraft
-    transitions: tuple[LoopTransition, ...] = ()
-    request: ModelRequest | None = None
-    model_call_record: ModelCallRecord | None = None
-    assistant_message: ModelMessage | None = None
-    context_revision: str | None = None
-    provider_serializer_revision: str | None = None
-
-
-class ModelTurnProvider(Protocol):
-    async def next_turn(
-        self,
-        state: LoopState,
-        *,
-        definition: AgentRuntimePolicy,
-        budget_remaining: int,
-    ) -> ModelTurnDraft | ModelTurnEnvelope: ...
 
 
 class LoopContextManager(Protocol):
@@ -307,7 +292,7 @@ class AgentLoop:
                 return state
 
             await self._emit_stream(
-                _stream_turn_start(
+                turn_start(
                     turn_id=state["run_config"].turn_id,
                     iteration=state["iteration"] + 1,
                 )
@@ -343,7 +328,7 @@ class AgentLoop:
                     checkpoint_reason="tool_calls_scheduled",
                 )
                 await self._emit_stream(
-                    _stream_turn_end(
+                    turn_end(
                         turn_id=state["run_config"].turn_id,
                         iteration=state["iteration"],
                         stop_reason="tool_use",
@@ -357,7 +342,7 @@ class AgentLoop:
 
             if turn.action == "pause":
                 await self._emit_stream(
-                    _stream_turn_end(
+                    turn_end(
                         turn_id=state["run_config"].turn_id,
                         iteration=state["iteration"],
                         stop_reason="pause",
@@ -374,7 +359,7 @@ class AgentLoop:
 
             # finish
             await self._emit_stream(
-                _stream_turn_end(
+                turn_end(
                     turn_id=state["run_config"].turn_id,
                     iteration=state["iteration"],
                     stop_reason="end_turn",
@@ -384,7 +369,7 @@ class AgentLoop:
                 return state
 
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=state["terminal"].stop_reason if state.get("terminal") else "loop_exited",
                 total_turns=state["iteration"],
@@ -415,7 +400,7 @@ class AgentLoop:
         replace_latest_transition(state, transition)
         await self._event_sink.emit(transition)
         await self._emit_stream(
-            _stream_compact_layer(
+            compact_layer(
                 channels=list(result.channels),
                 warnings=list(result.warnings),
                 turn_id=state["run_config"].turn_id,
@@ -597,7 +582,7 @@ class AgentLoop:
         replace_latest_transition(state, tr)
         await self._event_sink.emit(tr)
         await self._emit_stream(
-            _stream_compact_layer(
+            compact_layer(
                 channels=list(result.channels),
                 warnings=list(result.warnings),
                 turn_id=state["run_config"].turn_id,
@@ -648,7 +633,7 @@ class AgentLoop:
 
         retries += 1
         await self._emit_stream(
-            _stream_recovery(
+            recovery_event(
                 strategy="model_retry",
                 detail=f"attempt={retries}, error={str(exc)[:200]}",
                 turn_id=state["run_config"].turn_id,
@@ -703,7 +688,7 @@ class AgentLoop:
                 ),
             )
             await self._emit_stream(
-                _stream_recovery(
+                recovery_event(
                     strategy="tool_call_correction",
                     detail=redact_sensitive_text(
                         exc.validation_error
@@ -743,7 +728,7 @@ class AgentLoop:
 
         retries += 1
         await self._emit_stream(
-            _stream_recovery(
+            recovery_event(
                 strategy="model_retry",
                 detail=f"attempt={retries}, error={safe_error[:200]}",
                 turn_id=state["run_config"].turn_id,
@@ -779,7 +764,7 @@ class AgentLoop:
         )
         for call in executable_calls:
             await self._emit_stream(
-                _stream_tool_use_start(
+                tool_use_start(
                     tool_name=call.tool_name,
                     tool_id=call.tool_call_id,
                     input_preview=_tool_input_preview(call.arguments),
@@ -873,9 +858,10 @@ class AgentLoop:
         for tool_result in new_results:
             if tool_result.is_error:
                 await self._emit_stream(
-                    _stream_tool_use_error(
+                    tool_use_error(
                         tool_id=tool_result.tool_call_id,
                         error=tool_result.error_message or "Unknown error",
+                        recoverable=None,
                         turn_id=turn_id,
                         iteration=turn,
                     )
@@ -893,7 +879,7 @@ class AgentLoop:
                         ),
                     )
                     await self._emit_stream(
-                        _stream_recovery(
+                        recovery_event(
                             strategy="tool_failure_circuit_breaker",
                             detail=detail,
                             turn_id=turn_id,
@@ -902,10 +888,11 @@ class AgentLoop:
                     )
             else:
                 await self._emit_stream(
-                    _stream_tool_use_result(
+                    tool_use_result(
                         tool_name=tool_result.tool_name,
                         tool_id=tool_result.tool_call_id,
                         result=_tool_result_text(tool_result)[:500],
+                        elapsed_ms=None,
                         details=_tool_result_event_details(tool_result),
                         turn_id=turn_id,
                         iteration=turn,
@@ -1262,7 +1249,7 @@ class AgentLoop:
             checkpoint_reason="terminal_completed",
         )
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=outcome.code,
                 total_turns=state["iteration"],
@@ -1305,7 +1292,7 @@ class AgentLoop:
         )
         # ── 流式事件：loop 结束 ──
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=stop_reason,
                 total_turns=state["iteration"],
@@ -1344,7 +1331,7 @@ class AgentLoop:
                 )
             )
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=str(transition_reason),
                 total_turns=state["iteration"],
@@ -1949,59 +1936,6 @@ def _reconciliation_request(
     )
 
 
-# ── 流式事件 helper ──────────────────────────────────────
-
-
-def _stream_turn_start(*, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TURN_START,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-    )
-
-
-def _stream_turn_end(*, turn_id: str, iteration: int, stop_reason: str) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TURN_END,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"stop_reason": stop_reason},
-    )
-
-
-def _stream_loop_end(*, turn_id: str, reason: str, total_turns: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.LOOP_END,
-        turn_id=turn_id,
-        sequence=next_sequence(),
-        data={"reason": reason, "total_turns": total_turns},
-    )
-
-
-def _stream_tool_use_start(
-    *,
-    tool_name: str,
-    tool_id: str,
-    input_preview: str,
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TOOL_USE_START,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data={
-            "tool_name": tool_name,
-            "tool_id": tool_id,
-            "input_preview": input_preview,
-        },
-    )
-
-
 def _stream_human_input_required(
     *,
     request: HumanInputRequest,
@@ -2031,32 +1965,6 @@ def _stream_human_input_required(
     )
 
 
-def _stream_tool_use_result(
-    *,
-    tool_name: str,
-    tool_id: str,
-    result: str,
-    details: Mapping[str, JsonValue] | None = None,
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    data: dict[str, JsonValue] = {
-        "tool_name": tool_name,
-        "tool_id": tool_id,
-        "result": result,
-    }
-    if details:
-        data["details"] = dict(details)
-    return StreamEvent(
-        type=EventType.TOOL_USE_RESULT,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data=data,
-    )
-
-
 def _stream_plan_updated(
     *,
     plan: AgentPlan,
@@ -2073,46 +1981,6 @@ def _stream_plan_updated(
             "plan": plan.model_dump(mode="json"),
             "event": event.model_dump(mode="json"),
         },
-    )
-
-
-def _stream_tool_use_error(*, tool_id: str, error: str, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TOOL_USE_ERROR,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data={"tool_id": tool_id, "error": error},
-    )
-
-
-def _stream_compact_layer(
-    *,
-    channels: list[str],
-    warnings: list[str],
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.COMPACT_LAYER,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={
-            "channels": tuple(channels),
-            "warnings": tuple(warnings),
-        },
-    )
-
-
-def _stream_recovery(*, strategy: str, detail: str, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.RECOVERY,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"strategy": strategy, "detail": detail},
     )
 
 

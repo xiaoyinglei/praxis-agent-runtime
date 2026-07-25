@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from rag.agent.tools.tool import JsonValue, json_schema_output
+from rag.agent.tools.tool import JsonValue, _thaw_json, json_schema_output
 
 if TYPE_CHECKING:
     from rag.agent.tools.tool import ToolResult
@@ -235,16 +235,6 @@ def canonical_json_text(value: JsonValue) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-
-
-def _thaw_json(value: JsonValue) -> object:
-    if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
-    return value
-
-
 __all__ = [
     "ModelMessage",
     "StopReason",

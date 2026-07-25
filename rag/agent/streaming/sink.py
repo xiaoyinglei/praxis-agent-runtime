@@ -1,9 +1,7 @@
 """
 StreamEventSink — 流式事件的出口。
 
-两种实现：
-1. QueueStreamEventSink — 把事件放进 asyncio.Queue，外部 async generator 消费
-2. NoopStreamEventSink — 什么都不做（非流式场景）
+QueueStreamEventSink 把事件放进 asyncio.Queue，供外部 async generator 消费。
 
 使用方式：
     sink = QueueStreamEventSink()
@@ -24,13 +22,6 @@ class StreamEventSink(Protocol):
     """流式事件 sink 协议。"""
 
     async def emit(self, event: StreamEvent) -> None: ...
-
-
-class NoopStreamEventSink:
-    """空实现，非流式场景使用。"""
-
-    async def emit(self, event: StreamEvent) -> None:
-        pass
 
 
 class QueueStreamEventSink:

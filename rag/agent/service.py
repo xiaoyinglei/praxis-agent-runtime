@@ -53,12 +53,13 @@ from rag.agent.core.turn_contracts import (
     ToolManifestDriftStatus,
 )
 from rag.agent.file_manifest import FileManifest, build_file_manifest
-from rag.agent.loop.runtime import AgentLoop, ModelTurnProvider
+from rag.agent.loop.runtime import AgentLoop
 from rag.agent.loop.state import (
     LoopPause,
     LoopState,
     LoopTerminal,
     LoopTransition,
+    ModelTurnProvider,
     create_loop_state,
 )
 from rag.agent.loop.stop_hooks import StopHookRunner, build_stop_hooks
