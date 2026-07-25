@@ -956,6 +956,69 @@ async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
 
 
 @pytest.mark.anyio
+async def test_pending_runtime_goal_requirements_are_visible_in_working_state() -> None:
+    gateway = _RecordingGateway()
+    goal = GoalSpec(
+        original_query="Implement and verify the requested API change.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="no_workspace_change",
+                constraint_type="workspace_change",
+                expected_value=False,
+            ),
+        ],
+    )
+    state = _state("pending-runtime-goal-requirements")
+
+    await _provider(gateway, names=(), goal_spec=goal).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    working_state = next(
+        message
+        for message in request.messages
+        if '"event_type":"working_state"' in message.content
+    )
+    payload = json.loads(working_state.content)["payload"]
+
+    assert payload["runtime_requirements"] == [
+        {
+            "constraint_id": "workspace_change",
+            "constraint_type": "workspace_change",
+            "expected_value": True,
+            "observation": "pending",
+            "requirement": (
+                "A runtime-observed write must change workspace contents; "
+                "prose and pre-change verification do not satisfy this."
+            ),
+        },
+        {
+            "constraint_id": "verification_after_change",
+            "constraint_type": "verification_after_change",
+            "expected_value": True,
+            "observation": "pending",
+            "requirement": (
+                "A recognized verification command must succeed after the "
+                "latest workspace change; pre-change commands do not satisfy this."
+            ),
+        },
+    ]
+
+
+@pytest.mark.anyio
 async def test_working_state_uses_durable_workspace_truth_after_projection_loss() -> None:
     gateway = _RecordingGateway()
     state = _state("typed-working-state-durable-evidence")

@@ -111,6 +111,19 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         )
 
 
+def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:
+    summary = b"short test summary: FAILED tests/test_api.py::test_contract\n"
+    payload = b"collection started\n" + (b"x" * 60_000) + summary
+
+    bounded, truncated = shell_module._bounded_stream(payload)
+
+    assert truncated is True
+    assert bounded.startswith("collection started\n")
+    assert bounded.endswith(summary.decode())
+    assert "output truncated; preserved head and tail" in bounded
+    assert len(bounded.encode("utf-8")) <= shell_module._MAX_STREAM_BYTES
+
+
 def test_run_command_declares_requested_network_as_dynamic_effect(
     tmp_path: Path,
 ) -> None:
@@ -750,7 +763,10 @@ async def test_run_command_nonzero_exit_is_a_canonical_tool_failure(
 
     assert execution.result.is_error is True
     assert execution.result.error_code == "command_failed"
-    assert execution.result.error_message == "command exited with status 7"
+    assert execution.result.error_message == (
+        "command exited with status 7; changing timeout alone cannot fix a "
+        "completed command, so inspect stdout/stderr or change the command or code"
+    )
     assert execution.result.retryable is False
     assert execution.result.structured_content is not None
     assert execution.result.structured_content["stderr"] == "failure evidence"

@@ -514,9 +514,13 @@ class AgentLoop:
             state["canonical_tool_calls"][plan.tool_call_id] = ToolCall(
                 tool_call_id=plan.tool_call_id,
                 tool_name=plan.tool_name,
-                arguments=cast(
-                    Mapping[str, JsonValue],
-                    plan.arguments,
+                arguments=_canonicalize_tool_arguments(
+                    self._registry_snapshot,
+                    tool_name=plan.tool_name,
+                    arguments=cast(
+                        Mapping[str, JsonValue],
+                        plan.arguments,
+                    ),
                 ),
                 origin=origin,
             )
@@ -1072,7 +1076,11 @@ class AgentLoop:
         call = ToolCall(
             tool_call_id=plan.tool_call_id,
             tool_name=plan.tool_name,
-            arguments=cast(Mapping[str, JsonValue], plan.arguments),
+            arguments=_canonicalize_tool_arguments(
+                self._registry_snapshot,
+                tool_name=plan.tool_name,
+                arguments=cast(Mapping[str, JsonValue], plan.arguments),
+            ),
             origin=origin,
         )
         state["canonical_tool_calls"][call.tool_call_id] = call
@@ -1569,11 +1577,21 @@ def _matching_tool_failures_since_recovery(
 ) -> tuple[ToolResult, ...]:
     failures: list[ToolResult] = []
     for result in reversed(state["tool_results"]):
-        if not result.is_error:
+        if (
+            not result.is_error
+            and result.tool_name != "update_plan"
+            and result.tool_name not in _EXPLORATION_TOOL_NAMES
+        ):
             break
         previous_call = state["canonical_tool_calls"].get(result.tool_call_id)
-        if previous_call is not None and _same_tool_invocation(previous_call, call):
-            failures.append(result)
+        if (
+            previous_call is None
+            or not _same_failed_operation(previous_call, call, result)
+        ):
+            continue
+        if not result.is_error:
+            break
+        failures.append(result)
     failures.reverse()
     return tuple(failures)
 
@@ -1670,6 +1688,43 @@ def _tool_failure_evidence_fingerprint(
 
 def _same_tool_invocation(left: ToolCall, right: ToolCall) -> bool:
     return left.tool_name == right.tool_name and left.arguments == right.arguments
+
+
+def _same_failed_operation(
+    left: ToolCall,
+    right: ToolCall,
+    result: ToolResult,
+) -> bool:
+    if left.tool_name != right.tool_name:
+        return False
+    if (
+        left.tool_name == "run_command"
+        and result.error_code == "command_failed"
+    ):
+        left_arguments = dict(left.arguments)
+        right_arguments = dict(right.arguments)
+        left_arguments.pop("timeout_seconds", None)
+        right_arguments.pop("timeout_seconds", None)
+        return left_arguments == right_arguments
+    return left.arguments == right.arguments
+
+
+def _canonicalize_tool_arguments(
+    registry_snapshot: Mapping[str, Tool],
+    *,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """Materialize schema defaults before identity, policy, and execution."""
+
+    tool = registry_snapshot.get(tool_name)
+    if tool is None:
+        return arguments
+    try:
+        return tool.validate_input(arguments)
+    except Exception:
+        # ToolExecutor remains the canonical fail-closed validation boundary.
+        return arguments
 
 
 def _merge_keyed[T](existing: list[T], additions: list[T]) -> list[T]:

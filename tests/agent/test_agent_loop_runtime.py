@@ -26,7 +26,9 @@ from rag.agent.loop.runtime import (
     LoopEventSink,
     ModelTurnEnvelope,
     _approval_request,
+    _canonicalize_tool_arguments,
     _guard_repeated_successful_inspections,
+    _matching_tool_failures_since_recovery,
 )
 from rag.agent.loop.state import (
     LoopState,
@@ -883,6 +885,113 @@ def test_repeated_successful_inspection_requires_new_arguments() -> None:
     assert blocked[0].error_code == "repeated_inspection"
     assert blocked[0].retryable is False
     assert blocked[0].metadata["previous_tool_call_id"] == previous.tool_call_id
+
+
+def test_canonical_tool_arguments_materialize_declared_defaults() -> None:
+    tool = replace(
+        _tool(
+            "run_command",
+            lambda _arguments: "unused",
+            schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "working_dir": {"type": "string", "default": "."},
+                    "timeout_seconds": {"type": "number", "default": 120.0},
+                    "network": {"type": "boolean", "default": False},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        ),
+        validate_input=lambda arguments: {
+            "command": arguments["command"],
+            "working_dir": arguments.get("working_dir", "."),
+            "timeout_seconds": arguments.get("timeout_seconds", 120.0),
+            "network": arguments.get("network", False),
+        },
+    )
+
+    omitted = _canonicalize_tool_arguments(
+        {"run_command": tool},
+        tool_name="run_command",
+        arguments={"command": "pytest -q"},
+    )
+    explicit = _canonicalize_tool_arguments(
+        {"run_command": tool},
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 120.0,
+            "network": False,
+        },
+    )
+
+    assert omitted == explicit
+
+
+def test_unrelated_read_success_does_not_reset_failed_command_circuit() -> None:
+    state = create_loop_state(
+        current_message="Implement and verify the change.",
+        run_config=_config("loop-command-failure-recovery"),
+    )
+    origin = ToolCallOrigin(
+        request_id="command-failure-request",
+        toolset_revision="command-tools",
+        exposed_tool_names=("run_command", "list_files", "apply_patch"),
+    )
+    previous = ToolCall(
+        tool_call_id="command-previous",
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 600.0,
+            "network": False,
+            "workspace_write": False,
+        },
+        origin=origin,
+    )
+    retried = ToolCall(
+        tool_call_id="command-retried",
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 120.0,
+            "network": False,
+            "workspace_write": False,
+        },
+        origin=origin,
+    )
+    state["canonical_tool_calls"][previous.tool_call_id] = previous
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id=previous.tool_call_id,
+            tool_name=previous.tool_name,
+            is_error=True,
+            error_code="command_failed",
+            error_message="command exited with status 1",
+        ),
+        ToolResult(
+            tool_call_id="list-between",
+            tool_name="list_files",
+        ),
+    ]
+
+    assert _matching_tool_failures_since_recovery(state, retried) == (
+        state["tool_results"][0],
+    )
+
+    state["tool_results"].append(
+        ToolResult(
+            tool_call_id="patch-delivery",
+            tool_name="apply_patch",
+        )
+    )
+
+    assert _matching_tool_failures_since_recovery(state, retried) == ()
 
 
 def test_delivery_action_reopens_same_inspection() -> None:

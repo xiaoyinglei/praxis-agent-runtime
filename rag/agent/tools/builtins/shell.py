@@ -28,7 +28,10 @@ from rag.agent.tools.tool import (
 )
 from rag.agent.workspace import WorkspaceRuntime
 
-_MAX_STREAM_BYTES = 50_000
+_MAX_STREAM_BYTES = 16_000
+_STREAM_TRUNCATION_MARKER = (
+    b"\n... output truncated; preserved head and tail ...\n"
+)
 _SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
 
 
@@ -712,7 +715,17 @@ def _process_group_exists(process_group_id: int) -> bool:
 
 def _bounded_stream(value: bytes) -> tuple[str, bool]:
     truncated = len(value) > _MAX_STREAM_BYTES
-    bounded = value[:_MAX_STREAM_BYTES]
+    if not truncated:
+        bounded = value
+    else:
+        available = _MAX_STREAM_BYTES - len(_STREAM_TRUNCATION_MARKER)
+        head_size = available // 2
+        tail_size = available - head_size
+        bounded = (
+            value[:head_size]
+            + _STREAM_TRUNCATION_MARKER
+            + value[-tail_size:]
+        )
     return bounded.decode("utf-8", errors="replace"), truncated
 
 
@@ -774,7 +787,11 @@ def _normalize_command_output(raw: object) -> NormalizedToolOutput:
             structured_content=structured,
             is_error=True,
             error_code="command_failed",
-            error_message=f"command exited with status {validated.exit_code}",
+            error_message=(
+                f"command exited with status {validated.exit_code}; changing "
+                "timeout alone cannot fix a completed command, so inspect "
+                "stdout/stderr or change the command or code"
+            ),
             retryable=False,
         )
     return NormalizedToolOutput(structured_content=structured)

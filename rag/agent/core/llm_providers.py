@@ -217,7 +217,10 @@ class LLMLoopModelTurnProvider:
             initial_memory=tuple(state.get("persistent_memories", ())),
             transcript=context_transcript,
         )
-        working_state = _working_state_message(state)
+        working_state = _working_state_message(
+            state,
+            goal_spec=self._goal_spec,
+        )
         if working_state is not None:
             context = context.append_message(working_state)
         context_limit = (
@@ -423,14 +426,70 @@ def _projection_summary_limits(
     return tuple(dict.fromkeys(limits))
 
 
-def _working_state_message(state: LoopState) -> ModelMessage | None:
+def _working_state_message(
+    state: LoopState,
+    *,
+    goal_spec: GoalSpec | None,
+) -> ModelMessage | None:
     memory_state = state["memory_state"]
     plan = state["plan_state"].agent_plan
+    workspace_change_tool_call_ids = tuple(
+        result.tool_call_id
+        for result in state["tool_results"]
+        if runtime_workspace_change(result) is not None
+    )
+    latest_change_index = max(
+        (
+            index
+            for index, result in enumerate(state["tool_results"])
+            if runtime_workspace_change(result) is not None
+        ),
+        default=-1,
+    )
+    verification_tool_call_ids = tuple(
+        result.tool_call_id
+        for result in state["tool_results"][latest_change_index + 1 :]
+        if (
+            latest_change_index >= 0
+            and result.tool_name == "run_command"
+            and not result.is_error
+        )
+    )
+    runtime_requirements = tuple(
+        {
+            "constraint_id": constraint.constraint_id,
+            "constraint_type": constraint.constraint_type,
+            "expected_value": cast(JsonValue, constraint.expected_value),
+            "observation": (
+                "observed"
+                if (
+                    constraint.constraint_type == "workspace_change"
+                    and workspace_change_tool_call_ids
+                )
+                or (
+                    constraint.constraint_type == "verification_after_change"
+                    and verification_tool_call_ids
+                )
+                else "pending"
+            ),
+            "requirement": _runtime_requirement_description(
+                constraint.constraint_type
+            ),
+        }
+        for constraint in (() if goal_spec is None else goal_spec.constraints)
+        if (
+            constraint.required
+            and constraint.expected_value is True
+            and constraint.constraint_type
+            in {"workspace_change", "verification_after_change"}
+        )
+    )
     if (
         not memory_state.recent_observations
         and not memory_state.known_locators
         and not memory_state.verified_workspace_paths
         and plan is None
+        and not runtime_requirements
     ):
         return None
 
@@ -472,6 +531,7 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
         "working_state",
         {
             "plan_claims": plan_payload,
+            "runtime_requirements": runtime_requirements,
             "runtime_evidence": {
                 "authority": "runtime",
                 "grounded_paths": grounded_paths,
@@ -494,12 +554,23 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
                     for locator in memory_state.known_locators
                 ),
                 "workspace_change_tool_call_ids": tuple(
-                    result.tool_call_id
-                    for result in state["tool_results"]
-                    if runtime_workspace_change(result) is not None
+                    workspace_change_tool_call_ids
                 ),
+                "verification_tool_call_ids": verification_tool_call_ids,
             },
         },
+    )
+
+
+def _runtime_requirement_description(constraint_type: str) -> str:
+    if constraint_type == "workspace_change":
+        return (
+            "A runtime-observed write must change workspace contents; "
+            "prose and pre-change verification do not satisfy this."
+        )
+    return (
+        "A recognized verification command must succeed after the latest "
+        "workspace change; pre-change commands do not satisfy this."
     )
 
 
