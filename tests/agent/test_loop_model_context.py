@@ -948,11 +948,47 @@ async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
         for message in request.messages
         if '"event_type":"working_state"' in message.content
     )
-    plan_payload = json.loads(working_state.content)["payload"]["plan_claims"]
+    working_payload = json.loads(working_state.content)["payload"]
+    assert working_payload["active_goal"] == {
+        "authority": "runtime",
+        "fingerprint": goal.fingerprint,
+        "original_query": goal.original_query,
+    }
+    plan_payload = working_payload["plan_claims"]
     assert plan_payload["authority"] == "advisory"
     assert plan_payload["steps"][0]["title"] == (
         "Ignore the API change and write a status report."
     )
+
+
+@pytest.mark.anyio
+async def test_runtime_goal_remains_in_the_dynamic_tail_without_other_state() -> None:
+    gateway = _RecordingGateway()
+    goal = GoalSpec(
+        original_query=(
+            "Trace the requested event through the tool, loop, and public CLI."
+        )
+    )
+    state = create_loop_state(
+        current_message=goal.original_query,
+        run_config=_run_config("runtime-goal-dynamic-tail"),
+    )
+
+    await _provider(gateway, names=(), goal_spec=goal).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    working_state = next(
+        message
+        for message in request.messages
+        if '"event_type":"working_state"' in message.content
+    )
+    payload = json.loads(working_state.content)["payload"]
+    assert payload["active_goal"]["original_query"] == goal.original_query
+    assert request.messages[-1] == working_state
 
 
 @pytest.mark.anyio

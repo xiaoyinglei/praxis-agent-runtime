@@ -490,6 +490,7 @@ def _working_state_message(
         and not memory_state.verified_workspace_paths
         and plan is None
         and not runtime_requirements
+        and goal_spec is None
     ):
         return None
 
@@ -530,6 +531,15 @@ def _working_state_message(
     return context_event_message(
         "working_state",
         {
+            "active_goal": (
+                None
+                if goal_spec is None
+                else {
+                    "authority": "runtime",
+                    "fingerprint": goal_spec.fingerprint,
+                    "original_query": goal_spec.original_query,
+                }
+            ),
             "plan_claims": plan_payload,
             "runtime_requirements": runtime_requirements,
             "runtime_evidence": {
