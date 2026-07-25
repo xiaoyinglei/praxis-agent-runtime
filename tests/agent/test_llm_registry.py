@@ -167,6 +167,7 @@ def test_load_configs_models_supports_provider_section_schema(
                         "capability": "chat",
                         "provider": "groq",
                         "model": "openai/gpt-oss-120b",
+                        "tokenizer_model": "gpt-oss-120b",
                         "context_window_tokens": 131072,
                         "request_context_tokens": 8000,
                     },
@@ -191,6 +192,7 @@ def test_load_configs_models_supports_provider_section_schema(
     assert groq.location == "cloud"
     assert groq.context_window_tokens == 131072
     assert groq.request_context_tokens == 8000
+    assert groq.tokenizer_model == "gpt-oss-120b"
     assert provider_config.api_key == "sk-test"
     assert provider_config.base_url == "https://api.groq.com/openai/v1"
     assert local.provider is ModelProvider.OPENAI_COMPATIBLE
@@ -392,6 +394,30 @@ class TestModelRegistryResolve:
             ).max_input_tokens
             == 5_440
         )
+
+    def test_explicit_tokenizer_model_avoids_provider_id_fallback_counting(
+        self,
+    ) -> None:
+        spec = ModelSpec(
+            provider=ModelProvider.OLLAMA,
+            model="provider/gpt-oss-120b",
+            tokenizer_model="gpt-oss-120b",
+        )
+        registry = ModelRegistry(
+            AgentModelsConfig(
+                models={"tokenized": spec},
+                default_model="tokenized",
+            )
+        )
+
+        resolved = registry.resolve("tokenized")
+
+        assert resolved.token_accounting is not None
+        assert resolved.token_accounting.backend_descriptor() == (
+            "tiktoken",
+            "gpt-oss-120b",
+        )
+        assert resolved.token_accounting.count('{"tools":[{"name":"read_file"}]}') > 4
 
     def test_explicit_model_output_limit_expands_tool_decision_stage_budget(
         self,

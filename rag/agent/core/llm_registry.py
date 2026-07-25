@@ -168,6 +168,7 @@ class ModelRegistry:
                 "provider_name": entry.get("provider"),
                 "protocol": merged.get("protocol"),
                 "model": entry["model"],
+                "tokenizer_model": entry.get("tokenizer_model"),
                 "max_tokens": entry.get("max_tokens", 2048),
                 "defaults": entry.get("defaults", {}),
                 "base_url": merged.get("base_url"),
@@ -229,8 +230,10 @@ class ModelRegistry:
         token_accounting = TokenAccountingService(
             TokenizerContract(
                 embedding_model_name=spec.model,
-                tokenizer_model_name=spec.model,
-                chunking_tokenizer_model_name=spec.model,
+                tokenizer_model_name=spec.tokenizer_model or spec.model,
+                chunking_tokenizer_model_name=(
+                    spec.tokenizer_model or spec.model
+                ),
                 tokenizer_backend="auto",
                 max_context_tokens=runtime_context_tokens,
                 prompt_reserved_tokens=512,

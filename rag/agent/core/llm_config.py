@@ -34,6 +34,7 @@ class ModelSpec(BaseModel):
 
     provider: ModelProvider
     model: str
+    tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = None
     protocol: str | None = None
     max_tokens: int = 2048
