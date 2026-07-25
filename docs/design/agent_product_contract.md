@@ -46,7 +46,7 @@ canonical history，不会回填覆盖当前请求。
 - 流式文本、工具、计划、恢复事件；
 - 工具审批、持久 checkpoint 和跨进程恢复；
 - 模型选择、本地模型健康检查和云模型密钥诊断；
-- Skill、MCP、subagent、working memory 和 persistent memory；
+- Skill、MCP、subagent 和 working memory；
 - 显式配置的 RAG knowledge provider、evidence 和 citation；
 - 稳定 `AgentResult`、usage、diagnostic、pause 和 tool-call 投影。
 

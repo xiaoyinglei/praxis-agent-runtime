@@ -213,7 +213,6 @@ class LLMLoopModelTurnProvider:
             instructions=tuple(instructions),
             frozen_run_context=tuple(frozen_run_context),
             initial_user_task=initial_message,
-            initial_memory=tuple(state.get("persistent_memories", ())),
             transcript=context_transcript,
         )
         working_state = _working_state_message(

@@ -122,9 +122,6 @@ class ModelCatalog:
             planner=_parse_task("planner"),
             synthesize=_parse_task("synthesize"),
             factcheck=_parse_task("factcheck"),
-            memory_select=_parse_task("memory_select"),
-            memory_extract=_parse_task("memory_extract"),
-            memory_consolidate=_parse_task("memory_consolidate"),
         )
 
     @property

@@ -22,37 +22,12 @@ from rag.agent.memory.models import (
 )
 
 
-def _persistent_memory_index_digest(
-    text: str,
-    *,
-    max_chars: int = 500,
-) -> str:
-    stripped = text.strip()
-    if len(stripped) <= max_chars:
-        return stripped
-    return stripped[:max_chars].rstrip() + "..."
-
-
 class StopHookFeedback(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     code: str = Field(min_length=1, max_length=120)
     message: str = Field(min_length=1, max_length=1000)
     occurrences: int = Field(default=1, ge=1)
-
-
-class PersistentMemorySnapshot(BaseModel):
-    """Bounded snapshot of persistent cross-session memory.
-
-    ``index_ref`` and ``index_digest`` default to empty strings so that
-    ``MemoryState(persistent=PersistentMemorySnapshot())`` works without
-    passing arguments — the "not loaded yet" state is valid.
-    """
-
-    index_ref: str = ""
-    index_digest: str = ""
-    selected_count: int = 0
-    selected_summaries: list[str] = Field(default_factory=list)
 
 
 class PlanState(BaseModel):
@@ -63,7 +38,7 @@ class PlanState(BaseModel):
 
 
 class MemoryState(BaseModel):
-    """Working memory and persistent-memory context for the current run."""
+    """Working-memory context for the current run."""
 
     working_summary: WorkingSummary | None = None
     extracted_facts: list[ExtractedFact] = Field(default_factory=list)
@@ -78,7 +53,6 @@ class MemoryState(BaseModel):
     memory_budget: MemoryBudgetSnapshot | None = None
     memory_warnings: list[str] = Field(default_factory=list)
     reactive_compact_used: bool = False
-    persistent: PersistentMemorySnapshot = Field(default_factory=PersistentMemorySnapshot)
 
 
 class DiscoveryCandidate(BaseModel):
@@ -126,7 +100,6 @@ __all__ = [
     "DiscoveryEvent",
     "FinishState",
     "MemoryState",
-    "PersistentMemorySnapshot",
     "PlanState",
     "StopHookFeedback",
 ]

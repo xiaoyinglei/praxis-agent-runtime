@@ -130,7 +130,6 @@ class StableModelContext:
     instructions: tuple[str, ...]
     frozen_run_context: tuple[ContextBlock, ...]
     initial_user_task: str
-    initial_memory: tuple[str, ...]
     transcript: tuple[ModelMessage, ...]
     context_revision: str
     parent_context_revision: str | None = None
@@ -153,7 +152,6 @@ class StableModelContext:
                 raise TypeError("frozen_run_context must contain ContextBlock values")
             blocks.append(ContextBlock(name=block.name, content=block.content))
         _require_non_empty_string(self.initial_user_task, field_name="initial_user_task")
-        memory = _ordered_strings(self.initial_memory, field_name="initial_memory")
         transcript = _snapshot_messages(self.transcript, field_name="transcript")
         _require_non_empty_string(self.context_revision, field_name="context_revision")
         if self.parent_context_revision is not None:
@@ -164,7 +162,6 @@ class StableModelContext:
         _require_non_empty_string(self.revision_reason, field_name="revision_reason")
         object.__setattr__(self, "instructions", instructions)
         object.__setattr__(self, "frozen_run_context", tuple(blocks))
-        object.__setattr__(self, "initial_memory", memory)
         object.__setattr__(self, "transcript", transcript)
 
     @property
@@ -185,13 +182,6 @@ class StableModelContext:
             )
             for block in self.frozen_run_context
         )
-        if self.initial_memory:
-            messages.append(
-                context_event_message(
-                    "initial_memory",
-                    {"items": self.initial_memory},
-                )
-            )
         messages.append(ModelMessage(role="user", content=self.initial_user_task))
         return tuple(messages)
 
@@ -249,7 +239,6 @@ class StableModelContext:
             instructions=self.instructions,
             frozen_run_context=self.frozen_run_context,
             initial_user_task=self.initial_user_task,
-            initial_memory=self.initial_memory,
             transcript=(event, *tail),
             context_revision=revision,
             parent_context_revision=self.context_revision,
@@ -285,7 +274,6 @@ class StableModelContext:
             instructions=self.instructions,
             frozen_run_context=self.frozen_run_context,
             initial_user_task=self.initial_user_task,
-            initial_memory=self.initial_memory,
             transcript=projected,
             context_revision=revision,
             parent_context_revision=self.context_revision,
@@ -300,7 +288,6 @@ class StableModelContext:
             instructions=self.instructions,
             frozen_run_context=self.frozen_run_context,
             initial_user_task=self.initial_user_task,
-            initial_memory=self.initial_memory,
             transcript=transcript,
             context_revision=self.context_revision,
             parent_context_revision=self.parent_context_revision,
@@ -411,7 +398,6 @@ def build_stable_context(
     instructions: Sequence[str],
     frozen_run_context: Sequence[ContextBlock] = (),
     initial_user_task: str,
-    initial_memory: Sequence[str] = (),
     transcript: Sequence[ModelMessage] = (),
 ) -> StableModelContext:
     instruction_values = _ordered_strings(
@@ -420,10 +406,6 @@ def build_stable_context(
         require_non_empty_sequence=True,
     )
     _require_non_empty_string(initial_user_task, field_name="initial_user_task")
-    memory_values = _ordered_strings(
-        initial_memory,
-        field_name="initial_memory",
-    )
     if isinstance(frozen_run_context, (str, bytes)) or not isinstance(
         frozen_run_context,
         Sequence,
@@ -441,13 +423,11 @@ def build_stable_context(
         "instructions": instruction_values,
         "frozen_run_context": tuple({"name": block.name, "content": block.content} for block in block_tuple),
         "initial_user_task": initial_user_task,
-        "initial_memory": memory_values,
     }
     return StableModelContext(
         instructions=instruction_values,
         frozen_run_context=block_tuple,
         initial_user_task=initial_user_task,
-        initial_memory=memory_values,
         transcript=transcript_tuple,
         context_revision=_revision("context", revision_payload),
     )
@@ -921,7 +901,6 @@ def _stable_context_payload(
             {"name": block.name, "content": block.content} for block in context.frozen_run_context
         ),
         "initial_user_task": context.initial_user_task,
-        "initial_memory": context.initial_memory,
     }
 
 

@@ -32,9 +32,6 @@ class LLMCallStage(StrEnum):
     LLM_GENERATE = "llm_generate"
     RAG_ANSWER = "rag_answer"
     FINAL_SYNTHESIS = "final_synthesis"
-    MEMORY_SELECT = "memory_select"
-    MEMORY_EXTRACT = "memory_extract"
-    MEMORY_CONSOLIDATE = "memory_consolidate"
 
 
 class LLMStageBudget(BaseModel):
@@ -219,21 +216,6 @@ DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
     LLMCallStage.FINAL_SYNTHESIS: LLMStageBudget(
         max_input_tokens=24_000,
         max_output_tokens=4_096,
-    ),
-    LLMCallStage.MEMORY_SELECT: LLMStageBudget(
-        max_input_tokens=3_000,
-        max_output_tokens=256,
-        safety_margin_tokens=256,
-    ),
-    LLMCallStage.MEMORY_EXTRACT: LLMStageBudget(
-        max_input_tokens=8_000,
-        max_output_tokens=2_048,
-        safety_margin_tokens=256,
-    ),
-    LLMCallStage.MEMORY_CONSOLIDATE: LLMStageBudget(
-        max_input_tokens=12_000,
-        max_output_tokens=4_096,
-        safety_margin_tokens=256,
     ),
 }
 

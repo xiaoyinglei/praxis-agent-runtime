@@ -23,7 +23,6 @@ from rag.agent.loop.substate import (
     DeferredToolState,
     FinishState,
     MemoryState,
-    PersistentMemorySnapshot,
     PlanState,
     StopHookFeedback,
 )
@@ -244,9 +243,6 @@ class LoopState(TypedDict):
     # ── File manifest (file-first processing) ──
     input_files: list[str]
     file_manifest: FileManifest | None
-    # ── Persistent cross-session memory ──
-    persistent_memories: list[str]  # selected memory texts for current run
-    memory_index: str  # MEMORY.md content (cheap, always loaded)
 
 
 def create_loop_state(
@@ -311,9 +307,6 @@ def create_loop_state(
         # ── File manifest (file-first processing) ──
         "input_files": list(input_files),
         "file_manifest": file_manifest,
-        # ── Persistent cross-session memory ──
-        "persistent_memories": [],
-        "memory_index": "",
         # ── Typed sub-state containers ──
         "plan_state": PlanState(
             agent_plan=None,
@@ -330,7 +323,6 @@ def create_loop_state(
                 limit=MAX_LOOP_MEMORY_WARNINGS,
             ),
             reactive_compact_used=False,
-            persistent=PersistentMemorySnapshot(),
         ),
         "deferred_tool_state": DeferredToolState(),
         "finish_state": FinishState(

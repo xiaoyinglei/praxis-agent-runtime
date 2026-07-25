@@ -585,7 +585,7 @@ PostgreSQL / Object Store 保存事实；Milvus 保存向量索引和检索入�
 
 ### Evidence Over Memory
 
-Agent memory 用于 working memory compaction / injection，workspace persistent memory 保存可选择的提炼信息，TurnStore 保存完整 canonical history；三者不是同一份数据。回答事实优先级为 RAG evidence 高于 memory；当两者冲突时，以 evidence 为准。
+Agent working memory 用于当前运行的 compaction / injection，TurnStore 保存完整 canonical history；两者不是同一份数据。回答事实优先级为 RAG evidence 高于 working memory；当两者冲突时，以 evidence 为准。
 
 ## Agent 编排层
 

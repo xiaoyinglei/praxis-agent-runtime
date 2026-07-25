@@ -450,9 +450,6 @@ def _parse_generation_config(raw: object) -> GenerationConfig:
         planner=parse_task("planner"),
         synthesize=parse_task("synthesize"),
         factcheck=parse_task("factcheck"),
-        memory_select=parse_task("memory_select"),
-        memory_extract=parse_task("memory_extract"),
-        memory_consolidate=parse_task("memory_consolidate"),
     )
 
 

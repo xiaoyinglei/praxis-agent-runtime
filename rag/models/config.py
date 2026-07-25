@@ -49,9 +49,6 @@ class GenerationConfig:
     planner: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
     synthesize: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
     factcheck: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
-    memory_select: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
-    memory_extract: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
-    memory_consolidate: GenerationTaskConfig = field(default_factory=GenerationTaskConfig)
 
 
 @dataclass(frozen=True, slots=True)

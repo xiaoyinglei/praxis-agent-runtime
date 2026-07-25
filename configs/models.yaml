@@ -238,18 +238,6 @@ generation:
     max_tokens: 2048
     temperature: 0.1
 
-  memory_select:
-    max_tokens: 256
-    temperature: 0.1
-
-  memory_extract:
-    max_tokens: 2048
-    temperature: 0.3
-
-  memory_consolidate:
-    max_tokens: 4096
-    temperature: 0.3
-
   tool_decision:
     max_tokens: 4096
     temperature: 0.2

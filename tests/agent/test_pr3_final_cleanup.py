@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 from pathlib import Path
 
@@ -18,13 +19,17 @@ from rag.agent.core.messages import (
 from rag.agent.core.messages import (
     ToolCall as ModelToolCall,
 )
+from rag.agent.core.model_request import StableModelContext
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.state import (
     PendingToolCall,
     ToolCallLedger,
     create_loop_state,
 )
+from rag.agent.loop.substate import MemoryState
 from rag.agent.tools.tool import ToolContentBlock, ToolResult
+from rag.models.config import GenerationConfig
+from rag.schema.llm import LLMCallStage
 
 
 def _production_source(relative_path: str) -> str:
@@ -94,9 +99,51 @@ def test_memory_digest_does_not_depend_on_checkpointing() -> None:
     assert "def _digest_text(" not in _production_source(
         "rag/agent/core/checkpointing.py"
     )
-    assert "def _digest_text(" not in _production_source(
-        "rag/agent/memory/persistent/runtime.py"
+
+
+def test_orphaned_persistent_memory_capability_is_removed() -> None:
+    root = Path(__file__).resolve().parents[2]
+    state = create_loop_state(current_message="cleanup", run_config=_config())
+    persistent_sources = root / "rag/agent/memory/persistent"
+
+    assert not tuple(persistent_sources.glob("*.py"))
+    assert not (root / "tests/agent/test_persistent_memory.py").exists()
+    assert "persistent_memories" not in state
+    assert "memory_index" not in state
+    assert "persistent" not in MemoryState.model_fields
+    assert "initial_memory" not in StableModelContext.__dataclass_fields__
+    assert {
+        "memory_select",
+        "memory_extract",
+        "memory_consolidate",
+    }.isdisjoint(stage.value for stage in LLMCallStage)
+    assert {
+        "memory_select",
+        "memory_extract",
+        "memory_consolidate",
+    }.isdisjoint(GenerationConfig.__dataclass_fields__)
+
+
+def test_checkpoint_decode_discards_removed_persistent_memory_snapshot() -> None:
+    legacy_payload = base64.b64decode(
+        "yAFdBZS3cmFnLmFnZW50Lmxvb3Auc3Vic3RhdGWrTWVtb3J5U3RhdGWL"
+        "r3dvcmtpbmdfc3VtbWFyecCvZXh0cmFjdGVkX2ZhY3RzkLNyZWNlbnRf"
+        "b2JzZXJ2YXRpb25zkLh2ZXJpZmllZF93b3Jrc3BhY2VfcGF0aHOQrmtu"
+        "b3duX2xvY2F0b3JzkK5jb250ZXh0X2J1ZGdldMCrbWVtb3J5X3JlZnOQ"
+        "rW1lbW9yeV9idWRnZXTAr21lbW9yeV93YXJuaW5nc5GmbGVnYWN5tXJl"
+        "YWN0aXZlX2NvbXBhY3RfdXNlZMKqcGVyc2lzdGVudISpaW5kZXhfcmVm"
+        "qU1FTU9SWS5tZKxpbmRleF9kaWdlc3StbGVnYWN5IGRpZ2VzdK5zZWxl"
+        "Y3RlZF9jb3VudAKyc2VsZWN0ZWRfc3VtbWFyaWVzkqNvbmWjdHdvs21v"
+        "ZGVsX3ZhbGlkYXRlX2pzb24="
     )
+
+    restored = agent_checkpoint_serde().loads_typed(
+        ("msgpack", legacy_payload)
+    )
+
+    assert isinstance(restored, MemoryState)
+    assert restored.memory_warnings == ["legacy"]
+    assert not hasattr(restored, "persistent")
 
 
 def test_model_provider_contracts_do_not_import_loop_implementation() -> None:
@@ -151,6 +198,8 @@ _DEPRECATED_FIELDS = frozenset(
         "context_bindings",
         "locators",
         "asset_refs",
+        "persistent_memories",
+        "memory_index",
     }
 )
 

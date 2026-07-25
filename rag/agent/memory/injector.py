@@ -69,8 +69,7 @@ class ContextBuilder:
         "evidence": 5,
         "memory": 6,
         "working_memory": 7,
-        "historical_hints": 8,
-        "message_tail": 9,
+        "message_tail": 8,
     }
 
     def __init__(
@@ -104,7 +103,6 @@ class ContextBuilder:
         definition: AgentRuntimePolicy,
         state: LoopState,
         policy_hints: Sequence[str] = (),
-        recalled_memories: Sequence[str] = (),
         included_sections: frozenset[ContextSectionName] | None = None,
         required_sections: frozenset[ContextSectionName] | None = None,
     ) -> InjectedContext:
@@ -162,10 +160,6 @@ class ContextBuilder:
             self._format_working_memory(
                 ms.extracted_facts if ms is not None else [],
             ),
-        )
-        add(
-            "historical_hints",
-            self._format_historical_hints(recalled_memories),
         )
         add(
             "message_tail",
@@ -290,7 +284,6 @@ class ContextBuilder:
             evidence_tokens=by_name.get("evidence", 0),
             memory_tokens=by_name.get("memory", 0),
             working_memory_tokens=by_name.get("working_memory", 0),
-            recalled_memory_tokens=by_name.get("historical_hints", 0),
             message_tail_tokens=by_name.get("message_tail", 0),
             tool_result_tokens=by_name.get("tool_results", 0) + by_name.get("open_decisions", 0),
             dropped_sections=selection.dropped_sections,
@@ -455,18 +448,6 @@ class ContextBuilder:
                 lines.append(f"  evidence_ids: {evidence_ids}")
             if source_ids:
                 lines.append(f"  source_message_ids: {source_ids}")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _format_historical_hints(recalled_memories: Sequence[str]) -> str:
-        memories = [memory.strip() for memory in recalled_memories if memory.strip()]
-        if not memories:
-            return ""
-        lines = [
-            "These memories are historical hints, not authoritative evidence.",
-            "If they conflict with retrieved evidence or current tool results, trust retrieved evidence.",
-        ]
-        lines.extend(f"- {memory}" for memory in memories)
         return "\n".join(lines)
 
     def _format_memory_refs(

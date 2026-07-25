@@ -227,7 +227,7 @@ def test_repository_catalog_declares_local_qwen35_9b() -> None:
     assert spec.runtime.expected_model_contains == "Qwen3.5-9B-4bit"
 
 
-def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) -> None:
+def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None:
     config_path = tmp_path / "models.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -250,7 +250,7 @@ def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) 
                 },
                 "defaults": {"primary_model": "main"},
                 "generation": {
-                    "memory_extract": {
+                    "factcheck": {
                         "model": "mimo_cloud",
                         "max_tokens": 2048,
                         "temperature": 0.3,
@@ -263,9 +263,9 @@ def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) 
 
     config = ModelRegistry._load_yaml_file(config_path)
 
-    assert config.generation.memory_extract.model == "mimo_cloud"
-    assert config.generation.memory_extract.max_tokens == 2048
-    assert config.generation.memory_extract.temperature == 0.3
+    assert config.generation.factcheck.model == "mimo_cloud"
+    assert config.generation.factcheck.max_tokens == 2048
+    assert config.generation.factcheck.temperature == 0.3
 
 
 def test_from_env_loads_dotenv_before_resolving_model_config(

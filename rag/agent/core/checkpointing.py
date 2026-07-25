@@ -72,9 +72,7 @@ from rag.agent.loop.substate import (
     DiscoveryEvent,
     FinishState,
     MemoryState,
-    PersistentMemorySnapshot,
     PlanState,
-    _persistent_memory_index_digest,
 )
 from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
 from rag.agent.tools.tool import (
@@ -222,7 +220,6 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.loop.substate", "DeferredToolState"),
     ("rag.agent.loop.substate", "FinishState"),
     ("rag.agent.loop.substate", "MemoryState"),
-    ("rag.agent.loop.substate", "PersistentMemorySnapshot"),
     ("rag.agent.loop.substate", "PlanState"),
     ("rag.agent.loop.substate", "StopHookFeedback"),
     ("rag.agent.loop.stop_hooks", "StopHookOutcome"),
@@ -413,6 +410,11 @@ def _checkpoint_type_alias(
 ) -> type[Any] | None:
     if module_name == "rag.agent.core.context" and type_name == "AgentRunConfig":
         return AgentRunConfig
+    if (
+        module_name == "rag.agent.loop.substate"
+        and type_name == "PersistentMemorySnapshot"
+    ):
+        return dict
     if module_name == "rag.agent.planning" and type_name in _LEGACY_PLAN_TYPE_NAMES:
         planning = import_module("agent_runtime.planning")
         target = getattr(planning, type_name, None)
@@ -2070,6 +2072,8 @@ _DEPRECATED_STATE_FIELDS = frozenset(
         "context_bindings",
         "locators",
         "asset_refs",
+        "persistent_memories",
+        "memory_index",
     }
 )
 
@@ -2120,12 +2124,6 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
             memory_budget=state.get("memory_budget"),
             memory_warnings=list(state.get("memory_warnings", [])),
             reactive_compact_used=bool(state.get("reactive_compact_used", False)),
-            persistent=PersistentMemorySnapshot(
-                index_digest=_persistent_memory_index_digest(
-                    state.get("memory_index", "")
-                ),
-                selected_count=len(state.get("persistent_memories", [])),
-            ),
         ),
     )
 

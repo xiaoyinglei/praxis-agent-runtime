@@ -14,7 +14,6 @@ from rag.agent.core.model_request import (
     canonical_transcript_revision,
     project_transcript_compaction,
 )
-from rag.agent.loop.substate import _persistent_memory_index_digest
 from rag.agent.memory.models import (
     ContextBudgetSnapshot,
     EvictedStateItem,
@@ -272,16 +271,6 @@ class MessageCompactor:
                 ),
                 "memory_warnings": list(
                     update.get("memory_warnings", memory_state.memory_warnings)
-                ),
-                "persistent": memory_state.persistent.model_copy(
-                    update={
-                        "index_digest": _persistent_memory_index_digest(
-                            state.get("memory_index", "")
-                        ),
-                        "selected_count": len(
-                            state.get("persistent_memories", [])
-                        ),
-                    }
                 ),
             }
         )
@@ -756,16 +745,6 @@ class LoopContextCompactor:
                         "memory_warnings",
                         memory_state.memory_warnings,
                     )
-                ),
-                "persistent": memory_state.persistent.model_copy(
-                    update={
-                        "index_digest": _persistent_memory_index_digest(
-                            state.get("memory_index", "")
-                        ),
-                        "selected_count": len(
-                            state.get("persistent_memories", [])
-                        ),
-                    }
                 ),
             }
         )
