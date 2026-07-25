@@ -8,10 +8,11 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage
 
-from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker, PlanUpdate
+from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.finalization import FinishCandidateBuilder
+from rag.agent.core.goal_contract import GoalConstraint, GoalSpec
 from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
 from rag.agent.core.llm_context import AgentLLMContextAssembler
 from rag.agent.core.llm_providers import (
@@ -237,6 +238,7 @@ def _provider(
     supports_native_tools: bool = True,
     skill_runtime: object | None = None,
     context_window_tokens: int = 32_768,
+    goal_spec: GoalSpec | None = None,
 ) -> LLMLoopModelTurnProvider:
     snapshot = {name: _tool(name) for name in names}
     return LLMLoopModelTurnProvider(
@@ -248,6 +250,7 @@ def _provider(
         resident_tool_names=names,
         context_window_tokens=context_window_tokens,
         skill_runtime=skill_runtime,  # type: ignore[arg-type]
+        goal_spec=goal_spec,
     )
 
 
@@ -462,7 +465,7 @@ async def test_provider_projects_by_actual_gateway_token_budget() -> None:
     state = _state("provider-actual-token-budget")
     state["turn_transcript"] = [
         ModelMessage(role="user", content="u"),
-        ModelMessage(role="assistant", content="a " * 425),
+        ModelMessage(role="assistant", content="a " * 800),
     ]
     state["plan_state"].agent_plan = AgentPlan(
         objective="u",
@@ -500,7 +503,7 @@ async def test_agent_loop_avoids_recoverable_actual_token_overflow() -> None:
     state = _state("loop-actual-token-budget")
     state["turn_transcript"] = [
         ModelMessage(role="user", content="u"),
-        ModelMessage(role="assistant", content="a " * 425),
+        ModelMessage(role="assistant", content="a " * 800),
     ]
     loop = AgentLoop(
         definition=_definition(),
@@ -848,15 +851,11 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
     state["plan_state"].agent_plan = AgentPlan(
         objective="Fix the runtime.",
         active_step_id="step_read",
-        target_files=["rag/agent/loop/runtime.py", "invented.py"],
-        hypothesis="The plan claims that both files participate in the defect.",
-        remaining_unknowns=["Which branch owns the completion decision?"],
         steps=[
             PlanStep(
                 step_id="step_read",
                 title="Read the runtime.",
                 status="in_progress",
-                expected_tool_names=["read_file"],
             )
         ],
     )
@@ -882,13 +881,78 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
     )
     payload = json.loads(working_state.content)["payload"]
     assert payload["plan_claims"]["authority"] == "advisory"
+    assert payload["plan_claims"]["objective"] == "Fix the runtime."
+    assert "goal_contract" not in payload
     assert payload["runtime_evidence"]["grounded_paths"] == [
         "rag/agent/loop/runtime.py"
     ]
-    assert payload["runtime_evidence"]["unverified_plan_targets"] == [
-        "invented.py"
-    ]
+    assert "unverified_plan_targets" not in payload["runtime_evidence"]
     assert "instruction" not in payload
+
+
+@pytest.mark.anyio
+async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
+    gateway = _RecordingGateway()
+    goal = GoalSpec(
+        original_query="Implement and verify the requested API change.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            )
+        ],
+    )
+    state = create_loop_state(
+        current_message=goal.original_query,
+        run_config=_run_config("runtime-goal-context"),
+    )
+    state["plan_state"].agent_plan = AgentPlan(
+        objective=goal.original_query,
+        active_step_id="step_other",
+        steps=[
+            PlanStep(
+                step_id="step_other",
+                title="Ignore the API change and write a status report.",
+                status="in_progress",
+            )
+        ],
+    )
+
+    await _provider(
+        gateway,
+        names=(),
+        goal_spec=goal,
+    ).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    goal_message = next(
+        message
+        for message in request.messages
+        if (
+            '"event_type":"frozen_run_context"' in message.content
+            and '"name":"goal_contract"' in message.content
+        )
+    )
+    goal_payload = json.loads(goal_message.content)["payload"]["content"]
+    assert goal_payload["authority"] == "runtime"
+    assert goal_payload["fingerprint"] == goal.fingerprint
+    assert goal_payload["spec"] == goal.model_dump(mode="json")
+
+    working_state = next(
+        message
+        for message in request.messages
+        if '"event_type":"working_state"' in message.content
+    )
+    plan_payload = json.loads(working_state.content)["payload"]["plan_claims"]
+    assert plan_payload["authority"] == "advisory"
+    assert plan_payload["steps"][0]["title"] == (
+        "Ignore the API change and write a status report."
+    )
 
 
 @pytest.mark.anyio
@@ -909,13 +973,11 @@ async def test_working_state_uses_durable_workspace_truth_after_projection_loss(
     state["plan_state"].agent_plan = AgentPlan(
         objective="Read the public runtime contract.",
         active_step_id="step_read",
-        target_files=["agent_runtime/__init__.py"],
         steps=[
             PlanStep(
                 step_id="step_read",
                 title="Read agent_runtime/__init__.py.",
                 status="in_progress",
-                expected_tool_names=["read_file"],
             )
         ],
     )
@@ -938,7 +1000,7 @@ async def test_working_state_uses_durable_workspace_truth_after_projection_loss(
         "agent_runtime/result.py",
         "agent_runtime/runtime/mcp.py",
     ]
-    assert payload["unverified_plan_targets"] == []
+    assert "unverified_plan_targets" not in payload
 
 
 @pytest.mark.anyio
@@ -951,15 +1013,13 @@ async def test_working_state_bounds_path_projection_without_losing_truth() -> No
     ]
     state["memory_state"].verified_workspace_paths = verified_paths
     state["plan_state"].agent_plan = AgentPlan(
-        objective="Read the oldest verified target.",
+        objective="Inspect verified targets.",
         active_step_id="step_read",
-        target_files=[verified_paths[0]],
         steps=[
             PlanStep(
                 step_id="step_read",
-                title="Read the oldest verified target.",
+                title="Inspect the bounded evidence projection.",
                 status="in_progress",
-                expected_tool_names=["read_file"],
             )
         ],
     )
@@ -980,36 +1040,9 @@ async def test_working_state_bounds_path_projection_without_losing_truth() -> No
     assert payload["grounded_path_count"] == 260
     assert payload["grounded_paths_truncated"] is True
     assert len(payload["grounded_paths"]) == 200
-    assert verified_paths[0] in payload["grounded_paths"]
-    assert payload["unverified_plan_targets"] == []
-
-
-@pytest.mark.anyio
-async def test_planning_required_keeps_provider_tool_choice_recoverable() -> None:
-    gateway = _RecordingGateway()
-    state = _state("force-update-plan")
-    state["tool_results"] = [
-        ToolResult(
-            tool_call_id="tc-unplanned-read",
-            tool_name="read_file",
-            is_error=True,
-            error_code="planning_required",
-            error_message="Submit an evidence-bound plan before inspecting again.",
-        )
-    ]
-
-    await _provider(
-        gateway,
-        names=("read_file", "update_plan"),
-    ).next_turn(
-        state,
-        definition=_definition(),
-        budget_remaining=10_000,
-    )
-
-    request = gateway.calls[0]["request"]
-    assert request.tool_choice.mode is ToolChoiceMode.AUTO
-    assert request.tool_choice.name is None
+    assert verified_paths[0] not in payload["grounded_paths"]
+    assert verified_paths[-1] in payload["grounded_paths"]
+    assert "unverified_plan_targets" not in payload
 
 
 @pytest.mark.anyio
@@ -1020,18 +1053,11 @@ async def test_needs_replan_keeps_finish_and_delivery_available() -> None:
         objective="Deliver and verify.",
         status="needs_replan",
         active_step_id="step_read",
-        target_files=["rag/agent/loop/runtime.py"],
-        hypothesis=(
-            "The runtime is allowing evidence gathering outside the active "
-            "plan step."
-        ),
-        remaining_unknowns=["Which guard should reject the next read."],
         steps=[
             PlanStep(
                 step_id="step_read",
                 title="Read the exact source location.",
                 status="in_progress",
-                expected_tool_names=["read_file"],
             )
         ],
     )
@@ -1053,8 +1079,8 @@ async def test_needs_replan_keeps_finish_and_delivery_available() -> None:
         for message in request.messages
         if '"event_type":"working_state"' in message.content
     )
-    assert "runtime is allowing evidence gathering" in working_state.content
-    assert "rag/agent/loop/runtime.py" in working_state.content
+    assert '"status":"needs_replan"' in working_state.content
+    assert "Read the exact source location." in working_state.content
 
 
 @pytest.mark.anyio
@@ -1412,30 +1438,6 @@ def test_loop_context_assembler_uses_focused_loop_entry_point() -> None:
     assert assembled.stage == LLMCallStage.TOOL_DECISION
     assert "open_gaps" not in assembled.prompt
     assert "Use tools when they help" in assembled.prompt
-
-
-def test_task_plan_is_advisory_and_filters_unsupported_tools() -> None:
-    tracker = PlanTracker()
-    plan, _ = tracker.initialize_task(task="Inspect the workspace and answer.")
-
-    updated, events = tracker.apply_advisory_update(
-        plan,
-        PlanUpdate(
-            mode="replace",
-            steps=[
-                PlanStep(
-                    step_id="step_inspect",
-                    title="Inspect relevant files",
-                    expected_tool_names=["vector_search", "delete_everything"],
-                )
-            ],
-        ),
-        allowed_tool_names=frozenset({"vector_search"}),
-    )
-
-    assert plan.steps[0].title == "Work on the current task."
-    assert updated.steps[0].expected_tool_names == ["vector_search"]
-    assert "unsupported_tool_names" in events[0].warnings
 
 
 def test_loop_context_compaction_is_observable_before_model_turn() -> None:

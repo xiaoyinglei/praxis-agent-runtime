@@ -44,8 +44,6 @@ from rag.agent.core.observations import (
     ObservationBatch,
     ObservationExtractor,
     grounded_workspace_paths,
-    runtime_workspace_change,
-    tool_result_progress_error,
 )
 from rag.agent.core.output_models import ValidatedFinalOutput
 from rag.agent.core.runtime_diagnostics import (
@@ -99,8 +97,6 @@ _NATIVE_TOOL_SET = frozenset(
 
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
 _MAX_RETRYABLE_IDENTICAL_FAILURES = 2
-_PLANNING_REQUIRED_CODE = "planning_required"
-_PLANNING_EVIDENCE_REQUIRED_CODE = "planning_evidence_required"
 _EXPLORATION_TOOL_NAMES = frozenset(
     {"list_files", "search_text", "read_file", "run_command", "find_tools"}
 )
@@ -337,7 +333,6 @@ class AgentLoop:
                 state["tool_call_ledger"].trim(
                     active_tool_call_ids={p.tool_call_id for p in state["pending_tool_calls"]},
                 )
-                self._record_plan_decision(state, turn)
                 await self._transition(
                     state, reason="next_turn", detail={"action": turn.action}, checkpoint_reason="model_turn"
                 )
@@ -768,15 +763,9 @@ class AgentLoop:
         turn = state["iteration"]
         pending = tuple(state["pending_tool_calls"])
         calls = tuple(self._canonical_call(state, pending_call) for pending_call in pending)
-        progress_checked_calls, planning_results = (
-            _guard_evidence_driven_progress(
-                state,
-                calls,
-            )
-        )
         circuit_checked_calls, circuit_results = _guard_repeated_tool_failures(
             state,
-            progress_checked_calls,
+            calls,
         )
         executable_calls, repeated_inspection_results = (
             _guard_repeated_successful_inspections(
@@ -820,7 +809,6 @@ class AgentLoop:
         results_by_id = {
             result.tool_call_id: result
             for result in (
-                *planning_results,
                 *circuit_results,
                 *repeated_inspection_results,
             )
@@ -859,7 +847,6 @@ class AgentLoop:
             batch,
             tool_results=observable_results,
         )
-        self._record_plan_observations(state, batch)
 
         new_results, plan_updates = self._apply_update_plan_results(
             state,
@@ -968,7 +955,6 @@ class AgentLoop:
                 "phase": "recorded",
                 "result_count": len(new_results),
                 "pending_count": len(state["pending_tool_calls"]),
-                "planning_required_count": len(planning_results),
                 "circuit_breaker_count": len(circuit_results),
                 "repeated_inspection_count": len(
                     repeated_inspection_results
@@ -1025,53 +1011,23 @@ class AgentLoop:
                     task=state["current_message"],
                 )
                 self._append_plan_events(state, events)
-            available_evidence = [
-                prior
-                for prior in state["tool_results"]
-                if not prior.is_error and prior.tool_name != "update_plan"
-            ]
-            used_evidence_ids: set[str] = set()
             steps = [
                 PlanStep(
                     step_id=item.step_id or f"step_{index:03d}",
                     title=item.step,
                     status=item.status,
-                    expected_tool_names=item.expected_tool_names,
-                    tool_call_ids=(
-                        []
-                        if item.status != "completed"
-                        else _claim_matching_plan_evidence(
-                            available_evidence,
-                            expected_tool_names=item.expected_tool_names,
-                            used_tool_call_ids=used_evidence_ids,
-                        )
-                    ),
                 )
                 for index, item in enumerate(submitted.plan, start=1)
             ]
             updated, events = self._plan_tracker.replace_from_tool(
                 current,
                 steps=steps,
-                target_files=submitted.target_files,
-                hypothesis=submitted.hypothesis,
-                remaining_unknowns=submitted.remaining_unknowns,
                 summary=submitted.explanation,
             )
             state["plan_state"].agent_plan = updated
             self._append_plan_events(state, events)
             event = events[-1]
             plan_updates.append((updated, event))
-            grounded_paths = _runtime_grounded_workspace_paths(state)
-            grounded_targets = [
-                path
-                for path in updated.target_files
-                if _normalized_workspace_path(path) in grounded_paths
-            ]
-            unverified_targets = [
-                path
-                for path in updated.target_files
-                if _normalized_workspace_path(path) not in grounded_paths
-            ]
             canonical_results.append(
                 replace(
                     result,
@@ -1079,12 +1035,10 @@ class AgentLoop:
                         "accepted": True,
                         "revision": updated.revision,
                         "message": (
-                            "Plan persisted as advisory state; runtime evidence "
-                            "controls inspection and completion."
+                            "Plan persisted as advisory state; tool policy and "
+                            "stop hooks retain execution and completion authority."
                         ),
                         "authority": "advisory",
-                        "grounded_target_files": tuple(grounded_targets),
-                        "unverified_target_files": tuple(unverified_targets),
                     },
                 )
             )
@@ -1411,38 +1365,6 @@ class AgentLoop:
                 reason=checkpoint_reason,
             )
 
-    def _record_plan_decision(
-        self,
-        state: LoopState,
-        turn: ModelTurn,
-    ) -> None:
-        plan = state["plan_state"].agent_plan
-        if plan is None:
-            return
-        work_calls = [call for call in turn.tool_calls if call.tool_name != "update_plan"]
-        if not work_calls:
-            return
-        updated, events = self._plan_tracker.record_decision_progress(
-            plan,
-            tool_call_ids=[call.tool_call_id for call in work_calls],
-            tool_names=[call.tool_name for call in work_calls],
-        )
-        state["plan_state"].agent_plan = updated
-        state["plan_state"].plan_events = [*state["plan_state"].plan_events, *events][-MAX_PLAN_EVENTS:]
-
-    def _record_plan_observations(
-        self,
-        state: LoopState,
-        batch: ObservationBatch,
-    ) -> None:
-        plan, events = self._plan_tracker.record_observation_progress(
-            plan=state["plan_state"].agent_plan,
-            observations=batch.structured_observations,
-        )
-        if plan is not None:
-            state["plan_state"].agent_plan = plan
-            state["plan_state"].plan_events = [*state["plan_state"].plan_events, *events][-MAX_PLAN_EVENTS:]
-
     @staticmethod
     def _append_plan_events(
         state: LoopState,
@@ -1525,249 +1447,6 @@ async def _remaining_llm_budget(handles: Any) -> int | None:
     if ledger is None:
         return None
     return cast(int, await ledger.remaining())
-
-
-def _claim_matching_plan_evidence(
-    results: Sequence[ToolResult],
-    *,
-    expected_tool_names: Sequence[str],
-    used_tool_call_ids: set[str],
-) -> list[str]:
-    for result in reversed(results):
-        if (
-            result.tool_call_id in used_tool_call_ids
-            or result.tool_name not in expected_tool_names
-            or tool_result_progress_error(result) is not None
-        ):
-            continue
-        used_tool_call_ids.add(result.tool_call_id)
-        return [result.tool_call_id]
-    return []
-
-
-def _guard_evidence_driven_progress(
-    state: LoopState,
-    calls: Sequence[ToolCall],
-) -> tuple[tuple[ToolCall, ...], tuple[ToolResult, ...]]:
-    """Require machine-checkable intent after the first evidence-gathering turn."""
-
-    plan = state["plan_state"].agent_plan
-    active_step = _active_plan_step(plan)
-    bootstrap_plan = _is_bootstrap_plan(plan)
-    successful_evidence_exists = any(
-        not result.is_error
-        and result.tool_name in _EXPLORATION_TOOL_NAMES
-        and tool_result_progress_error(result) is None
-        for result in _delivery_cycle_results(state)
-    )
-    verification_after_change = bool(
-        state["tool_results"]
-        and runtime_workspace_change(state["tool_results"][-1]) is not None
-    )
-
-    executable: list[ToolCall] = []
-    blocked: list[ToolResult] = []
-    for call in calls:
-        if (
-            call.tool_call_id in state["tool_execution_records"]
-            or call.tool_name == "update_plan"
-            or call.tool_name not in _EXPLORATION_TOOL_NAMES
-        ):
-            executable.append(call)
-            continue
-
-        reason: str | None = None
-        error_code = _PLANNING_REQUIRED_CODE
-        unverified_path: str | None = None
-        expected_tool_names: list[str] = []
-        follows_known_evidence = _follows_known_evidence(state, call)
-        if plan is not None and plan.status == "needs_replan":
-            if not verification_after_change and not follows_known_evidence:
-                reason = (
-                    "The current plan no longer matches the observed evidence. "
-                    "Submit update_plan before gathering more evidence."
-                )
-        elif plan is None or bootstrap_plan:
-            if successful_evidence_exists and not follows_known_evidence:
-                reason = (
-                    "The initial evidence-gathering turn is complete. Submit "
-                    "update_plan with concrete unresolved questions and exact "
-                    "expected_tool_names before inspecting again."
-                )
-        elif active_step is None:
-            if not follows_known_evidence:
-                reason = (
-                    "The plan has no executable step. Submit update_plan before "
-                    "gathering more evidence."
-                )
-        else:
-            expected_tool_names = list(active_step.expected_tool_names)
-            if (
-                call.tool_name not in active_step.expected_tool_names
-                and not follows_known_evidence
-            ):
-                reason = (
-                    f"The active plan step expects {expected_tool_names!r}, not "
-                    f"{call.tool_name!r}. Submit update_plan if the evidence "
-                    "changed the next action."
-                )
-            elif (
-                successful_evidence_exists
-                and call.tool_name in {"list_files", "search_text", "read_file"}
-                and not _inspection_path_is_grounded(state, call)
-            ):
-                error_code = _PLANNING_EVIDENCE_REQUIRED_CODE
-                unverified_path = _inspection_workspace_path(call)
-                reason = (
-                    "The model plan is advisory and cannot establish a file "
-                    "location. Discover this path through a successful workspace "
-                    "tool result or use a path already present in runtime evidence."
-                )
-
-        if reason is None:
-            executable.append(call)
-            continue
-        blocked.append(
-            ToolResult(
-                tool_call_id=call.tool_call_id,
-                tool_name=call.tool_name,
-                is_error=True,
-                error_code=error_code,
-                error_message=reason,
-                retryable=False,
-                metadata={
-                    "plan_status": (
-                        "unplanned"
-                        if plan is None or bootstrap_plan
-                        else plan.status
-                    ),
-                    "active_step_id": (
-                        None if active_step is None else active_step.step_id
-                    ),
-                    "expected_tool_names": tuple(expected_tool_names),
-                    **(
-                        {"unverified_path": unverified_path}
-                        if unverified_path is not None
-                        else {}
-                    ),
-                },
-            )
-        )
-    return tuple(executable), tuple(blocked)
-
-
-def _follows_known_evidence(
-    state: LoopState,
-    call: ToolCall,
-) -> bool:
-    """Authorize an inspection only from durable, runtime-verified paths."""
-
-    if call.tool_name not in {"list_files", "search_text", "read_file"}:
-        return False
-    requested_path = _inspection_workspace_path(call)
-    if requested_path is None:
-        return False
-    known_paths = _runtime_grounded_workspace_paths(state)
-    if requested_path not in known_paths:
-        return False
-    # Delivery cycles and prompt compaction are deliberately lossy control
-    # projections.  They must never invalidate an observed workspace fact.
-    # Repetition and exploration limits are enforced by their dedicated guards.
-    return True
-
-
-def _normalized_workspace_path(value: str) -> str:
-    normalized = value.strip().replace("\\", "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    return normalized.rstrip("/")
-
-
-def _inspection_workspace_path(call: ToolCall) -> str | None:
-    raw_path = call.arguments.get("path")
-    if raw_path is None and call.tool_name in {"list_files", "search_text"}:
-        raw_path = "."
-    if not isinstance(raw_path, str):
-        return None
-    normalized = _normalized_workspace_path(raw_path)
-    return normalized or None
-
-
-def _inspection_path_is_grounded(
-    state: LoopState,
-    call: ToolCall,
-) -> bool:
-    requested_path = _inspection_workspace_path(call)
-    if requested_path is None:
-        return False
-    if call.tool_name in {"list_files", "search_text"} and not any(
-        not result.is_error
-        and result.tool_name in {"list_files", "search_text"}
-        for result in _delivery_cycle_results(state)
-    ):
-        # A direct read may be the first useful observation. Preserve exactly
-        # one bounded discovery action so a cross-layer task can locate the
-        # next component without treating the model's guessed path as fact.
-        return True
-    grounded_paths = _runtime_grounded_workspace_paths(state)
-    if call.tool_name == "read_file":
-        return requested_path in grounded_paths
-    if requested_path == ".":
-        return False
-    prefix = f"{requested_path}/"
-    return requested_path in grounded_paths or any(
-        path.startswith(prefix) for path in grounded_paths
-    )
-
-
-def _runtime_grounded_workspace_paths(state: LoopState) -> set[str]:
-    manifest = state.get("file_manifest")
-    manifest_paths = (
-        ()
-        if manifest is None
-        else tuple(entry.path for entry in manifest.files)
-    )
-    return set(
-        grounded_workspace_paths(
-            locators=state["memory_state"].known_locators,
-            input_paths=(
-                *manifest_paths,
-                *state["memory_state"].verified_workspace_paths,
-            ),
-            tool_results=state["tool_results"],
-            tool_calls=state["canonical_tool_calls"],
-        )
-    )
-
-
-def _is_bootstrap_plan(plan: AgentPlan | None) -> bool:
-    return bool(
-        plan is not None
-        and plan.revision == 0
-        and len(plan.steps) == 1
-        and plan.steps[0].step_id == "step_task"
-        and not plan.steps[0].expected_tool_names
-    )
-
-
-def _active_plan_step(plan: AgentPlan | None) -> PlanStep | None:
-    if plan is None:
-        return None
-    if plan.active_step_id is not None:
-        for step in plan.steps:
-            if (
-                step.step_id == plan.active_step_id
-                and step.status in {"pending", "in_progress"}
-            ):
-                return step
-    return next(
-        (
-            step
-            for step in plan.steps
-            if step.status in {"pending", "in_progress"}
-        ),
-        None,
-    )
 
 
 def _delivery_cycle_results(state: LoopState) -> list[ToolResult]:

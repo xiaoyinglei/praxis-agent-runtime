@@ -73,8 +73,8 @@ def test_resident_aci_spells_out_observed_model_argument_pitfalls(
     update = tools["update_plan"].definition
     assert '"step"' in update.description
     assert '"status"' in update.description
-    assert '"target_files"' in update.description
-    assert '"hypothesis"' in update.description
+    assert "advisory" in update.description
+    assert "never prove" in update.description
 
 
 @pytest.mark.anyio

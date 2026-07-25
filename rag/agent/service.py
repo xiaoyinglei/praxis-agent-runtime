@@ -613,6 +613,9 @@ class AgentService:
     ]:
         started_at = time.perf_counter()
         tool_trace_start = len(self._tool_executor.traces)
+        goal_spec = request.goal_spec or GoalSpec(
+            original_query=request.message,
+        )
         workspace = self._workspace_for_request(request)
         imported_files: list[Path] = []
         if request.input_files:
@@ -642,14 +645,14 @@ class AgentService:
         checkpoint_store = LangGraphCheckpointStore(
             self._checkpointer,
             run_config=run_config,
-            compatibility_config=GoalCompatibilityConfig(goal_spec=request.goal_spec),
+            compatibility_config=GoalCompatibilityConfig(goal_spec=goal_spec),
             snapshot_sink=self._sync_checkpoint_turn,
         )
         loop = self._build_loop(
             state=state,
             checkpoint_store=checkpoint_store,
             memory_store=memory_store,
-            goal_spec=request.goal_spec,
+            goal_spec=goal_spec,
             workspace=workspace,
         )
         return (
@@ -787,6 +790,7 @@ class AgentService:
             model_registry=self._model_registry,
             policy=self._policy,
             registry_snapshot=self._tool_snapshot,
+            goal_spec=goal_spec,
             strict_model_provider=self._strict_model_provider,
             stream_sink=self._stream_sink,
             skill_runtime=self._skill_runtime,

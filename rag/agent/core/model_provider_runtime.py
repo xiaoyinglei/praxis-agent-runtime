@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from rag.agent.core.definition import AgentRuntimePolicy
+from rag.agent.core.goal_contract import GoalSpec
 from rag.agent.core.llm_providers import create_loop_model_turn_provider
 from rag.agent.core.llm_registry import ModelResolver
 from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
@@ -66,6 +67,7 @@ class ModelProviderResolver:
     model_registry: ModelResolver | None
     policy: AgentRuntimePolicy
     registry_snapshot: Mapping[str, Tool]
+    goal_spec: GoalSpec | None = None
     strict_model_provider: bool = True
     stream_sink: object | None = None
     skill_runtime: SkillRuntime | None = None
@@ -89,6 +91,7 @@ class ModelProviderResolver:
                     registry_snapshot=self.registry_snapshot,
                     resident_tool_names=resident,
                     disabled_tool_names=disabled,
+                    goal_spec=self.goal_spec,
                     stream_sink=self.stream_sink,
                     skill_runtime=self.skill_runtime,
                 )

@@ -7,6 +7,7 @@ from typing import Literal, cast
 from pydantic import BaseModel, Field
 
 from rag.agent.core.definition import AgentRuntimePolicy, ModelSelectionPolicy
+from rag.agent.core.goal_contract import GoalSpec
 from rag.agent.core.llm_registry import ModelResolver
 from rag.agent.core.messages import (
     ModelMessage,
@@ -110,6 +111,7 @@ class LLMLoopModelTurnProvider:
         context_window_tokens: int = 32_768,
         stream_sink: object | None = None,
         skill_runtime: SkillRuntime | None = None,
+        goal_spec: GoalSpec | None = None,
     ) -> None:
         if not hasattr(gateway, "agenerate_model_request"):
             raise TypeError("gateway must execute canonical ModelRequest values")
@@ -132,6 +134,9 @@ class LLMLoopModelTurnProvider:
         self._context_window_tokens = context_window_tokens
         self._stream_sink = stream_sink
         self._skill_runtime = skill_runtime
+        self._goal_spec = (
+            None if goal_spec is None else goal_spec.model_copy(deep=True)
+        )
 
     async def next_turn(
         self,
@@ -168,10 +173,20 @@ class LLMLoopModelTurnProvider:
         if skill_context:
             instructions.append(skill_context)
         file_manifest = state.get("file_manifest")
-        frozen_run_context = (
-            ()
-            if file_manifest is None or not file_manifest.files
-            else (
+        frozen_run_context: list[ContextBlock] = []
+        if self._goal_spec is not None:
+            frozen_run_context.append(
+                ContextBlock(
+                    name="goal_contract",
+                    content={
+                        "authority": "runtime",
+                        "fingerprint": self._goal_spec.fingerprint,
+                        "spec": self._goal_spec.model_dump(mode="json"),
+                    },
+                )
+            )
+        if file_manifest is not None and file_manifest.files:
+            frozen_run_context.append(
                 ContextBlock(
                     name="input_files",
                     content={
@@ -188,9 +203,8 @@ class LLMLoopModelTurnProvider:
                             for entry in file_manifest.files
                         ),
                     },
-                ),
+                )
             )
-        )
         settings = self._model_settings(definition.model_selection)
         initial_message, context_transcript = split_turn_context(
             conversation_history=state["conversation_history"],
@@ -198,7 +212,7 @@ class LLMLoopModelTurnProvider:
         )
         context = build_stable_context(
             instructions=tuple(instructions),
-            frozen_run_context=frozen_run_context,
+            frozen_run_context=tuple(frozen_run_context),
             initial_user_task=initial_message,
             initial_memory=tuple(state.get("persistent_memories", ())),
             transcript=context_transcript,
@@ -427,15 +441,11 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
             "objective": plan.objective,
             "status": plan.status,
             "active_step_id": plan.active_step_id,
-            "target_files": tuple(plan.target_files),
-            "hypothesis": plan.hypothesis,
-            "remaining_unknowns": tuple(plan.remaining_unknowns),
             "steps": tuple(
                 {
                     "step_id": step.step_id,
                     "title": step.title,
                     "status": step.status,
-                    "expected_tool_names": tuple(step.expected_tool_names),
                 }
                 for step in plan.steps
             ),
@@ -455,19 +465,8 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
         tool_results=state["tool_results"],
         tool_calls=state["canonical_tool_calls"],
     )
-    grounded_path_set = set(verified_grounded_paths)
     grounded_paths = _project_grounded_workspace_paths(
         verified_grounded_paths,
-        plan=plan,
-    )
-    unverified_plan_targets = (
-        ()
-        if plan is None
-        else tuple(
-            path
-            for path in plan.target_files
-            if path not in grounded_path_set
-        )
     )
     return context_event_message(
         "working_state",
@@ -480,7 +479,6 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
                 "grounded_paths_truncated": (
                     len(grounded_paths) < len(verified_grounded_paths)
                 ),
-                "unverified_plan_targets": unverified_plan_targets,
                 "recent_observations": tuple(
                     {
                         "tool_call_id": observation.tool_call_id,
@@ -507,17 +505,10 @@ def _working_state_message(state: LoopState) -> ModelMessage | None:
 
 def _project_grounded_workspace_paths(
     paths: Sequence[str],
-    *,
-    plan: object | None,
 ) -> tuple[str, ...]:
     if len(paths) <= _MAX_WORKING_STATE_GROUNDED_PATHS:
         return tuple(paths)
-    path_set = set(paths)
     selected: dict[str, None] = {}
-    target_files = getattr(plan, "target_files", ()) if plan is not None else ()
-    for path in target_files:
-        if path in path_set:
-            selected.setdefault(path, None)
     for path in reversed(paths):
         selected.setdefault(path, None)
         if len(selected) >= _MAX_WORKING_STATE_GROUNDED_PATHS:
@@ -629,6 +620,7 @@ def create_loop_model_turn_provider(
     disabled_tool_names: Sequence[str] = (),
     stream_sink: object | None = None,
     skill_runtime: SkillRuntime | None = None,
+    goal_spec: GoalSpec | None = None,
 ) -> LLMLoopModelTurnProvider:
     resolved = registry.resolve_for_node(
         node_model=selection.tool_decision_model,
@@ -652,6 +644,7 @@ def create_loop_model_turn_provider(
         context_window_tokens=resolved.context_window_tokens,
         stream_sink=stream_sink,
         skill_runtime=skill_runtime,
+        goal_spec=goal_spec,
     )
 
 

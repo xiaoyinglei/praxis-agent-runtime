@@ -14,7 +14,10 @@ from rag.agent.core.checkpointing import (
 )
 from rag.agent.core.context import AgentRunConfig, TurnRegistry
 from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.goal_contract import GoalDeliverable, GoalSpec
+from rag.agent.core.goal_contract import (
+    GoalDeliverable,
+    GoalSpec,
+)
 from rag.agent.core.messages import ModelMessage
 from rag.agent.core.model_request import build_tool_manifest
 from rag.agent.core.turn_contracts import ToolCallPlan
@@ -356,7 +359,7 @@ async def test_resume_reconciles_pending_call_before_changed_tool_executes() -> 
 
 
 @pytest.mark.anyio
-async def test_explicit_goal_spec_is_a_stop_hook_not_default_controller() -> None:
+async def test_explicit_goal_spec_completion_still_uses_stop_hook() -> None:
     service = AgentService(
         definition=_definition(),
         tool_registry=_registry([]),
@@ -388,6 +391,26 @@ async def test_explicit_goal_spec_is_a_stop_hook_not_default_controller() -> Non
 
     assert result.status == "paused"
     assert result.needs_user_input == "Explicit goal still needs evidence."
+
+
+@pytest.mark.anyio
+async def test_service_owns_a_goal_contract_for_every_request() -> None:
+    service = AgentService(
+        definition=_definition(),
+        tool_registry=_registry([]),
+        model_turn_provider=_FinishFromResultsProvider(),
+    )
+    message = "Implement the requested API change."
+
+    result = await service.run(
+        AgentRunRequest(
+            message=message,
+            turn_id="service-loop-default-goal",
+        )
+    )
+
+    assert result.plan is not None
+    assert result.plan.objective == message
 
 
 def test_runtime_modules_use_loop_state_instead_of_compatibility_state() -> None:

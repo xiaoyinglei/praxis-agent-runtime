@@ -231,8 +231,6 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("agent_runtime.planning", "AgentPlan"),
     ("agent_runtime.planning", "PlanEvent"),
     ("agent_runtime.planning", "PlanStep"),
-    ("agent_runtime.planning", "PlanStepPatch"),
-    ("agent_runtime.planning", "PlanUpdate"),
     ("rag.agent.skills.models", "LoadedSkill"),
     ("rag.agent.skills.models", "LoadedSkillRef"),
     ("rag.agent.skills.models", "SkillInvocation"),
@@ -313,8 +311,6 @@ _LEGACY_PLAN_TYPE_NAMES = frozenset(
         "AgentPlan",
         "PlanEvent",
         "PlanStep",
-        "PlanStepPatch",
-        "PlanUpdate",
     }
 )
 _CHECKPOINT_CONSTRUCTOR_CODES = frozenset(

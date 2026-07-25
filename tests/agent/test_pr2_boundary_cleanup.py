@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 
-from agent_runtime.planning import PlanTracker
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.llm_context import AgentLLMContextAssembler
@@ -139,38 +138,3 @@ def test_llm_context_assembler_preserves_canonical_tool_content() -> None:
     assert "call-knowledge" in assembled.prompt
     assert "Canonical evidence." in assembled.prompt
     assert "formatter_resolver" not in inspect.signature(AgentLLMContextAssembler).parameters
-
-
-def test_plan_tracker_accepts_core_structured_observation_directly() -> None:
-    tracker = PlanTracker()
-    plan, _ = tracker.initialize_task(task="Track one tool result")
-    plan = plan.model_copy(
-        update={
-            "steps": [
-                plan.steps[0].model_copy(
-                    update={"expected_tool_names": ["search_knowledge"]}
-                )
-            ]
-        }
-    )
-    plan, _ = tracker.record_decision_progress(
-        plan,
-        tool_call_ids=["call-1"],
-        tool_names=["search_knowledge"],
-    )
-
-    updated, events = tracker.record_observation_progress(
-        plan,
-        observations=[
-            StructuredObservation(
-                tool_call_id="call-1",
-                tool_name="search_knowledge",
-                status="ok",
-                raw_result_ref="call-1",
-            )
-        ],
-    )
-
-    assert updated is not None
-    assert updated.steps[0].status == "completed"
-    assert events[0].event_type == "observation_progress"

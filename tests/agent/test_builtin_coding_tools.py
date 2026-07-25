@@ -597,23 +597,15 @@ async def test_update_plan_uses_the_injected_state_callback(tmp_path: Path) -> N
         update_plan,
         {
             "explanation": "Show the next implementation checkpoint.",
-            "target_files": ["rag/agent/tools/builtins/planning.py"],
-            "hypothesis": (
-                "Making the working theory explicit will prevent repeated "
-                "repository discovery."
-            ),
-            "remaining_unknowns": ["Whether focused tests remain green."],
             "plan": [
                 {
                     "step_id": "step_implement",
                     "step": "Implement the resident tools",
                     "status": "in_progress",
-                    "expected_tool_names": ["apply_patch"],
                 },
                 {
                     "step": "Run focused tests",
                     "status": "pending",
-                    "expected_tool_names": ["run_command"],
                 },
             ],
         },
@@ -626,20 +618,17 @@ async def test_update_plan_uses_the_injected_state_callback(tmp_path: Path) -> N
         "revision": 1,
         "message": "plan updated",
         "authority": "advisory",
-        "grounded_target_files": (),
-        "unverified_target_files": (),
     }
     assert len(updates) == 1
     assert updates[0]["plan"][0]["step_id"] == "step_implement"
     assert updates[0]["plan"][0]["step"] == "Implement the resident tools"
-    assert updates[0]["target_files"] == (
-        "rag/agent/tools/builtins/planning.py",
+    assert updates[0]["explanation"] == (
+        "Show the next implementation checkpoint."
     )
-    assert "working theory" in str(updates[0]["hypothesis"])
 
 
 @pytest.mark.anyio
-async def test_update_plan_accepts_a_bounded_discovery_checkpoint(
+async def test_update_plan_accepts_strategy_without_task_choreography(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -649,19 +638,10 @@ async def test_update_plan_accepts_a_bounded_discovery_checkpoint(
     execution = await _execute(
         update_plan,
         {
-            "target_files": [],
-            "hypothesis": (
-                "The event is likely dropped between the filesystem tool and "
-                "the loop, but the exact files are not grounded yet."
-            ),
-            "remaining_unknowns": [
-                "Which files define patch output and loop event forwarding?"
-            ],
             "plan": [
                 {
-                    "step": "Locate the patch output and event forwarding code",
+                    "step": "Try the next viable strategy",
                     "status": "in_progress",
-                    "expected_tool_names": ["search_text"],
                 }
             ],
         },
@@ -669,45 +649,35 @@ async def test_update_plan_accepts_a_bounded_discovery_checkpoint(
     )
 
     assert execution.result.is_error is False
-    assert updates[0]["target_files"] == ()
-    assert updates[0]["remaining_unknowns"] == (
-        "Which files define patch output and loop event forwarding?",
-    )
+    assert set(updates[0]) == {"plan", "explanation"}
+    assert set(updates[0]["plan"][0]) == {
+        "step_id",
+        "step",
+        "status",
+    }
 
 
 @pytest.mark.anyio
-async def test_update_plan_rejects_a_plan_without_a_working_theory(
+async def test_update_plan_requires_only_a_visible_plan(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
     update_plan = _tools_by_name(workspace)["update_plan"]
 
-    execution = await _execute(
+    missing_plan = await _execute(
         update_plan,
-        {
-            "plan": [
-                {
-                    "step": "Keep inspecting",
-                    "status": "in_progress",
-                    "expected_tool_names": ["read_file"],
-                }
-            ]
-        },
+        {},
         workspace=workspace,
     )
 
-    assert execution.result.is_error is True
-    assert execution.result.error_code == "invalid_arguments"
-    assert "target_files" in (execution.result.error_message or "")
-    assert {
-        "target_files",
-        "hypothesis",
-        "remaining_unknowns",
-    }.issubset(set(update_plan.definition.input_schema["required"]))
+    assert missing_plan.result.error_code == "invalid_arguments"
+    assert "plan" in (missing_plan.result.error_message or "")
+    assert set(update_plan.definition.input_schema["required"]) == {"plan"}
+    assert "goal_id" not in update_plan.definition.input_schema["properties"]
 
 
 @pytest.mark.anyio
-async def test_update_plan_rejects_target_files_outside_the_workspace(
+async def test_update_plan_rejects_removed_plan_authority_fields(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -717,15 +687,10 @@ async def test_update_plan_rejects_target_files_outside_the_workspace(
         update_plan,
         {
             "target_files": ["../outside.py"],
-            "hypothesis": (
-                "The implementation file outside the workspace needs editing."
-            ),
-            "remaining_unknowns": [],
             "plan": [
                 {
                     "step": "Read the target",
                     "status": "in_progress",
-                    "expected_tool_names": ["read_file"],
                 }
             ],
         },
