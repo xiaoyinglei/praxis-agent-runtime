@@ -1171,9 +1171,12 @@ def _approval_metadata(
         "approval_id": approval_id,
         "approval_scope": decision.approval_scope,
         "network_requested": ToolEffect.NETWORK in resolved.effects,
+        "workspace_write": ToolEffect.WRITE_WORKSPACE in resolved.effects,
     }
     for target in resolved.targets:
-        if target.kind == "cwd_path":
+        if target.kind == "workspace_path":
+            metadata["workspace_path"] = target.value
+        elif target.kind == "cwd_path":
             metadata["cwd"] = target.value
         elif target.kind == "execution_mode":
             metadata["execution_mode"] = target.value

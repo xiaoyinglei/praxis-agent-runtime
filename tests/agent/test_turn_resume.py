@@ -500,6 +500,7 @@ async def test_run_command_network_uses_two_checkpointed_approvals(
             "working_dir": ".",
             "timeout_seconds": 2,
             "network": True,
+            "workspace_write": True,
         },
     )
     definition = AgentRuntimePolicy.test_factory(
@@ -529,8 +530,18 @@ async def test_run_command_network_uses_two_checkpointed_approvals(
     assert first.human_input_request is not None
     tool_approval = first.human_input_request
     assert tool_approval.context["approval_scope"] == "tool"
+    assert tool_approval.context["workspace_write"] is True
+    assert tool_approval.context["workspace_path"] == str(workspace.root)
     assert tool_approval.tool_calls[0].approval_id == plan.tool_call_id
     assert command in tool_approval.tool_calls[0].args_preview
+    assert "workspace write: requested for entire workspace" in (
+        tool_approval.tool_calls[0].args_preview
+    )
+    assert str(workspace.root) in tool_approval.tool_calls[0].args_preview
+    assert "destructive operation" in tool_approval.tool_calls[0].reason
+    assert "destructive write access to the entire workspace" in (
+        tool_approval.question
+    )
 
     second = await service(_CommandProvider(plan)).resume_turn(
         turn_id=first.turn_id,

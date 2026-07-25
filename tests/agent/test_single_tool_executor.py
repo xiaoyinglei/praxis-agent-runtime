@@ -646,15 +646,24 @@ def test_sandbox_auto_approval_requires_process_execution() -> None:
         ),
         pytest.param(
             "run_command",
-            "builtin-run-command-v3-trusted-toolchain",
-            frozenset(
-                {ToolEffect.EXECUTE_PROCESS, ToolEffect.DESTRUCTIVE}
-            ),
+            "builtin-run-command-v4-read-only-default",
+            frozenset({ToolEffect.EXECUTE_PROCESS, ToolEffect.DESTRUCTIVE}),
             id="destructive-effect",
+        ),
+        pytest.param(
+            "run_command",
+            "builtin-run-command-v4-read-only-default",
+            frozenset(
+                {
+                    ToolEffect.EXECUTE_PROCESS,
+                    ToolEffect.WRITE_WORKSPACE,
+                }
+            ),
+            id="workspace-write-effect",
         ),
     ],
 )
-def test_sandbox_auto_approval_rejects_unverified_or_destructive_calls(
+def test_sandbox_auto_approval_rejects_unverified_or_mutating_calls(
     name: str,
     execution_revision: str,
     effects: frozenset[ToolEffect],

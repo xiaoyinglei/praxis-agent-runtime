@@ -2105,6 +2105,8 @@ def _approval_request(
     cwd = result.metadata.get("cwd")
     execution_mode = result.metadata.get("execution_mode")
     network_requested = result.metadata.get("network_requested") is True
+    workspace_path = result.metadata.get("workspace_path")
+    workspace_write = result.metadata.get("workspace_write") is True
     args_preview = _tool_input_preview(call.arguments)
     question = f"Allow {result.tool_name} to run once? {reason}"
     if result.tool_name == "run_command":
@@ -2113,11 +2115,20 @@ def _approval_request(
             cwd=cwd if isinstance(cwd, str) else None,
             execution_mode=(execution_mode if isinstance(execution_mode, str) else "restricted_sandbox"),
             network_requested=network_requested,
+            workspace_path=(
+                workspace_path if isinstance(workspace_path, str) else None
+            ),
+            workspace_write=workspace_write,
         )
         if approval_scope == "network":
             question = f"Allow network access for this run_command invocation? {reason}"
         else:
             question = f"Allow run_command to execute once in restricted_sandbox mode? {reason}"
+            if workspace_write:
+                question += (
+                    " This approval grants destructive write access to the "
+                    "entire workspace except Git metadata."
+                )
             if network_requested:
                 question += " Network access is not included in this approval."
     return HumanInputRequest(
@@ -2141,6 +2152,8 @@ def _approval_request(
             "cwd": cwd,
             "network_requested": network_requested,
             "execution_mode": execution_mode,
+            "workspace_path": workspace_path,
+            "workspace_write": workspace_write,
         },
         options=["allow_once", "deny"],
     )
@@ -2152,6 +2165,8 @@ def _run_command_approval_preview(
     cwd: str | None,
     execution_mode: str,
     network_requested: bool,
+    workspace_path: str | None,
+    workspace_write: bool,
 ) -> str:
     command = arguments.get("command")
     raw_command = command if isinstance(command, str) else str(command)
@@ -2161,7 +2176,23 @@ def _run_command_approval_preview(
         ensure_ascii=False,
     )
     network_text = "requested (separate approval required)" if network_requested else "disabled"
-    return f"command: {command_text}\ncwd: {cwd_text}\nnetwork: {network_text}\nexecution mode: {execution_mode}"
+    workspace_path_text = json.dumps(
+        workspace_path or "<unknown>",
+        ensure_ascii=False,
+    )
+    workspace_write_text = (
+        f"requested for entire workspace {workspace_path_text} "
+        "(Git metadata remains read-only)"
+        if workspace_write
+        else "disabled (workspace is read-only)"
+    )
+    return (
+        f"command: {command_text}\n"
+        f"cwd: {cwd_text}\n"
+        f"workspace write: {workspace_write_text}\n"
+        f"network: {network_text}\n"
+        f"execution mode: {execution_mode}"
+    )
 
 
 def _reconciliation_request(
