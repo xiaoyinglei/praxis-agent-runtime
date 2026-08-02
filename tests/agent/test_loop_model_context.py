@@ -9,6 +9,7 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker
+from rag.agent.core import llm_providers as llm_providers_module
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.finalization import FinishCandidateBuilder
@@ -331,6 +332,302 @@ async def test_long_session_projects_model_context_without_mutating_history() ->
     assert any("context_compaction" in message.content for message in request.messages)
     assert any("message-29" in message.content for message in request.messages)
     assert envelope.context_revision is not None
+
+
+@pytest.mark.anyio
+async def test_budget_projection_preserves_latest_failed_tool_pair_with_semantic_evidence() -> None:
+    gateway = _BudgetEnforcingRecordingGateway(max_input_tokens=650)
+    provider = _provider(
+        gateway,
+        names=(),
+        context_window_tokens=10_000,
+    )
+    state = _state("latest-failed-tool-pair")
+    state["plan_state"].agent_plan = AgentPlan(
+        objective="Fix the failing implementation.",
+        steps=[PlanStep(step_id="step_fix", title="Fix the implementation.")],
+    )
+    state["memory_state"].known_locators = [
+        {
+            "source_tool": "list_files",
+            "path": f"src/package/module_{index:02d}.py",
+            "name": f"module_{index:02d}.py",
+            "size_bytes": 1_024 + index,
+            "is_dir": False,
+        }
+        for index in range(40)
+    ]
+    state["memory_state"].verified_workspace_paths = [
+        str(locator["path"])
+        for locator in state["memory_state"].known_locators
+    ]
+    tool_call_id = "tc-latest-failure"
+    command_arguments = {
+        "command": "pytest -q",
+        "working_dir": ".",
+        "timeout_seconds": 120,
+        "workspace_write": False,
+    }
+    stdout = (
+        ("old noisy failure detail\n" * 1_000)
+        + "FAILED tests/agent/test_context.py::test_keeps_latest_pair - AssertionError\n"
+        + "1 failed, 20 passed\n"
+    )
+    stderr = ("diagnostic noise\n" * 500) + "final stderr evidence\n"
+    failed_result = ToolResult(
+        tool_call_id=tool_call_id,
+        tool_name="run_command",
+        structured_content={
+            "stdout": stdout,
+            "stderr": stderr,
+            "exit_code": 1,
+            "timed_out": False,
+            "truncated": True,
+            "duration_ms": 12.0,
+        },
+        is_error=True,
+        error_code="command_failed",
+        error_message="command exited with status 1",
+        retryable=False,
+    )
+    state["tool_results"] = [failed_result]
+    state["memory_state"].recent_observations = [
+        StructuredObservation(
+            tool_call_id=tool_call_id,
+            tool_name="run_command",
+            status="error",
+            error="command exited with status 1",
+            raw_result_ref=tool_call_id,
+        )
+    ]
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="Fix the implementation and verify it."),
+        ModelMessage(
+            role="assistant",
+            content=("old context " * 600) + "old-history-marker",
+        ),
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=tool_call_id,
+                    name="run_command",
+                    input=command_arguments,
+                ),
+            ),
+        ),
+        tool_result_message(failed_result),
+    ]
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    wire = serialize_openai_request(request).serialized_json
+    assert gateway.token_accounting.count(wire) <= gateway.max_input_tokens
+    assistant = next(
+        message
+        for message in request.messages
+        if any(call.id == tool_call_id for call in message.tool_calls)
+    )
+    tool_message = next(
+        message
+        for message in request.messages
+        if message.role == "tool" and message.tool_call_id == tool_call_id
+    )
+    assert assistant.tool_calls[0].input == command_arguments
+    payload = json.loads(tool_message.content)
+    assert payload["error_code"] == "command_failed"
+    assert payload["truncated"] is True
+    projection = payload["structured_content"]["tool_result_projection"]
+    assert projection["exit_code"] == 1
+    assert projection["failed_tests"] == [
+        "tests/agent/test_context.py::test_keeps_latest_pair"
+    ]
+    assert projection["stdout_tail"].endswith("1 failed, 20 passed\n")
+    assert projection["stderr_tail"].endswith("final stderr evidence\n")
+    assert projection["source_truncated"] is True
+    assert projection["projection_truncated"] is True
+    assert "old-history-marker" not in wire
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in request.messages
+    )
+    working_state = next(
+        json.loads(message.content)["payload"]["runtime_evidence"]
+        for message in request.messages
+        if '"event_type":"working_state"' in message.content
+    )
+    assert working_state["recent_observations"] == []
+
+
+@pytest.mark.anyio
+async def test_repeated_failure_keeps_original_semantic_evidence_chain() -> None:
+    gateway = _BudgetEnforcingRecordingGateway(max_input_tokens=1_020)
+    provider = _provider(
+        gateway,
+        names=(
+            "search_text",
+            "list_files",
+            "read_file",
+            "apply_patch",
+            "run_command",
+            "update_plan",
+            "invoke_skill",
+            "materialize_skill_asset",
+            "find_tools",
+        ),
+        context_window_tokens=10_000,
+    )
+    state = _state("repeated-failure-evidence-chain")
+    state["plan_state"].agent_plan = AgentPlan(
+        objective="Recover from the failed verification.",
+        steps=[PlanStep(step_id="step_recover", title="Recover.")],
+    )
+    state["memory_state"].verified_workspace_paths = [
+        f"src/package/verified module number {index:02d}.py"
+        for index in range(80)
+    ]
+    original_id = "tc-original-failure"
+    repeated_id = "tc-repeated-failure"
+    command_arguments = {
+        "command": "pytest -q",
+        "working_dir": ".",
+        "timeout_seconds": 120,
+        "workspace_write": False,
+    }
+    original_result = ToolResult(
+        tool_call_id=original_id,
+        tool_name="run_command",
+        structured_content={
+            "stdout": (
+                ("failure noise\n" * 1_000)
+                + "FAILED tests/agent/test_context.py::test_original_evidence - AssertionError\n"
+                + "1 failed, 20 passed\n"
+            ),
+            "stderr": "final original stderr\n",
+            "exit_code": 1,
+            "timed_out": False,
+            "truncated": True,
+        },
+        is_error=True,
+        error_code="command_failed",
+        error_message="command exited with status 1",
+        retryable=False,
+    )
+    repeated_result = ToolResult(
+        tool_call_id=repeated_id,
+        tool_name="run_command",
+        structured_content={
+            "repeated_failure": True,
+            "original_tool_call_id": original_id,
+            "repeat_count": 2,
+        },
+        is_error=True,
+        error_code="repeated_tool_failure",
+        error_message="Repeated identical tool call blocked.",
+        retryable=False,
+    )
+    state["tool_results"] = [original_result, repeated_result]
+    state["memory_state"].recent_observations = [
+        StructuredObservation(
+            tool_call_id=original_id,
+            tool_name="run_command",
+            status="error",
+            error="command exited with status 1",
+            raw_result_ref=original_id,
+        ),
+        StructuredObservation(
+            tool_call_id=repeated_id,
+            tool_name="run_command",
+            status="error",
+            error="Repeated identical tool call blocked.",
+            raw_result_ref=repeated_id,
+        ),
+    ]
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="Fix the implementation and verify it."),
+        ModelMessage(
+            role="assistant",
+            content=("old inspection " * 600) + "obsolete-inspection-tail",
+        ),
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=original_id,
+                    name="run_command",
+                    input=command_arguments,
+                ),
+            ),
+        ),
+        tool_result_message(original_result),
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=repeated_id,
+                    name="run_command",
+                    input=command_arguments,
+                ),
+            ),
+        ),
+        tool_result_message(repeated_result),
+    ]
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    wire = serialize_openai_request(request).serialized_json
+    assert gateway.token_accounting.count(wire) <= gateway.max_input_tokens
+    assert "obsolete-inspection-tail" not in wire
+    assert {
+        call.id
+        for message in request.messages
+        for call in message.tool_calls
+    } >= {original_id, repeated_id}
+    tool_messages = {
+        message.tool_call_id: json.loads(message.content)
+        for message in request.messages
+        if message.role == "tool"
+    }
+    original_projection = tool_messages[original_id]["structured_content"][
+        "tool_result_projection"
+    ]
+    assert original_projection["failed_tests"] == [
+        "tests/agent/test_context.py::test_original_evidence"
+    ]
+    assert tool_messages[repeated_id]["error_code"] == "repeated_tool_failure"
+
+
+def test_arbitrary_tool_failure_cannot_pin_an_old_tool_pair() -> None:
+    message = tool_result_message(
+        ToolResult(
+            tool_call_id="tc-current",
+            tool_name="untrusted_tool",
+            structured_content={
+                "original_tool_call_id": "tc-old",
+            },
+            is_error=True,
+            error_code="tool_reported_failure",
+            error_message="failed",
+        )
+    )
+
+    assert (
+        llm_providers_module._referenced_original_tool_call_id(message)
+        is None
+    )
 
 
 @pytest.mark.anyio
@@ -891,6 +1188,50 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
 
 
 @pytest.mark.anyio
+async def test_working_state_omits_path_only_locators_already_grounded() -> None:
+    gateway = _RecordingGateway()
+    state = _state("typed-working-state-deduplicated-locators")
+    state["memory_state"].known_locators = [
+        {
+            "source_tool": "list_files",
+            "path": "rag/agent/core/llm_providers.py",
+            "name": "llm_providers.py",
+            "size_bytes": 24_000,
+            "is_dir": False,
+        },
+        {
+            "source_tool": "search_text",
+            "path": "rag/agent/core/llm_providers.py",
+            "line_number": 263,
+        },
+    ]
+
+    await _provider(gateway, names=()).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    working_state = next(
+        message
+        for message in request.messages
+        if '"event_type":"working_state"' in message.content
+    )
+    evidence = json.loads(working_state.content)["payload"]["runtime_evidence"]
+    assert evidence["grounded_paths"] == ["rag/agent/core/llm_providers.py"]
+    assert evidence["known_locator_count"] == 2
+    assert evidence["known_locators_compacted"] is True
+    assert evidence["known_locators"] == [
+        {
+            "source_tool": "search_text",
+            "path": "rag/agent/core/llm_providers.py",
+            "line_number": 263,
+        }
+    ]
+
+
+@pytest.mark.anyio
 async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
     gateway = _RecordingGateway()
     goal = GoalSpec(
@@ -1138,7 +1479,7 @@ async def test_working_state_bounds_path_projection_without_losing_truth() -> No
     payload = json.loads(working_state.content)["payload"]["runtime_evidence"]
     assert payload["grounded_path_count"] == 260
     assert payload["grounded_paths_truncated"] is True
-    assert len(payload["grounded_paths"]) == 200
+    assert len(payload["grounded_paths"]) == 32
     assert verified_paths[0] not in payload["grounded_paths"]
     assert verified_paths[-1] in payload["grounded_paths"]
     assert "unverified_plan_targets" not in payload

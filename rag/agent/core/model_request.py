@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -29,6 +31,9 @@ from rag.schema.llm import LLMUsage
 CANONICAL_REQUEST_REVISION = "canonical-model-request-v1"
 STABLE_CONTEXT_REVISION = "stable-model-context-v1"
 COMPACTION_REVISION = "context-compaction-v1"
+_MAX_PROJECTED_STREAM_TAIL_CHARS = 2_000
+_MAX_PROJECTED_FAILED_TESTS = 12
+_MIN_PROJECTED_TOOL_RESULT_CHARS = 512
 
 
 class ToolChoiceMode(StrEnum):
@@ -250,12 +255,14 @@ class StableModelContext:
         *,
         tail_start: int,
         max_summary_chars: int,
+        project_tool_results: bool = False,
     ) -> StableModelContext:
         projected = project_transcript_compaction(
             self.transcript,
             parent_context_revision=self.context_revision,
             tail_start=tail_start,
             max_summary_chars=max_summary_chars,
+            project_tool_results=project_tool_results,
         )
         if projected == self.transcript:
             return self
@@ -668,6 +675,7 @@ def project_transcript_compaction(
     parent_context_revision: str,
     tail_start: int,
     max_summary_chars: int,
+    project_tool_results: bool = False,
 ) -> tuple[ModelMessage, ...]:
     """Project a smaller canonical transcript with a verifiable compaction event."""
 
@@ -695,8 +703,13 @@ def project_transcript_compaction(
 
     actual_tail_start = _extend_tail_for_tool_pair(messages, tail_start)
     covered = messages[:actual_tail_start]
-    tail = messages[actual_tail_start:]
-    if not covered:
+    source_tail = messages[actual_tail_start:]
+    tail, projected_tool_result_count = _project_tool_result_messages(
+        source_tail,
+        max_chars=max_summary_chars,
+        enabled=project_tool_results,
+    )
+    if not covered and projected_tool_result_count == 0:
         return messages
     summary_limit = min(max_summary_chars, 12_000)
     summary = _deterministic_transcript_summary(
@@ -714,6 +727,11 @@ def project_transcript_compaction(
             tuple(model_message_payload(message) for message in tail)
         ),
     }
+    if projected_tool_result_count:
+        projection = {
+            **projection,
+            "projected_tool_result_count": projected_tool_result_count,
+        }
     event = context_event_message(
         "context_compaction",
         {
@@ -846,6 +864,135 @@ def _deterministic_transcript_summary(
     if len(summary) <= max_chars:
         return summary
     return summary[:max_chars].rstrip() + " [truncated]"
+
+
+def _project_tool_result_messages(
+    messages: tuple[ModelMessage, ...],
+    *,
+    max_chars: int,
+    enabled: bool,
+) -> tuple[tuple[ModelMessage, ...], int]:
+    if not enabled:
+        return messages, 0
+    projected: list[ModelMessage] = []
+    projected_count = 0
+    for message in messages:
+        candidate = _project_tool_result_message(
+            message,
+            max_chars=max_chars,
+        )
+        projected.append(candidate)
+        if candidate != message:
+            projected_count += 1
+    return tuple(projected), projected_count
+
+
+def _project_tool_result_message(
+    message: ModelMessage,
+    *,
+    max_chars: int,
+) -> ModelMessage:
+    if (
+        message.role != "tool"
+        or message.tool_call_id is None
+        or len(message.content) <= max_chars
+    ):
+        return message
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return message
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("is_error") is not True
+    ):
+        return message
+
+    structured = payload.get("structured_content")
+    structured_mapping = (
+        structured
+        if isinstance(structured, Mapping)
+        else {}
+    )
+    stdout = _string_value(structured_mapping.get("stdout"))
+    stderr = _string_value(structured_mapping.get("stderr"))
+    projection_budget = max(
+        max_chars,
+        _MIN_PROJECTED_TOOL_RESULT_CHARS,
+    )
+    stream_tail_chars = min(
+        _MAX_PROJECTED_STREAM_TAIL_CHARS,
+        max(1, (projection_budget - 256) // 2),
+    )
+    projection: dict[str, JsonValue] = {
+        "exit_code": _json_scalar(
+            structured_mapping.get("exit_code")
+        ),
+        "timed_out": _json_scalar(
+            structured_mapping.get("timed_out")
+        ),
+        "failed_tests": _failed_test_names(stdout, stderr),
+        "stdout_tail": stdout[-stream_tail_chars:] if stream_tail_chars else "",
+        "stderr_tail": stderr[-stream_tail_chars:] if stream_tail_chars else "",
+        "source_truncated": bool(
+            payload.get("truncated")
+            or structured_mapping.get("truncated")
+        ),
+        "projection_truncated": True,
+    }
+    if not structured_mapping and structured is not None:
+        rendered = canonical_json_text(structured)
+        projection["output_tail"] = (
+            rendered[-stream_tail_chars:]
+            if stream_tail_chars
+            else ""
+        )
+    projected_payload: Mapping[str, JsonValue] = {
+        "content": (),
+        "structured_content": {
+            "tool_result_projection": projection,
+        },
+        "is_error": payload.get("is_error") is True,
+        "error_code": _json_scalar(payload.get("error_code")),
+        "error_message": _json_scalar(payload.get("error_message")),
+        "retryable": payload.get("retryable") is True,
+        "truncated": True,
+    }
+    candidate = ModelMessage(
+        role="tool",
+        content=canonical_json_text(projected_payload),
+        tool_call_id=message.tool_call_id,
+    )
+    return candidate if len(candidate.content) < len(message.content) else message
+
+
+def _failed_test_names(stdout: str, stderr: str) -> tuple[str, ...]:
+    combined = f"{stdout}\n{stderr}"
+    selected: dict[str, None] = {}
+    patterns = (
+        r"(?m)^(?:FAILED|ERROR)\s+([^\s]+)",
+        r"(?m)^FAIL:\s+([^\r\n]+)",
+        r"(?m)^\s*●\s+([^\r\n]+)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, combined):
+            name = match.group(1).strip()
+            if not name:
+                continue
+            selected.setdefault(name, None)
+            if len(selected) >= _MAX_PROJECTED_FAILED_TESTS:
+                return tuple(selected)
+    return tuple(selected)
+
+
+def _string_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _json_scalar(value: object) -> JsonValue:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
 
 
 def _model_messages_size(messages: Sequence[ModelMessage]) -> int:

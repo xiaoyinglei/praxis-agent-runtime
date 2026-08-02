@@ -384,6 +384,41 @@ def test_compaction_closes_the_old_revision_and_creates_a_new_one() -> None:
     assert context.transcript == tuple(ModelMessage(role="assistant", content=f"turn-{index}") for index in range(3))
 
 
+def test_failure_projection_does_not_erase_large_successful_tool_result() -> None:
+    call_id = "call_read_large_success"
+    context = _context().append_message(
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=call_id,
+                    name="read_file",
+                    input={"path": "large.txt"},
+                ),
+            ),
+        )
+    ).append_tool_result(
+        ToolResult(
+            tool_call_id=call_id,
+            tool_name="read_file",
+            structured_content={
+                "path": "large.txt",
+                "text": "successful file content\n" * 1_000,
+            },
+        )
+    )
+
+    projected = context.project_compaction(
+        tail_start=0,
+        max_summary_chars=512,
+        project_tool_results=True,
+    )
+
+    assert projected == context
+    assert "successful file content" in projected.transcript[-1].content
+
+
 def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
     block_content: dict[str, JsonValue] = {"paths": ["src"]}
     arguments = {"path": "README.md"}

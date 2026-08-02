@@ -1202,6 +1202,12 @@ async def test_repeated_tool_failure_circuit_uses_checkpointed_history() -> None
     assert result["status"] == "completed"
     assert attempts == ["stuck", "stuck", "recovered"]
     assert result["tool_results"][-2].error_code == "repeated_tool_failure"
+    assert result["tool_results"][-2].structured_content == {
+        "repeated_failure": True,
+        "original_tool_call_id": first.tool_call_id,
+        "failure_count": 2,
+        "last_error_code": "runner_failed",
+    }
 
 
 @pytest.mark.anyio

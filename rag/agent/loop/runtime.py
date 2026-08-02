@@ -1491,6 +1491,14 @@ def _guard_repeated_tool_failures(
                     "finish with the available evidence."
                 ),
                 retryable=False,
+                structured_content={
+                    "repeated_failure": True,
+                    "original_tool_call_id": failures[0].tool_call_id,
+                    "failure_count": len(failures),
+                    "last_error_code": (
+                        failures[-1].error_code or "unknown"
+                    ),
+                },
                 metadata={
                     "failure_count": len(failures),
                     "last_error_code": failures[-1].error_code or "unknown",

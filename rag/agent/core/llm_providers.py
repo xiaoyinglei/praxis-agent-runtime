@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, cast
 
@@ -46,7 +47,23 @@ from rag.providers.llm_gateway import (
 )
 from rag.schema.llm import LLMCallStage
 
-_MAX_WORKING_STATE_GROUNDED_PATHS = 200
+_MAX_WORKING_STATE_GROUNDED_PATHS = 32
+_MAX_WORKING_STATE_LOCATORS = 32
+_REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
+_PATH_ONLY_LOCATOR_FIELDS = frozenset(
+    {
+        "source_tool",
+        "path",
+        "name",
+        "mime_type",
+        "size_bytes",
+        "is_dir",
+        "file_kind",
+        "is_binary",
+        "readable_as_text",
+        "truncated",
+    }
+)
 
 
 class LoopModelDecision(BaseModel):
@@ -385,19 +402,26 @@ def _project_model_context(
             len(context.transcript),
         )
     )
-    if maximum_tail_start <= 0:
-        return context
+    latest_tool_pair_start = _latest_tool_pair_start(
+        context.transcript
+    )
+    if latest_tool_pair_start is not None:
+        maximum_tail_start = min(
+            maximum_tail_start,
+            latest_tool_pair_start,
+        )
 
     best = context
     best_tokens = current_tokens
     summary_limits = _projection_summary_limits(
         max_summary_chars
     )
-    for tail_start in range(1, maximum_tail_start + 1):
+    for tail_start in range(0, maximum_tail_start + 1):
         for summary_limit in summary_limits:
             candidate = context.project_compaction(
                 tail_start=tail_start,
                 max_summary_chars=summary_limit,
+                project_tool_results=True,
             )
             if candidate == context:
                 continue
@@ -408,6 +432,78 @@ def _project_model_context(
             if candidate_tokens <= max_input_tokens:
                 return candidate
     return best
+
+
+def _latest_tool_pair_start(
+    transcript: Sequence[ModelMessage],
+) -> int | None:
+    for tool_index in range(len(transcript) - 1, -1, -1):
+        tool_message = transcript[tool_index]
+        if (
+            tool_message.role != "tool"
+            or tool_message.tool_call_id is None
+        ):
+            continue
+        for assistant_index in range(tool_index - 1, -1, -1):
+            assistant_message = transcript[assistant_index]
+            if any(
+                call.id == tool_message.tool_call_id
+                for call in assistant_message.tool_calls
+            ):
+                original_call_id = (
+                    _referenced_original_tool_call_id(
+                        tool_message
+                    )
+                )
+                if original_call_id is None:
+                    return assistant_index
+                original_index = _assistant_tool_call_index(
+                    transcript[:assistant_index],
+                    original_call_id,
+                )
+                return (
+                    assistant_index
+                    if original_index is None
+                    else original_index
+                )
+        return tool_index
+    return None
+
+
+def _referenced_original_tool_call_id(
+    message: ModelMessage,
+) -> str | None:
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("is_error") is not True
+        or payload.get("error_code") != _REPEATED_TOOL_FAILURE_CODE
+    ):
+        return None
+    structured = payload.get("structured_content")
+    if (
+        not isinstance(structured, Mapping)
+        or structured.get("repeated_failure") is not True
+    ):
+        return None
+    original = structured.get("original_tool_call_id")
+    return original if isinstance(original, str) and original else None
+
+
+def _assistant_tool_call_index(
+    transcript: Sequence[ModelMessage],
+    tool_call_id: str,
+) -> int | None:
+    for index in range(len(transcript) - 1, -1, -1):
+        if any(
+            call.id == tool_call_id
+            for call in transcript[index].tool_calls
+        ):
+            return index
+    return None
 
 
 def _projection_summary_limits(
@@ -431,6 +527,11 @@ def _working_state_message(
 ) -> ModelMessage | None:
     memory_state = state["memory_state"]
     plan = state["plan_state"].agent_plan
+    protected_tool_call_ids = (
+        _protected_transcript_tool_call_ids(
+            state["turn_transcript"]
+        )
+    )
     workspace_change_tool_call_ids = tuple(
         result.tool_call_id
         for result in state["tool_results"]
@@ -526,6 +627,9 @@ def _working_state_message(
     grounded_paths = _project_grounded_workspace_paths(
         verified_grounded_paths,
     )
+    known_locators = _project_working_locators(
+        memory_state.known_locators,
+    )
     return context_event_message(
         "working_state",
         {
@@ -556,10 +660,21 @@ def _working_state_message(
                         "warnings": tuple(observation.warnings),
                     }
                     for observation in memory_state.recent_observations
+                    if (
+                        observation.tool_call_id
+                        not in protected_tool_call_ids
+                    )
                 ),
                 "known_locators": tuple(
                     cast(Mapping[str, JsonValue], locator)
-                    for locator in memory_state.known_locators
+                    for locator in known_locators
+                ),
+                "known_locator_count": len(
+                    memory_state.known_locators
+                ),
+                "known_locators_compacted": (
+                    len(known_locators)
+                    < len(memory_state.known_locators)
                 ),
                 "workspace_change_tool_call_ids": tuple(
                     workspace_change_tool_call_ids
@@ -593,6 +708,37 @@ def _project_grounded_workspace_paths(
         if len(selected) >= _MAX_WORKING_STATE_GROUNDED_PATHS:
             break
     return tuple(selected)
+
+
+def _project_working_locators(
+    locators: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    precise = tuple(
+        locator
+        for locator in locators
+        if not set(locator).issubset(
+            _PATH_ONLY_LOCATOR_FIELDS
+        )
+    )
+    if len(precise) <= _MAX_WORKING_STATE_LOCATORS:
+        return precise
+    return precise[-_MAX_WORKING_STATE_LOCATORS:]
+
+
+def _protected_transcript_tool_call_ids(
+    transcript: Sequence[ModelMessage],
+) -> frozenset[str]:
+    protected_start = _latest_tool_pair_start(transcript)
+    if protected_start is None:
+        return frozenset()
+    return frozenset(
+        message.tool_call_id
+        for message in transcript[protected_start:]
+        if (
+            message.role == "tool"
+            and message.tool_call_id is not None
+        )
+    )
 
 
 def _record_request_sizes(state: LoopState, request: ModelRequest) -> None:
