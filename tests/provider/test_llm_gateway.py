@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
@@ -208,6 +209,33 @@ class _RejectedToolCallGenerator:
                 '<function=read_file>{"path":"README.md",'
                 '"max_bytes":2000000}</function>'
             ),
+        }
+        raise error
+
+
+class _StructuredRejectedToolCallGenerator:
+    def generate_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMProviderResult[dict[str, object]]:
+        del messages, tools, kwargs
+        error = RuntimeError("provider rejected generated tool call")
+        error.body = {  # type: ignore[attr-defined]
+            "error": {
+                "message": "Tool call validation failed: invalid arguments",
+                "code": "tool_use_failed",
+                "failed_generation": {
+                    "reason": "schema_validation",
+                    "tool_call_id": "call_read_file",
+                    "attempted_arguments": {
+                        "path": "README.md",
+                        "line_start": 20,
+                    },
+                },
+            }
         }
         raise error
 
@@ -732,6 +760,31 @@ async def test_gateway_normalizes_provider_tool_call_validation_failure() -> Non
 
     assert "max_bytes exceeds maximum" in exc_info.value.validation_error
     assert '"max_bytes":2000000' in exc_info.value.failed_generation
+
+
+@pytest.mark.anyio
+async def test_gateway_preserves_structured_failed_generation() -> None:
+    with pytest.raises(LLMToolCallValidationError) as exc_info:
+        await _gateway(
+            _StructuredRejectedToolCallGenerator(),
+            max_input_tokens=2_000,
+            model_context_tokens=4_000,
+        ).agenerate_model_request(
+            stage=LLMCallStage.TOOL_DECISION,
+            request=_canonical_request(),
+            provider="openai-compatible",
+            supports_native_tools=True,
+        )
+
+    failed_generation = json.loads(exc_info.value.failed_generation)
+    assert failed_generation == {
+        "attempted_arguments": {
+            "line_start": 20,
+            "path": "README.md",
+        },
+        "reason": "schema_validation",
+        "tool_call_id": "call_read_file",
+    }
 
 
 @pytest.mark.anyio

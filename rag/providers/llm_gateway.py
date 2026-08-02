@@ -1094,6 +1094,16 @@ def _tool_call_validation_error(
             code = raw_code
         if isinstance(raw_generation, str):
             failed_generation = raw_generation
+        elif raw_generation is not None:
+            try:
+                failed_generation = json.dumps(
+                    raw_generation,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                failed_generation = ""
 
     fallback = str(exc)
     searchable = f"{code} {message} {fallback}".casefold()

@@ -26,6 +26,7 @@ from rag.agent.core.messages import (
     ModelMessage,
     StopReason,
     ToolUseResult,
+    context_event_message,
     tool_result_message,
 )
 from rag.agent.core.messages import (
@@ -47,6 +48,8 @@ from rag.agent.loop.stop_hooks import StopHookRunner
 from rag.agent.memory.compactor import LoopContextCompactor
 from rag.agent.memory.injector import ContextBuilder
 from rag.agent.memory.models import MemoryPolicy
+from rag.agent.tools.builtins.filesystem import ReadFileInput
+from rag.agent.tools.builtins.shell import RunCommandInput
 from rag.agent.tools.executor import ToolExecutor
 from rag.agent.tools.permissions import ToolExecutionContext
 from rag.agent.tools.tool import (
@@ -60,6 +63,7 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     ToolResult,
     json_schema_input,
+    pydantic_input,
 )
 from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 from rag.providers.llm_gateway import (
@@ -232,6 +236,21 @@ def _tool(name: str) -> Tool:
     )
 
 
+def _tool_with_schema(
+    name: str,
+    schema: Mapping[str, JsonValue],
+) -> Tool:
+    return replace(
+        _tool(name),
+        definition=ToolDefinition(
+            name=name,
+            description=f"Use {name}.",
+            input_schema=schema,
+        ),
+        validate_input=json_schema_input(schema),
+    )
+
+
 def _provider(
     gateway: _RecordingGateway,
     *,
@@ -332,6 +351,174 @@ async def test_long_session_projects_model_context_without_mutating_history() ->
     assert any("context_compaction" in message.content for message in request.messages)
     assert any("message-29" in message.content for message in request.messages)
     assert envelope.context_revision is not None
+
+
+@pytest.mark.anyio
+async def test_tool_rejection_projects_read_file_schema_delta_without_raw_generation() -> None:
+    read_file_schema, _ = pydantic_input(ReadFileInput)
+    gateway = _RecordingGateway()
+    provider = LLMLoopModelTurnProvider(
+        gateway,  # type: ignore[arg-type]
+        model="test-model",
+        provider="openai-compatible",
+        supports_native_tools=True,
+        registry_snapshot={
+            "read_file": _tool_with_schema("read_file", read_file_schema)
+        },
+        resident_tool_names=("read_file",),
+    )
+    state = _state("read-file-tool-correction")
+    rejected_generation = (
+        '{"name":"read_file","arguments":{"path":"tests/test_agent.py",'
+        '"line_start":300,"line_end":380,"encoding":"utf-8"}}'
+    )
+    state["turn_transcript"].append(
+        context_event_message(
+            "model_tool_call_rejected",
+            {
+                "recovery": "correct_tool_arguments",
+                "validation_error": (
+                    "Tool call validation failed: additional properties "
+                    "line_start and line_end are not allowed"
+                ),
+                "failed_generation": rejected_generation,
+            },
+        )
+    )
+    canonical_transcript = list(state["turn_transcript"])
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    correction_messages = [
+        message
+        for message in request.messages
+        if '"event_type":"tool_call_correction"' in message.content
+    ]
+    assert len(correction_messages) == 1
+    correction = json.loads(correction_messages[0].content)["payload"]
+    assert correction["attempt_count"] == 1
+    assert correction["failure_kind"] == "schema_validation"
+    assert correction["tool_name"] == "read_file"
+    assert correction["required_argument_names"] == ["path"]
+    assert correction["rejected_argument_names"] == [
+        "line_end",
+        "line_start",
+    ]
+    assert correction["allowed_argument_names"] == [
+        "encoding",
+        "max_bytes",
+        "max_lines",
+        "offset",
+        "path",
+        "start_line",
+    ]
+    assert correction["additional_properties_allowed"] is False
+    assert correction["failed_generation_chars"] == len(rejected_generation)
+    assert len(correction["failed_generation_sha256"]) == 64
+    assert rejected_generation not in correction_messages[0].content
+    assert not any(
+        '"event_type":"model_tool_call_rejected"' in message.content
+        for message in request.messages
+    )
+    assert state["turn_transcript"] == canonical_transcript
+
+
+@pytest.mark.anyio
+async def test_duplicate_invalid_json_rejections_become_one_actionable_correction() -> None:
+    run_command_schema, _ = pydantic_input(RunCommandInput)
+    gateway = _RecordingGateway()
+    provider = LLMLoopModelTurnProvider(
+        gateway,  # type: ignore[arg-type]
+        model="test-model",
+        provider="openai-compatible",
+        supports_native_tools=True,
+        registry_snapshot={
+            "run_command": _tool_with_schema(
+                "run_command",
+                run_command_schema,
+            )
+        },
+        resident_tool_names=("run_command",),
+    )
+    state = _state("invalid-json-tool-correction")
+    state["plan_state"].agent_plan = AgentPlan(
+        objective="Repair the tool call and continue the task.",
+        steps=[PlanStep(step_id="repair", title="Repair the tool call.")],
+    )
+    historical = context_event_message(
+        "model_tool_call_rejected",
+        {
+            "recovery": "correct_tool_arguments",
+            "validation_error": "earlier schema failure",
+            "failed_generation": (
+                '<function=run_command>{"command":"pytest -q"}</function>'
+            ),
+        },
+    )
+    malformed = (
+        '{"name":"run_command","arguments":{"command":"pytest -q"],'
+        '"timeout_seconds":600,"working_dir":"."}}'
+    )
+    rejected = context_event_message(
+        "model_tool_call_rejected",
+        {
+            "recovery": "correct_tool_arguments",
+            "validation_error": "Failed to parse tool call arguments as JSON",
+            "failed_generation": malformed,
+        },
+    )
+    state["turn_transcript"].extend(
+        [
+            historical,
+            ModelMessage(role="assistant", content="Recovered and continued."),
+            rejected,
+            rejected,
+        ]
+    )
+    canonical_transcript = list(state["turn_transcript"])
+
+    await provider.next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    correction_messages = [
+        message
+        for message in request.messages
+        if '"event_type":"tool_call_correction"' in message.content
+    ]
+    assert len(correction_messages) == 1
+    correction = json.loads(correction_messages[0].content)["payload"]
+    assert correction["attempt_count"] == 2
+    assert correction["failure_kind"] == "invalid_json"
+    assert correction["tool_name"] == "run_command"
+    assert correction["required_argument_names"] == ["command"]
+    assert correction["rejected_argument_names"] == []
+    assert correction["allowed_argument_names"] == [
+        "command",
+        "network",
+        "timeout_seconds",
+        "working_dir",
+        "workspace_write",
+    ]
+    assert correction_messages[0] == request.messages[-1]
+    assert any(
+        '"event_type":"working_state"' in message.content
+        for message in request.messages[:-1]
+    )
+    assert malformed not in correction_messages[0].content
+    assert not any(
+        '"event_type":"model_tool_call_rejected"' in message.content
+        for message in request.messages
+    )
+    assert state["turn_transcript"] == canonical_transcript
 
 
 @pytest.mark.anyio

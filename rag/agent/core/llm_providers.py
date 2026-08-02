@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal, cast
 
@@ -50,6 +51,8 @@ from rag.schema.llm import LLMCallStage
 _MAX_WORKING_STATE_GROUNDED_PATHS = 32
 _MAX_WORKING_STATE_LOCATORS = 32
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
+_MODEL_TOOL_CALL_REJECTED_EVENT = "model_tool_call_rejected"
+_TOOL_CALL_CORRECTION_EVENT = "tool_call_correction"
 _PATH_ONLY_LOCATOR_FIELDS = frozenset(
     {
         "source_tool",
@@ -226,6 +229,12 @@ class LLMLoopModelTurnProvider:
             conversation_history=state["conversation_history"],
             turn_transcript=state["turn_transcript"],
         )
+        context_transcript, tool_call_correction = (
+            _project_tool_call_correction_context(
+                context_transcript,
+                selected_tools=selected_tools,
+            )
+        )
         context = build_stable_context(
             instructions=tuple(instructions),
             frozen_run_context=tuple(frozen_run_context),
@@ -238,6 +247,8 @@ class LLMLoopModelTurnProvider:
         )
         if working_state is not None:
             context = context.append_message(working_state)
+        if tool_call_correction is not None:
+            context = context.append_message(tool_call_correction)
         context_limit = (
             state["run_config"].max_context_tokens
             or self._context_window_tokens
@@ -375,6 +386,226 @@ class LLMLoopModelTurnProvider:
         if not callable(emit):
             return
         await emit(text_delta(value))
+
+
+def _project_tool_call_correction_context(
+    transcript: Sequence[ModelMessage],
+    *,
+    selected_tools: Sequence[Tool],
+) -> tuple[tuple[ModelMessage, ...], ModelMessage | None]:
+    """Replace trailing provider rejections with one schema-derived retry hint.
+
+    The checkpoint transcript remains append-only.  This projection is only for
+    the next model request, so raw rejected generations stay available for
+    diagnostics without teaching the model to copy them.
+    """
+
+    rejection_payloads = tuple(
+        _tool_call_rejection_payload(message) for message in transcript
+    )
+    trailing: list[Mapping[str, object]] = []
+    for payload in reversed(rejection_payloads):
+        if payload is None:
+            break
+        trailing.append(payload)
+    retained = tuple(
+        message
+        for message, payload in zip(
+            transcript,
+            rejection_payloads,
+            strict=True,
+        )
+        if payload is None
+    )
+    if not trailing:
+        return retained, None
+    trailing.reverse()
+    return retained, context_event_message(
+        _TOOL_CALL_CORRECTION_EVENT,
+        _tool_call_correction_payload(
+            trailing,
+            selected_tools=selected_tools,
+        ),
+    )
+
+
+def _tool_call_rejection_payload(
+    message: ModelMessage,
+) -> Mapping[str, object] | None:
+    if message.role != "context":
+        return None
+    try:
+        event = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(event, Mapping)
+        or event.get("event_type") != _MODEL_TOOL_CALL_REJECTED_EVENT
+    ):
+        return None
+    payload = event.get("payload")
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _tool_call_correction_payload(
+    rejections: Sequence[Mapping[str, object]],
+    *,
+    selected_tools: Sequence[Tool],
+) -> Mapping[str, JsonValue]:
+    latest = rejections[-1]
+    failed_generation = latest.get("failed_generation")
+    raw = failed_generation if isinstance(failed_generation, str) else ""
+    validation_error_value = latest.get("validation_error")
+    validation_error = (
+        validation_error_value[:1_000]
+        if isinstance(validation_error_value, str)
+        else "Provider rejected the generated tool call."
+    )
+    if raw and raw in validation_error:
+        validation_error = validation_error.replace(
+            raw,
+            "[rejected generation omitted]",
+        )
+
+    tools_by_name = {
+        tool.definition.name: tool for tool in selected_tools
+    }
+    tool_name, attempted_arguments, failure_kind = (
+        _inspect_rejected_tool_generation(
+            raw,
+            selected_tool_names=frozenset(tools_by_name),
+        )
+    )
+    selected = tools_by_name.get(tool_name or "")
+    allowed_names: tuple[str, ...] = ()
+    required_names: tuple[str, ...] = ()
+    additional_properties_allowed: bool | None = None
+    if selected is not None:
+        schema = selected.definition.input_schema
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            allowed_names = tuple(
+                sorted(
+                    name
+                    for name in properties
+                    if isinstance(name, str)
+                )
+            )
+        required = schema.get("required")
+        if isinstance(required, Sequence) and not isinstance(
+            required,
+            (str, bytes),
+        ):
+            required_names = tuple(
+                sorted(
+                    name
+                    for name in required
+                    if isinstance(name, str)
+                )
+            )
+        additional_properties_allowed = (
+            schema.get("additionalProperties", True) is not False
+        )
+    rejected_names = (
+        ()
+        if selected is None or attempted_arguments is None
+        else tuple(
+            sorted(
+                name
+                for name in attempted_arguments
+                if isinstance(name, str) and name not in allowed_names
+            )
+        )
+    )
+    return {
+        "recovery": "retry_native_tool_call",
+        "instruction": (
+            "Retry one native tool call with a strict JSON object. Use only "
+            "argument names allowed by the attached tool schema; do not copy "
+            "the rejected generation."
+        ),
+        "attempt_count": len(rejections),
+        "failure_kind": failure_kind,
+        "tool_name": tool_name,
+        "allowed_argument_names": allowed_names,
+        "required_argument_names": required_names,
+        "rejected_argument_names": rejected_names,
+        "additional_properties_allowed": additional_properties_allowed,
+        "validation_error": validation_error,
+        "failed_generation_chars": len(raw),
+        "failed_generation_sha256": (
+            hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if raw
+            else None
+        ),
+    }
+
+
+def _inspect_rejected_tool_generation(
+    value: str,
+    *,
+    selected_tool_names: frozenset[str],
+) -> tuple[str | None, Mapping[str, object] | None, str]:
+    text = value.strip()
+    tool_name: str | None = None
+    arguments: Mapping[str, object] | None = None
+    parsed_json = False
+    candidate = text
+
+    if text.startswith("<function=") and text.endswith("</function>"):
+        header_end = text.find(">")
+        if header_end > len("<function="):
+            tool_name = text[len("<function=") : header_end]
+            candidate = text[header_end + 1 : -len("</function>")]
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+        parsed = None
+    else:
+        parsed_json = True
+
+    if isinstance(parsed, Mapping):
+        function = parsed.get("function")
+        envelope = function if isinstance(function, Mapping) else parsed
+        candidate_name = envelope.get("name")
+        if not isinstance(candidate_name, str):
+            candidate_name = envelope.get("tool_name")
+        if isinstance(candidate_name, str):
+            tool_name = candidate_name
+        raw_arguments = envelope.get("arguments")
+        if raw_arguments is None:
+            raw_arguments = envelope.get("attempted_arguments")
+        if isinstance(raw_arguments, Mapping):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, str):
+            try:
+                decoded_arguments = json.loads(raw_arguments)
+            except (TypeError, ValueError):
+                parsed_json = False
+            else:
+                if isinstance(decoded_arguments, Mapping):
+                    arguments = decoded_arguments
+                else:
+                    parsed_json = False
+        elif text.startswith("<function="):
+            arguments = parsed
+
+    if tool_name not in selected_tool_names:
+        match = re.search(
+            r'"(?:name|tool_name)"\s*:\s*"([A-Za-z0-9_.:-]+)"',
+            text,
+        )
+        tool_name = (
+            match.group(1)
+            if match is not None
+            and match.group(1) in selected_tool_names
+            else None
+        )
+    return (
+        tool_name,
+        arguments,
+        "schema_validation" if parsed_json else "invalid_json",
+    )
 
 
 def _project_model_context(
