@@ -40,6 +40,7 @@ _DEFAULT_IGNORED_DIRECTORIES = frozenset(
         "node_modules",
     }
 )
+_AUXILIARY_SOURCE_DIRECTORIES = frozenset({".agents", ".codex"})
 _MAX_SEARCH_FILE_BYTES = 2_000_000
 _MAX_RETURNED_LINE_CHARS = 500
 _SOURCE_FILE_SUFFIXES = frozenset(
@@ -121,10 +122,14 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
         definition=ToolDefinition(
             name="search_text",
             description=(
-                "Search current workspace files without an index. Supports literal or "
-                "regex matching, one file or directory path, an optional glob, bounded "
-                "context lines, and a result limit. Symlinks are not followed, so every "
-                "call observes only current in-workspace file contents."
+                "Search current workspace files without an index. This is the preferred "
+                "first tool when an implementation task names a symbol, event, API, or "
+                "behavior. Supports literal or regex matching, one file or directory "
+                "path, an optional glob, bounded context lines, and a result limit. "
+                "Directory searches first diversify results across matching files and "
+                "prioritize product source over agent-support directories before filling "
+                "remaining slots. Symlinks are not followed, so every call observes only "
+                "current in-workspace file contents."
             ),
             input_schema=_SEARCH_INPUT_SCHEMA,
         ),
@@ -147,7 +152,7 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 ),
             ),
         ),
-        execution_revision="builtin-search-text-v2-source-first",
+        execution_revision="builtin-search-text-v4-relevant-diverse-files",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -186,7 +191,9 @@ def _search_text(
         else None
     )
     matches: list[SearchTextMatch] = []
+    overflow: list[SearchTextMatch] = []
     truncated = False
+    per_file_limit = max(1, (request.max_results + 4) // 5)
 
     for path in files:
         raw = path.read_bytes()[: _MAX_SEARCH_FILE_BYTES + 1]
@@ -197,6 +204,7 @@ def _search_text(
             truncated = True
         lines = raw.decode("utf-8", errors="replace").splitlines()
         relative = path.relative_to(workspace.root).as_posix()
+        file_match_count = 0
         for index, line in enumerate(lines):
             found = expression.search(line) if expression is not None else None
             if expression is None:
@@ -208,32 +216,45 @@ def _search_text(
                 if found is None:
                     continue
                 start, end = found.span()
-            if len(matches) >= request.max_results:
-                return SearchTextOutput(
-                    matches=matches,
-                    total_matches=len(matches),
-                    truncated=True,
-                )
             before_start = max(0, index - request.context_lines)
             after_end = min(len(lines), index + request.context_lines + 1)
-            matches.append(
-                SearchTextMatch(
-                    file_path=relative,
-                    line_number=index + 1,
-                    line_content=_bounded_line(line),
-                    match_start=start,
-                    match_end=end,
-                    context_before=[
-                        _bounded_line(value) for value in lines[before_start:index]
-                    ],
-                    context_after=[
-                        _bounded_line(value) for value in lines[index + 1 : after_end]
-                    ],
-                )
+            match = SearchTextMatch(
+                file_path=relative,
+                line_number=index + 1,
+                line_content=_bounded_line(line),
+                match_start=start,
+                match_end=end,
+                context_before=[
+                    _bounded_line(value) for value in lines[before_start:index]
+                ],
+                context_after=[
+                    _bounded_line(value) for value in lines[index + 1 : after_end]
+                ],
             )
+            if (
+                len(matches) < request.max_results
+                and file_match_count < per_file_limit
+            ):
+                matches.append(match)
+                file_match_count += 1
+                continue
+            if len(overflow) < request.max_results:
+                overflow.append(match)
+                if len(matches) >= request.max_results:
+                    return SearchTextOutput(
+                        matches=matches,
+                        total_matches=len(matches),
+                        truncated=True,
+                    )
+                continue
+            truncated = True
+            break
+    remaining = request.max_results - len(matches)
+    returned = [*matches, *overflow[:remaining]]
+    truncated = truncated or len(overflow) > remaining
     return SearchTextOutput(
-        matches=matches,
-        total_matches=len(matches),
+        matches=returned,
+        total_matches=len(returned),
         truncated=truncated,
     )
 
@@ -304,6 +325,8 @@ def _search_file_priority(
     parts = set(Path(relative).parts[:-1])
     if "docs" in parts:
         group = 3
+    elif parts & _AUXILIARY_SOURCE_DIRECTORIES:
+        group = 2
     elif path.suffix.lower() in _SOURCE_FILE_SUFFIXES:
         group = 1 if "tests" in parts else 0
     else:

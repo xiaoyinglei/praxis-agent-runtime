@@ -1,8 +1,8 @@
 <div align="center">
 
-# 面向私有业务文档的本地知识 Agent
+# Python-first 通用 Code Agent
 
-通用工具型 Agent runtime，内置 evidence-first RAG 检索子系统。
+面向受信任本地工作区的工具型 Agent runtime，RAG 是按需启用的证据子系统。
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.12">
@@ -13,10 +13,9 @@
 </p>
 
 <p>
-  <img src="https://img.shields.io/badge/Local-Qwen3.5--9B--4bit-111827?style=for-the-badge" alt="Qwen3.5 9B 4bit">
-  <img src="https://img.shields.io/badge/Cloud-Groq_GPT--OSS--120B-f55036?style=for-the-badge" alt="Groq GPT OSS 120B">
-  <img src="https://img.shields.io/badge/Embedding-Qwen3--8B--4bit-10b981?style=for-the-badge" alt="Qwen3 Embedding 8B">
-  <img src="https://img.shields.io/badge/Rerank-Qwen3--4B-f97316?style=for-the-badge" alt="Qwen3 Reranker 4B">
+  <img src="https://img.shields.io/badge/Models-Alias_Catalog-111827?style=for-the-badge" alt="model alias catalog">
+  <img src="https://img.shields.io/badge/Local-MLX_OpenAI--compatible-10b981?style=for-the-badge" alt="local MLX OpenAI compatible">
+  <img src="https://img.shields.io/badge/Cloud-Configurable_Provider-f55036?style=for-the-badge" alt="configurable cloud provider">
 </p>
 
 <p>
@@ -30,9 +29,11 @@
 
 </div>
 
-这是一个面向本地文件、代码任务与私有知识库的通用 Agent runtime。它通过 while-loop 驱动模型自主选择工具、执行任务并回灌结果，直到产出最终答案。每次用户输入创建一个 Turn；需要上下文时，新 Turn 只通过 `previous_turn_id` 指向前一个 Turn。首次调用不需要预先创建对话容器，Checkpoint 只恢复尚未完成的 Turn。
+这是一个面向真实 Python、Git 和本地文件任务的通用 Code Agent runtime。它通过 while-loop 驱动模型自主定位源码、选择工具、执行修改、验证结果并回灌证据，直到满足运行时验收条件或明确停止。每次用户输入创建一个 Turn；需要上下文时，新 Turn 只通过 `previous_turn_id` 指向前一个 Turn。首次调用不需要预先创建对话容器，Checkpoint 只恢复尚未完成的 Turn。
 
 RAG 是 Agent 可调用的证据检索子系统，负责把私有资料定位成可复查证据；此外 Agent 还能直接处理当前 workspace、表格分析、受限命令执行、计划更新、Skill、MCP、隔离子任务和人工审批。
+
+当前产品边界是 **trusted-local**：单用户在 macOS 上操作自己信任的 Python/Git workspace。它不是多租户远程执行平台，也不以 README、测试数量或某次模型跑分宣称“生产就绪”。修改类 Turn 的交付事实来自真实 workspace diff、最后一次变更后的验证结果，以及独立 acceptance；只返回一段非空文字不能冒充完成。
 
 运行时采用单 Agent 内核，而不是让多个角色 Agent 互相转发消息：
 
@@ -71,34 +72,52 @@ Agent 会读取仓库根目录的 `.env`，但不会覆盖已经存在的宿主�
 cp .env.example .env
 ```
 
-默认聊天模型是 `deepseek_chat`。在 `.env` 中配置密钥即可使用：
+模型通过 alias 目录和 workspace-local 会话选择控制。可用 alias 及其 provider 配置以 `configs/models.yaml` 为准；先查看目录和当前选择：
 
-```dotenv
-DEEPSEEK_API_KEY=your-key
+```bash
+uv run agent model list
+uv run agent model current
+uv run agent model switch <model-alias>
 ```
 
-也可以完全使用本地 Qwen3.5。`qwen3_5_9b_mlx_4bit` 会根据 `configs/models.yaml` 检查 `127.0.0.1:8080/v1/models`，服务未启动时自动拉起 MLX OpenAI-compatible server：
+`agent model switch` 改变后续根 Turn 使用的会话选择；`agent run --model <model-alias>` 只覆盖本次根 Turn。云端 alias 按目录配置对应 API key，本地 alias 按目录配置对应 endpoint。下面的 Qwen3.5 和 Groq 只展示两种显式选择方式，不表示优先级。
+
+本地 Qwen3.5 示例。`qwen3_5_9b_mlx_4bit` 会根据目录检查 `127.0.0.1:8080/v1/models`，服务未启动时自动拉起 MLX OpenAI-compatible server：
 
 ```bash
 uv run agent run \
   "读取当前项目中的 pyproject.toml，并说明包入口" \
   --model qwen3_5_9b_mlx_4bit \
+  --no-require-workspace-change \
   --verbose
 ```
 
-直接调用 Agent：
+Groq 示例：
+
+```bash
+GROQ_API_KEY=your-key uv run agent run \
+  "读取当前项目中的 pyproject.toml，并说明包入口" \
+  --model groq_gpt_oss_120b \
+  --no-require-workspace-change \
+  --verbose
+```
+
+修改类任务直接调用 Agent：
 
 ```bash
 uv run agent run \
-  "总结一下这个项目现在的能力边界" \
+  "给公开 Agent.run 增加一个有类型标注的 timeout 参数，更新测试并验证" \
   --verbose
 ```
+
+`agent run` 和 Python SDK 的 `run/arun/astream` 默认要求产生真实 workspace 变更，并在最后一次真实变更后成功运行被识别的 test、lint、type-check 或 build；旧验证不能覆盖后续写入。只读分析必须显式传 `--no-require-workspace-change`，SDK 则传 `require_workspace_change=False`。`agent chat` 按对话模式运行，不强制每条消息修改 workspace。
 
 `agent run` 会根据当前 workspace 中已安装、已启用的能力自动装配工具面。只需描述任务，不需要记忆工具名；CLI 会展示实际调用的工具和结果。普通工具审批显示有界参数，`run_command` 审批完整显示命令、cwd、网络状态和执行模式：
 
 ```bash
 uv run agent run \
   "找到 AgentService 的定义文件并说明主要职责" \
+  --no-require-workspace-change \
   --verbose
 
 uv run agent run \
@@ -113,13 +132,20 @@ Agent 默认读取当前 workspace 的 `.env`。在 Git linked worktree 中本�
 Agent 定义中更小的安全上限：
 
 ```bash
-uv run agent run "只检查这一个问题" --max-turns 6
+uv run agent run \
+  "只检查这一个问题" \
+  --max-turns 6 \
+  --no-require-workspace-change
 ```
 
 ```python
 from agent_runtime import Agent
 
-result = Agent().run("只检查这一个问题", max_turns=6)
+result = Agent().run(
+    "只检查这一个问题",
+    max_turns=6,
+    require_workspace_change=False,
+)
 ```
 
 达到请求上限会以 `stop_reason=max_turns` 结束，不会再发起下一次模型调用；已经由
@@ -156,6 +182,7 @@ uv run agent resume <turn-id> --action abort
 uv run agent run \
   "读取这个文件，列出结构并给出摘要" \
   --file "./path/to/file.xlsx" \
+  --no-require-workspace-change \
   --verbose
 ```
 
@@ -172,8 +199,15 @@ agent = Agent(
     workspace_path=Path.cwd(),
 )
 
-first = agent.run("记住项目代号 ORCHID-731")
-second = agent.run("项目代号是什么？", previous_turn_id=first.turn_id)
+first = agent.run(
+    "记住项目代号 ORCHID-731",
+    require_workspace_change=False,
+)
+second = agent.run(
+    "项目代号是什么？",
+    previous_turn_id=first.turn_id,
+    require_workspace_change=False,
+)
 
 print(second.turn_id)
 print(second.answer)
@@ -192,7 +226,7 @@ uv build --wheel
 uv tool install --force dist/*.whl
 ```
 
-wheel 内置 `configs/models.yaml` 的发行快照，因此安装后从任意 cwd 都能解析 `qwen3_5_9b_mlx_4bit`。`RAG_AGENT_MODELS_PATH` 和 `RAG_AGENT_MODELS` 仍可显式覆盖目录；运行时不会依赖源码仓库旁边恰好存在一份配置。
+wheel 内置 `configs/models.yaml` 的发行快照，因此安装后从任意 cwd 都能解析目录中的 alias。`RAG_AGENT_MODELS_PATH` 和 `RAG_AGENT_MODELS` 仍可显式覆盖目录；运行时不会依赖源码仓库旁边恰好存在一份配置。
 
 只有维护知识库或进行底层检索诊断时，才需要启动 embedding 服务并使用 `rag ingest/query`。日常文件与代码任务只需调用 `agent`。在仓库根目录启动 embedding 服务：
 
@@ -229,6 +263,7 @@ uv run rag ingest \
 uv run agent run \
   "P1 工单首次响应目标是多少？请给出处" \
   --knowledge-config ./knowledge.quickstart.yaml \
+  --no-require-workspace-change \
   --verbose
 ```
 
@@ -248,11 +283,11 @@ export AGENT_VECTOR_DSN="$VECTOR_DSN"
 
 ## Agent 工具面与 ACI
 
-默认编码工具面只有六个常驻工具，顺序稳定：`list_files`、`search_text`、`read_file`、`apply_patch`、`run_command`、`update_plan`。本地 workspace 导航遵循 Grep-not-RAG 规则：先用 `list_files` 或 `search_text` 定位当前文件，再用 `read_file` 读取；不会为了搜索源码或已导入文件自动启动 RAG。
+基础编码工具面有六个常驻工具，顺序稳定：`search_text`、`list_files`、`read_file`、`apply_patch`、`run_command`、`update_plan`。本地 workspace 导航遵循 Grep-not-RAG 规则：先用 `search_text` 或 `list_files` 定位当前文件，再用 `read_file` 读取；不会为了搜索源码或已导入文件自动启动 RAG。
 
 产品装配规则是确定的：
 
-1. 六个编码工具始终常驻。
+1. 上述六个编码工具始终常驻。
 2. 显式配置 knowledge 时，`search_knowledge` 常驻。
 3. 启动时扫描 workspace 中的 Skill catalog；只有存在 policy 允许且模型可调用的 Skill 时，`invoke_skill` 和 `materialize_skill_asset` 才常驻。扫描 catalog 不等于创建工具，更不等于所有 Skill 已激活。
 4. 只要冻结 Registry 中存在 hidden 且 discoverable 的工具，`find_tools` 就常驻。当前 MCP 和 subagent 使用这条路径，可见性规则不依赖 capability 的来源类型。
@@ -265,16 +300,17 @@ MCP 从 workspace 的 `configs/mcp_servers.yaml` 装配，也可用 `AGENT_MCP_C
 
 Skill 资产访问有独立的 hard guard：`invoke_skill` 只能激活 catalog/policy 允许的 Skill，`materialize_skill_asset` 只能访问 checkpoint 中已激活 Skill 的 root；未激活、路径越界或状态不一致都会 hard-deny。
 
-`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。默认写 workspace 和执行进程需要审批；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.rag/agent_checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
+`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。workspace 写入和进程执行需要各自的 effect 授权；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.rag/agent_checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
 
 `run_command` 不以宿主用户的完整能力直接执行，而是进入 macOS Seatbelt 受限沙箱：
 
-- cwd 必须位于当前 workspace；只允许写 workspace 和本次命令的私有临时目录。
+- cwd 必须位于当前 workspace；workspace 默认只读，只有本次命令的私有临时目录可写。
+- `workspace_write=true` 会把调用提升为 destructive workspace write，并进入独立写权限判断；即使获准，递归 `.git`、`.venv` 和 `node_modules` 仍保持只读。
 - 不继承宿主环境，`HOME`、cache 和临时目录都重定向到私有目录；token、key、secret 和密码不会透传。
 - 默认禁止网络，也不能访问用户 home、其他项目、SSH 配置或 Docker socket。
 - `network=true` 只提出联网请求。执行审批和网络审批是两个独立 gate；`--allow-execute-tools` 不会顺带授权网络。
 - 审批展示完整命令、解析后的 cwd、网络状态和 `restricted_sandbox` 执行模式，不截断成命令预览。
-- 沙箱不可用时 fail closed，不会退回可信本机执行。超时或取消会终止并回收整个进程组。
+- 沙箱不可用、Git 元数据别名或 hardlink 无法证明 containment 时 fail closed，不会退回可信本机执行。超时或取消会终止并回收整个进程组。
 
 所有工具仍通过同一个 `ToolExecutor`。有副作用的调用在持久化记录中明确区分 `prepared` 与 `started`；非幂等调用若在 `started` 后中断且结果不可确认，会进入 `outcome_unknown`，必须先用 `mark_completed` 或 `mark_failed` 对账，禁止直接重放。
 
@@ -297,35 +333,31 @@ uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
 uv run python scripts/agent_cli_smoke.py
 ```
 
-真实门禁覆盖 Qwen3.5 和 Groq 的文件工具选择、缺失文件恢复、审批后继续、重复失败控制、参数有效性和 ACI 调用效率。基线由真实重复试验自动校准，阈值取每项指标的 empirical worst-trial envelope，不手填宽容值：
+真实门禁覆盖已声明模型的文件工具选择、缺失文件恢复、审批后继续、重复失败控制、参数有效性和 ACI 调用效率。基线由真实重复试验校准，阈值取已提交观察的 empirical worst-trial envelope，不在 README 复制易过期的模型清单、试验数量或指标值：
 
 ```bash
-# 校准固定覆盖两个声明模型；每个模型至少 3 次 trial
-uv run python scripts/agent_model_quality_gate.py calibrate \
-  --env-file .env \
-  --trials 3
+# 查看校准接口；维护者显式选择重复次数并提交 baseline
+uv run python scripts/agent_model_quality_gate.py calibrate --help
 
 # 按已提交 baseline 运行全部模型
 uv run python scripts/agent_model_quality_gate.py gate --env-file .env
 
-# 也可单独运行一个声明模型
+# 也可按 alias 单独运行一个模型
 uv run python scripts/agent_model_quality_gate.py gate \
   --env-file .env \
-  --model qwen3_5_9b_mlx_4bit
-
-uv run python scripts/agent_model_quality_gate.py gate \
-  --env-file .env \
-  --model groq_gpt_oss_120b
+  --model <model-alias>
 ```
 
-已提交的基线包含 `3 trials × 5 cases × 2 models = 30` 条真实观察。成功率、工具选择、失败恢复、审批继续、重复失败控制和参数有效性下限均为 `1.0`；冗余失败重放上限为 `0.0`；每 case 平均工具调用和模型调用上限分别为 `2.0` 和 `3.0`。gate 退出码为：`0 = PASS`、`1 = QUALITY_FAIL`、`2 = INFRASTRUCTURE_INCONCLUSIVE / 配置错误`。原始观察和阈值保存在 `evals/model_quality/baseline_v1.json`，加载时会重新计算 trial 指标与阈值，篡改会 fail loud。
+当前原始观察、模型集合、trial 指标和阈值以 `evals/model_quality/baseline_v1.json` 为唯一事实源；加载时会重新计算并校验，篡改会 fail loud。gate 退出码为：`0 = PASS`、`1 = QUALITY_FAIL`、`2 = INFRASTRUCTURE_INCONCLUSIVE / 配置错误`。一次 gate 通过只说明该基线下的模型质量门禁通过，不等于 cross-layer 任务已经交付。
 
-## 版本亮点
+## 当前产品边界与关键能力
 
+- **受信任本地边界**：面向单用户 macOS/Python/Git workspace；不是多租户远程执行服务。
+- **交付验收**：修改类公开入口默认要求真实 workspace 变更和最后一次变更后的成功验证，非空回答不能替代交付证据。
 - **可继续、可恢复**：`previous_turn_id` 链保存完整 canonical history，Checkpoint 只恢复 paused / interrupted Turn。
 - **统一 CLI 与 SDK**：`agent run/chat/resume` 和 `agent_runtime.Agent` 共用同一 runtime 装配、权限、stream 与结果语义。
-- **安全命令执行**：`run_command` 默认进入受限沙箱，使用最小环境、默认断网，并将命令执行与联网审批分离。
-- **本地与云端模型**：支持本地 MLX Qwen3.5 和 Groq；wheel 内置模型目录，可从任意工作目录解析模型 alias。
+- **安全命令执行**：`run_command` 默认以只读 workspace 进入受限沙箱，使用最小环境、默认断网，并将命令执行、写入与联网权限分离。
+- **可切换模型**：模型由 alias 目录和 workspace-local 会话选择控制，也可按根 Turn 覆盖。
 - **可观测 ACI**：单一 Tool 合同、可见性函数和执行入口，计划、工具事件、usage 与恢复状态通过 CLI、stream 和 result 暴露。
 - **Evidence-first RAG**：多格式入库、summary index、Milvus/PostgreSQL、asset grounding 和 DuckDB 表格计算按需作为 Agent 工具启用。
 
@@ -338,14 +370,15 @@ uv run python scripts/agent_model_quality_gate.py gate \
 | 未完成恢复 | Checkpoint 只恢复 paused / interrupted Turn；完成和失败状态 fail loud | `rag/agent/core/checkpointing.py`、`rag/agent/service.py` |
 | Agent 内核 | 单 generic loop，模型选择工具，运行时负责安全边界 | `rag/agent/loop/runtime.py` |
 | 模型请求 | provider-neutral `ModelRequest`；OpenAI wire 只产生一个前置 system message | `rag/agent/core/model_request.py`、`rag/providers/openai_wire.py` |
-| 工具选择/发现 | 六个编码工具常驻，hidden tools 由 `find_tools` 搜索并原子激活 | `rag/agent/tools/selection.py` |
+| 工具选择/发现 | 六个基础编码工具常驻，hidden tools 由 `find_tools` 搜索并原子激活 | `rag/agent/tools/selection.py` |
 | 本地文件工具 | workspace 导入、列文件、Grep、有界读取、精确补丁和命令 | `rag/agent/tools/builtins/` |
-| 命令安全 | Seatbelt 受限执行、空白宿主环境、默认断网、网络独立审批 | `rag/agent/tools/builtins/shell.py` |
+| 命令安全 | Seatbelt 受限执行、workspace 默认只读、空白宿主环境、默认断网、写入/网络独立授权 | `rag/agent/tools/builtins/shell.py` |
+| 修改验收 | 运行时观察 workspace tree 变更，并要求最新变更后的识别型验证全部成功 | `agent_runtime/agent.py`、`rag/agent/loop/stop_hooks.py` |
 | 副作用恢复 | prepared / started / outcome_unknown 记录；非幂等未知结果禁止重放 | `rag/agent/tools/executor.py` |
-| 计划透明度 | `update_plan` 持久化到 checkpoint，并通过 CLI / stream / result 暴露 | `rag/agent/planning.py` |
+| 计划透明度 | `update_plan` 持久化到 checkpoint，并通过 CLI / stream / result 暴露 | `agent_runtime/planning.py` |
 | 外部工具接入 | knowledge、MCP、skills 和 subagent 适配为相同 `Tool` 值 | `rag/agent/tools/integrations/` |
-| 模型质量 | fake/stub runtime 门禁与 Qwen3.5/Groq live quality gate 分离 | `scripts/agent_model_quality_gate.py` |
-| 发行包 | wheel 内置模型目录，可从源码仓库外解析 Qwen3.5 alias | `pyproject.toml`、`rag/agent/core/llm_registry.py` |
+| 模型质量 | fake/stub runtime 门禁与 live model quality gate 分离 | `scripts/agent_model_quality_gate.py` |
+| 发行包 | wheel 内置模型目录，可从源码仓库外解析已声明 alias | `pyproject.toml`、`rag/agent/core/llm_registry.py` |
 | 多格式入库 | 支持 PDF、Word、Markdown、Excel、PPT、图片、纯文本 | `rag/ingest/pipeline.py`、`rag/ingest/parsers/*` |
 | 多粒度索引 | doc / section / asset 三类 summary index | `SummaryRecord`、Milvus collections |
 | 混合检索 | 支持 `fast / auto / deep / asset / bypass` profile | `rag/retrieval/l3_l4_engine.py`、`rag/retrieval/orchestrator.py` |
@@ -366,7 +399,7 @@ flowchart TB
     subgraph AG["Per-Turn runtime"]
         direction LR
         binding["持久化 RuntimeBinding"] --> assembly["workspace / model / Skill / MCP / subagent 装配"] --> loop["generic AgentLoop"]
-        loop --> request["stable ModelRequest"] --> provider["MLX / Groq / OpenAI-compatible"] --> loop
+        loop --> request["stable ModelRequest"] --> provider["configured provider adapter"] --> loop
         loop --> visible["select_tools / find_tools"] --> executor["ToolExecutor"] --> loop
         loop --> checkpoint["未完成 Turn checkpoint"]
         loop --> result["answer / plan / events / usage"]
@@ -458,13 +491,17 @@ Checkpoint 与 TurnStore 可以落在同一个 SQLite 文件中，但职责不�
 
 ### 模型上下文与 provider boundary
 
-Agent kernel 只消费 provider-neutral `ModelRequest` 和 `ModelTurn`。`StableModelContext` 固定 instructions、workspace/file manifest、初始任务和 memory，动态 transcript、工具结果、Skill 激活与压缩事件按 canonical `ModelMessage` 追加；`prompt_revision`、`toolset_revision` 和 provider wire hash 让每次调用可复查。
+Agent kernel 只消费 provider-neutral `ModelRequest` 和 `ModelTurn`。`StableModelContext` 固定 instructions、workspace/file manifest 和初始任务，动态 transcript、working state、工具结果、Skill 激活与压缩事件按 canonical `ModelMessage` 装配；`prompt_revision`、`toolset_revision` 和 provider wire hash 让每次调用可复查。
 
-OpenAI-compatible 序列化是唯一 wire 关口。所有前置 `system` 和 `context` 会合并为唯一第一条 system message，避免 MLX Qwen3.5 因第二条 system 拒绝带输入文件的请求；对话开始后的 context 作为 user event 序列化，任何 late system message 都明确报错。MLX 与 Groq 因此共享同一 canonical request，而不是各自维护一套 Agent 语义。
+上下文是否过大以最终序列化的 provider request token 数为准，而不是只看内存状态对象。运行时先把 working state 投影为有界的目标、计划、路径和近期观察；若仍超限，再压缩旧 transcript。最新 assistant 工具调用与对应 tool result 始终作为一对保留：assistant 消息保留工具参数，大型失败 result 可投影为退出状态、错误码、失败测试名、stdout/stderr 尾部和截断标志。canonical history 不被删除。
+
+provider 拒绝非法 tool JSON 或 schema 参数时，原始拒绝仍保存在追加式 transcript 中，但下一次模型请求只注入一条由当前工具 schema 生成的修正提示，避免让模型复制旧的非法生成。相同失败调用还有运行时熔断；这些机制提供有界恢复证据，不承诺任意模型一定会正确定位或编辑。
+
+OpenAI-compatible 序列化是唯一 wire 关口。所有前置 `system` 和 `context` 会合并为唯一第一条 system message，避免不接受 late system 的兼容服务拒绝带输入文件的请求；对话开始后的 context 作为 user event 序列化，任何 late system message 都明确报错。本地与云端 adapter 因此共享同一 canonical request，而不是各自维护一套 Agent 语义。
 
 ### ACI 与执行边界
 
-`Tool` 是唯一生产工具值，包含输入 schema/validator、runner、输出归一化/schema、effects/targets、execution revision、幂等性、并发性、取消模式、超时和模型可见输出上限。`ToolRegistry` 只负责确定性装配并 freeze；`select_tools()` 是唯一模型可见性函数；`ToolExecutor` 是唯一 validation-to-result 执行入口。
+`Tool` 是唯一运行时工具值，包含输入 schema/validator、runner、输出归一化/schema、effects/targets、execution revision、幂等性、并发性、取消模式、超时和模型可见输出上限。`ToolRegistry` 只负责确定性装配并 freeze；`select_tools()` 是唯一模型可见性函数；`ToolExecutor` 是唯一 validation-to-result 执行入口。
 
 一次调用依次经过 origin/schema 校验、参数校验、动态 effect/target 解析、不可绕过的 hard guard、执行边界选择、allow/ask/deny 权限判定、外部审批、prepared/started 记录、runner、输出校验与有界 externalization。provider、CLI、SDK、Skill、MCP 和 subagent 都不能绕开这条链路。
 
@@ -525,7 +562,7 @@ L6 只基于 `EvidenceItem` 合成回答。回答保留 `doc_id / section_id / a
 
 Agent 只有一个 `generic` 入口，不区分角色身份。模型在同一个 while-loop 中产生工具调用或最终答案，运行时保持以下单一边界：
 
-- `Tool` 是唯一生产工具合同，包含 schema、validator、runner、输出归一化、effects 和超时/取消语义。
+- `Tool` 是唯一运行时工具合同，包含 schema、validator、runner、输出归一化、effects 和超时/取消语义。
 - `ToolRegistry` 只做确定性装配，运行前 freeze 成不可变 snapshot。
 - `select_tools()` 是唯一模型可见性函数，`find_tools` 只搜索 hidden tool 的冻结元数据。
 - `can_use_tool()` 将调用判定为 allow / ask / deny，`ToolExecutor` 是唯一 validation-to-`ToolResult` 执行入口。
@@ -540,7 +577,7 @@ Agent 只有一个 `generic` 入口，不区分角色身份。模型在同一个
 
 ### Agent 层：Canonical History 与 Model Context 分离
 
-Turn lineage 保真保存 user / assistant / tool 事件；模型上下文由 `StableModelContext` 重新装配，可以进行 cheap-first compaction、summary 和 tail retention。压缩只改变当前模型输入，不改变 canonical history。workspace memory 是辅助上下文，RAG evidence 仍是业务事实的高优先级来源。
+Turn lineage 保真保存 user / assistant / tool 事件；模型上下文由 `StableModelContext` 重新装配，可以进行有界 working-state 投影、确定性 summary 和 tail retention。压缩只改变当前模型输入，不改变 canonical history；最新 assistant→tool 对受保护。working memory 是辅助上下文，RAG evidence 仍是业务事实的高优先级来源。
 
 ### Agent 层：Recoverable Side Effects
 
@@ -549,6 +586,12 @@ Turn lineage 保真保存 user / assistant / tool 事件；模型上下文由 `S
 ### Agent 层：Observable Plan
 
 每个 Turn 初始化有界 `AgentPlan`。模型可以通过 `update_plan` 替换可见步骤，运行时也会把工具决策、观察、replan 和 completion 记为有界 `PlanEvent`。Plan 是进度与证据关联层，不是调度器，也不越过 ACI 权限边界。
+
+### Agent 层：Runtime Goal Contract
+
+修改类 `agent run` 和 SDK `run/arun/astream` 默认创建不可变 `GoalSpec`：运行时必须观察到 executor 记录的 workspace tree 前后摘要发生真实变化，并且最后一次写入之后至少执行一条被识别的 test、lint、type-check 或 build，且其后的所有识别型验证都成功。`apply_patch` 与 `run_command(workspace_write=true)` 走同一 executor-owned 变更证据；写入发生在验证之后时，旧验证立即失效。
+
+`update_plan` 只有 advisory authority，不能修改目标、伪造约束证据或宣布验收通过。只读任务由调用方显式关闭 workspace-change contract；这只改变该 Turn 的目标类型，不放宽 Tool 权限、沙箱或结果记录。
 
 ### Agent 层：Bounded State 与 Observability
 
@@ -585,7 +628,7 @@ PostgreSQL / Object Store 保存事实；Milvus 保存向量索引和检索入�
 
 ### Evidence Over Memory
 
-Agent memory 用于 working memory compaction / injection，workspace persistent memory 保存可选择的提炼信息，TurnStore 保存完整 canonical history；三者不是同一份数据。回答事实优先级为 RAG evidence 高于 memory；当两者冲突时，以 evidence 为准。
+Agent working memory 用于当前运行的 compaction / injection，TurnStore 保存完整 canonical history；两者不是同一份数据。回答事实优先级为 RAG evidence 高于 working memory；当两者冲突时，以 evidence 为准。
 
 ## Agent 编排层
 
@@ -619,7 +662,7 @@ CLI agent chat
 
 | 类型 | 默认可见 | 说明 |
 | --- | --- | --- |
-| 基础常驻 | 是 | `list_files`、`search_text`、`read_file`、`apply_patch`、`run_command`、`update_plan` |
+| 基础常驻 | 是 | `search_text`、`list_files`、`read_file`、`apply_patch`、`run_command`、`update_plan` |
 | Knowledge | 配置时可见 | `--knowledge-config` / `RAGKnowledgeConfig` 安装的 `search_knowledge` |
 | Skill gateways | 有可调用 Skill 时可见 | `invoke_skill`、`materialize_skill_asset`；激活和资产 root 受 hard guard |
 | Hidden discoverable | 否 | 当前为 MCP 和 subagent；由 `find_tools` 发现并原子激活 |
@@ -645,10 +688,11 @@ CLI agent chat
 
 - CLI 和 SDK 共用 product runtime builder，不存在第二套 Agent runtime。
 - `run/arun` 统一执行文件、代码和连续上下文任务；`chat` 只是 CLI 交互循环；`resume` 支持审批、澄清、中断继续、未知副作用对账和 abort。
+- `run/arun/astream` 默认启用真实 workspace 变更与修改后验证合同；只读任务必须显式关闭该合同，`chat` 使用对话模式。
 - canonical history、Turn 状态、runtime binding 和 checkpoint 使用 SQLite 持久化；内存对象只用于同进程资源复用。
 - 当前 workspace 由文件工具直接读写；`--file` 对 workspace 内文件直接引用，对外部文件才按 Turn 复制到 `.rag/agent_runtime/input_files/`。运行时不会在项目根目录创建 `input_files/` 等伪业务目录。
 - MCP server 由 workspace 配置显式启用；Skill 采用 catalog + progressive disclosure；subagent 作为 hidden `task` Tool 接入并继承有界上下文与权限。
-- model context 支持 proactive compaction，工具输出有界，usage 只在 provider 明确返回时记录 cache read/write。
+- model context 按实际 provider request 大小压缩，保留最新 assistant→tool 对并语义投影大型失败结果；usage 只在 provider 明确返回时记录 cache read/write。
 
 ### 文档入库
 
@@ -681,7 +725,7 @@ CLI agent chat
 ### 评测
 
 - Agent deterministic gates：fake/stub 覆盖 Turn lineage、checkpoint、权限、沙箱、plan、stream、package 和工具装配。
-- Agent live model gate：Qwen3.5/Groq 覆盖 5 类模型工具质量 case，并以真实 trial 校准阈值。
+- Agent live model gate：按已提交 baseline 的模型与 case 运行真实试验并校验阈值。
 - 公开 benchmark：MedicalRetrieval mini。
 - 私有制度数据：329 条 golden queries。
 - 支持按题型拆分指标，观察 doc hit、section hit、MRR、rerank 消融和 top-k 扩展效果。
@@ -690,26 +734,27 @@ CLI agent chat
 
 ## 模型与运行配置
 
-模型目录以 `configs/models.yaml` 为准，构建时作为 package resource 写入 wheel。业务代码不直接写 provider、模型名、base URL 或 API key；加载优先级为 `RAG_AGENT_MODELS_PATH` YAML、`RAG_AGENT_MODELS` JSON、wheel 内置资源、源码目录配置。模型选择由 Model Control Plane 持有，不通过修改 YAML 表示。CLI 可用：
+模型 alias 目录以 `configs/models.yaml` 为准，构建时作为 package resource 写入 wheel。业务代码不直接写 provider、模型名、base URL 或 API key。目录加载优先级为 `RAG_AGENT_MODELS_PATH` YAML、`RAG_AGENT_MODELS` JSON、wheel 内置资源、源码目录配置。实际选择由 Model Control Plane 持有，不通过修改 YAML 表示。CLI 可用：
 
 ```bash
 uv run agent model list
 uv run agent model current
-uv run agent model switch qwen3_5_9b_mlx_4bit
-uv run agent model switch deepseek_chat
-uv run agent model switch groq_gpt_oss_120b
+uv run agent model switch <model-alias>
+uv run agent run \
+  "<read-only-task>" \
+  --model <model-alias> \
+  --no-require-workspace-change
 ```
 
-`agent model switch` 写入 workspace-local model selection；`agent run --model ...` 只是本次运行覆盖，不改变模型目录。根 Turn 会冻结自己的 model binding，通过 `previous_turn_id` 继续时不会被后来切换的全局模型替换。指定什么模型就用什么模型：云端模型缺 API key 会报 `Missing API key: ...`；本地端口已被其他模型占用会报 endpoint conflict，不会 silent fallback。
+Python SDK 在构造根 Agent 时也可显式选择：
 
-默认配置：
+```python
+from agent_runtime import Agent
 
-- `defaults.primary_model`：`deepseek_chat`
-- `deepseek_chat.model`：`deepseek-chat`，DeepSeek OpenAI-compatible endpoint，读取 `DEEPSEEK_API_KEY`
-- Groq 模型保留为显式选择；其账户限额不再影响默认运行路径
-- 本地质量门禁模型：`qwen3_5_9b_mlx_4bit` → `mlx-community/Qwen3.5-9B-4bit`，262144 context，`127.0.0.1:8080`
-- Embedding：`mlx-community/Qwen3-Embedding-8B-4bit-DWQ`
-- Rerank：`Qwen/Qwen3-Reranker-4B`
+agent = Agent(model="<model-alias>")
+```
+
+`agent model switch` 写入 workspace-local model selection；`agent run --model ...` 只是本次根 Turn 覆盖，不改变模型目录。根 Turn 会冻结自己的 model binding，通过 `previous_turn_id` 继续时不会被后来切换的会话模型替换。指定什么 alias 就使用其声明的 provider：云端模型缺 API key 会明确失败；本地端口已被其他模型占用会报 endpoint conflict；运行时不会 silent fallback 到另一模型。chat、embedding 和 rerank 是目录中的独立 capability，RAG 组件不会替代 Agent 的 chat 选择。
 
 `.env` 在 CLI/SDK runtime 装配前加载，已经存在的环境变量优先。`run_command` 随后使用一份固定最小环境启动沙箱命令，不会把这些 provider 凭证继承给子进程。
 
@@ -822,7 +867,7 @@ uv run pytest -q \
 ├── CLAUDE.md                          # AI coding agent 参考（启动命令、约束）
 ├── pyproject.toml                     # console scripts、质量配置和 wheel 内置模型目录
 ├── uv.lock                            # uv 锁文件
-├── configs/models.yaml                # 默认 chat / embedding / rerank 模型配置
+├── configs/models.yaml                # chat / embedding / rerank alias 与 provider 目录
 ├── agent_runtime/
 │   ├── agent.py                       # Python SDK facade：run / stream / resume
 │   ├── result.py                      # AgentResult / AgentUsage 公开结果
@@ -831,7 +876,7 @@ uv run pytest -q \
 │       ├── builder.py                 # product capability / Tool / Turn runtime 装配
 │       └── mcp.py                     # MCP config、生命周期和普通 Tool 投影
 ├── evals/model_quality/
-│   └── baseline_v1.json               # Qwen3.5/Groq 真实观察、trial 指标和实测阈值
+│   └── baseline_v1.json               # live model 真实观察、trial 指标和实测阈值
 ├── docs/
 │   ├── RUNBOOK.md                     # 安装、服务管理、端到端运行手册
 │   ├── EVALUATION.md                  # 历史基线和已验证端到端结果
@@ -842,7 +887,7 @@ uv run pytest -q \
 └── scripts/                           # 入库、评测、诊断、benchmark 脚本
     ├── agent_delivery_smoke.py        # CLI/SDK deterministic delivery matrix
     ├── agent_tool_aci_eval.py         # deterministic Single Tool Runtime ACI 评估
-    └── agent_model_quality_gate.py    # Qwen3.5/Groq live quality calibrate/gate
+    └── agent_model_quality_gate.py    # live model quality calibrate/gate
 ```
 
 ```text

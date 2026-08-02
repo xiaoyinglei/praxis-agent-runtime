@@ -177,9 +177,13 @@ def parse_openai_response(response: object) -> ToolUseResult:
         content = ""
     if not isinstance(content, str):
         content = str(content)
+    reasoning_content = _field(message, "reasoning_content", default=None)
+    if reasoning_content is not None and not isinstance(reasoning_content, str):
+        reasoning_content = str(reasoning_content)
     return ToolUseResult(
         tool_calls=calls,
         text=content,
+        reasoning_content=reasoning_content,
         stop_reason=stop_reason,
         raw_stop_reason=raw_stop_text,
     )
@@ -277,6 +281,8 @@ def _message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
             "role": "assistant",
             "content": message.content or None,
         }
+        if message.reasoning_content is not None:
+            payload["reasoning_content"] = message.reasoning_content
         if message.tool_calls:
             payload["tool_calls"] = tuple(
                 {

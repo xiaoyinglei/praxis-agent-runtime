@@ -329,6 +329,7 @@ class ModelControlPlane:
                 from agent_runtime.local_runtime import LocalRuntimeManager
 
                 manager = cast(LocalRuntimeReadyManager, LocalRuntimeManager())
+                self._local_runtime_manager = manager
             manager.ensure_ready(spec)
             return
         if spec.api_key_env:
@@ -339,6 +340,12 @@ class ModelControlPlane:
                     f"{spec.api_key_env} is not set. Export it or add it to .env; "
                     "use AGENT_ENV_FILE to select a different env file"
                 )
+
+    def close(self) -> None:
+        manager = self._local_runtime_manager
+        close = getattr(manager, "close", None)
+        if callable(close):
+            close()
 
 
 def _load_session_state(

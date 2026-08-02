@@ -7,12 +7,12 @@ serialised through the existing checkpoint serde path.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.planning import AgentPlan, PlanEvent
+from rag.agent.core.observations import StructuredObservation
 from rag.agent.core.output_models import ValidatedFinalOutput
 from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.loop.state import StopHookFeedback
 from rag.agent.memory.models import (
     ContextBudgetSnapshot,
     ExtractedFact,
@@ -22,18 +22,12 @@ from rag.agent.memory.models import (
 )
 
 
-class PersistentMemorySnapshot(BaseModel):
-    """Bounded snapshot of persistent cross-session memory.
+class StopHookFeedback(BaseModel):
+    model_config = ConfigDict(frozen=True)
 
-    ``index_ref`` and ``index_digest`` default to empty strings so that
-    ``MemoryState(persistent=PersistentMemorySnapshot())`` works without
-    passing arguments — the "not loaded yet" state is valid.
-    """
-
-    index_ref: str = ""
-    index_digest: str = ""
-    selected_count: int = 0
-    selected_summaries: list[str] = Field(default_factory=list)
+    code: str = Field(min_length=1, max_length=120)
+    message: str = Field(min_length=1, max_length=1000)
+    occurrences: int = Field(default=1, ge=1)
 
 
 class PlanState(BaseModel):
@@ -44,16 +38,21 @@ class PlanState(BaseModel):
 
 
 class MemoryState(BaseModel):
-    """Working memory and persistent-memory context for the current run."""
+    """Working-memory context for the current run."""
 
     working_summary: WorkingSummary | None = None
     extracted_facts: list[ExtractedFact] = Field(default_factory=list)
+    recent_observations: list[StructuredObservation] = Field(default_factory=list)
+    # Runtime-owned truth. Unlike the model-visible locator projection below,
+    # verified paths are checkpointed without lossy eviction.
+    verified_workspace_paths: list[str] = Field(default_factory=list)
+    # Bounded model-context projection; never an authorization source by itself.
+    known_locators: list[dict[str, object]] = Field(default_factory=list)
     context_budget: ContextBudgetSnapshot | None = None
     memory_refs: list[MemoryRef] = Field(default_factory=list)
     memory_budget: MemoryBudgetSnapshot | None = None
     memory_warnings: list[str] = Field(default_factory=list)
     reactive_compact_used: bool = False
-    persistent: PersistentMemorySnapshot = Field(default_factory=PersistentMemorySnapshot)
 
 
 class DiscoveryCandidate(BaseModel):
@@ -101,7 +100,6 @@ __all__ = [
     "DiscoveryEvent",
     "FinishState",
     "MemoryState",
-    "PersistentMemorySnapshot",
     "PlanState",
     "StopHookFeedback",
 ]

@@ -20,6 +20,8 @@ from rag.agent.tools.tool import (
     Tool,
     ToolDefinition,
     ToolTarget,
+    _require_exact_bool,
+    _thaw_json,
     json_schema_output,
     pydantic_input,
 )
@@ -210,7 +212,7 @@ def resolve_tool_options(
     """Resolve stable public tool options without reading runtime state."""
 
     installed_names = _validate_snapshot(registry_snapshot)
-    _require_bool(
+    _require_exact_bool(
         allow_discovery_tools,
         field_name="allow_discovery_tools",
     )
@@ -798,16 +800,6 @@ def _enforce_schema_budget(
             budget_bytes=schema_budget,
             selected_names=tuple(tool.definition.name for tool in tools),
         )
-
-
-def _thaw_json(value: JsonValue) -> object:
-    if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
-    return value
-
-
 def _validate_snapshot(registry_snapshot: Mapping[str, Tool]) -> tuple[str, ...]:
     if not isinstance(registry_snapshot, Mapping):
         raise TypeError("registry_snapshot must be a mapping")
@@ -880,13 +872,6 @@ def _validate_max_active_tools(value: int | None) -> None:
         return
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError("max_active_tools must be a positive integer or None")
-
-
-def _require_bool(value: object, *, field_name: str) -> None:
-    if type(value) is not bool:
-        raise TypeError(f"{field_name} must be a bool")
-
-
 __all__ = [
     "FIND_TOOLS_NAME",
     "MAX_DISCOVERABLE_TOOLS",

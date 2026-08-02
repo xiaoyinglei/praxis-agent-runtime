@@ -79,6 +79,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
@@ -90,6 +91,7 @@ class Agent:
                 files=files,
                 max_turns=max_turns,
                 max_tokens_total=max_tokens_total,
+                require_workspace_change=require_workspace_change,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
                 event_sink=event_sink,
@@ -104,6 +106,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
@@ -119,6 +122,7 @@ class Agent:
             files=files,
             max_turns=max_turns,
             max_tokens_total=max_tokens_total,
+            require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
         )
@@ -190,12 +194,37 @@ class Agent:
         files: Sequence[str] | None,
         max_turns: int | None,
         max_tokens_total: int | None,
+        require_workspace_change: bool,
         allow_write_tools: bool,
         allow_execute_tools: bool,
     ) -> AgentRunRequest:
+        from rag.agent.core.goal_contract import GoalConstraint, GoalSpec
         from rag.agent.service import AgentRunRequest
 
         turn_id = str(uuid4())
+        goal_constraints = [
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            )
+        ]
+        if require_workspace_change:
+            goal_constraints.append(
+                GoalConstraint(
+                    constraint_id="verification_after_change",
+                    constraint_type="verification_after_change",
+                    expected_value=True,
+                )
+            )
+        goal_spec = (
+            GoalSpec(
+                original_query=message,
+                constraints=goal_constraints,
+            )
+            if require_workspace_change
+            else None
+        )
         return AgentRunRequest(
             message=message,
             previous_turn_id=previous_turn_id,
@@ -204,6 +233,7 @@ class Agent:
             llm_budget_total=max_tokens_total,
             input_files=list(files or ()),
             workspace_path=(None if self.workspace_path is None else str(self.workspace_path)),
+            goal_spec=goal_spec,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
         )
@@ -235,6 +265,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
     ) -> AsyncIterator[StreamEvent]:
@@ -249,6 +280,7 @@ class Agent:
             files=files,
             max_turns=max_turns,
             max_tokens_total=max_tokens_total,
+            require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
         )
@@ -325,6 +357,11 @@ class Agent:
                         await _close_owned_sync_resource(
                             provider,
                             label="knowledge provider",
+                        )
+                    if self._model_control_plane is not None:
+                        await _close_owned_sync_resource(
+                            self._model_control_plane,
+                            label="model control plane",
                         )
 
     def _build_service(

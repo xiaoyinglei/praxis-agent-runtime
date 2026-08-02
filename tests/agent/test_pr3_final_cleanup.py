@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ast
+import base64
 import importlib
+from pathlib import Path
 
 import pytest
 
@@ -16,13 +19,22 @@ from rag.agent.core.messages import (
 from rag.agent.core.messages import (
     ToolCall as ModelToolCall,
 )
+from rag.agent.core.model_request import StableModelContext
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.state import (
     PendingToolCall,
     ToolCallLedger,
     create_loop_state,
 )
+from rag.agent.loop.substate import MemoryState
 from rag.agent.tools.tool import ToolContentBlock, ToolResult
+from rag.models.config import GenerationConfig
+from rag.schema.llm import LLMCallStage
+
+
+def _production_source(relative_path: str) -> str:
+    root = Path(__file__).resolve().parents[2]
+    return (root / relative_path).read_text(encoding="utf-8")
 
 
 def _config() -> AgentRunConfig:
@@ -30,6 +42,146 @@ def _config() -> AgentRunConfig:
         turn_id="test-pr3-cleanup",
         llm_budget_total=100,
     )
+
+
+def test_runtime_helpers_have_one_canonical_owner() -> None:
+    cli_source = _production_source("rag/agent/cli.py")
+    loop_source = _production_source("rag/agent/loop/runtime.py")
+    sink_source = _production_source("rag/agent/streaming/sink.py")
+
+    assert "def _build_model_control_plane(" not in cli_source
+    assert "def _format_public_tool_summary(" not in cli_source
+    assert "class NoopStreamEventSink" not in sink_source
+    for duplicate in (
+        "_stream_turn_start",
+        "_stream_turn_end",
+        "_stream_loop_end",
+        "_stream_tool_use_start",
+        "_stream_tool_use_result",
+        "_stream_tool_use_error",
+        "_stream_compact_layer",
+        "_stream_recovery",
+    ):
+        assert f"def {duplicate}(" not in loop_source
+
+
+def test_substate_does_not_import_its_owner_module() -> None:
+    tree = ast.parse(_production_source("rag/agent/loop/substate.py"))
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "rag.agent.loop.state" not in imports
+
+
+def test_local_runtime_only_type_checks_public_model_contract() -> None:
+    tree = ast.parse(_production_source("agent_runtime/local_runtime.py"))
+    runtime_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "agent_runtime.models" not in runtime_imports
+
+
+def test_memory_digest_does_not_depend_on_checkpointing() -> None:
+    compactor_tree = ast.parse(_production_source("rag/agent/memory/compactor.py"))
+    compactor_imports = {
+        node.module
+        for node in ast.walk(compactor_tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "rag.agent.core.checkpointing" not in compactor_imports
+    assert "def _digest_text(" not in _production_source(
+        "rag/agent/core/checkpointing.py"
+    )
+
+
+def test_orphaned_persistent_memory_capability_is_removed() -> None:
+    root = Path(__file__).resolve().parents[2]
+    state = create_loop_state(current_message="cleanup", run_config=_config())
+    persistent_sources = root / "rag/agent/memory/persistent"
+
+    assert not tuple(persistent_sources.glob("*.py"))
+    assert not (root / "tests/agent/test_persistent_memory.py").exists()
+    assert "persistent_memories" not in state
+    assert "memory_index" not in state
+    assert "persistent" not in MemoryState.model_fields
+    assert "initial_memory" not in StableModelContext.__dataclass_fields__
+    assert {
+        "memory_select",
+        "memory_extract",
+        "memory_consolidate",
+    }.isdisjoint(stage.value for stage in LLMCallStage)
+    assert {
+        "memory_select",
+        "memory_extract",
+        "memory_consolidate",
+    }.isdisjoint(GenerationConfig.__dataclass_fields__)
+
+
+def test_checkpoint_decode_discards_removed_persistent_memory_snapshot() -> None:
+    legacy_payload = base64.b64decode(
+        "yAFdBZS3cmFnLmFnZW50Lmxvb3Auc3Vic3RhdGWrTWVtb3J5U3RhdGWL"
+        "r3dvcmtpbmdfc3VtbWFyecCvZXh0cmFjdGVkX2ZhY3RzkLNyZWNlbnRf"
+        "b2JzZXJ2YXRpb25zkLh2ZXJpZmllZF93b3Jrc3BhY2VfcGF0aHOQrmtu"
+        "b3duX2xvY2F0b3JzkK5jb250ZXh0X2J1ZGdldMCrbWVtb3J5X3JlZnOQ"
+        "rW1lbW9yeV9idWRnZXTAr21lbW9yeV93YXJuaW5nc5GmbGVnYWN5tXJl"
+        "YWN0aXZlX2NvbXBhY3RfdXNlZMKqcGVyc2lzdGVudISpaW5kZXhfcmVm"
+        "qU1FTU9SWS5tZKxpbmRleF9kaWdlc3StbGVnYWN5IGRpZ2VzdK5zZWxl"
+        "Y3RlZF9jb3VudAKyc2VsZWN0ZWRfc3VtbWFyaWVzkqNvbmWjdHdvs21v"
+        "ZGVsX3ZhbGlkYXRlX2pzb24="
+    )
+
+    restored = agent_checkpoint_serde().loads_typed(
+        ("msgpack", legacy_payload)
+    )
+
+    assert isinstance(restored, MemoryState)
+    assert restored.memory_warnings == ["legacy"]
+    assert not hasattr(restored, "persistent")
+
+
+def test_model_provider_contracts_do_not_import_loop_implementation() -> None:
+    for relative_path in (
+        "rag/agent/core/llm_providers.py",
+        "rag/agent/core/model_provider_runtime.py",
+    ):
+        tree = ast.parse(_production_source(relative_path))
+        imports = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+
+        assert "rag.agent.loop.runtime" not in imports
+
+
+def test_checkpoint_legacy_alias_does_not_import_public_facade() -> None:
+    tree = ast.parse(_production_source("rag/agent/core/checkpointing.py"))
+    imports = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert "agent_runtime" not in imports
+
+
+def test_json_contract_helpers_are_not_reimplemented_by_consumers() -> None:
+    for relative_path in (
+        "rag/agent/core/messages.py",
+        "rag/agent/core/model_request.py",
+        "rag/agent/tools/selection.py",
+    ):
+        source = _production_source(relative_path)
+        assert "def _thaw_json(" not in source
+        assert "def _require_non_empty_string(" not in source
+        assert "def _require_bool(" not in source
 
 
 _DEPRECATED_FIELDS = frozenset(
@@ -46,6 +198,8 @@ _DEPRECATED_FIELDS = frozenset(
         "context_bindings",
         "locators",
         "asset_refs",
+        "persistent_memories",
+        "memory_index",
     }
 )
 

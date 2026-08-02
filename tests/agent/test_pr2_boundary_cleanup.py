@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import inspect
 
-from agent_runtime.planning import PlanTracker
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.llm_context import AgentLLMContextAssembler
@@ -49,7 +48,7 @@ def _state() -> dict[str, object]:
     return create_loop_state(current_message="Find policy evidence", run_config=_config())
 
 
-def test_observations_do_not_recreate_deprecated_flat_state() -> None:
+def test_observations_update_typed_working_state_without_flat_channels() -> None:
     state = _state()
     batch = ObservationBatch(
         structured_observations=[
@@ -57,6 +56,7 @@ def test_observations_do_not_recreate_deprecated_flat_state() -> None:
                 tool_call_id="call-1",
                 tool_name="search_knowledge",
                 status="ok",
+                locators=[{"doc_id": 7, "section_id": 3}],
                 raw_result_ref="call-1",
             )
         ]
@@ -64,6 +64,10 @@ def test_observations_do_not_recreate_deprecated_flat_state() -> None:
 
     AgentLoop._merge_observations(state, batch)
 
+    assert state["memory_state"].recent_observations == batch.structured_observations
+    assert state["memory_state"].known_locators == [
+        {"doc_id": 7, "section_id": 3}
+    ]
     assert {
         "structured_observations",
         "evidence",
@@ -134,29 +138,3 @@ def test_llm_context_assembler_preserves_canonical_tool_content() -> None:
     assert "call-knowledge" in assembled.prompt
     assert "Canonical evidence." in assembled.prompt
     assert "formatter_resolver" not in inspect.signature(AgentLLMContextAssembler).parameters
-
-
-def test_plan_tracker_accepts_core_structured_observation_directly() -> None:
-    tracker = PlanTracker()
-    plan, _ = tracker.initialize_task(task="Track one tool result")
-    plan, _ = tracker.record_decision_progress(
-        plan,
-        tool_call_ids=["call-1"],
-        tool_names=["search_knowledge"],
-    )
-
-    updated, events = tracker.record_observation_progress(
-        plan,
-        observations=[
-            StructuredObservation(
-                tool_call_id="call-1",
-                tool_name="search_knowledge",
-                status="ok",
-                raw_result_ref="call-1",
-            )
-        ],
-    )
-
-    assert updated is not None
-    assert updated.steps[0].status == "completed"
-    assert events[0].event_type == "observation_progress"

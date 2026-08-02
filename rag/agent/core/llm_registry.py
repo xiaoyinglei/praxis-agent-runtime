@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from rag.agent.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
 from rag.models.config import GenerationConfig, GenerationTaskConfig
-from rag.schema.llm import parse_llm_stage_budgets
+from rag.schema.llm import LLMCallStage, parse_llm_stage_budgets
 
 
 class UnknownModelAliasError(KeyError):
@@ -168,10 +168,13 @@ class ModelRegistry:
                 "provider_name": entry.get("provider"),
                 "protocol": merged.get("protocol"),
                 "model": entry["model"],
+                "tokenizer_model": entry.get("tokenizer_model"),
                 "max_tokens": entry.get("max_tokens", 2048),
+                "defaults": entry.get("defaults", {}),
                 "base_url": merged.get("base_url"),
                 "api_key_env": merged.get("api_key_env"),
                 "context_window_tokens": entry.get("context_window_tokens", 32_768),
+                "request_context_tokens": entry.get("request_context_tokens"),
                 "supports_tools": entry.get("tools", entry.get("supports_tools", True)),
                 "supports_structured_output": entry.get(
                     "structured_output",
@@ -220,26 +223,43 @@ class ModelRegistry:
             raise ModelNotAvailableError(f"Provider for {alias!r} does not support chat generation")
 
         kwargs: dict[str, Any] = {"max_tokens": spec.max_tokens, **spec.defaults}
+        runtime_context_tokens = min(
+            spec.context_window_tokens,
+            spec.request_context_tokens or spec.context_window_tokens,
+        )
         token_accounting = TokenAccountingService(
             TokenizerContract(
                 embedding_model_name=spec.model,
-                tokenizer_model_name=spec.model,
-                chunking_tokenizer_model_name=spec.model,
+                tokenizer_model_name=spec.tokenizer_model or spec.model,
+                chunking_tokenizer_model_name=(
+                    spec.tokenizer_model or spec.model
+                ),
                 tokenizer_backend="auto",
-                max_context_tokens=spec.context_window_tokens,
+                max_context_tokens=runtime_context_tokens,
                 prompt_reserved_tokens=512,
                 local_files_only=True,
             )
         )
+        stage_budgets = {
+            stage: budget.model_copy()
+            for stage, budget in self._config.llm_stage_budgets.items()
+        }
+        tool_decision_budget = stage_budgets[LLMCallStage.TOOL_DECISION]
+        if spec.max_tokens > tool_decision_budget.max_output_tokens:
+            stage_budgets[LLMCallStage.TOOL_DECISION] = (
+                tool_decision_budget.model_copy(
+                    update={"max_output_tokens": spec.max_tokens}
+                )
+            )
         resolved = ResolvedModel(
             generator=generator,
             kwargs=kwargs,
-            context_window_tokens=spec.context_window_tokens,
+            context_window_tokens=runtime_context_tokens,
             gateway=LLMGateway(
                 generator=generator,
                 token_accounting=token_accounting,
-                model_context_tokens=spec.context_window_tokens,
-                stage_budgets=self._config.llm_stage_budgets,
+                model_context_tokens=runtime_context_tokens,
+                stage_budgets=stage_budgets,
             ),
             token_accounting=token_accounting,
             provider=spec.provider_name or spec.provider.value,
@@ -430,9 +450,6 @@ def _parse_generation_config(raw: object) -> GenerationConfig:
         planner=parse_task("planner"),
         synthesize=parse_task("synthesize"),
         factcheck=parse_task("factcheck"),
-        memory_select=parse_task("memory_select"),
-        memory_extract=parse_task("memory_extract"),
-        memory_consolidate=parse_task("memory_consolidate"),
     )
 
 

@@ -27,6 +27,9 @@ from rag.agent.tools.tool import (
 from rag.agent.workspace import WorkspaceRuntime
 
 _INTERNAL_DIRECTORY = ".agent_memory"
+_PROTECTED_VERIFICATION_DIRECTORIES = frozenset(
+    {".venv", "node_modules"}
+)
 _DEFAULT_HIDDEN_DIRECTORIES = frozenset(
     {
         _INTERNAL_DIRECTORY,
@@ -224,6 +227,7 @@ _PATCH_ERROR_CODES = {
     "file not found": "file_not_found",
     "old_string not found": "old_string_not_found",
     "old_string is not unique; set replace_all=true": "old_string_not_unique",
+    "replacement produced no change": "patch_no_change",
 }
 
 
@@ -233,8 +237,10 @@ def create_list_files_tool(workspace: WorkspaceRuntime) -> Tool:
             name="list_files",
             description=(
                 "List one workspace directory in deterministic filename order. "
-                "Use glob to narrow entries and limit to bound the result. This tool "
-                "does not recurse; call it again for a returned directory."
+                "This is not a code-search tool; use it when directory layout or an "
+                "unknown filename is the missing fact. Use glob to narrow entries and "
+                "limit to bound the result. This tool does not recurse; call it again "
+                "for a returned directory."
             ),
             input_schema=_LIST_INPUT_SCHEMA,
         ),
@@ -311,7 +317,8 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
             description=(
                 "Edit an existing UTF-8 workspace file by exact text replacement. "
                 "Without replace_all, the old text must occur exactly once. The write "
-                "is atomically installed and does not create new files."
+                "is atomically installed and does not create new files. Verification "
+                "toolchains under .venv and node_modules are read-only."
             ),
             input_schema=_PATCH_INPUT_SCHEMA,
         ),
@@ -338,7 +345,7 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 }
             ),
         ),
-        execution_revision="builtin-apply-patch-v1",
+        execution_revision="builtin-apply-patch-v2-protected-toolchain",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -491,7 +498,26 @@ def _apply_patch(
     workspace: WorkspaceRuntime,
     request: ApplyPatchInput,
 ) -> _ApplyPatchRunResult:
+    requested_path = Path(request.file_path)
+    if any(
+        part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
+        for part in requested_path.parts
+    ):
+        raise PermissionError(
+            "apply_patch cannot modify the verification toolchain"
+        )
     target = _checked_path(workspace, request.file_path)
+    relative = target.relative_to(workspace.root.resolve())
+    if (
+        relative.parts
+        and any(
+            part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
+            for part in relative.parts
+        )
+    ):
+        raise PermissionError(
+            "apply_patch cannot modify the verification toolchain"
+        )
     if not target.is_file():
         return _ApplyPatchRunResult(
             ApplyPatchOutput(
@@ -528,6 +554,15 @@ def _apply_patch(
         if request.replace_all
         else current.replace(request.old_string, request.new_string, 1)
     )
+    if updated == current:
+        return _ApplyPatchRunResult(
+            ApplyPatchOutput(
+                file_path=request.file_path,
+                replaced=False,
+                occurrences=occurrences if request.replace_all else 1,
+                message="replacement produced no change",
+            )
+        )
     diff, diff_truncated = _patch_diff(
         current,
         updated,

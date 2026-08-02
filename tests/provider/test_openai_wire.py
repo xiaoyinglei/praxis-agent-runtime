@@ -198,6 +198,35 @@ def test_openai_wire_serializes_later_context_as_user_event() -> None:
     assert sum(message["role"] == "system" for message in messages) == 1
 
 
+def test_openai_wire_round_trips_assistant_reasoning_for_tool_continuation() -> None:
+    context = build_stable_context(
+        instructions=("Use tools.",),
+        initial_user_task="Inspect the repository.",
+        transcript=(
+            ModelMessage(
+                role="assistant",
+                content="",
+                reasoning_content="I need to inspect the source first.",
+                tool_calls=(),
+            ),
+        ),
+    )
+    request = build_model_request(
+        request_id="req-reasoning-continuation",
+        context=context,
+        selected_tools=(),
+        settings=ModelSettings(model="gpt-compatible"),
+    )
+
+    payload = _thaw(serialize_openai_request(request).payload)
+
+    assert payload["messages"][-1] == {
+        "role": "assistant",
+        "content": None,
+        "reasoning_content": "I need to inspect the source first.",
+    }
+
+
 def test_openai_wire_rejects_non_leading_system_message() -> None:
     context = build_stable_context(
         instructions=("Be precise.",),
@@ -277,6 +306,7 @@ def test_openai_response_parser_returns_the_provider_neutral_model_turn() -> Non
                 finish_reason="tool_calls",
                 message=SimpleNamespace(
                     content="I will inspect it.",
+                    reasoning_content="The repository must be inspected before editing.",
                     tool_calls=[
                         SimpleNamespace(
                             id="call_1",
@@ -297,6 +327,9 @@ def test_openai_response_parser_returns_the_provider_neutral_model_turn() -> Non
     assert turn.stop_reason is StopReason.TOOL_USE
     assert turn.raw_stop_reason == "tool_calls"
     assert turn.text == "I will inspect it."
+    assert turn.reasoning_content == (
+        "The repository must be inspected before editing."
+    )
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].id == "call_1"
     assert turn.tool_calls[0].name == "mcp__zeta__lookup"

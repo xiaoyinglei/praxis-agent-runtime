@@ -8,7 +8,7 @@ import pytest
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
-from rag.agent.core.messages import StopReason, ToolUseResult
+from rag.agent.core.messages import ModelMessage, StopReason, ToolUseResult
 from rag.agent.loop.runtime import ModelTurnEnvelope
 from rag.agent.loop.state import create_loop_state
 from rag.agent.tools.tool import (
@@ -21,6 +21,7 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
+from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 from rag.schema.llm import LLMCallStage, LLMStageBudget, LLMUsage
 
 
@@ -53,8 +54,25 @@ def _tool(name: str) -> Tool:
 
 
 class _CanonicalGateway:
-    def __init__(self) -> None:
+    def __init__(self, turn: ToolUseResult | None = None) -> None:
         self.calls: list[dict[str, object]] = []
+        self.turn = turn or ToolUseResult(
+            text="canonical answer",
+            tool_calls=[],
+            stop_reason=StopReason.END_TURN,
+            raw_stop_reason="stop",
+        )
+        self.token_accounting = TokenAccountingService(
+            TokenizerContract(
+                embedding_model_name="canonical-gateway",
+                tokenizer_model_name="canonical-gateway",
+                chunking_tokenizer_model_name="canonical-gateway",
+                tokenizer_backend="simple",
+                max_context_tokens=32_768,
+                prompt_reserved_tokens=256,
+                local_files_only=True,
+            )
+        )
 
     def effective_stage_budget(
         self,
@@ -71,12 +89,7 @@ class _CanonicalGateway:
     async def agenerate_model_request(self, **kwargs: object) -> object:
         self.calls.append(dict(kwargs))
         return SimpleNamespace(
-            turn=ToolUseResult(
-                text="canonical answer",
-                tool_calls=[],
-                stop_reason=StopReason.END_TURN,
-                raw_stop_reason="stop",
-            ),
+            turn=self.turn,
             usage=LLMUsage(
                 input_tokens=12,
                 output_tokens=2,
@@ -178,3 +191,50 @@ async def test_all_supported_providers_receive_the_same_canonical_request() -> N
     assert len({request.toolset_revision for request in captured}) == 1
     assert all(envelope.model_call_record.request_id == captured[0].request_id for envelope in envelopes)
     assert all(envelope.draft.final_answer == "canonical answer" for envelope in envelopes)
+
+
+@pytest.mark.anyio
+async def test_model_defaults_and_reasoning_continuation_reach_canonical_messages() -> None:
+    gateway = _CanonicalGateway(
+        ToolUseResult(
+            text="",
+            reasoning_content="I should inspect README.md first.",
+            tool_calls=[],
+            stop_reason=StopReason.END_TURN,
+            raw_stop_reason="stop",
+        )
+    )
+    provider = LLMLoopModelTurnProvider(
+        gateway,
+        model="kimi-k2.6",
+        provider="kimi",
+        supports_native_tools=True,
+        registry_snapshot=MappingProxyType({}),
+        resident_tool_names=(),
+        kwargs={
+            "max_tokens": 32_768,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "provider_options": {"thinking": {"type": "enabled"}},
+        },
+        context_window_tokens=65_536,
+    )
+
+    envelope = await provider.next_turn(
+        _state(),
+        definition=_definition(),
+        budget_remaining=100_000,
+    )
+
+    request = gateway.calls[0]["request"]
+    assert request.settings.max_output_tokens == 32_768
+    assert request.settings.temperature == 1.0
+    assert request.settings.top_p == 0.95
+    assert request.settings.provider_options == {
+        "thinking": {"type": "enabled"}
+    }
+    assert envelope.assistant_message == ModelMessage(
+        role="assistant",
+        content="",
+        reasoning_content="I should inspect README.md first.",
+    )

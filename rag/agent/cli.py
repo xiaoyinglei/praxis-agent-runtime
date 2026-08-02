@@ -16,13 +16,13 @@ import yaml
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
-    ModelControlPlane,
     ModelNotAvailableError,
     ModelPolicyError,
     ModelSpec,
     format_model_rows,
 )
-from agent_runtime.result import AgentDiagnostic, AgentResult, AgentToolCall
+from agent_runtime.result import AgentDiagnostic, AgentResult
+from agent_runtime.runtime.builder import build_model_control_plane
 from rag.agent.core.llm_registry import UnknownModelAliasError
 from rag.agent.streaming.events import EventType, StreamEvent
 from rag.agent.turns import (
@@ -204,17 +204,6 @@ def _bounded_cli_text(value: str, *, limit: int = 180) -> str:
     return f"{compact[: limit - 1]}…"
 
 
-def _build_model_control_plane(
-    *,
-    model_alias: str | None = None,
-    session_path: Path | None = None,
-) -> ModelControlPlane:
-    return ModelControlPlane.from_env(
-        initial_model_id=model_alias,
-        session_path=session_path,
-    )
-
-
 def _load_knowledge_config(path: Path | None) -> RAGKnowledgeConfig | None:
     if path is None:
         return None
@@ -375,16 +364,6 @@ def _display_agent_result(
 
     if verbose:
         print(f"状态: {result.status}")
-
-
-def _format_public_tool_summary(
-    tool_calls: Sequence[AgentToolCall],
-) -> str:
-    lines = ["", "─" * 40, "工具执行:"]
-    for tool_call in tool_calls:
-        marker = "✗" if tool_call.is_error else "✓"
-        lines.append(f"  {marker} {tool_call.tool_name}")
-    return "\n".join(lines)
 
 
 def _handle_pause(
@@ -556,6 +535,7 @@ async def _run_facade_command(
     max_tokens_total: int | None,
     interactive_approval: bool,
     max_turns: int | None = None,
+    require_workspace_change: bool = True,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
     event_display: _CLIToolEventDisplay | None = None,
@@ -570,6 +550,7 @@ async def _run_facade_command(
             files=files,
             max_turns=max_turns,
             max_tokens_total=max_tokens_total,
+            require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             event_sink=display,
@@ -704,6 +685,7 @@ async def _chat_facade_loop(
             previous_turn_id=current_turn_id,
             max_turns=max_turns,
             max_tokens_total=max_tokens_total,
+            require_workspace_change=False,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             event_sink=event_display,
@@ -791,7 +773,7 @@ def model_list(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """列出可用模型，并标记当前会话模型。"""
-    control_plane = _build_model_control_plane(session_path=session_path)
+    control_plane = build_model_control_plane(session_path=session_path)
     for line in format_model_rows(
         control_plane.list_models(),
         current_model_id=control_plane.current_model().id,
@@ -807,7 +789,7 @@ def model_current(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示当前会话模型。"""
-    _print_current_model(_build_model_control_plane(session_path=session_path).current_model())
+    _print_current_model(build_model_control_plane(session_path=session_path).current_model())
 
 
 @model_app.command(name="switch")
@@ -819,7 +801,7 @@ def model_switch(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """切换当前模型 session state，不修改 models.yaml。"""
-    control_plane = _build_model_control_plane(session_path=session_path)
+    control_plane = build_model_control_plane(session_path=session_path)
     try:
         spec = control_plane.switch_model(model_id, requested_by="user")
     except (ModelPolicyError, UnknownModelAliasError) as exc:
@@ -957,6 +939,13 @@ def agent_run(
         Path,
         typer.Option("--checkpoint-db", help="SQLite checkpoint 文件；启用后可跨进程 resume"),
     ] = DEFAULT_CHECKPOINT_PATH,
+    model_session_path: Annotated[
+        Path,
+        typer.Option(
+            "--model-session-path",
+            help="模型会话状态文件；可放在 workspace 外部。",
+        ),
+    ] = DEFAULT_MODEL_SESSION_PATH,
     max_tokens_total: Annotated[
         int | None,
         typer.Option(
@@ -992,6 +981,16 @@ def agent_run(
         bool,
         typer.Option("--allow-write-tools", help="预授权本次 workspace 写入类调用"),
     ] = False,
+    require_workspace_change: Annotated[
+        bool,
+        typer.Option(
+            "--require-workspace-change/--no-require-workspace-change",
+            help=(
+                "默认仅在产生真实 workspace 变更，且在最后一次真实变更后"
+                "成功运行测试、lint、类型检查或构建时允许完成 Turn。"
+            ),
+        ),
+    ] = True,
     allow_execute_tools: Annotated[
         bool,
         typer.Option("--allow-execute-tools", help="预授权本次进程执行类调用"),
@@ -1019,7 +1018,7 @@ def agent_run(
         model=model,
         checkpoint_db=checkpoint_db,
         workspace_path=Path.cwd(),
-        model_session_path=DEFAULT_MODEL_SESSION_PATH,
+        model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
     )
     interactive_approval = not non_interactive and _is_interactive_terminal()
@@ -1033,6 +1032,7 @@ def agent_run(
             max_tokens_total=max_tokens_total,
             interactive_approval=interactive_approval,
             max_turns=max_turns,
+            require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             event_display=event_display,

@@ -34,6 +34,7 @@ class ModelSpec(BaseModel):
 
     provider: ModelProvider
     model: str
+    tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = None
     protocol: str | None = None
     max_tokens: int = 2048
@@ -42,6 +43,7 @@ class ModelSpec(BaseModel):
     api_key_env: str | None = None
     defaults: dict[str, Any] = Field(default_factory=dict)
     context_window_tokens: int = Field(default=32_768, gt=0)
+    request_context_tokens: int | None = Field(default=None, gt=0)
     supports_tools: bool = True
     supports_structured_output: bool = True
     location: Literal["local", "cloud"] | None = None
@@ -50,6 +52,17 @@ class ModelSpec(BaseModel):
     cache_read_cost_per_1m: float | None = Field(default=None, ge=0)
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0)
     runtime: ModelRuntimeConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_request_context_limit(self) -> ModelSpec:
+        if (
+            self.request_context_tokens is not None
+            and self.request_context_tokens > self.context_window_tokens
+        ):
+            raise ValueError(
+                "request_context_tokens must not exceed context_window_tokens"
+            )
+        return self
 
 
 class AgentModelsConfig(BaseModel):

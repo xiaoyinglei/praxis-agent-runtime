@@ -66,6 +66,7 @@ def test_agent_public_signatures_are_exact() -> None:
         "files: 'Sequence[str] | None' = None, "
         "max_turns: 'int | None' = None, "
         "max_tokens_total: 'int | None' = None, "
+        "require_workspace_change: 'bool' = True, "
         "allow_write_tools: 'bool' = False, "
         "allow_execute_tools: 'bool' = False, "
         "event_sink: 'AgentEventSink | None' = None) -> 'AgentResult'"
@@ -240,6 +241,152 @@ def test_agent_facade_run_passes_public_permission_options(
     request = requests[0]
     assert request.allow_write_tools is True
     assert request.allow_execute_tools is True
+
+
+def test_agent_facade_defaults_to_real_change_and_post_change_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="changed and verified",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run("Fix the implementation.")
+
+    goal = requests[0].goal_spec
+    assert goal is not None
+    assert [
+        (item.constraint_id, item.constraint_type, item.expected_value)
+        for item in goal.constraints
+    ] == [
+        ("workspace_change", "workspace_change", True),
+        (
+            "verification_after_change",
+            "verification_after_change",
+            True,
+        ),
+    ]
+
+
+def test_agent_facade_builds_explicit_completion_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="changed",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run(
+        "Fix the implementation.",
+        require_workspace_change=True,
+        allow_write_tools=True,
+    )
+
+    goal = requests[0].goal_spec
+    assert goal is not None
+    assert goal.original_query == "Fix the implementation."
+    assert [
+        (item.constraint_id, item.constraint_type, item.expected_value)
+        for item in goal.constraints
+    ] == [
+        ("workspace_change", "workspace_change", True),
+        (
+            "verification_after_change",
+            "verification_after_change",
+            True,
+        ),
+    ]
+
+
+def test_agent_facade_allows_explicit_read_only_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="read-only answer",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run("Explain the implementation.", require_workspace_change=False)
+
+    assert requests[0].goal_spec is None
+
+
+def test_agent_facade_requires_post_change_verification_when_execution_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[Any] = []
+
+    class _Service:
+        async def run(self, request: Any) -> AgentRunResult:
+            requests.append(request)
+            return AgentRunResult(
+                turn_id=request.turn_id,
+                status="done",
+                final_answer="changed and verified",
+            )
+
+    monkeypatch.setattr(
+        runtime_builder,
+        "build_agent_service",
+        lambda *_args, **_kwargs: _Service(),
+    )
+
+    Agent().run(
+        "Fix and verify the implementation.",
+        require_workspace_change=True,
+        allow_write_tools=True,
+        allow_execute_tools=True,
+    )
+
+    goal = requests[0].goal_spec
+    assert goal is not None
+    assert [
+        (item.constraint_id, item.constraint_type, item.expected_value)
+        for item in goal.constraints
+    ] == [
+        ("workspace_change", "workspace_change", True),
+        (
+            "verification_after_change",
+            "verification_after_change",
+            True,
+        ),
+    ]
 
 
 @pytest.mark.anyio
@@ -444,6 +591,7 @@ def test_agent_facade_registers_knowledge_runner_lazily(monkeypatch: pytest.Monk
 
 def test_agent_facade_closes_service_after_run(monkeypatch: pytest.MonkeyPatch) -> None:
     closed: list[bool] = []
+    model_runtime_closed: list[bool] = []
 
     class _Service:
         async def run(
@@ -459,13 +607,26 @@ def test_agent_facade_closes_service_after_run(monkeypatch: pytest.MonkeyPatch) 
         async def aclose(self) -> None:
             closed.append(True)
 
-    monkeypatch.setattr(runtime_builder, "build_agent_service", lambda *_args, **_kwargs: _Service())
+    class _ControlPlane:
+        def current_model(self) -> object:
+            return SimpleNamespace(id="qwen3_14b_mlx_4bit")
 
-    result = Agent(model="qwen3_14b_mlx_4bit").run("close service")
+        def close(self) -> None:
+            model_runtime_closed.append(True)
+
+    monkeypatch.setattr(runtime_builder, "build_agent_service", lambda *_args, **_kwargs: _Service())
+    agent = Agent(model="qwen3_14b_mlx_4bit")
+    agent._model_control_plane = cast(
+        ModelControlPlane,
+        _ControlPlane(),
+    )
+
+    result = agent.run("close service")
 
     assert result.answer == "closed"
     assert not hasattr(result, "session_id")
     assert closed == [True]
+    assert model_runtime_closed == [True]
 
 
 @pytest.mark.anyio

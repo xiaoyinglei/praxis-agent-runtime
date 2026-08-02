@@ -6,7 +6,7 @@ from langchain_core.messages import HumanMessage
 
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.messages import tool_result_message
+from rag.agent.core.messages import ModelMessage, tool_result_message
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.state import LoopState, PendingToolCall, create_loop_state
 from rag.agent.memory.injector import ContextBuilder
@@ -85,6 +85,38 @@ def test_context_sections_follow_authority_order() -> None:
     assert "ev1" in rendered
     assert "tool_call_id=tc1" in rendered
     assert '"error_code":"tool_not_implemented"' in rendered
+
+
+def test_model_visible_conversation_uses_only_canonical_transcript() -> None:
+    state = _state()
+    state["conversation_history"] = [
+        ModelMessage(role="user", content="canonical prior user"),
+        ModelMessage(role="assistant", content="canonical prior answer"),
+    ]
+    state["turn_transcript"] = [
+        ModelMessage(role="user", content="canonical current request"),
+    ]
+    state["messages"] = [
+        HumanMessage(content="FORGED LEGACY MESSAGE", id="legacy-forged"),
+    ]
+    state["memory_state"].working_summary = WorkingSummary(
+        summary="FORGED LEGACY SUMMARY",
+        covered_message_ids=["legacy-forged"],
+        updated_at="2026-05-08T00:00:00Z",
+        token_count=3,
+    )
+
+    context = ContextBuilder(max_context_tokens=2_000).assemble_loop(
+        definition=_definition(),
+        state=state,
+    )
+
+    rendered = context.as_text()
+    assert "canonical prior user" in rendered
+    assert "canonical prior answer" in rendered
+    assert "canonical current request" in rendered
+    assert "FORGED LEGACY MESSAGE" not in rendered
+    assert "FORGED LEGACY SUMMARY" not in rendered
 
 
 def test_tool_result_uses_fixed_canonical_content_without_formatter() -> None:

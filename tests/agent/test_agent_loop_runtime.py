@@ -6,7 +6,6 @@ from collections.abc import AsyncIterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import cast
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
@@ -27,8 +26,9 @@ from rag.agent.loop.runtime import (
     LoopEventSink,
     ModelTurnEnvelope,
     _approval_request,
-    _delivery_control_event,
-    _guard_exploration_stall,
+    _canonicalize_tool_arguments,
+    _guard_repeated_successful_inspections,
+    _matching_tool_failures_since_recovery,
 )
 from rag.agent.loop.state import (
     LoopState,
@@ -295,6 +295,76 @@ async def test_model_tool_result_next_turn_and_finish() -> None:
         "started",
         "completed",
     ]
+
+
+
+@pytest.mark.anyio
+async def test_repeated_failure_evidence_is_fingerprinted_in_model_transcript() -> None:
+    failure_text = "same failing test output\n" * 100
+    attempt = 0
+
+    def fail_with_variable_duration(
+        _arguments: Mapping[str, JsonValue],
+    ) -> Mapping[str, JsonValue]:
+        nonlocal attempt
+        attempt += 1
+        return {
+            "stdout": "",
+            "stderr": failure_text,
+            "exit_code": 1,
+            "duration_ms": attempt,
+        }
+
+    def normalize_failure(raw: object) -> NormalizedToolOutput:
+        assert isinstance(raw, Mapping)
+        return NormalizedToolOutput(
+            structured_content=dict(raw),
+            is_error=True,
+            error_code="command_failed",
+            error_message="command exited with status 1",
+            retryable=False,
+        )
+
+    tool = replace(
+        _tool("run_command", fail_with_variable_duration),
+        normalize_output=normalize_failure,
+    )
+    calls = tuple(
+        ToolCallPlan.create("run_command", {"value": command})
+        for command in ("pytest -q", "pytest --quiet")
+    )
+    state = create_loop_state(
+        current_message="Run the verification command.",
+        run_config=_config("loop-fold-repeated-failure-evidence"),
+        pending_tool_calls=calls,
+    )
+    state["resident_tool_names"] = ["run_command"]
+
+    result = await _loop(
+        provider=_SequenceProvider(
+            [ModelTurnDraft(action="finish", final_answer="Captured.")]
+        ),
+        tools=(tool,),
+    ).run(state)
+
+    tool_messages = [
+        json.loads(message.content)
+        for message in result["turn_transcript"]
+        if message.role == "tool"
+    ]
+    assert len(tool_messages) == 2
+    assert tool_messages[0]["structured_content"]["stderr"] == failure_text
+    repeated = tool_messages[1]["structured_content"]
+    assert repeated["repeated_failure"] is True
+    assert repeated["original_tool_call_id"] == calls[0].tool_call_id
+    assert repeated["repeat_count"] == 2
+    assert len(repeated["evidence_fingerprint"]) == 64
+    assert failure_text not in result["turn_transcript"][2].content
+    assert [
+        item.structured_content["stderr"]
+        for item in result["tool_results"]
+        if isinstance(item.structured_content, Mapping)
+    ] == [failure_text, failure_text]
 
 
 @pytest.mark.anyio
@@ -597,6 +667,31 @@ async def test_provider_error_retries_then_fails() -> None:
 
 
 @pytest.mark.anyio
+async def test_provider_error_redacts_credential_identifier_from_state() -> None:
+    credential_id = "ak-provider-credential-123456"
+    provider = _SequenceProvider(
+        [RuntimeError(f"429 rate limit for <{credential_id}>")]
+    )
+
+    result = await _loop(provider=provider, max_model_retries=0).run(
+        create_loop_state(
+            current_message="Answer.",
+            run_config=_config("loop-provider-secret-redaction"),
+        )
+    )
+
+    assert result["terminal"] is not None
+    assert credential_id not in (result["terminal"].error or "")
+    assert "[REDACTED]" in (result["terminal"].error or "")
+    assert all(
+        credential_id not in item.message
+        for item in result["runtime_diagnostics"]
+    )
+    assert result["latest_transition"] is not None
+    assert credential_id not in result["latest_transition"].model_dump_json()
+
+
+@pytest.mark.anyio
 async def test_provider_tool_validation_retry_gives_model_corrective_context() -> None:
     provider = _SequenceProvider(
         [
@@ -622,6 +717,39 @@ async def test_provider_tool_validation_retry_gives_model_corrective_context() -
     assert "model_tool_call_rejected" in feedback.content
     assert "max_bytes exceeds maximum" in feedback.content
     assert 'max_bytes\\":2000000' in feedback.content
+
+
+@pytest.mark.anyio
+async def test_provider_tool_validation_does_not_consume_transport_retry() -> None:
+    provider = _SequenceProvider(
+        [
+            LLMToolCallValidationError(
+                validation_error=(
+                    "Tool call validation failed: timeout_seconds exceeds maximum"
+                ),
+                failed_generation=(
+                    '<function=run_command>{"command":"pytest -q",'
+                    '"timeout_seconds":1000}</function>'
+                ),
+            ),
+            RuntimeError("request timed out"),
+            ModelTurnDraft(action="finish", final_answer="recovered"),
+        ]
+    )
+
+    result = await _loop(provider=provider, max_model_retries=1).run(
+        create_loop_state(
+            current_message="Run focused tests.",
+            run_config=_config("loop-provider-tool-validation-timeout"),
+        )
+    )
+
+    assert result["status"] == "completed"
+    assert result["iteration"] == 3
+    assert any(
+        item.code == "model_tool_call_rejected"
+        for item in result["runtime_diagnostics"]
+    )
 
 
 @pytest.mark.anyio
@@ -710,171 +838,255 @@ async def test_find_tools_result_and_activation_are_checkpointed_atomically() ->
     )
 
 
-def test_exploration_stall_blocks_inspection_but_keeps_delivery_paths() -> None:
+def test_repeated_successful_inspection_requires_new_arguments() -> None:
     state = create_loop_state(
-        current_message="Make the requested change.",
-        run_config=_config("loop-exploration-stall"),
+        current_message="Find the implementation choke point.",
+        run_config=_config("loop-repeated-successful-inspection"),
     )
-    state["tool_results"] = [
-        ToolResult(tool_call_id=f"read-{index}", tool_name="read_file")
-        for index in range(20)
-    ]
     origin = ToolCallOrigin(
-        request_id="delivery-control-request",
-        toolset_revision="delivery-control-tools",
-        exposed_tool_names=("read_file", "apply_patch"),
+        request_id="inspection-request",
+        toolset_revision="inspection-tools",
+        exposed_tool_names=("search_text",),
     )
-    repeated_read = ToolCall(
-        tool_call_id="read-new",
-        tool_name="read_file",
-        arguments={"path": "src/example.py"},
+    previous = ToolCall(
+        tool_call_id="search-previous",
+        tool_name="search_text",
+        arguments={"pattern": "system", "path": ""},
         origin=origin,
     )
-    replayed_read = ToolCall(
-        tool_call_id="read-replay",
-        tool_name="read_file",
-        arguments={"path": "src/example.py"},
+    repeated = ToolCall(
+        tool_call_id="search-repeated",
+        tool_name="search_text",
+        arguments={"pattern": "system", "path": ""},
         origin=origin,
     )
-    patch = ToolCall(
-        tool_call_id="patch-now",
-        tool_name="apply_patch",
-        arguments={"file_path": "src/example.py"},
+    narrowed = ToolCall(
+        tool_call_id="search-narrowed",
+        tool_name="search_text",
+        arguments={"pattern": "system", "path": "rag/providers"},
         origin=origin,
     )
-    state["tool_execution_records"][replayed_read.tool_call_id] = cast(
-        ToolExecutionRecord,
-        object(),
-    )
-
-    executable, blocked = _guard_exploration_stall(
-        state,
-        (repeated_read, replayed_read, patch),
-    )
-
-    assert executable == (replayed_read, patch)
-    assert len(blocked) == 1
-    assert blocked[0].tool_call_id == repeated_read.tool_call_id
-    assert blocked[0].error_code == "delivery_control"
-    assert blocked[0].retryable is False
-    assert blocked[0].metadata["delivery_control_already_open"] is False
-    event = _delivery_control_event(state)
-    assert event is not None
-    assert '"threshold":20' in event.content
-
-
-def test_update_plan_grants_only_one_bounded_focused_extension() -> None:
-    state = create_loop_state(
-        current_message="Deliver the implementation.",
-        run_config=_config("loop-plan-does-not-reopen-exploration"),
-    )
+    state["canonical_tool_calls"][previous.tool_call_id] = previous
     state["tool_results"] = [
-        *(
-            ToolResult(tool_call_id=f"read-{index}", tool_name="read_file")
-            for index in range(20)
+        ToolResult(
+            tool_call_id=previous.tool_call_id,
+            tool_name=previous.tool_name,
+        )
+    ]
+
+    executable, blocked = _guard_repeated_successful_inspections(
+        state,
+        (repeated, narrowed),
+    )
+
+    assert executable == (narrowed,)
+    assert len(blocked) == 1
+    assert blocked[0].tool_call_id == repeated.tool_call_id
+    assert blocked[0].error_code == "repeated_inspection"
+    assert blocked[0].retryable is False
+    assert blocked[0].metadata["previous_tool_call_id"] == previous.tool_call_id
+
+
+def test_canonical_tool_arguments_materialize_declared_defaults() -> None:
+    tool = replace(
+        _tool(
+            "run_command",
+            lambda _arguments: "unused",
+            schema={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "working_dir": {"type": "string", "default": "."},
+                    "timeout_seconds": {"type": "number", "default": 120.0},
+                    "network": {"type": "boolean", "default": False},
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        ),
+        validate_input=lambda arguments: {
+            "command": arguments["command"],
+            "working_dir": arguments.get("working_dir", "."),
+            "timeout_seconds": arguments.get("timeout_seconds", 120.0),
+            "network": arguments.get("network", False),
+        },
+    )
+
+    omitted = _canonicalize_tool_arguments(
+        {"run_command": tool},
+        tool_name="run_command",
+        arguments={"command": "pytest -q"},
+    )
+    explicit = _canonicalize_tool_arguments(
+        {"run_command": tool},
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 120.0,
+            "network": False,
+        },
+    )
+
+    assert omitted == explicit
+
+
+def test_unrelated_read_success_does_not_reset_failed_command_circuit() -> None:
+    state = create_loop_state(
+        current_message="Implement and verify the change.",
+        run_config=_config("loop-command-failure-recovery"),
+    )
+    origin = ToolCallOrigin(
+        request_id="command-failure-request",
+        toolset_revision="command-tools",
+        exposed_tool_names=("run_command", "list_files", "apply_patch"),
+    )
+    previous = ToolCall(
+        tool_call_id="command-previous",
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 600.0,
+            "network": False,
+            "workspace_write": False,
+        },
+        origin=origin,
+    )
+    retried = ToolCall(
+        tool_call_id="command-retried",
+        tool_name="run_command",
+        arguments={
+            "command": "pytest -q",
+            "working_dir": ".",
+            "timeout_seconds": 120.0,
+            "network": False,
+            "workspace_write": False,
+        },
+        origin=origin,
+    )
+    state["canonical_tool_calls"][previous.tool_call_id] = previous
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id=previous.tool_call_id,
+            tool_name=previous.tool_name,
+            is_error=True,
+            error_code="command_failed",
+            error_message="command exited with status 1",
         ),
         ToolResult(
-            tool_call_id="blocked-read",
-            tool_name="read_file",
-            is_error=True,
-            error_code="delivery_control",
-            error_message="exploration closed",
+            tool_call_id="list-between",
+            tool_name="list_files",
         ),
-        ToolResult(tool_call_id="plan-update", tool_name="update_plan"),
     ]
-    origin = ToolCallOrigin(
-        request_id="plan-escape-request",
-        toolset_revision="plan-escape-tools",
-        exposed_tool_names=("read_file",),
+
+    assert _matching_tool_failures_since_recovery(state, retried) == (
+        state["tool_results"][0],
     )
-    calls = tuple(
-        ToolCall(
-            tool_call_id=f"focused-read-{index}",
-            tool_name="read_file",
-            arguments={"path": f"src/example_{index}.py"},
-            origin=origin,
+
+    state["tool_results"].append(
+        ToolResult(
+            tool_call_id="patch-delivery",
+            tool_name="apply_patch",
         )
-        for index in range(9)
     )
 
-    executable, blocked = _guard_exploration_stall(state, calls)
-
-    assert executable == calls[:8]
-    assert len(blocked) == 1
-    assert blocked[0].tool_call_id == calls[8].tool_call_id
-    assert blocked[0].metadata["delivery_control_already_open"] is True
-    assert blocked[0].metadata["focused_extension_active"] is True
+    assert _matching_tool_failures_since_recovery(state, retried) == ()
 
 
-def test_exploration_stall_caps_a_batch_at_the_threshold() -> None:
+def test_delivery_action_reopens_same_inspection() -> None:
     state = create_loop_state(
-        current_message="Inspect the two remaining files.",
-        run_config=_config("loop-exploration-threshold-batch"),
+        current_message="Verify the delivered change.",
+        run_config=_config("loop-inspection-after-delivery"),
     )
-    state["tool_results"] = [
-        ToolResult(tool_call_id=f"read-{index}", tool_name="read_file")
-        for index in range(19)
-    ]
     origin = ToolCallOrigin(
-        request_id="delivery-batch-request",
-        toolset_revision="delivery-batch-tools",
+        request_id="inspection-after-delivery-request",
+        toolset_revision="inspection-after-delivery-tools",
         exposed_tool_names=("read_file",),
     )
-    calls = tuple(
-        ToolCall(
-            tool_call_id=f"batch-{index}",
-            tool_name="read_file",
-            arguments={"path": f"src/file_{index}.py"},
-            origin=origin,
-        )
-        for index in range(2)
+    previous = ToolCall(
+        tool_call_id="read-before-patch",
+        tool_name="read_file",
+        arguments={"path": "src/example.py"},
+        origin=origin,
+    )
+    verification = ToolCall(
+        tool_call_id="read-after-patch",
+        tool_name="read_file",
+        arguments={"path": "src/example.py"},
+        origin=origin,
+    )
+    state["canonical_tool_calls"][previous.tool_call_id] = previous
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id=previous.tool_call_id,
+            tool_name=previous.tool_name,
+        ),
+        ToolResult(
+            tool_call_id="patch",
+            tool_name="apply_patch",
+            metadata={
+                "workspace_changed": True,
+                "file_path": "src/example.py",
+                "before_sha256": "a" * 64,
+                "after_sha256": "b" * 64,
+            },
+        ),
+    ]
+
+    executable, blocked = _guard_repeated_successful_inspections(
+        state,
+        (verification,),
     )
 
-    executable, blocked = _guard_exploration_stall(state, calls)
-
-    assert executable == calls[:1]
-    assert len(blocked) == 1
-    assert blocked[0].tool_call_id == calls[1].tool_call_id
+    assert executable == (verification,)
+    assert blocked == ()
 
 
 @pytest.mark.anyio
-async def test_repeated_delivery_control_breach_fails_fast() -> None:
-    attempts = 0
-
-    def inspect(_arguments: Mapping[str, JsonValue]) -> str:
-        nonlocal attempts
-        attempts += 1
-        return "unexpected inspection"
-
-    first = ToolCallPlan.create("read_file", {"value": "first"})
-    repeated = ToolCallPlan.create("read_file", {"value": "second"})
+async def test_novel_grounded_inspection_is_not_capped_by_prior_call_count() -> None:
+    attempts: list[str] = []
+    call = ToolCallPlan.create(
+        "read_file",
+        {"path": "src/novel.py"},
+    )
     state = create_loop_state(
-        current_message="Stop exploring and deliver.",
-        run_config=_config("loop-delivery-control-fail-fast"),
-        pending_tool_calls=(first,),
+        current_message="Keep following novel grounded evidence.",
+        run_config=_config("loop-no-global-inspection-count"),
+        pending_tool_calls=(call,),
     )
     state["resident_tool_names"] = ["read_file"]
+    state["memory_state"].verified_workspace_paths = ["src/novel.py"]
     state["tool_results"] = [
         ToolResult(tool_call_id=f"seed-{index}", tool_name="read_file")
-        for index in range(20)
+        for index in range(25)
     ]
+    schema: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
 
     result = await _loop(
         provider=_SequenceProvider(
-            [ModelTurnDraft(action="execute", tool_calls=(repeated,))]
+            [ModelTurnDraft(action="finish", final_answer="Inspected.")]
         ),
-        tools=(_tool("read_file", inspect),),
+        tools=(
+            _tool(
+                "read_file",
+                lambda arguments: (
+                    attempts.append(str(arguments["path"]))
+                    or arguments["path"]
+                ),
+                schema=schema,
+            ),
+        ),
     ).run(state)
 
-    assert attempts == 0
-    assert result["status"] == "failed"
-    assert result["terminal"] is not None
-    assert result["terminal"].stop_reason == "delivery_stalled"
-    assert "cross-file coding" in (result["terminal"].error or "")
-    assert [item.error_code for item in result["tool_results"][-2:]] == [
-        "delivery_control",
-        "delivery_control",
-    ]
+    assert result["status"] == "completed"
+    assert attempts == ["src/novel.py"]
+    assert result["tool_results"][-1].error_code is None
 
 
 @pytest.mark.anyio
@@ -990,6 +1202,12 @@ async def test_repeated_tool_failure_circuit_uses_checkpointed_history() -> None
     assert result["status"] == "completed"
     assert attempts == ["stuck", "stuck", "recovered"]
     assert result["tool_results"][-2].error_code == "repeated_tool_failure"
+    assert result["tool_results"][-2].structured_content == {
+        "repeated_failure": True,
+        "original_tool_call_id": first.tool_call_id,
+        "failure_count": 2,
+        "last_error_code": "runner_failed",
+    }
 
 
 @pytest.mark.anyio

@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
-from rag.agent.core.messages import ModelMessage
+from rag.agent.core.context import AgentRunConfig
+from rag.agent.core.messages import ModelMessage, canonical_json_text
+from rag.agent.core.model_request import (
+    canonical_transcript_revision,
+    project_transcript_compaction,
+)
+from rag.agent.loop.state import create_loop_state
+from rag.agent.memory.compactor import LoopContextCompactor
+from rag.agent.memory.models import MemoryPolicy
 from rag.agent.turns import (
     RuntimeBinding,
     TurnStateError,
@@ -89,6 +99,185 @@ def test_turn_transcript_sync_is_append_only(tmp_path: Path) -> None:
             ],
         )
     assert store.turn_history(turn.turn_id) == tuple(transcript)
+    store.close()
+
+
+def _compacted_turn_messages(
+    turn_id: str,
+    user_message: str,
+) -> tuple[list[ModelMessage], list[ModelMessage]]:
+    policy = _compaction_policy()
+    state = create_loop_state(
+        current_message=user_message,
+        run_config=AgentRunConfig(
+            turn_id=turn_id,
+            llm_budget_total=10_000,
+            memory_policy=policy,
+        ),
+    )
+    original = [
+        ModelMessage(role="user", content=user_message),
+        *[
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=f"persisted-{index}: " + (f"token-{index} " * 500),
+            )
+            for index in range(6)
+        ],
+    ]
+    state["turn_transcript"] = list(original)
+    result = LoopContextCompactor().reactive_compact(state)
+    assert result.changed is True
+    return original, list(state["turn_transcript"])
+
+
+def _compaction_policy() -> MemoryPolicy:
+    return MemoryPolicy(
+        message_compaction_min_count=99,
+        reactive_compact_tail_count=2,
+    )
+
+
+def test_turn_store_accepts_verified_canonical_compaction_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    turn = store.begin_turn("compact me", _runtime(tmp_path))
+    original, compacted = _compacted_turn_messages(
+        turn.turn_id,
+        "compact me",
+    )
+    store.sync_turn_messages(turn.turn_id, original)
+    candidate = [
+        *compacted,
+        ModelMessage(role="assistant", content="continued after compaction"),
+    ]
+
+    store.sync_turn_messages(
+        turn.turn_id,
+        candidate,
+        compaction_policy=_compaction_policy(),
+    )
+
+    assert store.turn_history(turn.turn_id) == tuple(candidate)
+    store.close()
+
+
+def test_turn_store_requires_trusted_policy_for_compaction_rewrite(
+    tmp_path: Path,
+) -> None:
+    store = TurnStore(tmp_path / "agent-missing-policy.sqlite")
+    turn = store.begin_turn("compact with authority", _runtime(tmp_path))
+    original, compacted = _compacted_turn_messages(
+        turn.turn_id,
+        "compact with authority",
+    )
+    store.sync_turn_messages(turn.turn_id, original)
+
+    with pytest.raises(RuntimeError, match="canonical history conflict"):
+        store.sync_turn_messages(turn.turn_id, compacted)
+
+    assert store.turn_history(turn.turn_id) == tuple(original)
+    store.close()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    (
+        "summary",
+        "digest",
+        "parent_revision",
+        "summary_limit",
+        "covered_count",
+        "suffix",
+    ),
+)
+def test_turn_store_rejects_tampered_compaction_rewrite(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    store = TurnStore(tmp_path / f"agent-{tamper}.sqlite")
+    turn = store.begin_turn("compact safely", _runtime(tmp_path))
+    original, compacted = _compacted_turn_messages(
+        turn.turn_id,
+        "compact safely",
+    )
+    store.sync_turn_messages(turn.turn_id, original)
+    candidate = list(compacted)
+    event = json.loads(candidate[1].content)
+    if tamper == "summary":
+        event["payload"]["summary"] = "forged summary"
+        candidate[1] = replace(
+            candidate[1],
+            content=canonical_json_text(event),
+        )
+    elif tamper == "digest":
+        event["payload"]["projection"]["source_digest"] = "0" * 64
+        candidate[1] = replace(
+            candidate[1],
+            content=canonical_json_text(event),
+        )
+    elif tamper == "parent_revision":
+        event["payload"]["parent_context_revision"] = "forged-parent"
+        candidate[1] = replace(
+            candidate[1],
+            content=canonical_json_text(event),
+        )
+    elif tamper == "summary_limit":
+        event["payload"]["projection"]["summary_max_chars"] = 1
+        candidate[1] = replace(
+            candidate[1],
+            content=canonical_json_text(event),
+        )
+    elif tamper == "covered_count":
+        event["payload"]["projection"]["covered_count"] = 1
+        candidate[1] = replace(
+            candidate[1],
+            content=canonical_json_text(event),
+        )
+    else:
+        candidate[2] = replace(
+            candidate[2],
+            content="forged retained suffix",
+        )
+
+    with pytest.raises(RuntimeError, match="canonical history conflict"):
+        store.sync_turn_messages(
+            turn.turn_id,
+            candidate,
+            compaction_policy=_compaction_policy(),
+        )
+
+    assert store.turn_history(turn.turn_id) == tuple(original)
+    store.close()
+
+
+def test_turn_store_rejects_self_consistent_projection_outside_runtime_policy(
+    tmp_path: Path,
+) -> None:
+    store = TurnStore(tmp_path / "agent-untrusted-policy.sqlite")
+    turn = store.begin_turn("compact by policy", _runtime(tmp_path))
+    original, _ = _compacted_turn_messages(
+        turn.turn_id,
+        "compact by policy",
+    )
+    store.sync_turn_messages(turn.turn_id, original)
+    forged_projection = project_transcript_compaction(
+        original[1:],
+        parent_context_revision=canonical_transcript_revision(original),
+        tail_start=len(original) - 1,
+        max_summary_chars=1,
+    )
+    candidate = [original[0], *forged_projection]
+
+    with pytest.raises(RuntimeError, match="canonical history conflict"):
+        store.sync_turn_messages(
+            turn.turn_id,
+            candidate,
+            compaction_policy=_compaction_policy(),
+        )
+
+    assert store.turn_history(turn.turn_id) == tuple(original)
     store.close()
 
 

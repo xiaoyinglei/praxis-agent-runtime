@@ -19,6 +19,8 @@ from rag.agent.core.messages import ModelMessage
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.runtime import ModelTurnEnvelope
 from rag.agent.loop.state import LoopPause, LoopState, ModelTurnDraft
+from rag.agent.memory.compactor import LoopContextCompactor
+from rag.agent.memory.models import MemoryPolicy
 from rag.agent.service import AgentRunRequest, AgentService
 from rag.agent.tools.builtins.shell import create_run_command_tool
 from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
@@ -289,6 +291,79 @@ async def test_resume_interrupted_turn_hydrates_full_predecessor_history(
 
 
 @pytest.mark.anyio
+async def test_resume_repairs_checkpoint_first_compaction_rewrite(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    checkpointer = MemorySaver(serde=agent_checkpoint_serde())
+    runtime = RuntimeBinding(workspace_path=str(tmp_path))
+    turn = store.begin_turn(
+        "compact before resume",
+        runtime,
+        lease_owner="dead-worker",
+    )
+    request = AgentRunRequest(
+        message="compact before resume",
+        turn_id=turn.turn_id,
+        memory_policy=MemoryPolicy(
+            message_compaction_min_count=99,
+            reactive_compact_tail_count=2,
+        ),
+    )
+    seed = _service(
+        tmp_path,
+        store=store,
+        checkpointer=checkpointer,
+        provider=_FinishProvider(),
+    )
+    state = seed.initial_state(request)
+    original = [
+        ModelMessage(role="user", content=request.message),
+        *[
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=f"resume-{index}: " + (f"token-{index} " * 500),
+            )
+            for index in range(6)
+        ],
+    ]
+    state["turn_transcript"] = list(original)
+    store.sync_turn_messages(turn.turn_id, original)
+    compaction = LoopContextCompactor().reactive_compact(state)
+    assert compaction.changed is True
+    compacted = tuple(state["turn_transcript"])
+    await LangGraphCheckpointStore(
+        checkpointer,
+        run_config=state["run_config"],
+    ).save_snapshot(
+        state,
+        reason="checkpoint_before_turn_store_sync",
+    )
+    store.mark_interrupted(turn.turn_id)
+
+    provider = _FinishProvider("resumed after compaction")
+    restored = _service(
+        tmp_path,
+        store=store,
+        checkpointer=checkpointer,
+        provider=provider,
+    )
+    result = await restored.resume_turn(
+        turn_id=turn.turn_id,
+        action="continue",
+    )
+
+    assert result.status == "done"
+    assert provider.observed[0]["turn_transcript"] == list(compacted)
+    persisted = store.turn_history(turn.turn_id)
+    assert persisted[: len(compacted)] == compacted
+    assert any(
+        '"event_type":"context_compaction"' in message.content
+        for message in persisted
+    )
+
+
+@pytest.mark.anyio
 async def test_resume_clarification_appends_user_input_to_same_turn(
     tmp_path,
 ) -> None:
@@ -425,6 +500,7 @@ async def test_run_command_network_uses_two_checkpointed_approvals(
             "working_dir": ".",
             "timeout_seconds": 2,
             "network": True,
+            "workspace_write": True,
         },
     )
     definition = AgentRuntimePolicy.test_factory(
@@ -454,8 +530,18 @@ async def test_run_command_network_uses_two_checkpointed_approvals(
     assert first.human_input_request is not None
     tool_approval = first.human_input_request
     assert tool_approval.context["approval_scope"] == "tool"
+    assert tool_approval.context["workspace_write"] is True
+    assert tool_approval.context["workspace_path"] == str(workspace.root)
     assert tool_approval.tool_calls[0].approval_id == plan.tool_call_id
     assert command in tool_approval.tool_calls[0].args_preview
+    assert "workspace write: requested for entire workspace" in (
+        tool_approval.tool_calls[0].args_preview
+    )
+    assert str(workspace.root) in tool_approval.tool_calls[0].args_preview
+    assert "destructive operation" in tool_approval.tool_calls[0].reason
+    assert "destructive write access to the entire workspace" in (
+        tool_approval.question
+    )
 
     second = await service(_CommandProvider(plan)).resume_turn(
         turn_id=first.turn_id,

@@ -89,7 +89,6 @@ def _context():
             ),
         ),
         initial_user_task="Inspect the repository and report the result.",
-        initial_memory=("The repository uses Python 3.12.",),
     )
 
 
@@ -385,15 +384,48 @@ def test_compaction_closes_the_old_revision_and_creates_a_new_one() -> None:
     assert context.transcript == tuple(ModelMessage(role="assistant", content=f"turn-{index}") for index in range(3))
 
 
+def test_failure_projection_does_not_erase_large_successful_tool_result() -> None:
+    call_id = "call_read_large_success"
+    context = _context().append_message(
+        ModelMessage(
+            role="assistant",
+            content="",
+            tool_calls=(
+                ModelToolCall(
+                    id=call_id,
+                    name="read_file",
+                    input={"path": "large.txt"},
+                ),
+            ),
+        )
+    ).append_tool_result(
+        ToolResult(
+            tool_call_id=call_id,
+            tool_name="read_file",
+            structured_content={
+                "path": "large.txt",
+                "text": "successful file content\n" * 1_000,
+            },
+        )
+    )
+
+    projected = context.project_compaction(
+        tail_start=0,
+        max_summary_chars=512,
+        project_tool_results=True,
+    )
+
+    assert projected == context
+    assert "successful file content" in projected.transcript[-1].content
+
+
 def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
     block_content: dict[str, JsonValue] = {"paths": ["src"]}
-    memory = ["frozen memory"]
     arguments = {"path": "README.md"}
     context = build_stable_context(
         instructions=("Stable instruction",),
         frozen_run_context=(ContextBlock("workspace", block_content),),
         initial_user_task="Read the file.",
-        initial_memory=memory,
     )
     request = build_model_request(
         request_id="req-snapshot",
@@ -411,36 +443,30 @@ def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
     before = canonical_model_request_json(request)
 
     block_content["paths"] = ("changed",)
-    memory[0] = "changed memory"
     arguments["path"] = "CHANGED.md"
 
     assert canonical_model_request_json(request) == before
     assert "CHANGED.md" not in before
-    assert "changed memory" not in stable_context_json(context)
 
 
 def test_direct_stable_context_construction_snapshots_caller_owned_sequences() -> None:
     instructions = ["Stable instruction"]
     blocks = [ContextBlock("workspace", {"paths": ["src"]})]
-    memory = ["Stable memory"]
     transcript = [ModelMessage(role="assistant", content="Stable turn")]
 
     context = StableModelContext(
         instructions=instructions,  # type: ignore[arg-type]
         frozen_run_context=blocks,  # type: ignore[arg-type]
         initial_user_task="Inspect the repository.",
-        initial_memory=memory,  # type: ignore[arg-type]
         transcript=transcript,  # type: ignore[arg-type]
         context_revision="context_persisted",
     )
     instructions[0] = "changed"
     blocks.clear()
-    memory[0] = "changed"
     transcript.clear()
 
     assert context.instructions == ("Stable instruction",)
     assert tuple(block.name for block in context.frozen_run_context) == ("workspace",)
-    assert context.initial_memory == ("Stable memory",)
     assert context.transcript == (ModelMessage(role="assistant", content="Stable turn"),)
 
 

@@ -37,6 +37,11 @@ _LEGACY_CLOSURE_PATHS = (
     "rag/agent/graphs/nodes/__init__.py",
 )
 
+_ORPHANED_AGENT_PATHS = (
+    "rag/agent/binding_providers.py",
+    "rag/agent/capabilities/__init__.py",
+)
+
 
 def test_agent_package_exports_new_contract_surface_only() -> None:
     import rag.agent as agent
@@ -124,6 +129,12 @@ def test_legacy_agent_closure_files_are_removed() -> None:
     root = Path(__file__).resolve().parents[2]
 
     assert [relative for relative in _LEGACY_CLOSURE_PATHS if (root / relative).exists()] == []
+
+
+def test_orphaned_agent_paths_are_removed() -> None:
+    root = Path(__file__).resolve().parents[2]
+
+    assert [relative for relative in _ORPHANED_AGENT_PATHS if (root / relative).exists()] == []
 
 
 def test_production_tree_has_no_legacy_agent_closure_imports() -> None:

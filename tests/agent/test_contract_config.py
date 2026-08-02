@@ -162,6 +162,11 @@ class TestAgentRuntimePolicy:
         assert "read_file.start_line" in GENERIC_SYSTEM_PROMPT
         assert "first concrete edit" in GENERIC_SYSTEM_PROMPT
         assert "twelve inspection" in GENERIC_SYSTEM_PROMPT
+        normalized_prompt = " ".join(GENERIC_SYSTEM_PROMPT.split())
+        assert "complete coherent change across every affected layer" in (
+            normalized_prompt
+        )
+        assert "smallest coherent change" not in normalized_prompt
 
     def test_definition_rejects_negative_output_validation_retries(self) -> None:
         with pytest.raises(

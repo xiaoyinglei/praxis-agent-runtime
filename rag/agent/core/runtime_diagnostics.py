@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Iterable
 from typing import Literal
 
@@ -7,6 +9,46 @@ from pydantic import BaseModel, ConfigDict, Field
 
 MAX_RUNTIME_DIAGNOSTICS = 20
 MAX_RUNTIME_DIAGNOSTIC_MESSAGE_LENGTH = 500
+_SENSITIVE_ENV_NAME_PARTS = (
+    "KEY",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
+)
+_CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:gsk_|sk-|ak[-_])[A-Za-z0-9_-]{8,}",
+    flags=re.IGNORECASE,
+)
+_BEARER_TOKEN_RE = re.compile(
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}",
+    flags=re.IGNORECASE,
+)
+
+
+def redact_sensitive_text(value: object) -> str:
+    """Remove process secrets and common provider credential identifiers."""
+
+    redacted = str(value)
+    secrets = sorted(
+        {
+            secret
+            for name, secret in os.environ.items()
+            if (
+                secret
+                and len(secret) >= 8
+                and any(
+                    marker in name.upper()
+                    for marker in _SENSITIVE_ENV_NAME_PARTS
+                )
+            )
+        },
+        key=len,
+        reverse=True,
+    )
+    for secret in secrets:
+        redacted = redacted.replace(secret, "[REDACTED]")
+    redacted = _CREDENTIAL_TOKEN_RE.sub("[REDACTED]", redacted)
+    return _BEARER_TOKEN_RE.sub("Bearer [REDACTED]", redacted)
 
 
 class RuntimeDiagnostic(BaseModel):
@@ -35,7 +77,7 @@ class RuntimeDiagnostic(BaseModel):
         severity: Literal["warning", "error"] = "warning",
         degraded: bool = True,
     ) -> RuntimeDiagnostic:
-        message = str(error).strip() or type(error).__name__
+        message = redact_sensitive_text(error).strip() or type(error).__name__
         return cls(
             code=code,
             component=component,
@@ -145,4 +187,5 @@ __all__ = [
     "RuntimeDiagnostic",
     "ToolCallMetrics",
     "merge_runtime_diagnostics",
+    "redact_sensitive_text",
 ]

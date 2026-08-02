@@ -4,8 +4,10 @@ from collections.abc import Mapping
 
 import pytest
 
+from rag.agent.core import model_provider_runtime
 from rag.agent.core.context import AgentRunConfig
 from rag.agent.core.definition import AgentRuntimePolicy
+from rag.agent.core.goal_contract import GoalSpec
 from rag.agent.core.model_provider_runtime import (
     ModelProviderResolver,
     ResultDrivenModelTurnProvider,
@@ -88,6 +90,36 @@ def test_resolver_reuses_injected_provider() -> None:
     )
 
     assert resolver.resolve(_state()) is provider
+
+
+def test_resolver_passes_runtime_goal_to_canonical_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    provider = _Provider()
+    goal = GoalSpec(original_query="Implement the requested change.")
+
+    def create_provider(*args: object, **kwargs: object) -> _Provider:
+        captured["args"] = args
+        captured.update(kwargs)
+        return provider
+
+    monkeypatch.setattr(
+        model_provider_runtime,
+        "create_loop_model_turn_provider",
+        create_provider,
+    )
+
+    resolved = ModelProviderResolver(
+        model_turn_provider=None,
+        model_registry=object(),  # type: ignore[arg-type]
+        policy=_policy(),
+        registry_snapshot={"read_file": _tool()},
+        goal_spec=goal,
+    ).resolve(_state())
+
+    assert resolved is provider
+    assert captured["goal_spec"] == goal
 
 
 def test_strict_registry_failure_is_not_hidden() -> None:

@@ -53,12 +53,13 @@ from rag.agent.core.turn_contracts import (
     ToolManifestDriftStatus,
 )
 from rag.agent.file_manifest import FileManifest, build_file_manifest
-from rag.agent.loop.runtime import AgentLoop, ModelTurnProvider
+from rag.agent.loop.runtime import AgentLoop
 from rag.agent.loop.state import (
     LoopPause,
     LoopState,
     LoopTerminal,
     LoopTransition,
+    ModelTurnProvider,
     create_loop_state,
 )
 from rag.agent.loop.stop_hooks import StopHookRunner, build_stop_hooks
@@ -513,6 +514,7 @@ class AgentService:
         self._turn_store.sync_turn_messages(
             run_config.turn_id,
             state["turn_transcript"],
+            compaction_policy=run_config.memory_policy,
         )
         if state["status"] == "paused":
             self._turn_store.mark_paused(run_config.turn_id)
@@ -532,6 +534,7 @@ class AgentService:
         self._turn_store.sync_turn_messages(
             run_config.turn_id,
             state["turn_transcript"],
+            compaction_policy=run_config.memory_policy,
         )
 
     def _interrupt_turn(self, turn_id: str) -> None:
@@ -611,6 +614,9 @@ class AgentService:
     ]:
         started_at = time.perf_counter()
         tool_trace_start = len(self._tool_executor.traces)
+        goal_spec = request.goal_spec or GoalSpec(
+            original_query=request.message,
+        )
         workspace = self._workspace_for_request(request)
         imported_files: list[Path] = []
         if request.input_files:
@@ -640,14 +646,14 @@ class AgentService:
         checkpoint_store = LangGraphCheckpointStore(
             self._checkpointer,
             run_config=run_config,
-            compatibility_config=GoalCompatibilityConfig(goal_spec=request.goal_spec),
+            compatibility_config=GoalCompatibilityConfig(goal_spec=goal_spec),
             snapshot_sink=self._sync_checkpoint_turn,
         )
         loop = self._build_loop(
             state=state,
             checkpoint_store=checkpoint_store,
             memory_store=memory_store,
-            goal_spec=request.goal_spec,
+            goal_spec=goal_spec,
             workspace=workspace,
         )
         return (
@@ -785,6 +791,7 @@ class AgentService:
             model_registry=self._model_registry,
             policy=self._policy,
             registry_snapshot=self._tool_snapshot,
+            goal_spec=goal_spec,
             strict_model_provider=self._strict_model_provider,
             stream_sink=self._stream_sink,
             skill_runtime=self._skill_runtime,
@@ -814,6 +821,7 @@ class AgentService:
                     definition=self._policy,
                     output_finalizer=output_finalizer,
                     goal_spec=goal_spec,
+                    workspace_root=workspace.root,
                 ),
                 max_blocks=self._policy.max_stop_hook_blocks,
             ),
@@ -1054,7 +1062,20 @@ class AgentService:
         elif persisted_turn[: len(checkpoint_turn)] == checkpoint_turn:
             current = persisted_turn
         else:
-            raise RuntimeError(f"Checkpoint and canonical history conflict for Turn {turn_id}")
+            try:
+                self._turn_store.sync_turn_messages(
+                    turn_id,
+                    checkpoint_turn,
+                    compaction_policy=(
+                        state["run_config"].memory_policy
+                    ),
+                )
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "Checkpoint and canonical history conflict for "
+                    f"Turn {turn_id}"
+                ) from exc
+            current = checkpoint_turn
         initial = ModelMessage(role="user", content=turn.user_message)
         if not current:
             current = (initial,)

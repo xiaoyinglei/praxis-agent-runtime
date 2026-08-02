@@ -7,7 +7,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, Field
 
 from rag.agent.memory.models import MemoryRef
-from rag.agent.tools.tool import ToolResult
+from rag.agent.tools.tool import ToolCall, ToolResult
 from rag.schema.query import AnswerCitation, EvidenceItem
 
 
@@ -145,6 +145,15 @@ class ObservationBuilder:
                 tool_name=result.tool_name,
                 status="error",
                 error=error_message,
+                raw_result_ref=result.tool_call_id,
+            )
+        progress_error = tool_result_progress_error(result)
+        if progress_error is not None:
+            return StructuredObservation(
+                tool_call_id=result.tool_call_id,
+                tool_name=result.tool_name,
+                status="error",
+                error=progress_error,
                 raw_result_ref=result.tool_call_id,
             )
 
@@ -667,6 +676,22 @@ def _workspace_tool_locators_from_output(
         return [_workspace_file_locator(file_info, source_tool="list_files") for file_info in entries or []]
     if tool_name == "read_file":
         return [_read_file_locator(output)]
+    if tool_name == "search_text":
+        matches = getattr(output, "matches", [])
+        locators: list[dict[str, object]] = []
+        for match in matches if isinstance(matches, list) else []:
+            file_path = _workspace_file_field(match, "file_path")
+            line_number = _workspace_file_field(match, "line_number")
+            if not isinstance(file_path, str) or not isinstance(line_number, int):
+                continue
+            locators.append(
+                {
+                    "source_tool": "search_text",
+                    "path": file_path,
+                    "line_number": line_number,
+                }
+            )
+        return locators
     return []
 
 
@@ -861,6 +886,213 @@ def _errors_from_results(
     ]
 
 
+def grounded_workspace_paths(
+    *,
+    locators: Sequence[Mapping[str, object]] = (),
+    input_paths: Sequence[str] = (),
+    tool_results: Sequence[ToolResult] = (),
+    tool_calls: Mapping[str, ToolCall] | None = None,
+) -> tuple[str, ...]:
+    """Reduce runtime-owned file evidence to normalized workspace paths.
+
+    Model-authored plans are deliberately not an input. A path is grounded only
+    when it came from the public file manifest, a successful tool observation,
+    or a write result that the runtime recorded as changing the workspace.
+    """
+
+    grounded: dict[str, None] = {}
+
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        normalized = _normalize_grounded_workspace_path(value)
+        if normalized is not None:
+            grounded[normalized] = None
+
+    for path in input_paths:
+        add(path)
+    for locator in locators:
+        add(locator.get("path"))
+    calls = tool_calls or {}
+    for result in tool_results:
+        if result.is_error:
+            continue
+        call = calls.get(result.tool_call_id)
+        if (
+            call is not None
+            and result.tool_name
+            in {"list_files", "search_text", "read_file"}
+        ):
+            requested_path = call.arguments.get("path")
+            if (
+                requested_path is None
+                and result.tool_name in {"list_files", "search_text"}
+            ):
+                requested_path = "."
+            add(requested_path)
+        if isinstance(result.structured_content, Mapping):
+            if result.tool_name in {"read_file", "apply_patch"}:
+                add(
+                    result.structured_content.get("path")
+                    or result.structured_content.get("file_path")
+                )
+            elif result.tool_name == "list_files":
+                entries = result.structured_content.get("entries")
+                if not isinstance(entries, Sequence) or isinstance(
+                    entries,
+                    (str, bytes),
+                ):
+                    entries = result.structured_content.get("files")
+                if isinstance(entries, Sequence) and not isinstance(
+                    entries,
+                    (str, bytes),
+                ):
+                    for entry in entries:
+                        if isinstance(entry, Mapping):
+                            add(entry.get("path"))
+            elif result.tool_name == "search_text":
+                matches = result.structured_content.get("matches")
+                if isinstance(matches, Sequence) and not isinstance(
+                    matches,
+                    (str, bytes),
+                ):
+                    for match in matches:
+                        if isinstance(match, Mapping):
+                            add(match.get("file_path"))
+        change = runtime_workspace_change(result)
+        if change is None:
+            continue
+        add(change[0])
+        if call is not None:
+            add(call.arguments.get("file_path") or call.arguments.get("path"))
+    return tuple(grounded)
+
+
+def runtime_workspace_change(
+    result: ToolResult,
+) -> tuple[str, str, str] | None:
+    """Return runtime-owned workspace change evidence."""
+
+    snapshot = runtime_workspace_snapshot(result)
+    if snapshot is not None:
+        before_sha256, after_sha256 = snapshot
+        if before_sha256 != after_sha256:
+            return ".", before_sha256, after_sha256
+        return None
+
+    # Checkpoints written before executor-owned tree snapshots stored this
+    # apply_patch receipt. Current executions cannot emit these protected keys:
+    # ToolExecutor strips tool-provided claims before returning a ToolResult.
+    if result.is_error or result.tool_name != "apply_patch":
+        return None
+    if result.metadata.get("workspace_changed") is not True:
+        return None
+    file_path = result.metadata.get("file_path")
+    legacy_before_sha256 = result.metadata.get("before_sha256")
+    legacy_after_sha256 = result.metadata.get("after_sha256")
+    normalized_path = (
+        _normalize_grounded_workspace_path(file_path)
+        if isinstance(file_path, str)
+        else None
+    )
+    if (
+        normalized_path is None
+        or not isinstance(legacy_before_sha256, str)
+        or not isinstance(legacy_after_sha256, str)
+        or not _valid_sha256(legacy_before_sha256)
+        or not _valid_sha256(legacy_after_sha256)
+        or legacy_before_sha256 == legacy_after_sha256
+    ):
+        return None
+    return normalized_path, legacy_before_sha256, legacy_after_sha256
+
+
+def runtime_workspace_snapshot(
+    result: ToolResult,
+) -> tuple[str, str] | None:
+    """Return a valid executor-owned before/after workspace snapshot."""
+
+    if result.metadata.get("runtime_workspace_write") is not True:
+        return None
+    before_sha256 = result.metadata.get("workspace_tree_before_sha256")
+    after_sha256 = result.metadata.get("workspace_tree_after_sha256")
+    if (
+        not isinstance(before_sha256, str)
+        or not isinstance(after_sha256, str)
+        or not _valid_sha256(before_sha256)
+        or not _valid_sha256(after_sha256)
+    ):
+        return None
+    return before_sha256, after_sha256
+
+
+def _valid_sha256(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
+
+
+def tool_result_progress_error(result: ToolResult) -> str | None:
+    """Return why a technically completed tool call is not useful progress."""
+
+    if result.is_error:
+        return result.error_message or "tool execution failed"
+    if result.tool_name == "apply_patch":
+        if runtime_workspace_change(result) is None:
+            return "write tool produced no workspace change"
+        return None
+    output = result.structured_content
+    if result.tool_name == "search_text" and isinstance(output, Mapping):
+        matches = output.get("matches")
+        if isinstance(matches, Sequence) and not isinstance(
+            matches,
+            (str, bytes),
+        ) and not matches:
+            return "search returned no matches"
+        return None
+    if result.tool_name == "list_files" and isinstance(output, Mapping):
+        entries = output.get("entries")
+        if isinstance(entries, Sequence) and not isinstance(
+            entries,
+            (str, bytes),
+        ) and not entries:
+            return "directory listing returned no entries"
+        return None
+    if result.tool_name != "run_command":
+        return None
+    if not isinstance(output, Mapping):
+        return "command result is missing an exit status"
+    exit_code = output.get("exit_code")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        return "command result is missing an exit status"
+    if exit_code != 0:
+        return f"command exited with status {exit_code}"
+    return None
+
+
+def _normalize_grounded_workspace_path(value: str) -> str | None:
+    normalized = value.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    normalized = normalized.rstrip("/")
+    if normalized == ".":
+        return "."
+    raw_parts = normalized.split("/")
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or (len(normalized) >= 2 and normalized[1] == ":")
+        or ".." in raw_parts
+    ):
+        return None
+    parts = [part for part in raw_parts if part not in {"", "."}]
+    return "/".join(parts) or None
+
+
 class _OutputView:
     def __init__(self, value: Mapping[str, object]) -> None:
         self._value = value
@@ -904,4 +1136,8 @@ __all__ = [
     "ObservationError",
     "ObservationExtractor",
     "StructuredObservation",
+    "grounded_workspace_paths",
+    "runtime_workspace_change",
+    "runtime_workspace_snapshot",
+    "tool_result_progress_error",
 ]

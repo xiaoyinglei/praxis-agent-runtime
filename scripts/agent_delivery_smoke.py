@@ -16,8 +16,8 @@ from uuid import uuid4
 
 DEFAULT_MODEL = "groq_gpt_oss_120b"
 RESIDENT_TOOL_NAMES = (
-    "list_files",
     "search_text",
+    "list_files",
     "read_file",
     "apply_patch",
     "run_command",

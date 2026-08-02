@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Literal, Protocol, Self
 
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from typing_extensions import TypedDict
 
 from rag.agent.core.context import AgentRunConfig
+from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.human_input import HumanInputRequest, HumanInputResponse
 from rag.agent.core.messages import ModelMessage
-from rag.agent.core.model_request import ModelCallRecord
+from rag.agent.core.model_request import ModelCallRecord, ModelRequest
 from rag.agent.core.output_models import ValidatedFinalOutput
 from rag.agent.core.runtime_diagnostics import (
     AgentLatencyProfile,
@@ -18,18 +19,19 @@ from rag.agent.core.runtime_diagnostics import (
     merge_runtime_diagnostics,
 )
 from rag.agent.core.turn_contracts import ToolCallPlan, ToolManifest
+from rag.agent.loop.substate import (
+    DeferredToolState,
+    FinishState,
+    MemoryState,
+    PlanState,
+    StopHookFeedback,
+)
+from rag.agent.skills.models import SkillState
 from rag.agent.tools.executor import ToolExecutionRecord
 from rag.agent.tools.tool import ToolCall, ToolResult
 
 if TYPE_CHECKING:
     from rag.agent.file_manifest import FileManifest
-    from rag.agent.loop.substate import (
-        DeferredToolState,
-        FinishState,
-        MemoryState,
-        PlanState,
-    )
-    from rag.agent.skills.models import SkillState
 
 MAX_STOP_HOOK_FEEDBACK = 10
 MAX_LOOP_MEMORY_WARNINGS = 20
@@ -95,6 +97,30 @@ class LoopTransition(BaseModel):
     detail: dict[str, object] = Field(default_factory=dict)
 
 
+class ModelTurnEnvelope(BaseModel):
+    """Optional provider metadata surrounding one accepted draft."""
+
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
+
+    draft: ModelTurnDraft
+    transitions: tuple[LoopTransition, ...] = ()
+    request: ModelRequest | None = None
+    model_call_record: ModelCallRecord | None = None
+    assistant_message: ModelMessage | None = None
+    context_revision: str | None = None
+    provider_serializer_revision: str | None = None
+
+
+class ModelTurnProvider(Protocol):
+    async def next_turn(
+        self,
+        state: LoopState,
+        *,
+        definition: AgentRuntimePolicy,
+        budget_remaining: int,
+    ) -> ModelTurnDraft | ModelTurnEnvelope: ...
+
+
 class LoopPause(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -110,14 +136,6 @@ class LoopTerminal(BaseModel):
     final_answer: str | None = None
     final_output: ValidatedFinalOutput | None = None
     error: str | None = Field(default=None, max_length=2000)
-
-
-class StopHookFeedback(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    code: str = Field(min_length=1, max_length=120)
-    message: str = Field(min_length=1, max_length=1000)
-    occurrences: int = Field(default=1, ge=1)
 
 
 class PendingToolCall(BaseModel):
@@ -225,9 +243,6 @@ class LoopState(TypedDict):
     # ── File manifest (file-first processing) ──
     input_files: list[str]
     file_manifest: FileManifest | None
-    # ── Persistent cross-session memory ──
-    persistent_memories: list[str]  # selected memory texts for current run
-    memory_index: str  # MEMORY.md content (cheap, always loaded)
 
 
 def create_loop_state(
@@ -243,16 +258,6 @@ def create_loop_state(
     input_files: Iterable[str] = (),
     file_manifest: FileManifest | None = None,
 ) -> LoopState:
-    # ── Function-level imports to avoid circular import with substate.py ──
-    from rag.agent.loop.substate import (
-        DeferredToolState,
-        FinishState,
-        MemoryState,
-        PersistentMemorySnapshot,
-        PlanState,
-    )
-    from rag.agent.skills.models import SkillState
-
     current_turn = list(turn_transcript)
     if not current_turn:
         current_turn.append(
@@ -302,9 +307,6 @@ def create_loop_state(
         # ── File manifest (file-first processing) ──
         "input_files": list(input_files),
         "file_manifest": file_manifest,
-        # ── Persistent cross-session memory ──
-        "persistent_memories": [],
-        "memory_index": "",
         # ── Typed sub-state containers ──
         "plan_state": PlanState(
             agent_plan=None,
@@ -321,7 +323,6 @@ def create_loop_state(
                 limit=MAX_LOOP_MEMORY_WARNINGS,
             ),
             reactive_compact_used=False,
-            persistent=PersistentMemorySnapshot(),
         ),
         "deferred_tool_state": DeferredToolState(),
         "finish_state": FinishState(
@@ -439,6 +440,8 @@ __all__ = [
     "LoopTransitionReason",
     "ModelTurn",
     "ModelTurnDraft",
+    "ModelTurnEnvelope",
+    "ModelTurnProvider",
     "PendingToolCall",
     "StopHookFeedback",
     "ToolCallLedger",

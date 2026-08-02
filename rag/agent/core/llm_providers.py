@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
-from typing import Literal
+import hashlib
+import json
+import re
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal, cast
 
 from pydantic import BaseModel, Field
 
 from rag.agent.core.definition import AgentRuntimePolicy, ModelSelectionPolicy
+from rag.agent.core.goal_contract import GoalSpec
 from rag.agent.core.llm_registry import ModelResolver
 from rag.agent.core.messages import (
     ModelMessage,
     StopReason,
     ToolUseResult,
     canonical_json_text,
+    context_event_message,
     model_message_payload,
 )
+from rag.agent.core.messages import ToolCall as ModelToolCall
 from rag.agent.core.model_request import (
     ContextBlock,
     ModelRequest,
@@ -25,16 +31,42 @@ from rag.agent.core.model_request import (
     split_turn_context,
     tool_definition_payload,
 )
+from rag.agent.core.observations import (
+    grounded_workspace_paths,
+    runtime_workspace_change,
+)
 from rag.agent.core.runtime_diagnostics import AgentLatencyProfile
 from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import LoopState, ModelTurnDraft
+from rag.agent.loop.state import LoopState, ModelTurnDraft, ModelTurnEnvelope
 from rag.agent.skills.runtime import SkillRuntime
 from rag.agent.streaming.events import text_delta
 from rag.agent.tools.selection import select_tools
-from rag.agent.tools.tool import Tool, ToolCallOrigin
-from rag.providers.llm_gateway import LLMGateway
+from rag.agent.tools.tool import JsonValue, Tool, ToolCallOrigin
+from rag.providers.llm_gateway import (
+    LLMGateway,
+    model_request_input_text,
+)
 from rag.schema.llm import LLMCallStage
+
+_MAX_WORKING_STATE_GROUNDED_PATHS = 32
+_MAX_WORKING_STATE_LOCATORS = 32
+_REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
+_MODEL_TOOL_CALL_REJECTED_EVENT = "model_tool_call_rejected"
+_TOOL_CALL_CORRECTION_EVENT = "tool_call_correction"
+_PATH_ONLY_LOCATOR_FIELDS = frozenset(
+    {
+        "source_tool",
+        "path",
+        "name",
+        "mime_type",
+        "size_bytes",
+        "is_dir",
+        "file_kind",
+        "is_binary",
+        "readable_as_text",
+        "truncated",
+    }
+)
 
 
 class LoopModelDecision(BaseModel):
@@ -98,6 +130,7 @@ class LLMLoopModelTurnProvider:
         context_window_tokens: int = 32_768,
         stream_sink: object | None = None,
         skill_runtime: SkillRuntime | None = None,
+        goal_spec: GoalSpec | None = None,
     ) -> None:
         if not hasattr(gateway, "agenerate_model_request"):
             raise TypeError("gateway must execute canonical ModelRequest values")
@@ -120,6 +153,9 @@ class LLMLoopModelTurnProvider:
         self._context_window_tokens = context_window_tokens
         self._stream_sink = stream_sink
         self._skill_runtime = skill_runtime
+        self._goal_spec = (
+            None if goal_spec is None else goal_spec.model_copy(deep=True)
+        )
 
     async def next_turn(
         self,
@@ -156,10 +192,20 @@ class LLMLoopModelTurnProvider:
         if skill_context:
             instructions.append(skill_context)
         file_manifest = state.get("file_manifest")
-        frozen_run_context = (
-            ()
-            if file_manifest is None or not file_manifest.files
-            else (
+        frozen_run_context: list[ContextBlock] = []
+        if self._goal_spec is not None:
+            frozen_run_context.append(
+                ContextBlock(
+                    name="goal_contract",
+                    content={
+                        "authority": "runtime",
+                        "fingerprint": self._goal_spec.fingerprint,
+                        "spec": self._goal_spec.model_dump(mode="json"),
+                    },
+                )
+            )
+        if file_manifest is not None and file_manifest.files:
+            frozen_run_context.append(
                 ContextBlock(
                     name="input_files",
                     content={
@@ -176,21 +222,33 @@ class LLMLoopModelTurnProvider:
                             for entry in file_manifest.files
                         ),
                     },
-                ),
+                )
             )
-        )
         settings = self._model_settings(definition.model_selection)
         initial_message, context_transcript = split_turn_context(
             conversation_history=state["conversation_history"],
             turn_transcript=state["turn_transcript"],
         )
+        context_transcript, tool_call_correction = (
+            _project_tool_call_correction_context(
+                context_transcript,
+                selected_tools=selected_tools,
+            )
+        )
         context = build_stable_context(
             instructions=tuple(instructions),
-            frozen_run_context=frozen_run_context,
+            frozen_run_context=tuple(frozen_run_context),
             initial_user_task=initial_message,
-            initial_memory=tuple(state.get("persistent_memories", ())),
             transcript=context_transcript,
         )
+        working_state = _working_state_message(
+            state,
+            goal_spec=self._goal_spec,
+        )
+        if working_state is not None:
+            context = context.append_message(working_state)
+        if tool_call_correction is not None:
+            context = context.append_message(tool_call_correction)
         context_limit = (
             state["run_config"].max_context_tokens
             or self._context_window_tokens
@@ -203,18 +261,47 @@ class LLMLoopModelTurnProvider:
             LLMCallStage.TOOL_DECISION,
             kwargs={"max_tokens": settings.max_output_tokens},
         ).max_input_tokens
+        request_id = (
+            f"{state['run_config'].turn_id}:turn:{state['iteration']}"
+        )
+
+        def request_for(
+            candidate_context: StableModelContext,
+        ) -> ModelRequest:
+            return build_model_request(
+                request_id=request_id,
+                context=candidate_context,
+                selected_tools=selected_tools,
+                settings=settings,
+            )
+
+        def request_input_tokens(
+            candidate_context: StableModelContext,
+        ) -> int:
+            candidate_request = request_for(candidate_context)
+            accounted_input = model_request_input_text(
+                candidate_request,
+                provider=self._provider,
+                supports_native_tools=self._supports_native_tools,
+            )
+            return self._gateway.token_accounting.count(
+                accounted_input
+            )
+
         context = _project_model_context(
             context,
             max_input_tokens=min(model_input_limit, stage_input_limit),
-        )
-        request = build_model_request(
-            request_id=(
-                f"{state['run_config'].turn_id}:turn:{state['iteration']}"
+            max_summary_chars=(
+                state["run_config"].memory_policy.max_working_summary_chars
             ),
-            context=context,
-            selected_tools=selected_tools,
-            settings=settings,
+            protected_tail_start=(
+                len(state["conversation_history"]) - 1
+                if state["conversation_history"]
+                else None
+            ),
+            input_token_count=request_input_tokens,
         )
+        request = request_for(context)
         _record_request_sizes(state, request)
         response = await self._gateway.agenerate_model_request(
             stage=LLMCallStage.TOOL_DECISION,
@@ -227,6 +314,10 @@ class LLMLoopModelTurnProvider:
         turn = response.turn
         if not isinstance(turn, ToolUseResult):
             raise TypeError("gateway must return a provider-neutral ToolUseResult")
+        turn = _scope_model_tool_call_ids(
+            turn,
+            request_id=request.request_id,
+        )
         record = bind_model_call_record(
             request=request,
             provider_wire_hash=response.provider_wire_hash,
@@ -235,6 +326,7 @@ class LLMLoopModelTurnProvider:
         assistant_message = ModelMessage(
             role="assistant",
             content=turn.text,
+            reasoning_content=turn.reasoning_content,
             tool_calls=tuple(turn.tool_calls),
         )
         return ModelTurnEnvelope(
@@ -260,6 +352,9 @@ class LLMLoopModelTurnProvider:
         )
         top_p = self._kwargs.get("top_p", 1.0)
         seed = self._kwargs.get("seed")
+        provider_options = self._kwargs.get("provider_options", {})
+        if not isinstance(provider_options, Mapping):
+            raise TypeError("provider_options must be a mapping")
         return ModelSettings(
             model=self._model,
             max_output_tokens=_int_setting(max_output_tokens),
@@ -277,6 +372,10 @@ class LLMLoopModelTurnProvider:
                 if seed is None
                 else _int_setting(seed)
             ),
+            provider_options=cast(
+                Mapping[str, JsonValue],
+                provider_options,
+            ),
         )
 
     async def _emit_text_delta(self, value: str) -> None:
@@ -289,80 +388,587 @@ class LLMLoopModelTurnProvider:
         await emit(text_delta(value))
 
 
+def _project_tool_call_correction_context(
+    transcript: Sequence[ModelMessage],
+    *,
+    selected_tools: Sequence[Tool],
+) -> tuple[tuple[ModelMessage, ...], ModelMessage | None]:
+    """Replace trailing provider rejections with one schema-derived retry hint.
+
+    The checkpoint transcript remains append-only.  This projection is only for
+    the next model request, so raw rejected generations stay available for
+    diagnostics without teaching the model to copy them.
+    """
+
+    rejection_payloads = tuple(
+        _tool_call_rejection_payload(message) for message in transcript
+    )
+    trailing: list[Mapping[str, object]] = []
+    for payload in reversed(rejection_payloads):
+        if payload is None:
+            break
+        trailing.append(payload)
+    retained = tuple(
+        message
+        for message, payload in zip(
+            transcript,
+            rejection_payloads,
+            strict=True,
+        )
+        if payload is None
+    )
+    if not trailing:
+        return retained, None
+    trailing.reverse()
+    return retained, context_event_message(
+        _TOOL_CALL_CORRECTION_EVENT,
+        _tool_call_correction_payload(
+            trailing,
+            selected_tools=selected_tools,
+        ),
+    )
+
+
+def _tool_call_rejection_payload(
+    message: ModelMessage,
+) -> Mapping[str, object] | None:
+    if message.role != "context":
+        return None
+    try:
+        event = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(event, Mapping)
+        or event.get("event_type") != _MODEL_TOOL_CALL_REJECTED_EVENT
+    ):
+        return None
+    payload = event.get("payload")
+    return payload if isinstance(payload, Mapping) else None
+
+
+def _tool_call_correction_payload(
+    rejections: Sequence[Mapping[str, object]],
+    *,
+    selected_tools: Sequence[Tool],
+) -> Mapping[str, JsonValue]:
+    latest = rejections[-1]
+    failed_generation = latest.get("failed_generation")
+    raw = failed_generation if isinstance(failed_generation, str) else ""
+    validation_error_value = latest.get("validation_error")
+    validation_error = (
+        validation_error_value[:1_000]
+        if isinstance(validation_error_value, str)
+        else "Provider rejected the generated tool call."
+    )
+    if raw and raw in validation_error:
+        validation_error = validation_error.replace(
+            raw,
+            "[rejected generation omitted]",
+        )
+
+    tools_by_name = {
+        tool.definition.name: tool for tool in selected_tools
+    }
+    tool_name, attempted_arguments, failure_kind = (
+        _inspect_rejected_tool_generation(
+            raw,
+            selected_tool_names=frozenset(tools_by_name),
+        )
+    )
+    selected = tools_by_name.get(tool_name or "")
+    allowed_names: tuple[str, ...] = ()
+    required_names: tuple[str, ...] = ()
+    additional_properties_allowed: bool | None = None
+    if selected is not None:
+        schema = selected.definition.input_schema
+        properties = schema.get("properties")
+        if isinstance(properties, Mapping):
+            allowed_names = tuple(
+                sorted(
+                    name
+                    for name in properties
+                    if isinstance(name, str)
+                )
+            )
+        required = schema.get("required")
+        if isinstance(required, Sequence) and not isinstance(
+            required,
+            (str, bytes),
+        ):
+            required_names = tuple(
+                sorted(
+                    name
+                    for name in required
+                    if isinstance(name, str)
+                )
+            )
+        additional_properties_allowed = (
+            schema.get("additionalProperties", True) is not False
+        )
+    rejected_names = (
+        ()
+        if selected is None or attempted_arguments is None
+        else tuple(
+            sorted(
+                name
+                for name in attempted_arguments
+                if isinstance(name, str) and name not in allowed_names
+            )
+        )
+    )
+    return {
+        "recovery": "retry_native_tool_call",
+        "instruction": (
+            "Retry one native tool call with a strict JSON object. Use only "
+            "argument names allowed by the attached tool schema; do not copy "
+            "the rejected generation."
+        ),
+        "attempt_count": len(rejections),
+        "failure_kind": failure_kind,
+        "tool_name": tool_name,
+        "allowed_argument_names": allowed_names,
+        "required_argument_names": required_names,
+        "rejected_argument_names": rejected_names,
+        "additional_properties_allowed": additional_properties_allowed,
+        "validation_error": validation_error,
+        "failed_generation_chars": len(raw),
+        "failed_generation_sha256": (
+            hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if raw
+            else None
+        ),
+    }
+
+
+def _inspect_rejected_tool_generation(
+    value: str,
+    *,
+    selected_tool_names: frozenset[str],
+) -> tuple[str | None, Mapping[str, object] | None, str]:
+    text = value.strip()
+    tool_name: str | None = None
+    arguments: Mapping[str, object] | None = None
+    parsed_json = False
+    candidate = text
+
+    if text.startswith("<function=") and text.endswith("</function>"):
+        header_end = text.find(">")
+        if header_end > len("<function="):
+            tool_name = text[len("<function=") : header_end]
+            candidate = text[header_end + 1 : -len("</function>")]
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+        parsed = None
+    else:
+        parsed_json = True
+
+    if isinstance(parsed, Mapping):
+        function = parsed.get("function")
+        envelope = function if isinstance(function, Mapping) else parsed
+        candidate_name = envelope.get("name")
+        if not isinstance(candidate_name, str):
+            candidate_name = envelope.get("tool_name")
+        if isinstance(candidate_name, str):
+            tool_name = candidate_name
+        raw_arguments = envelope.get("arguments")
+        if raw_arguments is None:
+            raw_arguments = envelope.get("attempted_arguments")
+        if isinstance(raw_arguments, Mapping):
+            arguments = raw_arguments
+        elif isinstance(raw_arguments, str):
+            try:
+                decoded_arguments = json.loads(raw_arguments)
+            except (TypeError, ValueError):
+                parsed_json = False
+            else:
+                if isinstance(decoded_arguments, Mapping):
+                    arguments = decoded_arguments
+                else:
+                    parsed_json = False
+        elif text.startswith("<function="):
+            arguments = parsed
+
+    if tool_name not in selected_tool_names:
+        match = re.search(
+            r'"(?:name|tool_name)"\s*:\s*"([A-Za-z0-9_.:-]+)"',
+            text,
+        )
+        tool_name = (
+            match.group(1)
+            if match is not None
+            and match.group(1) in selected_tool_names
+            else None
+        )
+    return (
+        tool_name,
+        arguments,
+        "schema_validation" if parsed_json else "invalid_json",
+    )
+
+
 def _project_model_context(
     context: StableModelContext,
     *,
     max_input_tokens: int,
+    max_summary_chars: int,
+    protected_tail_start: int | None,
+    input_token_count: Callable[[StableModelContext], int],
 ) -> StableModelContext:
-    """Bound model-visible history without mutating canonical Session history."""
+    """Apply a final measured model-window projection."""
 
-    if not context.transcript:
-        return context
-    maximum_bytes = max_input_tokens * 4
-    visible = (*context.stable_messages, *context.transcript)
-    if _messages_size(visible) <= maximum_bytes:
+    current_tokens = input_token_count(context)
+    if (
+        not context.transcript
+        or current_tokens <= max_input_tokens
+    ):
         return context
 
-    tail_budget = max(512, maximum_bytes // 2)
-    tail_start = len(context.transcript)
-    used = 0
-    for index in range(len(context.transcript) - 1, -1, -1):
-        size = _message_size(context.transcript[index])
-        if tail_start < len(context.transcript) and used + size > tail_budget:
-            break
-        tail_start = index
-        used += size
-    tail_start = _extend_tail_for_tool_pair(context.transcript, tail_start)
-    tail = context.transcript[tail_start:]
-    covered = context.transcript[:tail_start]
-    summary_limit = min(12_000, max(256, maximum_bytes // 4))
-    summary = _deterministic_transcript_summary(
-        covered,
-        max_chars=summary_limit,
+    maximum_tail_start = (
+        len(context.transcript)
+        if protected_tail_start is None
+        else min(
+            max(protected_tail_start, 0),
+            len(context.transcript),
+        )
     )
-    return context.compact(summary=summary, retained_tail=tail)
+    latest_tool_pair_start = _latest_tool_pair_start(
+        context.transcript
+    )
+    if latest_tool_pair_start is not None:
+        maximum_tail_start = min(
+            maximum_tail_start,
+            latest_tool_pair_start,
+        )
+
+    best = context
+    best_tokens = current_tokens
+    summary_limits = _projection_summary_limits(
+        max_summary_chars
+    )
+    for tail_start in range(0, maximum_tail_start + 1):
+        for summary_limit in summary_limits:
+            candidate = context.project_compaction(
+                tail_start=tail_start,
+                max_summary_chars=summary_limit,
+                project_tool_results=True,
+            )
+            if candidate == context:
+                continue
+            candidate_tokens = input_token_count(candidate)
+            if candidate_tokens < best_tokens:
+                best = candidate
+                best_tokens = candidate_tokens
+            if candidate_tokens <= max_input_tokens:
+                return candidate
+    return best
 
 
-def _extend_tail_for_tool_pair(
-    transcript: tuple[ModelMessage, ...],
-    start: int,
-) -> int:
-    if start <= 0 or start >= len(transcript):
-        return start
-    first = transcript[start]
-    if first.role != "tool" or first.tool_call_id is None:
-        return start
-    for index in range(start - 1, -1, -1):
-        message = transcript[index]
-        if any(call.id == first.tool_call_id for call in message.tool_calls):
+def _latest_tool_pair_start(
+    transcript: Sequence[ModelMessage],
+) -> int | None:
+    for tool_index in range(len(transcript) - 1, -1, -1):
+        tool_message = transcript[tool_index]
+        if (
+            tool_message.role != "tool"
+            or tool_message.tool_call_id is None
+        ):
+            continue
+        for assistant_index in range(tool_index - 1, -1, -1):
+            assistant_message = transcript[assistant_index]
+            if any(
+                call.id == tool_message.tool_call_id
+                for call in assistant_message.tool_calls
+            ):
+                original_call_id = (
+                    _referenced_original_tool_call_id(
+                        tool_message
+                    )
+                )
+                if original_call_id is None:
+                    return assistant_index
+                original_index = _assistant_tool_call_index(
+                    transcript[:assistant_index],
+                    original_call_id,
+                )
+                return (
+                    assistant_index
+                    if original_index is None
+                    else original_index
+                )
+        return tool_index
+    return None
+
+
+def _referenced_original_tool_call_id(
+    message: ModelMessage,
+) -> str | None:
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("is_error") is not True
+        or payload.get("error_code") != _REPEATED_TOOL_FAILURE_CODE
+    ):
+        return None
+    structured = payload.get("structured_content")
+    if (
+        not isinstance(structured, Mapping)
+        or structured.get("repeated_failure") is not True
+    ):
+        return None
+    original = structured.get("original_tool_call_id")
+    return original if isinstance(original, str) and original else None
+
+
+def _assistant_tool_call_index(
+    transcript: Sequence[ModelMessage],
+    tool_call_id: str,
+) -> int | None:
+    for index in range(len(transcript) - 1, -1, -1):
+        if any(
+            call.id == tool_call_id
+            for call in transcript[index].tool_calls
+        ):
             return index
-    return start
+    return None
 
 
-def _deterministic_transcript_summary(
-    messages: tuple[ModelMessage, ...],
+def _projection_summary_limits(
+    max_summary_chars: int,
+) -> tuple[int, ...]:
+    current = min(max_summary_chars, 12_000)
+    limits: list[int] = []
+    while current > 80:
+        limits.append(current)
+        current = max(80, current // 2)
+    limits.append(current)
+    if limits[-1] != 1:
+        limits.append(1)
+    return tuple(dict.fromkeys(limits))
+
+
+def _working_state_message(
+    state: LoopState,
     *,
-    max_chars: int,
-) -> str:
-    if not messages:
-        return "Earlier conversation omitted to fit the model context window."
-    lines = [
-        f"{message.role}: {canonical_json_text(model_message_payload(message))}"
-        for message in messages
-    ]
-    summary = "\n".join(lines)
-    if len(summary) <= max_chars:
-        return summary
-    return summary[:max_chars].rstrip() + " [truncated]"
+    goal_spec: GoalSpec | None,
+) -> ModelMessage | None:
+    memory_state = state["memory_state"]
+    plan = state["plan_state"].agent_plan
+    protected_tool_call_ids = (
+        _protected_transcript_tool_call_ids(
+            state["turn_transcript"]
+        )
+    )
+    workspace_change_tool_call_ids = tuple(
+        result.tool_call_id
+        for result in state["tool_results"]
+        if runtime_workspace_change(result) is not None
+    )
+    latest_change_index = max(
+        (
+            index
+            for index, result in enumerate(state["tool_results"])
+            if runtime_workspace_change(result) is not None
+        ),
+        default=-1,
+    )
+    verification_tool_call_ids = tuple(
+        result.tool_call_id
+        for result in state["tool_results"][latest_change_index + 1 :]
+        if (
+            latest_change_index >= 0
+            and result.tool_name == "run_command"
+            and not result.is_error
+        )
+    )
+    runtime_requirements = tuple(
+        {
+            "constraint_id": constraint.constraint_id,
+            "constraint_type": constraint.constraint_type,
+            "expected_value": cast(JsonValue, constraint.expected_value),
+            "observation": (
+                "observed"
+                if (
+                    constraint.constraint_type == "workspace_change"
+                    and workspace_change_tool_call_ids
+                )
+                or (
+                    constraint.constraint_type == "verification_after_change"
+                    and verification_tool_call_ids
+                )
+                else "pending"
+            ),
+            "requirement": _runtime_requirement_description(
+                constraint.constraint_type
+            ),
+        }
+        for constraint in (() if goal_spec is None else goal_spec.constraints)
+        if (
+            constraint.required
+            and constraint.expected_value is True
+            and constraint.constraint_type
+            in {"workspace_change", "verification_after_change"}
+        )
+    )
+    if (
+        not memory_state.recent_observations
+        and not memory_state.known_locators
+        and not memory_state.verified_workspace_paths
+        and plan is None
+        and not runtime_requirements
+        and goal_spec is None
+    ):
+        return None
+
+    plan_payload: JsonValue = None
+    if plan is not None:
+        plan_payload = {
+            "authority": "advisory",
+            "objective": plan.objective,
+            "status": plan.status,
+            "active_step_id": plan.active_step_id,
+            "steps": tuple(
+                {
+                    "step_id": step.step_id,
+                    "title": step.title,
+                    "status": step.status,
+                }
+                for step in plan.steps
+            ),
+        }
+    file_manifest = state.get("file_manifest")
+    manifest_paths = (
+        ()
+        if file_manifest is None
+        else tuple(entry.path for entry in file_manifest.files)
+    )
+    verified_grounded_paths = grounded_workspace_paths(
+        locators=memory_state.known_locators,
+        input_paths=(
+            *manifest_paths,
+            *memory_state.verified_workspace_paths,
+        ),
+        tool_results=state["tool_results"],
+        tool_calls=state["canonical_tool_calls"],
+    )
+    grounded_paths = _project_grounded_workspace_paths(
+        verified_grounded_paths,
+    )
+    known_locators = _project_working_locators(
+        memory_state.known_locators,
+    )
+    return context_event_message(
+        "working_state",
+        {
+            "active_goal": (
+                None
+                if goal_spec is None
+                else {
+                    "authority": "runtime",
+                    "fingerprint": goal_spec.fingerprint,
+                    "original_query": goal_spec.original_query,
+                }
+            ),
+            "plan_claims": plan_payload,
+            "runtime_requirements": runtime_requirements,
+            "runtime_evidence": {
+                "authority": "runtime",
+                "grounded_paths": grounded_paths,
+                "grounded_path_count": len(verified_grounded_paths),
+                "grounded_paths_truncated": (
+                    len(grounded_paths) < len(verified_grounded_paths)
+                ),
+                "recent_observations": tuple(
+                    {
+                        "tool_call_id": observation.tool_call_id,
+                        "tool_name": observation.tool_name,
+                        "status": observation.status,
+                        "error": observation.error,
+                        "warnings": tuple(observation.warnings),
+                    }
+                    for observation in memory_state.recent_observations
+                    if (
+                        observation.tool_call_id
+                        not in protected_tool_call_ids
+                    )
+                ),
+                "known_locators": tuple(
+                    cast(Mapping[str, JsonValue], locator)
+                    for locator in known_locators
+                ),
+                "known_locator_count": len(
+                    memory_state.known_locators
+                ),
+                "known_locators_compacted": (
+                    len(known_locators)
+                    < len(memory_state.known_locators)
+                ),
+                "workspace_change_tool_call_ids": tuple(
+                    workspace_change_tool_call_ids
+                ),
+                "verification_tool_call_ids": verification_tool_call_ids,
+            },
+        },
+    )
 
 
-def _messages_size(messages: Sequence[ModelMessage]) -> int:
-    return sum(_message_size(message) for message in messages)
+def _runtime_requirement_description(constraint_type: str) -> str:
+    if constraint_type == "workspace_change":
+        return (
+            "A runtime-observed write must change workspace contents; "
+            "prose and pre-change verification do not satisfy this."
+        )
+    return (
+        "A recognized verification command must succeed after the latest "
+        "workspace change; pre-change commands do not satisfy this."
+    )
 
 
-def _message_size(message: ModelMessage) -> int:
-    return len(
-        canonical_json_text(model_message_payload(message)).encode("utf-8")
+def _project_grounded_workspace_paths(
+    paths: Sequence[str],
+) -> tuple[str, ...]:
+    if len(paths) <= _MAX_WORKING_STATE_GROUNDED_PATHS:
+        return tuple(paths)
+    selected: dict[str, None] = {}
+    for path in reversed(paths):
+        selected.setdefault(path, None)
+        if len(selected) >= _MAX_WORKING_STATE_GROUNDED_PATHS:
+            break
+    return tuple(selected)
+
+
+def _project_working_locators(
+    locators: Sequence[Mapping[str, object]],
+) -> tuple[Mapping[str, object], ...]:
+    precise = tuple(
+        locator
+        for locator in locators
+        if not set(locator).issubset(
+            _PATH_ONLY_LOCATOR_FIELDS
+        )
+    )
+    if len(precise) <= _MAX_WORKING_STATE_LOCATORS:
+        return precise
+    return precise[-_MAX_WORKING_STATE_LOCATORS:]
+
+
+def _protected_transcript_tool_call_ids(
+    transcript: Sequence[ModelMessage],
+) -> frozenset[str]:
+    protected_start = _latest_tool_pair_start(transcript)
+    if protected_start is None:
+        return frozenset()
+    return frozenset(
+        message.tool_call_id
+        for message in transcript[protected_start:]
+        if (
+            message.role == "tool"
+            and message.tool_call_id is not None
+        )
     )
 
 
@@ -436,6 +1042,31 @@ def _draft_from_turn(
     )
 
 
+def _scope_model_tool_call_ids(
+    turn: ToolUseResult,
+    *,
+    request_id: str,
+) -> ToolUseResult:
+    """Make provider-local tool IDs deterministic and unique per request."""
+
+    if not turn.tool_calls:
+        return turn
+    scoped_calls = [
+        ModelToolCall(
+            id=(
+                "tc_"
+                + hashlib.sha256(
+                    f"{request_id}\0{index}\0{call.id}".encode()
+                ).hexdigest()[:20]
+            ),
+            name=call.name,
+            input=dict(call.input),
+        )
+        for index, call in enumerate(turn.tool_calls)
+    ]
+    return turn.model_copy(update={"tool_calls": scoped_calls})
+
+
 def create_loop_model_turn_provider(
     registry: ModelResolver,
     selection: ModelSelectionPolicy,
@@ -445,6 +1076,7 @@ def create_loop_model_turn_provider(
     disabled_tool_names: Sequence[str] = (),
     stream_sink: object | None = None,
     skill_runtime: SkillRuntime | None = None,
+    goal_spec: GoalSpec | None = None,
 ) -> LLMLoopModelTurnProvider:
     resolved = registry.resolve_for_node(
         node_model=selection.tool_decision_model,
@@ -468,6 +1100,7 @@ def create_loop_model_turn_provider(
         context_window_tokens=resolved.context_window_tokens,
         stream_sink=stream_sink,
         skill_runtime=skill_runtime,
+        goal_spec=goal_spec,
     )
 
 

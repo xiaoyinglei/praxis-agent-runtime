@@ -2,11 +2,34 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
+import stat
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+_SNAPSHOT_IGNORED_DIRECTORIES = frozenset(
+    {
+        ".agent_memory",
+        ".cache",
+        ".git",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".rag",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+    }
+)
+_TEMP_RUNTIME_DIRECTORIES = frozenset(
+    {"artifacts", "logs", "reports", "scratch"}
+)
+_WORKSPACE_SNAPSHOT_REVISION = b"workspace-tree-v1\0"
 
 
 class WorkspacePathError(ValueError):
@@ -150,6 +173,148 @@ def import_files(
     return imported
 
 
+def workspace_tree_sha256(root: Path | str) -> str | None:
+    """Hash workspace files without depending on mutable Git metadata."""
+
+    workspace_root = Path(root).expanduser().resolve()
+    if not workspace_root.is_dir():
+        return None
+    try:
+        relative_paths = _filesystem_workspace_paths(
+            workspace_root,
+            ignore_runtime_root=_has_temporary_runtime_layout(workspace_root),
+        )
+    except OSError:
+        return None
+
+    digest = hashlib.sha256(_WORKSPACE_SNAPSHOT_REVISION)
+    try:
+        for relative_path in relative_paths:
+            _hash_workspace_path(
+                digest,
+                root=workspace_root,
+                relative_path=relative_path,
+            )
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _has_temporary_runtime_layout(root: Path) -> bool:
+    return bool(
+        (root / ".agent_memory").is_dir()
+        and all((root / name).is_dir() for name in _TEMP_RUNTIME_DIRECTORIES)
+        and not (root / ".rag" / "agent_runtime").exists()
+    )
+
+
+def _filesystem_workspace_paths(
+    root: Path,
+    *,
+    ignore_runtime_root: bool = False,
+) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        current = Path(directory)
+        kept_directories: list[str] = []
+        for name in sorted(directory_names):
+            child = current / name
+            if (
+                name in _SNAPSHOT_IGNORED_DIRECTORIES
+                or (
+                    ignore_runtime_root
+                    and current == root
+                    and name in _TEMP_RUNTIME_DIRECTORIES
+                )
+            ):
+                continue
+            if child.is_symlink():
+                paths.append(child.relative_to(root))
+            else:
+                kept_directories.append(name)
+        directory_names[:] = kept_directories
+        for name in sorted(file_names):
+            if name == ".git":
+                continue
+            paths.append((current / name).relative_to(root))
+    return tuple(sorted(paths, key=lambda path: os.fsencode(path.as_posix())))
+
+
+def _safe_snapshot_path(path: Path) -> bool:
+    return bool(
+        not path.is_absolute()
+        and path.parts
+        and ".." not in path.parts
+        and ".git" not in path.parts
+    )
+
+
+def _hash_workspace_path(
+    digest: hashlib._Hash,
+    *,
+    root: Path,
+    relative_path: Path,
+) -> None:
+    if not _safe_snapshot_path(relative_path):
+        raise OSError("unsafe workspace snapshot path")
+    target = root / relative_path
+    _hash_field(digest, b"path", os.fsencode(relative_path.as_posix()))
+    try:
+        file_stat = target.lstat()
+    except FileNotFoundError:
+        _hash_field(digest, b"type", b"missing")
+        return
+
+    mode = stat.S_IMODE(file_stat.st_mode)
+    _hash_field(digest, b"mode", str(mode).encode("ascii"))
+    if stat.S_ISLNK(file_stat.st_mode):
+        _hash_field(digest, b"type", b"symlink")
+        _hash_field(digest, b"target", os.fsencode(os.readlink(target)))
+        return
+    if stat.S_ISDIR(file_stat.st_mode):
+        _hash_field(digest, b"type", b"directory")
+        for nested in _filesystem_workspace_paths(target):
+            _hash_workspace_path(
+                digest,
+                root=target,
+                relative_path=nested,
+            )
+        return
+    if not stat.S_ISREG(file_stat.st_mode):
+        _hash_field(digest, b"type", b"special")
+        return
+
+    _hash_field(digest, b"type", b"file")
+    _hash_field(digest, b"size", str(file_stat.st_size).encode("ascii"))
+    with target.open("rb") as stream:
+        opened_stat = os.fstat(stream.fileno())
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+        final_stat = os.fstat(stream.fileno())
+    if (
+        opened_stat.st_size != final_stat.st_size
+        or opened_stat.st_mtime_ns != final_stat.st_mtime_ns
+    ):
+        raise OSError("workspace changed while it was being snapshotted")
+
+
+def _hash_field(
+    digest: hashlib._Hash,
+    name: bytes,
+    value: bytes,
+) -> None:
+    digest.update(name)
+    digest.update(b"\0")
+    digest.update(str(len(value)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(value)
+    digest.update(b"\0")
+
+
 def _unique_dest(directory: Path, filename: str) -> Path:
     """Generate a unique destination path, appending __N on collision."""
     dest = directory / filename
@@ -171,4 +336,5 @@ __all__ = [
     "create_temp_workspace",
     "import_files",
     "open_workspace",
+    "workspace_tree_sha256",
 ]

@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from rag.agent.tools.tool import JsonValue, json_schema_output
+from rag.agent.tools.tool import JsonValue, _thaw_json, json_schema_output
 
 if TYPE_CHECKING:
     from rag.agent.tools.tool import ToolResult
@@ -81,6 +81,7 @@ class ModelMessage:
 
     role: Literal["system", "user", "assistant", "tool", "context"]
     content: str
+    reasoning_content: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None  # required when role="tool"
 
@@ -95,6 +96,7 @@ class ToolUseResult(BaseModel):
 
     tool_calls: list[ToolCall] = Field(default_factory=list)
     text: str = ""
+    reasoning_content: str | None = None
     stop_reason: StopReason
     raw_stop_reason: str  # debug / logging only
 
@@ -108,6 +110,13 @@ def snapshot_model_message(message: ModelMessage) -> ModelMessage:
         raise ValueError(f"unsupported model message role: {message.role}")
     if not isinstance(message.content, str):
         raise TypeError("model message content must be a string")
+    if message.reasoning_content is not None:
+        if not isinstance(message.reasoning_content, str):
+            raise TypeError("model message reasoning_content must be a string or None")
+        if message.role != "assistant":
+            raise ValueError(
+                "reasoning_content is only valid for assistant messages"
+            )
     if message.tool_calls and message.role != "assistant":
         raise ValueError("only assistant messages may contain tool calls")
     if message.role == "tool":
@@ -136,6 +145,7 @@ def snapshot_model_message(message: ModelMessage) -> ModelMessage:
     return ModelMessage(
         role=message.role,
         content=message.content,
+        reasoning_content=message.reasoning_content,
         tool_calls=tuple(calls),
         tool_call_id=message.tool_call_id,
     )
@@ -196,7 +206,7 @@ def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
     """Return the canonical JSON value for one snapshotted message."""
 
     snapshotted = snapshot_model_message(message)
-    return {
+    payload: dict[str, JsonValue] = {
         "role": snapshotted.role,
         "content": snapshotted.content,
         "tool_calls": tuple(
@@ -209,6 +219,9 @@ def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
         ),
         "tool_call_id": snapshotted.tool_call_id,
     }
+    if snapshotted.reasoning_content is not None:
+        payload["reasoning_content"] = snapshotted.reasoning_content
+    return payload
 
 
 def canonical_json_text(value: JsonValue) -> str:
@@ -222,16 +235,6 @@ def canonical_json_text(value: JsonValue) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
-
-
-def _thaw_json(value: JsonValue) -> object:
-    if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return [_thaw_json(item) for item in value]
-    return value
-
-
 __all__ = [
     "ModelMessage",
     "StopReason",

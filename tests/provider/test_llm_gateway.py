@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
@@ -151,6 +152,46 @@ class _CanonicalNativeGenerator:
         )
 
 
+class _ReasoningNativeGenerator:
+    def generate_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMProviderResult[dict[str, object]]:
+        del messages, tools, kwargs
+        return LLMProviderResult(
+            value={
+                "choices": [
+                    {
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "reasoning_content": "Inspect the source before editing.",
+                            "tool_calls": [
+                                {
+                                    "id": "call_reasoning",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": '{"path":"README.md"}',
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                ]
+            },
+            usage=LLMUsage(
+                input_tokens=20,
+                output_tokens=8,
+                source="provider",
+            ),
+        )
+
+
 class _RejectedToolCallGenerator:
     def generate_with_tools(
         self,
@@ -168,6 +209,33 @@ class _RejectedToolCallGenerator:
                 '<function=read_file>{"path":"README.md",'
                 '"max_bytes":2000000}</function>'
             ),
+        }
+        raise error
+
+
+class _StructuredRejectedToolCallGenerator:
+    def generate_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> LLMProviderResult[dict[str, object]]:
+        del messages, tools, kwargs
+        error = RuntimeError("provider rejected generated tool call")
+        error.body = {  # type: ignore[attr-defined]
+            "error": {
+                "message": "Tool call validation failed: invalid arguments",
+                "code": "tool_use_failed",
+                "failed_generation": {
+                    "reason": "schema_validation",
+                    "tool_call_id": "call_read_file",
+                    "attempted_arguments": {
+                        "path": "README.md",
+                        "line_start": 20,
+                    },
+                },
+            }
         }
         raise error
 
@@ -624,6 +692,35 @@ async def test_gateway_adapts_one_canonical_request_to_openai_wire() -> None:
 
 
 @pytest.mark.anyio
+async def test_canonical_provider_options_use_openai_extra_body_transport() -> None:
+    generator = _CanonicalNativeGenerator()
+    original = _canonical_request()
+    request = replace(
+        original,
+        settings=replace(
+            original.settings,
+            provider_options={"thinking": {"type": "enabled"}},
+        ),
+    )
+
+    await _gateway(
+        generator,
+        max_input_tokens=2_000,
+        model_context_tokens=4_000,
+    ).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION,
+        request=request,
+        provider="openai-compatible",
+        supports_native_tools=True,
+    )
+
+    assert "thinking" not in generator.calls[0]
+    assert generator.calls[0]["extra_body"] == {
+        "thinking": {"type": "enabled"}
+    }
+
+
+@pytest.mark.anyio
 async def test_canonical_request_output_limit_reaches_native_provider() -> None:
     generator = _CanonicalNativeGenerator()
     original = _canonical_request()
@@ -663,6 +760,31 @@ async def test_gateway_normalizes_provider_tool_call_validation_failure() -> Non
 
     assert "max_bytes exceeds maximum" in exc_info.value.validation_error
     assert '"max_bytes":2000000' in exc_info.value.failed_generation
+
+
+@pytest.mark.anyio
+async def test_gateway_preserves_structured_failed_generation() -> None:
+    with pytest.raises(LLMToolCallValidationError) as exc_info:
+        await _gateway(
+            _StructuredRejectedToolCallGenerator(),
+            max_input_tokens=2_000,
+            model_context_tokens=4_000,
+        ).agenerate_model_request(
+            stage=LLMCallStage.TOOL_DECISION,
+            request=_canonical_request(),
+            provider="openai-compatible",
+            supports_native_tools=True,
+        )
+
+    failed_generation = json.loads(exc_info.value.failed_generation)
+    assert failed_generation == {
+        "attempted_arguments": {
+            "line_start": 20,
+            "path": "README.md",
+        },
+        "reason": "schema_validation",
+        "tool_call_id": "call_read_file",
+    }
 
 
 @pytest.mark.anyio
@@ -735,3 +857,22 @@ async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
     assert result.usage.cache_read_input_tokens == 9
     assert result.usage.usage_source == "provider"
     assert deltas == ["stream answer"]
+
+
+@pytest.mark.anyio
+async def test_streaming_fallback_preserves_reasoning_for_next_tool_turn() -> None:
+    result = await _gateway(
+        _ReasoningNativeGenerator(),
+        max_input_tokens=2_000,
+        max_output_tokens=128,
+        model_context_tokens=4_000,
+    ).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION,
+        request=_canonical_request(),
+        provider="openai-compatible",
+        supports_native_tools=True,
+        stream=True,
+    )
+
+    assert result.turn.reasoning_content == "Inspect the source before editing."
+    assert result.turn.tool_calls[0].name == "read_file"

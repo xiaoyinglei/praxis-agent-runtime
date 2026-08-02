@@ -20,8 +20,14 @@ from rag.agent.workspace import open_workspace
 _PLAN_ARGUMENTS = {
     "explanation": "Implementation is ready; verification is next.",
     "plan": [
-        {"step": "Implement durable plan state", "status": "completed"},
-        {"step": "Run integration verification", "status": "in_progress"},
+        {
+            "step": "Implement durable plan state",
+            "status": "completed",
+        },
+        {
+            "step": "Run integration verification",
+            "status": "in_progress",
+        },
     ],
 }
 
@@ -36,6 +42,9 @@ class _UpdatePlanThenPauseProvider:
     ) -> ModelTurnDraft:
         del definition, budget_remaining
         if not state["tool_results"]:
+            active_plan = state["plan_state"].agent_plan
+            assert active_plan is not None
+            assert active_plan.objective
             return ModelTurnDraft(
                 action="execute",
                 tool_calls=(
@@ -87,23 +96,33 @@ async def test_update_plan_is_canonical_result_and_checkpoint_state(
 
     assert result.status == "paused"
     assert result.plan is not None
+    assert result.plan.objective == request.message
     assert result.plan.summary == _PLAN_ARGUMENTS["explanation"]
     assert [step.title for step in result.plan.steps] == [
         "Implement durable plan state",
         "Run integration verification",
     ]
     assert [step.status for step in result.plan.steps] == [
-        "completed",
+        "pending",
         "in_progress",
     ]
     assert result.plan.revision == 1
     assert result.plan.active_step_id == "step_002"
-    assert any(event.event_type == "llm_update" for event in result.plan_events)
+    update_event = next(
+        event
+        for event in result.plan_events
+        if event.event_type == "llm_update"
+    )
+    assert update_event.warnings == ["unverified_completion_ignored"]
     update_result = next(item for item in result.tool_results if item.tool_name == "update_plan")
     assert update_result.structured_content == {
         "accepted": True,
         "revision": result.plan.revision,
-        "message": "Plan updated and persisted.",
+        "message": (
+            "Plan persisted as advisory state; tool policy and stop hooks "
+            "retain execution and completion authority."
+        ),
+        "authority": "advisory",
     }
 
     restored = await LangGraphCheckpointStore(
@@ -141,9 +160,13 @@ async def test_update_plan_emits_complete_plan_snapshot_on_stream(
     assert plan_event.iteration == 1
     assert plan_event.sequence > 0
     assert plan_event.data["plan"]["summary"] == _PLAN_ARGUMENTS["explanation"]
+    assert "goal_id" not in plan_event.data["plan"]
+    assert "goal_requirement_ids" not in plan_event.data["plan"]
+    assert "target_files" not in plan_event.data["plan"]
+    assert "hypothesis" not in plan_event.data["plan"]
     assert plan_event.data["plan"]["active_step_id"] == "step_002"
     assert [step["status"] for step in plan_event.data["plan"]["steps"]] == [
-        "completed",
+        "pending",
         "in_progress",
     ]
     assert plan_event.data["event"]["event_type"] == "llm_update"

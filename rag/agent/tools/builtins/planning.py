@@ -3,7 +3,11 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+)
 
 from rag.agent.tools.tool import (
     CancellationMode,
@@ -26,6 +30,15 @@ type PlanUpdater = Callable[
 class PlanStepInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    step_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        description=(
+            "Stable step identifier from the visible plan. Omit it for a new "
+            "step; the runtime will assign one."
+        ),
+    )
     step: str = Field(
         min_length=1,
         max_length=180,
@@ -43,8 +56,7 @@ class UpdatePlanInput(BaseModel):
         min_length=1,
         max_length=20,
         description=(
-            'The complete ordered plan; every item requires both "step" and '
-            '"status" fields.'
+            "The complete ordered strategy for the immutable goal."
         ),
     )
     explanation: str | None = Field(
@@ -53,13 +65,13 @@ class UpdatePlanInput(BaseModel):
         description="A short reason for the plan transition.",
     )
 
-
 class UpdatePlanOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     accepted: bool
     revision: int = Field(ge=0)
     message: str = Field(min_length=1, max_length=800)
+    authority: Literal["advisory"] = "advisory"
 
 
 _UPDATE_INPUT_SCHEMA, _validate_update_input = pydantic_input(UpdatePlanInput)
@@ -75,11 +87,10 @@ def create_update_plan_tool(plan_updater: PlanUpdater) -> Tool:
         definition=ToolDefinition(
             name="update_plan",
             description=(
-                "Replace the visible implementation plan with an ordered set of "
-                "pending, in-progress, and completed steps. Use it when the work "
-                "crosses meaningful checkpoints. Every plan item must be shaped like "
-                '{"step": "verify tests", "status": "in_progress"}; the tool '
-                "reports state but grants no tool permission."
+                "Replace the visible advisory strategy for the current task. "
+                'Every plan item requires only "step" and "status". The plan '
+                "explains intended work; it never grants or restricts tool "
+                "permission and never proves that the task is complete."
             ),
             input_schema=_UPDATE_INPUT_SCHEMA,
         ),

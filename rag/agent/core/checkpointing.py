@@ -12,6 +12,7 @@ from collections.abc import (
 )
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -71,7 +72,6 @@ from rag.agent.loop.substate import (
     DiscoveryEvent,
     FinishState,
     MemoryState,
-    PersistentMemorySnapshot,
     PlanState,
 )
 from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
@@ -177,10 +177,6 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.core.runtime_diagnostics", "ToolCallMetrics"),
     ("rag.agent.core.runtime_diagnostics", "AgentLatencyProfile"),
     ("rag.agent.core.model_request", "ModelCallRecord"),
-    ("rag.agent.core.tool_execution", "ToolBatchRequest"),
-    ("rag.agent.core.tool_execution", "ToolBatchResult"),
-    ("rag.agent.core.tool_execution", "ToolExecutionRecord"),
-    ("rag.agent.core.tool_execution", "ToolExecutionSummary"),
     ("rag.agent.core.turn_contracts", "ToolCallPlan"),
     ("rag.agent.core.turn_contracts", "ToolManifest"),
     ("rag.agent.core.turn_contracts", "ToolManifestEntry"),
@@ -224,23 +220,19 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("rag.agent.loop.substate", "DeferredToolState"),
     ("rag.agent.loop.substate", "FinishState"),
     ("rag.agent.loop.substate", "MemoryState"),
-    ("rag.agent.loop.substate", "PersistentMemorySnapshot"),
     ("rag.agent.loop.substate", "PlanState"),
+    ("rag.agent.loop.substate", "StopHookFeedback"),
     ("rag.agent.loop.stop_hooks", "StopHookOutcome"),
     ("rag.agent.loop.stop_hooks", "StopVerdict"),
     ("agent_runtime.planning", "AgentPlan"),
     ("agent_runtime.planning", "PlanEvent"),
     ("agent_runtime.planning", "PlanStep"),
-    ("agent_runtime.planning", "PlanStepPatch"),
-    ("agent_runtime.planning", "PlanUpdate"),
     ("rag.agent.skills.models", "LoadedSkill"),
     ("rag.agent.skills.models", "LoadedSkillRef"),
     ("rag.agent.skills.models", "SkillInvocation"),
     ("rag.agent.skills.models", "SkillManifest"),
     ("rag.agent.skills.models", "SkillSource"),
     ("rag.agent.skills.models", "SkillState"),
-    ("rag.agent.tools.spec", "ToolError"),
-    ("rag.agent.tools.spec", "ToolResult"),
     ("rag.agent.tools.executor", "ExecutionStatus"),
     ("rag.agent.tools.executor", "ToolExecutionRecord"),
     ("rag.agent.tools.tool", "ArtifactReference"),
@@ -273,7 +265,6 @@ __all__ = [
     "TOOL_CHECKPOINT_FORMAT_VERSION",
     # Migration helpers (used by Tasks 6, 8)
     "_migrate_legacy_state",
-    "_digest_text",
     "_migrate_discovery_candidates",
     "_migrate_discovery_events",
     "_string_list",
@@ -313,8 +304,6 @@ _LEGACY_PLAN_TYPE_NAMES = frozenset(
         "AgentPlan",
         "PlanEvent",
         "PlanStep",
-        "PlanStepPatch",
-        "PlanUpdate",
     }
 )
 _CHECKPOINT_CONSTRUCTOR_CODES = frozenset(
@@ -421,9 +410,13 @@ def _checkpoint_type_alias(
 ) -> type[Any] | None:
     if module_name == "rag.agent.core.context" and type_name == "AgentRunConfig":
         return AgentRunConfig
+    if (
+        module_name == "rag.agent.loop.substate"
+        and type_name == "PersistentMemorySnapshot"
+    ):
+        return dict
     if module_name == "rag.agent.planning" and type_name in _LEGACY_PLAN_TYPE_NAMES:
-        from agent_runtime import planning
-
+        planning = import_module("agent_runtime.planning")
         target = getattr(planning, type_name, None)
         return target if isinstance(target, type) else None
     return None
@@ -1691,10 +1684,14 @@ def _decode_checkpoint_message(raw: object) -> ModelMessage:
     tool_call_id = payload.get("tool_call_id")
     if tool_call_id is not None and not isinstance(tool_call_id, str):
         raise TypeError("message tool_call_id must be a string or None")
+    reasoning_content = payload.get("reasoning_content")
+    if reasoning_content is not None and not isinstance(reasoning_content, str):
+        raise TypeError("message reasoning_content must be a string or None")
     return snapshot_model_message(
         ModelMessage(
             role=cast(Any, role),
             content=content,
+            reasoning_content=reasoning_content,
             tool_calls=tuple(tool_calls),
             tool_call_id=tool_call_id,
         )
@@ -2075,6 +2072,8 @@ _DEPRECATED_STATE_FIELDS = frozenset(
         "context_bindings",
         "locators",
         "asset_refs",
+        "persistent_memories",
+        "memory_index",
     }
 )
 
@@ -2125,10 +2124,6 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
             memory_budget=state.get("memory_budget"),
             memory_warnings=list(state.get("memory_warnings", [])),
             reactive_compact_used=bool(state.get("reactive_compact_used", False)),
-            persistent=PersistentMemorySnapshot(
-                index_digest=_digest_text(state.get("memory_index", "")),
-                selected_count=len(state.get("persistent_memories", [])),
-            ),
         ),
     )
 
@@ -2251,16 +2246,6 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
         state.pop(key, None)
 
     return cast(LoopState, state)
-
-
-def _digest_text(text: str, *, max_chars: int = 500) -> str:
-    """Truncate text to a bounded digest for PersistentMemorySnapshot."""
-    stripped = text.strip()
-    if len(stripped) <= max_chars:
-        return stripped
-    return stripped[:max_chars].rstrip() + "..."
-
-
 def _migrate_discovery_candidates(
     raw: list[dict[str, object]],
 ) -> list[DiscoveryCandidate]:

@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -21,6 +21,12 @@ from rag.agent.core.messages import (
     model_message_payload,
     snapshot_model_message,
 )
+from rag.agent.core.model_request import (
+    is_verified_transcript_compaction_rewrite,
+)
+
+if TYPE_CHECKING:
+    from rag.agent.memory.models import MemoryPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -358,8 +364,14 @@ class TurnStore:
         self,
         turn_id: str,
         messages: tuple[ModelMessage, ...] | list[ModelMessage],
+        *,
+        compaction_policy: MemoryPolicy | None = None,
     ) -> None:
-        payloads = tuple(_message_json(message) for message in messages)
+        candidate = tuple(
+            snapshot_model_message(message)
+            for message in messages
+        )
+        payloads = tuple(_message_json(message) for message in candidate)
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -378,8 +390,42 @@ class TurnStore:
                     (turn_id,),
                 ).fetchall()
                 existing = tuple(str(row["payload_json"]) for row in existing_rows)
-                if len(payloads) < len(existing) or payloads[: len(existing)] != existing:
-                    raise RuntimeError(f"canonical history conflict for Turn {turn_id}")
+                prefix_matches = (
+                    len(payloads) >= len(existing)
+                    and payloads[: len(existing)] == existing
+                )
+                if not prefix_matches:
+                    existing_messages = tuple(
+                        _message_from_json(payload)
+                        for payload in existing
+                    )
+                    if (
+                        compaction_policy is None
+                        or not is_verified_transcript_compaction_rewrite(
+                            existing_messages,
+                            candidate,
+                            message_compaction_min_count=(
+                                compaction_policy.message_compaction_min_count
+                            ),
+                            max_message_tail_count=(
+                                compaction_policy.max_message_tail_count
+                            ),
+                            reactive_compact_tail_count=(
+                                compaction_policy.reactive_compact_tail_count
+                            ),
+                            max_summary_chars=(
+                                compaction_policy.max_working_summary_chars
+                            ),
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"canonical history conflict for Turn {turn_id}"
+                        )
+                    self._connection.execute(
+                        "DELETE FROM agent_turn_messages WHERE turn_id = ?",
+                        (turn_id,),
+                    )
+                    existing = ()
                 for index in range(len(existing), len(payloads)):
                     self._connection.execute(
                         """
@@ -942,10 +988,16 @@ def _message_from_json(raw: str) -> ModelMessage:
         for item in tool_calls_raw
         if isinstance(item, dict)
     )
+    reasoning_content = payload.get("reasoning_content")
+    if reasoning_content is not None and not isinstance(reasoning_content, str):
+        raise RuntimeError(
+            "canonical history reasoning_content must be a string or null"
+        )
     return snapshot_model_message(
         ModelMessage(
             role=cast(Any, payload.get("role")),
             content=str(payload.get("content", "")),
+            reasoning_content=reasoning_content,
             tool_calls=tool_calls,
             tool_call_id=cast(str | None, payload.get("tool_call_id")),
         )

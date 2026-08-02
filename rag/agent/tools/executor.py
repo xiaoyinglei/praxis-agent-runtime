@@ -36,8 +36,20 @@ from rag.agent.tools.tool import (
     ToolValidationError,
     json_schema_output,
 )
+from rag.agent.workspace import workspace_tree_sha256
 
 _NETWORK_APPROVAL_SUFFIX = "::network"
+_PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
+    {
+        "after_sha256",
+        "before_sha256",
+        "runtime_workspace_write",
+        "workspace_changed",
+        "workspace_tree_after_sha256",
+        "workspace_tree_before_sha256",
+        "workspace_tree_changed",
+    }
+)
 
 
 class ExecutionBoundary(StrEnum):
@@ -152,6 +164,8 @@ class _PreparedExecution:
     record: ToolExecutionRecord
     record_sink: RecordSink | None
     started_at: float
+    workspace_root: Path | None
+    workspace_tree_before_sha256: str | None
 
 
 class _CancelledTimeoutError(Exception):
@@ -544,6 +558,19 @@ class ToolExecutor:
             error_code=None,
             requires_reconciliation=False,
         )
+        workspace_root = (
+            Path(context.workspace_root)
+            if (
+                context.workspace_root is not None
+                and ToolEffect.WRITE_WORKSPACE in resolved.effects
+            )
+            else None
+        )
+        workspace_tree_before_sha256 = (
+            await asyncio.to_thread(workspace_tree_sha256, workspace_root)
+            if workspace_root is not None
+            else None
+        )
         await _emit_record(record_sink, execution_record)
         return _PreparedExecution(
             call=call,
@@ -555,6 +582,8 @@ class ToolExecutor:
             record=execution_record,
             record_sink=record_sink,
             started_at=started_at,
+            workspace_root=workspace_root,
+            workspace_tree_before_sha256=workspace_tree_before_sha256,
         )
 
     async def _require_approval(
@@ -831,6 +860,30 @@ class ToolExecutor:
             boundary = prepared.boundary
             decision = prepared.decision.decision
             record_sink = prepared.record_sink
+            metadata = {
+                key: value
+                for key, value in result.metadata.items()
+                if key not in _PROTECTED_WORKSPACE_METADATA_KEYS
+            }
+            if prepared.workspace_root is not None:
+                after_sha256 = await asyncio.to_thread(
+                    workspace_tree_sha256,
+                    prepared.workspace_root,
+                )
+                before_sha256 = prepared.workspace_tree_before_sha256
+                metadata.update(
+                    {
+                        "runtime_workspace_write": True,
+                        "workspace_tree_before_sha256": before_sha256,
+                        "workspace_tree_after_sha256": after_sha256,
+                        "workspace_tree_changed": bool(
+                            before_sha256 is not None
+                            and after_sha256 is not None
+                            and before_sha256 != after_sha256
+                        ),
+                    }
+                )
+            result = replace(result, metadata=metadata)
         if record is not None:
             await _emit_record(record_sink, record)
         trace = ToolExecutionTrace(
@@ -1171,9 +1224,12 @@ def _approval_metadata(
         "approval_id": approval_id,
         "approval_scope": decision.approval_scope,
         "network_requested": ToolEffect.NETWORK in resolved.effects,
+        "workspace_write": ToolEffect.WRITE_WORKSPACE in resolved.effects,
     }
     for target in resolved.targets:
-        if target.kind == "cwd_path":
+        if target.kind == "workspace_path":
+            metadata["workspace_path"] = target.value
+        elif target.kind == "cwd_path":
             metadata["cwd"] = target.value
         elif target.kind == "execution_mode":
             metadata["execution_mode"] = target.value

@@ -9,6 +9,7 @@ import pytest
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from rag.agent.core.checkpointing import _migrate_legacy_state, agent_checkpoint_serde
 from rag.agent.core.context import AgentRunConfig
+from rag.agent.core.observations import StructuredObservation
 from rag.agent.loop.state import (
     StopHookFeedback,
     create_loop_state,
@@ -19,7 +20,6 @@ from rag.agent.loop.substate import (
     DiscoveryEvent,
     FinishState,
     MemoryState,
-    PersistentMemorySnapshot,
     PlanState,
 )
 
@@ -34,23 +34,14 @@ def _run_config(run_id: str = "pr1-test") -> AgentRunConfig:
 # ── Sub-state model construction ──
 
 
-def test_persistent_memory_snapshot_defaults_are_empty() -> None:
-    """Default-constructed snapshot represents 'not loaded yet'."""
-    snapshot = PersistentMemorySnapshot()
-    assert snapshot.index_ref == ""
-    assert snapshot.index_digest == ""
-    assert snapshot.selected_count == 0
-    assert snapshot.selected_summaries == []
-
-
 def test_memory_state_default_factory_works_without_args() -> None:
     """MemoryState() with no args produces valid state."""
     ms = MemoryState()
     assert ms.working_summary is None
     assert ms.extracted_facts == []
+    assert ms.recent_observations == []
+    assert ms.known_locators == []
     assert ms.reactive_compact_used is False
-    assert isinstance(ms.persistent, PersistentMemorySnapshot)
-    assert ms.persistent.index_digest == ""
 
 
 def test_plan_state_default_is_empty() -> None:
@@ -174,10 +165,8 @@ def test_migrate_legacy_state_populates_memory_state() -> None:
     ms = result["memory_state"]
     assert ms.memory_warnings == ["test warning"]
     assert ms.reactive_compact_used is True
-    assert ms.persistent.index_digest != ""
-    assert len(ms.persistent.index_digest) <= 503  # 500 + "…"
-    assert ms.persistent.selected_count == 2
-    # Old fields remain
+    assert "memory_index" not in result
+    assert "persistent_memories" not in result
     assert result["memory_state"].memory_warnings == ["test warning"]
 
 
@@ -246,7 +235,6 @@ def test_migrate_legacy_state_handles_missing_fields_gracefully() -> None:
 
     assert result["plan_state"].agent_plan is None
     assert result["memory_state"].working_summary is None
-    assert result["memory_state"].persistent.index_digest == ""
     assert result["finish_state"].feedback == []
     assert result["deferred_tool_state"].active_tools == []
 
@@ -290,11 +278,21 @@ def test_checkpoint_serde_roundtrips_substate_models(
         "plan_state": PlanState(agent_plan=None, plan_events=[]),
         "memory_state": MemoryState(
             memory_warnings=["low budget"],
-            persistent=PersistentMemorySnapshot(
-                index_digest="digest content",
-                selected_count=3,
-                selected_summaries=["a", "b", "c"],
-            ),
+            recent_observations=[
+                StructuredObservation(
+                    tool_call_id="tc-search",
+                    tool_name="search_text",
+                    status="ok",
+                    raw_result_ref="tc-search",
+                )
+            ],
+            known_locators=[
+                {
+                    "source_tool": "search_text",
+                    "path": "rag/agent/loop/runtime.py",
+                    "line_number": 718,
+                }
+            ],
         ),
         "deferred_tool_state": DeferredToolState(
             active_tools=["t1"],
@@ -313,8 +311,8 @@ def test_checkpoint_serde_roundtrips_substate_models(
     # No serializer warnings for the new models
 
 
-def test_full_legacy_checkpoint_roundtrip_preserves_all_data() -> None:
-    """Load a simulated legacy checkpoint, migrate, save, reload -- all data preserved."""
+def test_full_legacy_checkpoint_migrates_supported_state() -> None:
+    """Retired fields are discarded while supported checkpoint state is retained."""
     from copy import deepcopy
 
     # Simulate a legacy checkpoint with populated RAG-era fields
@@ -413,8 +411,8 @@ def test_full_legacy_checkpoint_roundtrip_preserves_all_data() -> None:
 
     # Memory state populated
     assert result["memory_state"].memory_warnings == ["old checkpoint"]
-    assert result["memory_state"].persistent.selected_count == 2
-    assert len(result["memory_state"].persistent.index_digest) <= 503
+    assert "persistent_memories" not in result
+    assert "memory_index" not in result
 
     # Finish state populated
     assert len(result["finish_state"].feedback) == 1

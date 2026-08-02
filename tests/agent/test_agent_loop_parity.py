@@ -87,8 +87,9 @@ async def test_final_loop_preserves_control_and_canonical_invariants() -> None:
 
     compaction = current["message_compaction"]
     assert compaction["status"] == "paused"
-    assert len(compaction["messages"]) == 2
-    assert compaction["working_summary"] is not None
+    assert len(compaction["messages"]) == 6
+    assert compaction["working_summary"] is None
+    assert compaction["transcript_roles"][0:2] == ["user", "context"]
 
     fallback = current["model_fallback"]
     assert fallback["status"] == "paused"

@@ -12,6 +12,7 @@ from rag.agent.tools.tool import (
     JsonValue,
     ResolvedToolUse,
     Tool,
+    ToolApprovalProfile,
     ToolEffect,
 )
 
@@ -135,11 +136,13 @@ def can_use_tool(
         )
     if (
         context.auto_approve_sandboxed
-        and tool.definition.name == "run_command"
-        and tool.execution_revision
-        == "builtin-run-command-v3-trusted-toolchain"
+        and (
+            tool.approval_profile
+            is ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS
+        )
         and tool.cancellation_mode is CancellationMode.MANAGED_PROCESS
         and ToolEffect.EXECUTE_PROCESS in resolved.effects
+        and ToolEffect.WRITE_WORKSPACE not in resolved.effects
         and ToolEffect.DESTRUCTIVE not in resolved.effects
         and any(
             target.kind == "execution_mode"

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -10,7 +11,7 @@ from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import ValidationError
 
 from agent_runtime.planning import (
     MAX_PLAN_EVENTS,
@@ -30,17 +31,22 @@ from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
 from rag.agent.core.llm_context import AgentLLMContextOverflowError
 from rag.agent.core.messages import (
     ModelMessage,
+    canonical_json_text,
     context_event_message,
     tool_result_message,
 )
-from rag.agent.core.model_request import (
-    ModelCallRecord,
-    ModelRequest,
-    build_tool_manifest,
+from rag.agent.core.model_request import build_tool_manifest
+from rag.agent.core.observations import (
+    ObservationBatch,
+    ObservationExtractor,
+    grounded_workspace_paths,
 )
-from rag.agent.core.observations import ObservationBatch, ObservationExtractor
 from rag.agent.core.output_models import ValidatedFinalOutput
-from rag.agent.core.runtime_diagnostics import AgentLatencyProfile, RuntimeDiagnostic
+from rag.agent.core.runtime_diagnostics import (
+    AgentLatencyProfile,
+    RuntimeDiagnostic,
+    redact_sensitive_text,
+)
 from rag.agent.loop.state import (
     LoopPause,
     LoopState,
@@ -48,14 +54,27 @@ from rag.agent.loop.state import (
     LoopTransition,
     LoopTransitionReason,
     ModelTurn,
-    ModelTurnDraft,
+    ModelTurnEnvelope,
+    ModelTurnProvider,
     PendingToolCall,
     append_loop_diagnostic,
     replace_latest_transition,
 )
 from rag.agent.loop.stop_hooks import StopHookOutcome, StopHookRunner
 from rag.agent.memory.compactor import LoopCompactionResult
-from rag.agent.streaming.events import EventType, StreamEvent, next_sequence
+from rag.agent.streaming.events import (
+    EventType,
+    StreamEvent,
+    compact_layer,
+    loop_end,
+    next_sequence,
+    recovery_event,
+    tool_use_error,
+    tool_use_result,
+    tool_use_start,
+    turn_end,
+    turn_start,
+)
 from rag.agent.streaming.sink import StreamEventSink
 from rag.agent.tools.builtins.planning import UpdatePlanInput
 from rag.agent.tools.executor import ToolExecutionRecord, ToolExecutor
@@ -87,14 +106,12 @@ _NATIVE_TOOL_SET = frozenset(
 
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
 _MAX_RETRYABLE_IDENTICAL_FAILURES = 2
-_DELIVERY_CONTROL_CODE = "delivery_control"
-_DELIVERY_STALLED_CODE = "delivery_stalled"
 _EXPLORATION_TOOL_NAMES = frozenset(
     {"list_files", "search_text", "read_file", "run_command", "find_tools"}
 )
-_DELIVERY_CONTROL_THRESHOLDS = (8, 12, 20, 28)
-_EXPLORATION_LIMIT = 20
-_FOCUSED_EXPLORATION_EXTENSION = 8
+_STABLE_INSPECTION_TOOL_NAMES = frozenset(
+    {"list_files", "search_text", "read_file", "find_tools"}
+)
 
 
 def _add_model_latency(state: LoopState, latency_ms: float) -> None:
@@ -114,30 +131,6 @@ def _append_turn_messages(
         *state.get("turn_transcript", []),
         *messages,
     ]
-
-
-class ModelTurnEnvelope(BaseModel):
-    """Optional provider metadata surrounding one accepted draft."""
-
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
-
-    draft: ModelTurnDraft
-    transitions: tuple[LoopTransition, ...] = ()
-    request: ModelRequest | None = None
-    model_call_record: ModelCallRecord | None = None
-    assistant_message: ModelMessage | None = None
-    context_revision: str | None = None
-    provider_serializer_revision: str | None = None
-
-
-class ModelTurnProvider(Protocol):
-    async def next_turn(
-        self,
-        state: LoopState,
-        *,
-        definition: AgentRuntimePolicy,
-        budget_remaining: int,
-    ) -> ModelTurnDraft | ModelTurnEnvelope: ...
 
 
 class LoopContextManager(Protocol):
@@ -299,7 +292,7 @@ class AgentLoop:
                 return state
 
             await self._emit_stream(
-                _stream_turn_start(
+                turn_start(
                     turn_id=state["run_config"].turn_id,
                     iteration=state["iteration"] + 1,
                 )
@@ -325,7 +318,6 @@ class AgentLoop:
                 state["tool_call_ledger"].trim(
                     active_tool_call_ids={p.tool_call_id for p in state["pending_tool_calls"]},
                 )
-                self._record_plan_decision(state, turn)
                 await self._transition(
                     state, reason="next_turn", detail={"action": turn.action}, checkpoint_reason="model_turn"
                 )
@@ -336,7 +328,7 @@ class AgentLoop:
                     checkpoint_reason="tool_calls_scheduled",
                 )
                 await self._emit_stream(
-                    _stream_turn_end(
+                    turn_end(
                         turn_id=state["run_config"].turn_id,
                         iteration=state["iteration"],
                         stop_reason="tool_use",
@@ -350,7 +342,7 @@ class AgentLoop:
 
             if turn.action == "pause":
                 await self._emit_stream(
-                    _stream_turn_end(
+                    turn_end(
                         turn_id=state["run_config"].turn_id,
                         iteration=state["iteration"],
                         stop_reason="pause",
@@ -367,7 +359,7 @@ class AgentLoop:
 
             # finish
             await self._emit_stream(
-                _stream_turn_end(
+                turn_end(
                     turn_id=state["run_config"].turn_id,
                     iteration=state["iteration"],
                     stop_reason="end_turn",
@@ -377,7 +369,7 @@ class AgentLoop:
                 return state
 
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=state["terminal"].stop_reason if state.get("terminal") else "loop_exited",
                 total_turns=state["iteration"],
@@ -408,7 +400,7 @@ class AgentLoop:
         replace_latest_transition(state, transition)
         await self._event_sink.emit(transition)
         await self._emit_stream(
-            _stream_compact_layer(
+            compact_layer(
                 channels=list(result.channels),
                 warnings=list(result.warnings),
                 turn_id=state["run_config"].turn_id,
@@ -507,9 +499,13 @@ class AgentLoop:
             state["canonical_tool_calls"][plan.tool_call_id] = ToolCall(
                 tool_call_id=plan.tool_call_id,
                 tool_name=plan.tool_name,
-                arguments=cast(
-                    Mapping[str, JsonValue],
-                    plan.arguments,
+                arguments=_canonicalize_tool_arguments(
+                    self._registry_snapshot,
+                    tool_name=plan.tool_name,
+                    arguments=cast(
+                        Mapping[str, JsonValue],
+                        plan.arguments,
+                    ),
                 ),
                 origin=origin,
             )
@@ -586,7 +582,7 @@ class AgentLoop:
         replace_latest_transition(state, tr)
         await self._event_sink.emit(tr)
         await self._emit_stream(
-            _stream_compact_layer(
+            compact_layer(
                 channels=list(result.channels),
                 warnings=list(result.warnings),
                 turn_id=state["run_config"].turn_id,
@@ -637,7 +633,7 @@ class AgentLoop:
 
         retries += 1
         await self._emit_stream(
-            _stream_recovery(
+            recovery_event(
                 strategy="model_retry",
                 detail=f"attempt={retries}, error={str(exc)[:200]}",
                 turn_id=state["run_config"].turn_id,
@@ -659,6 +655,60 @@ class AgentLoop:
         retries: int,
     ) -> tuple[ModelTurn | None, int]:
         """Model provider failure.  Retry or fail."""
+        safe_error = redact_sensitive_text(
+            str(exc) or type(exc).__name__
+        )
+        if isinstance(exc, LLMToolCallValidationError):
+            append_loop_diagnostic(
+                state,
+                RuntimeDiagnostic.from_exception(
+                    code="model_tool_call_rejected",
+                    component="agent_loop",
+                    error=exc,
+                    severity="warning",
+                ),
+            )
+            feedback: dict[str, JsonValue] = {
+                "recovery": "correct_tool_arguments",
+                "validation_error": redact_sensitive_text(
+                    exc.validation_error
+                ),
+            }
+            if exc.failed_generation:
+                feedback["failed_generation"] = redact_sensitive_text(
+                    exc.failed_generation
+                )
+            _append_turn_messages(
+                state,
+                (
+                    context_event_message(
+                        "model_tool_call_rejected",
+                        feedback,
+                    ),
+                ),
+            )
+            await self._emit_stream(
+                recovery_event(
+                    strategy="tool_call_correction",
+                    detail=redact_sensitive_text(
+                        exc.validation_error
+                    )[:200],
+                    turn_id=state["run_config"].turn_id,
+                    iteration=state["iteration"],
+                )
+            )
+            await self._transition(
+                state,
+                reason="retry",
+                detail={
+                    "component": "model_tool_call",
+                    "attempt": 0,
+                    "error": safe_error,
+                },
+                checkpoint_reason="model_tool_call_rejected",
+            )
+            return None, 0
+
         append_loop_diagnostic(
             state,
             RuntimeDiagnostic.from_exception(
@@ -670,36 +720,17 @@ class AgentLoop:
             await self._fail(
                 state,
                 stop_reason="model_provider_failed",
-                error=str(exc) or type(exc).__name__,
+                error=safe_error,
                 transition_reason="failed",
                 checkpoint_reason="model_provider_failed",
             )
             return None, retries
 
         retries += 1
-        if isinstance(exc, LLMToolCallValidationError):
-            feedback: dict[str, JsonValue] = {
-                "instruction": (
-                    "Return a corrected tool call whose arguments satisfy the "
-                    "published JSON schema. Do not repeat the rejected call."
-                ),
-                "validation_error": exc.validation_error,
-            }
-            if exc.failed_generation:
-                feedback["failed_generation"] = exc.failed_generation
-            _append_turn_messages(
-                state,
-                (
-                    context_event_message(
-                        "model_tool_call_rejected",
-                        feedback,
-                    ),
-                ),
-            )
         await self._emit_stream(
-            _stream_recovery(
+            recovery_event(
                 strategy="model_retry",
-                detail=f"attempt={retries}, error={str(exc)[:200]}",
+                detail=f"attempt={retries}, error={safe_error[:200]}",
                 turn_id=state["run_config"].turn_id,
                 iteration=state["iteration"],
             )
@@ -707,7 +738,11 @@ class AgentLoop:
         await self._transition(
             state,
             reason="retry",
-            detail={"component": "model", "attempt": retries, "error": str(exc)},
+            detail={
+                "component": "model",
+                "attempt": retries,
+                "error": safe_error,
+            },
             checkpoint_reason="model_retry",
         )
         return None, retries  # caller will retry
@@ -717,17 +752,19 @@ class AgentLoop:
         turn = state["iteration"]
         pending = tuple(state["pending_tool_calls"])
         calls = tuple(self._canonical_call(state, pending_call) for pending_call in pending)
-        delivery_calls, delivery_results = _guard_exploration_stall(
+        circuit_checked_calls, circuit_results = _guard_repeated_tool_failures(
             state,
             calls,
         )
-        executable_calls, circuit_results = _guard_repeated_tool_failures(
-            state,
-            delivery_calls,
+        executable_calls, repeated_inspection_results = (
+            _guard_repeated_successful_inspections(
+                state,
+                circuit_checked_calls,
+            )
         )
         for call in executable_calls:
             await self._emit_stream(
-                _stream_tool_use_start(
+                tool_use_start(
                     tool_name=call.tool_name,
                     tool_id=call.tool_call_id,
                     input_preview=_tool_input_preview(call.arguments),
@@ -760,7 +797,10 @@ class AgentLoop:
         approval_ids = {execution.result.tool_call_id for execution in approval_executions}
         results_by_id = {
             result.tool_call_id: result
-            for result in (*delivery_results, *circuit_results)
+            for result in (
+                *circuit_results,
+                *repeated_inspection_results,
+            )
         }
         results_by_id.update(
             {
@@ -791,8 +831,11 @@ class AgentLoop:
             seen_tool_call_ids=list(self._observed_tool_call_ids),
         )
         self._observed_tool_call_ids.update(observation.tool_call_id for observation in batch.structured_observations)
-        self._merge_observations(state, batch)
-        self._record_plan_observations(state, batch)
+        self._merge_observations(
+            state,
+            batch,
+            tool_results=observable_results,
+        )
 
         new_results, plan_updates = self._apply_update_plan_results(
             state,
@@ -800,32 +843,25 @@ class AgentLoop:
             results=new_results,
         )
         self._apply_activation_results(state, new_results)
+        transcript_messages = _tool_result_transcript_messages(
+            state,
+            new_results,
+        )
         state["tool_results"] = _merge_keyed(
             state["tool_results"],
             new_results,
         )
         _append_turn_messages(
             state,
-            tuple(tool_result_message(result) for result in new_results),
+            transcript_messages,
         )
-        delivery_control = _delivery_control_event(state)
-        if delivery_control is not None:
-            _append_turn_messages(state, (delivery_control,))
-            await self._emit_stream(
-                _stream_recovery(
-                    strategy="delivery_control",
-                    detail=delivery_control.content[:200],
-                    turn_id=turn_id,
-                    iteration=turn,
-                )
-            )
-
         for tool_result in new_results:
             if tool_result.is_error:
                 await self._emit_stream(
-                    _stream_tool_use_error(
+                    tool_use_error(
                         tool_id=tool_result.tool_call_id,
                         error=tool_result.error_message or "Unknown error",
+                        recoverable=None,
                         turn_id=turn_id,
                         iteration=turn,
                     )
@@ -843,7 +879,7 @@ class AgentLoop:
                         ),
                     )
                     await self._emit_stream(
-                        _stream_recovery(
+                        recovery_event(
                             strategy="tool_failure_circuit_breaker",
                             detail=detail,
                             turn_id=turn_id,
@@ -852,10 +888,11 @@ class AgentLoop:
                     )
             else:
                 await self._emit_stream(
-                    _stream_tool_use_result(
+                    tool_use_result(
                         tool_name=tool_result.tool_name,
                         tool_id=tool_result.tool_call_id,
                         result=_tool_result_text(tool_result)[:500],
+                        elapsed_ms=None,
                         details=_tool_result_event_details(tool_result),
                         turn_id=turn_id,
                         iteration=turn,
@@ -910,6 +947,9 @@ class AgentLoop:
                 "result_count": len(new_results),
                 "pending_count": len(state["pending_tool_calls"]),
                 "circuit_breaker_count": len(circuit_results),
+                "repeated_inspection_count": len(
+                    repeated_inspection_results
+                ),
             },
             checkpoint_reason="tool_results_recorded",
         )
@@ -924,34 +964,6 @@ class AgentLoop:
 
         # Record tool call metrics.
         self._record_metrics(state, new_results)
-
-        delivery_control_remained_open = not executions and any(
-            result.metadata.get("delivery_control_already_open") is True
-            for result in delivery_results
-        )
-        if delivery_control_remained_open:
-            inspection_counts: list[int] = []
-            for result in delivery_results:
-                value = result.metadata.get("consecutive_exploration_calls")
-                if isinstance(value, int) and not isinstance(value, bool):
-                    inspection_counts.append(value)
-            inspection_calls = max(
-                inspection_counts,
-                default=_EXPLORATION_LIMIT,
-            )
-            await self._fail(
-                state,
-                stop_reason=_DELIVERY_STALLED_CODE,
-                error=(
-                    f"The model used {inspection_calls} inspection calls plus "
-                    "the focused extension without making a concrete delivery "
-                    "action. Narrow the task or select a model capable of "
-                    "cross-file coding."
-                ),
-                transition_reason="failed",
-                checkpoint_reason=_DELIVERY_STALLED_CODE,
-            )
-            return True
 
         circuit_remained_open = not executions and any(
             result.metadata.get("circuit_already_open") is True for result in circuit_results
@@ -992,7 +1004,7 @@ class AgentLoop:
                 self._append_plan_events(state, events)
             steps = [
                 PlanStep(
-                    step_id=f"step_{index:03d}",
+                    step_id=item.step_id or f"step_{index:03d}",
                     title=item.step,
                     status=item.status,
                 )
@@ -1013,7 +1025,11 @@ class AgentLoop:
                     structured_content={
                         "accepted": True,
                         "revision": updated.revision,
-                        "message": "Plan updated and persisted.",
+                        "message": (
+                            "Plan persisted as advisory state; tool policy and "
+                            "stop hooks retain execution and completion authority."
+                        ),
+                        "authority": "advisory",
                     },
                 )
             )
@@ -1047,7 +1063,11 @@ class AgentLoop:
         call = ToolCall(
             tool_call_id=plan.tool_call_id,
             tool_name=plan.tool_name,
-            arguments=cast(Mapping[str, JsonValue], plan.arguments),
+            arguments=_canonicalize_tool_arguments(
+                self._registry_snapshot,
+                tool_name=plan.tool_name,
+                arguments=cast(Mapping[str, JsonValue], plan.arguments),
+            ),
             origin=origin,
         )
         state["canonical_tool_calls"][call.tool_call_id] = call
@@ -1229,7 +1249,7 @@ class AgentLoop:
             checkpoint_reason="terminal_completed",
         )
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=outcome.code,
                 total_turns=state["iteration"],
@@ -1246,6 +1266,7 @@ class AgentLoop:
         checkpoint_reason: str,
         final_output: ValidatedFinalOutput | None = None,
     ) -> None:
+        error = redact_sensitive_text(error)
         state["status"] = "failed"
         state["pause"] = None
         state["terminal"] = LoopTerminal(
@@ -1271,7 +1292,7 @@ class AgentLoop:
         )
         # ── 流式事件：loop 结束 ──
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=stop_reason,
                 total_turns=state["iteration"],
@@ -1310,7 +1331,7 @@ class AgentLoop:
                 )
             )
         await self._emit_stream(
-            _stream_loop_end(
+            loop_end(
                 turn_id=state["run_config"].turn_id,
                 reason=str(transition_reason),
                 total_turns=state["iteration"],
@@ -1339,38 +1360,6 @@ class AgentLoop:
                 reason=checkpoint_reason,
             )
 
-    def _record_plan_decision(
-        self,
-        state: LoopState,
-        turn: ModelTurn,
-    ) -> None:
-        plan = state["plan_state"].agent_plan
-        if plan is None:
-            return
-        work_calls = [call for call in turn.tool_calls if call.tool_name != "update_plan"]
-        if not work_calls:
-            return
-        updated, events = self._plan_tracker.record_decision_progress(
-            plan,
-            tool_call_ids=[call.tool_call_id for call in work_calls],
-            tool_names=[call.tool_name for call in work_calls],
-        )
-        state["plan_state"].agent_plan = updated
-        state["plan_state"].plan_events = [*state["plan_state"].plan_events, *events][-MAX_PLAN_EVENTS:]
-
-    def _record_plan_observations(
-        self,
-        state: LoopState,
-        batch: ObservationBatch,
-    ) -> None:
-        plan, events = self._plan_tracker.record_observation_progress(
-            plan=state["plan_state"].agent_plan,
-            observations=batch.structured_observations,
-        )
-        if plan is not None:
-            state["plan_state"].agent_plan = plan
-            state["plan_state"].plan_events = [*state["plan_state"].plan_events, *events][-MAX_PLAN_EVENTS:]
-
     @staticmethod
     def _append_plan_events(
         state: LoopState,
@@ -1385,10 +1374,61 @@ class AgentLoop:
     def _merge_observations(
         state: LoopState,
         batch: ObservationBatch,
+        *,
+        tool_results: Sequence[ToolResult] = (),
     ) -> None:
-        # Tool semantics are already fixed in canonical ToolResult values and the
-        # append-only model transcript; observations do not re-render them.
-        return
+        memory_state = state["memory_state"]
+        observation_limit = (
+            state["run_config"].memory_policy.reactive_compact_max_observations
+        )
+        locator_limit = (
+            state["run_config"].memory_policy.reactive_compact_max_evidence
+        )
+        observations_by_id = {
+            observation.tool_call_id: observation
+            for observation in memory_state.recent_observations
+        }
+        for observation in batch.structured_observations:
+            observations_by_id[observation.tool_call_id] = observation
+
+        locators_by_key = {
+            json.dumps(locator, ensure_ascii=False, sort_keys=True): locator
+            for locator in memory_state.known_locators
+        }
+        new_locators = [
+            *batch.locators,
+            *[
+                locator
+                for observation in batch.structured_observations
+                for locator in observation.locators
+            ],
+        ]
+        for locator in new_locators:
+            locators_by_key[
+                json.dumps(locator, ensure_ascii=False, sort_keys=True)
+            ] = locator
+        verified_paths = dict.fromkeys(
+            memory_state.verified_workspace_paths
+        )
+        for path in grounded_workspace_paths(
+            locators=new_locators,
+            tool_results=(
+                *state["tool_results"],
+                *tool_results,
+            ),
+            tool_calls=state["canonical_tool_calls"],
+        ):
+            verified_paths.setdefault(path, None)
+
+        state["memory_state"] = memory_state.model_copy(
+            update={
+                "recent_observations": list(observations_by_id.values())[
+                    -observation_limit:
+                ],
+                "verified_workspace_paths": list(verified_paths),
+                "known_locators": list(locators_by_key.values())[-locator_limit:],
+            }
+        )
 
 
 async def _await_value[T](value: T | Awaitable[T]) -> T:
@@ -1402,158 +1442,6 @@ async def _remaining_llm_budget(handles: Any) -> int | None:
     if ledger is None:
         return None
     return cast(int, await ledger.remaining())
-
-
-def _delivery_control_event(state: LoopState) -> ModelMessage | None:
-    trailing = _trailing_exploration_results(state)
-    if not trailing:
-        return None
-
-    inspection_calls = len(trailing)
-    reached = [
-        threshold
-        for threshold in _DELIVERY_CONTROL_THRESHOLDS
-        if inspection_calls >= threshold
-    ]
-    if not reached:
-        return None
-    threshold = reached[-1]
-    cycle_id = trailing[0].tool_call_id
-    marker = f'"cycle_id":"{cycle_id}"'
-    threshold_marker = f'"threshold":{threshold}'
-    if any(
-        message.role == "context"
-        and '"event_type":"delivery_control"' in message.content
-        and marker in message.content
-        and threshold_marker in message.content
-        for message in state["turn_transcript"]
-    ):
-        return None
-
-    if threshold < 12:
-        instruction = (
-            "Stop broad exploration and choose the delivery path now. For an "
-            "implementation task, update the plan or make the first concrete "
-            "edit. For an analysis task, synthesize the answer from current "
-            "evidence."
-        )
-    elif threshold < _EXPLORATION_LIMIT:
-        instruction = (
-            "The first concrete edit is overdue. Stop mapping the repository. "
-            "Use only the exact remaining evidence needed for the existing "
-            "choke point, then call apply_patch or finish with blocker evidence."
-        )
-    else:
-        instruction = (
-            "Exploration is closed for this delivery cycle. Do not issue "
-            "another list_files, search_text, read_file, find_tools, or "
-            "run_command call. If evidence is still missing, one update_plan "
-            "checkpoint naming the exact unresolved files or questions grants "
-            "at most eight focused inspection calls; repeating update_plan does "
-            "not grant more. Otherwise call apply_patch, use another concrete "
-            "delivery tool, or finish with blocker evidence."
-        )
-    return context_event_message(
-        "delivery_control",
-        {
-            "cycle_id": cycle_id,
-            "inspection_calls": inspection_calls,
-            "threshold": threshold,
-            "instruction": instruction,
-        },
-    )
-
-
-def _guard_exploration_stall(
-    state: LoopState,
-    calls: Sequence[ToolCall],
-) -> tuple[tuple[ToolCall, ...], tuple[ToolResult, ...]]:
-    cycle = _delivery_cycle_results(state)
-    trailing = _trailing_exploration_results(state)
-    trailing_exploration_calls = len(trailing)
-    control_already_open = any(
-        result.error_code == _DELIVERY_CONTROL_CODE for result in cycle
-    )
-    focused_extension_active = control_already_open and any(
-        result.tool_name == "update_plan" for result in cycle
-    )
-    exploration_limit = _EXPLORATION_LIMIT + (
-        _FOCUSED_EXPLORATION_EXTENSION if focused_extension_active else 0
-    )
-    remaining_exploration = max(
-        exploration_limit - trailing_exploration_calls,
-        0,
-    )
-    projected_exploration_calls = trailing_exploration_calls
-
-    executable: list[ToolCall] = []
-    blocked: list[ToolResult] = []
-    for call in calls:
-        if call.tool_call_id in state["tool_execution_records"]:
-            # Delivery actions remain available. Recorded calls must stay on
-            # ToolExecutor's replay/reconciliation path.
-            executable.append(call)
-            continue
-        if call.tool_name not in _EXPLORATION_TOOL_NAMES:
-            executable.append(call)
-            if call.tool_name != "update_plan":
-                # A concrete delivery action starts a fresh inspection cycle,
-                # including focused verification later in the same tool batch.
-                remaining_exploration = _EXPLORATION_LIMIT
-                projected_exploration_calls = 0
-                control_already_open = False
-                focused_extension_active = False
-            continue
-        if remaining_exploration > 0:
-            executable.append(call)
-            remaining_exploration -= 1
-            projected_exploration_calls += 1
-            continue
-        if not control_already_open:
-            message = (
-                "Exploration limit reached after "
-                f"{projected_exploration_calls} consecutive inspection calls. "
-                "Submit one update_plan naming the exact unresolved evidence "
-                "for up to eight focused inspection calls, call apply_patch, "
-                "use another concrete delivery tool, or finish."
-            )
-        elif focused_extension_active:
-            message = (
-                "The focused exploration extension is exhausted. Repeating "
-                "update_plan does not grant more calls. Call apply_patch, use "
-                "another concrete delivery tool, or finish."
-            )
-        else:
-            message = (
-                "Exploration remains closed. Use the available evidence to "
-                "call apply_patch, use another concrete delivery tool, or "
-                "finish."
-            )
-        blocked.append(
-            ToolResult(
-                tool_call_id=call.tool_call_id,
-                tool_name=call.tool_name,
-                is_error=True,
-                error_code=_DELIVERY_CONTROL_CODE,
-                error_message=message,
-                retryable=False,
-                metadata={
-                    "consecutive_exploration_calls": projected_exploration_calls,
-                    "delivery_control_already_open": control_already_open,
-                    "focused_extension_active": focused_extension_active,
-                },
-            )
-        )
-    return tuple(executable), tuple(blocked)
-
-
-def _trailing_exploration_results(state: LoopState) -> list[ToolResult]:
-    return [
-        result
-        for result in _delivery_cycle_results(state)
-        if result.tool_name in _EXPLORATION_TOOL_NAMES
-        and result.error_code != _DELIVERY_CONTROL_CODE
-    ]
 
 
 def _delivery_cycle_results(state: LoopState) -> list[ToolResult]:
@@ -1603,10 +1491,75 @@ def _guard_repeated_tool_failures(
                     "finish with the available evidence."
                 ),
                 retryable=False,
+                structured_content={
+                    "repeated_failure": True,
+                    "original_tool_call_id": failures[0].tool_call_id,
+                    "failure_count": len(failures),
+                    "last_error_code": (
+                        failures[-1].error_code or "unknown"
+                    ),
+                },
                 metadata={
                     "failure_count": len(failures),
                     "last_error_code": failures[-1].error_code or "unknown",
                     "circuit_already_open": already_open,
+                },
+            )
+        )
+    return tuple(executable), tuple(blocked)
+
+
+def _guard_repeated_successful_inspections(
+    state: LoopState,
+    calls: Sequence[ToolCall],
+) -> tuple[tuple[ToolCall, ...], tuple[ToolResult, ...]]:
+    successful_cycle_results = tuple(
+        result
+        for result in _delivery_cycle_results(state)
+        if not result.is_error
+        and result.tool_name in _STABLE_INSPECTION_TOOL_NAMES
+    )
+    executable: list[ToolCall] = []
+    blocked: list[ToolResult] = []
+    for call in calls:
+        if (
+            call.tool_call_id in state["tool_execution_records"]
+            or call.tool_name not in _STABLE_INSPECTION_TOOL_NAMES
+        ):
+            executable.append(call)
+            continue
+        previous = next(
+            (
+                result
+                for result in reversed(successful_cycle_results)
+                if (
+                    (previous_call := state["canonical_tool_calls"].get(
+                        result.tool_call_id
+                    ))
+                    is not None
+                    and _same_tool_invocation(previous_call, call)
+                )
+            ),
+            None,
+        )
+        if previous is None:
+            executable.append(call)
+            continue
+        blocked.append(
+            ToolResult(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                is_error=True,
+                error_code="repeated_inspection",
+                error_message=(
+                    "This exact read-only inspection already succeeded without "
+                    "an intervening delivery action. Use the existing result, "
+                    "narrow or change the arguments, choose a different tool, "
+                    "or make the concrete delivery change."
+                ),
+                retryable=False,
+                metadata={
+                    "previous_tool_call_id": previous.tool_call_id,
                 },
             )
         )
@@ -1619,17 +1572,154 @@ def _matching_tool_failures_since_recovery(
 ) -> tuple[ToolResult, ...]:
     failures: list[ToolResult] = []
     for result in reversed(state["tool_results"]):
-        if not result.is_error:
+        if (
+            not result.is_error
+            and result.tool_name != "update_plan"
+            and result.tool_name not in _EXPLORATION_TOOL_NAMES
+        ):
             break
         previous_call = state["canonical_tool_calls"].get(result.tool_call_id)
-        if previous_call is not None and _same_tool_invocation(previous_call, call):
-            failures.append(result)
+        if (
+            previous_call is None
+            or not _same_failed_operation(previous_call, call, result)
+        ):
+            continue
+        if not result.is_error:
+            break
+        failures.append(result)
     failures.reverse()
     return tuple(failures)
 
 
+def _tool_result_transcript_messages(
+    state: LoopState,
+    results: Sequence[ToolResult],
+) -> tuple[ModelMessage, ...]:
+    seen: dict[str, tuple[str, int]] = {}
+    prior_failures: list[ToolResult] = []
+    for result in reversed(state["tool_results"]):
+        if not result.is_error:
+            break
+        prior_failures.append(result)
+    for result in reversed(prior_failures):
+        fingerprint = _tool_failure_evidence_fingerprint(result)
+        if fingerprint is None:
+            continue
+        original_id, count = seen.get(
+            fingerprint,
+            (result.tool_call_id, 0),
+        )
+        seen[fingerprint] = (original_id, count + 1)
+
+    messages: list[ModelMessage] = []
+    for result in results:
+        if not result.is_error:
+            seen.clear()
+            messages.append(tool_result_message(result))
+            continue
+        fingerprint = _tool_failure_evidence_fingerprint(result)
+        previous = None if fingerprint is None else seen.get(fingerprint)
+        if fingerprint is None or previous is None:
+            messages.append(tool_result_message(result))
+            if fingerprint is not None:
+                seen[fingerprint] = (result.tool_call_id, 1)
+            continue
+        original_id, count = previous
+        repeat_count = count + 1
+        visible_result = replace(
+            result,
+            content=(),
+            structured_content={
+                "repeated_failure": True,
+                "evidence_fingerprint": fingerprint,
+                "original_tool_call_id": original_id,
+                "repeat_count": repeat_count,
+            },
+        )
+        messages.append(tool_result_message(visible_result))
+        seen[fingerprint] = (original_id, repeat_count)
+    return tuple(messages)
+
+
+def _tool_failure_evidence_fingerprint(
+    result: ToolResult,
+) -> str | None:
+    if not result.is_error:
+        return None
+    structured_content = result.structured_content
+    if result.tool_name == "run_command" and isinstance(
+        structured_content,
+        Mapping,
+    ):
+        structured_content = {
+            key: value
+            for key, value in structured_content.items()
+            if key != "duration_ms"
+        }
+    visible_content = tuple(
+        {
+            "type": block.type,
+            "data": block.data,
+        }
+        for block in result.content
+    )
+    payload = cast(
+        JsonValue,
+        {
+            "tool_name": result.tool_name,
+            "content": visible_content,
+            "structured_content": structured_content,
+            "is_error": result.is_error,
+            "error_code": result.error_code,
+            "error_message": result.error_message,
+            "retryable": result.retryable,
+            "truncated": result.truncated,
+        },
+    )
+    return hashlib.sha256(
+        canonical_json_text(payload).encode("utf-8")
+    ).hexdigest()
+
+
 def _same_tool_invocation(left: ToolCall, right: ToolCall) -> bool:
     return left.tool_name == right.tool_name and left.arguments == right.arguments
+
+
+def _same_failed_operation(
+    left: ToolCall,
+    right: ToolCall,
+    result: ToolResult,
+) -> bool:
+    if left.tool_name != right.tool_name:
+        return False
+    if (
+        left.tool_name == "run_command"
+        and result.error_code == "command_failed"
+    ):
+        left_arguments = dict(left.arguments)
+        right_arguments = dict(right.arguments)
+        left_arguments.pop("timeout_seconds", None)
+        right_arguments.pop("timeout_seconds", None)
+        return left_arguments == right_arguments
+    return left.arguments == right.arguments
+
+
+def _canonicalize_tool_arguments(
+    registry_snapshot: Mapping[str, Tool],
+    *,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    """Materialize schema defaults before identity, policy, and execution."""
+
+    tool = registry_snapshot.get(tool_name)
+    if tool is None:
+        return arguments
+    try:
+        return tool.validate_input(arguments)
+    except Exception:
+        # ToolExecutor remains the canonical fail-closed validation boundary.
+        return arguments
 
 
 def _merge_keyed[T](existing: list[T], additions: list[T]) -> list[T]:
@@ -1744,6 +1834,8 @@ def _approval_request(
     cwd = result.metadata.get("cwd")
     execution_mode = result.metadata.get("execution_mode")
     network_requested = result.metadata.get("network_requested") is True
+    workspace_path = result.metadata.get("workspace_path")
+    workspace_write = result.metadata.get("workspace_write") is True
     args_preview = _tool_input_preview(call.arguments)
     question = f"Allow {result.tool_name} to run once? {reason}"
     if result.tool_name == "run_command":
@@ -1752,11 +1844,20 @@ def _approval_request(
             cwd=cwd if isinstance(cwd, str) else None,
             execution_mode=(execution_mode if isinstance(execution_mode, str) else "restricted_sandbox"),
             network_requested=network_requested,
+            workspace_path=(
+                workspace_path if isinstance(workspace_path, str) else None
+            ),
+            workspace_write=workspace_write,
         )
         if approval_scope == "network":
             question = f"Allow network access for this run_command invocation? {reason}"
         else:
             question = f"Allow run_command to execute once in restricted_sandbox mode? {reason}"
+            if workspace_write:
+                question += (
+                    " This approval grants destructive write access to the "
+                    "entire workspace except Git metadata."
+                )
             if network_requested:
                 question += " Network access is not included in this approval."
     return HumanInputRequest(
@@ -1780,6 +1881,8 @@ def _approval_request(
             "cwd": cwd,
             "network_requested": network_requested,
             "execution_mode": execution_mode,
+            "workspace_path": workspace_path,
+            "workspace_write": workspace_write,
         },
         options=["allow_once", "deny"],
     )
@@ -1791,6 +1894,8 @@ def _run_command_approval_preview(
     cwd: str | None,
     execution_mode: str,
     network_requested: bool,
+    workspace_path: str | None,
+    workspace_write: bool,
 ) -> str:
     command = arguments.get("command")
     raw_command = command if isinstance(command, str) else str(command)
@@ -1800,7 +1905,23 @@ def _run_command_approval_preview(
         ensure_ascii=False,
     )
     network_text = "requested (separate approval required)" if network_requested else "disabled"
-    return f"command: {command_text}\ncwd: {cwd_text}\nnetwork: {network_text}\nexecution mode: {execution_mode}"
+    workspace_path_text = json.dumps(
+        workspace_path or "<unknown>",
+        ensure_ascii=False,
+    )
+    workspace_write_text = (
+        f"requested for entire workspace {workspace_path_text} "
+        "(Git metadata remains read-only)"
+        if workspace_write
+        else "disabled (workspace is read-only)"
+    )
+    return (
+        f"command: {command_text}\n"
+        f"cwd: {cwd_text}\n"
+        f"workspace write: {workspace_write_text}\n"
+        f"network: {network_text}\n"
+        f"execution mode: {execution_mode}"
+    )
 
 
 def _reconciliation_request(
@@ -1820,59 +1941,6 @@ def _reconciliation_request(
             "execution_status": (None if record is None else record.status.value),
         },
         options=["mark_completed", "mark_failed"],
-    )
-
-
-# ── 流式事件 helper ──────────────────────────────────────
-
-
-def _stream_turn_start(*, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TURN_START,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-    )
-
-
-def _stream_turn_end(*, turn_id: str, iteration: int, stop_reason: str) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TURN_END,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"stop_reason": stop_reason},
-    )
-
-
-def _stream_loop_end(*, turn_id: str, reason: str, total_turns: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.LOOP_END,
-        turn_id=turn_id,
-        sequence=next_sequence(),
-        data={"reason": reason, "total_turns": total_turns},
-    )
-
-
-def _stream_tool_use_start(
-    *,
-    tool_name: str,
-    tool_id: str,
-    input_preview: str,
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TOOL_USE_START,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data={
-            "tool_name": tool_name,
-            "tool_id": tool_id,
-            "input_preview": input_preview,
-        },
     )
 
 
@@ -1905,32 +1973,6 @@ def _stream_human_input_required(
     )
 
 
-def _stream_tool_use_result(
-    *,
-    tool_name: str,
-    tool_id: str,
-    result: str,
-    details: Mapping[str, JsonValue] | None = None,
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    data: dict[str, JsonValue] = {
-        "tool_name": tool_name,
-        "tool_id": tool_id,
-        "result": result,
-    }
-    if details:
-        data["details"] = dict(details)
-    return StreamEvent(
-        type=EventType.TOOL_USE_RESULT,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data=data,
-    )
-
-
 def _stream_plan_updated(
     *,
     plan: AgentPlan,
@@ -1947,46 +1989,6 @@ def _stream_plan_updated(
             "plan": plan.model_dump(mode="json"),
             "event": event.model_dump(mode="json"),
         },
-    )
-
-
-def _stream_tool_use_error(*, tool_id: str, error: str, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.TOOL_USE_ERROR,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        span_id=f"tool:{tool_id}",
-        data={"tool_id": tool_id, "error": error},
-    )
-
-
-def _stream_compact_layer(
-    *,
-    channels: list[str],
-    warnings: list[str],
-    turn_id: str,
-    iteration: int,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.COMPACT_LAYER,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={
-            "channels": tuple(channels),
-            "warnings": tuple(warnings),
-        },
-    )
-
-
-def _stream_recovery(*, strategy: str, detail: str, turn_id: str, iteration: int) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.RECOVERY,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"strategy": strategy, "detail": detail},
     )
 
 

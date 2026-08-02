@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -21,6 +23,7 @@ from rag.agent.tools.tool import (
     Tool,
     ToolDefinition,
     ToolResult,
+    _require_non_empty_string,
     json_schema_output,
 )
 from rag.schema.llm import LLMUsage
@@ -28,6 +31,9 @@ from rag.schema.llm import LLMUsage
 CANONICAL_REQUEST_REVISION = "canonical-model-request-v1"
 STABLE_CONTEXT_REVISION = "stable-model-context-v1"
 COMPACTION_REVISION = "context-compaction-v1"
+_MAX_PROJECTED_STREAM_TAIL_CHARS = 2_000
+_MAX_PROJECTED_FAILED_TESTS = 12
+_MIN_PROJECTED_TOOL_RESULT_CHARS = 512
 
 
 class ToolChoiceMode(StrEnum):
@@ -129,7 +135,6 @@ class StableModelContext:
     instructions: tuple[str, ...]
     frozen_run_context: tuple[ContextBlock, ...]
     initial_user_task: str
-    initial_memory: tuple[str, ...]
     transcript: tuple[ModelMessage, ...]
     context_revision: str
     parent_context_revision: str | None = None
@@ -152,7 +157,6 @@ class StableModelContext:
                 raise TypeError("frozen_run_context must contain ContextBlock values")
             blocks.append(ContextBlock(name=block.name, content=block.content))
         _require_non_empty_string(self.initial_user_task, field_name="initial_user_task")
-        memory = _ordered_strings(self.initial_memory, field_name="initial_memory")
         transcript = _snapshot_messages(self.transcript, field_name="transcript")
         _require_non_empty_string(self.context_revision, field_name="context_revision")
         if self.parent_context_revision is not None:
@@ -163,7 +167,6 @@ class StableModelContext:
         _require_non_empty_string(self.revision_reason, field_name="revision_reason")
         object.__setattr__(self, "instructions", instructions)
         object.__setattr__(self, "frozen_run_context", tuple(blocks))
-        object.__setattr__(self, "initial_memory", memory)
         object.__setattr__(self, "transcript", transcript)
 
     @property
@@ -184,13 +187,6 @@ class StableModelContext:
             )
             for block in self.frozen_run_context
         )
-        if self.initial_memory:
-            messages.append(
-                context_event_message(
-                    "initial_memory",
-                    {"items": self.initial_memory},
-                )
-            )
         messages.append(ModelMessage(role="user", content=self.initial_user_task))
         return tuple(messages)
 
@@ -248,8 +244,44 @@ class StableModelContext:
             instructions=self.instructions,
             frozen_run_context=self.frozen_run_context,
             initial_user_task=self.initial_user_task,
-            initial_memory=self.initial_memory,
             transcript=(event, *tail),
+            context_revision=revision,
+            parent_context_revision=self.context_revision,
+            revision_reason="compaction",
+        )
+
+    def project_compaction(
+        self,
+        *,
+        tail_start: int,
+        max_summary_chars: int,
+        project_tool_results: bool = False,
+    ) -> StableModelContext:
+        projected = project_transcript_compaction(
+            self.transcript,
+            parent_context_revision=self.context_revision,
+            tail_start=tail_start,
+            max_summary_chars=max_summary_chars,
+            project_tool_results=project_tool_results,
+        )
+        if projected == self.transcript:
+            return self
+        revision = _revision(
+            "context",
+            {
+                "serializer_revision": COMPACTION_REVISION,
+                "parent_context_revision": self.context_revision,
+                "transcript": tuple(
+                    model_message_payload(message)
+                    for message in projected
+                ),
+            },
+        )
+        return StableModelContext(
+            instructions=self.instructions,
+            frozen_run_context=self.frozen_run_context,
+            initial_user_task=self.initial_user_task,
+            transcript=projected,
             context_revision=revision,
             parent_context_revision=self.context_revision,
             revision_reason="compaction",
@@ -263,7 +295,6 @@ class StableModelContext:
             instructions=self.instructions,
             frozen_run_context=self.frozen_run_context,
             initial_user_task=self.initial_user_task,
-            initial_memory=self.initial_memory,
             transcript=transcript,
             context_revision=self.context_revision,
             parent_context_revision=self.parent_context_revision,
@@ -374,7 +405,6 @@ def build_stable_context(
     instructions: Sequence[str],
     frozen_run_context: Sequence[ContextBlock] = (),
     initial_user_task: str,
-    initial_memory: Sequence[str] = (),
     transcript: Sequence[ModelMessage] = (),
 ) -> StableModelContext:
     instruction_values = _ordered_strings(
@@ -383,10 +413,6 @@ def build_stable_context(
         require_non_empty_sequence=True,
     )
     _require_non_empty_string(initial_user_task, field_name="initial_user_task")
-    memory_values = _ordered_strings(
-        initial_memory,
-        field_name="initial_memory",
-    )
     if isinstance(frozen_run_context, (str, bytes)) or not isinstance(
         frozen_run_context,
         Sequence,
@@ -404,13 +430,11 @@ def build_stable_context(
         "instructions": instruction_values,
         "frozen_run_context": tuple({"name": block.name, "content": block.content} for block in block_tuple),
         "initial_user_task": initial_user_task,
-        "initial_memory": memory_values,
     }
     return StableModelContext(
         instructions=instruction_values,
         frozen_run_context=block_tuple,
         initial_user_task=initial_user_task,
-        initial_memory=memory_values,
         transcript=transcript_tuple,
         context_revision=_revision("context", revision_payload),
     )
@@ -630,6 +654,358 @@ def canonical_hash(value: JsonValue) -> str:
     return hashlib.sha256(canonical_json_text(value).encode("utf-8")).hexdigest()
 
 
+def canonical_transcript_revision(
+    transcript: Sequence[ModelMessage],
+) -> str:
+    """Return the deterministic revision owned by a canonical transcript."""
+
+    messages = _snapshot_messages(
+        transcript,
+        field_name="transcript",
+    )
+    return _revision(
+        "transcript",
+        tuple(model_message_payload(message) for message in messages),
+    )
+
+
+def project_transcript_compaction(
+    transcript: Sequence[ModelMessage],
+    *,
+    parent_context_revision: str,
+    tail_start: int,
+    max_summary_chars: int,
+    project_tool_results: bool = False,
+) -> tuple[ModelMessage, ...]:
+    """Project a smaller canonical transcript with a verifiable compaction event."""
+
+    messages = _snapshot_messages(
+        transcript,
+        field_name="transcript",
+    )
+    _require_non_empty_string(
+        parent_context_revision,
+        field_name="parent_context_revision",
+    )
+    if (
+        not isinstance(tail_start, int)
+        or isinstance(tail_start, bool)
+        or tail_start < 0
+        or tail_start > len(messages)
+    ):
+        raise ValueError("tail_start must index the transcript")
+    if (
+        not isinstance(max_summary_chars, int)
+        or isinstance(max_summary_chars, bool)
+        or max_summary_chars <= 0
+    ):
+        raise ValueError("max_summary_chars must be a positive integer")
+
+    actual_tail_start = _extend_tail_for_tool_pair(messages, tail_start)
+    covered = messages[:actual_tail_start]
+    source_tail = messages[actual_tail_start:]
+    tail, projected_tool_result_count = _project_tool_result_messages(
+        source_tail,
+        max_chars=max_summary_chars,
+        enabled=project_tool_results,
+    )
+    if not covered and projected_tool_result_count == 0:
+        return messages
+    summary_limit = min(max_summary_chars, 12_000)
+    summary = _deterministic_transcript_summary(
+        covered,
+        max_chars=summary_limit,
+    )
+    projection: Mapping[str, JsonValue] = {
+        "covered_count": len(covered),
+        "retained_tail_count": len(tail),
+        "summary_max_chars": summary_limit,
+        "source_digest": canonical_hash(
+            tuple(model_message_payload(message) for message in messages)
+        ),
+        "retained_tail_digest": canonical_hash(
+            tuple(model_message_payload(message) for message in tail)
+        ),
+    }
+    if projected_tool_result_count:
+        projection = {
+            **projection,
+            "projected_tool_result_count": projected_tool_result_count,
+        }
+    event = context_event_message(
+        "context_compaction",
+        {
+            "summary": summary,
+            "parent_context_revision": parent_context_revision,
+            "projection": projection,
+        },
+    )
+    candidate = (event, *tail)
+    if _model_messages_size(candidate) >= _model_messages_size(messages):
+        return messages
+    return candidate
+
+
+def is_verified_transcript_compaction_rewrite(
+    existing_turn: Sequence[ModelMessage],
+    candidate_turn: Sequence[ModelMessage],
+    *,
+    message_compaction_min_count: int,
+    max_message_tail_count: int,
+    reactive_compact_tail_count: int,
+    max_summary_chars: int,
+) -> bool:
+    """Verify a rewrite against projections allowed by trusted runtime policy."""
+
+    existing = _snapshot_messages(
+        existing_turn,
+        field_name="existing_turn",
+    )
+    candidate = _snapshot_messages(
+        candidate_turn,
+        field_name="candidate_turn",
+    )
+    if (
+        len(existing) < 2
+        or len(candidate) < 2
+        or existing[0].role != "user"
+        or candidate[0] != existing[0]
+        or candidate[1].role != "context"
+        or any(
+            isinstance(value, bool) or not isinstance(value, int)
+            for value in (
+                message_compaction_min_count,
+                max_message_tail_count,
+                reactive_compact_tail_count,
+                max_summary_chars,
+            )
+        )
+        or message_compaction_min_count <= 0
+        or max_message_tail_count < 0
+        or reactive_compact_tail_count <= 0
+        or max_summary_chars <= 0
+    ):
+        return False
+
+    existing_body = existing[1:]
+    parent_revision = canonical_transcript_revision(existing)
+    allowed: list[tuple[ModelMessage, ...]] = []
+    if len(existing) >= message_compaction_min_count:
+        proactive = project_transcript_compaction(
+            existing_body,
+            parent_context_revision=parent_revision,
+            tail_start=max(
+                0,
+                len(existing_body) - max_message_tail_count,
+            ),
+            max_summary_chars=max_summary_chars,
+        )
+        if proactive != existing_body:
+            allowed.append(proactive)
+
+    reactive_tail_start = max(
+        0,
+        len(existing_body) - reactive_compact_tail_count,
+    )
+    if reactive_tail_start == 0:
+        reactive_tail_start = 1
+    reactive = project_transcript_compaction(
+        existing_body,
+        parent_context_revision=parent_revision,
+        tail_start=reactive_tail_start,
+        max_summary_chars=max_summary_chars,
+    )
+    if reactive == existing_body:
+        reactive = project_transcript_compaction(
+            existing_body,
+            parent_context_revision=parent_revision,
+            tail_start=len(existing_body),
+            max_summary_chars=max_summary_chars,
+        )
+    if reactive != existing_body:
+        allowed.append(reactive)
+
+    for projection in allowed:
+        expected_prefix = (existing[0], *projection)
+        if (
+            len(candidate) >= len(expected_prefix)
+            and candidate[: len(expected_prefix)] == expected_prefix
+        ):
+            return True
+    return False
+
+
+def _extend_tail_for_tool_pair(
+    transcript: tuple[ModelMessage, ...],
+    start: int,
+) -> int:
+    if start <= 0 or start >= len(transcript):
+        return start
+    first = transcript[start]
+    if first.role != "tool" or first.tool_call_id is None:
+        return start
+    for index in range(start - 1, -1, -1):
+        message = transcript[index]
+        if any(call.id == first.tool_call_id for call in message.tool_calls):
+            return index
+    return start
+
+
+def _deterministic_transcript_summary(
+    messages: tuple[ModelMessage, ...],
+    *,
+    max_chars: int,
+) -> str:
+    lines = [
+        f"{message.role}: {canonical_json_text(model_message_payload(message))}"
+        for message in messages
+    ]
+    summary = "\n".join(lines)
+    if len(summary) <= max_chars:
+        return summary
+    return summary[:max_chars].rstrip() + " [truncated]"
+
+
+def _project_tool_result_messages(
+    messages: tuple[ModelMessage, ...],
+    *,
+    max_chars: int,
+    enabled: bool,
+) -> tuple[tuple[ModelMessage, ...], int]:
+    if not enabled:
+        return messages, 0
+    projected: list[ModelMessage] = []
+    projected_count = 0
+    for message in messages:
+        candidate = _project_tool_result_message(
+            message,
+            max_chars=max_chars,
+        )
+        projected.append(candidate)
+        if candidate != message:
+            projected_count += 1
+    return tuple(projected), projected_count
+
+
+def _project_tool_result_message(
+    message: ModelMessage,
+    *,
+    max_chars: int,
+) -> ModelMessage:
+    if (
+        message.role != "tool"
+        or message.tool_call_id is None
+        or len(message.content) <= max_chars
+    ):
+        return message
+    try:
+        payload = json.loads(message.content)
+    except (TypeError, ValueError):
+        return message
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("is_error") is not True
+    ):
+        return message
+
+    structured = payload.get("structured_content")
+    structured_mapping = (
+        structured
+        if isinstance(structured, Mapping)
+        else {}
+    )
+    stdout = _string_value(structured_mapping.get("stdout"))
+    stderr = _string_value(structured_mapping.get("stderr"))
+    projection_budget = max(
+        max_chars,
+        _MIN_PROJECTED_TOOL_RESULT_CHARS,
+    )
+    stream_tail_chars = min(
+        _MAX_PROJECTED_STREAM_TAIL_CHARS,
+        max(1, (projection_budget - 256) // 2),
+    )
+    projection: dict[str, JsonValue] = {
+        "exit_code": _json_scalar(
+            structured_mapping.get("exit_code")
+        ),
+        "timed_out": _json_scalar(
+            structured_mapping.get("timed_out")
+        ),
+        "failed_tests": _failed_test_names(stdout, stderr),
+        "stdout_tail": stdout[-stream_tail_chars:] if stream_tail_chars else "",
+        "stderr_tail": stderr[-stream_tail_chars:] if stream_tail_chars else "",
+        "source_truncated": bool(
+            payload.get("truncated")
+            or structured_mapping.get("truncated")
+        ),
+        "projection_truncated": True,
+    }
+    if not structured_mapping and structured is not None:
+        rendered = canonical_json_text(structured)
+        projection["output_tail"] = (
+            rendered[-stream_tail_chars:]
+            if stream_tail_chars
+            else ""
+        )
+    projected_payload: Mapping[str, JsonValue] = {
+        "content": (),
+        "structured_content": {
+            "tool_result_projection": projection,
+        },
+        "is_error": payload.get("is_error") is True,
+        "error_code": _json_scalar(payload.get("error_code")),
+        "error_message": _json_scalar(payload.get("error_message")),
+        "retryable": payload.get("retryable") is True,
+        "truncated": True,
+    }
+    candidate = ModelMessage(
+        role="tool",
+        content=canonical_json_text(projected_payload),
+        tool_call_id=message.tool_call_id,
+    )
+    return candidate if len(candidate.content) < len(message.content) else message
+
+
+def _failed_test_names(stdout: str, stderr: str) -> tuple[str, ...]:
+    combined = f"{stdout}\n{stderr}"
+    selected: dict[str, None] = {}
+    patterns = (
+        r"(?m)^(?:FAILED|ERROR)\s+([^\s]+)",
+        r"(?m)^FAIL:\s+([^\r\n]+)",
+        r"(?m)^\s*●\s+([^\r\n]+)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, combined):
+            name = match.group(1).strip()
+            if not name:
+                continue
+            selected.setdefault(name, None)
+            if len(selected) >= _MAX_PROJECTED_FAILED_TESTS:
+                return tuple(selected)
+    return tuple(selected)
+
+
+def _string_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _json_scalar(value: object) -> JsonValue:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    return str(value)
+
+
+def _model_messages_size(messages: Sequence[ModelMessage]) -> int:
+    return sum(
+        len(
+            canonical_json_text(
+                model_message_payload(message)
+            ).encode("utf-8")
+        )
+        for message in messages
+    )
+
+
 def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
     return {
         "definition": tool_definition_payload(tool.definition),
@@ -642,6 +1018,11 @@ def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
         "interrupt_behavior": tool.interrupt_behavior.value,
         "timeout_seconds": float(tool.timeout_seconds),
         "max_model_output_bytes": tool.max_model_output_bytes,
+        "approval_profile": (
+            tool.approval_profile.value
+            if tool.approval_profile is not None
+            else None
+        ),
     }
 
 
@@ -667,7 +1048,6 @@ def _stable_context_payload(
             {"name": block.name, "content": block.content} for block in context.frozen_run_context
         ),
         "initial_user_task": context.initial_user_task,
-        "initial_memory": context.initial_memory,
     }
 
 
@@ -722,15 +1102,6 @@ def _ordered_strings(
     for value in result:
         _require_non_empty_string(value, field_name=field_name)
     return result
-
-
-def _require_non_empty_string(value: object, *, field_name: str) -> None:
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string")
-    if not value:
-        raise ValueError(f"{field_name} must not be empty")
-
-
 def _validate_real_range(
     value: object,
     *,
@@ -767,6 +1138,7 @@ __all__ = [
     "build_tool_manifest",
     "canonical_hash",
     "canonical_model_request_json",
+    "canonical_transcript_revision",
     "freeze_json_mapping",
     "model_settings_payload",
     "model_call_record_payload",

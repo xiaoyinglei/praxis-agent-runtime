@@ -1,5 +1,7 @@
 # PR1: Sub-State Convergence + Legacy Migration Implementation Plan
 
+> **历史实施记录：** 其中的 persistent-memory 方案已于 2026-07-25 从产品运行时移除；不要按本文恢复该能力。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Introduce `PlanState`, `MemoryState`, `FinishState`, `DeferredToolState` as typed sub-state containers on `LoopState`, with dual-write to both new sub-states and old flat fields. Enable legacy checkpoint migration that reads old fields into new sub-states. No fields are deleted in this PR.

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 from typing import Literal, Self
 
@@ -61,18 +63,28 @@ class GoalDeliverable(BaseModel):
 
 
 class GoalSpec(BaseModel):
-    """Opt-in completion contract evaluated only by an explicit stop hook."""
+    """Immutable user-goal contract owned by runtime and completion checks."""
 
     model_config = ConfigDict(frozen=True)
 
     original_query: str
     deliverables: list[GoalDeliverable] = Field(default_factory=list)
     constraints: list[GoalConstraint] = Field(default_factory=list)
-    success_criteria: list[str] = Field(default_factory=list)
     # Accepted only to preserve callers that persisted the former public schema.
     required_outputs: list[str] = Field(default_factory=lambda: ["answer"])
     required_evidence: list[str] = Field(default_factory=list)
     required_operations: list[str] = Field(default_factory=list)
+
+    @property
+    def fingerprint(self) -> str:
+        canonical = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @model_validator(mode="after")
     def normalize_deliverables(self) -> Self:
@@ -88,11 +100,16 @@ class GoalSpec(BaseModel):
         ids = [item.deliverable_id for item in deliverables]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate deliverable_id values are not allowed")
+        constraint_ids = [
+            constraint.constraint_id for constraint in self.constraints
+        ]
+        if len(constraint_ids) != len(set(constraint_ids)):
+            raise ValueError("duplicate constraint_id values are not allowed")
         return self
 
 
 class GoalCompatibilityConfig(BaseModel):
-    """Persisted opt-in stop-hook configuration kept outside LoopState."""
+    """Persisted goal contract kept outside the canonical LoopState schema."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -146,10 +163,7 @@ class GoalContractEvaluator:
             issues.append(
                 GoalContractIssue(
                     issue_id=f"constraint:{constraint.constraint_id}",
-                    description=(
-                        "Bind context satisfying the required constraint "
-                        f"{constraint.constraint_id!r}."
-                    ),
+                    description=_constraint_issue_description(constraint),
                     kind="constraint",
                 )
             )
@@ -226,6 +240,29 @@ def _issue_description(kind: DeliverableKind) -> str:
             "Provide a reproducible computation with traceable evidence."
         ),
     }[kind]
+
+
+def _constraint_issue_description(constraint: GoalConstraint) -> str:
+    if (
+        constraint.constraint_type == "workspace_change"
+        and constraint.expected_value is True
+    ):
+        return (
+            "Make a real workspace change with a write tool before finishing; "
+            "a prose-only answer does not complete this task."
+        )
+    if (
+        constraint.constraint_type == "verification_after_change"
+        and constraint.expected_value is True
+    ):
+        return (
+            "Run a recognized test, lint, type-check, or build command after the "
+            "latest workspace change and keep every such verification green."
+        )
+    return (
+        "Bind context satisfying the required constraint "
+        f"{constraint.constraint_id!r}."
+    )
 
 
 __all__ = [

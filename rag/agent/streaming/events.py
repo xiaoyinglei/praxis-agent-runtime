@@ -10,6 +10,7 @@ StreamEvent 定义 — 流式输出的基础类型。
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -96,21 +97,6 @@ def text_delta(
     )
 
 
-def thinking_delta(
-    text: str,
-    *,
-    turn_id: str = "",
-    iteration: int = 0,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.THINKING_DELTA,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"text": text},
-    )
-
-
 def tool_use_start(
     tool_name: str,
     tool_id: str,
@@ -161,23 +147,28 @@ def tool_use_result(
     tool_id: str,
     result: JsonValue,
     *,
-    elapsed_ms: float = 0,
+    elapsed_ms: float | None = 0,
+    details: Mapping[str, JsonValue] | None = None,
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
     span = f"tool:{tool_id}"
+    data: dict[str, JsonValue] = {
+        "tool_name": tool_name,
+        "tool_id": tool_id,
+        "result": result,
+    }
+    if elapsed_ms is not None:
+        data["elapsed_ms"] = elapsed_ms
+    if details:
+        data["details"] = dict(details)
     return StreamEvent(
         type=EventType.TOOL_USE_RESULT,
         turn_id=turn_id,
         iteration=iteration,
         sequence=next_sequence(),
         span_id=span,
-        data={
-            "tool_name": tool_name,
-            "tool_id": tool_id,
-            "result": result,
-            "elapsed_ms": elapsed_ms,
-        },
+        data=data,
     )
 
 
@@ -185,30 +176,31 @@ def tool_use_error(
     tool_id: str,
     error: str,
     *,
-    recoverable: bool = True,
+    recoverable: bool | None = True,
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
     span = f"tool:{tool_id}"
+    data: dict[str, JsonValue] = {
+        "tool_id": tool_id,
+        "error": error,
+    }
+    if recoverable is not None:
+        data["recoverable"] = recoverable
     return StreamEvent(
         type=EventType.TOOL_USE_ERROR,
         turn_id=turn_id,
         iteration=iteration,
         sequence=next_sequence(),
         span_id=span,
-        data={
-            "tool_id": tool_id,
-            "error": error,
-            "recoverable": recoverable,
-        },
+        data=data,
     )
 
 
 def compact_layer(
-    layer_name: str,
-    before_tokens: int,
-    after_tokens: int,
     *,
+    channels: Sequence[str],
+    warnings: Sequence[str],
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
@@ -218,10 +210,8 @@ def compact_layer(
         iteration=iteration,
         sequence=next_sequence(),
         data={
-            "layer": layer_name,
-            "before": before_tokens,
-            "after": after_tokens,
-            "reduction": before_tokens - after_tokens,
+            "channels": tuple(channels),
+            "warnings": tuple(warnings),
         },
     )
 
@@ -277,20 +267,4 @@ def recovery_event(
         iteration=iteration,
         sequence=next_sequence(),
         data={"strategy": strategy, "detail": detail},
-    )
-
-
-def budget_update(
-    used: int,
-    remaining: int,
-    *,
-    turn_id: str = "",
-    iteration: int = 0,
-) -> StreamEvent:
-    return StreamEvent(
-        type=EventType.BUDGET_UPDATE,
-        turn_id=turn_id,
-        iteration=iteration,
-        sequence=next_sequence(),
-        data={"used": used, "remaining": remaining},
     )

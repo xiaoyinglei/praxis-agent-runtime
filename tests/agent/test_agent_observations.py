@@ -6,13 +6,15 @@ from rag.agent.core.observations import (
     EvidenceRef,
     ObservationExtractor,
     StructuredObservation,
+    grounded_workspace_paths,
 )
 from rag.agent.tools.builtins.filesystem import (
     FileEntry,
     ListFilesOutput,
     ReadFileOutput,
 )
-from rag.agent.tools.tool import ToolResult
+from rag.agent.tools.builtins.search import SearchTextMatch, SearchTextOutput
+from rag.agent.tools.tool import ToolCall, ToolCallOrigin, ToolResult
 from rag.schema.query import AnswerCitation, EvidenceItem
 
 
@@ -56,6 +58,70 @@ def test_canonical_list_files_observation_preserves_workspace_locator() -> None:
     assert update["locators"] == [expected_locator]
 
 
+def test_successful_inspection_grounds_its_requested_container() -> None:
+    origin = ToolCallOrigin(
+        request_id="ground-list-root",
+        toolset_revision="ground-list-root-tools",
+        exposed_tool_names=("list_files",),
+    )
+    call = ToolCall(
+        tool_call_id="tc-list-root",
+        tool_name="list_files",
+        arguments={"path": ".", "limit": 50},
+        origin=origin,
+    )
+    result = ToolResult(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        structured_content={
+            "entries": [
+                {
+                    "path": "agent_runtime",
+                    "name": "agent_runtime",
+                    "is_directory": True,
+                }
+            ]
+        },
+    )
+
+    paths = grounded_workspace_paths(
+        tool_results=[result],
+        tool_calls={call.tool_call_id: call},
+    )
+
+    assert paths == (".", "agent_runtime")
+
+
+def test_grounded_paths_apply_the_published_search_default() -> None:
+    origin = ToolCallOrigin(
+        request_id="ground-default-search",
+        toolset_revision="ground-default-search-tools",
+        exposed_tool_names=("search_text",),
+    )
+    call = ToolCall(
+        tool_call_id="tc-search-root",
+        tool_name="search_text",
+        arguments={"pattern": "apply_patch"},
+        origin=origin,
+    )
+    result = ToolResult(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        structured_content={
+            "matches": [],
+            "total_matches": 0,
+            "truncated": False,
+        },
+    )
+
+    paths = grounded_workspace_paths(
+        tool_results=[result],
+        tool_calls={call.tool_call_id: call},
+    )
+
+    assert paths == (".",)
+
+
 def test_canonical_read_file_observation_preserves_content_and_locator() -> None:
     output = ReadFileOutput(
         path="input_files/data.csv",
@@ -93,6 +159,68 @@ def test_canonical_read_file_observation_preserves_content_and_locator() -> None
         metadata={"source_tool": "read_file"},
     )
     assert update["locators"] == [expected_locator]
+
+
+def test_search_text_observation_preserves_patchable_source_locators() -> None:
+    output = SearchTextOutput(
+        matches=[
+            SearchTextMatch(
+                file_path="rag/agent/loop/runtime.py",
+                line_number=718,
+                line_content="                    _stream_tool_use_result(",
+                match_start=20,
+                match_end=43,
+            ),
+            SearchTextMatch(
+                file_path="rag/agent/cli.py",
+                line_number=111,
+                line_content="    def _render_tool_result(self, event: StreamEvent) -> None:",
+                match_start=8,
+                match_end=27,
+            ),
+        ],
+        total_matches=2,
+    )
+    result = ToolResult(
+        tool_call_id="tc-search-code",
+        tool_name="search_text",
+        structured_content=output.model_dump(mode="json"),
+    )
+
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
+
+    assert update["locators"] == [
+        {
+            "source_tool": "search_text",
+            "path": "rag/agent/loop/runtime.py",
+            "line_number": 718,
+        },
+        {
+            "source_tool": "search_text",
+            "path": "rag/agent/cli.py",
+            "line_number": 111,
+        },
+    ]
+
+
+def test_empty_search_is_not_a_successful_plan_observation() -> None:
+    result = ToolResult(
+        tool_call_id="tc-search-empty",
+        tool_name="search_text",
+        structured_content={
+            "matches": [],
+            "total_matches": 0,
+            "truncated": False,
+        },
+    )
+
+    update = ObservationExtractor().reduce_tool_results(
+        {"tool_results": [result]}
+    )
+
+    [observation] = update["structured_observations"]
+    assert observation.status == "error"
+    assert observation.error == "search returned no matches"
 
 
 def test_neutral_rag_observation_preserves_evidence_and_citations() -> None:
@@ -285,6 +413,49 @@ def test_structured_tool_error_is_visible_without_controller_fields() -> None:
         "iteration",
         "controller_next",
     }.isdisjoint(update)
+
+
+def test_nonzero_command_is_not_a_successful_plan_observation() -> None:
+    result = ToolResult(
+        tool_call_id="tc-failed-check",
+        tool_name="run_command",
+        structured_content={
+            "stdout": "",
+            "stderr": "1 failed",
+            "exit_code": 1,
+            "timed_out": False,
+            "sandbox_error": None,
+        },
+    )
+
+    update = ObservationExtractor().reduce_tool_results(
+        {"tool_results": [result]}
+    )
+
+    [observation] = update["structured_observations"]
+    assert observation.status == "error"
+    assert observation.error == "command exited with status 1"
+
+
+def test_noop_patch_is_not_a_successful_plan_observation() -> None:
+    result = ToolResult(
+        tool_call_id="tc-noop-patch",
+        tool_name="apply_patch",
+        structured_content={
+            "file_path": "rag/agent/loop/runtime.py",
+            "replaced": False,
+            "occurrences": 0,
+            "message": "No change.",
+        },
+    )
+
+    update = ObservationExtractor().reduce_tool_results(
+        {"tool_results": [result]}
+    )
+
+    [observation] = update["structured_observations"]
+    assert observation.status == "error"
+    assert observation.error == "write tool produced no workspace change"
 
 
 def test_neutral_reducer_skips_already_observed_tool_calls() -> None:

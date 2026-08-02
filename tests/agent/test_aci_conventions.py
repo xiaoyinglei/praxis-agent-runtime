@@ -73,6 +73,12 @@ def test_resident_aci_spells_out_observed_model_argument_pitfalls(
     update = tools["update_plan"].definition
     assert '"step"' in update.description
     assert '"status"' in update.description
+    assert "advisory" in update.description
+    assert "never prove" in update.description
+
+    assert "preferred first tool" in tools["search_text"].definition.description
+    assert "not a code-search tool" in tools["list_files"].definition.description
+    assert "focused verification" in tools["run_command"].definition.description
 
 
 @pytest.mark.anyio

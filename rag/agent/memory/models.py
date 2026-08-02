@@ -18,7 +18,6 @@ ContextSectionName = Literal[
     "evidence",
     "memory",
     "working_memory",
-    "historical_hints",
     "message_tail",
     "tool_results",
     "open_decisions",
@@ -192,7 +191,6 @@ class ContextBudgetSnapshot(BaseModel):
     evidence_tokens: int = 0
     memory_tokens: int = 0
     working_memory_tokens: int = 0
-    recalled_memory_tokens: int = 0
     message_tail_tokens: int = 0
     tool_result_tokens: int = 0
     dropped_sections: list[ContextSectionName] = Field(default_factory=list)

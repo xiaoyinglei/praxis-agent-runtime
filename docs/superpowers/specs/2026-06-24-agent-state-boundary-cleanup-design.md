@@ -1,5 +1,7 @@
 # Agent State Boundary Cleanup Design
 
+> **历史设计记录：** 其中的 persistent-memory 方案已于 2026-07-25 从产品运行时移除；相关内容不再代表当前产品契约。
+
 ## 0. 核心矛盾
 
 > Agent runtime 已经是通用内核，但状态模型、上下文注入层、工具合约还保留着 RAG-first 的语义惯性。

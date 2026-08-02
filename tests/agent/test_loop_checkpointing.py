@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from importlib import import_module
 
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
 from rag.agent.core.checkpointing import (
+    AGENT_CHECKPOINT_MSGPACK_ALLOWLIST,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
@@ -76,6 +78,23 @@ def _tool(*, execution_revision: str = "write-v1") -> Tool:
         timeout_seconds=1.0,
         max_model_output_bytes=4096,
     )
+
+
+def test_checkpoint_allowlist_only_contains_live_types() -> None:
+    missing: list[str] = []
+    for module_name, *type_names in AGENT_CHECKPOINT_MSGPACK_ALLOWLIST:
+        try:
+            module = import_module(module_name)
+        except ModuleNotFoundError:
+            missing.extend(f"{module_name}.{type_name}" for type_name in type_names)
+            continue
+        missing.extend(
+            f"{module_name}.{type_name}"
+            for type_name in type_names
+            if not hasattr(module, type_name)
+        )
+
+    assert missing == []
 
 
 def _state(run_id: str):

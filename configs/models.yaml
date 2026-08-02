@@ -50,6 +50,12 @@ providers:
     base_url: https://api.groq.com/openai/v1
     api_key_env: GROQ_API_KEY
 
+  kimi:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+
   mimo:
     protocol: openai_compatible
     location: cloud
@@ -134,7 +140,9 @@ models:
     capability: chat
     provider: groq
     model: openai/gpt-oss-120b
+    tokenizer_model: gpt-oss-120b
     context_window_tokens: 131072
+    request_context_tokens: 8000
 
   groq_llama_3_3_70b:
     capability: chat
@@ -150,6 +158,19 @@ models:
     provider: mimo
     model: mimo-v2.5-pro
     context_window_tokens: 256000
+
+  kimi_cloud:
+    capability: chat
+    provider: kimi
+    model: kimi-k2.6
+    max_tokens: 32768
+    context_window_tokens: 262144
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      provider_options:
+        thinking:
+          type: enabled
 
   # -------------------------------------------------------------------------
   # Embedding models.
@@ -184,10 +205,9 @@ models:
 # Defaults: what to use when no explicit model is requested.
 # ---------------------------------------------------------------------------
 defaults:
-  # For local-only testing, change this to qwen3_8b_mlx_4bit.
-  # The bundled default must be usable for real coding turns without Groq's
-  # free-tier 8k TPM ceiling; Groq models remain explicit opt-in choices.
-  primary_model: deepseek_chat
+  # Product runs default to Groq so an omitted --model never starts a local
+  # MLX server. Benchmark release lanes remain explicit in their manifest.
+  primary_model: groq_gpt_oss_120b
 
   embedding_model: qwen3_embedding_8b_4bit_dwq
   reranker_model: qwen3_reranker_4b
@@ -217,18 +237,6 @@ generation:
   factcheck:
     max_tokens: 2048
     temperature: 0.1
-
-  memory_select:
-    max_tokens: 256
-    temperature: 0.1
-
-  memory_extract:
-    max_tokens: 2048
-    temperature: 0.3
-
-  memory_consolidate:
-    max_tokens: 4096
-    temperature: 0.3
 
   tool_decision:
     max_tokens: 4096

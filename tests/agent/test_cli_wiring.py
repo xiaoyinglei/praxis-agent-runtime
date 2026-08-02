@@ -12,6 +12,7 @@ from agent_runtime import RAGKnowledgeConfig
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
 from agent_runtime.runtime.builder import build_agent_service
+from rag.agent import cli as cli_module
 from rag.agent.cli import (
     _CLIToolEventDisplay,
     _display_agent_result,
@@ -60,6 +61,9 @@ class _ModelRegistry:
                 "--max-tokens-total",
                 "--allow-write-tools",
                 "--allow-execute-tools",
+                "--require-workspace-change",
+                "--no-require-workspace-change",
+                "--model-session-path",
             ),
             (
                 "--agent",
@@ -121,6 +125,18 @@ def test_agent_command_options_match_the_clean_public_contract(
         assert option not in option_names
 
 
+def test_workspace_change_help_discloses_post_change_verification_gate() -> None:
+    result = CliRunner().invoke(
+        agent_app,
+        ["run", "--help"],
+        env={"COLUMNS": "240"},
+    )
+
+    assert result.exit_code == 0
+    assert "最后一次真实变更后" in result.output
+    assert "测试、lint、类型检查或构建" in result.output
+
+
 def test_agent_run_rejects_missing_input_without_internal_traceback(
     tmp_path: Path,
 ) -> None:
@@ -141,6 +157,70 @@ def test_agent_run_rejects_missing_input_without_internal_traceback(
     assert result.exit_code == 2
     assert "输入文件不存在" in result.output
     assert "Traceback" not in result.output
+
+
+def test_agent_run_can_store_model_session_outside_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+            return _result()
+
+    def create_facade(**kwargs: object) -> _Facade:
+        facade_options.append(kwargs)
+        return _Facade()
+
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+    model_session_path = tmp_path / "artifacts" / "model-session.json"
+
+    cli_module.agent_run(
+        task="Inspect the repository.",
+        checkpoint_db=tmp_path / "artifacts" / "checkpoints.sqlite",
+        model_session_path=model_session_path,
+        non_interactive=True,
+    )
+
+    assert facade_options[0]["model_session_path"] == model_session_path
+
+
+def test_agent_run_forwards_workspace_change_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **kwargs: object) -> AgentResult:
+            run_options.append(kwargs)
+            return _result()
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_agent_facade",
+        lambda **_kwargs: _Facade(),
+    )
+
+    cli_module.agent_run(
+        task="Fix the implementation.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        non_interactive=True,
+    )
+
+    assert run_options[0]["require_workspace_change"] is True
+
+    cli_module.agent_run(
+        task="Explain the implementation.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        require_workspace_change=False,
+        non_interactive=True,
+    )
+
+    assert run_options[1]["require_workspace_change"] is False
 
 
 def _result(
