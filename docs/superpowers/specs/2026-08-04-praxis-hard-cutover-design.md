@@ -175,14 +175,42 @@ Agent execution currently consumes several neutral model, usage, token, and
 query-result contracts through `rag.*` paths. These must stop leaking the RAG
 identity into the runtime. The implementation plan must place Agent-owned
 contracts under `agent_runtime` and keep RAG-specific values behind the
-adapter. It may update RAG consumers to use runtime-owned neutral protocols,
-but it must not create a new third top-level `core` package or duplicate a
+adapter. It must not create a new third top-level `core` package or duplicate a
 second model gateway.
+
+The concrete ownership split is:
+
+| Current dependency | Canonical target | Consumer rule |
+| --- | --- | --- |
+| `rag.providers.llm_gateway` | `agent_runtime.modeling.gateway` | Agent and RAG both use the one moved gateway |
+| Agent-used `rag.models.config` values | `agent_runtime.modeling.config` | RAG may import the neutral runtime contract |
+| Agent-used `rag.schema.llm` values | `agent_runtime.modeling.contracts` | Usage, stage, and budget types have one identity |
+| Agent-used token accounting | `agent_runtime.modeling.tokenization` | RAG-specific tokenizer assembly may adapt it |
+| `rag.utils.text.text_unit_count` | `agent_runtime.text` | Shared neutral helper has one implementation |
+| `rag.schema.query` evidence types | remain RAG-owned | The RAG adapter converts them to `agent_runtime.knowledge` DTOs |
+
+`agent_runtime.modeling` is a package internal to the already-approved
+`agent_runtime` namespace, not a third distribution. The current
+`agent_runtime/models.py` public control-plane facade remains in place;
+`models.py` and the distinctly named `modeling/` package do not collide. The
+facade imports the canonical contracts it needs from `agent_runtime.modeling`.
+
+RAG may depend inward on the small, provider-neutral
+`agent_runtime.modeling` contracts. The runtime core never imports `rag` to get
+them. Existing non-Agent `rag.schema.llm` or `rag.providers.llm_gateway` public
+paths may remain as RAG-facing re-exports only when current RAG tests require
+them; their implementation and type identity are runtime-owned, and no Agent
+module may import those re-export paths.
 
 Import-linter must enforce the allowed direction. Active source, tests,
 scripts, and README must contain no `rag.agent` import or path. Historical
 design documents under `docs/superpowers` may retain old names when clearly
-treated as archived implementation history.
+treated as archived implementation history. The frozen
+`evals/code_agent/benchmark_v1.json` manifest and tests that verify its immutable
+historical path mappings are also exempt: those paths describe old source and
+target commits and must not be rewritten to make the current tree look clean.
+The no-old-path check must use an explicit, documented allowlist for these two
+historical locations rather than a repository-wide blind replacement.
 
 ## Namespace and package migration
 
@@ -231,6 +259,15 @@ must contain only current type identities, and the implementation must not add
 dozens of old module aliases. Existing migrations for still-supported data
 shape versions remain tested; only the removed namespace compatibility is
 dropped.
+
+The same compatibility boundary applies to neutral class identities moved from
+`rag.schema.llm` or `rag.models.config` into `agent_runtime.modeling`. Old Agent
+checkpoint files containing either `rag.agent.*` or moved `rag.*` constructor
+identities are not decoded by the new runtime. New checkpoints serialize only
+the canonical `agent_runtime` identities. RAG indexes and storage payloads are
+not Agent checkpoints; before moving a neutral class, focused tests must prove
+that RAG persistence is shape-based or update its explicit codec without
+rewriting existing user data.
 
 `.gitignore` must ignore `.praxis/`. No runtime state, API key, live temporary
 workspace, or unredacted provider artifact may enter Git.
@@ -399,6 +436,19 @@ the report was measured on itself. No production code changes are allowed
 between the measured source commit and the evidence commit. After adding
 evidence, all deterministic gates run again on final HEAD.
 
+The live gate itself must fail before the first provider call unless the source
+worktree is clean. Its machine-readable preflight records:
+
+- `git rev-parse HEAD` as `source_commit`;
+- `git rev-parse HEAD^{tree}` as `source_tree`;
+- an empty `git status --porcelain --untracked-files=all` result;
+- `dirty: false`;
+- the model-quality fixture revision and evaluator version.
+
+The runner, not a hand-edited Markdown page, captures these fields. This binds
+the live result to the exact committed source tree and prevents an uncommitted
+runtime change from being attributed to the recorded commit.
+
 After local verification:
 
 1. push `codex/praxis-hard-cutover`;
@@ -406,10 +456,12 @@ After local verification:
 3. wait for GitHub CI;
 4. fix failures only on the branch and rerun local gates;
 5. mark ready and merge only when CI and required local evidence are green;
-6. rename the GitHub repository to `praxis-agent-runtime`;
-7. update the shared local `origin` URL;
-8. update GitHub description and topics;
-9. verify the new URL, old URL redirect, default branch, Actions, and clean
+6. wait for the push-triggered workflow on the exact merged `main` commit to
+   finish successfully;
+7. rename the GitHub repository to `praxis-agent-runtime`;
+8. update the shared local `origin` URL;
+9. update GitHub description and topics;
+10. verify the new URL, old URL redirect, default branch, Actions, and clean
    remote state.
 
 The user explicitly authorized merge and repository rename after verification.
@@ -443,12 +495,15 @@ The work is complete only when all of the following are true:
 - the MIT license exists with the approved copyright line;
 - README contains the clearly labelled deterministic GIF;
 - the one-page benchmark report and redacted Groq real-run record exist;
+- the live report proves a clean source worktree and records both commit and
+  tree identities;
 - the 30-task suite is described honestly without a current release-pass claim;
 - full Ruff reports zero errors;
 - full mypy, pytest, import-linter, build, installed CLI smoke, deterministic
   delivery checks, manifest validation, and macOS safety checks pass;
 - the Groq 5-case x 3-trial gate has a current PASS, or the work remains open;
-- the PR is merged and GitHub CI is green;
+- the PR is merged and the workflow for the exact merged `main` commit is
+  green before repository rename;
 - the new repository URL, old redirect, origin URL, description, and topics are
   verified;
 - the original dirty `main` worktree remains unmodified.
