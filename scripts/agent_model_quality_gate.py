@@ -17,9 +17,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.util
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -35,6 +37,24 @@ DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_ca
 DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
+EVALUATOR_VERSION = "agent_model_quality_gate_v1"
+_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
+_SENSITIVE_ARTIFACT_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "authorization",
+        "credential",
+        "credentials",
+        "env",
+        "environment",
+        "header",
+        "headers",
+        "password",
+        "secret",
+        "token",
+    }
+)
 _MODEL_QUALITY_FAILURE_REASONS = frozenset(
     {
         "invalid_model_turn",
@@ -69,6 +89,21 @@ _VALIDATION_ERROR_CODES = frozenset(
 
 class InfrastructureUnavailableError(RuntimeError):
     """The live sample could not measure model tool-use quality."""
+
+
+class DirtyRepositoryError(RuntimeError):
+    """Live evidence cannot be attributed to a repository with changes."""
+
+
+class SourceRepositoryMismatchError(RuntimeError):
+    """The requested evidence repository is not the running source tree."""
+
+
+@dataclass(frozen=True)
+class RepositoryFingerprint:
+    source_commit: str
+    source_tree: str
+    dirty: bool
 
 
 @dataclass(frozen=True)
@@ -382,7 +417,28 @@ async def run_model_trials(
                 case=case,
             )
             observations.append(observation)
-            _raise_for_infrastructure((observation,), model_alias=model_alias)
+            if observation.infrastructure_failure:
+                return {
+                    "status": "inconclusive",
+                    "model_alias": model_alias,
+                    "provider": spec.provider,
+                    "provider_model": spec.provider_model,
+                    "trial_count": trials,
+                    "trial_metrics": trial_metrics,
+                    "trials": [
+                        *trial_payloads,
+                        {
+                            "trial": trial_index,
+                            "metrics": None,
+                            "informational_metrics": None,
+                            "cases": _partial_case_payloads(
+                                cases[: len(observations)],
+                                observations,
+                            ),
+                        },
+                    ],
+                    "infrastructure_failure": _infrastructure_payload(observation),
+                }
         metrics, scored = score_trial(cases, observations)
         trial_metrics.append(metrics)
         trial_payloads.append(
@@ -404,6 +460,7 @@ async def run_model_trials(
             }
         )
     return {
+        "status": "completed",
         "model_alias": model_alias,
         "provider": spec.provider,
         "provider_model": spec.provider_model,
@@ -520,6 +577,7 @@ def build_baseline(
     *,
     suite: Mapping[str, object],
     model_reports: Sequence[Mapping[str, object]],
+    fingerprint: RepositoryFingerprint,
 ) -> dict[str, object]:
     models: dict[str, object] = {}
     for report in model_reports:
@@ -541,7 +599,11 @@ def build_baseline(
         "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
         "measured_at": datetime.now(UTC).isoformat(),
-        "git_commit": _git_commit(),
+        "git_commit": fingerprint.source_commit,
+        "source_commit": fingerprint.source_commit,
+        "source_tree": fingerprint.source_tree,
+        "dirty": fingerprint.dirty,
+        "evaluator_version": EVALUATOR_VERSION,
         "threshold_method": THRESHOLD_METHOD,
         "models": models,
     }
@@ -552,19 +614,26 @@ def build_baseline(
 async def _calibrate(args: argparse.Namespace) -> int:
     if args.trials < MIN_CALIBRATION_TRIALS:
         raise ValueError(f"calibration requires at least {MIN_CALIBRATION_TRIALS} real trials")
+    fingerprint = source_repository_fingerprint(args.repository)
     suite = load_suite(args.fixture)
     models = _selected_models(suite, None)
     cases = cast(list[Mapping[str, object]], suite["cases"])
-    reports = [
-        await run_model_trials(
+    reports: list[dict[str, object]] = []
+    for model in models:
+        report = await run_model_trials(
             model_alias=model,
             cases=cases,
             trials=args.trials,
             env_file=args.env_file,
         )
-        for model in models
-    ]
-    baseline = build_baseline(suite=suite, model_reports=reports)
+        if report.get("status") == "inconclusive":
+            raise InfrastructureUnavailableError(_infrastructure_message(report))
+        reports.append(report)
+    baseline = build_baseline(
+        suite=suite,
+        model_reports=reports,
+        fingerprint=fingerprint,
+    )
     args.baseline.parent.mkdir(parents=True, exist_ok=True)
     args.baseline.write_text(_pretty_json(baseline), encoding="utf-8")
     print(f"wrote measured baseline: {args.baseline}")
@@ -574,6 +643,7 @@ async def _calibrate(args: argparse.Namespace) -> int:
 
 
 async def _gate(args: argparse.Namespace) -> int:
+    fingerprint = source_repository_fingerprint(args.repository)
     suite = load_suite(args.fixture)
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
     validate_baseline(baseline, suite=suite)
@@ -584,6 +654,7 @@ async def _gate(args: argparse.Namespace) -> int:
     cases = cast(list[Mapping[str, object]], suite["cases"])
     reports: list[dict[str, object]] = []
     results: list[dict[str, object]] = []
+    inconclusive = False
     for model in models:
         raw_model_baseline = baseline_models.get(model)
         if not isinstance(raw_model_baseline, Mapping):
@@ -596,6 +667,21 @@ async def _gate(args: argparse.Namespace) -> int:
             env_file=args.env_file,
         )
         reports.append(report)
+        if report.get("status") == "inconclusive":
+            results.append(
+                {
+                    "model_alias": model,
+                    "provider_model": report["provider_model"],
+                    "status": "inconclusive",
+                    "passed": None,
+                    "observed": {},
+                    "thresholds": {},
+                    "failures": [],
+                    "infrastructure_failure": report["infrastructure_failure"],
+                }
+            )
+            inconclusive = True
+            break
         current_metrics = [
             _float_metric_mapping(item, label=f"model {model} trial")
             for item in cast(Sequence[object], report["trial_metrics"])
@@ -608,25 +694,46 @@ async def _gate(args: argparse.Namespace) -> int:
                 baseline=raw_model_baseline,
             )
         )
+    passed = None if inconclusive else all(bool(item["passed"]) for item in results)
+    status = "inconclusive" if inconclusive else ("passed" if passed else "failed")
     gate_report = {
         "schema_version": 1,
+        "status": status,
+        "source_commit": fingerprint.source_commit,
+        "source_tree": fingerprint.source_tree,
+        "dirty": fingerprint.dirty,
+        "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
-        "baseline_path": str(args.baseline),
+        "evaluator_version": EVALUATOR_VERSION,
+        "case_metadata": _case_metadata(suite),
+        "baseline_path": _redacted_artifact_path(
+            args.baseline,
+            repository=args.repository,
+        ),
         "measured_at": datetime.now(UTC).isoformat(),
-        "passed": all(bool(item["passed"]) for item in results),
+        "passed": passed,
         "models": results,
         "runs": reports,
     }
     if args.report is not None:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(_pretty_json(gate_report), encoding="utf-8")
+        args.report.write_text(
+            _pretty_json(_sanitize_artifact(gate_report)),
+            encoding="utf-8",
+        )
         print(f"wrote gate report: {args.report}")
     for result in results:
-        marker = "PASS" if result["passed"] else "FAIL"
+        marker = (
+            "INCONCLUSIVE"
+            if result["passed"] is None
+            else ("PASS" if result["passed"] else "FAIL")
+        )
         print(f"{marker} {result['model_alias']}")
         for failure in cast(Sequence[str], result["failures"]):
             print(f"  {failure}")
-    return 0 if gate_report["passed"] else 1
+    if inconclusive:
+        return 2
+    return 0 if passed else 1
 
 
 def _score_case(
@@ -744,6 +851,56 @@ def _raise_for_infrastructure(
         details.append(f"{item.case_id}(stop_reason={item.stop_reason or 'unknown'}, error_types={error_types})")
     raise InfrastructureUnavailableError(
         f"{model_alias} live quality sample is infrastructure-inconclusive: " + "; ".join(details)
+    )
+
+
+def _partial_case_payloads(
+    cases: Sequence[Mapping[str, object]],
+    observations: Sequence[CaseObservation],
+) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for case, observation in zip(cases, observations, strict=True):
+        score = (
+            {
+                "case_id": observation.case_id,
+                "capability": observation.capability,
+                "passed": None,
+                "core_success": None,
+                "capability_passed": None,
+                "inconclusive": True,
+            }
+            if observation.infrastructure_failure
+            else _score_case(case, observation)
+        )
+        payloads.append(
+            {
+                "observation": observation.payload(),
+                "score": score,
+            }
+        )
+    return payloads
+
+
+def _infrastructure_payload(observation: CaseObservation) -> dict[str, object]:
+    return {
+        "case_id": observation.case_id,
+        "stop_reason": observation.stop_reason,
+        "diagnostic_error_types": list(observation.diagnostic_error_types),
+    }
+
+
+def _infrastructure_message(report: Mapping[str, object]) -> str:
+    failure = _mapping(report.get("infrastructure_failure"))
+    error_types = ",".join(
+        _string_sequence(
+            failure.get("diagnostic_error_types", ()),
+            label="diagnostic_error_types",
+        )
+    ) or "unknown"
+    return (
+        f"{report.get('model_alias', 'model')} live quality sample is infrastructure-inconclusive: "
+        f"{failure.get('case_id', 'unknown')}"
+        f"(stop_reason={failure.get('stop_reason') or 'unknown'}, error_types={error_types})"
     )
 
 
@@ -1067,15 +1224,141 @@ def _safe_error(exc: Exception) -> str:
     return text
 
 
-def _git_commit() -> str:
+def source_repository_fingerprint(repository: Path) -> RepositoryFingerprint:
+    requested = repository.resolve()
+    source_root = ROOT.resolve()
+    git_root = Path(
+        _git_text(repository, "rev-parse", "--show-toplevel")
+    ).resolve()
+    runtime_source = (source_root / "agent_runtime").resolve()
+    runtime_spec = importlib.util.find_spec("agent_runtime")
+    runtime_origin = (
+        None
+        if runtime_spec is None or runtime_spec.origin is None
+        else Path(runtime_spec.origin).resolve()
+    )
+    if (
+        requested != source_root
+        or git_root != source_root
+        or not runtime_source.is_dir()
+        or not runtime_source.is_relative_to(source_root)
+        or runtime_origin is None
+        or not runtime_origin.is_relative_to(runtime_source)
+    ):
+        raise SourceRepositoryMismatchError(
+            "model quality evidence repository must be the running source tree"
+        )
+    return repository_fingerprint(source_root)
+
+
+def repository_fingerprint(repository: Path) -> RepositoryFingerprint:
+    source_commit = _git_text(repository, "rev-parse", "HEAD")
+    source_tree = _git_text(repository, "rev-parse", "HEAD^{tree}")
+    status = _git_text(
+        repository,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
+    if status:
+        raise DirtyRepositoryError("model quality evidence requires a clean repository")
+    return RepositoryFingerprint(
+        source_commit=source_commit,
+        source_tree=source_tree,
+        dirty=False,
+    )
+
+
+def _git_text(repository: Path, *args: str) -> str:
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
+        ["git", *args],
+        cwd=repository,
         check=False,
         capture_output=True,
         text=True,
     )
-    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "unknown git error"
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return completed.stdout.strip()
+
+
+def _case_metadata(suite: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_cases = suite.get("cases")
+    if not isinstance(raw_cases, Sequence) or isinstance(raw_cases, (str, bytes)):
+        raise ValueError("model quality suite cases are invalid")
+    metadata: list[dict[str, object]] = []
+    for raw_case in raw_cases:
+        case = _mapping(raw_case)
+        before = {
+            _input_file_path(str(path)): content
+            for path, content in _mapping(case.get("workspace_files", {})).items()
+        }
+        after = dict(_mapping(case.get("workspace_assertions", {})))
+        metadata.append(
+            {
+                "case_id": str(case["id"]),
+                "capability": str(case["capability"]),
+                "task": str(case["task"]),
+                "workspace_before": before,
+                "workspace_after": after,
+            }
+        )
+    return metadata
+
+
+def _input_file_path(path: str) -> str:
+    return path if path.startswith("input_files/") else f"input_files/{path}"
+
+
+def _redacted_artifact_path(path: Path, *, repository: Path) -> str:
+    try:
+        return path.resolve().relative_to(repository.resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _sanitize_artifact(value: object) -> object:
+    secrets = _artifact_secret_values()
+    return _sanitize_artifact_value(value, secrets=secrets)
+
+
+def _sanitize_artifact_value(
+    value: object,
+    *,
+    secrets: Sequence[str],
+) -> object:
+    if isinstance(value, Mapping):
+        sanitized: dict[str, object] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            normalized = key.casefold().replace("-", "_")
+            if normalized in _SENSITIVE_ARTIFACT_KEYS:
+                continue
+            sanitized[key] = _sanitize_artifact_value(item, secrets=secrets)
+        return sanitized
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_sanitize_artifact_value(item, secrets=secrets) for item in value]
+    if isinstance(value, str):
+        sanitized_text = value
+        for secret in secrets:
+            sanitized_text = sanitized_text.replace(secret, "[REDACTED]")
+        return _ABSOLUTE_PATH_PATTERN.sub(
+            "[REDACTED_ABSOLUTE_PATH]",
+            sanitized_text,
+        )
+    return value
+
+
+def _artifact_secret_values() -> tuple[str, ...]:
+    values: list[str] = []
+    for name, value in os.environ.items():
+        upper = name.upper()
+        if not any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+            continue
+        if len(value) >= 8:
+            values.append(value)
+    return tuple(values)
 
 
 def _pretty_json(value: object) -> str:
@@ -1095,6 +1378,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Run the baseline trial count and fail on model-quality regression.",
     )
     for command in (calibrate, gate):
+        command.add_argument(
+            "--repository",
+            type=Path,
+            default=ROOT,
+            help="Clean Git repository whose committed source is being evaluated.",
+        )
         command.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE_PATH)
         command.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE_PATH)
         command.add_argument(
