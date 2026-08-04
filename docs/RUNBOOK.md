@@ -72,6 +72,10 @@ uv run agent model switch mimo_cloud
 `agent model switch` 写入 `.praxis/` 目录中的 `model_session.json`。临时只跑一次其他模型时，用
 `agent run --model mimo_cloud ...`，不要改 `configs/models.yaml`。
 
+早期版本写在 `.rag/` 中的 `agent_checkpoints.sqlite` 和
+`agent_model_session.json` 不迁移、不读取、也不删除；新的运行从 `.praxis/`
+中的全新状态开始，RAG 知识数据则继续留在 `.rag/`。
+
 先检查是否已经有同模型服务，避免重复常驻占内存：
 
 ```bash

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -62,19 +63,30 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
     legacy_root = tmp_path / ".rag"
     legacy_checkpoint = legacy_root / "agent_checkpoints.sqlite"
     legacy_session = legacy_root / "agent_model_session.json"
+    legacy_session_text = '{"current_model_id":"legacy-sentinel"}'
     legacy_root.mkdir()
     legacy_checkpoint.write_bytes(b"legacy checkpoint sentinel")
-    legacy_session.write_text('{"model":"legacy-sentinel"}', encoding="utf-8")
+    legacy_session.write_text(legacy_session_text, encoding="utf-8")
 
     agent = Agent()
     assert agent.checkpoint_db == Path(".praxis/checkpoints.sqlite")
     assert agent.model_session_path == Path(".praxis/model_session.json")
-    agent._get_turn_store()
+    store = agent._get_turn_store()
+    try:
+        current = agent.current_model()
+        switched = agent.switch_model(current.id)
 
-    assert cli_module.DEFAULT_CHECKPOINT_PATH.exists()
-    assert not cli_module.DEFAULT_MODEL_SESSION_PATH.exists()
-    assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
-    assert legacy_session.read_text(encoding="utf-8") == '{"model":"legacy-sentinel"}'
+        assert switched.id == current.id
+        assert cli_module.DEFAULT_CHECKPOINT_PATH.is_file()
+        assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
+            "current_model_id": current.id
+        }
+        assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
+        assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
+    finally:
+        store.close()
+        if agent._model_control_plane is not None:
+            agent._model_control_plane.close()
 
 
 @pytest.mark.parametrize(
