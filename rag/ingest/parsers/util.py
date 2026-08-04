@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-
 from pathlib import Path
 
 _WHITESPACE_RE = re.compile(r"\s+")

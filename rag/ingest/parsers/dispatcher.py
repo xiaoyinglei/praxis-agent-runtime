@@ -5,6 +5,7 @@ from typing import Protocol
 
 from rag.schema.core import ParsedDocument, SourceType
 
+
 class DocumentParser(Protocol):
     def parse(
         self,

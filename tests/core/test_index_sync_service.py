@@ -20,7 +20,9 @@ class _MetadataRepo:
     def get_processing_state(self, doc_id: int) -> ProcessingStateRecord | None:
         return self.states.get(doc_id)
 
-    def list_processing_states(self, *, source_id: int | None = None, status: str | None = None, stage: str | None = None):
+    def list_processing_states(
+        self, *, source_id: int | None = None, status: str | None = None, stage: str | None = None
+    ):
         states = list(self.states.values())
         if source_id is not None:
             states = [state for state in states if state.source_id == source_id]
@@ -35,8 +37,12 @@ def test_index_sync_service_claims_high_priority_pending_task() -> None:
     now = datetime(2026, 4, 19, tzinfo=UTC)
     repo = _MetadataRepo(
         states={
-            1: ProcessingStateRecord(doc_id=1, source_id=7, stage="index_sync", status="pending", priority="normal", updated_at=now),
-            2: ProcessingStateRecord(doc_id=2, source_id=7, stage="index_sync", status="pending", priority="high", updated_at=now),
+            1: ProcessingStateRecord(
+                doc_id=1, source_id=7, stage="index_sync", status="pending", priority="normal", updated_at=now
+            ),
+            2: ProcessingStateRecord(
+                doc_id=2, source_id=7, stage="index_sync", status="pending", priority="high", updated_at=now
+            ),
         }
     )
     service = IndexSyncService(repo)
@@ -158,8 +164,12 @@ def test_index_sync_service_reports_monitor_snapshot() -> None:
     now = datetime(2026, 4, 20, tzinfo=UTC)
     repo = _MetadataRepo(
         states={
-            1: ProcessingStateRecord(doc_id=1, source_id=7, stage="index_sync", status="pending", updated_at=now - timedelta(seconds=400)),
-            2: ProcessingStateRecord(doc_id=2, source_id=7, stage="index_sync", status="failed", updated_at=now - timedelta(seconds=10)),
+            1: ProcessingStateRecord(
+                doc_id=1, source_id=7, stage="index_sync", status="pending", updated_at=now - timedelta(seconds=400)
+            ),
+            2: ProcessingStateRecord(
+                doc_id=2, source_id=7, stage="index_sync", status="failed", updated_at=now - timedelta(seconds=10)
+            ),
             3: ProcessingStateRecord(doc_id=3, source_id=7, stage="index_sync", status="completed", updated_at=now),
         }
     )

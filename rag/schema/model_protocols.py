@@ -12,9 +12,11 @@ if TYPE_CHECKING:
 
 T = TypeVar("T", bound=BaseModel)
 
-"""
-模型与多模态能力的抽象协议：定义文本生成、结构化生成、向量编码、重排序、OCR 识别和视觉描述等外部能力接口，供不同模型服务或实现类统一接入。
-"""
+(
+    "模型与多模态能力的抽象协议：定义文本生成、结构化生成、向量编码、重排序、OCR "
+    "识别和视觉描述等外部能力接口，供不同模型服务或实现类统一接入。"
+)
+
 
 class Generator(Protocol):
     def generate_text(self, *, prompt: str, **kwargs: Any) -> str: ...

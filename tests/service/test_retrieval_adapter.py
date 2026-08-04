@@ -63,7 +63,7 @@ class _BranchRegistry:
         source_scope: list[str],
         retrieval_signals: RetrievalSignals,
     ) -> list[_FakeCandidate]:
-        del query, source_scope, query_understanding
+        del query, source_scope, retrieval_signals
         return []
 
 

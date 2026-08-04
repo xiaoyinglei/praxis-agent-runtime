@@ -47,8 +47,7 @@ def test_excel_parser_preserves_full_shape_when_profile_reads_are_bounded(tmp_pa
     source_path = tmp_path / "large-ledger.xlsx"
     row_count = 5_010
     rows = [
-        {"Name": f"row{index}", "Department": f"dept{index % 3}", "Amount": index * 100}
-        for index in range(row_count)
+        {"Name": f"row{index}", "Department": f"dept{index % 3}", "Amount": index * 100} for index in range(row_count)
     ]
     pd.DataFrame(rows).to_excel(source_path, sheet_name="Ledger", index=False)
 
@@ -102,9 +101,13 @@ def test_excel_parser_evaluates_common_formula_cells_without_cached_values(tmp_p
     report = workbook.active
     report.title = "Report"
     report.append(["Key", "Group", "Amount", "GroupTotal", "LookupAmount"])
-    report.append(["north-a", "North", 10, '=SUMIF($B$2:$B$3,$B2,$C$2:$C$3)', '=IFERROR(VLOOKUP($A2,Data!$A:$B,2,0),0)'])
-    report.append(["north-b", "North", 20, '=SUMIF($B$2:$B$3,$B3,$C$2:$C$3)', '=IFERROR(VLOOKUP($A3,Data!$A:$B,2,0),0)'])
-    report.append(["total", "All", '=SUM(C2:C3)', '=SUM(D2:D3)', ""])
+    report.append(
+        ["north-a", "North", 10, "=SUMIF($B$2:$B$3,$B2,$C$2:$C$3)", "=IFERROR(VLOOKUP($A2,Data!$A:$B,2,0),0)"]
+    )
+    report.append(
+        ["north-b", "North", 20, "=SUMIF($B$2:$B$3,$B3,$C$2:$C$3)", "=IFERROR(VLOOKUP($A3,Data!$A:$B,2,0),0)"]
+    )
+    report.append(["total", "All", "=SUM(C2:C3)", "=SUM(D2:D3)", ""])
     data = workbook.create_sheet("Data")
     data.append(["Key", "LookupAmount"])
     data.append(["north-a", 100])
