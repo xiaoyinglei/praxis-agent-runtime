@@ -3,15 +3,15 @@ from __future__ import annotations
 import pytest
 from pydantic import BaseModel
 
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.llm_context import AgentLLMContextOverflowError
-from rag.agent.core.output_finalizer import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.llm_context import AgentLLMContextOverflowError
+from agent_runtime.core.output_finalizer import (
     ModelStructuredOutputFinalizer,
     OutputValidationExhaustedError,
     final_answer_from_output,
 )
-from rag.agent.loop.state import LoopState, create_loop_state
+from agent_runtime.loop.state import LoopState, create_loop_state
 from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 from rag.providers.llm_gateway import LLMGateway
 from rag.schema.llm import LLMCallStage, LLMStageBudget

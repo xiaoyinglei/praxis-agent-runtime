@@ -5,7 +5,7 @@ from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ModelMessage,
     StopReason,
     ToolCall,
@@ -13,14 +13,14 @@ from rag.agent.core.messages import (
     canonical_json_text,
     snapshot_model_message,
 )
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ModelRequest,
     ToolChoice,
     ToolChoiceMode,
     canonical_hash,
     freeze_json_mapping,
 )
-from rag.agent.tools.tool import JsonValue, json_schema_output
+from agent_runtime.tools.tool import JsonValue, json_schema_output
 from rag.schema.llm import LLMUsage, normalize_llm_usage
 
 OPENAI_WIRE_REVISION = "openai-compatible-chat-v2"

@@ -5,13 +5,13 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
-from rag.agent.core.messages import ModelMessage, StopReason, ToolUseResult
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import create_loop_state
-from rag.agent.tools.tool import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.llm_providers import LLMLoopModelTurnProvider
+from agent_runtime.core.messages import ModelMessage, StopReason, ToolUseResult
+from agent_runtime.loop.runtime import ModelTurnEnvelope
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -129,7 +129,7 @@ class TestLLMLoopModelTurnProviderBasic:
 
     def test_module_exports_expected_symbols(self) -> None:
         """Verify the module exports the expected public API after cleanup."""
-        import rag.agent.core.llm_providers as m
+        import agent_runtime.core.llm_providers as m
 
         assert hasattr(m, "LLMLoopModelTurnProvider")
         assert hasattr(m, "LoopModelDecision")
@@ -138,7 +138,7 @@ class TestLLMLoopModelTurnProviderBasic:
 
     def test_retrieval_hint_code_is_removed(self) -> None:
         """Verify LLMRetrievalHintProvider no longer exists in the module."""
-        import rag.agent.core.llm_providers as m
+        import agent_runtime.core.llm_providers as m
 
         assert not hasattr(m, "LLMRetrievalHintProvider")
         assert not hasattr(m, "create_default_providers")

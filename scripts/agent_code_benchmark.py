@@ -1724,42 +1724,58 @@ def repository_state_fingerprint(repository: Path) -> str:
 
 
 def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
+    runtime_roots = ("agent_runtime", "rag/" + "agent")
     layers: set[str] = set()
     for path in paths:
-        if path in {
-            "agent_runtime/__init__.py",
-            "agent_runtime/agent.py",
-            "rag/agent/cli.py",
-        }:
+        if path in {"agent_runtime/__init__.py", "agent_runtime/agent.py"} or any(
+            path == f"{root}/cli.py" for root in runtime_roots
+        ):
             layers.add("public_api_cli")
         if (
-            path == "rag/agent/service.py"
+            any(path == f"{root}/service.py" for root in runtime_roots)
             or path.startswith("agent_runtime/runtime/")
-            or path in {
-                "rag/agent/core/llm_registry.py",
-                "rag/agent/core/llm_providers.py",
-                "rag/agent/core/model_provider_runtime.py",
-                "rag/models/catalog.py",
-            }
+            or path == "rag/models/catalog.py"
+            or any(
+                path
+                in {
+                    f"{root}/core/llm_registry.py",
+                    f"{root}/core/llm_providers.py",
+                    f"{root}/core/model_provider_runtime.py",
+                }
+                for root in runtime_roots
+            )
         ):
             layers.add("service")
-        if path.startswith("rag/agent/loop/"):
+        if any(path.startswith(f"{root}/loop/") for root in runtime_roots):
             layers.add("loop")
         if (
-            path.startswith("rag/agent/tools/")
-            or path.startswith("rag/agent/tooling/")
-            or path.startswith("rag/agent/builtin/")
-            or path in {"rag/agent/planning.py", "agent_runtime/planning.py"}
+            any(
+                path.startswith(
+                    (
+                        f"{root}/tools/",
+                        f"{root}/tooling/",
+                        f"{root}/builtin/",
+                    )
+                )
+                or path == f"{root}/planning.py"
+                for root in runtime_roots
+            )
         ):
             layers.add("tool")
-        if path in {
-            "rag/agent/core/checkpointing.py",
-            "rag/agent/core/context.py",
-            "rag/agent/sessions.py",
-        }:
+        if any(
+            path
+            in {
+                f"{root}/core/checkpointing.py",
+                f"{root}/core/context.py",
+                f"{root}/sessions.py",
+            }
+            for root in runtime_roots
+        ):
             layers.add("turn_checkpoint")
-        if path == "agent_runtime/result.py" or path.startswith(
-            "rag/agent/streaming/"
+        if any(
+            path == f"{root}/result.py"
+            or path.startswith(f"{root}/streaming/")
+            for root in runtime_roots
         ):
             layers.add("result_events")
     return layers

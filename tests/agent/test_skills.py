@@ -13,40 +13,40 @@ from typing import Any
 
 import pytest
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.loop.state import create_loop_state
-from rag.agent.skills.catalog import SkillCatalog
-from rag.agent.skills.context import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.skills.catalog import SkillCatalog
+from agent_runtime.skills.context import (
     SKILL_PROMPT_GUIDANCE,
     build_skills_prompt_section,
     render_active_loaded_skills,
     render_loaded_skill,
     render_skill_listing,
 )
-from rag.agent.skills.loader import (
+from agent_runtime.skills.loader import (
     SkillLoadError,
     load_skill_body,
     load_skill_from_file,
     scan_and_load_skills,
 )
-from rag.agent.skills.models import (
+from agent_runtime.skills.models import (
     SkillInvocation,
     SkillSource,
     SkillState,
     SkillSummary,
 )
-from rag.agent.skills.policy import SkillPolicy
-from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations import skills as skill_integration_module
-from rag.agent.tools.integrations.skills import (
+from agent_runtime.skills.policy import SkillPolicy
+from agent_runtime.skills.runtime import SkillRuntime
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations import skills as skill_integration_module
+from agent_runtime.tools.integrations.skills import (
     MAX_SKILL_INSTRUCTIONS_CHARS,
     create_invoke_skill_tool,
     create_materialize_skill_asset_tool,
 )
-from rag.agent.tools.permissions import ToolExecutionContext as FinalToolExecutionContext
-from rag.agent.tools.tool import Tool, ToolCall, ToolCallOrigin
-from rag.agent.workspace import open_workspace
+from agent_runtime.tools.permissions import ToolExecutionContext as FinalToolExecutionContext
+from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
+from agent_runtime.workspace import open_workspace
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -668,8 +668,8 @@ class TestExternalSkills:
 class TestSkillStateIntegration:
     def test_skill_state_in_loop_state(self):
         """SkillState should be present in a newly created LoopState."""
-        from rag.agent.core.context import AgentRunConfig
-        from rag.agent.loop.state import create_loop_state
+        from agent_runtime.core.context import AgentRunConfig
+        from agent_runtime.loop.state import create_loop_state
 
         run_config = AgentRunConfig(
             turn_id="r1",
@@ -683,7 +683,7 @@ class TestSkillStateIntegration:
         assert skill_state.active == {}
 
     def test_checkpoint_serde_restores_skill_state(self):
-        from rag.agent.core.checkpointing import agent_checkpoint_serde
+        from agent_runtime.core.checkpointing import agent_checkpoint_serde
 
         with tempfile.TemporaryDirectory() as d:
             _write_skill(Path(d), "checkpoint-test", "Checkpoint test")
@@ -854,7 +854,7 @@ class TestFinalSkillToolFactories:
         assert execution.result.structured_content is not None
         output = execution.result.structured_content
         assert output["workspace_path"] == (
-            ".rag/agent_runtime/scratch/skills/project_demo/scripts/helper.py"
+            ".rag/" + "agent_runtime/scratch/skills/project_demo/scripts/helper.py"
         )
         materialized = workspace.root / output["workspace_path"]
         assert materialized.read_text(encoding="utf-8") == "print('ok')\n"

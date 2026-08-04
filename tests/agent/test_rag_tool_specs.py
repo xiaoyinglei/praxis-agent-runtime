@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from rag.agent.tools.integrations.knowledge import (
+from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchOutput,
     create_knowledge_tools,
 )
-from rag.agent.tools.tool import Tool
+from agent_runtime.tools.tool import Tool
 
 
 def test_configured_knowledge_exposes_one_final_tool() -> None:

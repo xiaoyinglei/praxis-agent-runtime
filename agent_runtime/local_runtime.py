@@ -9,7 +9,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
 
-from rag.agent.core.llm_registry import ModelNotAvailableError
+from agent_runtime.core.llm_registry import ModelNotAvailableError
 
 if TYPE_CHECKING:
     from agent_runtime.models import ModelSpec

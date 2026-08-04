@@ -5,12 +5,12 @@ import importlib.util
 import pytest
 from pydantic import ValidationError
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.observations import ObservationExtractor
-from rag.agent.loop.state import create_loop_state
-from rag.agent.service import AgentRunResult
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchInput
-from rag.agent.tools.tool import ToolResult
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.observations import ObservationExtractor
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.service import AgentRunResult
+from agent_runtime.tools.integrations.knowledge import KnowledgeSearchInput
+from agent_runtime.tools.tool import ToolResult
 
 
 def test_final_knowledge_input_does_not_expose_retrieval_routing() -> None:
@@ -99,5 +99,5 @@ def test_public_run_result_accepts_final_knowledge_citation_anchors() -> None:
 
 
 def test_deleted_agent_retrieval_modules_are_not_importable() -> None:
-    assert importlib.util.find_spec("rag.agent.tools.rag_tools") is None
-    assert importlib.util.find_spec("rag.agent.tools.rag_tool_runner") is None
+    assert importlib.util.find_spec("agent_runtime.tools.rag_tools") is None
+    assert importlib.util.find_spec("agent_runtime.tools.rag_tool_runner") is None

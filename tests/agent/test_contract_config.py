@@ -4,14 +4,14 @@ import asyncio
 
 import pytest
 
-from rag.agent.builtin.generic import GENERIC_AGENT, GENERIC_SYSTEM_PROMPT
-from rag.agent.core.context import (
+from agent_runtime.builtin.generic import GENERIC_AGENT, GENERIC_SYSTEM_PROMPT
+from agent_runtime.core.context import (
     AgentRunConfig,
     AgentRuntimeHandles,
     LLMBudgetLedger,
     TurnRegistry,
 )
-from rag.agent.core.definition import AgentRuntimePolicy, ModelSelectionPolicy, ToolPolicy
+from agent_runtime.core.definition import AgentRuntimePolicy, ModelSelectionPolicy, ToolPolicy
 
 
 class TestLLMBudgetLedger:

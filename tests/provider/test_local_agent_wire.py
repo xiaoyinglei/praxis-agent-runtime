@@ -8,14 +8,14 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from rag.agent.core.messages import ModelMessage, StopReason, ToolUseResult
-from rag.agent.core.model_request import (
+from agent_runtime.core.messages import ModelMessage, StopReason, ToolUseResult
+from agent_runtime.core.model_request import (
     ContextBlock,
     ModelSettings,
     build_model_request,
     build_stable_context,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -249,11 +249,11 @@ def test_local_wire_is_serialization_not_a_second_runtime() -> None:
     assert not any(
         module.startswith(
             (
-                "rag.agent.tools.selection",
-                "rag.agent.tools.executor",
-                "rag.agent.tools.registry",
-                "rag.agent.loop",
-                "rag.agent.tooling",
+                "agent_runtime.tools.selection",
+                "agent_runtime.tools.executor",
+                "agent_runtime.tools.registry",
+                "agent_runtime.loop",
+                "agent_runtime.tooling",
             )
         )
         for module in imports

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.workspace import (
+from agent_runtime.workspace import (
     WorkspacePathError,
     WorkspaceRuntime,
     create_temp_workspace,
@@ -448,20 +448,20 @@ class TestImportFiles:
 
 class TestUniqueDest:
     def test_no_collision(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest == tmp_path / "file.txt"
 
     def test_collision_appends_counter(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("existing")
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest.name == "file__1.txt"
 
     def test_multiple_collisions(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("1")
         (tmp_path / "file__1.txt").write_text("2")

@@ -6,26 +6,26 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     CanonicalToolCheckpoint,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
     encode_tool_checkpoint,
 )
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.goal_contract import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.goal_contract import (
     GoalDeliverable,
     GoalSpec,
 )
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, ModelTurnDraft, create_loop_state
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import (
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopState, ModelTurnDraft, create_loop_state
+from agent_runtime.service import AgentRunRequest, AgentService
+from agent_runtime.tools.executor import ExecutionStatus, ToolExecutionRecord
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -40,8 +40,8 @@ from rag.agent.tools.tool import (
     ToolTarget,
     json_schema_input,
 )
-from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
-from rag.agent.workspace import open_workspace
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
+from agent_runtime.workspace import open_workspace
 
 _INPUT_SCHEMA: Mapping[str, JsonValue] = {
     "type": "object",
@@ -416,14 +416,14 @@ async def test_service_owns_a_goal_contract_for_every_request() -> None:
 def test_runtime_modules_use_loop_state_instead_of_compatibility_state() -> None:
     root = Path(__file__).resolve().parents[2]
     runtime_files = [
-        "rag/agent/core/llm_context.py",
-        "rag/agent/core/output_finalizer.py",
-        "rag/agent/memory/injector.py",
-        "rag/agent/tools/registry.py",
+        "agent_runtime/core/llm_context.py",
+        "agent_runtime/core/output_finalizer.py",
+        "agent_runtime/memory/injector.py",
+        "agent_runtime/tools/registry.py",
     ]
 
     offenders = [
-        relative for relative in runtime_files if "rag.agent.state" in (root / relative).read_text(encoding="utf-8")
+        relative for relative in runtime_files if "agent_runtime.state" in (root / relative).read_text(encoding="utf-8")
     ]
 
     assert offenders == []
@@ -457,15 +457,15 @@ def test_public_runtime_files_do_not_reach_legacy_tool_paths() -> None:
     runtime_files = (
         "agent_runtime/agent.py",
         "agent_runtime/runtime/builder.py",
-        "rag/agent/cli.py",
-        "rag/agent/service.py",
-        "rag/agent/loop/runtime.py",
-        "rag/agent/core/model_provider_runtime.py",
-        "rag/agent/core/llm_providers.py",
+        "agent_runtime/cli.py",
+        "agent_runtime/service.py",
+        "agent_runtime/loop/runtime.py",
+        "agent_runtime/core/model_provider_runtime.py",
+        "agent_runtime/core/llm_providers.py",
         "rag/providers/llm_gateway.py",
     )
     forbidden = (
-        "rag.agent.tooling",
+        "agent_runtime.tooling",
         "ToolExecutionService",
         "RuntimeToolRegistryBuilder",
         "ToolSurfaceRequest",
@@ -485,7 +485,7 @@ def test_public_runtime_files_do_not_reach_legacy_tool_paths() -> None:
 
 
 def test_default_runtime_has_no_goal_gap_planning_fields() -> None:
-    root = Path(__file__).resolve().parents[2] / "rag" / "agent"
+    root = Path(__file__).resolve().parents[2] / "agent_runtime"
     forbidden = (
         "related_gap_ids",
         "resolved_gaps",

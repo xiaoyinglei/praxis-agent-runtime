@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rag.agent.core.observations import (
+from agent_runtime.core.observations import (
     ComputationResult,
     ContextUnit,
     EvidenceRef,
@@ -8,13 +8,13 @@ from rag.agent.core.observations import (
     StructuredObservation,
     grounded_workspace_paths,
 )
-from rag.agent.tools.builtins.filesystem import (
+from agent_runtime.tools.builtins.filesystem import (
     FileEntry,
     ListFilesOutput,
     ReadFileOutput,
 )
-from rag.agent.tools.builtins.search import SearchTextMatch, SearchTextOutput
-from rag.agent.tools.tool import ToolCall, ToolCallOrigin, ToolResult
+from agent_runtime.tools.builtins.search import SearchTextMatch, SearchTextOutput
+from agent_runtime.tools.tool import ToolCall, ToolCallOrigin, ToolResult
 from rag.schema.query import AnswerCitation, EvidenceItem
 
 
@@ -165,14 +165,14 @@ def test_search_text_observation_preserves_patchable_source_locators() -> None:
     output = SearchTextOutput(
         matches=[
             SearchTextMatch(
-                file_path="rag/agent/loop/runtime.py",
+                file_path="agent_runtime/loop/runtime.py",
                 line_number=718,
                 line_content="                    _stream_tool_use_result(",
                 match_start=20,
                 match_end=43,
             ),
             SearchTextMatch(
-                file_path="rag/agent/cli.py",
+                file_path="agent_runtime/cli.py",
                 line_number=111,
                 line_content="    def _render_tool_result(self, event: StreamEvent) -> None:",
                 match_start=8,
@@ -192,12 +192,12 @@ def test_search_text_observation_preserves_patchable_source_locators() -> None:
     assert update["locators"] == [
         {
             "source_tool": "search_text",
-            "path": "rag/agent/loop/runtime.py",
+            "path": "agent_runtime/loop/runtime.py",
             "line_number": 718,
         },
         {
             "source_tool": "search_text",
-            "path": "rag/agent/cli.py",
+            "path": "agent_runtime/cli.py",
             "line_number": 111,
         },
     ]
@@ -442,7 +442,7 @@ def test_noop_patch_is_not_a_successful_plan_observation() -> None:
         tool_call_id="tc-noop-patch",
         tool_name="apply_patch",
         structured_content={
-            "file_path": "rag/agent/loop/runtime.py",
+            "file_path": "agent_runtime/loop/runtime.py",
             "replaced": False,
             "occurrences": 0,
             "message": "No change.",

@@ -33,7 +33,7 @@ def _deepseek_service():
 class TestRealModelSmoke:
     async def test_hello(self) -> None:
         """Agent returns a simple text response via DeepSeek."""
-        from rag.agent.service import AgentRunRequest
+        from agent_runtime.service import AgentRunRequest
 
         svc = _deepseek_service()
         result = await svc.run(
@@ -49,7 +49,7 @@ class TestRealModelSmoke:
 
     async def test_simple_math(self) -> None:
         """Model answers 2+2 correctly."""
-        from rag.agent.service import AgentRunRequest
+        from agent_runtime.service import AgentRunRequest
 
         svc = _deepseek_service()
         result = await svc.run(

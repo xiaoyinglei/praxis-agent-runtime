@@ -7,9 +7,9 @@ from uuid import uuid4
 import pytest
 from pytest import MonkeyPatch
 
+from agent_runtime import cli
 from agent_runtime.result import AgentResult, AgentUsage
-from rag.agent import cli
-from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:

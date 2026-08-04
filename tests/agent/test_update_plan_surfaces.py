@@ -5,17 +5,17 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from agent_runtime.result import AgentResult
-from agent_runtime.runtime.builder import build_agent_service
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, ModelTurnDraft
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.workspace import open_workspace
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.result import AgentResult
+from agent_runtime.runtime.builder import build_agent_service
+from agent_runtime.service import AgentRunRequest, AgentService
+from agent_runtime.workspace import open_workspace
 
 _PLAN_ARGUMENTS = {
     "explanation": "Implementation is ready; verification is next.",

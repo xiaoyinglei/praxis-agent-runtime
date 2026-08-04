@@ -8,6 +8,8 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from agent_runtime.cli import agent_app
+from agent_runtime.core.llm_registry import ModelNotAvailableError, ModelRegistry
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
 from agent_runtime.models import (
     ModelCatalog,
@@ -18,8 +20,6 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSpec,
 )
-from rag.agent.cli import agent_app
-from rag.agent.core.llm_registry import ModelNotAvailableError, ModelRegistry
 from rag.schema.llm import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from rag.utils.text import load_env_file
 

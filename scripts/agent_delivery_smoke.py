@@ -99,7 +99,7 @@ class _FakeTurn:
 
 
 def build_cases() -> tuple[SmokeCase, ...]:
-    service_source = (Path(__file__).parents[1] / "rag" / "agent" / "service.py").read_text(encoding="utf-8")
+    service_source = (Path(__file__).parents[1] / "agent_runtime" / "service.py").read_text(encoding="utf-8")
     return (
         SmokeCase(
             name="direct_answer",
@@ -118,7 +118,7 @@ def build_cases() -> tuple[SmokeCase, ...]:
             expected_tools=("search_text", "read_file"),
             expected_initial_tools=("search_text", "read_file"),
             tools=("search_text", "read_file"),
-            workspace_files={"rag/agent/service.py": service_source},
+            workspace_files={"agent_runtime/service.py": service_source},
         ),
         SmokeCase(
             name="patch_fixture",
@@ -436,7 +436,7 @@ class _FakeModelResolver:
     fallback_model = "fake"
 
     def __init__(self, case: SmokeCase, generator: _FakeGenerator) -> None:
-        from rag.agent.core.llm_registry import ResolvedModel
+        from agent_runtime.core.llm_registry import ResolvedModel
         from rag.providers.llm_gateway import LLMGateway
         from rag.schema.llm import LLMCallStage, LLMStageBudget
 
@@ -483,7 +483,7 @@ def _local_prompt_tool_names(prompt: str) -> tuple[str, ...]:
 
 
 def _hidden_mcp_tools() -> tuple[object, ...]:
-    from rag.agent.tools.integrations.mcp import (
+    from agent_runtime.tools.integrations.mcp import (
         MCPToolDescriptor,
         create_mcp_tools,
     )
@@ -516,16 +516,16 @@ async def run_case(
     model: str,
     fake_model: bool = False,
 ) -> SmokeResult:
-    from agent_runtime.models import ModelControlPlane
-    from agent_runtime.result import AgentResult
-    from agent_runtime.runtime.builder import build_agent_service
-    from rag.agent.core.model_request import (
+    from agent_runtime.core.model_request import (
         canonical_json_text,
         tool_definition_payload,
     )
-    from rag.agent.service import AgentRunRequest
-    from rag.agent.tools.selection import select_tools
-    from rag.agent.turns import RuntimeBinding, TurnStore
+    from agent_runtime.models import ModelControlPlane
+    from agent_runtime.result import AgentResult
+    from agent_runtime.runtime.builder import build_agent_service
+    from agent_runtime.service import AgentRunRequest
+    from agent_runtime.tools.selection import select_tools
+    from agent_runtime.turns import RuntimeBinding, TurnStore
 
     turn_id = str(uuid4())
     service = None
@@ -679,7 +679,7 @@ async def _checkpoint_evidence(
 ) -> tuple[tuple[str, ...], str]:
     """Read canonical v2 evidence without materializing the whole loop state."""
 
-    from rag.agent.core.checkpointing import (
+    from agent_runtime.core.checkpointing import (
         LOOP_CHECKPOINT_NAMESPACE,
         LOOP_STATE_CHANNEL,
         decode_tool_checkpoint,

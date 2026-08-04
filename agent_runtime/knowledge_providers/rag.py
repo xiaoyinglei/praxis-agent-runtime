@@ -5,14 +5,14 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TYPE_CHECKING, Self
 
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 from agent_runtime.knowledge import RAGKnowledgeConfig
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.integrations.knowledge import (
+from agent_runtime.tools.integrations.knowledge import (
     KnowledgeResult,
     KnowledgeSearchInput,
     KnowledgeSearchOutput,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.permissions import ToolExecutionContext
 from rag.retrieval import QueryOptions
 
 if TYPE_CHECKING:

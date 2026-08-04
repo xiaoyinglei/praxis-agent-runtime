@@ -6,6 +6,13 @@ from dataclasses import FrozenInstanceError, fields
 import pytest
 
 import agent_runtime.result as result_module
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.model_request import ModelCallRecord
+from agent_runtime.core.runtime_diagnostics import (
+    AgentLatencyProfile,
+    RuntimeDiagnostic,
+    ToolCallMetrics,
+)
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import (
     AgentCitation,
@@ -17,15 +24,8 @@ from agent_runtime.result import (
     AgentToolSummary,
     AgentUsage,
 )
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.model_request import ModelCallRecord
-from rag.agent.core.runtime_diagnostics import (
-    AgentLatencyProfile,
-    RuntimeDiagnostic,
-    ToolCallMetrics,
-)
-from rag.agent.service import AgentRunResult
-from rag.agent.tools.tool import ToolResult
+from agent_runtime.service import AgentRunResult
+from agent_runtime.tools.tool import ToolResult
 from rag.schema.llm import LLMUsage
 from rag.schema.query import AnswerCitation, EvidenceItem, GroundingTarget
 

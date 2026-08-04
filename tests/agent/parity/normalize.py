@@ -6,7 +6,7 @@ from dataclasses import asdict, is_dataclass
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
-from rag.agent.loop.state import LoopState
+from agent_runtime.loop.state import LoopState
 
 
 def normalize_loop_state(

@@ -9,18 +9,18 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 from agent_runtime import RAGKnowledgeConfig
-from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
-from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
-from agent_runtime.runtime.builder import build_agent_service
-from rag.agent import cli as cli_module
-from rag.agent.cli import (
+from agent_runtime import cli as cli_module
+from agent_runtime.cli import (
     _CLIToolEventDisplay,
     _display_agent_result,
     _load_knowledge_config,
     agent_app,
 )
-from rag.agent.service import AgentRunRequest
-from rag.agent.streaming.events import (
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
+from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
+from agent_runtime.runtime.builder import build_agent_service
+from agent_runtime.service import AgentRunRequest
+from agent_runtime.streaming.events import (
     EventType,
     StreamEvent,
     recovery_event,
@@ -30,14 +30,14 @@ from rag.agent.streaming.events import (
     tool_use_result,
     tool_use_start,
 )
-from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchOutput
-from rag.agent.tools.integrations.mcp import (
+from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
+from agent_runtime.tools.integrations.knowledge import KnowledgeSearchOutput
+from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
     create_mcp_tools,
 )
-from rag.agent.tools.integrations.skills import create_skill_tools
-from rag.agent.workspace import open_workspace
+from agent_runtime.tools.integrations.skills import create_skill_tools
+from agent_runtime.workspace import open_workspace
 
 
 class _ModelRegistry:

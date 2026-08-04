@@ -11,13 +11,13 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
-from rag.agent.core.context import LLMBudgetLedger
-from rag.agent.core.model_request import (
+from agent_runtime.core.context import LLMBudgetLedger
+from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
     build_stable_context,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

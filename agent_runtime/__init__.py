@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
-from rag.agent.streaming.events import EventType, StreamEvent
+from agent_runtime.streaming.events import EventType, StreamEvent
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink

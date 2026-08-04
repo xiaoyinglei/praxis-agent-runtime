@@ -8,9 +8,9 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 
-from rag.agent.core.llm_config import ModelProvider
-from rag.agent.core.llm_config import ModelSpec as InternalModelSpec
-from rag.agent.core.llm_registry import (
+from agent_runtime.core.llm_config import ModelProvider
+from agent_runtime.core.llm_config import ModelSpec as InternalModelSpec
+from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
     ModelResolver,

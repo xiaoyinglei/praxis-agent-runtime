@@ -5,12 +5,12 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from langchain_core.messages import BaseMessage
 from pydantic import BaseModel
 
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, create_loop_state
-from rag.agent.memory.models import MemoryPolicy
-from rag.agent.tools.tool import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopState, create_loop_state
+from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

@@ -25,7 +25,7 @@ def fake_sandbox_exec(
     actual filesystem or network isolation must continue to use real Seatbelt.
     """
 
-    from rag.agent.tools.builtins import shell as shell_module
+    from agent_runtime.tools.builtins import shell as shell_module
 
     executable = tmp_path / "fake-sandbox-exec"
     executable.write_text(

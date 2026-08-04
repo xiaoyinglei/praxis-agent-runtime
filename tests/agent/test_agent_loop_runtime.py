@@ -10,18 +10,18 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     CheckpointStore,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.finalization import FinishCandidateBuilder
-from rag.agent.core.human_input import HumanInputResponse
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.finalization import FinishCandidateBuilder
+from agent_runtime.core.human_input import HumanInputResponse
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.runtime import (
     AgentLoop,
     LoopEventSink,
     ModelTurnEnvelope,
@@ -30,31 +30,31 @@ from rag.agent.loop.runtime import (
     _guard_repeated_successful_inspections,
     _matching_tool_failures_since_recovery,
 )
-from rag.agent.loop.state import (
+from agent_runtime.loop.state import (
     LoopState,
     LoopTransition,
     ModelTurnDraft,
     create_loop_state,
 )
-from rag.agent.loop.stop_hooks import StopHookRunner
-from rag.agent.memory.compactor import LoopCompactionResult
-from rag.agent.skills.catalog import SkillCatalog
-from rag.agent.skills.loader import scan_and_load_skills
-from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import EventType, StreamEvent, text_delta
-from rag.agent.tools.executor import (
+from agent_runtime.loop.stop_hooks import StopHookRunner
+from agent_runtime.memory.compactor import LoopCompactionResult
+from agent_runtime.skills.catalog import SkillCatalog
+from agent_runtime.skills.loader import scan_and_load_skills
+from agent_runtime.skills.runtime import SkillRuntime
+from agent_runtime.streaming.events import EventType, StreamEvent, text_delta
+from agent_runtime.tools.executor import (
     ExecutionStatus,
     ToolExecutionRecord,
     ToolExecutor,
 )
-from rag.agent.tools.integrations.skills import create_invoke_skill_tool
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.selection import (
+from agent_runtime.tools.integrations.skills import create_invoke_skill_tool
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.selection import (
     FindToolMatch,
     FindToolsOutput,
     create_find_tools_tool,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

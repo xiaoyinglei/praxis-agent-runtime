@@ -7,29 +7,29 @@ from importlib import import_module
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     AGENT_CHECKPOINT_MSGPACK_ALLOWLIST,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.human_input import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.human_input import (
     HumanInputRequest,
     HumanInputRequestIdMismatchError,
     HumanInputResponse,
 )
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.messages import ToolCall as ModelToolCall
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopPause, create_loop_state
-from rag.agent.tools.executor import (
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.messages import ToolCall as ModelToolCall
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopPause, create_loop_state
+from agent_runtime.tools.executor import (
     ExecutionStatus,
     ToolExecutionRecord,
     ToolExecutor,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import (
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from rag.agent.core.context import LLMBudgetLedger
+from agent_runtime.core.context import LLMBudgetLedger
 from rag.providers.generation import (
     AnswerGenerationService,
     AnswerGenerator,

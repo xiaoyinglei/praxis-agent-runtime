@@ -6,13 +6,13 @@ from uuid import uuid4
 import pytest
 import typer
 
+from agent_runtime import cli
 from agent_runtime.result import (
     AgentPause,
     AgentResult,
     AgentToolSummary,
     AgentUsage,
 )
-from rag.agent import cli
 
 
 def _result(

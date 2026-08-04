@@ -8,51 +8,51 @@ from types import SimpleNamespace
 import pytest
 from langchain_core.messages import HumanMessage
 
-from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker
-from rag.agent.core import llm_providers as llm_providers_module
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.finalization import FinishCandidateBuilder
-from rag.agent.core.goal_contract import GoalConstraint, GoalSpec
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.llm_context import AgentLLMContextAssembler
-from rag.agent.core.llm_providers import (
+from agent_runtime.core import llm_providers as llm_providers_module
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.finalization import FinishCandidateBuilder
+from agent_runtime.core.goal_contract import GoalConstraint, GoalSpec
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.llm_context import AgentLLMContextAssembler
+from agent_runtime.core.llm_providers import (
     LLMLoopModelTurnProvider,
     create_loop_model_turn_provider,
     parse_loop_model_turn,
 )
-from rag.agent.core.llm_registry import ResolvedModel
-from rag.agent.core.messages import (
+from agent_runtime.core.llm_registry import ResolvedModel
+from agent_runtime.core.messages import (
     ModelMessage,
     StopReason,
     ToolUseResult,
     context_event_message,
     tool_result_message,
 )
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ToolCall as ModelToolCall,
 )
-from rag.agent.core.model_request import ToolChoiceMode
-from rag.agent.core.observations import StructuredObservation
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.file_manifest import FileManifest, FileManifestEntry
-from rag.agent.loop.runtime import AgentLoop
-from rag.agent.loop.state import (
+from agent_runtime.core.model_request import ToolChoiceMode
+from agent_runtime.core.observations import StructuredObservation
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.file_manifest import FileManifest, FileManifestEntry
+from agent_runtime.loop.runtime import AgentLoop
+from agent_runtime.loop.state import (
     LoopState,
     ModelTurnDraft,
     PendingToolCall,
     StopHookFeedback,
     create_loop_state,
 )
-from rag.agent.loop.stop_hooks import StopHookRunner
-from rag.agent.memory.compactor import LoopContextCompactor
-from rag.agent.memory.injector import ContextBuilder
-from rag.agent.memory.models import MemoryPolicy
-from rag.agent.tools.builtins.filesystem import ReadFileInput
-from rag.agent.tools.builtins.shell import RunCommandInput
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import (
+from agent_runtime.loop.stop_hooks import StopHookRunner
+from agent_runtime.memory.compactor import LoopContextCompactor
+from agent_runtime.memory.injector import ContextBuilder
+from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker
+from agent_runtime.tools.builtins.filesystem import ReadFileInput
+from agent_runtime.tools.builtins.shell import RunCommandInput
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -1296,7 +1296,7 @@ async def test_loop_provider_injects_compact_typed_working_state() -> None:
             locators=[
                 {
                     "source_tool": "search_text",
-                    "path": "rag/agent/loop/runtime.py",
+                    "path": "agent_runtime/loop/runtime.py",
                     "line_number": 718,
                 }
             ],
@@ -1306,7 +1306,7 @@ async def test_loop_provider_injects_compact_typed_working_state() -> None:
     state["memory_state"].known_locators = [
         {
             "source_tool": "search_text",
-            "path": "rag/agent/loop/runtime.py",
+            "path": "agent_runtime/loop/runtime.py",
             "line_number": 718,
         }
     ]
@@ -1325,7 +1325,7 @@ async def test_loop_provider_injects_compact_typed_working_state() -> None:
     ]
     assert len(working_state) == 1
     assert "tc-search-runtime" in working_state[0].content
-    assert "rag/agent/loop/runtime.py" in working_state[0].content
+    assert "agent_runtime/loop/runtime.py" in working_state[0].content
 
 
 @pytest.mark.anyio
@@ -1346,7 +1346,7 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
     state["memory_state"].known_locators = [
         {
             "source_tool": "search_text",
-            "path": "rag/agent/loop/runtime.py",
+            "path": "agent_runtime/loop/runtime.py",
             "line_number": 718,
         }
     ]
@@ -1368,7 +1368,7 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
     assert payload["plan_claims"]["objective"] == "Fix the runtime."
     assert "goal_contract" not in payload
     assert payload["runtime_evidence"]["grounded_paths"] == [
-        "rag/agent/loop/runtime.py"
+        "agent_runtime/loop/runtime.py"
     ]
     assert "unverified_plan_targets" not in payload["runtime_evidence"]
     assert "instruction" not in payload
@@ -1381,14 +1381,14 @@ async def test_working_state_omits_path_only_locators_already_grounded() -> None
     state["memory_state"].known_locators = [
         {
             "source_tool": "list_files",
-            "path": "rag/agent/core/llm_providers.py",
+            "path": "agent_runtime/core/llm_providers.py",
             "name": "llm_providers.py",
             "size_bytes": 24_000,
             "is_dir": False,
         },
         {
             "source_tool": "search_text",
-            "path": "rag/agent/core/llm_providers.py",
+            "path": "agent_runtime/core/llm_providers.py",
             "line_number": 263,
         },
     ]
@@ -1406,13 +1406,13 @@ async def test_working_state_omits_path_only_locators_already_grounded() -> None
         if '"event_type":"working_state"' in message.content
     )
     evidence = json.loads(working_state.content)["payload"]["runtime_evidence"]
-    assert evidence["grounded_paths"] == ["rag/agent/core/llm_providers.py"]
+    assert evidence["grounded_paths"] == ["agent_runtime/core/llm_providers.py"]
     assert evidence["known_locator_count"] == 2
     assert evidence["known_locators_compacted"] is True
     assert evidence["known_locators"] == [
         {
             "source_tool": "search_text",
-            "path": "rag/agent/core/llm_providers.py",
+            "path": "agent_runtime/core/llm_providers.py",
             "line_number": 263,
         }
     ]

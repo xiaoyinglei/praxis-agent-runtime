@@ -14,13 +14,13 @@ from agent_runtime.models import ModelControlPlane
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
-    from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-    from rag.agent.service import AgentService
-    from rag.agent.skills.runtime import SkillRuntime
-    from rag.agent.streaming.sink import StreamEventSink
-    from rag.agent.tools.tool import Tool
-    from rag.agent.turns import RuntimeBinding, TurnStore
-    from rag.agent.workspace import WorkspaceRuntime
+    from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+    from agent_runtime.service import AgentService
+    from agent_runtime.skills.runtime import SkillRuntime
+    from agent_runtime.streaming.sink import StreamEventSink
+    from agent_runtime.tools.tool import Tool
+    from agent_runtime.turns import RuntimeBinding, TurnStore
+    from agent_runtime.workspace import WorkspaceRuntime
     from rag.runtime import RAGRuntime
 
 logger = logging.getLogger(__name__)
@@ -58,25 +58,25 @@ def build_agent_service(
     runtime_binding: RuntimeBinding | None = None,
 ) -> AgentService:
     """Build one CLI/SDK runtime from ordinary canonical Tool values."""
-    from rag.agent.builtin.generic import GENERIC_AGENT
-    from rag.agent.core.checkpointing import create_agent_checkpointer
-    from rag.agent.core.runtime_diagnostics import (
+    from agent_runtime.builtin.generic import GENERIC_AGENT
+    from agent_runtime.core.checkpointing import create_agent_checkpointer
+    from agent_runtime.core.runtime_diagnostics import (
         AgentLatencyProfile,
         RuntimeDiagnostic,
     )
-    from rag.agent.service import AgentService
-    from rag.agent.tools.builtins import create_resident_coding_tools
-    from rag.agent.tools.integrations.knowledge import (
+    from agent_runtime.service import AgentService
+    from agent_runtime.tools.builtins import create_resident_coding_tools
+    from agent_runtime.tools.integrations.knowledge import (
         KnowledgeSearchInput,
         create_knowledge_tools,
     )
-    from rag.agent.tools.permissions import ToolExecutionContext
-    from rag.agent.tools.registry import build_tool_registry
-    from rag.agent.tools.selection import (
+    from agent_runtime.tools.permissions import ToolExecutionContext
+    from agent_runtime.tools.registry import build_tool_registry
+    from agent_runtime.tools.selection import (
         create_find_tools_tool,
         find_tools,
     )
-    from rag.agent.workspace import WorkspaceRuntime, create_temp_workspace
+    from agent_runtime.workspace import WorkspaceRuntime, create_temp_workspace
 
     build_started_at = time.perf_counter()
     model_ready_ms = 0.0
@@ -194,7 +194,7 @@ def build_optional_rag_runtime(
     model_alias: str | None,
     vector_dsn: str | None,
 ) -> tuple[RAGRuntime | None, tuple[RuntimeDiagnostic, ...]]:
-    from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
+    from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 
     try:
         if not config.storage_root.exists():

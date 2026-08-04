@@ -7,14 +7,14 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     StopReason,
     ToolCall,
     ToolUseResult,
     canonical_json_text,
     model_message_payload,
 )
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ModelRequest,
     canonical_hash,
     freeze_json_mapping,
@@ -22,7 +22,7 @@ from rag.agent.core.model_request import (
     tool_choice_payload,
     tool_definition_payload,
 )
-from rag.agent.tools.tool import JsonValue
+from agent_runtime.tools.tool import JsonValue
 from rag.schema.llm import LLMUsage, normalize_llm_usage
 
 LOCAL_AGENT_WIRE_REVISION = "local-agent-flat-json-v1"

@@ -12,8 +12,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from rag.agent.core.messages import StopReason, ToolCall, ToolUseResult
-from rag.agent.core.model_request import ModelRequest
+from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.model_request import ModelRequest
 from rag.providers.local_agent_wire import (
     parse_local_agent_response,
     render_local_agent_request,

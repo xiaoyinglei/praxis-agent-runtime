@@ -5,8 +5,8 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from rag.agent.core.llm_config import ModelProvider, ModelSpec
-from rag.agent.core.model_request import (
+from agent_runtime.core.llm_config import ModelProvider, ModelSpec
+from agent_runtime.core.model_request import (
     ModelSettings,
     bind_model_call_record,
     build_model_request,

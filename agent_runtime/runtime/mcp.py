@@ -14,12 +14,12 @@ import yaml
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.integrations.mcp import (
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
     create_mcp_tools,
 )
-from rag.agent.tools.tool import JsonValue, Tool
+from agent_runtime.tools.tool import JsonValue, Tool
 
 logger = logging.getLogger(__name__)
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")

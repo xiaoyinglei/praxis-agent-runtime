@@ -11,23 +11,23 @@ from typing import Any
 
 import pytest
 
-from rag.agent.core.observations import runtime_workspace_change
-from rag.agent.tools.builtins import (
+from agent_runtime.core.observations import runtime_workspace_change
+from agent_runtime.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
 )
-from rag.agent.tools.builtins import search as search_module
-from rag.agent.tools.builtins import shell as shell_module
-from rag.agent.tools.executor import ToolExecution, ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import (
+from agent_runtime.tools.builtins import search as search_module
+from agent_runtime.tools.builtins import shell as shell_module
+from agent_runtime.tools.executor import ToolExecution, ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
     Tool,
     ToolCall,
     ToolCallOrigin,
     ToolEffect,
     ToolValidationError,
 )
-from rag.agent.workspace import WorkspaceRuntime, open_workspace
+from agent_runtime.workspace import WorkspaceRuntime, open_workspace
 
 
 def _origin(tool_name: str) -> ToolCallOrigin:

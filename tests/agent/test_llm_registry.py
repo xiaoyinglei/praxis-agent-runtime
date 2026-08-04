@@ -5,8 +5,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from rag.agent.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
-from rag.agent.core.llm_registry import (
+from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.core.llm_registry import (
     ModelRegistry,
     UnknownModelAliasError,
 )

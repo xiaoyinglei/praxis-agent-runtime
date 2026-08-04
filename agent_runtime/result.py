@@ -6,15 +6,15 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 from agent_runtime.planning import AgentPlan, PlanEvent
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.tool import JsonValue, ToolResult
+from agent_runtime.tools.tool import JsonValue, ToolResult
 from rag.schema.llm import LLMUsage
 from rag.schema.query import AnswerCitation, EvidenceItem, GroundingTarget
 
 if TYPE_CHECKING:
-    from rag.agent.service import AgentRunResult
+    from agent_runtime.service import AgentRunResult
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
 type AgentPauseKind = Literal[

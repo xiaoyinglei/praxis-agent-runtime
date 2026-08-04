@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from rag.agent.core.human_input import (
+from agent_runtime.core.human_input import (
     HumanInputRequest,
     HumanInputResponse,
     ToolCallSummary,

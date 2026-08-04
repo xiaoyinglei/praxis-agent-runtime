@@ -9,20 +9,20 @@ from types import SimpleNamespace
 import pytest
 from openai.types.chat import ChatCompletion
 
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ModelMessage,
     StopReason,
     ToolUseResult,
     context_event_message,
 )
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ContextBlock,
     ModelSettings,
     ToolChoice,
     build_model_request,
     build_stable_context,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -459,11 +459,11 @@ def test_openai_wire_is_only_a_serializer_and_parser() -> None:
     assert not any(
         module.startswith(
             (
-                "rag.agent.tools.selection",
-                "rag.agent.tools.executor",
-                "rag.agent.tools.registry",
-                "rag.agent.loop",
-                "rag.agent.tooling",
+                "agent_runtime.tools.selection",
+                "agent_runtime.tools.executor",
+                "agent_runtime.tools.registry",
+                "agent_runtime.loop",
+                "agent_runtime.tooling",
             )
         )
         for module in imports

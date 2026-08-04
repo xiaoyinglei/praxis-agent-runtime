@@ -4,14 +4,14 @@ import inspect
 
 from langchain_core.messages import HumanMessage
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.messages import ModelMessage, tool_result_message
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, PendingToolCall, create_loop_state
-from rag.agent.memory.injector import ContextBuilder
-from rag.agent.memory.models import ExtractedFact, MemoryRef, WorkingSummary
-from rag.agent.tools.tool import ToolContentBlock, ToolResult
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.messages import ModelMessage, tool_result_message
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopState, PendingToolCall, create_loop_state
+from agent_runtime.memory.injector import ContextBuilder
+from agent_runtime.memory.models import ExtractedFact, MemoryRef, WorkingSummary
+from agent_runtime.tools.tool import ToolContentBlock, ToolResult
 
 
 class _CharacterTokenAccounting:

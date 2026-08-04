@@ -69,7 +69,7 @@ uv run agent model current
 uv run agent model switch mimo_cloud
 ```
 
-`agent model switch` 写 `.rag/agent_model_session.json`。临时只跑一次其他模型时，用
+`agent model switch` 写 `.agent_runtime_model_session.json`。临时只跑一次其他模型时，用
 `agent run --model mimo_cloud ...`，不要改 `configs/models.yaml`。
 
 先检查是否已经有同模型服务，避免重复常驻占内存：

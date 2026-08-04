@@ -7,12 +7,12 @@ from uuid import UUID
 
 import pytest
 
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ModelMessage,
     canonical_json_text,
     model_message_payload,
 )
-from rag.agent.turns import RuntimeBinding, TurnStore
+from agent_runtime.turns import RuntimeBinding, TurnStore
 
 
 def _create_session_schema(database: Path) -> sqlite3.Connection:

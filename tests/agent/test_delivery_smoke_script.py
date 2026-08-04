@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
+from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
 
 
 def _load_smoke_module():
@@ -229,6 +229,6 @@ def test_smoke_source_no_longer_imports_legacy_tool_surface() -> None:
         Path(__file__).parents[2] / "scripts" / "agent_delivery_smoke.py"
     ).read_text(encoding="utf-8")
 
-    assert "rag.agent.tooling" not in source
+    assert "agent_runtime.tooling" not in source
     assert "ToolSurfaceRequest" not in source
     assert "tool_surface_request" not in source

@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
     build_stable_context,

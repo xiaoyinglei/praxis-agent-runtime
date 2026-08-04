@@ -15,18 +15,18 @@ import pytest
 import agent_runtime
 from agent_runtime import Agent, AgentResult, AgentUsage
 from agent_runtime import agent as agent_module
+from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.knowledge_providers.rag import LazyRAGKnowledgeProvider
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.runtime import builder as runtime_builder
-from rag.agent.core.runtime_diagnostics import AgentLatencyProfile
-from rag.agent.service import AgentRunResult
-from rag.agent.streaming.events import EventType, StreamEvent
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchInput
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import ToolCall, ToolCallOrigin
-from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
+from agent_runtime.service import AgentRunResult
+from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations.knowledge import KnowledgeSearchInput
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 
 
 def test_agent_runtime_exports_sdk_facade() -> None:
@@ -888,8 +888,8 @@ async def test_knowledge_initialization_redacts_vector_secret_from_all_public_su
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from rag.agent.cli import _display_agent_result
-    from rag.agent.tools.tool import ToolResult
+    from agent_runtime.cli import _display_agent_result
+    from agent_runtime.tools.tool import ToolResult
 
     marker = "secret-vector-dsn-MARKER"
 

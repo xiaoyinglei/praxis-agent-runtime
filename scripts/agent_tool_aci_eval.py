@@ -249,21 +249,21 @@ async def run_evaluation(
 
 
 def _build_runtime_fixture() -> _RuntimeFixture:
-    from rag.agent.tools.builtins import (
+    from agent_runtime.tools.builtins import (
         RESIDENT_CODING_TOOL_NAMES,
         create_resident_coding_tools,
     )
-    from rag.agent.tools.integrations.knowledge import (
+    from agent_runtime.tools.integrations.knowledge import (
         create_search_knowledge_tool,
     )
-    from rag.agent.tools.integrations.mcp import (
+    from agent_runtime.tools.integrations.mcp import (
         MCPToolDescriptor,
         create_mcp_tools,
     )
-    from rag.agent.tools.integrations.subagent import create_subagent_tool
-    from rag.agent.tools.registry import build_tool_registry
-    from rag.agent.tools.selection import create_find_tools_tool, find_tools
-    from rag.agent.workspace import create_temp_workspace
+    from agent_runtime.tools.integrations.subagent import create_subagent_tool
+    from agent_runtime.tools.registry import build_tool_registry
+    from agent_runtime.tools.selection import create_find_tools_tool, find_tools
+    from agent_runtime.workspace import create_temp_workspace
 
     workspace = create_temp_workspace(prefix="agent_tool_aci_")
     (workspace.input_files / "README.md").write_text(
@@ -384,11 +384,11 @@ def _evaluate_case(
     case: ACICase,
     runtime: _RuntimeFixture,
 ) -> dict[str, object]:
-    from rag.agent.core.model_request import (
+    from agent_runtime.core.model_request import (
         canonical_json_text,
         tool_definition_payload,
     )
-    from rag.agent.tools.selection import (
+    from agent_runtime.tools.selection import (
         find_tools,
         resolve_tool_options,
         select_tools,

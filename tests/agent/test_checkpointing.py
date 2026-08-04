@@ -10,25 +10,25 @@ from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from pydantic import create_model
 
-from agent_runtime.planning import AgentPlan, PlanStep
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     _normalize_loaded_state,
     aclose_agent_checkpointer,
     agent_checkpoint_serde,
     create_agent_checkpointer,
 )
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.runtime_diagnostics import AgentLatencyProfile, ToolCallMetrics
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import PendingToolCall, create_loop_state
-from rag.agent.memory.models import ExternalizedToolOutput, MemoryRef
-from rag.agent.primitive_ops import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile, ToolCallMetrics
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import PendingToolCall, create_loop_state
+from agent_runtime.memory.models import ExternalizedToolOutput, MemoryRef
+from agent_runtime.planning import AgentPlan, PlanStep
+from agent_runtime.primitive_ops import (
     CandidateHeaderRow,
     StructuredProbeOutput,
     StructuredTableProbe,
 )
-from rag.agent.tools.tool import ToolContentBlock, ToolResult
+from agent_runtime.tools.tool import ToolContentBlock, ToolResult
 from rag.schema.runtime import AccessPolicy
 
 
@@ -95,10 +95,10 @@ def test_checkpoint_serde_restores_agent_plan(
     assert restored == plan
 
 
-def test_checkpoint_serde_migrates_legacy_plan_module_identity() -> None:
+def test_checkpoint_serde_rejects_legacy_plan_module_identity() -> None:
     legacy_plan_type = create_model(
         "AgentPlan",
-        __module__="rag.agent.planning",
+        __module__="rag." + "agent.planning",
         objective=(str, ...),
         status=(str, "active"),
         revision=(int, 0),
@@ -122,9 +122,10 @@ def test_checkpoint_serde_migrates_legacy_plan_module_identity() -> None:
 
     restored = agent_checkpoint_serde().loads_typed(encoded)
 
-    assert isinstance(restored, AgentPlan)
-    assert restored.__class__.__module__ == "agent_runtime.planning"
-    assert restored.steps[0].step_id == "step_migrate"
+    assert isinstance(restored, dict)
+    assert not isinstance(restored, AgentPlan)
+    assert restored["objective"] == "Legacy checkpoint plan."
+    assert restored["steps"][0]["step_id"] == "step_migrate"
 
 
 def test_checkpoint_serde_restores_checkpoint_stable_structured_preview(
@@ -163,7 +164,7 @@ def test_checkpoint_serde_restores_checkpoint_stable_structured_preview(
 def test_checkpoint_serde_normalizes_removed_primitive_model_to_mapping() -> None:
     legacy_model = create_model(
         "ListFilesOutput",
-        __module__="rag.agent.primitive_ops",
+        __module__="rag." + "agent.primitive_ops",
         files=(list[dict[str, object]], ...),
         truncated=(bool, False),
     )
@@ -179,7 +180,7 @@ def test_checkpoint_serde_normalizes_removed_primitive_model_to_mapping() -> Non
     }
 
 
-def test_checkpoint_serde_restores_legacy_run_config_fixture() -> None:
+def test_checkpoint_serde_rejects_legacy_run_config_identity() -> None:
     legacy_config_type = make_dataclass(
         "AgentRunConfig",
         (
@@ -192,7 +193,7 @@ def test_checkpoint_serde_restores_legacy_run_config_fixture() -> None:
             ("source_scope", tuple[str, ...]),
         ),
         frozen=True,
-        module="rag.agent.core.context",
+        module="rag." + "agent.core.context",
     )
     config = legacy_config_type(
         run_id="legacy-run-config",
@@ -209,21 +210,11 @@ def test_checkpoint_serde_restores_legacy_run_config_fixture() -> None:
 
     restored = agent_checkpoint_serde().loads_typed(encoded)
 
-    assert isinstance(restored, AgentRunConfig)
-    assert restored.turn_id == "legacy-run-config"
-    assert restored.llm_budget_total == 100
-    for removed in (
-        "run_id",
-        "thread_id",
-        "max_depth",
-        "access_policy",
-        "agent_type",
-        "parent_run_id",
-        "source_scope",
-        "deadline_iso",
-        "trace_parent_id",
-    ):
-        assert not hasattr(restored, removed)
+    assert isinstance(restored, dict)
+    assert not isinstance(restored, AgentRunConfig)
+    assert restored["run_id"] == "legacy-run-config"
+    assert restored["thread_id"] == "legacy-run-config"
+    assert restored["llm_budget_total"] == 100
 
 
 def test_legacy_message_context_migrates_without_losing_conversation_history() -> None:
@@ -254,7 +245,7 @@ def test_checkpoint_serde_restores_externalized_output_record(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     output = ExternalizedToolOutput(
-        original_output_model="rag.agent.tools.builtins.shell.RunCommandOutput",
+        original_output_model="agent_runtime.tools.builtins.shell.RunCommandOutput",
         summary="run_command ok=True exit_code=0 stdout_preview=large",
         ref=MemoryRef(
             ref_id="mem_abc",

@@ -4,16 +4,16 @@ from collections.abc import Mapping
 
 import pytest
 
-from rag.agent.core import model_provider_runtime
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.goal_contract import GoalSpec
-from rag.agent.core.model_provider_runtime import (
+from agent_runtime.core import model_provider_runtime
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.goal_contract import GoalSpec
+from agent_runtime.core.model_provider_runtime import (
     ModelProviderResolver,
     ResultDrivenModelTurnProvider,
 )
-from rag.agent.loop.state import ModelTurnDraft, create_loop_state
-from rag.agent.tools.tool import (
+from agent_runtime.loop.state import ModelTurnDraft, create_loop_state
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
