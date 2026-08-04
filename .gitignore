@@ -16,6 +16,7 @@ docs/superpowers/specs/
 data/
 logs/
 .rag*/
+.praxis/
 .agent_memory/
 *.db
 *.sqlite

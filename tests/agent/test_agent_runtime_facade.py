@@ -73,9 +73,9 @@ def test_agent_runtime_exports_sdk_facade() -> None:
 
 def test_agent_public_signatures_are_exact() -> None:
     constructor = (
-        "(*, model: 'str | None' = None, checkpoint_db: 'Path | None' = None, "
+        "(*, model: 'str | None' = None, checkpoint_db: 'Path | None' = PosixPath('.praxis/checkpoints.sqlite'), "
         "workspace_path: 'Path | str | None' = None, "
-        "model_session_path: 'Path | None' = None, "
+        "model_session_path: 'Path | None' = PosixPath('.praxis/model_session.json'), "
         "knowledge: 'RAGKnowledgeConfig | None' = None) -> 'None'"
     )
     run = (
@@ -197,7 +197,7 @@ def test_agent_facade_run_maps_public_request_to_internal_service(
     assert built == [
         {
             "runtime": None,
-            "checkpoint_db": None,
+            "checkpoint_db": Path(".praxis/checkpoints.sqlite"),
             "checkpointer": built[0]["checkpointer"],
             "model_alias": "qwen3_14b_mlx_4bit",
             "model_control_plane": built[0]["model_control_plane"],

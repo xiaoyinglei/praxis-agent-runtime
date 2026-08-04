@@ -14,6 +14,7 @@ import click
 import typer
 import yaml
 
+from agent_runtime.agent import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 from agent_runtime.core.llm_registry import UnknownModelAliasError
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
@@ -40,13 +41,6 @@ agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 logger = logging.getLogger(__name__)
-
-_LEGACY_RUNTIME_ROOT = Path(".rag")
-DEFAULT_MODEL_SESSION_PATH = _LEGACY_RUNTIME_ROOT / (
-    "agent_" + "model_session.json"
-)
-DEFAULT_CHECKPOINT_PATH = _LEGACY_RUNTIME_ROOT / ("agent_" + "checkpoints.sqlite")
-
 
 class _CLIToolEventDisplay:
     """Project canonical stream events into bounded terminal output."""

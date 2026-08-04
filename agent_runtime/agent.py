@@ -25,6 +25,8 @@ if TYPE_CHECKING:
     from agent_runtime.turns import RuntimeBinding, TurnStore
 
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
+DEFAULT_CHECKPOINT_PATH = Path(".praxis/checkpoints.sqlite")
+DEFAULT_MODEL_SESSION_PATH = Path(".praxis/model_session.json")
 logger = logging.getLogger(__name__)
 
 
@@ -39,9 +41,9 @@ class Agent:
         self,
         *,
         model: str | None = None,
-        checkpoint_db: Path | None = None,
+        checkpoint_db: Path | None = DEFAULT_CHECKPOINT_PATH,
         workspace_path: Path | str | None = None,
-        model_session_path: Path | None = None,
+        model_session_path: Path | None = DEFAULT_MODEL_SESSION_PATH,
         knowledge: RAGKnowledgeConfig | None = None,
     ) -> None:
         if knowledge is not None and not isinstance(

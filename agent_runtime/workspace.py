@@ -18,6 +18,7 @@ _SNAPSHOT_IGNORED_DIRECTORIES = frozenset(
         ".mypy_cache",
         ".nox",
         ".pytest_cache",
+        ".praxis",
         ".rag",
         ".ruff_cache",
         ".tox",
@@ -49,7 +50,7 @@ class WorkspaceRuntime:
 
         if self.is_temporary:
             return self.root
-        return self.root / ".rag" / "agent_runtime"
+        return self.root / ".praxis" / "runtime"
 
     @property
     def input_files(self) -> Path:
@@ -204,7 +205,7 @@ def _has_temporary_runtime_layout(root: Path) -> bool:
     return bool(
         (root / ".agent_memory").is_dir()
         and all((root / name).is_dir() for name in _TEMP_RUNTIME_DIRECTORIES)
-        and not (root / ".rag" / "agent_runtime").exists()
+        and not (root / ".praxis" / "runtime").exists()
     )
 
 

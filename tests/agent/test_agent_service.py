@@ -560,7 +560,7 @@ async def test_service_builds_manifest_for_imported_input_files(
     )
 
     assert result.status == "done"
-    assert provider.paths == (".rag/" + "agent_runtime/input_files/service-input-manifest/fixture.txt",)
+    assert provider.paths == (".praxis/" + "runtime/input_files/service-input-manifest/fixture.txt",)
 
 
 def test_result_restores_configured_concrete_final_output() -> None:

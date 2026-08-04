@@ -195,7 +195,7 @@ from agent_runtime import Agent
 
 agent = Agent(
     model="qwen3_5_9b_mlx_4bit",
-    checkpoint_db=Path(".rag") / "agent_checkpoints.sqlite",
+    checkpoint_db=Path(".praxis") / "checkpoints.sqlite",
     workspace_path=Path.cwd(),
 )
 
@@ -300,7 +300,7 @@ MCP 从 workspace 的 `configs/mcp_servers.yaml` 装配，也可用 `AGENT_MCP_C
 
 Skill 资产访问有独立的 hard guard：`invoke_skill` 只能激活 catalog/policy 允许的 Skill，`materialize_skill_asset` 只能访问 checkpoint 中已激活 Skill 的 root；未激活、路径越界或状态不一致都会 hard-deny。
 
-`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。workspace 写入和进程执行需要各自的 effect 授权；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.rag/` 下的 `agent_checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
+`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。workspace 写入和进程执行需要各自的 effect 授权；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.praxis/` 下的 `checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
 
 `run_command` 不以宿主用户的完整能力直接执行，而是进入 macOS Seatbelt 受限沙箱：
 
@@ -672,7 +672,7 @@ CLI agent chat
 ```text
 --file / files=
   -> workspace 内文件直接引用
-  -> workspace 外文件按 Turn 归档到 .rag/ 下的 agent_runtime/input_files/
+  -> workspace 外文件按 Turn 归档到 .praxis/ 下的 runtime/input_files/
   -> list_files / search_text
   -> read_file
   -> apply_patch or run_command when explicitly needed
@@ -690,7 +690,7 @@ CLI agent chat
 - `run/arun` 统一执行文件、代码和连续上下文任务；`chat` 只是 CLI 交互循环；`resume` 支持审批、澄清、中断继续、未知副作用对账和 abort。
 - `run/arun/astream` 默认启用真实 workspace 变更与修改后验证合同；只读任务必须显式关闭该合同，`chat` 使用对话模式。
 - canonical history、Turn 状态、runtime binding 和 checkpoint 使用 SQLite 持久化；内存对象只用于同进程资源复用。
-- 当前 workspace 由文件工具直接读写；`--file` 对 workspace 内文件直接引用，对外部文件才按 Turn 复制到 `.rag/` 下的 `agent_runtime/input_files/`。运行时不会在项目根目录创建 `input_files/` 等伪业务目录。
+- 当前 workspace 由文件工具直接读写；`--file` 对 workspace 内文件直接引用，对外部文件才按 Turn 复制到 `.praxis/` 下的 `runtime/input_files/`。运行时不会在项目根目录创建 `input_files/` 等伪业务目录。
 - MCP server 由 workspace 配置显式启用；Skill 采用 catalog + progressive disclosure；subagent 作为 hidden `task` Tool 接入并继承有界上下文与权限。
 - model context 按实际 provider request 大小压缩，保留最新 assistant→tool 对并语义投影大型失败结果；usage 只在 provider 明确返回时记录 cache read/write。
 

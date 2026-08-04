@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import rag
+from agent_runtime.knowledge import RAGKnowledgeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -65,11 +66,17 @@ def test_rag_root_no_longer_exports_agent_runtime_objects() -> None:
     assert not hasattr(rag, "ToolRegistry")
 
 
+def test_rag_knowledge_storage_remains_in_rag_namespace() -> None:
+    assert RAGKnowledgeConfig().storage_root == Path(".rag")
+
+
 def test_active_sources_do_not_reference_legacy_agent_namespace() -> None:
     forbidden = (
         "rag." + "agent",
         "rag/" + "agent",
         "Private-" + "RAG-Agent",
+        ".rag/" + "agent_",
+        ".rag/" + "agent_runtime",
     )
     offenders: dict[str, tuple[str, ...]] = {}
 
