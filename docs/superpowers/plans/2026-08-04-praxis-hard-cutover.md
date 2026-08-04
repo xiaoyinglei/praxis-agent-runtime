@@ -202,6 +202,7 @@ git commit -m "refactor: move Agent runtime out of RAG namespace"
 - Modify: RAG consumers of the moved canonical modules
 - Modify: `.importlinter`
 - Create: `tests/agent/test_runtime_rag_boundary.py`
+- Create: `tests/core/test_rag_persistence_shape_compatibility.py`
 
 - [ ] **Step 1: Write failing dependency and identity tests**
 
@@ -232,7 +233,27 @@ uv run pytest -q tests/agent/test_runtime_rag_boundary.py
 Expected: failures list current imports from `rag.schema`, `rag.models`,
 `rag.providers`, `rag.assembly`, and `rag.utils`.
 
-- [ ] **Step 3: Move each neutral implementation once**
+- [ ] **Step 3: Characterize RAG persistence before moving neutral types**
+
+Before any `git mv`, add focused tests around the SQLite metadata repository,
+Redis/cache repository serialization helpers, and cached runtime-contract
+payload. Prove the persisted representation is JSON/data-shape based: it must
+round-trip the current values while containing no constructor identity such as
+`rag.models.config`, `rag.schema.llm`, or `__module__`.
+
+Run:
+
+```bash
+uv run pytest -q tests/core/test_rag_persistence_shape_compatibility.py
+```
+
+Expected: PASS against the pre-move code. This is a characterization gate, not
+a RED test. If any record contains a Python module/class identity, stop the
+move and add an explicit data-shape codec and compatibility test first. Rerun
+this exact test after the move to prove existing JSON-shaped RAG data remains
+readable.
+
+- [ ] **Step 4: Move each neutral implementation once**
 
 Use `git mv` for the five canonical modules, then add explicit RAG-facing
 re-export modules with their existing `__all__` contracts. Update Agent imports
@@ -244,7 +265,7 @@ focused compatibility tests.
 Do not copy the 1,134-line gateway. There must be one `LLMGateway`
 implementation.
 
-- [ ] **Step 4: Introduce Agent-owned knowledge DTOs**
+- [ ] **Step 5: Introduce Agent-owned knowledge DTOs**
 
 In `agent_runtime/knowledge.py`, add frozen DTOs or Pydantic models for the
 runtime's evidence, citation, and grounding target values. Preserve the fields
@@ -255,7 +276,7 @@ validate Agent-owned DTOs. Change `agent_runtime/result.py` to project those
 DTOs without importing `rag.schema.query`. Keep all `rag.schema.query`
 conversion inside `agent_runtime/knowledge_providers/rag.py`.
 
-- [ ] **Step 5: Make checkpoint identities current-only**
+- [ ] **Step 6: Make checkpoint identities current-only**
 
 Update the checkpoint allowlist to canonical `agent_runtime` module identities.
 Remove old `rag.agent` aliases and do not add aliases for moved
@@ -270,14 +291,14 @@ assert b"rag.schema.llm" not in encoded[1]
 assert agent_checkpoint_serde().loads_typed(encoded) == LLMUsage(input_tokens=1)
 ```
 
-- [ ] **Step 6: Enforce the import contract**
+- [ ] **Step 7: Enforce the import contract**
 
 Configure import-linter with both roots and a forbidden contract from
 `agent_runtime` to `rag`, ignoring only direct imports made by
 `agent_runtime.knowledge_providers.rag`. Keep the existing schema/tools/memory
 contracts expressed against their new package paths.
 
-- [ ] **Step 7: Verify focused boundaries and commit**
+- [ ] **Step 8: Verify focused boundaries and commit**
 
 Run:
 
@@ -288,6 +309,7 @@ uv run pytest -q \
   tests/agent/test_loop_state.py \
   tests/agent/test_rag_answer_tool.py \
   tests/agent/test_agent_service.py \
+  tests/core/test_rag_persistence_shape_compatibility.py \
   tests/core/test_model_runtime.py \
   tests/core/test_query_pipeline.py
 uv run lint-imports
@@ -734,12 +756,20 @@ uv run python scripts/agent_cli_smoke.py
 uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
 uv run python scripts/agent_tool_aci_eval.py --fake-model --json
 uv run python scripts/agent_code_benchmark.py validate evals/code_agent/benchmark_v1.json --repository .
-uv run pytest -q tests/agent/test_run_command_safety.py
+test -x /usr/bin/sandbox-exec
+uv run pytest -q -rs \
+  tests/agent/test_run_command_safety.py::test_run_command_default_blocks_ordinary_workspace_write \
+  tests/agent/test_run_command_safety.py::test_run_command_workspace_write_never_writes_dot_git \
+  tests/agent/test_run_command_safety.py::test_run_command_workspace_write_cannot_escape_workspace
+uv run pytest -q -rs tests/agent/test_run_command_safety.py
 git diff --check
 git status --short
 ```
 
-Expected: every command exits zero and Git status is clean.
+Expected: every command exits zero and Git status is clean. The three named
+macOS Seatbelt cases must each report PASS, with zero skips in that selected
+run; an unavailable `sandbox-exec`, an all-skipped selection, or a fake
+sandbox is a failed release gate even if pytest otherwise exits zero.
 
 - [ ] **Step 2: Record the candidate identities outside Git**
 
@@ -816,6 +846,15 @@ git commit -m "docs: publish current Groq model evidence"
 
 Repeat every command from Task 9. Expected: all exit zero and tree clean.
 
+From this point onward, any change outside `README.md`, `docs/benchmark.md`,
+`docs/runs/**`, or `evals/model_quality/runs/**` invalidates the live report.
+In particular, a review or CI fix touching runtime code, dependencies
+(`pyproject.toml` or `uv.lock`), configuration/model aliases, test fixtures,
+the evaluator/report renderer, or execution scripts must return to Task 9,
+commit a new clean source candidate, rerun all of Task 10, replace the evidence
+with the new commit/tree fingerprint, and rerun the deterministic gates. Never
+describe evidence from an earlier source tree as current.
+
 ## Task 11: Review, PR, merge, and GitHub repository rename
 
 **Files:** No new product changes unless review or CI finds a defect.
@@ -825,7 +864,9 @@ Repeat every command from Task 9. Expected: all exit zero and tree clean.
 Use the requesting-code-review skill with the spec, plan, base commit, and
 current HEAD. Independently inspect `git diff origin/main...HEAD`, commits,
 untracked files, and every acceptance criterion. Fix real issues with focused
-tests and rerun affected/full gates.
+tests and rerun affected/full gates. Apply the Task 10 evidence-invalidation
+rule after every fix: if the changed path is outside the four evidence-only
+locations, repeat Tasks 9 and 10 before continuing.
 
 - [ ] **Step 2: Push and create a Draft PR**
 
@@ -874,7 +915,9 @@ publication.
 
 Use `gh pr checks --watch`. Do not merge on partial or pending checks. For each
 failure, reproduce locally, write a regression test when behavior is involved,
-fix the smallest cause, and rerun all relevant gates.
+fix the smallest cause, and rerun all relevant gates. Any source, dependency,
+configuration, evaluator, or script fix invalidates the live evidence and
+requires the complete Task 9 -> Task 10 cycle on a newly committed candidate.
 
 - [ ] **Step 4: Mark ready and merge**
 
@@ -882,7 +925,7 @@ After fresh local verification and green PR CI:
 
 ```bash
 gh pr ready
-gh pr merge --merge --delete-branch
+gh pr merge --merge
 ```
 
 Record the exact merge commit on `main`.
@@ -919,7 +962,8 @@ Verify:
 - the old GitHub URL redirects to the new repository;
 - `origin` fetch/push URLs use the new slug;
 - `origin/main` contains the merge commit;
-- no PR remains open;
+- this Praxis hard-cutover PR reports state `MERGED` (unrelated open PRs do not
+  block or satisfy this check);
 - the implementation worktree is clean;
 - the original dirty `main` still has its user-owned `configs/models.yaml` and
   was not synchronized or cleaned;
