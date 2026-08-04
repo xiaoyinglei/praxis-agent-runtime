@@ -395,11 +395,18 @@ async def run_model_trials(
 
     from agent_runtime.models import ModelControlPlane
 
-    control_plane = ModelControlPlane.from_env(
-        env_path=str(env_file),
-        initial_model_id=model_alias,
-    )
-    spec = control_plane.current_model()
+    try:
+        control_plane = ModelControlPlane.from_env(
+            env_path=str(env_file),
+            initial_model_id=model_alias,
+        )
+        spec = control_plane.current_model()
+    except (FileNotFoundError, KeyError, RuntimeError, ValueError) as exc:
+        return _initialization_inconclusive_report(
+            model_alias=model_alias,
+            trials=trials,
+            error_type=type(exc).__name__,
+        )
     trial_payloads: list[dict[str, object]] = []
     trial_metrics: list[dict[str, float]] = []
     for trial_index in range(1, trials + 1):
@@ -881,6 +888,30 @@ def _partial_case_payloads(
     return payloads
 
 
+def _initialization_inconclusive_report(
+    *,
+    model_alias: str,
+    trials: int,
+    error_type: str,
+) -> dict[str, object]:
+    failure = {
+        "case_id": None,
+        "stage": "model_control_plane_initialization",
+        "stop_reason": "model_control_plane_initialization_failed",
+        "diagnostic_error_types": [error_type],
+    }
+    return {
+        "status": "inconclusive",
+        "model_alias": model_alias,
+        "provider": "unavailable",
+        "provider_model": "unavailable",
+        "trial_count": trials,
+        "trial_metrics": [],
+        "trials": [],
+        "infrastructure_failure": failure,
+    }
+
+
 def _infrastructure_payload(observation: CaseObservation) -> dict[str, object]:
     return {
         "case_id": observation.case_id,
@@ -897,9 +928,10 @@ def _infrastructure_message(report: Mapping[str, object]) -> str:
             label="diagnostic_error_types",
         )
     ) or "unknown"
+    location = failure.get("case_id") or failure.get("stage") or "unknown"
     return (
         f"{report.get('model_alias', 'model')} live quality sample is infrastructure-inconclusive: "
-        f"{failure.get('case_id', 'unknown')}"
+        f"{location}"
         f"(stop_reason={failure.get('stop_reason') or 'unknown'}, error_types={error_types})"
     )
 

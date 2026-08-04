@@ -215,6 +215,73 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "redacted-id" not in rendered
 
 
+def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_success(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["status"] = "inconclusive"
+    payload["passed"] = None
+    model = payload["models"][0]
+    model["status"] = "inconclusive"
+    model["passed"] = None
+    model["observed"] = {}
+    model["thresholds"] = {}
+    model["failures"] = []
+    trial = payload["runs"][0]["trials"][0]
+    approval_case = trial["cases"][0]
+    observation = approval_case["observation"]
+    observation["status"] = "failed"
+    observation["answer"] = "UNTRUSTED_FINAL_SENTINEL"
+    observation["tool_calls"] = [
+        {
+            "tool_call_id": "partial-read",
+            "tool_name": "read_file",
+            "arguments": {"path": "input_files/approval.txt"},
+            "is_error": False,
+            "error_code": None,
+        }
+    ]
+    observation["approval_pause_observed"] = False
+    observation["approval_kind"] = None
+    observation["approval_resumes"] = 0
+    observation["workspace_assertions_passed"] = False
+    observation["infrastructure_failure"] = True
+    observation["stop_reason"] = "model_provider_failed"
+    observation["diagnostic_error_types"] = ["RateLimitError"]
+    approval_case["score"] = {
+        "case_id": "approval_continue",
+        "capability": "approval_continuation",
+        "passed": None,
+        "core_success": None,
+        "capability_passed": None,
+        "inconclusive": True,
+    }
+    trial["cases"] = [approval_case]
+    payload["runs"][0]["trials"] = [trial]
+    report_path = tmp_path / "partial-approval-report.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+
+    module.render_model_quality_report(
+        report_path,
+        benchmark_path=benchmark_path,
+        run_record_path=run_record_path,
+    )
+
+    run_record = run_record_path.read_text(encoding="utf-8")
+    assert "read_file" in run_record
+    assert "Approval case was reached, but approval evidence was not reached." in run_record
+    assert "model_provider_failed" in run_record
+    assert "RateLimitError" in run_record
+    assert "Evaluator verdict: **INCONCLUSIVE**" in run_record
+    assert "Approval resumes:" not in run_record
+    assert "-before_gate" not in run_record
+    assert "+after_gate" not in run_record
+    assert "UNTRUSTED_FINAL_SENTINEL" not in run_record
+
+
 @pytest.mark.parametrize("dirty", [True, None, "false"])
 def test_renderer_rejects_any_report_not_explicitly_clean(
     tmp_path: Path,

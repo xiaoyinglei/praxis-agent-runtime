@@ -104,6 +104,18 @@ def _render_benchmark(
                 "",
             ]
         )
+        infrastructure = model.get("infrastructure_failure")
+        if isinstance(infrastructure, Mapping):
+            lines.extend(
+                [
+                    "- Infrastructure status: **INCONCLUSIVE**",
+                    f"- Infrastructure stage: `{_scalar(infrastructure.get('stage'))}`",
+                    f"- Stop reason: `{_scalar(infrastructure.get('stop_reason'))}`",
+                    "- Diagnostic error types: "
+                    f"`{_scalar(infrastructure.get('diagnostic_error_types'))}`",
+                    "",
+                ]
+            )
         observed = _mapping(model.get("observed"), label=f"{model_alias} observed metrics")
         thresholds = _mapping(model.get("thresholds"), label=f"{model_alias} thresholds")
         if observed:
@@ -193,6 +205,18 @@ def _render_approval_record(
                     "",
                 ]
             )
+        else:
+            infrastructure = _report_infrastructure_failure(report)
+            if infrastructure is not None:
+                lines.extend(
+                    [
+                        f"- Infrastructure stage: `{_scalar(infrastructure.get('stage'))}`",
+                        f"- Stop reason: `{_scalar(infrastructure.get('stop_reason'))}`",
+                        "- Diagnostic error types: "
+                        f"`{_scalar(infrastructure.get('diagnostic_error_types'))}`",
+                        "",
+                    ]
+                )
         lines.extend(
             [
                 "### Evaluator verdict",
@@ -224,6 +248,27 @@ def _render_approval_record(
             arguments = _mapping(call.get("arguments"), label="tool arguments")
             error = " error" if call.get("is_error") is True else ""
             lines.append(f"{index}. `{tool_name}`{error}: `{_safe_json(arguments)}`")
+        if not _approval_evidence_reached(observation):
+            lines.extend(
+                [
+                    "",
+                    "### Approval evidence",
+                    "",
+                    "Approval case was reached, but approval evidence was not reached.",
+                    "",
+                    "No approval/resume, workspace diff assertion, or final answer evidence was reported.",
+                    "",
+                    f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
+                    "- Diagnostic error types: "
+                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    "",
+                    "### Evaluator verdict",
+                    "",
+                    f"Evaluator verdict: **{case.verdict}**",
+                    "",
+                ]
+            )
+            continue
         lines.extend(
             [
                 "",
@@ -255,6 +300,30 @@ def _render_approval_record(
             ]
         )
     return "\n".join(lines)
+
+
+def _approval_evidence_reached(observation: Mapping[str, object]) -> bool:
+    resumes = observation.get("approval_resumes")
+    return (
+        observation.get("infrastructure_failure") is not True
+        and observation.get("approval_pause_observed") is True
+        and observation.get("approval_kind") == "tool_approval"
+        and isinstance(resumes, int)
+        and not isinstance(resumes, bool)
+        and resumes >= 1
+    )
+
+
+def _report_infrastructure_failure(
+    report: Mapping[str, object],
+) -> Mapping[str, object] | None:
+    for field in ("runs", "models"):
+        for raw_item in _sequence(report.get(field), label=field):
+            item = _mapping(raw_item, label=field[:-1])
+            failure = item.get("infrastructure_failure")
+            if isinstance(failure, Mapping):
+                return cast(Mapping[str, object], failure)
+    return None
 
 
 class _RenderedCase:

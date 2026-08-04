@@ -516,6 +516,232 @@ async def test_run_model_trials_returns_inconclusive_partial_evidence(
     assert raw_case["score"]["passed"] is None
 
 
+@pytest.mark.parametrize("failure_stage", ["from_env", "current_model"])
+@pytest.mark.anyio
+async def test_gate_records_control_plane_initialization_failure_before_cases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_stage: str,
+) -> None:
+    module = _load_gate_module()
+    case_called = False
+
+    class FailingControlPlane:
+        @classmethod
+        def from_env(cls, **_kwargs: object) -> FailingControlPlane:
+            if failure_stage == "from_env":
+                raise RuntimeError("provider bootstrap unavailable")
+            return cls()
+
+        def current_model(self) -> object:
+            raise RuntimeError("model identity unavailable")
+
+    async def should_not_run_case(**_kwargs: object) -> object:
+        nonlocal case_called
+        case_called = True
+        raise AssertionError("live case must not run")
+
+    from agent_runtime import models as model_module
+
+    monkeypatch.setattr(model_module, "ModelControlPlane", FailingControlPlane)
+    monkeypatch.setattr(module, "run_live_case", should_not_run_case)
+    monkeypatch.setattr(
+        module,
+        "source_repository_fingerprint",
+        lambda _repository: SimpleNamespace(
+            source_commit="e" * 40,
+            source_tree="f" * 40,
+            dirty=False,
+        ),
+    )
+    report_path = tmp_path / "initialization-report.json"
+    args = SimpleNamespace(
+        repository=module.ROOT,
+        fixture=FIXTURE_PATH,
+        baseline=BASELINE_PATH,
+        env_file=tmp_path / ".env",
+        models=["groq_gpt_oss_120b"],
+        report=report_path,
+    )
+
+    exit_code = await module._gate(args)
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert case_called is False
+    assert payload["status"] == "inconclusive"
+    assert payload["passed"] is None
+    assert payload["source_commit"] == "e" * 40
+    assert payload["source_tree"] == "f" * 40
+    assert payload["dirty"] is False
+    assert payload["runs"][0]["trials"] == []
+    assert payload["runs"][0]["infrastructure_failure"] == {
+        "case_id": None,
+        "diagnostic_error_types": ["RuntimeError"],
+        "stage": "model_control_plane_initialization",
+        "stop_reason": "model_control_plane_initialization_failed",
+    }
+
+    renderer_path = SCRIPT_PATH.with_name("render_model_quality_report.py")
+    spec = importlib.util.spec_from_file_location(
+        "render_model_quality_report_from_initialization",
+        renderer_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    renderer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = renderer
+    spec.loader.exec_module(renderer)
+    benchmark = tmp_path / "initialization-benchmark.md"
+    run_record = tmp_path / "initialization-run.md"
+
+    renderer.render_model_quality_report(
+        report_path,
+        benchmark_path=benchmark,
+        run_record_path=run_record,
+    )
+
+    assert "Overall verdict: **INCONCLUSIVE**" in benchmark.read_text(
+        encoding="utf-8"
+    )
+    rendered_run = run_record.read_text(encoding="utf-8")
+    assert "Approval-continuation case was not reached." in rendered_run
+    assert "model_control_plane_initialization_failed" in rendered_run
+
+
+def test_cli_returns_two_and_writes_report_for_control_plane_initialization_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    case_called = False
+
+    class FailingControlPlane:
+        @classmethod
+        def from_env(cls, **_kwargs: object) -> FailingControlPlane:
+            raise RuntimeError("provider bootstrap unavailable")
+
+    async def should_not_run_case(**_kwargs: object) -> object:
+        nonlocal case_called
+        case_called = True
+        raise AssertionError("live case must not run")
+
+    from agent_runtime import models as model_module
+
+    monkeypatch.setattr(model_module, "ModelControlPlane", FailingControlPlane)
+    monkeypatch.setattr(module, "run_live_case", should_not_run_case)
+    monkeypatch.setattr(
+        module,
+        "source_repository_fingerprint",
+        lambda _repository: SimpleNamespace(
+            source_commit="1" * 40,
+            source_tree="2" * 40,
+            dirty=False,
+        ),
+    )
+    report_path = tmp_path / "cli-initialization-report.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT_PATH),
+            "gate",
+            "--repository",
+            str(module.ROOT),
+            "--fixture",
+            str(FIXTURE_PATH),
+            "--baseline",
+            str(BASELINE_PATH),
+            "--env-file",
+            str(tmp_path / ".env"),
+            "--model",
+            "groq_gpt_oss_120b",
+            "--report",
+            str(report_path),
+        ],
+    )
+
+    exit_code = module.main()
+
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 2
+    assert case_called is False
+    assert payload["status"] == "inconclusive"
+    assert payload["passed"] is None
+
+
+@pytest.mark.anyio
+async def test_model_trial_initialization_does_not_swallow_programming_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+
+    class BuggyControlPlane:
+        @classmethod
+        def from_env(cls, **_kwargs: object) -> BuggyControlPlane:
+            raise TypeError("programming defect")
+
+    from agent_runtime import models as model_module
+
+    monkeypatch.setattr(model_module, "ModelControlPlane", BuggyControlPlane)
+
+    with pytest.raises(TypeError, match="programming defect"):
+        await module.run_model_trials(
+            model_alias="groq_gpt_oss_120b",
+            cases=module.load_suite(FIXTURE_PATH)["cases"],
+            trials=3,
+            env_file=tmp_path / ".env",
+        )
+
+
+def test_calibrate_cli_returns_two_without_partial_initialization_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+
+    class FailingControlPlane:
+        @classmethod
+        def from_env(cls, **_kwargs: object) -> FailingControlPlane:
+            raise RuntimeError("provider bootstrap unavailable")
+
+    from agent_runtime import models as model_module
+
+    monkeypatch.setattr(model_module, "ModelControlPlane", FailingControlPlane)
+    monkeypatch.setattr(
+        module,
+        "source_repository_fingerprint",
+        lambda _repository: SimpleNamespace(
+            source_commit="3" * 40,
+            source_tree="4" * 40,
+            dirty=False,
+        ),
+    )
+    baseline_path = tmp_path / "partial-baseline.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(SCRIPT_PATH),
+            "calibrate",
+            "--repository",
+            str(module.ROOT),
+            "--fixture",
+            str(FIXTURE_PATH),
+            "--baseline",
+            str(baseline_path),
+            "--env-file",
+            str(tmp_path / ".env"),
+        ],
+    )
+
+    exit_code = module.main()
+
+    assert exit_code == 2
+    assert not baseline_path.exists()
+
+
 @pytest.mark.anyio
 async def test_gate_writes_provenance_complete_inconclusive_report(
     monkeypatch: pytest.MonkeyPatch,
@@ -608,6 +834,127 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
     assert "Approval-continuation case was not reached." in run_record.read_text(
         encoding="utf-8"
     )
+
+
+@pytest.mark.anyio
+async def test_gate_approval_infrastructure_report_renders_only_partial_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    suite = _quality_suite()
+    observation = module.CaseObservation(
+        case_id="approval_continue",
+        capability="approval_continuation",
+        status="failed",
+        answer="UNTRUSTED_FINAL_SENTINEL",
+        tool_calls=(
+            module.ToolCallEvidence(
+                "partial-read",
+                "read_file",
+                {"path": "input_files/approval.txt"},
+                False,
+                None,
+            ),
+        ),
+        model_calls=1,
+        input_tokens=1,
+        output_tokens=1,
+        latency_ms=1.0,
+        tool_schema_bytes=1,
+        approval_pause_observed=False,
+        approval_kind=None,
+        approval_resumes=0,
+        workspace_assertions_passed=False,
+        stop_reason="model_provider_failed",
+        diagnostic_codes=("model_provider_failed",),
+        diagnostic_error_types=("RateLimitError",),
+        infrastructure_failure=True,
+    )
+
+    class FakeControlPlane:
+        @classmethod
+        def from_env(cls, **_kwargs: object) -> FakeControlPlane:
+            return cls()
+
+        def current_model(self) -> object:
+            return SimpleNamespace(
+                provider="groq",
+                provider_model="openai/gpt-oss-120b",
+            )
+
+    async def run_case(**_kwargs: object) -> object:
+        return observation
+
+    from agent_runtime import models as model_module
+
+    monkeypatch.setattr(model_module, "ModelControlPlane", FakeControlPlane)
+    monkeypatch.setattr(module, "run_live_case", run_case)
+    monkeypatch.setattr(module, "load_suite", lambda _path: suite)
+    monkeypatch.setattr(module, "validate_baseline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "source_repository_fingerprint",
+        lambda _repository: SimpleNamespace(
+            source_commit="5" * 40,
+            source_tree="6" * 40,
+            dirty=False,
+        ),
+    )
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "groq_gpt_oss_120b": {
+                        "trial_count": 3,
+                        "thresholds": {},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "approval-infrastructure.json"
+    exit_code = await module._gate(
+        SimpleNamespace(
+            repository=module.ROOT,
+            fixture=tmp_path / "cases.json",
+            baseline=baseline,
+            env_file=tmp_path / ".env",
+            models=["groq_gpt_oss_120b"],
+            report=report_path,
+        )
+    )
+    renderer_path = SCRIPT_PATH.with_name("render_model_quality_report.py")
+    spec = importlib.util.spec_from_file_location(
+        "render_model_quality_report_from_partial_approval",
+        renderer_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    renderer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = renderer
+    spec.loader.exec_module(renderer)
+    run_record = tmp_path / "approval-run.md"
+
+    renderer.render_model_quality_report(
+        report_path,
+        benchmark_path=tmp_path / "approval-benchmark.md",
+        run_record_path=run_record,
+    )
+
+    rendered = run_record.read_text(encoding="utf-8")
+    assert exit_code == 2
+    assert "read_file" in rendered
+    assert "Approval case was reached, but approval evidence was not reached." in rendered
+    assert "model_provider_failed" in rendered
+    assert "RateLimitError" in rendered
+    assert "Evaluator verdict: **INCONCLUSIVE**" in rendered
+    assert "Approval resumes:" not in rendered
+    assert "-before_gate" not in rendered
+    assert "+after_gate" not in rendered
+    assert "UNTRUSTED_FINAL_SENTINEL" not in rendered
 
 
 def test_fixture_locks_models_and_quality_capabilities() -> None:
