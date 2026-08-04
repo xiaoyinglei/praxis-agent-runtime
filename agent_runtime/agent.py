@@ -14,6 +14,7 @@ from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelControlPlane, ModelSpec
 from agent_runtime.result import AgentPause, AgentResult, _project_pause
 from agent_runtime.streaming.events import StreamEvent
+from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -25,8 +26,6 @@ if TYPE_CHECKING:
     from agent_runtime.turns import RuntimeBinding, TurnStore
 
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
-DEFAULT_CHECKPOINT_PATH = Path(".praxis/checkpoints.sqlite")
-DEFAULT_MODEL_SESSION_PATH = Path(".praxis/model_session.json")
 logger = logging.getLogger(__name__)
 
 

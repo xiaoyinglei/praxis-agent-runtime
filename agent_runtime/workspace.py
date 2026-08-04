@@ -31,6 +31,8 @@ _TEMP_RUNTIME_DIRECTORIES = frozenset(
     {"artifacts", "logs", "reports", "scratch"}
 )
 _WORKSPACE_SNAPSHOT_REVISION = b"workspace-tree-v1\0"
+DEFAULT_CHECKPOINT_PATH = Path(".praxis/checkpoints.sqlite")
+DEFAULT_MODEL_SESSION_PATH = Path(".praxis/model_session.json")
 
 
 class WorkspacePathError(ValueError):

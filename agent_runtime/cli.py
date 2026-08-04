@@ -14,7 +14,6 @@ import click
 import typer
 import yaml
 
-from agent_runtime.agent import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 from agent_runtime.core.llm_registry import UnknownModelAliasError
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
@@ -32,6 +31,7 @@ from agent_runtime.turns import (
     TurnStateError,
     TurnStore,
 )
+from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent
