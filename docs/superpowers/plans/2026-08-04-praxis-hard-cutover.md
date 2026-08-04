@@ -83,7 +83,7 @@ def test_distribution_and_console_entrypoint_use_praxis_namespace() -> None:
 
 def test_legacy_rag_agent_package_is_absent() -> None:
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("rag.agent")
+        importlib.import_module("rag." + "agent")
 
 
 def test_rag_root_no_longer_exports_agent_runtime_objects() -> None:
@@ -93,7 +93,11 @@ def test_rag_root_no_longer_exports_agent_runtime_objects() -> None:
 
 Also add a source scan that fails on `rag.agent` in active code/tests/scripts,
 with an explicit allowlist for `tests/agent/test_code_agent_benchmark.py` and
-the frozen manifest.
+the frozen manifest. Every negative-test needle must itself be assembled from
+non-contiguous pieces (for example, `"rag." + "agent"` and
+`"Private-" + "RAG-Agent"`); comments and docstrings in active test files must
+not spell a forbidden token literally. This keeps the same zero-hit scan valid
+in both Task 1 and Task 8 without excluding the contract tests themselves.
 
 - [ ] **Step 2: Run the contract test and confirm RED**
 
@@ -695,7 +699,9 @@ git commit -m "docs: add deterministic Praxis demo"
 Assert README contains the approved title/tagline, demo link, architecture,
 evidence, Quickstart, optional RAG, safety/limitations, and MIT link. Assert it
 does not contain `Private-RAG-Agent`, a `production-ready` claim, or active
-`rag.agent` paths.
+`rag.agent` paths. Construct all forbidden test needles from non-contiguous
+pieces so the negative test source is not itself a scan hit; do not add a broad
+test-file exception.
 
 - [ ] **Step 2: Run the presentation tests and confirm RED**
 
@@ -731,7 +737,9 @@ git diff --check
 ```
 
 Expected: presentation tests pass; any remaining search hits are reviewed and
-limited to the explicit frozen benchmark exception. Commit:
+limited to the explicit frozen benchmark exception. The two new negative-test
+files are included in this zero-hit rule because their needles are split.
+Commit:
 
 ```bash
 git add README.md LICENSE docs tests/repo/test_readme_presentation.py
