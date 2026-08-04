@@ -55,6 +55,10 @@ from agent_runtime.loop.state import (
 )
 from agent_runtime.loop.stop_hooks import StopHookOutcome, StopHookRunner
 from agent_runtime.memory.compactor import LoopCompactionResult
+from agent_runtime.modeling.gateway import (
+    LLMContextOverflowError,
+    LLMToolCallValidationError,
+)
 from agent_runtime.planning import (
     MAX_PLAN_EVENTS,
     AgentPlan,
@@ -81,10 +85,6 @@ from agent_runtime.tools.executor import ToolExecutionRecord, ToolExecutor
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.selection import FIND_TOOLS_NAME, reduce_tool_activation
 from agent_runtime.tools.tool import JsonValue, Tool, ToolCall, ToolCallOrigin, ToolResult
-from rag.providers.llm_gateway import (
-    LLMContextOverflowError,
-    LLMToolCallValidationError,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +106,8 @@ _NATIVE_TOOL_SET = frozenset(
 
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
 _MAX_RETRYABLE_IDENTICAL_FAILURES = 2
-_EXPLORATION_TOOL_NAMES = frozenset(
-    {"list_files", "search_text", "read_file", "run_command", "find_tools"}
-)
-_STABLE_INSPECTION_TOOL_NAMES = frozenset(
-    {"list_files", "search_text", "read_file", "find_tools"}
-)
+_EXPLORATION_TOOL_NAMES = frozenset({"list_files", "search_text", "read_file", "run_command", "find_tools"})
+_STABLE_INSPECTION_TOOL_NAMES = frozenset({"list_files", "search_text", "read_file", "find_tools"})
 
 
 def _add_model_latency(state: LoopState, latency_ms: float) -> None:
@@ -655,9 +651,7 @@ class AgentLoop:
         retries: int,
     ) -> tuple[ModelTurn | None, int]:
         """Model provider failure.  Retry or fail."""
-        safe_error = redact_sensitive_text(
-            str(exc) or type(exc).__name__
-        )
+        safe_error = redact_sensitive_text(str(exc) or type(exc).__name__)
         if isinstance(exc, LLMToolCallValidationError):
             append_loop_diagnostic(
                 state,
@@ -670,14 +664,10 @@ class AgentLoop:
             )
             feedback: dict[str, JsonValue] = {
                 "recovery": "correct_tool_arguments",
-                "validation_error": redact_sensitive_text(
-                    exc.validation_error
-                ),
+                "validation_error": redact_sensitive_text(exc.validation_error),
             }
             if exc.failed_generation:
-                feedback["failed_generation"] = redact_sensitive_text(
-                    exc.failed_generation
-                )
+                feedback["failed_generation"] = redact_sensitive_text(exc.failed_generation)
             _append_turn_messages(
                 state,
                 (
@@ -690,9 +680,7 @@ class AgentLoop:
             await self._emit_stream(
                 recovery_event(
                     strategy="tool_call_correction",
-                    detail=redact_sensitive_text(
-                        exc.validation_error
-                    )[:200],
+                    detail=redact_sensitive_text(exc.validation_error)[:200],
                     turn_id=state["run_config"].turn_id,
                     iteration=state["iteration"],
                 )
@@ -756,11 +744,9 @@ class AgentLoop:
             state,
             calls,
         )
-        executable_calls, repeated_inspection_results = (
-            _guard_repeated_successful_inspections(
-                state,
-                circuit_checked_calls,
-            )
+        executable_calls, repeated_inspection_results = _guard_repeated_successful_inspections(
+            state,
+            circuit_checked_calls,
         )
         for call in executable_calls:
             await self._emit_stream(
@@ -947,9 +933,7 @@ class AgentLoop:
                 "result_count": len(new_results),
                 "pending_count": len(state["pending_tool_calls"]),
                 "circuit_breaker_count": len(circuit_results),
-                "repeated_inspection_count": len(
-                    repeated_inspection_results
-                ),
+                "repeated_inspection_count": len(repeated_inspection_results),
             },
             checkpoint_reason="tool_results_recorded",
         )
@@ -1378,38 +1362,22 @@ class AgentLoop:
         tool_results: Sequence[ToolResult] = (),
     ) -> None:
         memory_state = state["memory_state"]
-        observation_limit = (
-            state["run_config"].memory_policy.reactive_compact_max_observations
-        )
-        locator_limit = (
-            state["run_config"].memory_policy.reactive_compact_max_evidence
-        )
-        observations_by_id = {
-            observation.tool_call_id: observation
-            for observation in memory_state.recent_observations
-        }
+        observation_limit = state["run_config"].memory_policy.reactive_compact_max_observations
+        locator_limit = state["run_config"].memory_policy.reactive_compact_max_evidence
+        observations_by_id = {observation.tool_call_id: observation for observation in memory_state.recent_observations}
         for observation in batch.structured_observations:
             observations_by_id[observation.tool_call_id] = observation
 
         locators_by_key = {
-            json.dumps(locator, ensure_ascii=False, sort_keys=True): locator
-            for locator in memory_state.known_locators
+            json.dumps(locator, ensure_ascii=False, sort_keys=True): locator for locator in memory_state.known_locators
         }
         new_locators = [
             *batch.locators,
-            *[
-                locator
-                for observation in batch.structured_observations
-                for locator in observation.locators
-            ],
+            *[locator for observation in batch.structured_observations for locator in observation.locators],
         ]
         for locator in new_locators:
-            locators_by_key[
-                json.dumps(locator, ensure_ascii=False, sort_keys=True)
-            ] = locator
-        verified_paths = dict.fromkeys(
-            memory_state.verified_workspace_paths
-        )
+            locators_by_key[json.dumps(locator, ensure_ascii=False, sort_keys=True)] = locator
+        verified_paths = dict.fromkeys(memory_state.verified_workspace_paths)
         for path in grounded_workspace_paths(
             locators=new_locators,
             tool_results=(
@@ -1422,9 +1390,7 @@ class AgentLoop:
 
         state["memory_state"] = memory_state.model_copy(
             update={
-                "recent_observations": list(observations_by_id.values())[
-                    -observation_limit:
-                ],
+                "recent_observations": list(observations_by_id.values())[-observation_limit:],
                 "verified_workspace_paths": list(verified_paths),
                 "known_locators": list(locators_by_key.values())[-locator_limit:],
             }
@@ -1447,10 +1413,7 @@ async def _remaining_llm_budget(handles: Any) -> int | None:
 def _delivery_cycle_results(state: LoopState) -> list[ToolResult]:
     cycle: list[ToolResult] = []
     for result in reversed(state["tool_results"]):
-        if (
-            result.tool_name != "update_plan"
-            and result.tool_name not in _EXPLORATION_TOOL_NAMES
-        ):
+        if result.tool_name != "update_plan" and result.tool_name not in _EXPLORATION_TOOL_NAMES:
             break
         cycle.append(result)
     cycle.reverse()
@@ -1495,9 +1458,7 @@ def _guard_repeated_tool_failures(
                     "repeated_failure": True,
                     "original_tool_call_id": failures[0].tool_call_id,
                     "failure_count": len(failures),
-                    "last_error_code": (
-                        failures[-1].error_code or "unknown"
-                    ),
+                    "last_error_code": (failures[-1].error_code or "unknown"),
                 },
                 metadata={
                     "failure_count": len(failures),
@@ -1516,16 +1477,12 @@ def _guard_repeated_successful_inspections(
     successful_cycle_results = tuple(
         result
         for result in _delivery_cycle_results(state)
-        if not result.is_error
-        and result.tool_name in _STABLE_INSPECTION_TOOL_NAMES
+        if not result.is_error and result.tool_name in _STABLE_INSPECTION_TOOL_NAMES
     )
     executable: list[ToolCall] = []
     blocked: list[ToolResult] = []
     for call in calls:
-        if (
-            call.tool_call_id in state["tool_execution_records"]
-            or call.tool_name not in _STABLE_INSPECTION_TOOL_NAMES
-        ):
+        if call.tool_call_id in state["tool_execution_records"] or call.tool_name not in _STABLE_INSPECTION_TOOL_NAMES:
             executable.append(call)
             continue
         previous = next(
@@ -1533,10 +1490,7 @@ def _guard_repeated_successful_inspections(
                 result
                 for result in reversed(successful_cycle_results)
                 if (
-                    (previous_call := state["canonical_tool_calls"].get(
-                        result.tool_call_id
-                    ))
-                    is not None
+                    (previous_call := state["canonical_tool_calls"].get(result.tool_call_id)) is not None
                     and _same_tool_invocation(previous_call, call)
                 )
             ),
@@ -1579,10 +1533,7 @@ def _matching_tool_failures_since_recovery(
         ):
             break
         previous_call = state["canonical_tool_calls"].get(result.tool_call_id)
-        if (
-            previous_call is None
-            or not _same_failed_operation(previous_call, call, result)
-        ):
+        if previous_call is None or not _same_failed_operation(previous_call, call, result):
             continue
         if not result.is_error:
             break
@@ -1651,11 +1602,7 @@ def _tool_failure_evidence_fingerprint(
         structured_content,
         Mapping,
     ):
-        structured_content = {
-            key: value
-            for key, value in structured_content.items()
-            if key != "duration_ms"
-        }
+        structured_content = {key: value for key, value in structured_content.items() if key != "duration_ms"}
     visible_content = tuple(
         {
             "type": block.type,
@@ -1676,9 +1623,7 @@ def _tool_failure_evidence_fingerprint(
             "truncated": result.truncated,
         },
     )
-    return hashlib.sha256(
-        canonical_json_text(payload).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(canonical_json_text(payload).encode("utf-8")).hexdigest()
 
 
 def _same_tool_invocation(left: ToolCall, right: ToolCall) -> bool:
@@ -1692,10 +1637,7 @@ def _same_failed_operation(
 ) -> bool:
     if left.tool_name != right.tool_name:
         return False
-    if (
-        left.tool_name == "run_command"
-        and result.error_code == "command_failed"
-    ):
+    if left.tool_name == "run_command" and result.error_code == "command_failed":
         left_arguments = dict(left.arguments)
         right_arguments = dict(right.arguments)
         left_arguments.pop("timeout_seconds", None)
@@ -1844,9 +1786,7 @@ def _approval_request(
             cwd=cwd if isinstance(cwd, str) else None,
             execution_mode=(execution_mode if isinstance(execution_mode, str) else "restricted_sandbox"),
             network_requested=network_requested,
-            workspace_path=(
-                workspace_path if isinstance(workspace_path, str) else None
-            ),
+            workspace_path=(workspace_path if isinstance(workspace_path, str) else None),
             workspace_write=workspace_write,
         )
         if approval_scope == "network":
@@ -1855,8 +1795,7 @@ def _approval_request(
             question = f"Allow run_command to execute once in restricted_sandbox mode? {reason}"
             if workspace_write:
                 question += (
-                    " This approval grants destructive write access to the "
-                    "entire workspace except Git metadata."
+                    " This approval grants destructive write access to the entire workspace except Git metadata."
                 )
             if network_requested:
                 question += " Network access is not included in this approval."
@@ -1910,8 +1849,7 @@ def _run_command_approval_preview(
         ensure_ascii=False,
     )
     workspace_write_text = (
-        f"requested for entire workspace {workspace_path_text} "
-        "(Git metadata remains read-only)"
+        f"requested for entire workspace {workspace_path_text} (Git metadata remains read-only)"
         if workspace_write
         else "disabled (workspace is read-only)"
     )

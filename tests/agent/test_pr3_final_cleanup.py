@@ -27,9 +27,9 @@ from agent_runtime.loop.state import (
     create_loop_state,
 )
 from agent_runtime.loop.substate import MemoryState
+from agent_runtime.modeling.config import GenerationConfig
+from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.tools.tool import ToolContentBlock, ToolResult
-from rag.models.config import GenerationConfig
-from rag.schema.llm import LLMCallStage
 
 
 def _production_source(relative_path: str) -> str:
@@ -67,38 +67,24 @@ def test_runtime_helpers_have_one_canonical_owner() -> None:
 
 def test_substate_does_not_import_its_owner_module() -> None:
     tree = ast.parse(_production_source("agent_runtime/loop/substate.py"))
-    imports = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime.loop.state" not in imports
 
 
 def test_local_runtime_only_type_checks_public_model_contract() -> None:
     tree = ast.parse(_production_source("agent_runtime/local_runtime.py"))
-    runtime_imports = {
-        node.module
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-    }
+    runtime_imports = {node.module for node in tree.body if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime.models" not in runtime_imports
 
 
 def test_memory_digest_does_not_depend_on_checkpointing() -> None:
     compactor_tree = ast.parse(_production_source("agent_runtime/memory/compactor.py"))
-    compactor_imports = {
-        node.module
-        for node in ast.walk(compactor_tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    compactor_imports = {node.module for node in ast.walk(compactor_tree) if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime.core.checkpointing" not in compactor_imports
-    assert "def _digest_text(" not in _production_source(
-        "agent_runtime/core/checkpointing.py"
-    )
+    assert "def _digest_text(" not in _production_source("agent_runtime/core/checkpointing.py")
 
 
 def test_orphaned_persistent_memory_capability_is_removed() -> None:
@@ -137,9 +123,7 @@ def test_checkpoint_decode_rejects_legacy_memory_state_identity() -> None:
         "ZGVsX3ZhbGlkYXRlX2pzb24="
     )
 
-    restored = agent_checkpoint_serde().loads_typed(
-        ("msgpack", legacy_payload)
-    )
+    restored = agent_checkpoint_serde().loads_typed(("msgpack", legacy_payload))
 
     assert isinstance(restored, dict)
     assert not isinstance(restored, MemoryState)
@@ -153,22 +137,14 @@ def test_model_provider_contracts_do_not_import_loop_implementation() -> None:
         "agent_runtime/core/model_provider_runtime.py",
     ):
         tree = ast.parse(_production_source(relative_path))
-        imports = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-        }
+        imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
         assert "agent_runtime.loop.runtime" not in imports
 
 
 def test_checkpoint_legacy_alias_does_not_import_public_facade() -> None:
     tree = ast.parse(_production_source("agent_runtime/core/checkpointing.py"))
-    imports = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime" not in imports
 

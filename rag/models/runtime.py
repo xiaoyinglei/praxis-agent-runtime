@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 from rag.models.catalog import ModelCatalog
-from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
 _DISABLED_RERANKER_ALIASES = {"", "none", "null", "off", "false"}
 

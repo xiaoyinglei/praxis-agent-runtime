@@ -52,6 +52,12 @@ from agent_runtime.core.turn_contracts import (
     ToolManifestDriftStatus,
 )
 from agent_runtime.file_manifest import FileManifest, build_file_manifest
+from agent_runtime.knowledge import (
+    AgentCitation,
+    AgentEvidence,
+    agent_citation_from_value,
+    agent_evidence_from_value,
+)
 from agent_runtime.loop.runtime import AgentLoop
 from agent_runtime.loop.state import (
     LoopPause,
@@ -92,7 +98,6 @@ from agent_runtime.workspace import (
     import_files,
     open_workspace,
 )
-from rag.schema.query import AnswerCitation, EvidenceItem
 
 logger = logging.getLogger(__name__)
 _TURN_LEASE_SECONDS = 300.0
@@ -162,8 +167,8 @@ class AgentRunResult(BaseModel):
     tool_results: list[ToolResult] = Field(default_factory=list)
     tool_call_arguments: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     model_call_records: list[ModelCallRecord] = Field(default_factory=list)
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    citations: list[AnswerCitation] = Field(default_factory=list)
+    evidence: list[AgentEvidence] = Field(default_factory=list)
+    citations: list[AgentCitation] = Field(default_factory=list)
     input_files: list[str] = Field(default_factory=list)
     iteration: int = 0
     groundedness_flag: bool = False
@@ -177,6 +182,24 @@ class AgentRunResult(BaseModel):
     latency_profile: AgentLatencyProfile | None = None
     plan: AgentPlan | None = None
     plan_events: list[PlanEvent] = Field(default_factory=list)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _canonical_evidence(cls, value: object) -> object:
+        return (
+            [agent_evidence_from_value(item) for item in value]
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+            else value
+        )
+
+    @field_validator("citations", mode="before")
+    @classmethod
+    def _canonical_citations(cls, value: object) -> object:
+        return (
+            [agent_citation_from_value(item) for item in value]
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes))
+            else value
+        )
 
     @classmethod
     def from_loop_result(
@@ -351,9 +374,7 @@ class AgentService:
         try:
             history = self._turn_store.history_before_turn(turn.turn_id)
             if history and history[0].role != "user":
-                raise RuntimeError(
-                    f"History for Turn {turn.turn_id} does not begin with a user message"
-                )
+                raise RuntimeError(f"History for Turn {turn.turn_id} does not begin with a user message")
             effective_request = request.model_copy(
                 update={
                     "turn_id": turn.turn_id,
@@ -623,11 +644,7 @@ class AgentService:
             imported_files = import_files(
                 workspace,
                 [Path(item) for item in request.input_files],
-                namespace=(
-                    None
-                    if workspace.is_temporary
-                    else run_config.turn_id
-                ),
+                namespace=(None if workspace.is_temporary else run_config.turn_id),
             )
         file_manifest = build_file_manifest(
             workspace,
@@ -680,13 +697,8 @@ class AgentService:
         state = create_loop_state(
             current_message=request.message,
             run_config=run_config,
-            conversation_history=(
-                snapshot_model_message(message)
-                for message in request.conversation_history
-            ),
-            turn_transcript=(
-                ModelMessage(role="user", content=request.message),
-            ),
+            conversation_history=(snapshot_model_message(message) for message in request.conversation_history),
+            turn_transcript=(ModelMessage(role="user", content=request.message),),
             pending_tool_calls=request.pending_tool_calls,
             messages=request.messages,
             runtime_diagnostics=self._runtime_diagnostics,
@@ -1066,15 +1078,10 @@ class AgentService:
                 self._turn_store.sync_turn_messages(
                     turn_id,
                     checkpoint_turn,
-                    compaction_policy=(
-                        state["run_config"].memory_policy
-                    ),
+                    compaction_policy=(state["run_config"].memory_policy),
                 )
             except RuntimeError as exc:
-                raise RuntimeError(
-                    "Checkpoint and canonical history conflict for "
-                    f"Turn {turn_id}"
-                ) from exc
+                raise RuntimeError(f"Checkpoint and canonical history conflict for Turn {turn_id}") from exc
             current = checkpoint_turn
         initial = ModelMessage(role="user", content=turn.user_message)
         if not current:
@@ -1314,9 +1321,9 @@ def _result_mapping(result: ToolResult) -> Mapping[str, object] | None:
 
 def _result_provenance(
     results: Sequence[ToolResult],
-) -> tuple[list[EvidenceItem], list[AnswerCitation]]:
-    evidence: list[EvidenceItem] = []
-    citations: list[AnswerCitation] = []
+) -> tuple[list[AgentEvidence], list[AgentCitation]]:
+    evidence: list[AgentEvidence] = []
+    citations: list[AgentCitation] = []
     for result in results:
         if result.is_error:
             continue
@@ -1329,16 +1336,16 @@ def _result_provenance(
             (str, bytes),
         ):
             for item in raw_evidence:
-                evidence.append(EvidenceItem.model_validate(item))
+                evidence.append(agent_evidence_from_value(item))
         raw_citations = payload.get("citations", ()) or ()
         if isinstance(raw_citations, Sequence) and not isinstance(
             raw_citations,
             (str, bytes),
         ):
             for item in raw_citations:
-                if not isinstance(item, (Mapping, AnswerCitation)):
+                if not isinstance(item, (Mapping, AgentCitation)):
                     continue
-                citations.append(AnswerCitation.model_validate(item))
+                citations.append(agent_citation_from_value(item))
     return evidence, citations
 
 

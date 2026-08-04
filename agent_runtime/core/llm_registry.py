@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
-from rag.models.config import GenerationConfig, GenerationTaskConfig
-from rag.schema.llm import LLMCallStage, parse_llm_stage_budgets
+from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
+from agent_runtime.modeling.contracts import LLMCallStage, parse_llm_stage_budgets
 
 
 class UnknownModelAliasError(KeyError):
@@ -30,6 +30,12 @@ class ResolvedModel:
     provider: str = "openai-compatible"
     model: str = "agent-model"
     supports_native_tools: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ChatProviderConfig:
+    base_url: str
+    api_key: str | None
 
 
 class ModelResolver(Protocol):
@@ -60,9 +66,7 @@ class ModelRegistry:
     加载顺序：RAG_AGENT_MODELS_PATH(YAML) > RAG_AGENT_MODELS(JSON) > models.yaml 内置默认
     """
 
-    _BUNDLED_CONFIG_PATH = (
-        Path(__file__).resolve().parents[2] / "configs" / "models.yaml"
-    )
+    _BUNDLED_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "models.yaml"
     _BUNDLED_CONFIG_PACKAGE = "agent_runtime"
     _BUNDLED_CONFIG_RESOURCE = ("_data", "models.yaml")
 
@@ -190,20 +194,21 @@ class ModelRegistry:
         if not default_model and agent_models:
             default_model = next(iter(agent_models))
 
-        return AgentModelsConfig.model_validate({
-            "version": data.get("version", 1),
-            "models": agent_models,
-            "default_model": default_model,
-            "fallback_model": data.get("fallback_model", default_model),
-            "generation": _parse_generation_config(data.get("generation")),
-            "llm_stage_budgets": parse_llm_stage_budgets(data.get("llm_budgets")),
-        })
+        return AgentModelsConfig.model_validate(
+            {
+                "version": data.get("version", 1),
+                "models": agent_models,
+                "default_model": default_model,
+                "fallback_model": data.get("fallback_model", default_model),
+                "generation": _parse_generation_config(data.get("generation")),
+                "llm_stage_budgets": parse_llm_stage_budgets(data.get("llm_budgets")),
+            }
+        )
 
     def resolve(self, alias: str) -> ResolvedModel:
         """别名 → (Generator, kwargs)。按 alias 缓存，同 alias 多次调用返回同一 Generator。"""
-        from rag.assembly.support import build_provider
-        from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
-        from rag.providers.llm_gateway import LLMGateway
+        from agent_runtime.modeling.gateway import LLMGateway
+        from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 
         if alias in self._cache:
             return self._cache[alias]
@@ -212,15 +217,10 @@ class ModelRegistry:
         if spec is None:
             raise UnknownModelAliasError(f"Model alias {alias!r} not found in config")
 
-        provider_config = self._spec_to_provider_config(spec)
         try:
-            provider = build_provider(provider_config)
+            generator = _build_chat_generator(spec)
         except Exception as exc:
             raise ModelNotAvailableError(f"Failed to build provider for {alias!r}: {exc}") from exc
-
-        generator = getattr(provider, "generator", None)
-        if generator is None:
-            raise ModelNotAvailableError(f"Provider for {alias!r} does not support chat generation")
 
         kwargs: dict[str, Any] = {"max_tokens": spec.max_tokens, **spec.defaults}
         runtime_context_tokens = min(
@@ -231,25 +231,18 @@ class ModelRegistry:
             TokenizerContract(
                 embedding_model_name=spec.model,
                 tokenizer_model_name=spec.tokenizer_model or spec.model,
-                chunking_tokenizer_model_name=(
-                    spec.tokenizer_model or spec.model
-                ),
+                chunking_tokenizer_model_name=(spec.tokenizer_model or spec.model),
                 tokenizer_backend="auto",
                 max_context_tokens=runtime_context_tokens,
                 prompt_reserved_tokens=512,
                 local_files_only=True,
             )
         )
-        stage_budgets = {
-            stage: budget.model_copy()
-            for stage, budget in self._config.llm_stage_budgets.items()
-        }
+        stage_budgets = {stage: budget.model_copy() for stage, budget in self._config.llm_stage_budgets.items()}
         tool_decision_budget = stage_budgets[LLMCallStage.TOOL_DECISION]
         if spec.max_tokens > tool_decision_budget.max_output_tokens:
-            stage_budgets[LLMCallStage.TOOL_DECISION] = (
-                tool_decision_budget.model_copy(
-                    update={"max_output_tokens": spec.max_tokens}
-                )
+            stage_budgets[LLMCallStage.TOOL_DECISION] = tool_decision_budget.model_copy(
+                update={"max_output_tokens": spec.max_tokens}
             )
         resolved = ResolvedModel(
             generator=generator,
@@ -292,31 +285,45 @@ class ModelRegistry:
         alias = node_model or self._config.default_model
         return self.resolve_or_fallback(alias)
 
-    @staticmethod
-    def _spec_to_provider_config(spec: ModelSpec) -> Any:
-        from rag.assembly.models import ProviderConfig
 
-        if spec.provider == ModelProvider.MLX:
-            return ProviderConfig(
-                provider_kind="openai-compatible",
-                base_url=spec.base_url or "http://127.0.0.1:8080/v1",
-                chat_model=spec.model,
-                api_key=_api_key_from_env(spec.api_key_env),
-            )
-        if spec.provider == ModelProvider.OLLAMA:
-            return ProviderConfig(
-                provider_kind="ollama",
-                base_url=spec.base_url or "http://localhost:11434",
-                chat_model=spec.model,
-            )
-        if spec.provider == ModelProvider.OPENAI_COMPATIBLE:
-            return ProviderConfig(
-                provider_kind="openai-compatible",
-                base_url=spec.base_url or "http://127.0.0.1:8080/v1",
-                chat_model=spec.model,
-                api_key=_api_key_from_env(spec.api_key_env),
-            )
-        raise ValueError(f"Unsupported provider: {spec.provider}")
+def _build_chat_generator(spec: ModelSpec) -> object:
+    """Construct only the chat capability required by AgentRuntime.
+
+    Embedding and reranking construction remains owned by RAG assembly.
+    Imports are intentionally local so importing the runtime never imports
+    optional HTTP clients or model backends.
+    """
+
+    config = _chat_provider_config(spec)
+    if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
+        from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
+
+        return OpenAICompatibleChatGenerator(
+            model=spec.model,
+            base_url=config.base_url,
+            api_key=config.api_key,
+            supports_tools=spec.supports_tools,
+        )
+    if spec.provider is ModelProvider.OLLAMA:
+        from agent_runtime.modeling.providers.ollama.generator import OllamaGenerator
+
+        return OllamaGenerator(
+            base_url=config.base_url,
+            default_model=spec.model,
+            timeout_seconds=spec.timeout_seconds,
+        )
+    raise ValueError(f"Unsupported provider: {spec.provider}")
+
+
+def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
+    if spec.provider is ModelProvider.OLLAMA:
+        return ChatProviderConfig(base_url=spec.base_url or "http://localhost:11434", api_key=None)
+    if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
+        return ChatProviderConfig(
+            base_url=spec.base_url or "http://127.0.0.1:8080/v1",
+            api_key=_api_key_from_env(spec.api_key_env),
+        )
+    raise ValueError(f"Unsupported provider: {spec.provider}")
 
 
 def _merge_provider_model_entry(
@@ -404,12 +411,7 @@ def _expand_launch_command_template(
     alias: str,
     model: str,
 ) -> list[str]:
-    return [
-        str(part)
-        .replace("{model}", model)
-        .replace("{alias}", alias)
-        for part in template
-    ]
+    return [str(part).replace("{model}", model).replace("{alias}", alias) for part in template]
 
 
 def _agent_provider_kind(entry: dict[str, object]) -> str:

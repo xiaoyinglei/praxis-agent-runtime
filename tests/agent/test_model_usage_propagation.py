@@ -11,6 +11,7 @@ from agent_runtime.core.definition import AgentRuntimePolicy
 from agent_runtime.core.model_request import ModelCallRecord
 from agent_runtime.loop.runtime import ModelTurnEnvelope
 from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.result import AgentResult
 from agent_runtime.service import AgentRunRequest, AgentService
 from agent_runtime.tools.registry import ToolRegistry
@@ -24,7 +25,6 @@ from agent_runtime.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.schema.llm import LLMUsage
 
 
 def _tool() -> Tool:
@@ -122,9 +122,7 @@ async def test_provider_usage_reaches_checkpoint_internal_and_public_results() -
         checkpointer=checkpointer,
     )
 
-    internal = await service.run(
-        AgentRunRequest(message="Answer.", turn_id=run_id)
-    )
+    internal = await service.run(AgentRunRequest(message="Answer.", turn_id=run_id))
     public = AgentResult._from_internal(internal)
     loaded = await LangGraphCheckpointStore(
         checkpointer,

@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 from agent_runtime.cli import agent_app
 from agent_runtime.core.llm_registry import ModelNotAvailableError, ModelRegistry
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
+from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from agent_runtime.models import (
     ModelCatalog,
     ModelControlPlane,
@@ -20,8 +21,7 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSpec,
 )
-from rag.schema.llm import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
-from rag.utils.text import load_env_file
+from agent_runtime.text import load_env_file
 
 
 def _write_models_config(path: Path) -> None:

@@ -47,6 +47,13 @@ from agent_runtime.loop.stop_hooks import StopHookRunner
 from agent_runtime.memory.compactor import LoopContextCompactor
 from agent_runtime.memory.injector import ContextBuilder
 from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget, LLMUsage
+from agent_runtime.modeling.gateway import (
+    AgentModelResponse,
+    LLMContextOverflowError,
+)
+from agent_runtime.modeling.openai_wire import serialize_openai_request
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.planning import AgentPlan, PlanStep, PlanTracker
 from agent_runtime.tools.builtins.filesystem import ReadFileInput
 from agent_runtime.tools.builtins.shell import RunCommandInput
@@ -65,13 +72,6 @@ from agent_runtime.tools.tool import (
     json_schema_input,
     pydantic_input,
 )
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
-from rag.providers.llm_gateway import (
-    AgentModelResponse,
-    LLMContextOverflowError,
-)
-from rag.providers.openai_wire import serialize_openai_request
-from rag.schema.llm import LLMCallStage, LLMStageBudget, LLMUsage
 
 
 class _RecordingGateway:
@@ -142,9 +142,7 @@ class _OverflowOnceRecordingGateway(_RecordingGateway):
             wire = serialize_openai_request(request)
             raise LLMContextOverflowError(
                 stage=LLMCallStage.TOOL_DECISION,
-                input_tokens=self.token_accounting.count(
-                    wire.serialized_json
-                ),
+                input_tokens=self.token_accounting.count(wire.serialized_json),
                 max_input_tokens=1,
             )
         return await super().agenerate_model_request(**kwargs)
@@ -362,9 +360,7 @@ async def test_tool_rejection_projects_read_file_schema_delta_without_raw_genera
         model="test-model",
         provider="openai-compatible",
         supports_native_tools=True,
-        registry_snapshot={
-            "read_file": _tool_with_schema("read_file", read_file_schema)
-        },
+        registry_snapshot={"read_file": _tool_with_schema("read_file", read_file_schema)},
         resident_tool_names=("read_file",),
     )
     state = _state("read-file-tool-correction")
@@ -378,8 +374,7 @@ async def test_tool_rejection_projects_read_file_schema_delta_without_raw_genera
             {
                 "recovery": "correct_tool_arguments",
                 "validation_error": (
-                    "Tool call validation failed: additional properties "
-                    "line_start and line_end are not allowed"
+                    "Tool call validation failed: additional properties line_start and line_end are not allowed"
                 ),
                 "failed_generation": rejected_generation,
             },
@@ -395,9 +390,7 @@ async def test_tool_rejection_projects_read_file_schema_delta_without_raw_genera
 
     request = gateway.calls[0]["request"]
     correction_messages = [
-        message
-        for message in request.messages
-        if '"event_type":"tool_call_correction"' in message.content
+        message for message in request.messages if '"event_type":"tool_call_correction"' in message.content
     ]
     assert len(correction_messages) == 1
     correction = json.loads(correction_messages[0].content)["payload"]
@@ -421,10 +414,7 @@ async def test_tool_rejection_projects_read_file_schema_delta_without_raw_genera
     assert correction["failed_generation_chars"] == len(rejected_generation)
     assert len(correction["failed_generation_sha256"]) == 64
     assert rejected_generation not in correction_messages[0].content
-    assert not any(
-        '"event_type":"model_tool_call_rejected"' in message.content
-        for message in request.messages
-    )
+    assert not any('"event_type":"model_tool_call_rejected"' in message.content for message in request.messages)
     assert state["turn_transcript"] == canonical_transcript
 
 
@@ -455,15 +445,10 @@ async def test_duplicate_invalid_json_rejections_become_one_actionable_correctio
         {
             "recovery": "correct_tool_arguments",
             "validation_error": "earlier schema failure",
-            "failed_generation": (
-                '<function=run_command>{"command":"pytest -q"}</function>'
-            ),
+            "failed_generation": ('<function=run_command>{"command":"pytest -q"}</function>'),
         },
     )
-    malformed = (
-        '{"name":"run_command","arguments":{"command":"pytest -q"],'
-        '"timeout_seconds":600,"working_dir":"."}}'
-    )
+    malformed = '{"name":"run_command","arguments":{"command":"pytest -q"],"timeout_seconds":600,"working_dir":"."}}'
     rejected = context_event_message(
         "model_tool_call_rejected",
         {
@@ -490,9 +475,7 @@ async def test_duplicate_invalid_json_rejections_become_one_actionable_correctio
 
     request = gateway.calls[0]["request"]
     correction_messages = [
-        message
-        for message in request.messages
-        if '"event_type":"tool_call_correction"' in message.content
+        message for message in request.messages if '"event_type":"tool_call_correction"' in message.content
     ]
     assert len(correction_messages) == 1
     correction = json.loads(correction_messages[0].content)["payload"]
@@ -509,15 +492,9 @@ async def test_duplicate_invalid_json_rejections_become_one_actionable_correctio
         "workspace_write",
     ]
     assert correction_messages[0] == request.messages[-1]
-    assert any(
-        '"event_type":"working_state"' in message.content
-        for message in request.messages[:-1]
-    )
+    assert any('"event_type":"working_state"' in message.content for message in request.messages[:-1])
     assert malformed not in correction_messages[0].content
-    assert not any(
-        '"event_type":"model_tool_call_rejected"' in message.content
-        for message in request.messages
-    )
+    assert not any('"event_type":"model_tool_call_rejected"' in message.content for message in request.messages)
     assert state["turn_transcript"] == canonical_transcript
 
 
@@ -545,8 +522,7 @@ async def test_budget_projection_preserves_latest_failed_tool_pair_with_semantic
         for index in range(40)
     ]
     state["memory_state"].verified_workspace_paths = [
-        str(locator["path"])
-        for locator in state["memory_state"].known_locators
+        str(locator["path"]) for locator in state["memory_state"].known_locators
     ]
     tool_call_id = "tc-latest-failure"
     command_arguments = {
@@ -617,14 +593,10 @@ async def test_budget_projection_preserves_latest_failed_tool_pair_with_semantic
     wire = serialize_openai_request(request).serialized_json
     assert gateway.token_accounting.count(wire) <= gateway.max_input_tokens
     assistant = next(
-        message
-        for message in request.messages
-        if any(call.id == tool_call_id for call in message.tool_calls)
+        message for message in request.messages if any(call.id == tool_call_id for call in message.tool_calls)
     )
     tool_message = next(
-        message
-        for message in request.messages
-        if message.role == "tool" and message.tool_call_id == tool_call_id
+        message for message in request.messages if message.role == "tool" and message.tool_call_id == tool_call_id
     )
     assert assistant.tool_calls[0].input == command_arguments
     payload = json.loads(tool_message.content)
@@ -632,18 +604,13 @@ async def test_budget_projection_preserves_latest_failed_tool_pair_with_semantic
     assert payload["truncated"] is True
     projection = payload["structured_content"]["tool_result_projection"]
     assert projection["exit_code"] == 1
-    assert projection["failed_tests"] == [
-        "tests/agent/test_context.py::test_keeps_latest_pair"
-    ]
+    assert projection["failed_tests"] == ["tests/agent/test_context.py::test_keeps_latest_pair"]
     assert projection["stdout_tail"].endswith("1 failed, 20 passed\n")
     assert projection["stderr_tail"].endswith("final stderr evidence\n")
     assert projection["source_truncated"] is True
     assert projection["projection_truncated"] is True
     assert "old-history-marker" not in wire
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in request.messages
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in request.messages)
     working_state = next(
         json.loads(message.content)["payload"]["runtime_evidence"]
         for message in request.messages
@@ -676,8 +643,7 @@ async def test_repeated_failure_keeps_original_semantic_evidence_chain() -> None
         steps=[PlanStep(step_id="step_recover", title="Recover.")],
     )
     state["memory_state"].verified_workspace_paths = [
-        f"src/package/verified module number {index:02d}.py"
-        for index in range(80)
+        f"src/package/verified module number {index:02d}.py" for index in range(80)
     ]
     original_id = "tc-original-failure"
     repeated_id = "tc-repeated-failure"
@@ -778,22 +744,12 @@ async def test_repeated_failure_keeps_original_semantic_evidence_chain() -> None
     wire = serialize_openai_request(request).serialized_json
     assert gateway.token_accounting.count(wire) <= gateway.max_input_tokens
     assert "obsolete-inspection-tail" not in wire
-    assert {
-        call.id
-        for message in request.messages
-        for call in message.tool_calls
-    } >= {original_id, repeated_id}
+    assert {call.id for message in request.messages for call in message.tool_calls} >= {original_id, repeated_id}
     tool_messages = {
-        message.tool_call_id: json.loads(message.content)
-        for message in request.messages
-        if message.role == "tool"
+        message.tool_call_id: json.loads(message.content) for message in request.messages if message.role == "tool"
     }
-    original_projection = tool_messages[original_id]["structured_content"][
-        "tool_result_projection"
-    ]
-    assert original_projection["failed_tests"] == [
-        "tests/agent/test_context.py::test_original_evidence"
-    ]
+    original_projection = tool_messages[original_id]["structured_content"]["tool_result_projection"]
+    assert original_projection["failed_tests"] == ["tests/agent/test_context.py::test_original_evidence"]
     assert tool_messages[repeated_id]["error_code"] == "repeated_tool_failure"
 
 
@@ -811,10 +767,7 @@ def test_arbitrary_tool_failure_cannot_pin_an_old_tool_pair() -> None:
         )
     )
 
-    assert (
-        llm_providers_module._referenced_original_tool_call_id(message)
-        is None
-    )
+    assert llm_providers_module._referenced_original_tool_call_id(message) is None
 
 
 @pytest.mark.anyio
@@ -834,10 +787,7 @@ async def test_loop_compactor_proactively_reduces_actual_model_request() -> None
     transcript = [
         ModelMessage(
             role="user" if index % 2 == 0 else "assistant",
-            content=(
-                f"compact-message-{index}: "
-                + (f"token-{index} " * 500)
-            ),
+            content=(f"compact-message-{index}: " + (f"token-{index} " * 500)),
         )
         for index in range(8)
     ]
@@ -875,23 +825,14 @@ async def test_loop_compactor_proactively_reduces_actual_model_request() -> None
     assert result.changed is True
     assert result.channels == ("turn_transcript",)
     assert compacted_state["turn_transcript"][0] == transcript[0]
-    baseline_wire = serialize_openai_request(
-        baseline_gateway.calls[0]["request"]
-    ).serialized_json
+    baseline_wire = serialize_openai_request(baseline_gateway.calls[0]["request"]).serialized_json
     compacted_request = compacted_gateway.calls[0]["request"]
-    compacted_wire = serialize_openai_request(
-        compacted_request
-    ).serialized_json
-    assert len(compacted_wire.encode("utf-8")) < len(
-        baseline_wire.encode("utf-8")
+    compacted_wire = serialize_openai_request(compacted_request).serialized_json
+    assert len(compacted_wire.encode("utf-8")) < len(baseline_wire.encode("utf-8"))
+    assert compacted_gateway.token_accounting.count(compacted_wire) < baseline_gateway.token_accounting.count(
+        baseline_wire
     )
-    assert compacted_gateway.token_accounting.count(
-        compacted_wire
-    ) < baseline_gateway.token_accounting.count(baseline_wire)
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in compacted_request.messages
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in compacted_request.messages)
 
 
 @pytest.mark.anyio
@@ -926,15 +867,10 @@ async def test_under_budget_provider_does_not_compact_by_message_count() -> None
     )
 
     request = gateway.calls[0]["request"]
-    assert not any(
-        '"event_type":"context_compaction"' in message.content
-        for message in request.messages
-    )
+    assert not any('"event_type":"context_compaction"' in message.content for message in request.messages)
     for message in transcript:
         assert any(
-            candidate.role == message.role
-            and candidate.content == message.content
-            for candidate in request.messages
+            candidate.role == message.role and candidate.content == message.content for candidate in request.messages
         )
 
 
@@ -970,10 +906,7 @@ async def test_provider_projects_by_actual_gateway_token_budget() -> None:
     request = gateway.calls[0]["request"]
     wire = serialize_openai_request(request).serialized_json
     assert gateway.token_accounting.count(wire) <= 520
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in request.messages
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in request.messages)
 
 
 @pytest.mark.anyio
@@ -1009,10 +942,7 @@ async def test_agent_loop_avoids_recoverable_actual_token_overflow() -> None:
     request = gateway.calls[0]["request"]
     wire = serialize_openai_request(request).serialized_json
     assert gateway.token_accounting.count(wire) <= 528
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in request.messages
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in request.messages)
 
 
 @pytest.mark.anyio
@@ -1068,14 +998,8 @@ async def test_actual_token_projection_handles_no_whitespace_history() -> None:
     request = gateway.calls[0]["request"]
     wire = serialize_openai_request(request).serialized_json
     assert gateway.token_accounting.count(wire) <= 1_000
-    assert any(
-        message.role == "user" and message.content == current_user
-        for message in request.messages
-    )
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in request.messages
-    )
+    assert any(message.role == "user" and message.content == current_user for message in request.messages)
+    assert any('"event_type":"context_compaction"' in message.content for message in request.messages)
 
 
 @pytest.mark.anyio
@@ -1095,13 +1019,10 @@ async def test_budget_projection_preserves_current_user_and_reduces_request() ->
     history = [
         ModelMessage(role="user", content="original session task"),
         *[
-                ModelMessage(
-                    role="assistant" if index % 2 == 0 else "user",
-                    content=(
-                        f"historical-message-{index}: "
-                        + ("history-token " * 1_000)
-                    ),
-                )
+            ModelMessage(
+                role="assistant" if index % 2 == 0 else "user",
+                content=(f"historical-message-{index}: " + ("history-token " * 1_000)),
+            )
             for index in range(12)
         ],
     ]
@@ -1110,10 +1031,7 @@ async def test_budget_projection_preserves_current_user_and_reduces_request() ->
         ModelMessage(role="user", content=current_user),
         ModelMessage(
             role="assistant",
-            content=(
-                "current working response "
-                + ("current-token " * 1_000)
-            ),
+            content=("current working response " + ("current-token " * 1_000)),
         ),
     ]
 
@@ -1141,23 +1059,14 @@ async def test_budget_projection_preserves_current_user_and_reduces_request() ->
         budget_remaining=10_000,
     )
 
-    baseline_wire = serialize_openai_request(
-        baseline_gateway.calls[0]["request"]
-    ).serialized_json
+    baseline_wire = serialize_openai_request(baseline_gateway.calls[0]["request"]).serialized_json
     projected_request = projected_gateway.calls[0]["request"]
-    projected_wire = serialize_openai_request(
-        projected_request
-    ).serialized_json
-    assert any(
-        message.role == "user" and message.content == current_user
-        for message in projected_request.messages
+    projected_wire = serialize_openai_request(projected_request).serialized_json
+    assert any(message.role == "user" and message.content == current_user for message in projected_request.messages)
+    assert len(projected_wire.encode("utf-8")) < len(baseline_wire.encode("utf-8"))
+    assert projected_gateway.token_accounting.count(projected_wire) < baseline_gateway.token_accounting.count(
+        baseline_wire
     )
-    assert len(projected_wire.encode("utf-8")) < len(
-        baseline_wire.encode("utf-8")
-    )
-    assert projected_gateway.token_accounting.count(
-        projected_wire
-    ) < baseline_gateway.token_accounting.count(baseline_wire)
 
 
 @pytest.mark.anyio
@@ -1180,10 +1089,7 @@ async def test_reactive_compaction_reduces_next_actual_model_request() -> None:
     state["turn_transcript"] = [
         ModelMessage(
             role="user" if index % 2 == 0 else "assistant",
-            content=(
-                f"oversized-message-{index}: "
-                + (f"token-{index} " * 1_000)
-            ),
+            content=(f"oversized-message-{index}: " + (f"token-{index} " * 1_000)),
         )
         for index in range(8)
     ]
@@ -1196,9 +1102,7 @@ async def test_reactive_compaction_reduces_next_actual_model_request() -> None:
     baseline_request = gateway.calls[-1]["request"]
     baseline_wire = serialize_openai_request(baseline_request)
     baseline_bytes = len(baseline_wire.serialized_json.encode("utf-8"))
-    baseline_tokens = gateway.token_accounting.count(
-        baseline_wire.serialized_json
-    )
+    baseline_tokens = gateway.token_accounting.count(baseline_wire.serialized_json)
 
     result = LoopContextCompactor().reactive_compact(state)
 
@@ -1212,15 +1116,10 @@ async def test_reactive_compaction_reduces_next_actual_model_request() -> None:
     compacted_request = gateway.calls[-1]["request"]
     compacted_wire = serialize_openai_request(compacted_request)
     compacted_bytes = len(compacted_wire.serialized_json.encode("utf-8"))
-    compacted_tokens = gateway.token_accounting.count(
-        compacted_wire.serialized_json
-    )
+    compacted_tokens = gateway.token_accounting.count(compacted_wire.serialized_json)
     assert compacted_bytes < baseline_bytes
     assert compacted_tokens < baseline_tokens
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in compacted_request.messages
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in compacted_request.messages)
 
 
 @pytest.mark.anyio
@@ -1266,22 +1165,11 @@ async def test_agent_loop_overflow_retries_with_smaller_actual_request() -> None
 
     assert result["status"] == "completed"
     assert len(gateway.calls) == 2
-    first_wire = serialize_openai_request(
-        gateway.calls[0]["request"]
-    ).serialized_json
-    second_wire = serialize_openai_request(
-        gateway.calls[1]["request"]
-    ).serialized_json
-    assert len(second_wire.encode("utf-8")) < len(
-        first_wire.encode("utf-8")
-    )
-    assert gateway.token_accounting.count(
-        second_wire
-    ) < gateway.token_accounting.count(first_wire)
-    assert any(
-        diagnostic.code == "context_overflow_recovered"
-        for diagnostic in result["runtime_diagnostics"]
-    )
+    first_wire = serialize_openai_request(gateway.calls[0]["request"]).serialized_json
+    second_wire = serialize_openai_request(gateway.calls[1]["request"]).serialized_json
+    assert len(second_wire.encode("utf-8")) < len(first_wire.encode("utf-8"))
+    assert gateway.token_accounting.count(second_wire) < gateway.token_accounting.count(first_wire)
+    assert any(diagnostic.code == "context_overflow_recovered" for diagnostic in result["runtime_diagnostics"])
 
 
 @pytest.mark.anyio
@@ -1318,11 +1206,7 @@ async def test_loop_provider_injects_compact_typed_working_state() -> None:
     )
 
     request = gateway.calls[0]["request"]
-    working_state = [
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    ]
+    working_state = [message for message in request.messages if '"event_type":"working_state"' in message.content]
     assert len(working_state) == 1
     assert "tc-search-runtime" in working_state[0].content
     assert "agent_runtime/loop/runtime.py" in working_state[0].content
@@ -1358,18 +1242,12 @@ async def test_working_state_separates_model_claims_from_runtime_evidence() -> N
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     payload = json.loads(working_state.content)["payload"]
     assert payload["plan_claims"]["authority"] == "advisory"
     assert payload["plan_claims"]["objective"] == "Fix the runtime."
     assert "goal_contract" not in payload
-    assert payload["runtime_evidence"]["grounded_paths"] == [
-        "agent_runtime/loop/runtime.py"
-    ]
+    assert payload["runtime_evidence"]["grounded_paths"] == ["agent_runtime/loop/runtime.py"]
     assert "unverified_plan_targets" not in payload["runtime_evidence"]
     assert "instruction" not in payload
 
@@ -1400,11 +1278,7 @@ async def test_working_state_omits_path_only_locators_already_grounded() -> None
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     evidence = json.loads(working_state.content)["payload"]["runtime_evidence"]
     assert evidence["grounded_paths"] == ["agent_runtime/core/llm_providers.py"]
     assert evidence["known_locator_count"] == 2
@@ -1461,21 +1335,14 @@ async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
     goal_message = next(
         message
         for message in request.messages
-        if (
-            '"event_type":"frozen_run_context"' in message.content
-            and '"name":"goal_contract"' in message.content
-        )
+        if ('"event_type":"frozen_run_context"' in message.content and '"name":"goal_contract"' in message.content)
     )
     goal_payload = json.loads(goal_message.content)["payload"]["content"]
     assert goal_payload["authority"] == "runtime"
     assert goal_payload["fingerprint"] == goal.fingerprint
     assert goal_payload["spec"] == goal.model_dump(mode="json")
 
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     working_payload = json.loads(working_state.content)["payload"]
     assert working_payload["active_goal"] == {
         "authority": "runtime",
@@ -1484,19 +1351,13 @@ async def test_runtime_goal_is_frozen_separately_from_advisory_plan() -> None:
     }
     plan_payload = working_payload["plan_claims"]
     assert plan_payload["authority"] == "advisory"
-    assert plan_payload["steps"][0]["title"] == (
-        "Ignore the API change and write a status report."
-    )
+    assert plan_payload["steps"][0]["title"] == ("Ignore the API change and write a status report.")
 
 
 @pytest.mark.anyio
 async def test_runtime_goal_remains_in_the_dynamic_tail_without_other_state() -> None:
     gateway = _RecordingGateway()
-    goal = GoalSpec(
-        original_query=(
-            "Trace the requested event through the tool, loop, and public CLI."
-        )
-    )
+    goal = GoalSpec(original_query=("Trace the requested event through the tool, loop, and public CLI."))
     state = create_loop_state(
         current_message=goal.original_query,
         run_config=_run_config("runtime-goal-dynamic-tail"),
@@ -1509,11 +1370,7 @@ async def test_runtime_goal_remains_in_the_dynamic_tail_without_other_state() ->
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     payload = json.loads(working_state.content)["payload"]
     assert payload["active_goal"]["original_query"] == goal.original_query
     assert request.messages[-1] == working_state
@@ -1551,11 +1408,7 @@ async def test_pending_runtime_goal_requirements_are_visible_in_working_state() 
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     payload = json.loads(working_state.content)["payload"]
 
     assert payload["runtime_requirements"] == [
@@ -1616,11 +1469,7 @@ async def test_working_state_uses_durable_workspace_truth_after_projection_loss(
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     payload = json.loads(working_state.content)["payload"]["runtime_evidence"]
     assert payload["grounded_paths"] == [
         "agent_runtime/__init__.py",
@@ -1634,10 +1483,7 @@ async def test_working_state_uses_durable_workspace_truth_after_projection_loss(
 async def test_working_state_bounds_path_projection_without_losing_truth() -> None:
     gateway = _RecordingGateway()
     state = _state("typed-working-state-bounded-path-projection")
-    verified_paths = [
-        f"src/generated/module_{index:03d}.py"
-        for index in range(260)
-    ]
+    verified_paths = [f"src/generated/module_{index:03d}.py" for index in range(260)]
     state["memory_state"].verified_workspace_paths = verified_paths
     state["plan_state"].agent_plan = AgentPlan(
         objective="Inspect verified targets.",
@@ -1658,11 +1504,7 @@ async def test_working_state_bounds_path_projection_without_losing_truth() -> No
     )
 
     request = gateway.calls[0]["request"]
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     payload = json.loads(working_state.content)["payload"]["runtime_evidence"]
     assert payload["grounded_path_count"] == 260
     assert payload["grounded_paths_truncated"] is True
@@ -1701,11 +1543,7 @@ async def test_needs_replan_keeps_finish_and_delivery_available() -> None:
     request = gateway.calls[0]["request"]
     assert request.tool_choice.mode is ToolChoiceMode.AUTO
     assert request.tool_choice.name is None
-    working_state = next(
-        message
-        for message in request.messages
-        if '"event_type":"working_state"' in message.content
-    )
+    working_state = next(message for message in request.messages if '"event_type":"working_state"' in message.content)
     assert '"status":"needs_replan"' in working_state.content
     assert "Read the exact source location." in working_state.content
 
@@ -1777,9 +1615,7 @@ async def test_loop_provider_reserves_input_budget_for_tool_schemas() -> None:
     )
 
     request = gateway.calls[0]["request"]
-    input_tokens = gateway.token_accounting.count(
-        serialize_openai_request(request).serialized_json
-    )
+    input_tokens = gateway.token_accounting.count(serialize_openai_request(request).serialized_json)
     assert input_tokens <= gateway.max_input_tokens
     assert any("context_compaction" in message.content for message in request.messages)
 
@@ -2068,10 +1904,7 @@ def test_loop_context_assembler_uses_focused_loop_entry_point() -> None:
 
 
 def test_loop_context_compaction_is_observable_before_model_turn() -> None:
-    legacy_messages = [
-        HumanMessage(content=f"legacy message {index}", id=f"msg-{index}")
-        for index in range(4)
-    ]
+    legacy_messages = [HumanMessage(content=f"legacy message {index}", id=f"msg-{index}") for index in range(4)]
     state = create_loop_state(
         current_message="Summarize the conversation.",
         run_config=AgentRunConfig(
@@ -2101,10 +1934,7 @@ def test_loop_context_compaction_is_observable_before_model_turn() -> None:
     assert result.channels == ("turn_transcript",)
     assert state["messages"] == legacy_messages
     assert state["memory_state"].working_summary is None
-    assert any(
-        '"event_type":"context_compaction"' in message.content
-        for message in state["turn_transcript"]
-    )
+    assert any('"event_type":"context_compaction"' in message.content for message in state["turn_transcript"])
     assert state["latest_transition"] is not None
     assert state["latest_transition"].reason == "compaction"
 

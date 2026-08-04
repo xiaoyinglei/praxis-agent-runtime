@@ -1,30 +1,48 @@
 [importlinter]
-root_package = rag
+root_packages =
+    agent_runtime
+    rag
+
+[importlinter:contract:runtime_rag_boundary]
+name = Runtime depends on RAG only through the knowledge adapter
+type = forbidden
+source_modules =
+    agent_runtime
+forbidden_modules =
+    rag
+ignore_imports =
+    agent_runtime.knowledge_providers.rag -> rag
+    agent_runtime.knowledge_providers.rag -> rag.models.assembly_adapter
+    agent_runtime.knowledge_providers.rag -> rag.models.runtime
+    agent_runtime.knowledge_providers.rag -> rag.retrieval
+    agent_runtime.knowledge_providers.rag -> rag.runtime
+    agent_runtime.knowledge_providers.rag -> rag.storage.runtime_config
+allow_indirect_imports = true
 
 [importlinter:contract:schema_foundation]
-name = Schema remains independent from agent orchestration
+name = RAG schema remains independent from runtime orchestration
 type = forbidden
 source_modules =
     rag.schema
 forbidden_modules =
-    rag.agent
+    agent_runtime.service
+    agent_runtime.runtime
+    agent_runtime.tools
 
 [importlinter:contract:tools_boundary]
-name = Tools do not depend on agent orchestration
+name = Runtime tools do not depend on service or loop orchestration
 type = forbidden
 source_modules =
-    rag.agent.tools
+    agent_runtime.tools
 forbidden_modules =
-    rag.agent.graphs
-    rag.agent.service
-    rag.cli
+    agent_runtime.service
+    agent_runtime.runtime
 
 [importlinter:contract:memory_boundary]
-name = Memory does not depend on agent orchestration
+name = Runtime memory does not depend on service orchestration or assembly
 type = forbidden
 source_modules =
-    rag.agent.memory
+    agent_runtime.memory
 forbidden_modules =
-    rag.agent.graphs
-    rag.agent.service
-    rag.cli
+    agent_runtime.service
+    agent_runtime.runtime

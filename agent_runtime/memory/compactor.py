@@ -26,8 +26,8 @@ from agent_runtime.memory.models import (
     WorkingMemoryDraft,
     WorkingSummary,
 )
+from agent_runtime.text import text_unit_count
 from agent_runtime.tools.tool import ToolResult
-from rag.utils.text import text_unit_count
 
 if TYPE_CHECKING:
     from agent_runtime.loop.state import LoopState
@@ -263,15 +263,9 @@ class MessageCompactor:
                     "working_summary",
                     memory_state.working_summary,
                 ),
-                "extracted_facts": list(
-                    update.get("extracted_facts", memory_state.extracted_facts)
-                ),
-                "memory_refs": list(
-                    update.get("memory_refs", memory_state.memory_refs)
-                ),
-                "memory_warnings": list(
-                    update.get("memory_warnings", memory_state.memory_warnings)
-                ),
+                "extracted_facts": list(update.get("extracted_facts", memory_state.extracted_facts)),
+                "memory_refs": list(update.get("memory_refs", memory_state.memory_refs)),
+                "memory_warnings": list(update.get("memory_warnings", memory_state.memory_warnings)),
             }
         )
         return {**state, **update}
@@ -481,9 +475,7 @@ class MemoryCompactor:
     def summarize_tool_result(self, result: ToolResult) -> str:
         """Summarize without changing the model-visible result representation."""
 
-        return self._one_line(
-            f"{result.tool_name} {tool_result_message(result).content}"
-        )
+        return self._one_line(f"{result.tool_name} {tool_result_message(result).content}")
 
     def _bounded_with_audit(
         self,
@@ -733,9 +725,7 @@ class LoopContextCompactor:
                         memory_state.extracted_facts,
                     )
                 ),
-                "memory_refs": list(
-                    state_dict.get("memory_refs", memory_state.memory_refs)
-                ),
+                "memory_refs": list(state_dict.get("memory_refs", memory_state.memory_refs)),
                 "memory_budget": state_dict.get(
                     "memory_budget",
                     memory_state.memory_budget,
@@ -783,9 +773,7 @@ class LoopContextCompactor:
 
         changed = bool(changed_channels)
         warnings = tuple(
-            warning
-            for warning in state["memory_state"].memory_warnings
-            if warning not in initial_warnings
+            warning for warning in state["memory_state"].memory_warnings if warning not in initial_warnings
         )
         channels = tuple(dict.fromkeys(changed_channels))
         if changed:
@@ -830,9 +818,7 @@ class LoopContextCompactor:
         self._sync_memory_state_from_flat_channels(state, state_dict)
 
         warnings = tuple(
-            warning
-            for warning in state["memory_state"].memory_warnings
-            if warning not in initial_warnings
+            warning for warning in state["memory_state"].memory_warnings if warning not in initial_warnings
         )
         return LoopCompactionResult(
             changed=bool(changed_channels),
@@ -848,11 +834,7 @@ class LoopContextCompactor:
         retained_tail_count: int,
         force: bool = False,
     ) -> bool:
-        messages = [
-            message
-            for message in state.get("turn_transcript", [])
-            if isinstance(message, ModelMessage)
-        ]
+        messages = [message for message in state.get("turn_transcript", []) if isinstance(message, ModelMessage)]
         if not messages:
             return False
         anchor_count = 1 if messages[0].role == "user" else 0
@@ -860,10 +842,7 @@ class LoopContextCompactor:
         body = tuple(messages[anchor_count:])
         if not body:
             return False
-        if (
-            not force
-            and len(messages) < policy.message_compaction_min_count
-        ):
+        if not force and len(messages) < policy.message_compaction_min_count:
             return False
 
         tail_start = max(0, len(body) - retained_tail_count)
@@ -878,9 +857,7 @@ class LoopContextCompactor:
         if force and projected == body:
             projected = project_transcript_compaction(
                 body,
-                parent_context_revision=canonical_transcript_revision(
-                    messages
-                ),
+                parent_context_revision=canonical_transcript_revision(messages),
                 tail_start=len(body),
                 max_summary_chars=policy.max_working_summary_chars,
             )

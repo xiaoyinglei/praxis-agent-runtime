@@ -38,15 +38,15 @@ from agent_runtime.core.observations import (
 from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile
 from agent_runtime.core.turn_contracts import ToolCallPlan
 from agent_runtime.loop.state import LoopState, ModelTurnDraft, ModelTurnEnvelope
+from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.modeling.gateway import (
+    LLMGateway,
+    model_request_input_text,
+)
 from agent_runtime.skills.runtime import SkillRuntime
 from agent_runtime.streaming.events import text_delta
 from agent_runtime.tools.selection import select_tools
 from agent_runtime.tools.tool import JsonValue, Tool, ToolCallOrigin
-from rag.providers.llm_gateway import (
-    LLMGateway,
-    model_request_input_text,
-)
-from rag.schema.llm import LLMCallStage
 
 _MAX_WORKING_STATE_GROUNDED_PATHS = 32
 _MAX_WORKING_STATE_LOCATORS = 32
@@ -88,11 +88,7 @@ def parse_loop_model_turn(
 
     if isinstance(value, ModelTurnDraft):
         return value
-    decision = (
-        value
-        if isinstance(value, LoopModelDecision)
-        else LoopModelDecision.model_validate(value)
-    )
+    decision = value if isinstance(value, LoopModelDecision) else LoopModelDecision.model_validate(value)
     calls = tuple(decision.tool_calls)
     if calls:
         return ModelTurnDraft(action="execute", tool_calls=calls)
@@ -102,10 +98,7 @@ def parse_loop_model_turn(
         return ModelTurnDraft(
             action="pause",
             pause_reason=(
-                decision.pause_reason
-                or decision.needs_user_input
-                or decision.stop_reason
-                or decision.thought
+                decision.pause_reason or decision.needs_user_input or decision.stop_reason or decision.thought
             ),
         )
     return ModelTurnDraft(action="execute")
@@ -153,9 +146,7 @@ class LLMLoopModelTurnProvider:
         self._context_window_tokens = context_window_tokens
         self._stream_sink = stream_sink
         self._skill_runtime = skill_runtime
-        self._goal_spec = (
-            None if goal_spec is None else goal_spec.model_copy(deep=True)
-        )
+        self._goal_spec = None if goal_spec is None else goal_spec.model_copy(deep=True)
 
     async def next_turn(
         self,
@@ -169,26 +160,16 @@ class LLMLoopModelTurnProvider:
             *state.get("resident_tool_names", ()),
             *state.get("explicit_tool_names", ()),
         )
-        resident_names = tuple(
-            state_resident_names or self._resident_tool_names
-        )
-        disabled_names = tuple(
-            state.get("disabled_tool_names") or self._disabled_tool_names
-        )
+        resident_names = tuple(state_resident_names or self._resident_tool_names)
+        disabled_names = tuple(state.get("disabled_tool_names") or self._disabled_tool_names)
         selected_tools = select_tools(
             self._registry_snapshot,
             resident_names=resident_names,
             active_names=tuple(state.get("active_tool_names", ())),
             disabled_names=disabled_names,
         )
-        skill_context = (
-            ""
-            if self._skill_runtime is None
-            else self._skill_runtime.render_prompt_context(state)
-        )
-        instructions = [
-            definition.system_instructions or "You are a helpful agent."
-        ]
+        skill_context = "" if self._skill_runtime is None else self._skill_runtime.render_prompt_context(state)
+        instructions = [definition.system_instructions or "You are a helpful agent."]
         if skill_context:
             instructions.append(skill_context)
         file_manifest = state.get("file_manifest")
@@ -209,10 +190,7 @@ class LLMLoopModelTurnProvider:
                 ContextBlock(
                     name="input_files",
                     content={
-                        "instruction": (
-                            "Use these exact workspace-relative paths when calling "
-                            "file tools."
-                        ),
+                        "instruction": ("Use these exact workspace-relative paths when calling file tools."),
                         "files": tuple(
                             {
                                 "path": entry.path,
@@ -229,11 +207,9 @@ class LLMLoopModelTurnProvider:
             conversation_history=state["conversation_history"],
             turn_transcript=state["turn_transcript"],
         )
-        context_transcript, tool_call_correction = (
-            _project_tool_call_correction_context(
-                context_transcript,
-                selected_tools=selected_tools,
-            )
+        context_transcript, tool_call_correction = _project_tool_call_correction_context(
+            context_transcript,
+            selected_tools=selected_tools,
         )
         context = build_stable_context(
             instructions=tuple(instructions),
@@ -249,10 +225,7 @@ class LLMLoopModelTurnProvider:
             context = context.append_message(working_state)
         if tool_call_correction is not None:
             context = context.append_message(tool_call_correction)
-        context_limit = (
-            state["run_config"].max_context_tokens
-            or self._context_window_tokens
-        )
+        context_limit = state["run_config"].max_context_tokens or self._context_window_tokens
         model_input_limit = max(
             256,
             context_limit - settings.max_output_tokens - 1_024,
@@ -261,9 +234,7 @@ class LLMLoopModelTurnProvider:
             LLMCallStage.TOOL_DECISION,
             kwargs={"max_tokens": settings.max_output_tokens},
         ).max_input_tokens
-        request_id = (
-            f"{state['run_config'].turn_id}:turn:{state['iteration']}"
-        )
+        request_id = f"{state['run_config'].turn_id}:turn:{state['iteration']}"
 
         def request_for(
             candidate_context: StableModelContext,
@@ -284,21 +255,13 @@ class LLMLoopModelTurnProvider:
                 provider=self._provider,
                 supports_native_tools=self._supports_native_tools,
             )
-            return self._gateway.token_accounting.count(
-                accounted_input
-            )
+            return self._gateway.token_accounting.count(accounted_input)
 
         context = _project_model_context(
             context,
             max_input_tokens=min(model_input_limit, stage_input_limit),
-            max_summary_chars=(
-                state["run_config"].memory_policy.max_working_summary_chars
-            ),
-            protected_tail_start=(
-                len(state["conversation_history"]) - 1
-                if state["conversation_history"]
-                else None
-            ),
+            max_summary_chars=(state["run_config"].memory_policy.max_working_summary_chars),
+            protected_tail_start=(len(state["conversation_history"]) - 1 if state["conversation_history"] else None),
             input_token_count=request_input_tokens,
         )
         request = request_for(context)
@@ -359,19 +322,9 @@ class LLMLoopModelTurnProvider:
             model=self._model,
             max_output_tokens=_int_setting(max_output_tokens),
             temperature=_float_setting(temperature),
-            top_p=(
-                None
-                if top_p is None
-                else _float_setting(top_p)
-            ),
-            parallel_tool_calls=bool(
-                self._kwargs.get("parallel_tool_calls", True)
-            ),
-            seed=(
-                None
-                if seed is None
-                else _int_setting(seed)
-            ),
+            top_p=(None if top_p is None else _float_setting(top_p)),
+            parallel_tool_calls=bool(self._kwargs.get("parallel_tool_calls", True)),
+            seed=(None if seed is None else _int_setting(seed)),
             provider_options=cast(
                 Mapping[str, JsonValue],
                 provider_options,
@@ -400,9 +353,7 @@ def _project_tool_call_correction_context(
     diagnostics without teaching the model to copy them.
     """
 
-    rejection_payloads = tuple(
-        _tool_call_rejection_payload(message) for message in transcript
-    )
+    rejection_payloads = tuple(_tool_call_rejection_payload(message) for message in transcript)
     trailing: list[Mapping[str, object]] = []
     for payload in reversed(rejection_payloads):
         if payload is None:
@@ -438,10 +389,7 @@ def _tool_call_rejection_payload(
         event = json.loads(message.content)
     except (TypeError, ValueError):
         return None
-    if (
-        not isinstance(event, Mapping)
-        or event.get("event_type") != _MODEL_TOOL_CALL_REJECTED_EVENT
-    ):
+    if not isinstance(event, Mapping) or event.get("event_type") != _MODEL_TOOL_CALL_REJECTED_EVENT:
         return None
     payload = event.get("payload")
     return payload if isinstance(payload, Mapping) else None
@@ -467,14 +415,10 @@ def _tool_call_correction_payload(
             "[rejected generation omitted]",
         )
 
-    tools_by_name = {
-        tool.definition.name: tool for tool in selected_tools
-    }
-    tool_name, attempted_arguments, failure_kind = (
-        _inspect_rejected_tool_generation(
-            raw,
-            selected_tool_names=frozenset(tools_by_name),
-        )
+    tools_by_name = {tool.definition.name: tool for tool in selected_tools}
+    tool_name, attempted_arguments, failure_kind = _inspect_rejected_tool_generation(
+        raw,
+        selected_tool_names=frozenset(tools_by_name),
     )
     selected = tools_by_name.get(tool_name or "")
     allowed_names: tuple[str, ...] = ()
@@ -484,38 +428,18 @@ def _tool_call_correction_payload(
         schema = selected.definition.input_schema
         properties = schema.get("properties")
         if isinstance(properties, Mapping):
-            allowed_names = tuple(
-                sorted(
-                    name
-                    for name in properties
-                    if isinstance(name, str)
-                )
-            )
+            allowed_names = tuple(sorted(name for name in properties if isinstance(name, str)))
         required = schema.get("required")
         if isinstance(required, Sequence) and not isinstance(
             required,
             (str, bytes),
         ):
-            required_names = tuple(
-                sorted(
-                    name
-                    for name in required
-                    if isinstance(name, str)
-                )
-            )
-        additional_properties_allowed = (
-            schema.get("additionalProperties", True) is not False
-        )
+            required_names = tuple(sorted(name for name in required if isinstance(name, str)))
+        additional_properties_allowed = schema.get("additionalProperties", True) is not False
     rejected_names = (
         ()
         if selected is None or attempted_arguments is None
-        else tuple(
-            sorted(
-                name
-                for name in attempted_arguments
-                if isinstance(name, str) and name not in allowed_names
-            )
-        )
+        else tuple(sorted(name for name in attempted_arguments if isinstance(name, str) and name not in allowed_names))
     )
     return {
         "recovery": "retry_native_tool_call",
@@ -533,11 +457,7 @@ def _tool_call_correction_payload(
         "additional_properties_allowed": additional_properties_allowed,
         "validation_error": validation_error,
         "failed_generation_chars": len(raw),
-        "failed_generation_sha256": (
-            hashlib.sha256(raw.encode("utf-8")).hexdigest()
-            if raw
-            else None
-        ),
+        "failed_generation_sha256": (hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else None),
     }
 
 
@@ -595,12 +515,7 @@ def _inspect_rejected_tool_generation(
             r'"(?:name|tool_name)"\s*:\s*"([A-Za-z0-9_.:-]+)"',
             text,
         )
-        tool_name = (
-            match.group(1)
-            if match is not None
-            and match.group(1) in selected_tool_names
-            else None
-        )
+        tool_name = match.group(1) if match is not None and match.group(1) in selected_tool_names else None
     return (
         tool_name,
         arguments,
@@ -619,10 +534,7 @@ def _project_model_context(
     """Apply a final measured model-window projection."""
 
     current_tokens = input_token_count(context)
-    if (
-        not context.transcript
-        or current_tokens <= max_input_tokens
-    ):
+    if not context.transcript or current_tokens <= max_input_tokens:
         return context
 
     maximum_tail_start = (
@@ -633,9 +545,7 @@ def _project_model_context(
             len(context.transcript),
         )
     )
-    latest_tool_pair_start = _latest_tool_pair_start(
-        context.transcript
-    )
+    latest_tool_pair_start = _latest_tool_pair_start(context.transcript)
     if latest_tool_pair_start is not None:
         maximum_tail_start = min(
             maximum_tail_start,
@@ -644,9 +554,7 @@ def _project_model_context(
 
     best = context
     best_tokens = current_tokens
-    summary_limits = _projection_summary_limits(
-        max_summary_chars
-    )
+    summary_limits = _projection_summary_limits(max_summary_chars)
     for tail_start in range(0, maximum_tail_start + 1):
         for summary_limit in summary_limits:
             candidate = context.project_compaction(
@@ -670,33 +578,19 @@ def _latest_tool_pair_start(
 ) -> int | None:
     for tool_index in range(len(transcript) - 1, -1, -1):
         tool_message = transcript[tool_index]
-        if (
-            tool_message.role != "tool"
-            or tool_message.tool_call_id is None
-        ):
+        if tool_message.role != "tool" or tool_message.tool_call_id is None:
             continue
         for assistant_index in range(tool_index - 1, -1, -1):
             assistant_message = transcript[assistant_index]
-            if any(
-                call.id == tool_message.tool_call_id
-                for call in assistant_message.tool_calls
-            ):
-                original_call_id = (
-                    _referenced_original_tool_call_id(
-                        tool_message
-                    )
-                )
+            if any(call.id == tool_message.tool_call_id for call in assistant_message.tool_calls):
+                original_call_id = _referenced_original_tool_call_id(tool_message)
                 if original_call_id is None:
                     return assistant_index
                 original_index = _assistant_tool_call_index(
                     transcript[:assistant_index],
                     original_call_id,
                 )
-                return (
-                    assistant_index
-                    if original_index is None
-                    else original_index
-                )
+                return assistant_index if original_index is None else original_index
         return tool_index
     return None
 
@@ -715,10 +609,7 @@ def _referenced_original_tool_call_id(
     ):
         return None
     structured = payload.get("structured_content")
-    if (
-        not isinstance(structured, Mapping)
-        or structured.get("repeated_failure") is not True
-    ):
+    if not isinstance(structured, Mapping) or structured.get("repeated_failure") is not True:
         return None
     original = structured.get("original_tool_call_id")
     return original if isinstance(original, str) and original else None
@@ -729,10 +620,7 @@ def _assistant_tool_call_index(
     tool_call_id: str,
 ) -> int | None:
     for index in range(len(transcript) - 1, -1, -1):
-        if any(
-            call.id == tool_call_id
-            for call in transcript[index].tool_calls
-        ):
+        if any(call.id == tool_call_id for call in transcript[index].tool_calls):
             return index
     return None
 
@@ -758,32 +646,18 @@ def _working_state_message(
 ) -> ModelMessage | None:
     memory_state = state["memory_state"]
     plan = state["plan_state"].agent_plan
-    protected_tool_call_ids = (
-        _protected_transcript_tool_call_ids(
-            state["turn_transcript"]
-        )
-    )
+    protected_tool_call_ids = _protected_transcript_tool_call_ids(state["turn_transcript"])
     workspace_change_tool_call_ids = tuple(
-        result.tool_call_id
-        for result in state["tool_results"]
-        if runtime_workspace_change(result) is not None
+        result.tool_call_id for result in state["tool_results"] if runtime_workspace_change(result) is not None
     )
     latest_change_index = max(
-        (
-            index
-            for index, result in enumerate(state["tool_results"])
-            if runtime_workspace_change(result) is not None
-        ),
+        (index for index, result in enumerate(state["tool_results"]) if runtime_workspace_change(result) is not None),
         default=-1,
     )
     verification_tool_call_ids = tuple(
         result.tool_call_id
         for result in state["tool_results"][latest_change_index + 1 :]
-        if (
-            latest_change_index >= 0
-            and result.tool_name == "run_command"
-            and not result.is_error
-        )
+        if (latest_change_index >= 0 and result.tool_name == "run_command" and not result.is_error)
     )
     runtime_requirements = tuple(
         {
@@ -792,26 +666,17 @@ def _working_state_message(
             "expected_value": cast(JsonValue, constraint.expected_value),
             "observation": (
                 "observed"
-                if (
-                    constraint.constraint_type == "workspace_change"
-                    and workspace_change_tool_call_ids
-                )
-                or (
-                    constraint.constraint_type == "verification_after_change"
-                    and verification_tool_call_ids
-                )
+                if (constraint.constraint_type == "workspace_change" and workspace_change_tool_call_ids)
+                or (constraint.constraint_type == "verification_after_change" and verification_tool_call_ids)
                 else "pending"
             ),
-            "requirement": _runtime_requirement_description(
-                constraint.constraint_type
-            ),
+            "requirement": _runtime_requirement_description(constraint.constraint_type),
         }
         for constraint in (() if goal_spec is None else goal_spec.constraints)
         if (
             constraint.required
             and constraint.expected_value is True
-            and constraint.constraint_type
-            in {"workspace_change", "verification_after_change"}
+            and constraint.constraint_type in {"workspace_change", "verification_after_change"}
         )
     )
     if (
@@ -841,11 +706,7 @@ def _working_state_message(
             ),
         }
     file_manifest = state.get("file_manifest")
-    manifest_paths = (
-        ()
-        if file_manifest is None
-        else tuple(entry.path for entry in file_manifest.files)
-    )
+    manifest_paths = () if file_manifest is None else tuple(entry.path for entry in file_manifest.files)
     verified_grounded_paths = grounded_workspace_paths(
         locators=memory_state.known_locators,
         input_paths=(
@@ -879,9 +740,7 @@ def _working_state_message(
                 "authority": "runtime",
                 "grounded_paths": grounded_paths,
                 "grounded_path_count": len(verified_grounded_paths),
-                "grounded_paths_truncated": (
-                    len(grounded_paths) < len(verified_grounded_paths)
-                ),
+                "grounded_paths_truncated": (len(grounded_paths) < len(verified_grounded_paths)),
                 "recent_observations": tuple(
                     {
                         "tool_call_id": observation.tool_call_id,
@@ -891,25 +750,12 @@ def _working_state_message(
                         "warnings": tuple(observation.warnings),
                     }
                     for observation in memory_state.recent_observations
-                    if (
-                        observation.tool_call_id
-                        not in protected_tool_call_ids
-                    )
+                    if (observation.tool_call_id not in protected_tool_call_ids)
                 ),
-                "known_locators": tuple(
-                    cast(Mapping[str, JsonValue], locator)
-                    for locator in known_locators
-                ),
-                "known_locator_count": len(
-                    memory_state.known_locators
-                ),
-                "known_locators_compacted": (
-                    len(known_locators)
-                    < len(memory_state.known_locators)
-                ),
-                "workspace_change_tool_call_ids": tuple(
-                    workspace_change_tool_call_ids
-                ),
+                "known_locators": tuple(cast(Mapping[str, JsonValue], locator) for locator in known_locators),
+                "known_locator_count": len(memory_state.known_locators),
+                "known_locators_compacted": (len(known_locators) < len(memory_state.known_locators)),
+                "workspace_change_tool_call_ids": tuple(workspace_change_tool_call_ids),
                 "verification_tool_call_ids": verification_tool_call_ids,
             },
         },
@@ -944,13 +790,7 @@ def _project_grounded_workspace_paths(
 def _project_working_locators(
     locators: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], ...]:
-    precise = tuple(
-        locator
-        for locator in locators
-        if not set(locator).issubset(
-            _PATH_ONLY_LOCATOR_FIELDS
-        )
-    )
+    precise = tuple(locator for locator in locators if not set(locator).issubset(_PATH_ONLY_LOCATOR_FIELDS))
     if len(precise) <= _MAX_WORKING_STATE_LOCATORS:
         return precise
     return precise[-_MAX_WORKING_STATE_LOCATORS:]
@@ -965,10 +805,7 @@ def _protected_transcript_tool_call_ids(
     return frozenset(
         message.tool_call_id
         for message in transcript[protected_start:]
-        if (
-            message.role == "tool"
-            and message.tool_call_id is not None
-        )
+        if (message.role == "tool" and message.tool_call_id is not None)
     )
 
 
@@ -977,21 +814,15 @@ def _record_request_sizes(state: LoopState, request: ModelRequest) -> None:
     if not isinstance(profile, AgentLatencyProfile):
         profile = AgentLatencyProfile()
     prompt_bytes = len(
-        canonical_json_text(
-            tuple(model_message_payload(message) for message in request.messages)
-        ).encode("utf-8")
+        canonical_json_text(tuple(model_message_payload(message) for message in request.messages)).encode("utf-8")
     )
     tool_schema_bytes = len(
-        canonical_json_text(
-            tuple(tool_definition_payload(tool) for tool in request.tools)
-        ).encode("utf-8")
+        canonical_json_text(tuple(tool_definition_payload(tool) for tool in request.tools)).encode("utf-8")
     )
     state["latency_profile"] = profile.model_copy(
         update={
             "prompt_bytes": profile.prompt_bytes + prompt_bytes,
-            "tool_schema_bytes": (
-                profile.tool_schema_bytes + tool_schema_bytes
-            ),
+            "tool_schema_bytes": (profile.tool_schema_bytes + tool_schema_bytes),
         }
     )
 
@@ -1053,12 +884,7 @@ def _scope_model_tool_call_ids(
         return turn
     scoped_calls = [
         ModelToolCall(
-            id=(
-                "tc_"
-                + hashlib.sha256(
-                    f"{request_id}\0{index}\0{call.id}".encode()
-                ).hexdigest()[:20]
-            ),
+            id=("tc_" + hashlib.sha256(f"{request_id}\0{index}\0{call.id}".encode()).hexdigest()[:20]),
             name=call.name,
             input=dict(call.input),
         )

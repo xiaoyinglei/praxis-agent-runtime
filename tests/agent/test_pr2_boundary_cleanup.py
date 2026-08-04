@@ -9,8 +9,8 @@ from agent_runtime.core.observations import ObservationBatch, StructuredObservat
 from agent_runtime.loop.runtime import AgentLoop
 from agent_runtime.loop.state import create_loop_state
 from agent_runtime.memory.injector import ContextBuilder
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 from agent_runtime.tools.tool import ToolContentBlock, ToolResult
-from rag.schema.llm import LLMCallStage, LLMStageBudget
 
 
 class _CharacterTokenAccounting:
@@ -65,9 +65,7 @@ def test_observations_update_typed_working_state_without_flat_channels() -> None
     AgentLoop._merge_observations(state, batch)
 
     assert state["memory_state"].recent_observations == batch.structured_observations
-    assert state["memory_state"].known_locators == [
-        {"doc_id": 7, "section_id": 3}
-    ]
+    assert state["memory_state"].known_locators == [{"doc_id": 7, "section_id": 3}]
     assert {
         "structured_observations",
         "evidence",

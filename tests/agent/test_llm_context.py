@@ -9,7 +9,7 @@ from agent_runtime.core.llm_context import (
     AgentLLMContextOverflowError,
 )
 from agent_runtime.loop.state import LoopState, create_loop_state
-from rag.schema.llm import LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 
 
 class _CharacterTokenAccounting:

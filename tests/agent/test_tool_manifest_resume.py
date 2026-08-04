@@ -31,6 +31,7 @@ from agent_runtime.core.model_request import (
 )
 from agent_runtime.core.turn_contracts import ToolCallPlan, ToolManifestDriftStatus
 from agent_runtime.loop.state import create_loop_state
+from agent_runtime.modeling.contracts import normalize_llm_usage
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -43,7 +44,6 @@ from agent_runtime.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.schema.llm import normalize_llm_usage
 
 _FIXTURE = Path(__file__).parent / "fixtures/checkpoints/legacy_tool_state_v1.json"
 

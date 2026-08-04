@@ -18,11 +18,12 @@ from agent_runtime.memory.models import (
     InjectedContext,
     MemoryRef,
 )
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.tools.tool import ToolResult
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 
 if TYPE_CHECKING:
     from agent_runtime.loop.state import LoopState
+
     type ContextState = LoopState
 
 
@@ -293,14 +294,16 @@ class ContextBuilder:
             required_truncated=selection.required_truncated,
             section_token_counts={str(key): value for key, value in by_name.items()},
             dropped_section_reasons=selection.dropped_section_reasons,
-            memory_ref_count=len(
-                state["memory_state"].memory_refs if "memory_state" in state else []
-            ),
+            memory_ref_count=len(state["memory_state"].memory_refs if "memory_state" in state else []),
             externalized_record_count=self._externalized_tool_output_count(state.get("tool_results", [])),
-            warnings=list(dict.fromkeys([
-                *(state["memory_state"].memory_warnings if "memory_state" in state else []),
-                *selection.warnings,
-            ])),
+            warnings=list(
+                dict.fromkeys(
+                    [
+                        *(state["memory_state"].memory_warnings if "memory_state" in state else []),
+                        *selection.warnings,
+                    ]
+                )
+            ),
         )
 
     def _clip_optional_section(
@@ -514,10 +517,7 @@ class ContextBuilder:
         lines = ["Tool results:"]
         for result in tool_results:
             message = tool_result_message(result)
-            lines.append(
-                f"- tool_call_id={result.tool_call_id} "
-                f"tool_name={result.tool_name} content={message.content}"
-            )
+            lines.append(f"- tool_call_id={result.tool_call_id} tool_name={result.tool_name} content={message.content}")
         return "\n".join(lines)
 
     def _format_tool_context(self, state: ContextState) -> str:
@@ -576,9 +576,7 @@ class ContextBuilder:
 
     @staticmethod
     def _format_message(message: ModelMessage) -> str:
-        return "- " + canonical_json_text(
-            model_message_payload(message)
-        )
+        return "- " + canonical_json_text(model_message_payload(message))
 
     @staticmethod
     def _externalized_tool_output_count(tool_results: Sequence[ToolResult]) -> int:

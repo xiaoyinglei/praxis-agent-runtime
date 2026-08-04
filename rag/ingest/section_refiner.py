@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from agent_runtime.text import _token_unit_spans, text_unit_count
 from rag.assembly import TokenAccountingService, TokenizerContract
 from rag.ingest.asset_anchors import iter_asset_anchor_spans
 from rag.schema.core import ParsedDocument, ParsedSection
-from rag.utils.text import _token_unit_spans, text_unit_count
 
 
 @dataclass(frozen=True, slots=True)

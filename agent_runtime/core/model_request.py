@@ -18,6 +18,7 @@ from agent_runtime.core.messages import (
     tool_result_message,
 )
 from agent_runtime.core.turn_contracts import ToolManifest, ToolManifestEntry
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.tools.tool import (
     JsonValue,
     Tool,
@@ -26,7 +27,6 @@ from agent_runtime.tools.tool import (
     _require_non_empty_string,
     json_schema_output,
 )
-from rag.schema.llm import LLMUsage
 
 CANONICAL_REQUEST_REVISION = "canonical-model-request-v1"
 STABLE_CONTEXT_REVISION = "stable-model-context-v1"
@@ -271,10 +271,7 @@ class StableModelContext:
             {
                 "serializer_revision": COMPACTION_REVISION,
                 "parent_context_revision": self.context_revision,
-                "transcript": tuple(
-                    model_message_payload(message)
-                    for message in projected
-                ),
+                "transcript": tuple(model_message_payload(message) for message in projected),
             },
         )
         return StableModelContext(
@@ -687,18 +684,9 @@ def project_transcript_compaction(
         parent_context_revision,
         field_name="parent_context_revision",
     )
-    if (
-        not isinstance(tail_start, int)
-        or isinstance(tail_start, bool)
-        or tail_start < 0
-        or tail_start > len(messages)
-    ):
+    if not isinstance(tail_start, int) or isinstance(tail_start, bool) or tail_start < 0 or tail_start > len(messages):
         raise ValueError("tail_start must index the transcript")
-    if (
-        not isinstance(max_summary_chars, int)
-        or isinstance(max_summary_chars, bool)
-        or max_summary_chars <= 0
-    ):
+    if not isinstance(max_summary_chars, int) or isinstance(max_summary_chars, bool) or max_summary_chars <= 0:
         raise ValueError("max_summary_chars must be a positive integer")
 
     actual_tail_start = _extend_tail_for_tool_pair(messages, tail_start)
@@ -720,12 +708,8 @@ def project_transcript_compaction(
         "covered_count": len(covered),
         "retained_tail_count": len(tail),
         "summary_max_chars": summary_limit,
-        "source_digest": canonical_hash(
-            tuple(model_message_payload(message) for message in messages)
-        ),
-        "retained_tail_digest": canonical_hash(
-            tuple(model_message_payload(message) for message in tail)
-        ),
+        "source_digest": canonical_hash(tuple(model_message_payload(message) for message in messages)),
+        "retained_tail_digest": canonical_hash(tuple(model_message_payload(message) for message in tail)),
     }
     if projected_tool_result_count:
         projection = {
@@ -827,10 +811,7 @@ def is_verified_transcript_compaction_rewrite(
 
     for projection in allowed:
         expected_prefix = (existing[0], *projection)
-        if (
-            len(candidate) >= len(expected_prefix)
-            and candidate[: len(expected_prefix)] == expected_prefix
-        ):
+        if len(candidate) >= len(expected_prefix) and candidate[: len(expected_prefix)] == expected_prefix:
             return True
     return False
 
@@ -856,10 +837,7 @@ def _deterministic_transcript_summary(
     *,
     max_chars: int,
 ) -> str:
-    lines = [
-        f"{message.role}: {canonical_json_text(model_message_payload(message))}"
-        for message in messages
-    ]
+    lines = [f"{message.role}: {canonical_json_text(model_message_payload(message))}" for message in messages]
     summary = "\n".join(lines)
     if len(summary) <= max_chars:
         return summary
@@ -892,28 +870,17 @@ def _project_tool_result_message(
     *,
     max_chars: int,
 ) -> ModelMessage:
-    if (
-        message.role != "tool"
-        or message.tool_call_id is None
-        or len(message.content) <= max_chars
-    ):
+    if message.role != "tool" or message.tool_call_id is None or len(message.content) <= max_chars:
         return message
     try:
         payload = json.loads(message.content)
     except (TypeError, ValueError):
         return message
-    if (
-        not isinstance(payload, Mapping)
-        or payload.get("is_error") is not True
-    ):
+    if not isinstance(payload, Mapping) or payload.get("is_error") is not True:
         return message
 
     structured = payload.get("structured_content")
-    structured_mapping = (
-        structured
-        if isinstance(structured, Mapping)
-        else {}
-    )
+    structured_mapping = structured if isinstance(structured, Mapping) else {}
     stdout = _string_value(structured_mapping.get("stdout"))
     stderr = _string_value(structured_mapping.get("stderr"))
     projection_budget = max(
@@ -925,28 +892,17 @@ def _project_tool_result_message(
         max(1, (projection_budget - 256) // 2),
     )
     projection: dict[str, JsonValue] = {
-        "exit_code": _json_scalar(
-            structured_mapping.get("exit_code")
-        ),
-        "timed_out": _json_scalar(
-            structured_mapping.get("timed_out")
-        ),
+        "exit_code": _json_scalar(structured_mapping.get("exit_code")),
+        "timed_out": _json_scalar(structured_mapping.get("timed_out")),
         "failed_tests": _failed_test_names(stdout, stderr),
         "stdout_tail": stdout[-stream_tail_chars:] if stream_tail_chars else "",
         "stderr_tail": stderr[-stream_tail_chars:] if stream_tail_chars else "",
-        "source_truncated": bool(
-            payload.get("truncated")
-            or structured_mapping.get("truncated")
-        ),
+        "source_truncated": bool(payload.get("truncated") or structured_mapping.get("truncated")),
         "projection_truncated": True,
     }
     if not structured_mapping and structured is not None:
         rendered = canonical_json_text(structured)
-        projection["output_tail"] = (
-            rendered[-stream_tail_chars:]
-            if stream_tail_chars
-            else ""
-        )
+        projection["output_tail"] = rendered[-stream_tail_chars:] if stream_tail_chars else ""
     projected_payload: Mapping[str, JsonValue] = {
         "content": (),
         "structured_content": {
@@ -996,14 +952,7 @@ def _json_scalar(value: object) -> JsonValue:
 
 
 def _model_messages_size(messages: Sequence[ModelMessage]) -> int:
-    return sum(
-        len(
-            canonical_json_text(
-                model_message_payload(message)
-            ).encode("utf-8")
-        )
-        for message in messages
-    )
+    return sum(len(canonical_json_text(model_message_payload(message)).encode("utf-8")) for message in messages)
 
 
 def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
@@ -1018,11 +967,7 @@ def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
         "interrupt_behavior": tool.interrupt_behavior.value,
         "timeout_seconds": float(tool.timeout_seconds),
         "max_model_output_bytes": tool.max_model_output_bytes,
-        "approval_profile": (
-            tool.approval_profile.value
-            if tool.approval_profile is not None
-            else None
-        ),
+        "approval_profile": (tool.approval_profile.value if tool.approval_profile is not None else None),
     }
 
 
@@ -1031,9 +976,7 @@ def _tool_manifest_entry(tool: Tool) -> ToolManifestEntry:
         name=tool.definition.name,
         description_hash=canonical_hash(tool.definition.description),
         input_schema_hash=canonical_hash(tool.definition.input_schema),
-        static_effects_hash=canonical_hash(
-            tuple(sorted(effect.value for effect in tool.static_effects))
-        ),
+        static_effects_hash=canonical_hash(tuple(sorted(effect.value for effect in tool.static_effects))),
         execution_contract_hash=canonical_hash(_tool_contract_payload(tool)),
     )
 
@@ -1102,6 +1045,8 @@ def _ordered_strings(
     for value in result:
         _require_non_empty_string(value, field_name=field_name)
     return result
+
+
 def _validate_real_range(
     value: object,
     *,

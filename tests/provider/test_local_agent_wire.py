@@ -15,6 +15,14 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.modeling.local_agent_wire import (
+    LocalAgentWireMode,
+    estimate_local_agent_usage,
+    parse_local_agent_response,
+    render_local_agent_request,
+    resolve_local_agent_wire,
+)
+from agent_runtime.modeling.openai_wire import parse_openai_response
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -26,14 +34,6 @@ from agent_runtime.tools.tool import (
     json_schema_input,
 )
 from rag.providers import local_agent_wire as local_wire_module
-from rag.providers.local_agent_wire import (
-    LocalAgentWireMode,
-    estimate_local_agent_usage,
-    parse_local_agent_response,
-    render_local_agent_request,
-    resolve_local_agent_wire,
-)
-from rag.providers.openai_wire import parse_openai_response
 
 
 def _tool(name: str, schema: Mapping[str, JsonValue] | None = None) -> Tool:

@@ -7,8 +7,8 @@ from typing import Any, Literal
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from agent_runtime.modeling.config import ModelCapability
 from rag.models.catalog import ModelCatalog
-from rag.models.config import ModelCapability
 
 _MAX_BATCH_SIZE = 32
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024  # 10 MB

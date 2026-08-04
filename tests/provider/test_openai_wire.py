@@ -22,6 +22,11 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.modeling.openai_wire import (
+    parse_openai_response,
+    parse_openai_usage,
+    serialize_openai_request,
+)
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -33,11 +38,6 @@ from agent_runtime.tools.tool import (
     json_schema_input,
 )
 from rag.providers import openai_wire as openai_wire_module
-from rag.providers.openai_wire import (
-    parse_openai_response,
-    parse_openai_usage,
-    serialize_openai_request,
-)
 
 
 def _tool(name: str, schema: Mapping[str, JsonValue] | None = None) -> Tool:
@@ -327,9 +327,7 @@ def test_openai_response_parser_returns_the_provider_neutral_model_turn() -> Non
     assert turn.stop_reason is StopReason.TOOL_USE
     assert turn.raw_stop_reason == "tool_calls"
     assert turn.text == "I will inspect it."
-    assert turn.reasoning_content == (
-        "The repository must be inspected before editing."
-    )
+    assert turn.reasoning_content == ("The repository must be inspected before editing.")
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].id == "call_1"
     assert turn.tool_calls[0].name == "mcp__zeta__lookup"
@@ -411,9 +409,7 @@ def test_openai_usage_preserves_reported_cache_write_details() -> None:
     assert usage.cache_read_input_tokens == 30
     assert usage.cache_write_input_tokens == 12
     assert usage.logical_input_tokens == (
-        usage.uncached_input_tokens
-        + usage.cache_read_input_tokens
-        + usage.cache_write_input_tokens
+        usage.uncached_input_tokens + usage.cache_read_input_tokens + usage.cache_write_input_tokens
     )
 
 

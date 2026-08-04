@@ -111,11 +111,7 @@ class Agent:
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
-        runtime_agent = (
-            self
-            if previous_turn_id is None
-            else self._agent_for_previous_turn(previous_turn_id)
-        )
+        runtime_agent = self if previous_turn_id is None else self._agent_for_previous_turn(previous_turn_id)
         request = runtime_agent._turn_request(
             task,
             previous_turn_id=previous_turn_id,
@@ -269,11 +265,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        runtime_agent = (
-            self
-            if previous_turn_id is None
-            else self._agent_for_previous_turn(previous_turn_id)
-        )
+        runtime_agent = self if previous_turn_id is None else self._agent_for_previous_turn(previous_turn_id)
         request = runtime_agent._turn_request(
             task,
             previous_turn_id=previous_turn_id,
@@ -376,20 +368,16 @@ class Agent:
         from agent_runtime.skills.loader import scan_and_load_skills
         from agent_runtime.skills.policy import SkillPolicy
         from agent_runtime.skills.runtime import SkillRuntime
+        from agent_runtime.text import load_env_file
         from agent_runtime.tools.integrations.skills import create_skill_tools
         from agent_runtime.tools.integrations.subagent import (
             SubagentInput,
             create_subagent_tool,
         )
         from agent_runtime.workspace import open_workspace
-        from rag.utils.text import load_env_file
 
         startup_started_at = time.perf_counter()
-        load_env_file(
-            ".env"
-            if self.workspace_path is None
-            else self.workspace_path / ".env"
-        )
+        load_env_file(".env" if self.workspace_path is None else self.workspace_path / ".env")
         try:
             model_control_plane = self._get_model_control_plane()
         except Exception:
@@ -487,7 +475,17 @@ class Agent:
                     ],
                     "citations": [
                         {
-                            **item.model_dump(mode="json"),
+                            "citation_id": item.citation_id,
+                            "evidence_id": item.evidence_id,
+                            "record_type": item.record_type,
+                            "file_name": item.file_name,
+                            "section_path": list(item.section_path),
+                            "page_start": item.page_start,
+                            "page_end": item.page_end,
+                            "doc_id": item.doc_id,
+                            "benchmark_doc_id": item.benchmark_doc_id,
+                            "source_id": item.source_id,
+                            "source_type": item.source_type,
                             "citation_anchor": item.citation_anchor or "",
                         }
                         for item in child.citations[:20]

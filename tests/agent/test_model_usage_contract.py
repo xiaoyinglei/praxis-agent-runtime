@@ -13,7 +13,7 @@ from agent_runtime.core.model_request import (
     build_stable_context,
     model_call_record_payload,
 )
-from rag.schema.llm import (
+from agent_runtime.modeling.contracts import (
     MAX_RAW_PROVIDER_USAGE_BYTES,
     LLMUsage,
     normalize_llm_usage,

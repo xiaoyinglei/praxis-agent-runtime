@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, TypeVar, cast
+from typing import Any, TypeVar
 
+from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
+from agent_runtime.modeling.contracts import LLMProviderResult
+from agent_runtime.modeling.providers.ollama.generator import OllamaGenerator
 from rag.assembly.models import (
     AssemblyConfig,
     AssemblyOverrides,
@@ -18,9 +20,6 @@ from rag.providers.huggingface.embedder import BgeM3Embedder, HuggingFaceEmbedde
 from rag.providers.huggingface.rerank import FlagEmbeddingReranker
 from rag.providers.mlx.embedder import MLXEmbedder
 from rag.providers.ollama.embedder import OllamaEmbedder
-from rag.providers.ollama.generator import OllamaGenerator
-from rag.providers.openai_wire import parse_openai_usage
-from rag.schema.llm import LLMProviderResult, LLMUsage
 
 T = TypeVar("T")
 _JSON_CODE_FENCE_RE = re.compile(
@@ -114,9 +113,7 @@ class _CompositeProvider:
         method = getattr(backend, "generate_structured_with_usage", None)
         if callable(method):
             return method(prompt=prompt, schema=schema, **kwargs)  # type: ignore[no-any-return]
-        return LLMProviderResult(
-            value=self.generate_structured(prompt=prompt, schema=schema, **kwargs)
-        )
+        return LLMProviderResult(value=self.generate_structured(prompt=prompt, schema=schema, **kwargs))
 
     def embed(self, texts: Sequence[str], **kwargs: Any) -> list[list[float]]:
         backend = self._require(self.embedder, capability="embedding")
@@ -152,172 +149,7 @@ class _CompositeProvider:
         return backend
 
 
-class _OpenAICompatibleChatGenerator:
-    """OpenAI-compatible chat API wrapper.  Does not expose api_key in repr."""
-
-    def __init__(
-        self,
-        *,
-        model: str,
-        base_url: str,
-        api_key: str | None = None,
-        supports_tools: bool | None = None,
-    ) -> None:
-        from openai import OpenAI
-
-        self.chat_model_name = model
-        self._base_url = base_url
-        self._client = OpenAI(base_url=base_url, api_key=api_key or "not-needed")
-        if supports_tools is None:
-            supports_tools = env_bool("RAG_NATIVE_TOOL_CALLING") is not False
-        self._supports_tools = supports_tools
-
-    @property
-    def supports_tools(self) -> bool:
-        """Whether this generator supports native OpenAI tool calling."""
-        return self._supports_tools
-
-    def generate_text(
-        self, *, prompt: str, system_prompt: str | None = None, **kwargs: object
-    ) -> str:
-        return self.generate_text_with_usage(
-            prompt=prompt,
-            system_prompt=system_prompt,
-            **kwargs,
-        ).value
-
-    def generate_text_with_usage(
-        self, *, prompt: str, system_prompt: str | None = None, **kwargs: object
-    ) -> LLMProviderResult[str]:
-        system_instructions = kwargs.pop("system_instructions", None)
-        if system_prompt is None and isinstance(system_instructions, str):
-            system_prompt = system_instructions
-        messages: list[dict[str, str]] = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-        response = self._client.chat.completions.create(  # type: ignore[call-overload]
-            model=self.chat_model_name,
-            messages=messages,
-            **kwargs,
-        )
-        content = response.choices[0].message.content
-        return LLMProviderResult(
-            value=str(content) if content is not None else "",
-            usage=_openai_response_usage(response),
-        )
-
-    def generate_structured(
-        self,
-        *,
-        prompt: str,
-        schema: type[T],
-        system_prompt: str | None = None,
-        **kwargs: object,
-    ) -> T:
-        return self.generate_structured_with_usage(
-            prompt=prompt,
-            schema=schema,
-            system_prompt=system_prompt,
-            **kwargs,
-        ).value
-
-    def generate_structured_with_usage(
-        self,
-        *,
-        prompt: str,
-        schema: type[T],
-        system_prompt: str | None = None,
-        **kwargs: object,
-    ) -> LLMProviderResult[T]:
-        schema_json = json.dumps(cast(Any, schema).model_json_schema(), ensure_ascii=False)
-        structured_prompt = f"""
-Return ONLY valid JSON matching this schema.
-Do not include markdown fences, explanations, or extra text.
-
-JSON schema:
-{schema_json}
-
-User task:
-{prompt}
-""".strip()
-        generated = self.generate_text_with_usage(
-            prompt=structured_prompt,
-            system_prompt=system_prompt,
-            **kwargs,
-        )
-        raw_output = generated.value
-        candidate = _extract_json_object(_strip_json_code_fence(raw_output)).strip()
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError("OpenAI-compatible structured fallback returned invalid JSON") from exc
-        return LLMProviderResult(
-            value=schema.model_validate(payload),  # type: ignore[attr-defined]
-            usage=generated.usage,
-        )
-
-    def generate_with_tools(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        **kwargs: object,
-    ) -> LLMProviderResult[Any]:
-        """Native OpenAI tool calling.  Returns the raw response object.
-
-        ``messages`` and ``tools`` are already in OpenAI wire format
-        (caller used ``OpenAIAdapter.messages`` / ``OpenAIAdapter.tools``).
-        """
-        response = self._client.chat.completions.create(  # type: ignore[call-overload]
-            model=self.chat_model_name,
-            messages=messages,
-            tools=tools or None,
-            **kwargs,
-        )
-        return LLMProviderResult(
-            value=response,
-            usage=_openai_response_usage(response),
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"_OpenAICompatibleChatGenerator(model={self.chat_model_name!r}, "
-            f"base_url={self._base_url!r})"
-        )
-
-
-def _strip_json_code_fence(text: str) -> str:
-    match = _JSON_CODE_FENCE_RE.match(text)
-    return match.group("body") if match else text
-
-
-def _extract_json_object(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("{") and stripped.endswith("}"):
-        return stripped
-
-    start = stripped.find("{")
-    end = stripped.rfind("}")
-    if start != -1 and end != -1 and start < end:
-        return stripped[start : end + 1]
-
-    return stripped
-
-
-def _openai_response_usage(response: object) -> LLMUsage | None:
-    normalized = parse_openai_usage(response)
-    if normalized is None:
-        return None
-    usage = getattr(response, "usage", None)
-    completion_details = getattr(usage, "completion_tokens_details", None)
-    return normalized.model_copy(
-        update={
-            "reasoning_tokens": int(
-                getattr(completion_details, "reasoning_tokens", 0) or 0
-            )
-        }
-    )
+_OpenAICompatibleChatGenerator = OpenAICompatibleChatGenerator
 
 
 def _backend_model_name(backend: object | None, capability: str) -> str | None:
@@ -509,9 +341,7 @@ def compatibility_config_from_environment() -> tuple[AssemblyConfig, dict[str, s
                 device=None if local_bge_device is None else str(local_bge_device),
                 rerank_model=None if local_bge_rerank_model is None else str(local_bge_rerank_model),
                 rerank_model_path=None if local_bge_rerank_model_path is None else str(local_bge_rerank_model_path),
-                rerank_batch_size=(
-                    None if local_bge_rerank_batch_size is None else int(local_bge_rerank_batch_size)
-                ),
+                rerank_batch_size=(None if local_bge_rerank_batch_size is None else int(local_bge_rerank_batch_size)),
             )
         )
     # local-hf provider removed; all models are cloud or OpenAI-compatible now.
@@ -632,13 +462,11 @@ def merge_assembly_overrides(
         embedding=merge_provider_config(high.embedding, low.embedding),
         rerank=merge_provider_config(high.rerank, low.rerank),
         tokenizer=merge_tokenizer_config(high.tokenizer, low.tokenizer),
-        embedding_provider=(
-            high.embedding_provider if high.embedding_provider is not None else low.embedding_provider
-        ),
-        rerank_provider=(
-            high.rerank_provider if high.rerank_provider is not None else low.rerank_provider
-        ),
+        embedding_provider=(high.embedding_provider if high.embedding_provider is not None else low.embedding_provider),
+        rerank_provider=(high.rerank_provider if high.rerank_provider is not None else low.rerank_provider),
     )
+
+
 def build_provider(provider_config: ProviderConfig) -> object:
     kind = provider_config.provider_kind
     if kind == "openai-compatible":
@@ -656,7 +484,7 @@ def build_provider(provider_config: ProviderConfig) -> object:
                 chat_model_name=chat_model,
             )
         generator: object | None
-        generator = _OpenAICompatibleChatGenerator(
+        generator = OpenAICompatibleChatGenerator(
             model=chat_model,
             base_url=base_url,
             api_key=provider_config.api_key,

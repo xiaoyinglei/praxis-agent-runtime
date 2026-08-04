@@ -11,6 +11,8 @@ from agent_runtime.core.llm_providers import LLMLoopModelTurnProvider
 from agent_runtime.core.messages import ModelMessage, StopReason, ToolUseResult
 from agent_runtime.loop.runtime import ModelTurnEnvelope
 from agent_runtime.loop.state import create_loop_state
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget, LLMUsage
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -21,8 +23,6 @@ from agent_runtime.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
-from rag.schema.llm import LLMCallStage, LLMStageBudget, LLMUsage
 
 
 def _tool(name: str) -> Tool:
@@ -230,9 +230,7 @@ async def test_model_defaults_and_reasoning_continuation_reach_canonical_message
     assert request.settings.max_output_tokens == 32_768
     assert request.settings.temperature == 1.0
     assert request.settings.top_p == 0.95
-    assert request.settings.provider_options == {
-        "thinking": {"type": "enabled"}
-    }
+    assert request.settings.provider_options == {"thinking": {"type": "enabled"}}
     assert envelope.assistant_message == ModelMessage(
         role="assistant",
         content="",

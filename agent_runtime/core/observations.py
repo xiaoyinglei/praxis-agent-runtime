@@ -6,9 +6,14 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field
 
+from agent_runtime.knowledge import (
+    AgentCitation,
+    AgentEvidence,
+    agent_citation_from_value,
+    agent_evidence_from_value,
+)
 from agent_runtime.memory.models import MemoryRef
 from agent_runtime.tools.tool import ToolCall, ToolResult
-from rag.schema.query import AnswerCitation, EvidenceItem
 
 
 class EvidenceRef(BaseModel):
@@ -117,8 +122,8 @@ class ObservationBatch(BaseModel):
     context_units: list[ContextUnit] = Field(default_factory=list)
     locators: list[dict[str, object]] = Field(default_factory=list)
     asset_refs: list[int] = Field(default_factory=list)
-    evidence: list[EvidenceItem] = Field(default_factory=list)
-    citations: list[AnswerCitation] = Field(default_factory=list)
+    evidence: list[AgentEvidence] = Field(default_factory=list)
+    citations: list[AgentCitation] = Field(default_factory=list)
     errors: list[ObservationError] = Field(default_factory=list)
 
     def as_state_update(self) -> dict[str, object]:
@@ -307,7 +312,7 @@ def _evidence_refs_from_output(output: BaseModel | _OutputView | None) -> list[E
     for citation_id in getattr(output, "citation_ids", []) or []:
         refs.append(EvidenceRef(citation_id=str(citation_id), source="tool_output"))
     for evidence in getattr(output, "evidence", []) or []:
-        evidence_item = EvidenceItem.model_validate(evidence)
+        evidence_item = agent_evidence_from_value(evidence)
         refs.append(
             EvidenceRef(
                 evidence_id=evidence_item.evidence_id,
@@ -317,9 +322,9 @@ def _evidence_refs_from_output(output: BaseModel | _OutputView | None) -> list[E
             )
         )
     for citation in getattr(output, "citations", []) or []:
-        if not isinstance(citation, (Mapping, AnswerCitation)):
+        if not isinstance(citation, (Mapping, AgentCitation)):
             continue
-        citation_item = AnswerCitation.model_validate(citation)
+        citation_item = agent_citation_from_value(citation)
         refs.append(
             EvidenceRef(
                 evidence_id=citation_item.evidence_id,
@@ -371,7 +376,7 @@ def _delegated_evidence_refs_from_output(
             )
         )
     for citation in getattr(output, "citations", []) or []:
-        citation_item = AnswerCitation.model_validate(citation)
+        citation_item = agent_citation_from_value(citation)
         if any(ref.evidence_id == citation_item.evidence_id for ref in refs):
             continue
         refs.append(
@@ -845,10 +850,10 @@ def _dedupe_evidence_refs(
 def _evidence_from_outputs(
     observations: Sequence[StructuredObservation],
     tool_results: Sequence[ToolResult],
-) -> list[EvidenceItem]:
+) -> list[AgentEvidence]:
     observed_ids = {observation.tool_call_id for observation in observations}
     return [
-        EvidenceItem.model_validate(item)
+        agent_evidence_from_value(item)
         for result in tool_results
         if result.tool_call_id in observed_ids and result.structured_content is not None
         for item in getattr(_result_output(result), "evidence", []) or []
@@ -858,14 +863,14 @@ def _evidence_from_outputs(
 def _citations_from_outputs(
     observations: Sequence[StructuredObservation],
     tool_results: Sequence[ToolResult],
-) -> list[AnswerCitation]:
+) -> list[AgentCitation]:
     observed_ids = {observation.tool_call_id for observation in observations}
     return [
-        AnswerCitation.model_validate(item)
+        agent_citation_from_value(item)
         for result in tool_results
         if result.tool_call_id in observed_ids and result.structured_content is not None
         for item in getattr(_result_output(result), "citations", []) or []
-        if isinstance(item, (Mapping, AnswerCitation))
+        if isinstance(item, (Mapping, AgentCitation))
     ]
 
 
@@ -918,24 +923,14 @@ def grounded_workspace_paths(
         if result.is_error:
             continue
         call = calls.get(result.tool_call_id)
-        if (
-            call is not None
-            and result.tool_name
-            in {"list_files", "search_text", "read_file"}
-        ):
+        if call is not None and result.tool_name in {"list_files", "search_text", "read_file"}:
             requested_path = call.arguments.get("path")
-            if (
-                requested_path is None
-                and result.tool_name in {"list_files", "search_text"}
-            ):
+            if requested_path is None and result.tool_name in {"list_files", "search_text"}:
                 requested_path = "."
             add(requested_path)
         if isinstance(result.structured_content, Mapping):
             if result.tool_name in {"read_file", "apply_patch"}:
-                add(
-                    result.structured_content.get("path")
-                    or result.structured_content.get("file_path")
-                )
+                add(result.structured_content.get("path") or result.structured_content.get("file_path"))
             elif result.tool_name == "list_files":
                 entries = result.structured_content.get("entries")
                 if not isinstance(entries, Sequence) or isinstance(
@@ -990,11 +985,7 @@ def runtime_workspace_change(
     file_path = result.metadata.get("file_path")
     legacy_before_sha256 = result.metadata.get("before_sha256")
     legacy_after_sha256 = result.metadata.get("after_sha256")
-    normalized_path = (
-        _normalize_grounded_workspace_path(file_path)
-        if isinstance(file_path, str)
-        else None
-    )
+    normalized_path = _normalize_grounded_workspace_path(file_path) if isinstance(file_path, str) else None
     if (
         normalized_path is None
         or not isinstance(legacy_before_sha256, str)
@@ -1048,18 +1039,26 @@ def tool_result_progress_error(result: ToolResult) -> str | None:
     output = result.structured_content
     if result.tool_name == "search_text" and isinstance(output, Mapping):
         matches = output.get("matches")
-        if isinstance(matches, Sequence) and not isinstance(
-            matches,
-            (str, bytes),
-        ) and not matches:
+        if (
+            isinstance(matches, Sequence)
+            and not isinstance(
+                matches,
+                (str, bytes),
+            )
+            and not matches
+        ):
             return "search returned no matches"
         return None
     if result.tool_name == "list_files" and isinstance(output, Mapping):
         entries = output.get("entries")
-        if isinstance(entries, Sequence) and not isinstance(
-            entries,
-            (str, bytes),
-        ) and not entries:
+        if (
+            isinstance(entries, Sequence)
+            and not isinstance(
+                entries,
+                (str, bytes),
+            )
+            and not entries
+        ):
             return "directory listing returned no entries"
         return None
     if result.tool_name != "run_command":

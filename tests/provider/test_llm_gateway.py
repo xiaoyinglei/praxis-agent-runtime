@@ -17,6 +17,18 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.modeling.contracts import (
+    LLMCallStage,
+    LLMProviderResult,
+    LLMStageBudget,
+    LLMUsage,
+)
+from agent_runtime.modeling.gateway import (
+    LLMContextOverflowError,
+    LLMGateway,
+    LLMToolCallValidationError,
+    StreamChunk,
+)
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -28,18 +40,6 @@ from agent_runtime.tools.tool import (
     json_schema_input,
 )
 from rag.assembly.support import _OpenAICompatibleChatGenerator
-from rag.providers.llm_gateway import (
-    LLMContextOverflowError,
-    LLMGateway,
-    LLMToolCallValidationError,
-    StreamChunk,
-)
-from rag.schema.llm import (
-    LLMCallStage,
-    LLMProviderResult,
-    LLMStageBudget,
-    LLMUsage,
-)
 
 
 class _WordTokenAccounting:
@@ -205,10 +205,7 @@ class _RejectedToolCallGenerator:
         error.body = {  # type: ignore[attr-defined]
             "message": "Tool call validation failed: max_bytes exceeds maximum",
             "code": "tool_use_failed",
-            "failed_generation": (
-                '<function=read_file>{"path":"README.md",'
-                '"max_bytes":2000000}</function>'
-            ),
+            "failed_generation": ('<function=read_file>{"path":"README.md","max_bytes":2000000}</function>'),
         }
         raise error
 
@@ -361,19 +358,13 @@ def _openai_generator_for_response(
     generator = _OpenAICompatibleChatGenerator.__new__(_OpenAICompatibleChatGenerator)
     generator.chat_model_name = "test-model"
     generator._base_url = "https://example.test/v1"
-    generator._client = SimpleNamespace(
-        chat=SimpleNamespace(
-            completions=SimpleNamespace(create=lambda **_: response)
-        )
-    )
+    generator._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_: response)))
     return generator
 
 
 @pytest.mark.anyio
 async def test_gateway_reserves_worst_case_and_commits_provider_usage() -> None:
-    generator = _UsageAwareGenerator(
-        usage=LLMUsage(input_tokens=3, output_tokens=2, source="provider")
-    )
+    generator = _UsageAwareGenerator(usage=LLMUsage(input_tokens=3, output_tokens=2, source="provider"))
     ledger = LLMBudgetLedger(total=20)
 
     result = await _gateway(generator).agenerate_text(
@@ -576,9 +567,7 @@ async def test_streaming_fallback_parses_sdk_text_completion(
 
     chunks = [
         chunk
-        async for chunk in _gateway(
-            _openai_generator_for_response(response)
-        ).astream_with_tools(
+        async for chunk in _gateway(_openai_generator_for_response(response)).astream_with_tools(
             stage=LLMCallStage.TOOL_DECISION,
             messages=[{"role": "user", "content": "hello prompt"}],
             tools=[],
@@ -613,9 +602,7 @@ async def test_streaming_fallback_parses_sdk_tool_completion(
 
     chunks = [
         chunk
-        async for chunk in _gateway(
-            _openai_generator_for_response(response)
-        ).astream_with_tools(
+        async for chunk in _gateway(_openai_generator_for_response(response)).astream_with_tools(
             stage=LLMCallStage.TOOL_DECISION,
             messages=[{"role": "user", "content": "read the file"}],
             tools=[],
@@ -715,9 +702,7 @@ async def test_canonical_provider_options_use_openai_extra_body_transport() -> N
     )
 
     assert "thinking" not in generator.calls[0]
-    assert generator.calls[0]["extra_body"] == {
-        "thinking": {"type": "enabled"}
-    }
+    assert generator.calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
 
 
 @pytest.mark.anyio

@@ -413,7 +413,7 @@ class _FakeGenerator:
         return turn
 
     def _provider_result(self, value: object) -> object:
-        from rag.schema.llm import LLMProviderResult, normalize_llm_usage
+        from agent_runtime.modeling.contracts import LLMProviderResult, normalize_llm_usage
 
         usage = normalize_llm_usage(
             input_tokens=40,
@@ -437,8 +437,8 @@ class _FakeModelResolver:
 
     def __init__(self, case: SmokeCase, generator: _FakeGenerator) -> None:
         from agent_runtime.core.llm_registry import ResolvedModel
-        from rag.providers.llm_gateway import LLMGateway
-        from rag.schema.llm import LLMCallStage, LLMStageBudget
+        from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+        from agent_runtime.modeling.gateway import LLMGateway
 
         gateway = LLMGateway(
             generator=generator,

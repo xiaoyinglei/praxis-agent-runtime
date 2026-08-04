@@ -73,6 +73,7 @@ from agent_runtime.loop.substate import (
     MemoryState,
     PlanState,
 )
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.tools.executor import ExecutionStatus, ToolExecutionRecord
 from agent_runtime.tools.tool import (
     ArtifactReference,
@@ -84,7 +85,6 @@ from agent_runtime.tools.tool import (
 from agent_runtime.tools.tool import (
     ToolCall as CanonicalToolCall,
 )
-from rag.schema.llm import LLMUsage
 
 LOOP_CHECKPOINT_NAMESPACE = "agent_loop"
 LOOP_COMPATIBILITY_CHANNEL = "loop_compatibility"
@@ -239,12 +239,7 @@ AGENT_CHECKPOINT_MSGPACK_ALLOWLIST: tuple[tuple[str, ...], ...] = (
     ("agent_runtime.tools.tool", "ToolCallOrigin"),
     ("agent_runtime.tools.tool", "ToolContentBlock"),
     ("agent_runtime.tools.tool", "ToolResult"),
-    ("rag.schema.llm", "LLMUsage"),
-    ("rag.schema.query", "AnswerCitation"),
-    ("rag.schema.query", "EvidenceItem"),
-    ("rag.schema.query", "RetrievalSignals"),
-    ("rag.schema.runtime", "AccessPolicy"),
-    ("rag.schema.runtime", "RuntimeMode"),
+    ("agent_runtime.modeling.contracts", "LLMUsage"),
 )
 
 
@@ -1955,26 +1950,17 @@ def _migrate_legacy_message_context(
     canonical = _legacy_model_messages(legacy_transcript)
     current_turn = _legacy_model_messages(state.get("turn_transcript"))
     full_context = list(canonical)
-    if anchor is not None and (
-        not full_context
-        or full_context[0].role != "user"
-        or full_context[0].content != anchor
-    ):
+    if anchor is not None and (not full_context or full_context[0].role != "user" or full_context[0].content != anchor):
         full_context.insert(0, ModelMessage(role="user", content=anchor))
 
     if current_turn:
         history = (
             full_context[: -len(current_turn)]
-            if len(full_context) >= len(current_turn)
-            and full_context[-len(current_turn) :] == current_turn
+            if len(full_context) >= len(current_turn) and full_context[-len(current_turn) :] == current_turn
             else []
         )
     elif full_context:
-        user_starts = [
-            index
-            for index, message in enumerate(full_context)
-            if message.role == "user"
-        ]
+        user_starts = [index for index, message in enumerate(full_context) if message.role == "user"]
         if user_starts:
             current_start = user_starts[-1]
             history = full_context[:current_start]
@@ -1996,15 +1982,10 @@ def _migrate_legacy_message_context(
         anchor or "Legacy checkpoint message unavailable.",
     )
     state.setdefault("current_message", current_user)
-    if "conversation_history" not in state or (
-        has_legacy_context
-        and not state["conversation_history"]
-    ):
+    if "conversation_history" not in state or (has_legacy_context and not state["conversation_history"]):
         state["conversation_history"] = history
     if "turn_transcript" not in state or (
-        has_legacy_context
-        and not state["turn_transcript"]
-        and state.get("tool_checkpoint") is None
+        has_legacy_context and not state["turn_transcript"] and state.get("tool_checkpoint") is None
     ):
         state["turn_transcript"] = current_turn
 
@@ -2210,6 +2191,8 @@ def _migrate_legacy_state(raw: dict[str, Any]) -> LoopState:
         state.pop(key, None)
 
     return cast(LoopState, state)
+
+
 def _migrate_discovery_candidates(
     raw: list[dict[str, object]],
 ) -> list[DiscoveryCandidate]:

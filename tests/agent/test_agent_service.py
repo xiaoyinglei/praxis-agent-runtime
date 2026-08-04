@@ -14,6 +14,7 @@ from agent_runtime.core.output_models import ValidatedFinalOutput
 from agent_runtime.core.turn_contracts import ToolCallPlan
 from agent_runtime.loop.runtime import ModelTurnEnvelope
 from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.service import AgentRunRequest, AgentRunResult, AgentService
 from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.registry import ToolRegistry
@@ -33,7 +34,6 @@ from agent_runtime.tools.tool import (
 )
 from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 from agent_runtime.workspace import open_workspace
-from rag.schema.llm import LLMUsage
 
 
 class _StructuredAnswer(BaseModel):
@@ -560,9 +560,7 @@ async def test_service_builds_manifest_for_imported_input_files(
     )
 
     assert result.status == "done"
-    assert provider.paths == (
-        ".rag/" + "agent_runtime/input_files/service-input-manifest/fixture.txt",
-    )
+    assert provider.paths == (".rag/" + "agent_runtime/input_files/service-input-manifest/fixture.txt",)
 
 
 def test_result_restores_configured_concrete_final_output() -> None:

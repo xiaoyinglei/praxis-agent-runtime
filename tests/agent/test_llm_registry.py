@@ -9,8 +9,9 @@ from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, Mode
 from agent_runtime.core.llm_registry import (
     ModelRegistry,
     UnknownModelAliasError,
+    _chat_provider_config,
 )
-from rag.schema.llm import LLMCallStage
+from agent_runtime.modeling.contracts import LLMCallStage
 
 
 def _ollama_spec(model: str = "test-model") -> ModelSpec:
@@ -114,7 +115,7 @@ def test_load_configs_models_preserves_api_key_env_for_cloud_models(
     monkeypatch.setenv("MIMO_API_KEY", "sk-test")
 
     config = ModelRegistry._load_yaml_file(config_path)
-    provider_config = ModelRegistry(config)._spec_to_provider_config(config.models["mimo_cloud"])
+    provider_config = _chat_provider_config(config.models["mimo_cloud"])
 
     assert config.models["mimo_cloud"].api_key_env == "MIMO_API_KEY"
     assert provider_config.api_key == "sk-test"
@@ -182,7 +183,7 @@ def test_load_configs_models_supports_provider_section_schema(
     config = ModelRegistry._load_yaml_file(config_path)
     groq = config.models["groq_gpt_oss_120b"]
     local = config.models["qwen3_8b_mlx_4bit"]
-    provider_config = ModelRegistry(config)._spec_to_provider_config(groq)
+    provider_config = _chat_provider_config(groq)
 
     assert config.default_model == "groq_gpt_oss_120b"
     assert groq.provider is ModelProvider.OPENAI_COMPATIBLE
@@ -293,8 +294,7 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
     )
     env_path = tmp_path / ".env"
     env_path.write_text(
-        f"RAG_AGENT_MODELS_PATH={config_path}\n"
-        "MIMO_API_KEY=sk-dotenv\n",
+        f"RAG_AGENT_MODELS_PATH={config_path}\nMIMO_API_KEY=sk-dotenv\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
@@ -302,7 +302,7 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
 
     registry = ModelRegistry.from_env(env_path=str(env_path))
     spec = registry._config.models["mimo_cloud"]
-    provider_config = registry._spec_to_provider_config(spec)
+    provider_config = _chat_provider_config(spec)
 
     assert registry.default_model == "mimo_cloud"
     assert provider_config.api_key == "sk-dotenv"

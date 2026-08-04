@@ -214,9 +214,7 @@ def test_empty_search_is_not_a_successful_plan_observation() -> None:
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"
@@ -256,8 +254,10 @@ def test_neutral_rag_observation_preserves_evidence_and_citations() -> None:
 
     update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
-    assert update["evidence"] == [evidence]
-    assert update["citations"] == [citation]
+    assert update["evidence"][0].evidence_id == evidence.evidence_id
+    assert update["citations"][0].citation_id == citation.citation_id
+    assert type(update["evidence"][0]).__module__ == "agent_runtime.knowledge"
+    assert type(update["citations"][0]).__module__ == "agent_runtime.knowledge"
     assert update["evidence_refs"] == [
         EvidenceRef(
             evidence_id="ev-policy",
@@ -428,9 +428,7 @@ def test_nonzero_command_is_not_a_successful_plan_observation() -> None:
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"
@@ -449,9 +447,7 @@ def test_noop_patch_is_not_a_successful_plan_observation() -> None:
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"

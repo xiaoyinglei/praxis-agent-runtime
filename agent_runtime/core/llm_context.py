@@ -17,8 +17,8 @@ from agent_runtime.memory.models import (
     ContextSectionName,
     InjectedContext,
 )
-from rag.providers.llm_gateway import structured_accounted_prompt
-from rag.schema.llm import LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.gateway import structured_accounted_prompt
 
 _OPTIONAL_STATE_SECTIONS: frozenset[ContextSectionName] = frozenset(
     {

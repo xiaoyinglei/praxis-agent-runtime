@@ -172,7 +172,7 @@ def test_agent_facade_run_maps_public_request_to_internal_service(
         built.append({"runtime": runtime, **kwargs})
         return _Service()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", fail_rag_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", fail_rag_runtime)
     monkeypatch.setattr(runtime_builder, "build_agent_service", build_service)
 
     result = Agent(model="qwen3_14b_mlx_4bit").run(
@@ -284,10 +284,7 @@ def test_agent_facade_defaults_to_real_change_and_post_change_verification(
 
     goal = requests[0].goal_spec
     assert goal is not None
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -326,10 +323,7 @@ def test_agent_facade_builds_explicit_completion_goal(
     goal = requests[0].goal_spec
     assert goal is not None
     assert goal.original_query == "Fix the implementation."
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -393,10 +387,7 @@ def test_agent_facade_requires_post_change_verification_when_execution_is_allowe
 
     goal = requests[0].goal_spec
     assert goal is not None
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -588,7 +579,7 @@ def test_agent_facade_registers_knowledge_runner_lazily(monkeypatch: pytest.Monk
         built.append({"runtime": runtime, **kwargs})
         return _Service()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", fail_rag_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", fail_rag_runtime)
     monkeypatch.setattr(runtime_builder, "build_agent_service", build_service)
 
     result = Agent(
@@ -856,7 +847,7 @@ async def test_lazy_knowledge_provider_search_uses_typed_final_contract(
     def build_runtime(**_: object) -> tuple[object, tuple[object, ...]]:
         return runtime, ()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", build_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", build_runtime)
 
     provider = LazyRAGKnowledgeProvider(config=RAGKnowledgeConfig(vector_backend="sqlite"))
     result = await provider.search_knowledge(

@@ -11,8 +11,9 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, ValidationError
 
-from rag.providers.llm_gateway import LLMGateway
-from rag.schema.llm import LLMCallStage
+from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.modeling.gateway import LLMGateway
+from agent_runtime.text import keyword_overlap, looks_command_like, search_terms, split_sentences
 from rag.schema.model_protocols import Generator
 from rag.schema.query import (
     AnswerCitation,
@@ -27,7 +28,6 @@ from rag.schema.runtime import (
     ProviderAttempt,
     RuntimeMode,
 )
-from rag.utils.text import keyword_overlap, looks_command_like, search_terms, split_sentences
 
 _DOC_ALIAS_RE = re.compile(r"\[(Doc-\d+)\]")
 _JSON_CODE_FENCE_RE = re.compile(
@@ -92,6 +92,7 @@ _GENERIC_ANSWER_TERMS = {
 # structured payload schema
 # ============================================================
 
+
 class AnswerSectionPayload(BaseModel):
     title: str
     text: str
@@ -107,6 +108,7 @@ class StructuredAnswerPayload(BaseModel):
 # ============================================================
 # provider binding
 # ============================================================
+
 
 @dataclass(frozen=True, slots=True)
 class GeneratorBinding:
@@ -128,6 +130,7 @@ class AnswerGenerationResult:
 # ============================================================
 # answer materialization service
 # ============================================================
+
 
 @dataclass(slots=True)
 class AnswerGenerationService:
@@ -203,8 +206,7 @@ class AnswerGenerationService:
             lines = [
                 grounded_candidate,
                 "",
-                "你是知识库回答生成器。你的任务是阅读以下多段证据，综合理解后生成一个流畅、"
-                "有条理的自然语言回答。",
+                "你是知识库回答生成器。你的任务是阅读以下多段证据，综合理解后生成一个流畅、有条理的自然语言回答。",
                 "",
                 "回答要求：",
                 "- answer_text 是一个完整的、面向用户的自然语言回答。你可以使用多段落、",
@@ -237,8 +239,7 @@ class AnswerGenerationService:
             lines.extend(
                 [
                     "表格计算例外：",
-                    "- 如果问题要求读取表格真实数据、筛选、求和、计数、排序、排名、对比或聚合，"
-                    "不要输出最终答案 JSON。",
+                    "- 如果问题要求读取表格真实数据、筛选、求和、计数、排序、排名、对比或聚合，不要输出最终答案 JSON。",
                     "- 必须只输出证据中指定格式的 <compute_request>...</compute_request>，"
                     "其中内容必须是 JSON 对象，格式为 "
                     '{"asset_id": 证据中的 asset_id, "sql": "SELECT ... FROM sheet WHERE ..."}。',
@@ -408,9 +409,7 @@ class AnswerGenerationService:
             return self.insufficient_answer()
 
         answer_text = payload.answer_text.strip() or grounded_candidate
-        sections = [
-            section for section in payload.answer_sections if section.text.strip()
-        ] or [
+        sections = [section for section in payload.answer_sections if section.text.strip()] or [
             AnswerSectionPayload(title="直接回答", text=answer_text, evidence_ids=[])
         ]
 
@@ -621,9 +620,7 @@ class AnswerGenerationService:
             alias_reference_map=alias_reference_map,
         )
 
-        overall_grounded = grounded and (
-            self._section_grounded(answer_text, evidence_pack) or len(answer_sections) > 1
-        )
+        overall_grounded = grounded and (self._section_grounded(answer_text, evidence_pack) or len(answer_sections) > 1)
 
         return GroundedAnswer(
             answer_text=answer_text,
@@ -707,11 +704,7 @@ class AnswerGenerationService:
         if keyword_overlap(query_terms, self._evidence_search_text(top)) == 0:
             return [top]
 
-        return [
-            item
-            for item in ranked[:2]
-            if keyword_overlap(query_terms, self._evidence_search_text(item)) > 0
-        ]
+        return [item for item in ranked[:2] if keyword_overlap(query_terms, self._evidence_search_text(item)) > 0]
 
     @classmethod
     def _alias_reference_map(cls, evidence_pack: Sequence[EvidenceItem]) -> dict[str, str]:
@@ -858,6 +851,7 @@ class AnswerGenerationService:
 # ============================================================
 # provider orchestration
 # ============================================================
+
 
 @dataclass(slots=True)
 class AnswerGenerator:

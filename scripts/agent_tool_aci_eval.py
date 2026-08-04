@@ -15,13 +15,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-DEFAULT_FIXTURE_PATH = (
-    Path(__file__).parents[1]
-    / "tests"
-    / "agent"
-    / "fixtures"
-    / "tool_aci_cases.json"
-)
+DEFAULT_FIXTURE_PATH = Path(__file__).parents[1] / "tests" / "agent" / "fixtures" / "tool_aci_cases.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +88,7 @@ def load_cases(fixture_path: Path = DEFAULT_FIXTURE_PATH) -> tuple[ACICase, ...]
                 fake_tool=_optional_text(raw.get("fake_tool")),
                 fake_arguments=dict(fake_arguments),
                 discovery_query=_optional_text(raw.get("discovery_query")),
-                expected_discovery=_optional_text(
-                    raw.get("expected_discovery")
-                ),
+                expected_discovery=_optional_text(raw.get("expected_discovery")),
                 recoverable=bool(raw.get("recoverable", False)),
                 fake_recovery_present="fake_recovery" in raw,
                 fake_recovery_tool=_fake_recovery_tool(raw, case_id=case_id),
@@ -125,44 +117,21 @@ async def run_evaluation(
     finally:
         shutil.rmtree(runtime.workspace_root, ignore_errors=True)
 
-    surface_expected = sum(
-        len(result["expected_surface"]) for result in case_results
-    )
-    surface_actual = sum(
-        len(result["actual_surface"]) for result in case_results
-    )
+    surface_expected = sum(len(result["expected_surface"]) for result in case_results)
+    surface_actual = sum(len(result["actual_surface"]) for result in case_results)
     surface_matches = sum(
-        len(
-            set(result["expected_surface"])
-            & set(result["actual_surface"])
-        )
-        for result in case_results
+        len(set(result["expected_surface"]) & set(result["actual_surface"])) for result in case_results
     )
-    predicted_calls = [
-        result for result in case_results if result["predicted_tool"] is not None
-    ]
-    no_call_cases = [
-        result for result in case_results if result["expected_tool"] is None
-    ]
-    discovery_cases = [
-        result
-        for result in case_results
-        if result["expected_discovery"] is not None
-    ]
-    fixture_recovery_cases = [
-        result for result in case_results if result["recoverable"]
-    ]
+    predicted_calls = [result for result in case_results if result["predicted_tool"] is not None]
+    no_call_cases = [result for result in case_results if result["expected_tool"] is None]
+    discovery_cases = [result for result in case_results if result["expected_discovery"] is not None]
+    fixture_recovery_cases = [result for result in case_results if result["recoverable"]]
     recovery_successes = delivery.recovery_successes + sum(
-        bool(result["recovery_succeeded"])
-        for result in fixture_recovery_cases
+        bool(result["recovery_succeeded"]) for result in fixture_recovery_cases
     )
     recovery_cases = delivery.recovery_cases + len(fixture_recovery_cases)
-    schema_bytes_total = sum(
-        int(result["schema_bytes"]) for result in case_results
-    )
-    schema_tokens_total = sum(
-        int(result["schema_tokens"]) for result in case_results
-    )
+    schema_bytes_total = sum(int(result["schema_bytes"]) for result in case_results)
+    schema_tokens_total = sum(int(result["schema_tokens"]) for result in case_results)
 
     metrics: dict[str, object] = {
         "surface_recall": _rate(surface_matches, surface_expected),
@@ -197,31 +166,19 @@ async def run_evaluation(
             "actual": surface_actual,
         },
         "tool_choice": {
-            "correct": sum(
-                bool(result["tool_choice_correct"])
-                for result in case_results
-            ),
+            "correct": sum(bool(result["tool_choice_correct"]) for result in case_results),
             "cases": len(case_results),
         },
         "arguments": {
-            "valid": sum(
-                bool(result["arguments_valid"])
-                for result in predicted_calls
-            ),
+            "valid": sum(bool(result["arguments_valid"]) for result in predicted_calls),
             "calls": len(predicted_calls),
         },
         "unnecessary_calls": {
-            "calls": sum(
-                result["predicted_tool"] is not None
-                for result in no_call_cases
-            ),
+            "calls": sum(result["predicted_tool"] is not None for result in no_call_cases),
             "no_call_cases": len(no_call_cases),
         },
         "discovery": {
-            "hits": sum(
-                bool(result["discovery_hit_at_5"])
-                for result in discovery_cases
-            ),
+            "hits": sum(bool(result["discovery_hit_at_5"]) for result in discovery_cases),
             "cases": len(discovery_cases),
             "k": 5,
         },
@@ -310,15 +267,10 @@ def _build_runtime_fixture() -> _RuntimeFixture:
             MCPToolDescriptor(
                 server_name="docs",
                 tool_name="search",
-                description=(
-                    "Search external runtime documentation. "
-                    "查询外部文档，搜索运行时资料。"
-                ),
+                description=("Search external runtime documentation. 查询外部文档，搜索运行时资料。"),
                 input_schema={
                     "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "minLength": 1}
-                    },
+                    "properties": {"query": {"type": "string", "minLength": 1}},
                     "required": ["query"],
                     "additionalProperties": False,
                 },
@@ -327,9 +279,7 @@ def _build_runtime_fixture() -> _RuntimeFixture:
                 execution_revision="aci-v1",
             ),
         ),
-        lambda _server, _tool, _arguments: {
-            "content": [{"type": "text", "text": "runtime docs"}]
-        },
+        lambda _server, _tool, _arguments: {"content": [{"type": "text", "text": "runtime docs"}]},
     )
     subagent_tool = create_subagent_tool(
         lambda _arguments: {
@@ -388,12 +338,12 @@ def _evaluate_case(
         canonical_json_text,
         tool_definition_payload,
     )
+    from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
     from agent_runtime.tools.selection import (
         find_tools,
         resolve_tool_options,
         select_tools,
     )
-    from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 
     options = resolve_tool_options(
         runtime.snapshot,
@@ -407,12 +357,7 @@ def _evaluate_case(
         disabled_names=options.disabled_names,
     )
     actual_surface = tuple(tool.definition.name for tool in selected)
-    schema_text = canonical_json_text(
-        tuple(
-            tool_definition_payload(tool.definition)
-            for tool in selected
-        )
-    )
+    schema_text = canonical_json_text(tuple(tool_definition_payload(tool.definition) for tool in selected))
     token_accounting = TokenAccountingService(
         TokenizerContract(
             embedding_model_name="aci-simple",
@@ -448,9 +393,7 @@ def _evaluate_case(
         discovery_names = tuple(match.name for match in found.matches)
         discovery_hit = case.expected_discovery in discovery_names
 
-    initial_rejected = (
-        case.fake_tool is not None and case.fake_tool not in actual_surface
-    )
+    initial_rejected = case.fake_tool is not None and case.fake_tool not in actual_surface
     recovery_succeeded = (
         case.recoverable
         and initial_rejected
@@ -491,9 +434,7 @@ async def _measure_delivery_evidence() -> Any:
     )
     failed = [result for result in results if not result.passed]
     if failed:
-        details = "; ".join(
-            f"{result.name}: {result.error}" for result in failed
-        )
+        details = "; ".join(f"{result.name}: {result.error}" for result in failed)
         raise RuntimeError(f"delivery evidence failed: {details}")
     return module.delivery_metric_evidence(results)
 
@@ -537,16 +478,12 @@ def _fake_recovery_tool(
         return None
     recovery = raw["fake_recovery"]
     if not isinstance(recovery, dict) or set(recovery) != {"tool"}:
-        raise ValueError(
-            f"ACI case {case_id!r} fake_recovery must contain only tool"
-        )
+        raise ValueError(f"ACI case {case_id!r} fake_recovery must contain only tool")
     return _optional_text(recovery["tool"])
 
 
 def _text_tuple(value: object, field_name: str) -> tuple[str, ...]:
-    if not isinstance(value, list) or any(
-        not isinstance(item, str) or not item for item in value
-    ):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
         raise ValueError(f"ACI case field {field_name!r} must be a text list")
     return tuple(value)
 
@@ -586,10 +523,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     if not args.fake_model:
-        parser.error(
-            "--fake-model is required; live-provider checks are opt-in via "
-            "scripts/agent_delivery_smoke.py"
-        )
+        parser.error("--fake-model is required; live-provider checks are opt-in via scripts/agent_delivery_smoke.py")
     report = asyncio.run(
         run_evaluation(
             fixture_path=args.fixture,

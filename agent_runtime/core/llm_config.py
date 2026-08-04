@@ -5,8 +5,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from rag.models.config import GenerationConfig
-from rag.schema.llm import (
+from agent_runtime.modeling.config import GenerationConfig
+from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
     LLMCallStage,
     LLMStageBudget,
@@ -55,13 +55,8 @@ class ModelSpec(BaseModel):
 
     @model_validator(mode="after")
     def validate_request_context_limit(self) -> ModelSpec:
-        if (
-            self.request_context_tokens is not None
-            and self.request_context_tokens > self.context_window_tokens
-        ):
-            raise ValueError(
-                "request_context_tokens must not exceed context_window_tokens"
-            )
+        if self.request_context_tokens is not None and self.request_context_tokens > self.context_window_tokens:
+            raise ValueError("request_context_tokens must not exceed context_window_tokens")
         return self
 
 
@@ -74,10 +69,7 @@ class AgentModelsConfig(BaseModel):
     fallback_model: str | None = None
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     llm_stage_budgets: dict[LLMCallStage, LLMStageBudget] = Field(
-        default_factory=lambda: {
-            stage: budget.model_copy()
-            for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()
-        }
+        default_factory=lambda: {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}
     )
 
     @model_validator(mode="after")

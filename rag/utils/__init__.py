@@ -1,11 +1,4 @@
-from rag.utils.guard import CircuitBreaker, CircuitConfig, RateLimiter, RateLimitExceeded, guarded
-from rag.utils.telemetry import (
-    LocalEventRepo,
-    TelemetryService,
-    compute_evaluation_metrics,
-    summarize_evaluation_metrics,
-)
-from rag.utils.text import (
+from agent_runtime.text import (
     DEFAULT_TOKENIZER_FALLBACK_MODEL,
     build_fts_query,
     keyword_overlap,
@@ -15,6 +8,13 @@ from rag.utils.text import (
     search_terms,
     split_sentences,
     text_unit_count,
+)
+from rag.utils.guard import CircuitBreaker, CircuitConfig, RateLimiter, RateLimitExceeded, guarded
+from rag.utils.telemetry import (
+    LocalEventRepo,
+    TelemetryService,
+    compute_evaluation_metrics,
+    summarize_evaluation_metrics,
 )
 
 __all__ = [

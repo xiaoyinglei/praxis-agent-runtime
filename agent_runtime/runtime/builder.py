@@ -8,7 +8,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelControlPlane
 
 if TYPE_CHECKING:
@@ -21,7 +20,6 @@ if TYPE_CHECKING:
     from agent_runtime.tools.tool import Tool
     from agent_runtime.turns import RuntimeBinding, TurnStore
     from agent_runtime.workspace import WorkspaceRuntime
-    from rag.runtime import RAGRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -186,67 +184,3 @@ def build_agent_service(
         turn_store=turn_store,
         runtime_binding=runtime_binding,
     )
-
-
-def build_optional_rag_runtime(
-    *,
-    config: RAGKnowledgeConfig,
-    model_alias: str | None,
-    vector_dsn: str | None,
-) -> tuple[RAGRuntime | None, tuple[RuntimeDiagnostic, ...]]:
-    from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
-
-    try:
-        if not config.storage_root.exists():
-            raise FileNotFoundError(f"RAG storage root does not exist: {config.storage_root}")
-        from rag import AssemblyRequest, CapabilityRequirements, RAGRuntime
-        from rag.models.assembly_adapter import to_assembly_overrides
-        from rag.models.runtime import RuntimeOverrides, resolve_runtime_config
-        from rag.retrieval import QueryOptions
-        from rag.storage.runtime_config import runtime_storage_config
-
-        runtime_config = resolve_runtime_config(
-            RuntimeOverrides(
-                model_alias=model_alias,
-                embedding_model_alias=config.embedding_model,
-                reranker_model_alias=config.reranker_model or "none",
-            )
-        )
-        assembly_overrides = to_assembly_overrides(runtime_config)
-        storage = runtime_storage_config(
-            config.storage_root,
-            vector_backend=config.vector_backend,
-            vector_dsn=vector_dsn,
-            vector_namespace=config.vector_namespace,
-            vector_collection_prefix=config.vector_collection_prefix,
-        )
-        requirements = CapabilityRequirements(
-            require_chat=True,
-            default_context_tokens=QueryOptions().max_context_tokens,
-        )
-        runtime = RAGRuntime.from_request(
-            storage=storage,
-            request=AssemblyRequest(
-                requirements=requirements,
-                overrides=assembly_overrides,
-            ),
-            generation_config=runtime_config.generation,
-            chat_context_window_tokens=(runtime_config.primary_model.context_window_tokens or 32_768),
-            llm_stage_budgets=runtime_config.llm_stage_budgets,
-        )
-        return runtime, ()
-    except Exception as exc:
-        error_type = type(exc).__name__[:120]
-        logger.warning(
-            "RAG knowledge runtime initialization failed (%s)",
-            error_type,
-        )
-        return None, (
-            RuntimeDiagnostic(
-                code="rag_knowledge_init_failed",
-                component="rag_runtime",
-                message="Configured knowledge runtime could not be initialized.",
-                severity="error",
-                error_type=error_type,
-            ),
-        )
