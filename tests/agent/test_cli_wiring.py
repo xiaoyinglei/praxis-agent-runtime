@@ -48,6 +48,15 @@ class _ModelRegistry:
         raise AssertionError("model resolution is not needed for assembly")
 
 
+def test_cli_defaults_preserve_task1_runtime_paths() -> None:
+    assert cli_module.DEFAULT_MODEL_SESSION_PATH == Path(".rag") / (
+        "agent_" + "model_session.json"
+    )
+    assert cli_module.DEFAULT_CHECKPOINT_PATH == Path(".rag") / (
+        "agent_" + "checkpoints.sqlite"
+    )
+
+
 @pytest.mark.parametrize(
     ("command", "present", "removed"),
     [

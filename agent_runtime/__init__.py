@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.streaming.events import EventType, StreamEvent
 
@@ -22,11 +23,14 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "Agent",
     "AgentEventSink",
+    "AgentPlan",
     "AgentResult",
     "AgentUsage",
     "EventType",
     "ModelNotAvailableError",
     "ModelSpec",
+    "PlanEvent",
+    "PlanStep",
     "RAGKnowledgeConfig",
     "StreamEvent",
 ]

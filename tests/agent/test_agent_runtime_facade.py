@@ -30,17 +30,34 @@ from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 
 
 def test_agent_runtime_exports_sdk_facade() -> None:
+    from agent_runtime import AgentPlan, PlanEvent, PlanStep
+    from agent_runtime.planning import (
+        AgentPlan as PlanningAgentPlan,
+    )
+    from agent_runtime.planning import (
+        PlanEvent as PlanningPlanEvent,
+    )
+    from agent_runtime.planning import (
+        PlanStep as PlanningPlanStep,
+    )
+
     assert Agent is not None
+    assert AgentPlan is PlanningAgentPlan
     assert AgentResult is not None
     assert AgentUsage is not None
+    assert PlanEvent is PlanningPlanEvent
+    assert PlanStep is PlanningPlanStep
     assert agent_runtime.__all__ == [
         "Agent",
         "AgentEventSink",
+        "AgentPlan",
         "AgentResult",
         "AgentUsage",
         "EventType",
         "ModelNotAvailableError",
         "ModelSpec",
+        "PlanEvent",
+        "PlanStep",
         "RAGKnowledgeConfig",
         "StreamEvent",
     ]

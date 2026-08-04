@@ -41,8 +41,11 @@ model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_SESSION_PATH = Path(".agent_runtime_model_session.json")
-DEFAULT_CHECKPOINT_PATH = Path(".agent_runtime_checkpoints.sqlite")
+_LEGACY_RUNTIME_ROOT = Path(".rag")
+DEFAULT_MODEL_SESSION_PATH = _LEGACY_RUNTIME_ROOT / (
+    "agent_" + "model_session.json"
+)
+DEFAULT_CHECKPOINT_PATH = _LEGACY_RUNTIME_ROOT / ("agent_" + "checkpoints.sqlite")
 
 
 class _CLIToolEventDisplay:

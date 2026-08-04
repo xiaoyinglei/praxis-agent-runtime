@@ -86,8 +86,6 @@ def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
         "AgentRunState",
         "AgentToolSpec",
         "ToolSpec",
-        "AgentPlan",
-        "PlanEvent",
         "PlanTracker",
     ):
         assert not hasattr(public_api, removed_name)

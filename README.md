@@ -195,7 +195,7 @@ from agent_runtime import Agent
 
 agent = Agent(
     model="qwen3_5_9b_mlx_4bit",
-    checkpoint_db=Path(".agent_runtime_checkpoints.sqlite"),
+    checkpoint_db=Path(".rag") / "agent_checkpoints.sqlite",
     workspace_path=Path.cwd(),
 )
 
@@ -300,7 +300,7 @@ MCP 从 workspace 的 `configs/mcp_servers.yaml` 装配，也可用 `AGENT_MCP_C
 
 Skill 资产访问有独立的 hard guard：`invoke_skill` 只能激活 catalog/policy 允许的 Skill，`materialize_skill_asset` 只能访问 checkpoint 中已激活 Skill 的 root；未激活、路径越界或状态不一致都会 hard-deny。
 
-`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。workspace 写入和进程执行需要各自的 effect 授权；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.agent_runtime_checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
+`apply_patch` 和 `run_command` 的 schema 可见不等于已授权。workspace 写入和进程执行需要各自的 effect 授权；`--allow-write-tools` 和 `--allow-execute-tools` 分别预授权这两类 effect。审批互动只存在于 CLI 层，SDK、`can_use_tool()` 和 `ToolExecutor` 都不读 stdin。拒绝会生成标准 `tool_denied` 结果供模型调整，不会把命令直接弄崩。默认 checkpoint 位于 `.rag/` 下的 `agent_checkpoints.sqlite`；跨进程恢复时使用 CLI 输出的 `agent resume <turn-id> --action ...` 命令。
 
 `run_command` 不以宿主用户的完整能力直接执行，而是进入 macOS Seatbelt 受限沙箱：
 
