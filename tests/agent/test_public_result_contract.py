@@ -88,6 +88,40 @@ def test_public_result_dtos_are_frozen_and_have_the_stable_surface() -> None:
             value.__setattr__(next(iter(value.__dataclass_fields__)), "changed")
 
 
+def test_agent_run_result_serializes_nested_immutable_grounding_target() -> None:
+    evidence = AgentEvidence(
+        evidence_id="e-1",
+        doc_id=7,
+        citation_anchor="report#summary",
+        text="Revenue increased.",
+        score=0.91,
+        grounding_target={
+            "kind": "section",
+            "section_path": ("Summary", "Revenue"),
+            "raw_locator": {"page": 2, "labels": ("finance",)},
+        },
+    )
+    result = AgentRunResult(
+        turn_id="turn-json",
+        status="done",
+        evidence=[evidence],
+        citations=[AgentCitation(citation_id="c-1", evidence_id="e-1", record_type="section")],
+    )
+
+    payload = result.model_dump(mode="json")
+    assert payload["evidence"][0]["grounding_target"] == {
+        "kind": "section",
+        "section_path": ["Summary", "Revenue"],
+        "raw_locator": {"page": 2, "labels": ["finance"]},
+    }
+    assert isinstance(payload["evidence"][0]["grounding_target"], dict)
+    restored = AgentRunResult.model_validate_json(result.model_dump_json())
+    assert isinstance(restored.evidence[0], AgentEvidence)
+    assert isinstance(restored.citations[0], AgentCitation)
+    with pytest.raises(TypeError):
+        restored.evidence[0].grounding_target["kind"] = "asset"  # type: ignore[index]
+
+
 def test_internal_projection_builds_stable_result_dtos_without_internal_objects() -> None:
     first_tool = ToolResult(
         tool_call_id="call-read",

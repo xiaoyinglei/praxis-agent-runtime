@@ -67,7 +67,10 @@ def test_legacy_and_canonical_modeling_exports_preserve_identity() -> None:
     from agent_runtime.modeling.config import GenerationConfig
     from agent_runtime.modeling.contracts import LLMUsage
     from agent_runtime.modeling.gateway import LLMGateway
-    from agent_runtime.modeling.local_agent_wire import LocalAgentWireRequest
+    from agent_runtime.modeling.local_agent_wire import (
+        LocalAgentWireRequest,
+        estimate_local_agent_usage,
+    )
     from agent_runtime.modeling.openai_wire import OpenAIWireRequest
     from agent_runtime.modeling.providers.ollama.generator import OllamaGenerator
     from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
@@ -78,7 +81,9 @@ def test_legacy_and_canonical_modeling_exports_preserve_identity() -> None:
     from rag.assembly.tokenizer import TokenizerContract as LegacyTokenizerContract
     from rag.models.config import GenerationConfig as LegacyGenerationConfig
     from rag.providers.llm_gateway import LLMGateway as LegacyLLMGateway
+    from rag.providers import local_agent_wire as legacy_local_agent_wire_module
     from rag.providers.local_agent_wire import LocalAgentWireRequest as LegacyLocalAgentWireRequest
+    from rag.providers.local_agent_wire import estimate_local_agent_usage as legacy_estimate_local_agent_usage
     from rag.providers.ollama.generator import OllamaGenerator as LegacyOllamaGenerator
     from rag.providers.openai_wire import OpenAIWireRequest as LegacyOpenAIWireRequest
     from rag.schema.llm import LLMUsage as LegacyLLMUsage
@@ -96,6 +101,8 @@ def test_legacy_and_canonical_modeling_exports_preserve_identity() -> None:
     assert legacy_text_unit_count is text_unit_count
     assert text_unit_count.__module__ == "agent_runtime.text"
     assert LegacyLocalAgentWireRequest is LocalAgentWireRequest
+    assert legacy_estimate_local_agent_usage is estimate_local_agent_usage
+    assert "estimate_local_agent_usage" in legacy_local_agent_wire_module.__all__
     assert LegacyOpenAIWireRequest is OpenAIWireRequest
     assert LegacyOllamaGenerator is OllamaGenerator
 

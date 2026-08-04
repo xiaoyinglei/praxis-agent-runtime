@@ -5,11 +5,27 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, PlainSerializer
 
 from agent_runtime.tools.tool import JsonValue
+
+
+def _json_serializable(value: object) -> Any:
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return cast(JsonValue, value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_serializable(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_json_serializable(item) for item in value]
+    raise TypeError(f"knowledge dynamic value is not JSON-compatible: {type(value).__name__}")
+
+
+type GroundingTargetJson = Annotated[
+    Mapping[str, JsonValue],
+    PlainSerializer(_json_serializable, return_type=Any, when_used="json"),
+]
 
 
 class RAGKnowledgeConfig(BaseModel):
@@ -43,7 +59,7 @@ class AgentEvidence:
     source_type: str | None = None
     retrieval_channels: tuple[str, ...] = ()
     retrieval_family: str | None = None
-    grounding_target: Mapping[str, JsonValue] | None = None
+    grounding_target: GroundingTargetJson | None = None
 
     def __post_init__(self) -> None:
         if self.grounding_target is not None:
