@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,12 +26,78 @@ def test_agent_runtime_has_no_rag_imports_except_knowledge_provider() -> None:
     assert not violations, "forbidden RAG imports: " + ", ".join(sorted(violations))
 
 
-def test_llm_usage_is_canonical_agent_runtime_contract() -> None:
-    contracts = importlib.import_module("agent_runtime.modeling.contracts")
-    from agent_runtime.modeling.contracts import LLMUsage
+def test_rag_production_consumers_do_not_import_legacy_canonical_paths() -> None:
+    rag_root = Path(__file__).parents[2] / "rag"
+    legacy_wrappers = {
+        "assembly/tokenizer.py",
+        "models/config.py",
+        "providers/llm_gateway.py",
+        "schema/llm.py",
+        "utils/text.py",
+    }
+    legacy_modules = {
+        "rag.assembly.tokenizer",
+        "rag.models.config",
+        "rag.providers.llm_gateway",
+        "rag.schema.llm",
+        "rag.utils.text",
+    }
+    violations: list[str] = []
+    for path in rag_root.rglob("*.py"):
+        relative_path = path.relative_to(rag_root).as_posix()
+        if relative_path in legacy_wrappers:
+            continue
+        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+            if isinstance(node, ast.ImportFrom):
+                if node.module in legacy_modules:
+                    violations.append(f"{relative_path}:{node.module}")
+                if node.module == "rag.assembly" and {alias.name for alias in node.names} & {
+                    "TokenAccountingService",
+                    "TokenizerContract",
+                }:
+                    violations.append(f"{relative_path}:rag.assembly tokenizer exports")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in legacy_modules:
+                        violations.append(f"{relative_path}:{alias.name}")
+    assert not violations, "legacy canonical imports: " + ", ".join(sorted(violations))
 
-    assert LLMUsage is contracts.LLMUsage
-    assert contracts.LLMUsage.__module__ == "agent_runtime.modeling.contracts"
+
+def test_legacy_and_canonical_modeling_exports_preserve_identity() -> None:
+    from agent_runtime.modeling.config import GenerationConfig
+    from agent_runtime.modeling.contracts import LLMUsage
+    from agent_runtime.modeling.gateway import LLMGateway
+    from agent_runtime.modeling.local_agent_wire import LocalAgentWireRequest
+    from agent_runtime.modeling.openai_wire import OpenAIWireRequest
+    from agent_runtime.modeling.providers.ollama.generator import OllamaGenerator
+    from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+    from agent_runtime.text import text_unit_count
+    from rag.assembly.tokenizer import (
+        TokenAccountingService as LegacyTokenAccountingService,
+    )
+    from rag.assembly.tokenizer import TokenizerContract as LegacyTokenizerContract
+    from rag.models.config import GenerationConfig as LegacyGenerationConfig
+    from rag.providers.llm_gateway import LLMGateway as LegacyLLMGateway
+    from rag.providers.local_agent_wire import LocalAgentWireRequest as LegacyLocalAgentWireRequest
+    from rag.providers.ollama.generator import OllamaGenerator as LegacyOllamaGenerator
+    from rag.providers.openai_wire import OpenAIWireRequest as LegacyOpenAIWireRequest
+    from rag.schema.llm import LLMUsage as LegacyLLMUsage
+    from rag.utils.text import text_unit_count as legacy_text_unit_count
+
+    assert LegacyLLMUsage is LLMUsage
+    assert LLMUsage.__module__ == "agent_runtime.modeling.contracts"
+    assert LegacyGenerationConfig is GenerationConfig
+    assert GenerationConfig.__module__ == "agent_runtime.modeling.config"
+    assert LegacyLLMGateway is LLMGateway
+    assert LLMGateway.__module__ == "agent_runtime.modeling.gateway"
+    assert LegacyTokenAccountingService is TokenAccountingService
+    assert LegacyTokenizerContract is TokenizerContract
+    assert TokenAccountingService.__module__ == "agent_runtime.modeling.tokenization"
+    assert legacy_text_unit_count is text_unit_count
+    assert text_unit_count.__module__ == "agent_runtime.text"
+    assert LegacyLocalAgentWireRequest is LocalAgentWireRequest
+    assert LegacyOpenAIWireRequest is OpenAIWireRequest
+    assert LegacyOllamaGenerator is OllamaGenerator
 
 
 def test_rag_provider_projects_query_dtos_to_agent_owned_knowledge_dtos(monkeypatch) -> None:
@@ -78,7 +143,11 @@ def test_rag_provider_projects_query_dtos_to_agent_owned_knowledge_dtos(monkeypa
 
 
 def test_agent_evidence_and_citation_are_canonical_knowledge_contracts() -> None:
+    from agent_runtime.knowledge import AgentCitation as KnowledgeAgentCitation
+    from agent_runtime.knowledge import AgentEvidence as KnowledgeAgentEvidence
     from agent_runtime.result import AgentCitation, AgentEvidence
 
+    assert AgentEvidence is KnowledgeAgentEvidence
+    assert AgentCitation is KnowledgeAgentCitation
     assert AgentEvidence.__module__ == "agent_runtime.knowledge"
     assert AgentCitation.__module__ == "agent_runtime.knowledge"

@@ -6,8 +6,8 @@ from typing import Any, Protocol
 
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import LLMGateway
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.text import text_unit_count
-from rag.assembly import TokenAccountingService, TokenizerContract
 from rag.ingest.parsers.util import normalize_whitespace
 from rag.schema.core import ParsedSection
 

@@ -4,8 +4,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.text import DEFAULT_TOKENIZER_FALLBACK_MODEL
-from rag.assembly import TokenAccountingService, TokenizerContract
 from rag.providers.generation import AnswerGenerationService
 from rag.retrieval.evidence import classify_retrieval_family
 from rag.schema.query import EvidenceItem

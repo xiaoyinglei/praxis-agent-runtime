@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from rag.assembly import (
     AssemblyDiagnostics,
     AssemblyRequest,
@@ -15,8 +16,6 @@ from rag.assembly import (
     CapabilityCatalog,
     ChatCapabilityBinding,
     ProviderConfig,
-    TokenAccountingService,
-    TokenizerContract,
 )
 from rag.assembly.support import build_provider
 from rag.ingest.parsers import (
