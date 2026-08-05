@@ -57,15 +57,6 @@ _SENSITIVE_ARTIFACT_KEY_TOKENS = frozenset(
         "token",
     }
 )
-_SENSITIVE_ENV_NAME_MARKERS = (
-    "AUTH",
-    "COOKIE",
-    "CREDENTIAL",
-    "KEY",
-    "PASSWORD",
-    "SECRET",
-    "TOKEN",
-)
 _MODEL_QUALITY_FAILURE_REASONS = frozenset(
     {
         "invalid_model_turn",
@@ -1271,8 +1262,7 @@ def _selected_models(
 def _safe_error(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"[:2000]
     for name, value in os.environ.items():
-        upper = name.upper()
-        if not any(marker in upper for marker in _SENSITIVE_ENV_NAME_MARKERS):
+        if not _is_sensitive_artifact_key(name):
             continue
         if len(value) >= 8:
             text = text.replace(value, "[REDACTED]")
@@ -1433,8 +1423,7 @@ def _is_sensitive_artifact_key(key: str) -> bool:
 def _artifact_secret_values() -> tuple[str, ...]:
     values: list[str] = []
     for name, value in os.environ.items():
-        upper = name.upper()
-        if not any(marker in upper for marker in _SENSITIVE_ENV_NAME_MARKERS):
+        if not _is_sensitive_artifact_key(name):
             continue
         if len(value) >= 8:
             values.append(value)

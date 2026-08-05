@@ -7,6 +7,7 @@ import argparse
 import difflib
 import json
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -15,7 +16,24 @@ from typing import cast
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = ROOT / "docs" / "benchmark.md"
 DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
-_SENSITIVE_KEY_MARKERS = ("authorization", "credential", "header", "key", "password", "secret", "token")
+_SENSITIVE_KEY_TOKENS = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "env",
+        "environment",
+        "header",
+        "headers",
+        "key",
+        "password",
+        "secret",
+        "token",
+    }
+)
 
 
 def render_model_quality_report(
@@ -699,7 +717,7 @@ def _safe_json(value: Mapping[str, object]) -> str:
 def _redacted_mapping(value: Mapping[str, object]) -> dict[str, object]:
     redacted: dict[str, object] = {}
     for key, item in value.items():
-        if any(marker in key.casefold() for marker in _SENSITIVE_KEY_MARKERS):
+        if _is_sensitive_key(key):
             redacted[key] = "[REDACTED]"
         elif isinstance(item, Mapping):
             redacted[key] = _redacted_mapping(cast(Mapping[str, object], item))
@@ -708,6 +726,17 @@ def _redacted_mapping(value: Mapping[str, object]) -> dict[str, object]:
         else:
             redacted[key] = _redacted_value(item)
     return redacted
+
+
+def _is_sensitive_key(key: str) -> bool:
+    camel_split = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", camel_split)
+    tokens = {
+        token.casefold()
+        for token in re.split(r"[^A-Za-z0-9]+", normalized)
+        if token
+    }
+    return bool(tokens & _SENSITIVE_KEY_TOKENS)
 
 
 def _redacted_value(value: object) -> object:

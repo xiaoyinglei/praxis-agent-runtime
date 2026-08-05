@@ -394,6 +394,28 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert ".env" not in serialized
 
 
+def test_artifact_secret_values_match_sensitive_name_tokens_without_substrings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_gate_module()
+    expected_secrets = {
+        "GROQ_API_KEY": "groq-api-key-sentinel",
+        "AUTH_TOKEN": "auth-token-sentinel",
+        "CLIENT_SECRET": "client-secret-sentinel",
+        "SESSION_COOKIE": "session-cookie-sentinel",
+        "CREDENTIAL": "credential-sentinel",
+    }
+    for name, value in expected_secrets.items():
+        monkeypatch.setenv(name, value)
+    monkey_value = "monkey-value-sentinel"
+    monkeypatch.setenv("MONKEY_VALUE", monkey_value)
+
+    collected = module._artifact_secret_values()
+
+    assert set(expected_secrets.values()) <= set(collected)
+    assert monkey_value not in collected
+
+
 @pytest.mark.anyio
 async def test_calibration_preflight_runs_before_model_calls(
     monkeypatch: pytest.MonkeyPatch,

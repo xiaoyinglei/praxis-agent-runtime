@@ -216,6 +216,36 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "redacted-id" not in rendered
 
 
+def test_renderer_redacts_sensitive_name_tokens_without_redacting_monkey() -> None:
+    module = _load_report_module()
+    payload = {
+        "monkey": "banana",
+        "nested": [
+            {
+                "apiKey": "api-key-value",
+                "x_api_key": "x-api-key-value",
+                "access_token": "access-token-value",
+                "client_secret": "client-secret-value",
+                "auth": "auth-value",
+                "cookie": "cookie-value",
+                "deeper": [{"monkey": "plantain"}],
+            }
+        ],
+    }
+
+    redacted = module._redacted_mapping(payload)
+
+    assert redacted["monkey"] == "banana"
+    nested = redacted["nested"][0]
+    assert nested["apiKey"] == "[REDACTED]"
+    assert nested["x_api_key"] == "[REDACTED]"
+    assert nested["access_token"] == "[REDACTED]"
+    assert nested["client_secret"] == "[REDACTED]"
+    assert nested["auth"] == "[REDACTED]"
+    assert nested["cookie"] == "[REDACTED]"
+    assert nested["deeper"][0]["monkey"] == "plantain"
+
+
 def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_success(
     tmp_path: Path,
 ) -> None:
