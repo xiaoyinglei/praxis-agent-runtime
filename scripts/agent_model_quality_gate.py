@@ -513,6 +513,7 @@ async def run_live_case(
         source.mkdir()
         workspace.mkdir()
         files = _write_source_files(source, _mapping(case.get("workspace_files", {})))
+        workspace_assertions = _mapping(case.get("workspace_assertions", {}))
         agent = Agent(
             model=model_alias,
             checkpoint_db=root / "checkpoint.sqlite3",
@@ -524,7 +525,11 @@ async def run_live_case(
         approval_resumes = 0
         result: AgentResult | None = None
         try:
-            result = await agent.arun(str(case["task"]), files=files)
+            result = await agent.arun(
+                str(case["task"]),
+                files=files,
+                require_workspace_change=bool(workspace_assertions),
+            )
             if bool(case.get("auto_approve", False)) and result.status == "paused":
                 pause_observed = True
                 approval_kind = None if result.pause is None else result.pause.kind
@@ -535,7 +540,7 @@ async def run_live_case(
             evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
             workspace_ok = _workspace_assertions_pass(
                 workspace,
-                _mapping(case.get("workspace_assertions", {})),
+                workspace_assertions,
             )
             return CaseObservation(
                 case_id=case_id,

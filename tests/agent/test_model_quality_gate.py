@@ -525,6 +525,70 @@ def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> Non
     assert evidence.latency_ms is None
 
 
+@pytest.mark.parametrize(
+    ("workspace_assertions", "expected"),
+    [
+        ({}, False),
+        ({"input_files/output.txt": "after\n"}, True),
+    ],
+    ids=["read-only", "workspace-mutation"],
+)
+@pytest.mark.anyio
+async def test_run_live_case_derives_workspace_change_contract_from_assertions(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_assertions: dict[str, str],
+    expected: bool,
+) -> None:
+    module = _load_gate_module()
+    captured: list[bool] = []
+
+    class FakeAgent:
+        def __init__(self, **_kwargs: object) -> None:
+            self._turn_store = None
+
+        async def arun(
+            self,
+            _task: str,
+            *,
+            files: list[str],
+            require_workspace_change: bool = True,
+        ) -> object:
+            del files
+            captured.append(require_workspace_change)
+            return SimpleNamespace(
+                status="done",
+                answer="complete",
+                tool_calls=(),
+                usage=SimpleNamespace(
+                    model_calls=1,
+                    input_tokens=1,
+                    output_tokens=1,
+                    latency_ms=1.0,
+                    tool_schema_bytes=1,
+                ),
+                stop_reason=None,
+                diagnostics=(),
+                pause=None,
+            )
+
+    import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
+    await module.run_live_case(
+        model_alias="groq_gpt_oss_120b",
+        control_plane=object(),
+        case={
+            "id": "workspace-contract",
+            "capability": "file_tool_selection",
+            "task": "Inspect the input file.",
+            "workspace_files": {"input.txt": "before\n"},
+            "workspace_assertions": workspace_assertions,
+        },
+    )
+
+    assert captured == [expected]
+
+
 def test_artifact_secret_values_match_sensitive_name_tokens_without_substrings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
