@@ -40,6 +40,7 @@ def test_delivery_cases_cover_the_locked_public_matrix() -> None:
         "cache_usage",
         "mlx_local_envelope",
         "ollama_local_envelope",
+        "praxis_demo",
     } == set(cases)
     assert cases["direct_answer"].expected_tools == ()
     assert cases["direct_answer"].expected_answer_exact == "4"
@@ -70,6 +71,13 @@ def test_delivery_cases_cover_the_locked_public_matrix() -> None:
     assert cases["cache_usage"].expected_answer_exact == "cache_visible"
     assert cases["mlx_local_envelope"].provider == "mlx"
     assert cases["ollama_local_envelope"].provider == "ollama"
+    assert cases["praxis_demo"].public_agent is True
+    assert cases["praxis_demo"].expected_tools == (
+        "read_file",
+        "apply_patch",
+        "read_file",
+        "run_command",
+    )
 
 
 def test_exact_answer_assertion_rejects_substring_false_positive() -> None:
@@ -102,7 +110,7 @@ async def test_fake_delivery_matrix_proves_public_runtime_invariants() -> None:
     results = await module.run_matrix(model="fake", fake_model=True)
     by_name = {result.name: result for result in results}
 
-    assert len(results) == 12
+    assert len(results) == 13
     assert all(result.passed for result in results), {
         result.name: result.error for result in results if not result.passed
     }
@@ -184,6 +192,97 @@ async def test_fake_delivery_matrix_proves_public_runtime_invariants() -> None:
         assert local.tools == ("read_file",)
         assert local.tool_errors == ()
         assert local.result_content_kinds == ("structured",)
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_praxis_demo_uses_public_agent_and_captures_real_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_runtime import Agent
+
+    module = _load_smoke_module()
+    calls: list[tuple[str, dict[str, object]]] = []
+    original_arun = Agent.arun
+
+    async def tracked_arun(
+        self: Agent,
+        task: str,
+        **kwargs: object,
+    ):
+        calls.append((task, kwargs))
+        return await original_arun(self, task, **kwargs)
+
+    monkeypatch.setattr(Agent, "arun", tracked_arun)
+
+    results = await module.run_matrix(
+        model="fake",
+        fake_model=True,
+        only={"praxis_demo"},
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["allow_write_tools"] is True
+    assert calls[0][1]["allow_execute_tools"] is True
+    assert calls[0][1]["event_sink"] is not None
+    assert len(results) == 1
+    demo = results[0]
+    assert demo.passed, demo.error
+    assert demo.status == "done"
+    assert demo.answer == "praxis demo complete"
+    assert demo.tools == (
+        "read_file",
+        "apply_patch",
+        "read_file",
+        "run_command",
+    )
+    assert demo.workspace_assertions_passed is True
+    assert demo.workspace_diff == (
+        "--- a/praxis_demo.py\n"
+        "+++ b/praxis_demo.py\n"
+        "@@ -1 +1 @@\n"
+        '-STATUS = "draft"\n'
+        '+STATUS = "ready"'
+    )
+    assert [
+        line for line in demo.event_lines if "tool:start" in line
+    ] == [
+        "[inspect] tool:start read_file praxis_demo.py",
+        "[patch] tool:start apply_patch praxis_demo.py",
+        "[verify] tool:start read_file praxis_demo.py",
+        "[verify] tool:start run_command make verify",
+    ]
+    assert demo.event_lines[-1] == (
+        "[complete] status=done answer=praxis demo complete"
+    )
+    rendered = "\n".join(demo.event_lines)
+    assert "/Users/" not in rendered
+    assert "delivery_smoke_" not in rendered
+    assert "api_key" not in rendered.casefold()
+
+
+@pytest.mark.anyio
+async def test_default_live_matrix_skips_the_fake_only_demo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_smoke_module()
+    seen: list[str] = []
+
+    async def record_case(
+        case: object,
+        *,
+        model: str,
+        fake_model: bool,
+    ) -> object:
+        del model, fake_model
+        seen.append(case.name)
+        return object()
+
+    monkeypatch.setattr(module, "run_case", record_case)
+
+    await module.run_matrix(model="live", fake_model=False)
+
+    assert "praxis_demo" not in seen
 
 
 def test_verbose_output_reports_revision_wire_schema_error_and_cache_data() -> None:
