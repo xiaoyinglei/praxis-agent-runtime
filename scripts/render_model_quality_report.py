@@ -784,6 +784,32 @@ def _validate_run_cases(
             score = _mapping(case.get("score"), label=f"{alias} case score")
             case_id = _required_text(observation, "case_id")
             capability = _required_text(observation, "capability")
+            observation_status = _required_text(observation, "status")
+            if observation_status not in {"done", "paused", "failed", "error"}:
+                raise ValueError(
+                    f"model quality report {alias}.{case_id}.status is invalid"
+                )
+            approval_pause_observed = observation.get("approval_pause_observed")
+            if not isinstance(approval_pause_observed, bool):
+                raise ValueError(
+                    "model quality report "
+                    f"{alias}.{case_id}.approval_pause_observed must be boolean"
+                )
+            approval_kind = observation.get("approval_kind")
+            if approval_kind is not None and not isinstance(approval_kind, str):
+                raise ValueError(
+                    f"model quality report {alias}.{case_id}.approval_kind "
+                    "must be text or null"
+                )
+            approval_resumes = _nonnegative_integer(
+                observation.get("approval_resumes"),
+                label=f"{alias}.{case_id}.approval_resumes",
+            )
+            if not isinstance(observation.get("infrastructure_failure"), bool):
+                raise ValueError(
+                    "model quality report "
+                    f"{alias}.{case_id}.infrastructure_failure must be boolean"
+                )
             tool_calls = _sequence(
                 observation.get("tool_calls"),
                 label=f"{alias}.{case_id} tool_calls",
@@ -868,30 +894,52 @@ def _validate_run_cases(
                 observation.get("infrastructure_failure") is True
             )
             score_passed = score.get("passed")
-            if run_status == "completed":
-                if observation_infrastructure or not isinstance(score_passed, bool):
-                    raise ValueError(
-                        f"model quality report completed case for {alias}.{case_id} is inconsistent"
-                    )
-                if (
-                    capability == "approval_continuation"
-                    and observation.get("workspace_assertions_passed") is False
-                    and score_passed is not False
+            core_success = score.get("core_success")
+            capability_passed = score.get("capability_passed")
+            if run_status == "completed" and observation_infrastructure:
+                raise ValueError(
+                    f"model quality report completed case for {alias}.{case_id} is inconsistent"
+                )
+            if observation_infrastructure:
+                if any(
+                    value is not None
+                    for value in (score_passed, core_success, capability_passed)
                 ):
-                    raise ValueError(
-                        "model quality report completed approval case with failed "
-                        f"workspace assertions for {alias}.{case_id} must fail evaluation"
-                    )
-            elif observation_infrastructure:
-                if score_passed is not None:
                     raise ValueError(
                         f"model quality report infrastructure case for {alias}.{case_id} is inconsistent"
                     )
                 infrastructure_observed = True
-            elif not isinstance(score_passed, bool):
-                raise ValueError(
-                    f"model quality report non-infrastructure case for {alias}.{case_id} is inconsistent"
-                )
+            else:
+                if not all(
+                    isinstance(value, bool)
+                    for value in (score_passed, core_success, capability_passed)
+                ):
+                    raise ValueError(
+                        f"model quality report non-infrastructure case for {alias}.{case_id} is inconsistent"
+                    )
+                if score_passed is not (core_success and capability_passed):
+                    raise ValueError(
+                        "model quality report score for "
+                        f"{alias}.{case_id} is inconsistent"
+                    )
+            if score_passed is True:
+                if (
+                    observation_status != "done"
+                    or observation.get("workspace_assertions_passed") is not True
+                ):
+                    raise ValueError(
+                        "model quality report passed case for "
+                        f"{alias}.{case_id} contradicts runtime evidence"
+                    )
+                if capability == "approval_continuation" and (
+                    approval_pause_observed is not True
+                    or approval_kind != "tool_approval"
+                    or approval_resumes != 1
+                ):
+                    raise ValueError(
+                        "model quality report passed approval case for "
+                        f"{alias}.{case_id} contradicts approval evidence"
+                    )
     if run_status == "inconclusive" and trials and not infrastructure_observed:
         raise ValueError(
             f"model quality report inconclusive run for {alias} has inconsistent case evidence"

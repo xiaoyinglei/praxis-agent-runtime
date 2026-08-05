@@ -212,6 +212,45 @@ def _render_payload(
     )
 
 
+def _make_inconclusive_with_completed_prefix(
+    payload: dict[str, object],
+) -> tuple[dict[str, object], dict[str, object]]:
+    infrastructure_failure = {
+        "case_id": "provider_down",
+        "stop_reason": "model_provider_failed",
+        "diagnostic_error_types": ["RateLimitError"],
+    }
+    model = payload["models"][0]
+    model.update(
+        status="inconclusive",
+        passed=None,
+        observed={},
+        thresholds={},
+        failures=[],
+        infrastructure_failure=infrastructure_failure,
+    )
+    run = payload["runs"][0]
+    run["status"] = "inconclusive"
+    run["infrastructure_failure"] = infrastructure_failure
+    prefix_case, infrastructure_case = run["trials"][0]["cases"]
+    infrastructure_observation = infrastructure_case["observation"]
+    infrastructure_observation.update(
+        status="failed",
+        infrastructure_failure=True,
+        stop_reason="model_provider_failed",
+        diagnostic_error_types=["RateLimitError"],
+    )
+    infrastructure_case["score"].update(
+        passed=None,
+        core_success=None,
+        capability_passed=None,
+        inconclusive=True,
+    )
+    payload["status"] = "inconclusive"
+    payload["passed"] = None
+    return prefix_case, infrastructure_case
+
+
 def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     tmp_path: Path,
 ) -> None:
@@ -389,6 +428,11 @@ def test_completed_passing_run_is_conclusive_not_inconclusive(
     model["passed"] = True
     model["observed"] = {"task_success_rate": 1.0}
     model["failures"] = []
+    recovered_observation = payload["runs"][0]["trials"][0]["cases"][1][
+        "observation"
+    ]
+    recovered_observation["status"] = "done"
+    recovered_observation["workspace_assertions_passed"] = True
     for case in payload["runs"][0]["trials"][0]["cases"]:
         case["score"].update(
             passed=True,
@@ -624,6 +668,180 @@ def test_renderer_rejects_invalid_bounded_tool_result_evidence(
             benchmark_path=tmp_path / "benchmark.md",
             run_record_path=tmp_path / "run.md",
         )
+
+
+def test_renderer_rejects_passed_approval_case_without_observed_pause_before_writing(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["approval_pause_observed"] = False
+    observation["approval_kind"] = None
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+    report_path = tmp_path / "passed-without-approval-pause.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+def test_renderer_rejects_passed_approval_case_without_resume_before_writing(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["approval_resumes"] = 0
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+    report_path = tmp_path / "passed-without-approval-resume.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+def test_renderer_rejects_passed_case_with_failed_observation_before_writing(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["status"] = "failed"
+    observation["workspace_assertions_passed"] = True
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+    report_path = tmp_path / "passed-with-failed-observation.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+def test_renderer_rejects_inconsistent_completed_prefix_score_in_inconclusive_run(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    prefix_case, _infrastructure_case = _make_inconclusive_with_completed_prefix(
+        payload
+    )
+    prefix_case["score"].update(
+        passed=True,
+        core_success=False,
+        capability_passed=True,
+    )
+    report_path = tmp_path / "inconclusive-with-contradictory-prefix.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [("core_success", None), ("capability_passed", "yes")],
+)
+def test_renderer_requires_boolean_score_fields_for_completed_prefix_case(
+    tmp_path: Path,
+    field: str,
+    invalid: object,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    prefix_case, _infrastructure_case = _make_inconclusive_with_completed_prefix(
+        payload
+    )
+    prefix_case["score"][field] = invalid
+    report_path = tmp_path / f"inconclusive-prefix-invalid-{field}.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+def test_renderer_requires_null_score_fields_for_infrastructure_case(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    _prefix_case, infrastructure_case = _make_inconclusive_with_completed_prefix(
+        payload
+    )
+    infrastructure_case["score"]["core_success"] = False
+    report_path = tmp_path / "infrastructure-with-non-null-score.json"
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
 
 
 @pytest.mark.parametrize("missing", ["runtime_platform", "source_unchanged"])
