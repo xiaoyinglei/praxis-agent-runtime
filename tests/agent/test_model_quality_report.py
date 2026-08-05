@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import sys
@@ -34,8 +35,13 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
                 "tool_call_id": "redacted-id-1",
                 "tool_name": "read_file",
                 "arguments": {"path": "input_files/approval.txt"},
+                "structured_output": {"content": "before_gate\n"},
                 "is_error": False,
                 "error_code": None,
+                "error_message": None,
+                "retryable": False,
+                "truncated": False,
+                "latency_ms": None,
             },
             {
                 "tool_call_id": "redacted-id-2",
@@ -45,8 +51,13 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
                     "old_string": "before_gate",
                     "new_string": "after_gate",
                 },
+                "structured_output": {"changed": True},
                 "is_error": False,
                 "error_code": None,
+                "error_message": None,
+                "retryable": False,
+                "truncated": False,
+                "latency_ms": 12.5,
             },
         ],
         "model_calls": 3,
@@ -179,6 +190,28 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
     }
 
 
+def _render_payload(
+    module: object,
+    payload: dict[str, object],
+    tmp_path: Path,
+    *,
+    name: str,
+) -> tuple[str, str]:
+    report_path = tmp_path / f"{name}.json"
+    benchmark_path = tmp_path / f"{name}-benchmark.md"
+    run_record_path = tmp_path / f"{name}-run.md"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    module.render_model_quality_report(
+        report_path,
+        benchmark_path=benchmark_path,
+        run_record_path=run_record_path,
+    )
+    return (
+        benchmark_path.read_text(encoding="utf-8"),
+        run_record_path.read_text(encoding="utf-8"),
+    )
+
+
 def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     tmp_path: Path,
 ) -> None:
@@ -219,6 +252,7 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "provider_down" in benchmark
     assert "- Provider: `groq`" in benchmark
     assert "- Provider model: `openai/gpt-oss-120b`" in benchmark
+    assert "- Infrastructure status: **CONCLUSIVE**" in benchmark
     assert "## Per-case usage" in benchmark
     assert "| `groq_gpt_oss_120b` | `1` | `approval_continue` | `2` | `3` | `125.0` | `100` | `20` |" in benchmark
     assert "## 30-task coding-agent protocol" in benchmark
@@ -228,8 +262,18 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "accuracy" not in benchmark
 
     assert "Change before_gate to after_gate." in run_record
+    assert "## Model identity and infrastructure" in run_record
+    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
     assert "read_file" in run_record
     assert "apply_patch" in run_record
+    assert "Arguments:" in run_record
+    assert "Result:" in run_record
+    assert '"content":"before_gate\\n"' in run_record
+    assert "Error code: `null`" in run_record
+    assert "Error message: `null`" in run_record
+    assert "Retryable: `false`" in run_record
+    assert "Truncated: `false`" in run_record
+    assert "Tool latency ms: `12.5`" in run_record
     assert "tool_approval" in run_record
     assert "Approval resumes: `1`" in run_record
     assert "Stop reason: `\"completed\"`" in run_record
@@ -251,6 +295,335 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "OPENAI_API_KEY" not in rendered
     assert "Authorization" not in rendered
     assert "redacted-id" not in rendered
+
+
+def test_completed_resumed_case_with_failed_workspace_assertions_never_renders_expected_diff(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["workspace_assertions_passed"] = False
+    observation["answer"] = "OBSERVED_FINAL_AFTER_FAILED_ASSERTION"
+    approval_case["score"].update(
+        passed=False,
+        core_success=False,
+        capability_passed=False,
+    )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="failed-workspace-assertion",
+    )
+
+    assert "### Workspace assertion evidence" in run_record
+    assert "Workspace assertions passed: `false`" in run_record
+    assert "expected before/after values are not rendered as observed evidence" in run_record
+    assert "### Fixture workspace assertion contract" not in run_record
+    assert "validated fixture before/after assertion contract" not in run_record
+    assert "-before_gate" not in run_record
+    assert "+after_gate" not in run_record
+    assert "### Observed final answer" in run_record
+    assert "OBSERVED_FINAL_AFTER_FAILED_ASSERTION" in run_record
+    assert "Evaluator verdict: **FAILED**" in run_record
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_message"),
+    [
+        ("approval_not_reached", "Approval was not reached."),
+        (
+            "resume_not_observed",
+            "Approval pause was observed, but approval resume was not observed.",
+        ),
+    ],
+)
+def test_incomplete_approval_states_never_render_expected_diff_or_final_answer(
+    tmp_path: Path,
+    state: str,
+    expected_message: str,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["answer"] = "UNTRUSTED_INCOMPLETE_APPROVAL_ANSWER"
+    observation["workspace_assertions_passed"] = False
+    if state == "approval_not_reached":
+        observation["approval_pause_observed"] = False
+        observation["approval_kind"] = None
+    observation["approval_resumes"] = 0
+    approval_case["score"].update(
+        passed=False,
+        core_success=False,
+        capability_passed=False,
+    )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name=state,
+    )
+
+    assert expected_message in run_record
+    assert "### Fixture workspace assertion contract" not in run_record
+    assert "-before_gate" not in run_record
+    assert "+after_gate" not in run_record
+    assert "UNTRUSTED_INCOMPLETE_APPROVAL_ANSWER" not in run_record
+    assert "### Final answer" not in run_record
+    assert "Evaluator verdict: **FAILED**" in run_record
+
+
+def test_completed_passing_run_is_conclusive_not_inconclusive(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["status"] = "passed"
+    payload["passed"] = True
+    model = payload["models"][0]
+    model["passed"] = True
+    model["observed"] = {"task_success_rate": 1.0}
+    model["failures"] = []
+    for case in payload["runs"][0]["trials"][0]["cases"]:
+        case["score"].update(
+            passed=True,
+            core_success=True,
+            capability_passed=True,
+        )
+
+    benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="passing-conclusive",
+    )
+
+    assert "Overall verdict: **PASSED**" in benchmark
+    assert "Overall verdict: **PASSED**" in run_record
+    assert "Infrastructure status: **CONCLUSIVE**" in benchmark
+    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
+    assert "Infrastructure status: **INCONCLUSIVE**" not in run_record
+
+
+def test_run_record_lists_every_reported_model_identity_and_infrastructure_status(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    second_model = copy.deepcopy(payload["models"][0])
+    second_model["model_alias"] = "qwen3_5_9b_mlx_4bit"
+    second_model["provider_model"] = "mlx-community/Qwen3.5-9B-4bit"
+    second_run = copy.deepcopy(payload["runs"][0])
+    second_run["model_alias"] = "qwen3_5_9b_mlx_4bit"
+    second_run["provider"] = "local_mlx_chat_8080"
+    second_run["provider_model"] = "mlx-community/Qwen3.5-9B-4bit"
+    payload["models"].append(second_model)
+    payload["runs"].append(second_run)
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="multiple-model-identities",
+    )
+
+    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
+    assert (
+        "| `qwen3_5_9b_mlx_4bit` | `local_mlx_chat_8080` | `mlx-community/Qwen3.5-9B-4bit` | **CONCLUSIVE** |"
+    ) in run_record
+
+
+def test_renderer_bounds_and_redacts_structured_tool_results_and_errors(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    tool_call = payload["runs"][0]["trials"][0]["cases"][0]["observation"]["tool_calls"][0]
+    oversized = "visible-prefix-" + ("x" * 5000)
+    tool_call.update(
+        structured_output={
+            "normal_result": "VISIBLE_NORMAL_RESULT",
+            "oversized": oversized,
+            "nested": {
+                "api_token": "renderer-secret-value",
+                "posix": "/Users/private/workspace/result.txt",
+                "windows": r"C:\private\workspace\result.txt",
+                "unc": r"\\private-server\workspace\result.txt",
+            },
+        },
+        is_error=True,
+        error_code="runner_failed",
+        error_message=(
+            "failure at /Users/private/workspace/result.txt, "
+            r"C:\private\workspace\result.txt, "
+            r"\\private-server\workspace\result.txt"
+        ),
+        retryable=True,
+        truncated=True,
+        latency_ms=None,
+    )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="bounded-redacted-tool-result",
+    )
+
+    assert "VISIBLE_NORMAL_RESULT" in run_record
+    assert "[report truncated]" in run_record
+    assert oversized not in run_record
+    assert "renderer-secret-value" not in run_record
+    assert "/Users/private/workspace/result.txt" not in run_record
+    assert r"C:\private\workspace\result.txt" not in run_record
+    assert r"\\private-server\workspace\result.txt" not in run_record
+    assert "runner_failed" in run_record
+    assert "Retryable: `true`" in run_record
+    assert "Truncated: `true`" in run_record
+    assert "Tool latency ms: `null`" in run_record
+    assert "redacted-id-1" not in run_record
+
+
+def test_generated_pages_preserve_the_pending_evidence_contract(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    model = payload["models"][0]
+    model["observed"].update(
+        approval_continuation_rate=0.0,
+        mean_model_calls_per_case=2.5,
+    )
+    model["thresholds"].update(
+        approval_continuation_rate={"direction": "min", "value": 1.0},
+        mean_model_calls_per_case={"direction": "max", "value": 3.0},
+    )
+
+    benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="pending-contract-coverage",
+    )
+
+    for required in (
+        "Overall verdict: **FAILED**",
+        "## Evidence provenance",
+        "source_commit",
+        "source_tree",
+        "source_unchanged",
+        "dirty",
+        "suite_id",
+        "suite_revision",
+        "evaluator_version",
+        "measured_at",
+        "Redacted raw report",
+        "## Environment",
+        "## Model results",
+        "Provider model",
+        "Infrastructure status: **CONCLUSIVE**",
+        "Trials: `1`",
+        "task_success_rate",
+        "approval_continuation_rate",
+        "mean_model_calls_per_case",
+        "Reported failures",
+        "## Case results",
+        "approval_continuation",
+        "## Per-case usage",
+        "Tool calls",
+        "Model calls",
+        "Latency ms",
+        "Input tokens",
+        "Output tokens",
+        "Total tokens",
+        "## 30-task coding-agent protocol",
+        "Manifest status: **validated only**",
+        "not run as this release gate",
+    ):
+        assert required in benchmark
+
+    for required in (
+        "Overall verdict: **FAILED**",
+        "source_commit",
+        "source_tree",
+        "source_unchanged",
+        "dirty",
+        "suite_id",
+        "suite_revision",
+        "evaluator_version",
+        "measured_at",
+        "Redacted raw report",
+        "## Model identity and infrastructure",
+        "groq_gpt_oss_120b",
+        "groq",
+        "openai/gpt-oss-120b",
+        "CONCLUSIVE",
+        "## Task",
+        "Change before_gate to after_gate.",
+        "## `groq_gpt_oss_120b` trial 1",
+        "### Tool trace",
+        "Arguments:",
+        "Result:",
+        "Error code:",
+        "Error message:",
+        "Retryable:",
+        "Truncated:",
+        "Tool latency ms:",
+        "### Runtime observation",
+        "Stop reason:",
+        "workspace assertions passed",
+        "Tool calls:",
+        "Model calls:",
+        "Latency ms:",
+        "Input tokens:",
+        "Output tokens:",
+        "Total tokens:",
+        "### Approval and resume",
+        "Approval pause observed: `true`",
+        'Approval kind: `"tool_approval"`',
+        "Approval resumes: `1`",
+        "### Fixture workspace assertion contract",
+        "not a captured filesystem diff",
+        "### Final answer",
+        "Updated approval.txt.",
+        "### Evaluator verdict",
+        "Evaluator verdict: **FAILED**",
+    ):
+        assert required in run_record
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid"),
+    [
+        ("error_message", 123),
+        ("retryable", "yes"),
+        ("truncated", 0),
+        ("latency_ms", -1.0),
+    ],
+)
+def test_renderer_rejects_invalid_bounded_tool_result_evidence(
+    tmp_path: Path,
+    field: str,
+    invalid: object,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    tool_call = payload["runs"][0]["trials"][0]["cases"][0]["observation"]["tool_calls"][0]
+    tool_call[field] = invalid
+    report_path = tmp_path / f"invalid-tool-{field}.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=field):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
 
 
 @pytest.mark.parametrize("missing", ["runtime_platform", "source_unchanged"])
@@ -333,8 +706,13 @@ def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_su
             "tool_call_id": "partial-read",
             "tool_name": "read_file",
             "arguments": {"path": "input_files/approval.txt"},
+            "structured_output": {"content": "before_gate\n"},
             "is_error": False,
             "error_code": None,
+            "error_message": None,
+            "retryable": False,
+            "truncated": False,
+            "latency_ms": None,
         }
     ]
     observation["approval_pause_observed"] = False
@@ -366,6 +744,10 @@ def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_su
     )
 
     run_record = run_record_path.read_text(encoding="utf-8")
+    benchmark = benchmark_path.read_text(encoding="utf-8")
+    assert "- Infrastructure status: **INCONCLUSIVE**" in benchmark
+    assert "## Model identity and infrastructure" in run_record
+    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **INCONCLUSIVE** |") in run_record
     assert "read_file" in run_record
     assert "Approval was not reached." in run_record
     assert "Approval pause observed: `false`" in run_record

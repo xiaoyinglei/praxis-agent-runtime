@@ -31,7 +31,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from agent_runtime.result import AgentToolCall
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_cases.json"
@@ -40,6 +43,9 @@ MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
 EVALUATOR_VERSION = "agent_model_quality_gate_v1"
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
+)
 _SENSITIVE_ARTIFACT_KEY_TOKENS = frozenset(
     {
         "apikey",
@@ -120,6 +126,11 @@ class ToolCallEvidence:
     arguments: dict[str, object]
     is_error: bool
     error_code: str | None
+    structured_output: object | None = None
+    error_message: str | None = None
+    retryable: bool = False
+    truncated: bool = False
+    latency_ms: float | None = None
 
     @property
     def key(self) -> str:
@@ -521,16 +532,7 @@ async def run_live_case(
                     result = await agent.aresume(result.turn_id, "allow_once")
                     approval_resumes = 1
 
-            evidence = tuple(
-                ToolCallEvidence(
-                    tool_call_id=call.tool_call_id,
-                    tool_name=call.tool_name,
-                    arguments=_mutable_json_mapping(call.arguments or {}),
-                    is_error=call.is_error,
-                    error_code=call.error_code,
-                )
-                for call in result.tool_calls
-            )
+            evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
             workspace_ok = _workspace_assertions_pass(
                 workspace,
                 _mapping(case.get("workspace_assertions", {})),
@@ -1020,6 +1022,26 @@ def _mutable_json_value(value: object) -> object:
     return value
 
 
+def _tool_call_evidence(call: AgentToolCall) -> ToolCallEvidence:
+    structured_output = (
+        None
+        if call.structured_output is None
+        else _mutable_json_value(call.structured_output)
+    )
+    return ToolCallEvidence(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        arguments=_mutable_json_mapping(call.arguments or {}),
+        is_error=call.is_error,
+        error_code=call.error_code,
+        structured_output=structured_output,
+        error_message=call.error_message,
+        retryable=call.retryable,
+        truncated=call.truncated,
+        latency_ms=call.latency_ms,
+    )
+
+
 def _workspace_assertions_pass(
     workspace: Path,
     assertions: Mapping[str, object],
@@ -1187,6 +1209,24 @@ def _observation_from_payload(value: object) -> CaseObservation:
         error_code = call.get("error_code")
         if error_code is not None and not isinstance(error_code, str):
             raise ValueError("raw observation tool call error_code must be text")
+        error_message = call.get("error_message")
+        if error_message is not None and not isinstance(error_message, str):
+            raise ValueError("raw observation tool call error_message must be text")
+        retryable = call.get("retryable", False)
+        if not isinstance(retryable, bool):
+            raise ValueError("raw observation tool call retryable must be boolean")
+        truncated = call.get("truncated", False)
+        if not isinstance(truncated, bool):
+            raise ValueError("raw observation tool call truncated must be boolean")
+        latency_ms = call.get("latency_ms")
+        if latency_ms is not None and (
+            isinstance(latency_ms, bool)
+            or not isinstance(latency_ms, (int, float))
+            or latency_ms < 0
+        ):
+            raise ValueError(
+                "raw observation tool call latency_ms must be null or non-negative numeric"
+            )
         calls.append(
             ToolCallEvidence(
                 tool_call_id=str(call.get("tool_call_id", "")),
@@ -1194,6 +1234,15 @@ def _observation_from_payload(value: object) -> CaseObservation:
                 arguments=dict(arguments),
                 is_error=is_error,
                 error_code=error_code,
+                structured_output=_mutable_json_value(
+                    call.get("structured_output")
+                ),
+                error_message=error_message,
+                retryable=retryable,
+                truncated=truncated,
+                latency_ms=(
+                    None if latency_ms is None else float(latency_ms)
+                ),
             )
         )
 
@@ -1417,6 +1466,10 @@ def _sanitize_artifact_value(
         sanitized_text = value
         for secret in secrets:
             sanitized_text = sanitized_text.replace(secret, "[REDACTED]")
+        sanitized_text = _WINDOWS_ABSOLUTE_PATH_PATTERN.sub(
+            "[REDACTED_ABSOLUTE_PATH]",
+            sanitized_text,
+        )
         return _ABSOLUTE_PATH_PATTERN.sub(
             "[REDACTED_ABSOLUTE_PATH]",
             sanitized_text,

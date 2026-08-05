@@ -16,6 +16,11 @@ from typing import cast
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = ROOT / "docs" / "benchmark.md"
 DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
+_TOOL_TRACE_VALUE_LIMIT = 1600
+_POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
+)
 _SENSITIVE_KEY_TOKENS = frozenset(
     {
         "apikey",
@@ -242,12 +247,17 @@ def _render_benchmark(
         model_alias = _required_text(model, "model_alias")
         run = runs[model_alias]
         model_verdict = _boolean_verdict(model.get("passed"))
+        infrastructure_status = (
+            "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
+        )
         lines.extend(
             [
                 f"### `{model_alias}`",
                 "",
                 f"- Provider: `{_required_text(run, 'provider')}`",
                 f"- Provider model: `{_required_text(model, 'provider_model')}`",
+                f"- Trials: `{_integer(run.get('trial_count'), label='trial_count')}`",
+                f"- Infrastructure status: **{infrastructure_status}**",
                 f"- Evaluator verdict: **{model_verdict}**",
                 "",
             ]
@@ -256,7 +266,6 @@ def _render_benchmark(
         if isinstance(infrastructure, Mapping):
             lines.extend(
                 [
-                    "- Infrastructure status: **INCONCLUSIVE**",
                     f"- Infrastructure stage: `{_scalar(infrastructure.get('stage'))}`",
                     f"- Stop reason: `{_scalar(infrastructure.get('stop_reason'))}`",
                     "- Diagnostic error types: "
@@ -299,8 +308,9 @@ def _render_benchmark(
         [
             "## Per-case usage",
             "",
-            "| Model | Trial | Case | Tool calls | Model calls | Latency ms | Input tokens | Output tokens |",
-            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| Model | Trial | Case | Tool calls | Model calls | Latency ms | "
+            "Input tokens | Output tokens | Total tokens |",
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for case in _iter_cases(report):
@@ -314,7 +324,8 @@ def _render_benchmark(
             f"`{len(tool_calls)}` | `{_scalar(case.observation.get('model_calls'))}` | "
             f"`{_scalar(case.observation.get('latency_ms'))}` | "
             f"`{_scalar(case.observation.get('input_tokens'))}` | "
-            f"`{_scalar(case.observation.get('output_tokens'))}` |"
+            f"`{_scalar(case.observation.get('output_tokens'))}` | "
+            f"`{_total_tokens(case.observation)}` |"
         )
     lines.extend(
         [
@@ -338,6 +349,7 @@ def _render_approval_record(
     metadata = _approval_metadata(report)
     case_id = _required_text(metadata, "case_id")
     task = _required_text(metadata, "task")
+    runs = _sequence(report.get("runs"), label="runs")
     lines = [
         "# Approval-continuation model run",
         "",
@@ -345,16 +357,39 @@ def _render_approval_record(
         "",
         f"- source_commit: `{_required_text(report, 'source_commit')}`",
         f"- source_tree: `{_required_text(report, 'source_tree')}`",
+        "- source_unchanged: `true`",
         "- dirty: `false`",
+        f"- suite_id: `{_required_text(report, 'suite_id')}`",
         f"- suite_revision: `{_required_text(report, 'suite_revision')}`",
         f"- evaluator_version: `{_required_text(report, 'evaluator_version')}`",
+        f"- measured_at: `{_required_text(report, 'measured_at')}`",
         f"- Redacted raw report: [{Path(raw_report_reference).name}]({raw_report_reference})",
         "",
-        "## Task",
+        "## Model identity and infrastructure",
         "",
-        _safe_text(task),
-        "",
+        "| Alias | Provider | Provider model | Infrastructure status |",
+        "| --- | --- | --- | --- |",
     ]
+    for raw_run in runs:
+        run = _mapping(raw_run, label="model run")
+        infrastructure_status = (
+            "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
+        )
+        lines.append(
+            f"| `{_cell(_required_text(run, 'model_alias'))}` | "
+            f"`{_cell(_required_text(run, 'provider'))}` | "
+            f"`{_cell(_required_text(run, 'provider_model'))}` | "
+            f"**{infrastructure_status}** |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Task",
+            "",
+            _safe_text(task),
+            "",
+        ]
+    )
     rendered_cases = _iter_cases(report)
     approval_runs = [case for case in rendered_cases if case.case_id == case_id]
     if not approval_runs:
@@ -427,7 +462,18 @@ def _render_approval_record(
             tool_name = _required_text(call, "tool_name")
             arguments = _mapping(call.get("arguments"), label="tool arguments")
             error = " error" if call.get("is_error") is True else ""
-            lines.append(f"{index}. `{tool_name}`{error}: `{_safe_json(arguments)}`")
+            lines.extend(
+                [
+                    f"{index}. `{tool_name}`{error}",
+                    f"   - Arguments: `{_safe_json_value(arguments)}`",
+                    f"   - Result: `{_safe_json_value(call.get('structured_output'))}`",
+                    f"   - Error code: `{_safe_nullable_text(call.get('error_code'))}`",
+                    f"   - Error message: `{_safe_nullable_text(call.get('error_message'))}`",
+                    f"   - Retryable: `{_scalar(call.get('retryable'))}`",
+                    f"   - Truncated: `{_scalar(call.get('truncated'))}`",
+                    f"   - Tool latency ms: `{_scalar(call.get('latency_ms'))}`",
+                ]
+            )
         lines.extend(
             [
                 "",
@@ -441,6 +487,7 @@ def _render_approval_record(
                 f"- Latency ms: `{_scalar(observation.get('latency_ms'))}`",
                 f"- Input tokens: `{_scalar(observation.get('input_tokens'))}`",
                 f"- Output tokens: `{_scalar(observation.get('output_tokens'))}`",
+                f"- Total tokens: `{_total_tokens(observation)}`",
                 "",
                 "### Approval and resume",
                 "",
@@ -578,23 +625,47 @@ def _render_approval_record(
                 ]
             )
             continue
+        workspace_assertions_passed = observation.get(
+            "workspace_assertions_passed"
+        )
+        if workspace_assertions_passed is True:
+            lines.extend(
+                [
+                    "### Fixture workspace assertion contract",
+                    "",
+                    "This is the validated fixture before/after assertion contract, "
+                    "not a captured filesystem diff.",
+                    "",
+                    "```diff",
+                    *_workspace_diff(before, after),
+                    "```",
+                    "",
+                    "Workspace assertions passed: `true`",
+                    "",
+                    "### Final answer",
+                    "",
+                    _safe_text(str(observation.get("answer") or "<none>")),
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "### Workspace assertion evidence",
+                    "",
+                    "Workspace assertions passed: `false`",
+                    "",
+                    "The fixture assertion contract failed; expected before/after "
+                    "values are not rendered as observed evidence.",
+                    "",
+                    "### Observed final answer",
+                    "",
+                    _safe_text(str(observation.get("answer") or "<none>")),
+                    "",
+                ]
+            )
         lines.extend(
             [
-                "### Fixture workspace assertion contract",
-                "",
-                "This is the validated fixture before/after assertion contract, "
-                "not a captured filesystem diff.",
-                "",
-                "```diff",
-                *_workspace_diff(before, after),
-                "```",
-                "",
-                f"Workspace assertions passed: `{_scalar(observation.get('workspace_assertions_passed'))}`",
-                "",
-                "### Final answer",
-                "",
-                _safe_text(str(observation.get("answer") or "<none>")),
-                "",
                 "### Evaluator verdict",
                 "",
                 f"Evaluator verdict: **{case.verdict}**",
@@ -713,10 +784,57 @@ def _validate_run_cases(
             score = _mapping(case.get("score"), label=f"{alias} case score")
             case_id = _required_text(observation, "case_id")
             capability = _required_text(observation, "capability")
-            _sequence(
+            tool_calls = _sequence(
                 observation.get("tool_calls"),
                 label=f"{alias}.{case_id} tool_calls",
             )
+            for raw_call in tool_calls:
+                call = _mapping(
+                    raw_call,
+                    label=f"{alias}.{case_id} tool call",
+                )
+                _required_text(call, "tool_call_id")
+                _required_text(call, "tool_name")
+                _mapping(
+                    call.get("arguments"),
+                    label=f"{alias}.{case_id} tool arguments",
+                )
+                for field in (
+                    "structured_output",
+                    "error_message",
+                    "retryable",
+                    "truncated",
+                    "latency_ms",
+                ):
+                    if field not in call:
+                        raise ValueError(
+                            f"model quality report {alias}.{case_id}.{field} "
+                            "must be reported"
+                        )
+                for field in ("error_code", "error_message"):
+                    value = call.get(field)
+                    if value is not None and not isinstance(value, str):
+                        raise ValueError(
+                            f"model quality report {alias}.{case_id}.{field} "
+                            "must be text or null"
+                        )
+                if not isinstance(call.get("is_error"), bool):
+                    raise ValueError(
+                        f"model quality report {alias}.{case_id}.is_error "
+                        "must be boolean"
+                    )
+                for field in ("retryable", "truncated"):
+                    if not isinstance(call.get(field), bool):
+                        raise ValueError(
+                            f"model quality report {alias}.{case_id}.{field} "
+                            "must be boolean"
+                        )
+                tool_latency_ms = call.get("latency_ms")
+                if tool_latency_ms is not None:
+                    _nonnegative_number(
+                        tool_latency_ms,
+                        label=f"{alias}.{case_id}.latency_ms",
+                    )
             for field in (
                 "model_calls",
                 "input_tokens",
@@ -754,6 +872,15 @@ def _validate_run_cases(
                 if observation_infrastructure or not isinstance(score_passed, bool):
                     raise ValueError(
                         f"model quality report completed case for {alias}.{case_id} is inconsistent"
+                    )
+                if (
+                    capability == "approval_continuation"
+                    and observation.get("workspace_assertions_passed") is False
+                    and score_passed is not False
+                ):
+                    raise ValueError(
+                        "model quality report completed approval case with failed "
+                        f"workspace assertions for {alias}.{case_id} must fail evaluation"
                     )
             elif observation_infrastructure:
                 if score_passed is not None:
@@ -824,13 +951,28 @@ def _report_reference(report_path: Path, output_path: Path) -> str:
     return Path(os.path.relpath(report_path.resolve(), output_path.resolve().parent)).as_posix()
 
 
-def _safe_json(value: Mapping[str, object]) -> str:
-    return json.dumps(
-        _redacted_mapping(value),
+def _safe_json_value(value: object) -> str:
+    rendered = json.dumps(
+        _redacted_value(value),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    return _bounded_report_text(rendered)
+
+
+def _safe_nullable_text(value: object) -> str:
+    if value is None:
+        return "null"
+    return _bounded_report_text(
+        json.dumps(_safe_text(str(value)), ensure_ascii=False)
+    )
+
+
+def _bounded_report_text(value: str) -> str:
+    if len(value) <= _TOOL_TRACE_VALUE_LIMIT:
+        return value
+    return f"{value[:_TOOL_TRACE_VALUE_LIMIT]}... [report truncated]"
 
 
 def _redacted_mapping(value: Mapping[str, object]) -> dict[str, object]:
@@ -861,14 +1003,26 @@ def _is_sensitive_key(key: str) -> bool:
 def _redacted_value(value: object) -> object:
     if isinstance(value, Mapping):
         return _redacted_mapping(cast(Mapping[str, object], value))
-    if isinstance(value, str) and Path(value).is_absolute():
-        return "[REDACTED_ABSOLUTE_PATH]"
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_redacted_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_absolute_paths(value)
     return value
 
 
 def _safe_text(value: str) -> str:
-    words = value.split()
-    return " ".join("[REDACTED_ABSOLUTE_PATH]" if Path(word).is_absolute() else word for word in words)
+    return " ".join(_redact_absolute_paths(value).split())
+
+
+def _redact_absolute_paths(value: str) -> str:
+    redacted = _WINDOWS_ABSOLUTE_PATH_PATTERN.sub(
+        "[REDACTED_ABSOLUTE_PATH]",
+        value,
+    )
+    return _POSIX_ABSOLUTE_PATH_PATTERN.sub(
+        "[REDACTED_ABSOLUTE_PATH]",
+        redacted,
+    )
 
 
 def _scalar(value: object) -> str:
@@ -877,6 +1031,16 @@ def _scalar(value: object) -> str:
 
 def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _total_tokens(observation: Mapping[str, object]) -> int:
+    return _integer(
+        observation.get("input_tokens"),
+        label="input_tokens",
+    ) + _integer(
+        observation.get("output_tokens"),
+        label="output_tokens",
+    )
 
 
 def _mapping(value: object, *, label: str) -> Mapping[str, object]:

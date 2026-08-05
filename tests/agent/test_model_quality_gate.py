@@ -90,6 +90,7 @@ def _quality_suite() -> dict[str, object]:
 def _passing_model_report() -> dict[str, object]:
     metrics = _trial_metrics()
     return {
+        "status": "completed",
         "model_alias": "groq_gpt_oss_120b",
         "provider": "groq",
         "provider_model": "openai/gpt-oss-120b",
@@ -231,6 +232,8 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     cookie_secret = "provider-cookie-sentinel"
     credential_secret = "provider-credential-sentinel"
     absolute_path = str(tmp_path / "private" / "approval.txt")
+    windows_path = r"C:\private\approval.txt"
+    unc_path = r"\\private-server\workspace\approval.txt"
     monkeypatch.setenv("GROQ_API_KEY", secret)
     monkeypatch.setenv("GROQ_SESSION_AUTH", auth_secret)
     monkeypatch.setenv("GROQ_SESSION_COOKIE", cookie_secret)
@@ -291,10 +294,40 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                                             }
                                         ],
                                     },
-                                    "is_error": False,
-                                    "error_code": None,
+                                    "structured_output": {
+                                        "summary": "VISIBLE_TOOL_RESULT",
+                                        "message": f"result contains {secret}",
+                                        "paths": {
+                                            "posix": absolute_path,
+                                            "windows": windows_path,
+                                            "unc": unc_path,
+                                        },
+                                        "nested": {
+                                            "client_secret": "nested-secret-value",
+                                            "monkey": "banana",
+                                        },
+                                    },
+                                    "is_error": True,
+                                    "error_code": "runner_failed",
+                                    "error_message": (
+                                        f"failed at {absolute_path}, {windows_path}, {unc_path}; credential {secret}"
+                                    ),
+                                    "retryable": True,
+                                    "truncated": True,
+                                    "latency_ms": None,
                                 }
                             ],
+                            "model_calls": 2,
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "latency_ms": 12.5,
+                            "tool_schema_bytes": 400,
+                            "approval_pause_observed": True,
+                            "approval_kind": "tool_approval",
+                            "approval_resumes": 1,
+                            "workspace_assertions_passed": True,
+                            "stop_reason": "completed",
+                            "diagnostic_error_types": [],
                             "error": f"diagnostic {secret}",
                             "infrastructure_failure": False,
                         },
@@ -302,6 +335,8 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                             "case_id": "approval_continue",
                             "capability": "approval_continuation",
                             "passed": True,
+                            "core_success": True,
+                            "capability_passed": True,
                         },
                     }
                 ],
@@ -394,6 +429,8 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert auth_secret not in serialized
     assert cookie_secret not in serialized
     assert credential_secret not in serialized
+    assert windows_path not in serialized
+    assert unc_path not in serialized
     assert "Authorization" not in serialized
     assert "access_token" not in serialized
     assert "client-secret" not in serialized
@@ -403,7 +440,89 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert '"auth"' not in serialized
     assert "apiKey" not in serialized
     assert '"monkey": "banana"' in serialized
+    tool_call = payload["runs"][0]["trials"][0]["cases"][0]["observation"]["tool_calls"][0]
+    assert tool_call["structured_output"]["summary"] == "VISIBLE_TOOL_RESULT"
+    assert tool_call["structured_output"]["message"] == "result contains [REDACTED]"
+    assert tool_call["structured_output"]["paths"] == {
+        "posix": "[REDACTED_ABSOLUTE_PATH]",
+        "windows": "[REDACTED_ABSOLUTE_PATH]",
+        "unc": "[REDACTED_ABSOLUTE_PATH]",
+    }
+    assert tool_call["structured_output"]["nested"] == {"monkey": "banana"}
+    assert tool_call["error_code"] == "runner_failed"
+    assert tool_call["retryable"] is True
+    assert tool_call["truncated"] is True
+    assert tool_call["latency_ms"] is None
+    assert absolute_path not in tool_call["error_message"]
+    assert windows_path not in tool_call["error_message"]
+    assert unc_path not in tool_call["error_message"]
+    assert secret not in tool_call["error_message"]
     assert ".env" not in serialized
+
+    renderer_path = SCRIPT_PATH.with_name("render_model_quality_report.py")
+    renderer_spec = importlib.util.spec_from_file_location(
+        "render_model_quality_report_from_sanitized_gate",
+        renderer_path,
+    )
+    assert renderer_spec is not None
+    assert renderer_spec.loader is not None
+    renderer = importlib.util.module_from_spec(renderer_spec)
+    sys.modules[renderer_spec.name] = renderer
+    renderer_spec.loader.exec_module(renderer)
+    run_record_path = tmp_path / "run.md"
+    renderer.render_model_quality_report(
+        report,
+        benchmark_path=tmp_path / "benchmark.md",
+        run_record_path=run_record_path,
+    )
+    rendered = run_record_path.read_text(encoding="utf-8")
+    assert "VISIBLE_TOOL_RESULT" in rendered
+    assert "runner_failed" in rendered
+    assert "Retryable: `true`" in rendered
+    assert "Truncated: `true`" in rendered
+    assert "Tool latency ms: `null`" in rendered
+    assert "call-1" not in rendered
+    assert absolute_path not in rendered
+    assert windows_path not in rendered
+    assert unc_path not in rendered
+    assert secret not in rendered
+
+
+def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> None:
+    module = _load_gate_module()
+    from agent_runtime.result import AgentToolCall
+
+    public_call = AgentToolCall(
+        tool_call_id="call-1",
+        tool_name="read_file",
+        arguments={"path": "input_files/data.json"},
+        structured_output={
+            "items": ({"name": "visible"},),
+            "metadata": {"count": 1},
+        },
+        is_error=True,
+        error_code="runner_failed",
+        error_message="bounded failure",
+        retryable=True,
+        truncated=True,
+        latency_ms=None,
+    )
+
+    evidence = module._tool_call_evidence(public_call)
+
+    assert evidence.tool_call_id == "call-1"
+    assert evidence.tool_name == "read_file"
+    assert evidence.arguments == {"path": "input_files/data.json"}
+    assert evidence.structured_output == {
+        "items": [{"name": "visible"}],
+        "metadata": {"count": 1},
+    }
+    assert evidence.is_error is True
+    assert evidence.error_code == "runner_failed"
+    assert evidence.error_message == "bounded failure"
+    assert evidence.retryable is True
+    assert evidence.truncated is True
+    assert evidence.latency_ms is None
 
 
 def test_artifact_secret_values_match_sensitive_name_tokens_without_substrings(
