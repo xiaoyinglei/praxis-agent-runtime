@@ -1,12 +1,15 @@
-# 运行手册
+# Praxis 运行手册
 
 > 从 [README.md](../README.md) 拆分出来。安装、服务管理、端到端运行命令。
+> `praxis-agent-runtime` 只是本地构建的 distribution metadata；当前未发布到 PyPI，
+> 所有命令均从 source checkout 运行。
 
 ## 安装
 
-安装依赖：
+先进入已克隆的仓库，再安装依赖：
 
 ```bash
+cd /path/to/praxis-agent-runtime
 uv sync
 ```
 
@@ -91,7 +94,7 @@ lsof -nP -iTCP -sTCP:LISTEN \
 ```bash
 screen -S rag_embedding_9090 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_embedding_9090 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run rag embedding-service \
   --model mlx-community/Qwen3-Embedding-4B-4bit-DWQ \
   --port 9090 \
@@ -106,7 +109,7 @@ rerank 是可选服务。需要重排时再启动。注意 `9091` 被 Milvus 占
 ```bash
 screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_rerank_9092 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run rag rerank-service \
   --model BAAI/bge-reranker-v2-m3 \
   --port 9092 \
@@ -122,7 +125,7 @@ uv run rag rerank-service \
 ```bash
 screen -S rag_qwen_8080 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_qwen_8080 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run python -m mlx_lm.server \
   --model mlx-community/Qwen3-8B-4bit \
   --host 127.0.0.1 \
@@ -157,7 +160,7 @@ screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 入库和 Agent 的 `RAGKnowledgeConfig` 必须指向同一套 `STORAGE_ROOT / VECTOR_PREFIX`。Milvus 连接信息只通过 `AGENT_VECTOR_DSN` 注入 Agent，不写入 knowledge config 或 Turn binding。切换 embedding 模型或想重建干净索引时，换新的 `STORAGE_ROOT` 和 `VECTOR_PREFIX`。
 
 ```bash
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 
 # 数据位置：按实际数据改这两个变量。
 export INPUT_PATH="/absolute/path/to/one-file.docx"

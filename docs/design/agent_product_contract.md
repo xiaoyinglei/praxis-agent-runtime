@@ -1,4 +1,4 @@
-# Agent 产品契约
+# Praxis 产品契约
 
 日期：2026-07-22
 状态：当前实施依据
@@ -8,7 +8,8 @@
 
 ## 产品主语
 
-Agent 只有一种执行：用户给出当前消息，运行一个 Turn，得到一个
+Praxis 是一个 trusted-local workspace agent runtime。Agent 只有一种执行：
+用户给出当前消息，运行一个 Turn，得到一个
 `AgentResult`。
 
 - `run()` / `arun()` 执行当前消息。

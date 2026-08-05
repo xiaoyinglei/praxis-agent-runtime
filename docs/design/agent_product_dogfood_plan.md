@@ -1,4 +1,8 @@
-# Agent 真实任务 Dogfood 计划
+# Praxis Agent 历史 Dogfood 记录
+
+Status: historical evidence snapshot
+
+> 本文保留当时的模型、配置和运行结果，不代表当前默认配置或发布门禁。
 
 > **执行方式：** 当前任务内联执行。真实模型和公开 CLI 是主验收；历史提交中的测试只在 Agent 完成修改后注入，作为隐藏回归门槛。
 
