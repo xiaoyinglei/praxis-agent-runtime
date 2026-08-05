@@ -17,6 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = ROOT / "docs" / "benchmark.md"
 DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
 _TOOL_TRACE_VALUE_LIMIT = 1600
+_MAX_APPROVAL_RESUMES_BY_EVALUATOR = {
+    "agent_model_quality_gate_v1": 1,
+    "agent_model_quality_gate_v2": 5,
+}
 _POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
@@ -94,7 +98,11 @@ def _validate_report(report: Mapping[str, object]) -> None:
         _required_text(runtime_platform, field)
     _required_text(report, "suite_id")
     _required_text(report, "suite_revision")
-    _required_text(report, "evaluator_version")
+    evaluator_version = _required_text(report, "evaluator_version")
+    if evaluator_version not in _MAX_APPROVAL_RESUMES_BY_EVALUATOR:
+        raise ValueError(
+            "model quality report evaluator_version is unsupported"
+        )
     status = _required_text(report, "status")
     expected_passed = {
         "passed": True,
@@ -160,6 +168,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
                 alias=alias,
                 run_status=run_status,
                 metadata_by_id=metadata_by_id,
+                evaluator_version=evaluator_version,
             )
             model_passes.append(model_passed)
         elif run_status == "inconclusive":
@@ -178,6 +187,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
                 alias=alias,
                 run_status=run_status,
                 metadata_by_id=metadata_by_id,
+                evaluator_version=evaluator_version,
             )
             has_inconclusive = True
         else:
@@ -770,6 +780,7 @@ def _validate_run_cases(
     alias: str,
     run_status: str,
     metadata_by_id: Mapping[str, Mapping[str, object]],
+    evaluator_version: str,
 ) -> None:
     trials = _sequence(run.get("trials"), label=f"{alias} trials")
     infrastructure_observed = False
@@ -784,6 +795,28 @@ def _validate_run_cases(
             score = _mapping(case.get("score"), label=f"{alias} case score")
             case_id = _required_text(observation, "case_id")
             capability = _required_text(observation, "capability")
+            runtime_input_namespace = observation.get(
+                "runtime_input_namespace"
+            )
+            if runtime_input_namespace is not None and (
+                not isinstance(runtime_input_namespace, str)
+                or not runtime_input_namespace
+            ):
+                raise ValueError(
+                    "model quality report "
+                    f"{alias}.{case_id}.runtime_input_namespace "
+                    "must be non-empty text or null"
+                )
+            if (
+                evaluator_version == "agent_model_quality_gate_v2"
+                and observation.get("infrastructure_failure") is not True
+                and not isinstance(runtime_input_namespace, str)
+            ):
+                raise ValueError(
+                    "model quality report "
+                    f"{alias}.{case_id}.runtime_input_namespace "
+                    "is required for v2 normal case evidence"
+                )
             observation_status = _required_text(observation, "status")
             if observation_status not in {"done", "paused", "failed", "error"}:
                 raise ValueError(
@@ -805,6 +838,15 @@ def _validate_run_cases(
                 observation.get("approval_resumes"),
                 label=f"{alias}.{case_id}.approval_resumes",
             )
+            if (
+                capability == "approval_continuation"
+                and approval_resumes
+                > _MAX_APPROVAL_RESUMES_BY_EVALUATOR[evaluator_version]
+            ):
+                raise ValueError(
+                    "model quality report approval case for "
+                    f"{alias}.{case_id} contradicts approval evidence"
+                )
             if not isinstance(observation.get("infrastructure_failure"), bool):
                 raise ValueError(
                     "model quality report "
@@ -934,7 +976,7 @@ def _validate_run_cases(
                 if capability == "approval_continuation" and (
                     approval_pause_observed is not True
                     or approval_kind != "tool_approval"
-                    or approval_resumes != 1
+                    or approval_resumes < 1
                 ):
                     raise ValueError(
                         "model quality report passed approval case for "

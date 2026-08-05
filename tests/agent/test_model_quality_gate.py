@@ -161,6 +161,12 @@ def _inconclusive_model_report(
     }
 
 
+def test_evaluator_version_tracks_namespaced_multi_approval_contract() -> None:
+    module = _load_gate_module()
+
+    assert module.EVALUATOR_VERSION == "agent_model_quality_gate_v2"
+
+
 def test_repository_fingerprint_binds_clean_commit_and_tree(tmp_path: Path) -> None:
     module = _load_gate_module()
     repository = _clean_git_repository(tmp_path / "repository")
@@ -324,9 +330,10 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                             "tool_schema_bytes": 400,
                             "approval_pause_observed": True,
                             "approval_kind": "tool_approval",
-                            "approval_resumes": 1,
-                            "workspace_assertions_passed": True,
-                            "stop_reason": "completed",
+                                "approval_resumes": 1,
+                                "workspace_assertions_passed": True,
+                                "runtime_input_namespace": "turn-123",
+                                "stop_reason": "completed",
                             "diagnostic_error_types": [],
                             "error": f"diagnostic {secret}",
                             "infrastructure_failure": False,
@@ -558,6 +565,7 @@ async def test_run_live_case_derives_workspace_change_contract_from_assertions(
             return SimpleNamespace(
                 status="done",
                 answer="complete",
+                turn_id="turn-123",
                 tool_calls=(),
                 usage=SimpleNamespace(
                     model_calls=1,
@@ -587,6 +595,136 @@ async def test_run_live_case_derives_workspace_change_contract_from_assertions(
     )
 
     assert captured == [expected]
+
+
+@pytest.mark.anyio
+async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespaced_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_gate_module()
+    resume_actions: list[str] = []
+
+    from agent_runtime.result import AgentToolCall
+
+    usage = SimpleNamespace(
+        model_calls=4,
+        input_tokens=100,
+        output_tokens=20,
+        latency_ms=125.0,
+        tool_schema_bytes=400,
+    )
+
+    class FakeAgent:
+        def __init__(self, *, workspace_path: Path, **_kwargs: object) -> None:
+            self._turn_store = None
+            self.workspace = workspace_path
+            self.runtime_file = (
+                workspace_path
+                / ".praxis/runtime/input_files/turn-123/approval.txt"
+            )
+            self.runtime_file.parent.mkdir(parents=True)
+            self.runtime_file.write_text("before_gate\n", encoding="utf-8")
+            self.calls: tuple[AgentToolCall, ...] = (
+                AgentToolCall(
+                    "read",
+                    "read_file",
+                    {"path": ".praxis/runtime/input_files/turn-123/approval.txt"},
+                ),
+            )
+
+        def result(
+            self,
+            *,
+            status: str,
+            answer: str | None = None,
+        ) -> object:
+            return SimpleNamespace(
+                status=status,
+                answer=answer,
+                tool_calls=self.calls,
+                usage=usage,
+                turn_id="turn-123",
+                stop_reason=None,
+                diagnostics=(),
+                pause=(
+                    SimpleNamespace(kind="tool_approval")
+                    if status == "paused"
+                    else None
+                ),
+            )
+
+        async def arun(self, _task: str, **_kwargs: object) -> object:
+            return self.result(status="paused")
+
+        async def aresume(self, _turn_id: str, action: str) -> object:
+            resume_actions.append(action)
+            if len(resume_actions) == 1:
+                self.runtime_file.write_text("after_gate\n", encoding="utf-8")
+                self.calls = (
+                    *self.calls,
+                    AgentToolCall(
+                        "patch",
+                        "apply_patch",
+                        {
+                            "file_path": (
+                                ".praxis/runtime/input_files/turn-123/approval.txt"
+                            ),
+                            "old_string": "before_gate",
+                            "new_string": "after_gate",
+                        },
+                    ),
+                )
+                return self.result(status="paused")
+            self.calls = (
+                *self.calls,
+                AgentToolCall(
+                    "verify",
+                    "run_command",
+                    {"command": "cat approval.txt"},
+                ),
+            )
+            return self.result(status="done", answer="complete")
+
+    import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
+    observation = await module.run_live_case(
+        model_alias="groq_gpt_oss_120b",
+        control_plane=object(),
+        case={
+            "id": "approval_continue",
+            "capability": "approval_continuation",
+            "task": "Change before_gate to after_gate and verify it.",
+            "workspace_files": {"approval.txt": "before_gate\n"},
+            "workspace_assertions": {
+                "input_files/approval.txt": "after_gate\n"
+            },
+            "auto_approve": True,
+        },
+    )
+
+    assert resume_actions == ["allow_once", "allow_once"]
+    assert observation.status == "done"
+    assert observation.approval_resumes == 2
+    assert observation.workspace_assertions_passed is True
+    assert observation.runtime_input_namespace == "turn-123"
+
+
+def test_workspace_assertions_never_fall_back_from_the_current_turn_namespace(
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    stale_file = tmp_path / "input_files/approval.txt"
+    stale_file.parent.mkdir()
+    stale_file.write_text("after_gate\n", encoding="utf-8")
+
+    passed = module._workspace_assertions_pass(
+        tmp_path,
+        {"input_files/approval.txt": "after_gate\n"},
+        turn_id="turn-123",
+    )
+
+    assert passed is False
 
 
 def test_artifact_secret_values_match_sensitive_name_tokens_without_substrings(
@@ -1496,6 +1634,198 @@ def test_approval_quality_allows_reads_around_one_approved_write() -> None:
 
     assert score["capability_passed"] is True
     assert score["redundant_tool_calls"] == 0
+
+
+def test_approval_quality_allows_a_second_resume_for_post_write_verification() -> None:
+    module = _load_gate_module()
+    case = {
+        "id": "approval_continue",
+        "capability": "approval_continuation",
+        "expected_tool_calls": [
+            {
+                "tool_name": "apply_patch",
+                "arguments": {
+                    "file_path": "input_files/approval.txt",
+                    "old_string": "before_gate",
+                    "new_string": "after_gate",
+                },
+            }
+        ],
+    }
+    calls = (
+        module.ToolCallEvidence(
+            "patch",
+            "apply_patch",
+            {
+                "file_path": (
+                    ".praxis/runtime/input_files/turn-123/approval.txt"
+                ),
+                "old_string": "before_gate",
+                "new_string": "after_gate",
+            },
+            False,
+            None,
+        ),
+        module.ToolCallEvidence(
+            "verify",
+            "run_command",
+            {"command": "cat approval.txt"},
+            False,
+            None,
+        ),
+    )
+    observation = module.CaseObservation(
+        case_id="approval_continue",
+        capability="approval_continuation",
+        status="done",
+        answer="done",
+        tool_calls=calls,
+        model_calls=3,
+        input_tokens=1,
+        output_tokens=1,
+        latency_ms=1.0,
+        tool_schema_bytes=1,
+        approval_pause_observed=True,
+        approval_kind="tool_approval",
+        approval_resumes=2,
+        workspace_assertions_passed=True,
+        runtime_input_namespace="turn-123",
+    )
+
+    score = module._score_case(case, observation)
+
+    assert score["capability_passed"] is True
+
+
+def test_call_matching_accepts_only_equivalent_namespaced_input_file_paths() -> None:
+    module = _load_gate_module()
+    spec = {
+        "tool_name": "read_file",
+        "arguments": {"path": "input_files/exact.txt"},
+    }
+
+    equivalent = module.ToolCallEvidence(
+        "read",
+        "read_file",
+        {"path": ".praxis/runtime/input_files/turn-123/exact.txt"},
+        False,
+        None,
+    )
+    wrong_file = module.ToolCallEvidence(
+        "read-wrong",
+        "read_file",
+        {"path": ".praxis/runtime/input_files/turn-123/other.txt"},
+        False,
+        None,
+    )
+
+    assert (
+        module._call_matches(
+            equivalent,
+            spec,
+            runtime_input_namespace="turn-123",
+        )
+        is True
+    )
+    assert (
+        module._call_matches(
+            wrong_file,
+            spec,
+            runtime_input_namespace="turn-123",
+        )
+        is False
+    )
+
+
+def test_file_selection_rejects_an_attachment_path_from_another_turn() -> None:
+    module = _load_gate_module()
+    case = {
+        "id": "exact_file_read",
+        "capability": "file_tool_selection",
+        "expected_answer_contains": "QUALITY_GATE_EXACT",
+        "expected_first_tool": "read_file",
+        "require_first_tool": True,
+        "expected_tool_calls": [
+            {
+                "tool_name": "read_file",
+                "arguments": {"path": "input_files/exact.txt"},
+            }
+        ],
+    }
+    observation = SimpleNamespace(
+        case_id="exact_file_read",
+        capability="file_tool_selection",
+        status="done",
+        answer="QUALITY_GATE_EXACT",
+        tool_calls=(
+            module.ToolCallEvidence(
+                "read",
+                "read_file",
+                {
+                    "path": (
+                        ".praxis/runtime/input_files/wrong-turn/exact.txt"
+                    )
+                },
+                False,
+                None,
+            ),
+        ),
+        model_calls=2,
+        workspace_assertions_passed=True,
+        runtime_input_namespace="turn-123",
+        error="",
+    )
+
+    score = module._score_case(case, observation)
+
+    assert score["capability_passed"] is False
+    assert score["passed"] is False
+
+
+def test_file_selection_rejects_a_failed_expected_read() -> None:
+    module = _load_gate_module()
+    case = {
+        "id": "exact_file_read",
+        "capability": "file_tool_selection",
+        "expected_answer_contains": "QUALITY_GATE_EXACT",
+        "expected_first_tool": "read_file",
+        "require_first_tool": True,
+        "expected_tool_calls": [
+            {
+                "tool_name": "read_file",
+                "arguments": {"path": "input_files/exact.txt"},
+            }
+        ],
+    }
+    observation = SimpleNamespace(
+        case_id="exact_file_read",
+        capability="file_tool_selection",
+        status="done",
+        answer="QUALITY_GATE_EXACT",
+        tool_calls=(
+            module.ToolCallEvidence(
+                "read",
+                "read_file",
+                {
+                    "path": (
+                        ".praxis/runtime/input_files/turn-123/exact.txt"
+                    )
+                },
+                True,
+                "runner_failed",
+            ),
+        ),
+        model_calls=2,
+        workspace_assertions_passed=True,
+        runtime_input_namespace="turn-123",
+        error="",
+    )
+
+    score = module._score_case(case, observation)
+
+    assert score["expected_sequence_matched"] is False
+    assert score["capability_passed"] is False
+    assert score["passed"] is False
 
 
 def test_redundancy_counts_only_replayed_identical_failures() -> None:

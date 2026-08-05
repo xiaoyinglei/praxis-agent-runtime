@@ -41,7 +41,9 @@ DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_ca
 DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
-EVALUATOR_VERSION = "agent_model_quality_gate_v1"
+EVALUATOR_VERSION = "agent_model_quality_gate_v2"
+_MAX_AUTO_APPROVAL_RESUMES = 5
+_RUNTIME_INPUT_FILE_PREFIX = ".praxis/runtime/input_files/"
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
@@ -159,6 +161,7 @@ class CaseObservation:
     approval_kind: str | None
     approval_resumes: int
     workspace_assertions_passed: bool
+    runtime_input_namespace: str | None = None
     stop_reason: str | None = None
     diagnostic_codes: tuple[str, ...] = ()
     diagnostic_error_types: tuple[str, ...] = ()
@@ -530,17 +533,25 @@ async def run_live_case(
                 files=files,
                 require_workspace_change=bool(workspace_assertions),
             )
-            if bool(case.get("auto_approve", False)) and result.status == "paused":
+            while (
+                bool(case.get("auto_approve", False))
+                and result.status == "paused"
+                and approval_resumes < _MAX_AUTO_APPROVAL_RESUMES
+            ):
                 pause_observed = True
-                approval_kind = None if result.pause is None else result.pause.kind
-                if approval_kind == "tool_approval":
-                    result = await agent.aresume(result.turn_id, "allow_once")
-                    approval_resumes = 1
+                current_kind = None if result.pause is None else result.pause.kind
+                if approval_kind is None:
+                    approval_kind = current_kind
+                if current_kind != "tool_approval":
+                    break
+                result = await agent.aresume(result.turn_id, "allow_once")
+                approval_resumes += 1
 
             evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
             workspace_ok = _workspace_assertions_pass(
                 workspace,
                 workspace_assertions,
+                turn_id=result.turn_id,
             )
             return CaseObservation(
                 case_id=case_id,
@@ -557,6 +568,7 @@ async def run_live_case(
                 approval_kind=approval_kind,
                 approval_resumes=approval_resumes,
                 workspace_assertions_passed=workspace_ok,
+                runtime_input_namespace=result.turn_id,
                 stop_reason=result.stop_reason,
                 diagnostic_codes=tuple(item.code for item in result.diagnostics),
                 diagnostic_error_types=tuple(
@@ -583,6 +595,9 @@ async def run_live_case(
                 approval_kind=approval_kind,
                 approval_resumes=approval_resumes,
                 workspace_assertions_passed=False,
+                runtime_input_namespace=(
+                    None if result is None else result.turn_id
+                ),
                 diagnostic_codes=(type(exc).__name__,),
                 diagnostic_error_types=(type(exc).__name__,),
                 infrastructure_failure=True,
@@ -793,7 +808,11 @@ def _score_case(
         label="expected_tool_calls",
     )
     sequence_ok = (
-        _contains_ordered_calls(calls, expected_calls)
+        _contains_ordered_calls(
+            calls,
+            expected_calls,
+            runtime_input_namespace=observation.runtime_input_namespace,
+        )
         if expected_calls
         else _contains_ordered_sequence(names, expected_sequence)
     )
@@ -808,18 +827,30 @@ def _score_case(
             raise ValueError("require_first_tool must be a boolean")
         capability_passed = (first_ok or not require_first) and sequence_ok and invalid_calls == 0
     elif capability == "failure_recovery":
-        capability_passed = _failure_recovered(case, calls)
+        capability_passed = _failure_recovered(
+            case,
+            calls,
+            runtime_input_namespace=observation.runtime_input_namespace,
+        )
     elif capability == "approval_continuation":
         if expected_calls:
             approval_spec = expected_calls[0]
-            approved_calls = [call for call in calls if _call_matches(call, approval_spec)]
+            approved_calls = [
+                call
+                for call in calls
+                if _call_matches(
+                    call,
+                    approval_spec,
+                    runtime_input_namespace=observation.runtime_input_namespace,
+                )
+            ]
         else:
             approval_tool = expected_sequence[0] if expected_sequence else str(expected_first or "")
             approved_calls = [call for call in calls if call.tool_name == approval_tool]
         capability_passed = (
             observation.approval_pause_observed
             and observation.approval_kind == "tool_approval"
-            and observation.approval_resumes == 1
+            and observation.approval_resumes >= 1
             and len(approved_calls) == 1
             and not approved_calls[0].is_error
         )
@@ -835,7 +866,16 @@ def _score_case(
             label="expected_failed_call",
         )
         failure_matched = (
-            bool(calls) and calls[0].is_error and (expected_failed is None or _call_matches(calls[0], expected_failed))
+            bool(calls)
+            and calls[0].is_error
+            and (
+                expected_failed is None
+                or _call_matches(
+                    calls[0],
+                    expected_failed,
+                    runtime_input_namespace=observation.runtime_input_namespace,
+                )
+            )
         )
         capability_passed = first_ok and failure_matched and max_failed <= allowed and len(calls) == 1
     else:  # pragma: no cover - load_suite rejects this first
@@ -963,6 +1003,8 @@ def _infrastructure_message(report: Mapping[str, object]) -> str:
 def _failure_recovered(
     case: Mapping[str, object],
     calls: Sequence[ToolCallEvidence],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     expected_failed = _optional_call_spec(
         case.get("expected_failed_call"),
@@ -974,12 +1016,29 @@ def _failure_recovered(
     )
     if expected_failed is not None and expected_recovery is not None:
         failure_index = next(
-            (index for index, call in enumerate(calls) if call.is_error and _call_matches(call, expected_failed)),
+            (
+                index
+                for index, call in enumerate(calls)
+                if call.is_error
+                and _call_matches(
+                    call,
+                    expected_failed,
+                    runtime_input_namespace=runtime_input_namespace,
+                )
+            ),
             None,
         )
         if failure_index is None:
             return False
-        return any(not call.is_error and _call_matches(call, expected_recovery) for call in calls[failure_index + 1 :])
+        return any(
+            not call.is_error
+            and _call_matches(
+                call,
+                expected_recovery,
+                runtime_input_namespace=runtime_input_namespace,
+            )
+            for call in calls[failure_index + 1 :]
+        )
 
     intentional_tool = case.get("intentional_error_tool")
     if not isinstance(intentional_tool, str) or not calls:
@@ -1050,11 +1109,20 @@ def _tool_call_evidence(call: AgentToolCall) -> ToolCallEvidence:
 def _workspace_assertions_pass(
     workspace: Path,
     assertions: Mapping[str, object],
+    *,
+    turn_id: str | None = None,
 ) -> bool:
     for relative, expected in assertions.items():
         if not isinstance(expected, str):
             return False
         path = workspace / relative
+        if turn_id is not None and relative.startswith("input_files/"):
+            path = (
+                workspace
+                / _RUNTIME_INPUT_FILE_PREFIX
+                / turn_id
+                / relative.removeprefix("input_files/")
+            )
         if not path.is_file() or path.read_text(encoding="utf-8") != expected:
             return False
     return True
@@ -1128,12 +1196,18 @@ def _call_spec(value: object, *, label: str) -> Mapping[str, object]:
 def _contains_ordered_calls(
     calls: Sequence[ToolCallEvidence],
     expected: Sequence[Mapping[str, object]],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     if not expected:
         return True
     expected_index = 0
     for call in calls:
-        if not _call_matches(call, expected[expected_index]):
+        if call.is_error or not _call_matches(
+            call,
+            expected[expected_index],
+            runtime_input_namespace=runtime_input_namespace,
+        ):
             continue
         expected_index += 1
         if expected_index == len(expected):
@@ -1144,11 +1218,50 @@ def _contains_ordered_calls(
 def _call_matches(
     call: ToolCallEvidence,
     spec: Mapping[str, object],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     if call.tool_name != spec.get("tool_name"):
         return False
     arguments = _mapping(spec.get("arguments"))
-    return all(call.arguments.get(name) == value for name, value in arguments.items())
+    return all(
+        _argument_matches(
+            name=name,
+            actual=call.arguments.get(name),
+            expected=value,
+            runtime_input_namespace=runtime_input_namespace,
+        )
+        for name, value in arguments.items()
+    )
+
+
+def _argument_matches(
+    *,
+    name: str,
+    actual: object,
+    expected: object,
+    runtime_input_namespace: str | None,
+) -> bool:
+    if actual == expected:
+        return True
+    if (
+        name not in {"path", "file_path"}
+        or not isinstance(actual, str)
+        or not isinstance(expected, str)
+        or not expected.startswith("input_files/")
+        or not actual.startswith(_RUNTIME_INPUT_FILE_PREFIX)
+        or runtime_input_namespace is None
+    ):
+        return False
+    runtime_parts = actual.removeprefix(_RUNTIME_INPUT_FILE_PREFIX).split("/")
+    if len(runtime_parts) < 2 or any(
+        part in {"", ".", ".."} for part in runtime_parts
+    ):
+        return False
+    if runtime_parts[0] != runtime_input_namespace:
+        return False
+    logical_path = "input_files/" + "/".join(runtime_parts[1:])
+    return logical_path == expected
 
 
 def _float_metric_mapping(value: object, *, label: str) -> dict[str, float]:
@@ -1290,6 +1403,7 @@ def _observation_from_payload(value: object) -> CaseObservation:
             label="approval_resumes",
         ),
         workspace_assertions_passed=boolean("workspace_assertions_passed"),
+        runtime_input_namespace=text_or_none("runtime_input_namespace"),
         stop_reason=text_or_none("stop_reason"),
         diagnostic_codes=_string_sequence(
             payload.get("diagnostic_codes", ()),

@@ -729,6 +729,97 @@ def test_renderer_rejects_passed_approval_case_without_resume_before_writing(
     assert not run_record_path.exists()
 
 
+def test_renderer_accepts_multiple_resumes_for_a_passing_approval_chain(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = "agent_model_quality_gate_v2"
+    for case in payload["runs"][0]["trials"][0]["cases"]:
+        case["observation"]["runtime_input_namespace"] = "turn-123"
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["approval_resumes"] = 2
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="multiple-approval-resumes",
+    )
+
+    assert "Approval resumes: `2`" in run_record
+    assert "Evaluator verdict: **PASSED**" in run_record
+
+
+@pytest.mark.parametrize(
+    ("evaluator_version", "approval_resumes"),
+    [
+        ("agent_model_quality_gate_v1", 2),
+        ("agent_model_quality_gate_v2", 6),
+    ],
+)
+def test_renderer_rejects_approval_resumes_outside_the_evaluator_contract(
+    tmp_path: Path,
+    evaluator_version: str,
+    approval_resumes: int,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = evaluator_version
+    approval_case = payload["runs"][0]["trials"][0]["cases"][0]
+    observation = approval_case["observation"]
+    observation["approval_resumes"] = approval_resumes
+    if evaluator_version == "agent_model_quality_gate_v2":
+        for case in payload["runs"][0]["trials"][0]["cases"]:
+            case["observation"]["runtime_input_namespace"] = "turn-123"
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+    report_path = tmp_path / f"invalid-resumes-{approval_resumes}.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="approval evidence"):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
+
+
+def test_renderer_rejects_v2_normal_case_without_runtime_input_namespace(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = "agent_model_quality_gate_v2"
+    cases = payload["runs"][0]["trials"][0]["cases"]
+    cases[1]["observation"]["runtime_input_namespace"] = "turn-123"
+    approval_case = cases[0]
+    approval_case["observation"]["approval_resumes"] = 2
+    approval_case["score"].update(
+        passed=True,
+        core_success=True,
+        capability_passed=True,
+    )
+    report_path = tmp_path / "v2-missing-runtime-namespace.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime_input_namespace"):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
+
+
 def test_renderer_rejects_passed_case_with_failed_observation_before_writing(
     tmp_path: Path,
 ) -> None:
