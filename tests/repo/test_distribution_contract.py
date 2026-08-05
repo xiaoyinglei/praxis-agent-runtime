@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import configparser
 import subprocess
+import tomllib
 import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+PYPROJECT = ROOT / "pyproject.toml"
 
 
 def _build_wheel(output_dir: Path) -> Path:
@@ -78,3 +80,15 @@ def test_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
     assert 'mktemp -d "$RUNNER_TEMP/praxis-wheel-smoke.XXXXXX"' in workflow
     assert "mapfile -d '' -t wheels" in workflow
     assert '"${#wheels[@]}" -ne 1' in workflow
+
+
+def test_mypy_allows_the_platform_only_mlx_dependency_to_be_absent() -> None:
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    ignored_modules = {
+        module
+        for override in config["tool"]["mypy"]["overrides"]
+        if override.get("ignore_missing_imports") is True
+        for module in override["module"]
+    }
+
+    assert {"mlx", "mlx.*"} <= ignored_modules

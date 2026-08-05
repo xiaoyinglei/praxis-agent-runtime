@@ -84,6 +84,8 @@ packages = ["agent_runtime", "rag"]
 module = [
   "boto3",
   "datasets",
+  "mlx",
+  "mlx.*",
   "ocrmac",
   "openpyxl",
   "openpyxl.*",
