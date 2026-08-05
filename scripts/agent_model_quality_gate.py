@@ -41,8 +41,7 @@ DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_ca
 DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
-EVALUATOR_VERSION = "agent_model_quality_gate_v2"
-_MAX_AUTO_APPROVAL_RESUMES = 5
+EVALUATOR_VERSION = "agent_model_quality_gate_v3"
 _RUNTIME_INPUT_FILE_PREFIX = ".praxis/runtime/input_files/"
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
@@ -531,21 +530,20 @@ async def run_live_case(
             result = await agent.arun(
                 str(case["task"]),
                 files=files,
-                require_workspace_change=bool(workspace_assertions),
+                require_workspace_change=False,
             )
-            while (
-                bool(case.get("auto_approve", False))
-                and result.status == "paused"
-                and approval_resumes < _MAX_AUTO_APPROVAL_RESUMES
-            ):
+            if bool(case.get("auto_approve", False)) and result.status == "paused":
                 pause_observed = True
                 current_kind = None if result.pause is None else result.pause.kind
-                if approval_kind is None:
-                    approval_kind = current_kind
-                if current_kind != "tool_approval":
-                    break
-                result = await agent.aresume(result.turn_id, "allow_once")
-                approval_resumes += 1
+                approval_kind = current_kind
+                if _is_declared_apply_patch_approval(
+                    case,
+                    result.pause,
+                    workspace=workspace,
+                    turn_id=result.turn_id,
+                ):
+                    result = await agent.aresume(result.turn_id, "allow_once")
+                    approval_resumes = 1
 
             evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
             workspace_ok = _workspace_assertions_pass(
@@ -607,6 +605,59 @@ async def run_live_case(
             store = getattr(agent, "_turn_store", None)
             if store is not None:
                 store.close()
+
+
+def _is_declared_apply_patch_approval(
+    case: Mapping[str, object],
+    pause: object | None,
+    *,
+    workspace: Path,
+    turn_id: str,
+) -> bool:
+    """Authorize one declared patch in the disposable benchmark workspace."""
+
+    if pause is None or getattr(pause, "kind", None) != "tool_approval":
+        return False
+    if str(case.get("capability", "")) != "approval_continuation":
+        return False
+    expected_calls = case.get("expected_tool_calls", ())
+    if (
+        not isinstance(expected_calls, Sequence)
+        or isinstance(expected_calls, (str, bytes))
+        or len(expected_calls) != 1
+    ):
+        return False
+    expected_call = _mapping(expected_calls[0])
+    if expected_call.get("tool_name") != "apply_patch":
+        return False
+    arguments = _mapping(expected_call.get("arguments"))
+    expected_path = arguments.get("file_path")
+    if not isinstance(expected_path, str) or not expected_path.startswith("input_files/"):
+        return False
+    relative_parts = expected_path.removeprefix("input_files/").split("/")
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return False
+    tool_calls = tuple(getattr(pause, "tool_calls", ()))
+    if len(tool_calls) != 1 or getattr(tool_calls[0], "tool_name", None) != "apply_patch":
+        return False
+    context = getattr(pause, "context", {})
+    if not isinstance(context, Mapping):
+        return False
+    workspace_target = context.get("workspace_path")
+    if not isinstance(workspace_target, str):
+        return False
+    expected_target = (
+        workspace
+        / _RUNTIME_INPUT_FILE_PREFIX
+        / turn_id
+        / Path(*relative_parts)
+    ).resolve()
+    return bool(
+        context.get("approval_scope") == "tool"
+        and context.get("network_requested") is False
+        and context.get("workspace_write") is True
+        and Path(workspace_target).resolve() == expected_target
+    )
 
 
 def build_baseline(

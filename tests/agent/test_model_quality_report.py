@@ -762,6 +762,7 @@ def test_renderer_accepts_multiple_resumes_for_a_passing_approval_chain(
     [
         ("agent_model_quality_gate_v1", 2),
         ("agent_model_quality_gate_v2", 6),
+        ("agent_model_quality_gate_v3", 2),
     ],
 )
 def test_renderer_rejects_approval_resumes_outside_the_evaluator_contract(
@@ -775,7 +776,10 @@ def test_renderer_rejects_approval_resumes_outside_the_evaluator_contract(
     approval_case = payload["runs"][0]["trials"][0]["cases"][0]
     observation = approval_case["observation"]
     observation["approval_resumes"] = approval_resumes
-    if evaluator_version == "agent_model_quality_gate_v2":
+    if evaluator_version in {
+        "agent_model_quality_gate_v2",
+        "agent_model_quality_gate_v3",
+    }:
         for case in payload["runs"][0]["trials"][0]["cases"]:
             case["observation"]["runtime_input_namespace"] = "turn-123"
     approval_case["score"].update(
@@ -794,22 +798,31 @@ def test_renderer_rejects_approval_resumes_outside_the_evaluator_contract(
         )
 
 
-def test_renderer_rejects_v2_normal_case_without_runtime_input_namespace(
+@pytest.mark.parametrize(
+    ("evaluator_version", "approval_resumes"),
+    [
+        ("agent_model_quality_gate_v2", 2),
+        ("agent_model_quality_gate_v3", 1),
+    ],
+)
+def test_renderer_rejects_namespaced_evaluator_case_without_runtime_input_namespace(
     tmp_path: Path,
+    evaluator_version: str,
+    approval_resumes: int,
 ) -> None:
     module = _load_report_module()
     payload = _report_payload(tmp_path)
-    payload["evaluator_version"] = "agent_model_quality_gate_v2"
+    payload["evaluator_version"] = evaluator_version
     cases = payload["runs"][0]["trials"][0]["cases"]
     cases[1]["observation"]["runtime_input_namespace"] = "turn-123"
     approval_case = cases[0]
-    approval_case["observation"]["approval_resumes"] = 2
+    approval_case["observation"]["approval_resumes"] = approval_resumes
     approval_case["score"].update(
         passed=True,
         core_success=True,
         capability_passed=True,
     )
-    report_path = tmp_path / "v2-missing-runtime-namespace.json"
+    report_path = tmp_path / "missing-runtime-namespace.json"
     report_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="runtime_input_namespace"):

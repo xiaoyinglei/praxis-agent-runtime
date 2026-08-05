@@ -161,10 +161,10 @@ def _inconclusive_model_report(
     }
 
 
-def test_evaluator_version_tracks_namespaced_multi_approval_contract() -> None:
+def test_evaluator_version_tracks_namespaced_least_authority_contract() -> None:
     module = _load_gate_module()
 
-    assert module.EVALUATOR_VERSION == "agent_model_quality_gate_v2"
+    assert module.EVALUATOR_VERSION == "agent_model_quality_gate_v3"
 
 
 def test_repository_fingerprint_binds_clean_commit_and_tree(tmp_path: Path) -> None:
@@ -533,18 +533,17 @@ def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> Non
 
 
 @pytest.mark.parametrize(
-    ("workspace_assertions", "expected"),
+    "workspace_assertions",
     [
-        ({}, False),
-        ({"input_files/output.txt": "after\n"}, True),
+        {},
+        {"input_files/output.txt": "after\n"},
     ],
     ids=["read-only", "workspace-mutation"],
 )
 @pytest.mark.anyio
-async def test_run_live_case_derives_workspace_change_contract_from_assertions(
+async def test_run_live_case_leaves_workspace_change_checks_to_the_evaluator(
     monkeypatch: pytest.MonkeyPatch,
     workspace_assertions: dict[str, str],
-    expected: bool,
 ) -> None:
     module = _load_gate_module()
     captured: list[bool] = []
@@ -594,11 +593,11 @@ async def test_run_live_case_derives_workspace_change_contract_from_assertions(
         },
     )
 
-    assert captured == [expected]
+    assert captured == [False]
 
 
 @pytest.mark.anyio
-async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespaced_file(
+async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow_up_tools(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_gate_module()
@@ -637,6 +636,9 @@ async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespace
             *,
             status: str,
             answer: str | None = None,
+            pause_tool_name: str = "apply_patch",
+            workspace_write: bool = True,
+            workspace_path: str | None = None,
         ) -> object:
             return SimpleNamespace(
                 status=status,
@@ -647,7 +649,20 @@ async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespace
                 stop_reason=None,
                 diagnostics=(),
                 pause=(
-                    SimpleNamespace(kind="tool_approval")
+                    SimpleNamespace(
+                        kind="tool_approval",
+                        tool_calls=(SimpleNamespace(tool_name=pause_tool_name),),
+                        context={
+                            "approval_scope": "tool",
+                            "network_requested": False,
+                            "workspace_write": workspace_write,
+                            "workspace_path": (
+                                str(self.runtime_file)
+                                if workspace_path is None
+                                else workspace_path
+                            ),
+                        },
+                    )
                     if status == "paused"
                     else None
                 ),
@@ -674,7 +689,12 @@ async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespace
                         },
                     ),
                 )
-                return self.result(status="paused")
+                return self.result(
+                    status="paused",
+                    pause_tool_name="run_command",
+                    workspace_write=True,
+                    workspace_path=str(self.workspace),
+                )
             self.calls = (
                 *self.calls,
                 AgentToolCall(
@@ -699,15 +719,128 @@ async def test_run_live_case_resumes_bounded_approval_chain_and_checks_namespace
             "workspace_assertions": {
                 "input_files/approval.txt": "after_gate\n"
             },
+            "expected_tool_calls": [
+                {
+                    "tool_name": "apply_patch",
+                    "arguments": {
+                        "file_path": "input_files/approval.txt",
+                        "old_string": "before_gate",
+                        "new_string": "after_gate",
+                    },
+                }
+            ],
             "auto_approve": True,
         },
     )
 
-    assert resume_actions == ["allow_once", "allow_once"]
-    assert observation.status == "done"
-    assert observation.approval_resumes == 2
+    assert resume_actions == ["allow_once"]
+    assert observation.status == "paused"
+    assert observation.approval_resumes == 1
     assert observation.workspace_assertions_passed is True
     assert observation.runtime_input_namespace == "turn-123"
+
+
+@pytest.mark.anyio
+async def test_declared_apply_patch_approval_accepts_the_real_public_pause(
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    from agent_runtime.loop.runtime import _approval_request
+    from agent_runtime.result import _project_pause
+    from agent_runtime.tools.builtins.filesystem import create_apply_patch_tool
+    from agent_runtime.tools.executor import ToolExecutor
+    from agent_runtime.tools.permissions import ToolExecutionContext
+    from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
+    from agent_runtime.workspace import open_workspace
+
+    workspace_root = tmp_path / "workspace"
+    workspace = open_workspace(workspace_root, create=True)
+    turn_id = "turn-123"
+    runtime_path = f".praxis/runtime/input_files/{turn_id}/approval.txt"
+    target = workspace_root / runtime_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("before_gate\n", encoding="utf-8")
+    call = ToolCall(
+        tool_call_id="call-patch",
+        tool_name="apply_patch",
+        arguments={
+            "file_path": runtime_path,
+            "old_string": "before_gate",
+            "new_string": "after_gate",
+        },
+        origin=ToolCallOrigin(
+            request_id="request-1",
+            toolset_revision="tools-v1",
+            exposed_tool_names=("apply_patch",),
+        ),
+    )
+    execution = await ToolExecutor(
+        {"apply_patch": create_apply_patch_tool(workspace)}
+    ).execute(
+        call,
+        context=ToolExecutionContext(
+            workspace_root=workspace_root,
+            cwd=workspace_root,
+        ),
+    )
+    assert execution.result.error_code == "approval_required"
+    pause = _project_pause(_approval_request(execution.result, call))
+    assert pause is not None
+    case = {
+        "capability": "approval_continuation",
+        "expected_tool_calls": [
+            {
+                "tool_name": "apply_patch",
+                "arguments": {
+                    "file_path": "input_files/approval.txt",
+                },
+            }
+        ],
+    }
+
+    assert module._is_declared_apply_patch_approval(
+        case,
+        pause,
+        workspace=workspace_root,
+        turn_id=turn_id,
+    )
+
+
+def test_declared_apply_patch_approval_rejects_a_different_workspace_target(
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    case = {
+        "capability": "approval_continuation",
+        "expected_tool_calls": [
+            {
+                "tool_name": "apply_patch",
+                "arguments": {
+                    "file_path": "input_files/approval.txt",
+                },
+            }
+        ],
+    }
+    pause = SimpleNamespace(
+        kind="tool_approval",
+        tool_calls=(SimpleNamespace(tool_name="apply_patch"),),
+        context={
+            "approval_scope": "tool",
+            "network_requested": False,
+            "workspace_write": True,
+            "workspace_path": str(tmp_path / "unrelated.txt"),
+        },
+    )
+
+    assert (
+        module._is_declared_apply_patch_approval(
+            case,
+            pause,
+            workspace=tmp_path,
+            turn_id="turn-123",
+        )
+        is False
+    )
 
 
 def test_workspace_assertions_never_fall_back_from_the_current_turn_namespace(

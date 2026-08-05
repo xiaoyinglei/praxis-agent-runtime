@@ -20,6 +20,7 @@ _TOOL_TRACE_VALUE_LIMIT = 1600
 _MAX_APPROVAL_RESUMES_BY_EVALUATOR = {
     "agent_model_quality_gate_v1": 1,
     "agent_model_quality_gate_v2": 5,
+    "agent_model_quality_gate_v3": 1,
 }
 _POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
@@ -808,7 +809,11 @@ def _validate_run_cases(
                     "must be non-empty text or null"
                 )
             if (
-                evaluator_version == "agent_model_quality_gate_v2"
+                evaluator_version
+                in {
+                    "agent_model_quality_gate_v2",
+                    "agent_model_quality_gate_v3",
+                }
                 and observation.get("infrastructure_failure") is not True
                 and not isinstance(runtime_input_namespace, str)
             ):
