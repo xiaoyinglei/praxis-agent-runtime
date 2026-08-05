@@ -357,7 +357,19 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert events == ["preflight", "model", "preflight"]
     assert payload["source_commit"] == "a" * 40
     assert payload["source_tree"] == "b" * 40
+    assert payload["source_unchanged"] is True
     assert payload["dirty"] is False
+    assert set(payload["runtime_platform"]) == {
+        "os",
+        "os_release",
+        "architecture",
+        "python_version",
+        "python_implementation",
+    }
+    assert all(
+        isinstance(value, str) and value
+        for value in payload["runtime_platform"].values()
+    )
     assert payload["suite_revision"] == module.suite_revision(suite)
     assert payload["evaluator_version"] == module.EVALUATOR_VERSION
     assert payload["case_metadata"] == [

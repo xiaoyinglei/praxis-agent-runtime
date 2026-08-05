@@ -24,7 +24,9 @@ machine-readable report:
 - **task** — the exact bounded workspace objective;
 - **redacted tool trace** — ordered tool choices and bounded results;
 - **approval event** — the destructive capability request and decision;
-- **before/after diff** — the validated workspace mutation without local paths;
+- **validated fixture before/after assertion contract** — the evaluator's
+  expected workspace contract and whether it passed; it is not a captured
+  filesystem diff;
 - **final answer** — the model's bounded completion response;
 - **evaluator verdict** — task-specific acceptance plus any failure reasons;
 - **raw JSON** — a relative link to the actual redacted report created by the

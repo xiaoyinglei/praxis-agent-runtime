@@ -21,6 +21,7 @@ import importlib.util
 import json
 import math
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -722,7 +723,9 @@ async def _gate(args: argparse.Namespace) -> int:
         "status": status,
         "source_commit": fingerprint.source_commit,
         "source_tree": fingerprint.source_tree,
+        "source_unchanged": True,
         "dirty": fingerprint.dirty,
+        "runtime_platform": runtime_platform_metadata(),
         "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
         "evaluator_version": EVALUATOR_VERSION,
@@ -1327,6 +1330,18 @@ def repository_fingerprint(repository: Path) -> RepositoryFingerprint:
         source_tree=source_tree,
         dirty=False,
     )
+
+
+def runtime_platform_metadata() -> dict[str, str]:
+    """Return the safe, path-free runtime identity committed with gate evidence."""
+
+    return {
+        "os": platform.system() or "unknown",
+        "os_release": platform.release() or "unknown",
+        "architecture": platform.machine() or "unknown",
+        "python_version": platform.python_version() or "unknown",
+        "python_implementation": platform.python_implementation() or "unknown",
+    }
 
 
 def _git_text(repository: Path, *args: str) -> str:

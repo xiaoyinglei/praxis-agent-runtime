@@ -7,9 +7,11 @@
 [![Distribution: source only](https://img.shields.io/badge/distribution-source%20checkout-555)](#quickstart)
 
 Praxis turns a model's plan into controlled work on files, code, data, documents,
-and private knowledge, then asks the runtime for evidence before reporting a result.
-It is designed for one person operating a trusted local workspace, with `agent` as
-the CLI and `agent_runtime.Agent` as the Python API.
+and private knowledge. For default modification tasks, the runtime requires a real
+workspace change and post-change verification before accepting completion.
+Read-only tasks explicitly opt out of that mutation contract and may answer
+directly. Praxis is designed for one person operating a trusted local workspace,
+with `agent` as the CLI and `agent_runtime.Agent` as the Python API.
 
 ![Praxis deterministic fake-model demo](docs/assets/praxis-demo.gif)
 
@@ -27,9 +29,12 @@ workspace knowledge -> controlled action -> verifiable result
 ```
 
 Praxis keeps that path visible. The model can inspect the workspace, propose and
-execute bounded tool calls, pause at approval boundaries, continue from durable
-state, and finish only with runtime evidence. RAG is an optional private-knowledge
-capability, not the product's default execution path.
+execute bounded tool calls, pause at approval boundaries, and continue from
+durable state. Default modification turns finish against diff and verification
+evidence. A read-only turn using `--no-require-workspace-change`, or the SDK with
+`require_workspace_change=False`, may return analysis without manufacturing a
+change. RAG is an optional private-knowledge capability, not the product's default
+execution path.
 
 ## Runtime architecture
 
@@ -108,6 +113,9 @@ uv run agent run \
   --no-require-workspace-change
 ```
 
+Read-only tasks can answer directly because `--no-require-workspace-change`
+disables only the mutation requirement; it does not invent a verification claim.
+
 For a task that may edit files or run verification, describe the outcome instead
 of scripting tool names:
 
@@ -151,7 +159,7 @@ existing paused or interrupted Turn. Async applications can use `arun()`,
 | **Files and code** | `agent` / `agent_runtime.Agent` | Discover, read, search, patch, inspect diffs, run bounded verification |
 | **Data and documents** | Workspace tools plus Python execution | Inspect CSV, JSON, spreadsheets, PDFs, and document-derived artifacts |
 | **Private knowledge** | Explicit `RAGKnowledgeConfig` | Retrieve cited evidence from a configured local knowledge index |
-| **Extensions** | Skills, MCP, and registered tools | Add documented ACI capabilities without replacing the core loop |
+| **Extensions** | Workspace Skills, configured MCP servers, and bounded subagent delegation | Add installed ACI capabilities without replacing the core loop |
 
 Capabilities are assembled for the current workspace. Availability does not
 grant permission: tool visibility, write authority, command execution, network
@@ -199,9 +207,11 @@ repository, or an untrusted operator into a safe workload.
 - Read/execute and workspace-write capabilities are distinct. Writes and command
   execution can require approval; `.git` mutations remain outside the default
   workspace-write boundary.
-- The command sandbox is platform-dependent. The strongest exercised boundary is
-  macOS Seatbelt; other platforms may use a narrower or test-only path and must be
-  evaluated separately.
+- Real `run_command` execution currently requires macOS
+  `/usr/bin/sandbox-exec` and a Seatbelt profile. If that executable is absent,
+  the tool will fail closed with `sandbox_unavailable`; on other platforms it is
+  unavailable, and this repository has no equivalent command-sandbox safety
+  evidence. The fake sandbox fixtures are test-only and are not safety evidence.
 - RAG evidence quality depends on parsing, indexing, retrieval configuration, and
   the source documents. A citation is traceability, not automatic truth.
 - Model and provider availability is external infrastructure. Timeouts, quota,

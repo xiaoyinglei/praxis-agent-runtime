@@ -58,6 +58,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "approval_kind": "tool_approval",
         "approval_resumes": 1,
         "workspace_assertions_passed": True,
+        "stop_reason": "completed",
         "infrastructure_failure": False,
         "error": "",
     }
@@ -67,6 +68,11 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "status": "failed",
         "answer": None,
         "tool_calls": [],
+        "model_calls": 2,
+        "input_tokens": 80,
+        "output_tokens": 10,
+        "latency_ms": 75.0,
+        "tool_schema_bytes": 400,
         "approval_pause_observed": False,
         "approval_kind": None,
         "approval_resumes": 0,
@@ -82,7 +88,15 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "passed": False,
         "source_commit": "a" * 40,
         "source_tree": "b" * 40,
+        "source_unchanged": True,
         "dirty": False,
+        "runtime_platform": {
+            "os": "Darwin",
+            "os_release": "25.6.0",
+            "architecture": "arm64",
+            "python_version": "3.12.11",
+            "python_implementation": "CPython",
+        },
         "suite_id": "agent-model-tool-quality-v1",
         "suite_revision": "suite_1234567890abcdef1234",
         "evaluator_version": "agent_model_quality_gate_v1",
@@ -190,12 +204,26 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "source_commit: `" + "a" * 40 + "`" in benchmark
     assert "source_tree: `" + "b" * 40 + "`" in benchmark
     assert "dirty: `false`" in benchmark
+    assert "source_unchanged: `true`" in benchmark
+    assert "## Environment" in benchmark
+    assert "| `os` | `Darwin` |" in benchmark
+    assert "| `os_release` | `25.6.0` |" in benchmark
+    assert "| `architecture` | `arm64` |" in benchmark
+    assert "| `python_version` | `3.12.11` |" in benchmark
+    assert "| `python_implementation` | `CPython` |" in benchmark
     assert "suite_1234567890abcdef1234" in benchmark
     assert "agent_model_quality_gate_v1" in benchmark
     assert "task_success_rate" in benchmark
     assert "0.8" in benchmark
     assert "task_success_rate: observed 0.8 < baseline floor 1.0" in benchmark
     assert "provider_down" in benchmark
+    assert "- Provider: `groq`" in benchmark
+    assert "- Provider model: `openai/gpt-oss-120b`" in benchmark
+    assert "## Per-case usage" in benchmark
+    assert "| `groq_gpt_oss_120b` | `1` | `approval_continue` | `2` | `3` | `125.0` | `100` | `20` |" in benchmark
+    assert "## 30-task coding-agent protocol" in benchmark
+    assert "Manifest status: **validated only**" in benchmark
+    assert "not run as this release gate" in benchmark
     assert "INCONCLUSIVE" not in benchmark
     assert "accuracy" not in benchmark
 
@@ -204,6 +232,15 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "apply_patch" in run_record
     assert "tool_approval" in run_record
     assert "Approval resumes: `1`" in run_record
+    assert "Stop reason: `\"completed\"`" in run_record
+    assert "Verification — workspace assertions passed: `true`" in run_record
+    assert "Tool calls: `2`" in run_record
+    assert "Model calls: `3`" in run_record
+    assert "Latency ms: `125.0`" in run_record
+    assert "Input tokens: `100`" in run_record
+    assert "Output tokens: `20`" in run_record
+    assert "validated fixture before/after assertion contract" in run_record
+    assert "not a captured filesystem diff" in run_record
     assert "-before_gate" in run_record
     assert "+after_gate" in run_record
     assert "Updated approval.txt." in run_record
@@ -214,6 +251,25 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "OPENAI_API_KEY" not in rendered
     assert "Authorization" not in rendered
     assert "redacted-id" not in rendered
+
+
+@pytest.mark.parametrize("missing", ["runtime_platform", "source_unchanged"])
+def test_renderer_requires_platform_and_source_consistency_metadata(
+    tmp_path: Path,
+    missing: str,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    del payload[missing]
+    report_path = tmp_path / "incomplete-provenance.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=missing):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
 
 
 def test_renderer_redacts_sensitive_name_tokens_without_redacting_monkey() -> None:

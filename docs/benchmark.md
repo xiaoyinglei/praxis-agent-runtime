@@ -47,6 +47,7 @@ The generated report records these exact fields or projections:
 | token usage | Available prompt, completion, and total usage without secret metadata |
 | failures | Evaluator failures and bounded diagnostic categories |
 | infrastructure status | Provider, runtime, or environment failure recorded as INCONCLUSIVE |
+| workspace mutation evidence | A validated fixture before/after assertion contract; not a captured filesystem diff |
 
 The checked-in machine-readable evidence will live under
 `evals/model_quality/runs/` and is rendered into this page plus the expanded

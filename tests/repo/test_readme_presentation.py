@@ -3,12 +3,15 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
 BENCHMARK = ROOT / "docs" / "benchmark.md"
 RUN_RECORD = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
+MODEL_CATALOG = ROOT / "configs" / "models.yaml"
 
 
 def _read(path: Path) -> str:
@@ -50,6 +53,35 @@ def test_readme_follows_the_public_product_story() -> None:
     assert "lazy" in readme.lower()
     assert "provider boundary" in readme.lower()
     assert "[MIT](LICENSE)" in readme
+
+
+def test_readme_scopes_completion_evidence_and_runtime_extensions_truthfully() -> None:
+    readme = _read(README)
+    unsupported_extension = "registered " + "tools"
+
+    assert "default modification tasks" in readme
+    assert "Read-only tasks" in readme
+    assert "--no-require-workspace-change" in readme
+    assert "require_workspace_change=False" in readme
+    assert "Workspace Skills" in readme
+    assert "configured MCP" in readme
+    assert "bounded subagent" in readme
+    assert unsupported_extension not in readme
+
+
+def test_readme_states_the_real_run_command_platform_boundary() -> None:
+    readme = _read(README)
+
+    for boundary in (
+        "/usr/bin/sandbox-exec",
+        "Seatbelt",
+        "fail closed",
+        "unavailable",
+        "fake sandbox",
+        "test-only",
+        "not safety evidence",
+    ):
+        assert boundary in readme
 
 
 def test_readme_sdk_examples_use_the_real_public_facade() -> None:
@@ -106,6 +138,38 @@ def test_runbook_uses_the_praxis_source_checkout_without_personal_paths() -> Non
     assert personal_path not in runbook
 
 
+def test_runbook_defaults_are_bound_to_the_model_catalog() -> None:
+    runbook = _read(RUNBOOK)
+    catalog = yaml.safe_load(MODEL_CATALOG.read_text(encoding="utf-8"))
+    defaults = catalog["defaults"]
+    models = catalog["models"]
+    providers = catalog["providers"]
+
+    expected = {
+        "primary_model": (
+            defaults["primary_model"],
+            models[defaults["primary_model"]]["model"],
+        ),
+        "embedding_model": (
+            defaults["embedding_model"],
+            models[defaults["embedding_model"]]["model"],
+        ),
+        "reranker_model": (
+            defaults["reranker_model"],
+            models[defaults["reranker_model"]]["model"],
+        ),
+    }
+    for alias, model in expected.values():
+        assert f"`{alias}`" in runbook
+        assert f"`{model}`" in runbook
+
+    primary = models[defaults["primary_model"]]
+    assert providers[primary["provider"]]["api_key_env"] == "GROQ_API_KEY"
+    assert "`GROQ_API_KEY`" in runbook
+    assert "qwen3_8b_mlx_4bit" in runbook
+    assert "显式可选" in runbook
+
+
 def test_license_and_pre_live_evidence_pages_are_explicit() -> None:
     license_text = _read(LICENSE)
     benchmark = _read(BENCHMARK)
@@ -139,7 +203,7 @@ def test_license_and_pre_live_evidence_pages_are_explicit() -> None:
         "task",
         "redacted tool trace",
         "approval event",
-        "before/after diff",
+        "validated fixture before/after assertion contract",
         "final answer",
         "evaluator verdict",
         "raw JSON",

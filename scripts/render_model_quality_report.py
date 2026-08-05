@@ -66,8 +66,27 @@ def _validate_report(report: Mapping[str, object]) -> None:
         raise ValueError("model quality gate report schema_version must be 1")
     if report.get("dirty") is not False:
         raise ValueError("model quality gate report dirty must be false")
+    if report.get("source_unchanged") is not True:
+        raise ValueError("model quality gate report source_unchanged must be true")
     _required_text(report, "source_commit")
     _required_text(report, "source_tree")
+    runtime_platform = _mapping(
+        report.get("runtime_platform"),
+        label="runtime_platform",
+    )
+    platform_fields = {
+        "os",
+        "os_release",
+        "architecture",
+        "python_version",
+        "python_implementation",
+    }
+    if set(runtime_platform) != platform_fields:
+        raise ValueError(
+            "model quality report runtime_platform must contain only safe platform fields"
+        )
+    for field in sorted(platform_fields):
+        _required_text(runtime_platform, field)
     _required_text(report, "suite_id")
     _required_text(report, "suite_revision")
     _required_text(report, "evaluator_version")
@@ -111,6 +130,12 @@ def _validate_report(report: Mapping[str, object]) -> None:
     model_passes: list[bool] = []
     for alias, model in models.items():
         run = runs[alias]
+        _required_text(run, "provider")
+        run_provider_model = _required_text(run, "provider_model")
+        if _required_text(model, "provider_model") != run_provider_model:
+            raise ValueError(
+                f"model quality report provider model for {alias} is inconsistent"
+            )
         run_status = run.get("status")
         model_passed = model.get("passed")
         model_infrastructure = model.get("infrastructure_failure")
@@ -169,6 +194,14 @@ def _render_benchmark(
     raw_report_reference: str,
 ) -> str:
     verdict = _verdict(report)
+    runtime_platform = _mapping(
+        report.get("runtime_platform"),
+        label="runtime_platform",
+    )
+    runs = _items_by_alias(
+        _sequence(report.get("runs"), label="runs"),
+        label="model run",
+    )
     lines = [
         "# Model quality benchmark",
         "",
@@ -178,6 +211,7 @@ def _render_benchmark(
         "",
         f"- source_commit: `{_required_text(report, 'source_commit')}`",
         f"- source_tree: `{_required_text(report, 'source_tree')}`",
+        "- source_unchanged: `true`",
         "- dirty: `false`",
         f"- suite_id: `{_required_text(report, 'suite_id')}`",
         f"- suite_revision: `{_required_text(report, 'suite_revision')}`",
@@ -185,17 +219,34 @@ def _render_benchmark(
         f"- measured_at: `{_required_text(report, 'measured_at')}`",
         f"- Redacted raw report: [{Path(raw_report_reference).name}]({raw_report_reference})",
         "",
+        "## Environment",
+        "",
+        "| Field | Value |",
+        "| --- | --- |",
+        *(
+            f"| `{field}` | `{_cell(_required_text(runtime_platform, field))}` |"
+            for field in (
+                "os",
+                "os_release",
+                "architecture",
+                "python_version",
+                "python_implementation",
+            )
+        ),
+        "",
         "## Model results",
         "",
     ]
     for raw_model in _sequence(report.get("models"), label="models"):
         model = _mapping(raw_model, label="model result")
         model_alias = _required_text(model, "model_alias")
+        run = runs[model_alias]
         model_verdict = _boolean_verdict(model.get("passed"))
         lines.extend(
             [
                 f"### `{model_alias}`",
                 "",
+                f"- Provider: `{_required_text(run, 'provider')}`",
                 f"- Provider model: `{_required_text(model, 'provider_model')}`",
                 f"- Evaluator verdict: **{model_verdict}**",
                 "",
@@ -244,6 +295,38 @@ def _render_benchmark(
             f"`{_cell(case.capability)}` | **{case.verdict}** |"
         )
     lines.append("")
+    lines.extend(
+        [
+            "## Per-case usage",
+            "",
+            "| Model | Trial | Case | Tool calls | Model calls | Latency ms | Input tokens | Output tokens |",
+            "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for case in _iter_cases(report):
+        tool_calls = _sequence(
+            case.observation.get("tool_calls"),
+            label=f"{case.case_id} tool_calls",
+        )
+        lines.append(
+            "| "
+            f"`{_cell(case.model_alias)}` | `{case.trial}` | `{_cell(case.case_id)}` | "
+            f"`{len(tool_calls)}` | `{_scalar(case.observation.get('model_calls'))}` | "
+            f"`{_scalar(case.observation.get('latency_ms'))}` | "
+            f"`{_scalar(case.observation.get('input_tokens'))}` | "
+            f"`{_scalar(case.observation.get('output_tokens'))}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 30-task coding-agent protocol",
+            "",
+            "- Manifest: `evals/code_agent/benchmark_v1.json`",
+            "- Manifest status: **validated only**",
+            "- The 30-task protocol was not run as this release gate and has no current score here.",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -348,6 +431,17 @@ def _render_approval_record(
         lines.extend(
             [
                 "",
+                "### Runtime observation",
+                "",
+                f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
+                "- Verification — workspace assertions passed: "
+                f"`{_scalar(observation.get('workspace_assertions_passed'))}`",
+                f"- Tool calls: `{len(raw_calls)}`",
+                f"- Model calls: `{_scalar(observation.get('model_calls'))}`",
+                f"- Latency ms: `{_scalar(observation.get('latency_ms'))}`",
+                f"- Input tokens: `{_scalar(observation.get('input_tokens'))}`",
+                f"- Output tokens: `{_scalar(observation.get('output_tokens'))}`",
+                "",
                 "### Approval and resume",
                 "",
                 f"- Approval pause observed: `{_scalar(observation.get('approval_pause_observed'))}`",
@@ -424,7 +518,8 @@ def _render_approval_record(
                     [
                         "### Fixture workspace assertion contract",
                         "",
-                        "This is the fixture's expected before/after contract, not a captured filesystem diff.",
+                        "This is the validated fixture before/after assertion contract, "
+                        "not a captured filesystem diff.",
                         "",
                         "```diff",
                         *_workspace_diff(before, after),
@@ -487,7 +582,8 @@ def _render_approval_record(
             [
                 "### Fixture workspace assertion contract",
                 "",
-                "This is the fixture's expected before/after contract, not a captured filesystem diff.",
+                "This is the validated fixture before/after assertion contract, "
+                "not a captured filesystem diff.",
                 "",
                 "```diff",
                 *_workspace_diff(before, after),
@@ -617,6 +713,29 @@ def _validate_run_cases(
             score = _mapping(case.get("score"), label=f"{alias} case score")
             case_id = _required_text(observation, "case_id")
             capability = _required_text(observation, "capability")
+            _sequence(
+                observation.get("tool_calls"),
+                label=f"{alias}.{case_id} tool_calls",
+            )
+            for field in (
+                "model_calls",
+                "input_tokens",
+                "output_tokens",
+                "tool_schema_bytes",
+            ):
+                _nonnegative_integer(
+                    observation.get(field),
+                    label=f"{alias}.{case_id}.{field}",
+                )
+            _nonnegative_number(
+                observation.get("latency_ms"),
+                label=f"{alias}.{case_id}.latency_ms",
+            )
+            if not isinstance(observation.get("workspace_assertions_passed"), bool):
+                raise ValueError(
+                    "model quality report "
+                    f"{alias}.{case_id}.workspace_assertions_passed must be boolean"
+                )
             metadata = metadata_by_id.get(case_id)
             if (
                 metadata is None
@@ -797,6 +916,19 @@ def _integer(value: object, *, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"model quality report {label} must be an integer")
     return value
+
+
+def _nonnegative_integer(value: object, *, label: str) -> int:
+    result = _integer(value, label=label)
+    if result < 0:
+        raise ValueError(f"model quality report {label} must be non-negative")
+    return result
+
+
+def _nonnegative_number(value: object, *, label: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"model quality report {label} must be a non-negative number")
+    return float(value)
 
 
 def _parser() -> argparse.ArgumentParser:
