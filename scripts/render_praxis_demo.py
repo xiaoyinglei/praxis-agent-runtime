@@ -1,12 +1,16 @@
 #!/usr/bin/env python
-"""Render the public deterministic Praxis delivery case as a labelled GIF."""
+"""Render the public deterministic Praxis delivery case as a labelled GIF.
+
+The visible content and frame sequence are deterministic. Encoded GIF bytes are
+repeatable in the same Pillow and selected-font environment; font fallbacks mean
+cross-platform binary identity is intentionally not promised.
+"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import importlib.util
-import re
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -22,12 +26,11 @@ TERMINAL_COMMAND = (
     "--fake-model --case praxis_demo"
 )
 FRAME_SIZE = (960, 540)
+BODY_FONT_SIZE = 17
+TERMINAL_TEXT_LEFT = 50
+TERMINAL_TEXT_RIGHT = 912
 MAX_VISIBLE_TRACE_LINES = 12
 _MINIMUM_FRAME_COUNT = 5
-_ABSOLUTE_LOCAL_PATH = re.compile(
-    r"(?<![\w.])/(?:Users|private|home|tmp)(?:/[^\s,'\"<>]*)?",
-    re.IGNORECASE,
-)
 _SENSITIVE_TRACE_TOKENS = (
     "api_key",
     "authorization:",
@@ -149,7 +152,7 @@ def _render_frame(lines: Sequence[str]) -> Image.Image:
     draw = ImageDraw.Draw(image)
     title_font = _load_monospace_font(25)
     label_font = _load_monospace_font(15)
-    body_font = _load_monospace_font(17)
+    body_font = _load_monospace_font(BODY_FONT_SIZE)
 
     draw.text((42, 28), lines[0], font=title_font, fill="#f5f7ff")
     label_box = draw.textbbox((0, 0), lines[1], font=label_font)
@@ -183,18 +186,55 @@ def _render_frame(lines: Sequence[str]) -> Image.Image:
         fill="#8291a7",
     )
     draw.line((48, 160, 912, 160), fill="#26354b", width=1)
-    draw.text((50, 174), lines[2], font=body_font, fill="#8bd5ff")
+    draw.text(
+        (TERMINAL_TEXT_LEFT, 174),
+        _fit_terminal_line(lines[2], font=body_font),
+        font=body_font,
+        fill="#8bd5ff",
+    )
 
     y = 209
     for line in lines[3:]:
         draw.text(
-            (50, y),
-            line,
+            (TERMINAL_TEXT_LEFT, y),
+            _fit_terminal_line(line, font=body_font),
             font=body_font,
             fill=_trace_color(line),
         )
         y += 23
     return image
+
+
+def _fit_terminal_line(
+    value: str,
+    *,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> str:
+    """Fit one terminal line to the viewport using the loaded font's pixels."""
+
+    draw = ImageDraw.Draw(Image.new("L", (1, 1)))
+
+    def fits(candidate: str) -> bool:
+        bbox = draw.textbbox(
+            (TERMINAL_TEXT_LEFT, 0),
+            candidate,
+            font=font,
+        )
+        return bbox[2] <= TERMINAL_TEXT_RIGHT
+
+    if fits(value):
+        return value
+
+    ellipsis = "..."
+    low = 0
+    high = len(value)
+    while low < high:
+        midpoint = (low + high + 1) // 2
+        if fits(f"{value[:midpoint]}{ellipsis}"):
+            low = midpoint
+        else:
+            high = midpoint - 1
+    return f"{value[:low]}{ellipsis}"
 
 
 def _trace_color(line: str) -> str:
@@ -240,7 +280,8 @@ def _validate_trace_line(value: str) -> str:
     line = " ".join(str(value).split())
     if not line:
         raise ValueError("demo trace contains an empty line")
-    if _ABSOLUTE_LOCAL_PATH.search(line):
+    smoke = _load_delivery_smoke()
+    if smoke._contains_demo_absolute_path(line):
         raise ValueError("demo trace contains an absolute local path")
     lowered = line.casefold()
     if any(token in lowered for token in _SENSITIVE_TRACE_TOKENS):

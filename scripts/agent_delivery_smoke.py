@@ -784,19 +784,34 @@ def _demo_event_subject(tool_name: str, preview: str) -> str:
     return _sanitize_demo_fragment(match.group(1) if match else "")
 
 
-_ABSOLUTE_LOCAL_PATH_PATTERN = re.compile(
-    r"(?<![\w.])/(?:[^\s,'\"<>]+)"
+_DEMO_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"""(?ix)
+    (?:
+        (?<![A-Za-z0-9_.:/\\])/(?!/)[^\s,'"<>]+
+        |
+        (?<![A-Za-z0-9_])[A-Z]:[\\/][^\s,'"<>]+
+        |
+        (?<![A-Za-z0-9_\\])\\\\[^\\/\s,'"<>]+\\[^\s,'"<>]+
+    )
+    """
 )
+
+
+def _contains_demo_absolute_path(value: str) -> bool:
+    """Recognize POSIX, Windows drive, and UNC absolute paths in trace text."""
+
+    return _DEMO_ABSOLUTE_PATH_PATTERN.search(value) is not None
+
+
+def _redact_demo_absolute_paths(value: str) -> str:
+    return _DEMO_ABSOLUTE_PATH_PATTERN.sub("[absolute-path]", value)
 
 
 def _sanitize_demo_fragment(value: object) -> str:
     from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 
     redacted = redact_sensitive_text(value)
-    redacted = _ABSOLUTE_LOCAL_PATH_PATTERN.sub(
-        "[absolute-path]",
-        redacted,
-    )
+    redacted = _redact_demo_absolute_paths(redacted)
     return " ".join(redacted.split())[:240]
 
 
@@ -804,10 +819,7 @@ def _sanitize_demo_diff(value: str) -> str:
     from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 
     redacted = redact_sensitive_text(value)
-    return _ABSOLUTE_LOCAL_PATH_PATTERN.sub(
-        "[absolute-path]",
-        redacted,
-    )[:2000]
+    return _redact_demo_absolute_paths(redacted)[:2000]
 
 
 async def run_case(
@@ -1186,11 +1198,7 @@ async def run_matrix(
         case
         for case in build_cases()
         if (only is None or case.name in only)
-        and (
-            fake_model
-            or not case.public_agent
-            or only is not None
-        )
+        and (not case.public_agent or only is not None)
     ]
     return [await run_case(case, model=model, fake_model=fake_model) for case in cases]
 
