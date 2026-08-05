@@ -53,17 +53,96 @@ def _validate_report(report: Mapping[str, object]) -> None:
     _required_text(report, "suite_id")
     _required_text(report, "suite_revision")
     _required_text(report, "evaluator_version")
-    _verdict(report)
-    _sequence(report.get("models"), label="models")
-    _sequence(report.get("runs"), label="runs")
+    status = _required_text(report, "status")
+    expected_passed = {
+        "passed": True,
+        "failed": False,
+        "inconclusive": None,
+    }
+    if status not in expected_passed:
+        raise ValueError(
+            "model quality report status must be passed, failed, or inconclusive"
+        )
+    if report.get("passed") is not expected_passed[status]:
+        raise ValueError("model quality report status and passed are inconsistent")
+    raw_models = _sequence(report.get("models"), label="models")
+    raw_runs = _sequence(report.get("runs"), label="runs")
+    if not raw_models or not raw_runs:
+        raise ValueError("model quality report models and runs must be non-empty")
+    models = _items_by_alias(raw_models, label="model result")
+    runs = _items_by_alias(raw_runs, label="model run")
+    if set(models) != set(runs):
+        raise ValueError("model quality report model and run aliases are inconsistent")
     metadata = _sequence(report.get("case_metadata"), label="case_metadata")
+    metadata_by_id: dict[str, Mapping[str, object]] = {}
+    for raw_item in metadata:
+        item = _mapping(raw_item, label="case metadata")
+        case_id = _required_text(item, "case_id")
+        _required_text(item, "capability")
+        if case_id in metadata_by_id:
+            raise ValueError(f"model quality report duplicate case metadata id: {case_id}")
+        metadata_by_id[case_id] = item
     approval_cases = [
-        _mapping(item, label="case metadata")
-        for item in metadata
-        if _mapping(item, label="case metadata").get("capability") == "approval_continuation"
+        item
+        for item in metadata_by_id.values()
+        if item.get("capability") == "approval_continuation"
     ]
     if not approval_cases:
         raise ValueError("model quality report has no approval-continuation metadata")
+    has_inconclusive = False
+    model_passes: list[bool] = []
+    for alias, model in models.items():
+        run = runs[alias]
+        run_status = run.get("status")
+        model_passed = model.get("passed")
+        model_infrastructure = model.get("infrastructure_failure")
+        run_infrastructure = run.get("infrastructure_failure")
+        if run_status == "completed":
+            if (
+                not isinstance(model_passed, bool)
+                or isinstance(model_infrastructure, Mapping)
+                or isinstance(run_infrastructure, Mapping)
+                or model.get("status") == "inconclusive"
+            ):
+                raise ValueError(
+                    f"model quality report completed result for {alias} is inconsistent"
+                )
+            _validate_run_cases(
+                run,
+                alias=alias,
+                run_status=run_status,
+                metadata_by_id=metadata_by_id,
+            )
+            model_passes.append(model_passed)
+        elif run_status == "inconclusive":
+            if (
+                model_passed is not None
+                or model.get("status") != "inconclusive"
+                or not isinstance(model_infrastructure, Mapping)
+                or not isinstance(run_infrastructure, Mapping)
+                or model_infrastructure != run_infrastructure
+            ):
+                raise ValueError(
+                    f"model quality report inconclusive result for {alias} is inconsistent"
+                )
+            _validate_run_cases(
+                run,
+                alias=alias,
+                run_status=run_status,
+                metadata_by_id=metadata_by_id,
+            )
+            has_inconclusive = True
+        else:
+            raise ValueError(
+                f"model quality report run status for {alias} is inconsistent"
+            )
+    derived_status = (
+        "inconclusive"
+        if has_inconclusive
+        else ("passed" if all(model_passes) else "failed")
+    )
+    if status != derived_status:
+        raise ValueError("model quality report overall verdict is inconsistent")
 
 
 def _render_benchmark(
@@ -248,16 +327,133 @@ def _render_approval_record(
             arguments = _mapping(call.get("arguments"), label="tool arguments")
             error = " error" if call.get("is_error") is True else ""
             lines.append(f"{index}. `{tool_name}`{error}: `{_safe_json(arguments)}`")
-        if not _approval_evidence_reached(observation):
+        lines.extend(
+            [
+                "",
+                "### Approval and resume",
+                "",
+                f"- Approval pause observed: `{_scalar(observation.get('approval_pause_observed'))}`",
+                f"- Approval kind: `{_scalar(observation.get('approval_kind'))}`",
+                f"- Approval resumes: `{_scalar(observation.get('approval_resumes'))}`",
+                "",
+            ]
+        )
+        approval_pause_observed = (
+            observation.get("approval_pause_observed") is True
+            and observation.get("approval_kind") == "tool_approval"
+        )
+        resumes = observation.get("approval_resumes")
+        approval_resumed = (
+            isinstance(resumes, int)
+            and not isinstance(resumes, bool)
+            and resumes >= 1
+        )
+        infrastructure_failure = observation.get("infrastructure_failure") is True
+        if not approval_pause_observed:
             lines.extend(
                 [
-                    "",
                     "### Approval evidence",
                     "",
-                    "Approval case was reached, but approval evidence was not reached.",
+                    "Approval was not reached.",
                     "",
-                    "No approval/resume, workspace diff assertion, or final answer evidence was reported.",
+                    "No workspace diff assertion or final answer evidence was reported.",
                     "",
+                    f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
+                    "- Diagnostic error types: "
+                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    "",
+                    "### Evaluator verdict",
+                    "",
+                    f"Evaluator verdict: **{case.verdict}**",
+                    "",
+                ]
+            )
+            continue
+        if not approval_resumed:
+            lines.extend(
+                [
+                    "### Approval evidence",
+                    "",
+                    "Approval pause was observed, but approval resume was not observed.",
+                    "",
+                    "No workspace diff assertion or final answer evidence was reported.",
+                    "",
+                    f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
+                    "- Diagnostic error types: "
+                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    "",
+                    "### Evaluator verdict",
+                    "",
+                    f"Evaluator verdict: **{case.verdict}**",
+                    "",
+                ]
+            )
+            continue
+        if infrastructure_failure:
+            lines.extend(
+                [
+                    "### Approval evidence",
+                    "",
+                    "Approval pause and resume were observed before infrastructure failure.",
+                    "",
+                ]
+            )
+            workspace_assertions_passed = observation.get(
+                "workspace_assertions_passed"
+            )
+            if workspace_assertions_passed is True:
+                lines.extend(
+                    [
+                        "### Fixture workspace assertion contract",
+                        "",
+                        "This is the fixture's expected before/after contract, not a captured filesystem diff.",
+                        "",
+                        "```diff",
+                        *_workspace_diff(before, after),
+                        "```",
+                        "",
+                        "Workspace assertions passed: `true`",
+                        "",
+                    ]
+                )
+            elif workspace_assertions_passed is False:
+                lines.extend(
+                    [
+                        "### Workspace assertion evidence",
+                        "",
+                        "Workspace assertions passed: `false`",
+                        "",
+                        "The fixture assertion contract was not satisfied, so its "
+                        "expected diff is not shown as observed evidence.",
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "Workspace assertion evidence was not reported.",
+                        "",
+                    ]
+                )
+            answer = observation.get("answer")
+            if isinstance(answer, str) and answer:
+                lines.extend(
+                    [
+                        "### Observed answer before infrastructure failure",
+                        "",
+                        _safe_text(answer),
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "No answer was reported before infrastructure failure.",
+                        "",
+                    ]
+                )
+            lines.extend(
+                [
                     f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
                     "- Diagnostic error types: "
                     f"`{_scalar(observation.get('diagnostic_error_types'))}`",
@@ -271,14 +467,9 @@ def _render_approval_record(
             continue
         lines.extend(
             [
+                "### Fixture workspace assertion contract",
                 "",
-                "### Approval and resume",
-                "",
-                f"- Approval pause observed: `{_scalar(observation.get('approval_pause_observed'))}`",
-                f"- Approval kind: `{_scalar(observation.get('approval_kind'))}`",
-                f"- Approval resumes: `{_scalar(observation.get('approval_resumes'))}`",
-                "",
-                "### Workspace diff assertion",
+                "This is the fixture's expected before/after contract, not a captured filesystem diff.",
                 "",
                 "```diff",
                 *_workspace_diff(before, after),
@@ -300,18 +491,6 @@ def _render_approval_record(
             ]
         )
     return "\n".join(lines)
-
-
-def _approval_evidence_reached(observation: Mapping[str, object]) -> bool:
-    resumes = observation.get("approval_resumes")
-    return (
-        observation.get("infrastructure_failure") is not True
-        and observation.get("approval_pause_observed") is True
-        and observation.get("approval_kind") == "tool_approval"
-        and isinstance(resumes, int)
-        and not isinstance(resumes, bool)
-        and resumes >= 1
-    )
 
 
 def _report_infrastructure_failure(
@@ -383,6 +562,76 @@ def _approval_metadata(report: Mapping[str, object]) -> Mapping[str, object]:
         if item.get("capability") == "approval_continuation":
             return item
     raise ValueError("model quality report has no approval-continuation metadata")
+
+
+def _items_by_alias(
+    items: Sequence[object],
+    *,
+    label: str,
+) -> dict[str, Mapping[str, object]]:
+    result: dict[str, Mapping[str, object]] = {}
+    for raw_item in items:
+        item = _mapping(raw_item, label=label)
+        alias = _required_text(item, "model_alias")
+        if alias in result:
+            raise ValueError(f"model quality report duplicate {label} alias: {alias}")
+        result[alias] = item
+    return result
+
+
+def _validate_run_cases(
+    run: Mapping[str, object],
+    *,
+    alias: str,
+    run_status: str,
+    metadata_by_id: Mapping[str, Mapping[str, object]],
+) -> None:
+    trials = _sequence(run.get("trials"), label=f"{alias} trials")
+    infrastructure_observed = False
+    for raw_trial in trials:
+        trial = _mapping(raw_trial, label=f"{alias} trial")
+        for raw_case in _sequence(trial.get("cases"), label=f"{alias} trial cases"):
+            case = _mapping(raw_case, label=f"{alias} case")
+            observation = _mapping(
+                case.get("observation"),
+                label=f"{alias} case observation",
+            )
+            score = _mapping(case.get("score"), label=f"{alias} case score")
+            case_id = _required_text(observation, "case_id")
+            capability = _required_text(observation, "capability")
+            metadata = metadata_by_id.get(case_id)
+            if (
+                metadata is None
+                or metadata.get("capability") != capability
+                or score.get("case_id") != case_id
+                or score.get("capability") != capability
+            ):
+                raise ValueError(
+                    f"model quality report case evidence for {alias}.{case_id} is inconsistent"
+                )
+            observation_infrastructure = (
+                observation.get("infrastructure_failure") is True
+            )
+            score_passed = score.get("passed")
+            if run_status == "completed":
+                if observation_infrastructure or not isinstance(score_passed, bool):
+                    raise ValueError(
+                        f"model quality report completed case for {alias}.{case_id} is inconsistent"
+                    )
+            elif observation_infrastructure:
+                if score_passed is not None:
+                    raise ValueError(
+                        f"model quality report infrastructure case for {alias}.{case_id} is inconsistent"
+                    )
+                infrastructure_observed = True
+            elif not isinstance(score_passed, bool):
+                raise ValueError(
+                    f"model quality report non-infrastructure case for {alias}.{case_id} is inconsistent"
+                )
+    if run_status == "inconclusive" and trials and not infrastructure_observed:
+        raise ValueError(
+            f"model quality report inconclusive run for {alias} has inconsistent case evidence"
+        )
 
 
 def _workspace_diff(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:

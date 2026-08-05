@@ -61,7 +61,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "infrastructure_failure": False,
         "error": "",
     }
-    inconclusive_observation = {
+    failed_observation = {
         "case_id": "provider_down",
         "capability": "failure_recovery",
         "status": "failed",
@@ -71,9 +71,9 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "approval_kind": None,
         "approval_resumes": 0,
         "workspace_assertions_passed": False,
-        "infrastructure_failure": True,
-        "stop_reason": "model_provider_failed",
-        "diagnostic_error_types": ["RateLimitError"],
+        "infrastructure_failure": False,
+        "stop_reason": "max_turns",
+        "diagnostic_error_types": [],
         "error": "",
     }
     return {
@@ -127,6 +127,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "runs": [
             {
                 "model_alias": "groq_gpt_oss_120b",
+                "status": "completed",
                 "provider": "groq",
                 "provider_model": "openai/gpt-oss-120b",
                 "trial_count": 1,
@@ -147,7 +148,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
                                 },
                             },
                             {
-                                "observation": inconclusive_observation,
+                                "observation": failed_observation,
                                 "score": {
                                     "case_id": "provider_down",
                                     "capability": "failure_recovery",
@@ -195,7 +196,7 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "0.8" in benchmark
     assert "task_success_rate: observed 0.8 < baseline floor 1.0" in benchmark
     assert "provider_down" in benchmark
-    assert "INCONCLUSIVE" in benchmark
+    assert "INCONCLUSIVE" not in benchmark
     assert "accuracy" not in benchmark
 
     assert "Change before_gate to after_gate." in run_record
@@ -228,6 +229,14 @@ def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_su
     model["observed"] = {}
     model["thresholds"] = {}
     model["failures"] = []
+    infrastructure_failure = {
+        "case_id": "approval_continue",
+        "stop_reason": "model_provider_failed",
+        "diagnostic_error_types": ["RateLimitError"],
+    }
+    model["infrastructure_failure"] = infrastructure_failure
+    payload["runs"][0]["status"] = "inconclusive"
+    payload["runs"][0]["infrastructure_failure"] = infrastructure_failure
     trial = payload["runs"][0]["trials"][0]
     approval_case = trial["cases"][0]
     observation = approval_case["observation"]
@@ -272,14 +281,259 @@ def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_su
 
     run_record = run_record_path.read_text(encoding="utf-8")
     assert "read_file" in run_record
-    assert "Approval case was reached, but approval evidence was not reached." in run_record
+    assert "Approval was not reached." in run_record
+    assert "Approval pause observed: `false`" in run_record
+    assert "Approval kind: `null`" in run_record
+    assert "Approval resumes: `0`" in run_record
     assert "model_provider_failed" in run_record
     assert "RateLimitError" in run_record
     assert "Evaluator verdict: **INCONCLUSIVE**" in run_record
-    assert "Approval resumes:" not in run_record
     assert "-before_gate" not in run_record
     assert "+after_gate" not in run_record
     assert "UNTRUSTED_FINAL_SENTINEL" not in run_record
+
+
+def test_renderer_preserves_observed_approval_resume_before_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["status"] = "inconclusive"
+    payload["passed"] = None
+    model = payload["models"][0]
+    model["status"] = "inconclusive"
+    model["passed"] = None
+    model["observed"] = {}
+    model["thresholds"] = {}
+    model["failures"] = []
+    infrastructure_failure = {
+        "case_id": "approval_continue",
+        "stop_reason": "model_provider_failed",
+        "diagnostic_error_types": ["RateLimitError"],
+    }
+    model["infrastructure_failure"] = infrastructure_failure
+    run = payload["runs"][0]
+    run["status"] = "inconclusive"
+    run["infrastructure_failure"] = infrastructure_failure
+    trial = run["trials"][0]
+    approval_case = trial["cases"][0]
+    observation = approval_case["observation"]
+    observation["status"] = "failed"
+    observation["answer"] = "UNTRUSTED_FINAL_SENTINEL"
+    observation["approval_pause_observed"] = True
+    observation["approval_kind"] = "tool_approval"
+    observation["approval_resumes"] = 1
+    observation["workspace_assertions_passed"] = False
+    observation["infrastructure_failure"] = True
+    observation["stop_reason"] = "model_provider_failed"
+    observation["diagnostic_error_types"] = ["RateLimitError"]
+    approval_case["score"] = {
+        "case_id": "approval_continue",
+        "capability": "approval_continuation",
+        "passed": None,
+        "core_success": None,
+        "capability_passed": None,
+        "inconclusive": True,
+    }
+    trial["cases"] = [approval_case]
+    report_path = tmp_path / "resumed-then-infrastructure-report.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+
+    module.render_model_quality_report(
+        report_path,
+        benchmark_path=benchmark_path,
+        run_record_path=run_record_path,
+    )
+
+    run_record = run_record_path.read_text(encoding="utf-8")
+    assert "Approval pause observed: `true`" in run_record
+    assert "Approval kind: `\"tool_approval\"`" in run_record
+    assert "Approval resumes: `1`" in run_record
+    assert "Approval pause and resume were observed before infrastructure failure." in run_record
+    assert "model_provider_failed" in run_record
+    assert "RateLimitError" in run_record
+    assert "Evaluator verdict: **INCONCLUSIVE**" in run_record
+    assert "-before_gate" not in run_record
+    assert "+after_gate" not in run_record
+    assert "Workspace assertions passed: `false`" in run_record
+    assert "### Observed answer before infrastructure failure" in run_record
+    assert "UNTRUSTED_FINAL_SENTINEL" in run_record
+    assert "### Final answer" not in run_record
+
+
+def test_renderer_shows_completed_evidence_stages_before_infrastructure_failure(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["status"] = "inconclusive"
+    payload["passed"] = None
+    infrastructure_failure = {
+        "case_id": "approval_continue",
+        "stop_reason": "model_provider_failed",
+        "diagnostic_error_types": ["RateLimitError"],
+    }
+    model = payload["models"][0]
+    model.update(
+        {
+            "status": "inconclusive",
+            "passed": None,
+            "observed": {},
+            "thresholds": {},
+            "failures": [],
+            "infrastructure_failure": infrastructure_failure,
+        }
+    )
+    run = payload["runs"][0]
+    run["status"] = "inconclusive"
+    run["infrastructure_failure"] = infrastructure_failure
+    trial = run["trials"][0]
+    approval_case = trial["cases"][0]
+    observation = approval_case["observation"]
+    observation.update(
+        {
+            "status": "failed",
+            "answer": "ACTUAL_ANSWER_BEFORE_PROVIDER_FAILURE",
+            "approval_pause_observed": True,
+            "approval_kind": "tool_approval",
+            "approval_resumes": 1,
+            "workspace_assertions_passed": True,
+            "infrastructure_failure": True,
+            "stop_reason": "model_provider_failed",
+            "diagnostic_error_types": ["RateLimitError"],
+        }
+    )
+    approval_case["score"] = {
+        "case_id": "approval_continue",
+        "capability": "approval_continuation",
+        "passed": None,
+        "core_success": None,
+        "capability_passed": None,
+        "inconclusive": True,
+    }
+    trial["cases"] = [approval_case]
+    report_path = tmp_path / "completed-stages-before-infrastructure.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+
+    module.render_model_quality_report(
+        report_path,
+        benchmark_path=benchmark_path,
+        run_record_path=run_record_path,
+    )
+
+    run_record = run_record_path.read_text(encoding="utf-8")
+    assert "Approval pause and resume were observed before infrastructure failure." in run_record
+    assert "### Fixture workspace assertion contract" in run_record
+    assert "-before_gate" in run_record
+    assert "+after_gate" in run_record
+    assert "Workspace assertions passed: `true`" in run_record
+    assert "### Observed answer before infrastructure failure" in run_record
+    assert "ACTUAL_ANSWER_BEFORE_PROVIDER_FAILURE" in run_record
+    assert "### Final answer" not in run_record
+
+
+@pytest.mark.parametrize(
+    "inconsistency",
+    ["passed_false", "passed_inconclusive", "alias_mismatch"],
+)
+def test_renderer_rejects_internally_inconsistent_reports_before_writing(
+    tmp_path: Path,
+    inconsistency: str,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    if inconsistency == "passed_false":
+        payload["status"] = "passed"
+    elif inconsistency == "passed_inconclusive":
+        payload["status"] = "passed"
+        payload["passed"] = True
+        infrastructure_failure = {
+            "case_id": "approval_continue",
+            "stop_reason": "model_provider_failed",
+            "diagnostic_error_types": ["RateLimitError"],
+        }
+        model = payload["models"][0]
+        model["status"] = "inconclusive"
+        model["passed"] = None
+        model["infrastructure_failure"] = infrastructure_failure
+        run = payload["runs"][0]
+        run["status"] = "inconclusive"
+        run["infrastructure_failure"] = infrastructure_failure
+    else:
+        payload["runs"][0]["model_alias"] = "different_alias"
+    report_path = tmp_path / "inconsistent.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+
+    with pytest.raises(ValueError, match="inconsistent"):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
+
+
+@pytest.mark.parametrize(
+    "inconsistency",
+    [
+        "duplicate_metadata",
+        "score_case_mismatch",
+        "completed_infrastructure_case",
+        "inconclusive_without_infrastructure_case",
+    ],
+)
+def test_renderer_rejects_internally_inconsistent_case_evidence_before_writing(
+    tmp_path: Path,
+    inconsistency: str,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    trial = payload["runs"][0]["trials"][0]
+    first_case = trial["cases"][0]
+    if inconsistency == "duplicate_metadata":
+        payload["case_metadata"].append(dict(payload["case_metadata"][0]))
+    elif inconsistency == "score_case_mismatch":
+        first_case["score"]["case_id"] = "different_case"
+    elif inconsistency == "completed_infrastructure_case":
+        first_case["observation"]["infrastructure_failure"] = True
+        first_case["score"]["passed"] = None
+    else:
+        payload["status"] = "inconclusive"
+        payload["passed"] = None
+        infrastructure_failure = {
+            "case_id": "approval_continue",
+            "stop_reason": "model_provider_failed",
+            "diagnostic_error_types": ["RateLimitError"],
+        }
+        model = payload["models"][0]
+        model["status"] = "inconclusive"
+        model["passed"] = None
+        model["infrastructure_failure"] = infrastructure_failure
+        run = payload["runs"][0]
+        run["status"] = "inconclusive"
+        run["infrastructure_failure"] = infrastructure_failure
+    report_path = tmp_path / "inconsistent-case.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+    benchmark_path = tmp_path / "benchmark.md"
+    run_record_path = tmp_path / "run.md"
+
+    with pytest.raises(ValueError, match="inconsistent|duplicate"):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=benchmark_path,
+            run_record_path=run_record_path,
+        )
+
+    assert not benchmark_path.exists()
+    assert not run_record_path.exists()
 
 
 @pytest.mark.parametrize("dirty", [True, None, "false"])

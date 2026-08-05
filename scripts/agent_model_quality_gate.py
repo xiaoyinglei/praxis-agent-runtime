@@ -39,21 +39,32 @@ MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
 EVALUATOR_VERSION = "agent_model_quality_gate_v1"
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
-_SENSITIVE_ARTIFACT_KEYS = frozenset(
+_SENSITIVE_ARTIFACT_KEY_TOKENS = frozenset(
     {
-        "api_key",
         "apikey",
+        "auth",
         "authorization",
+        "cookie",
         "credential",
         "credentials",
         "env",
         "environment",
         "header",
         "headers",
+        "key",
         "password",
         "secret",
         "token",
     }
+)
+_SENSITIVE_ENV_NAME_MARKERS = (
+    "AUTH",
+    "COOKIE",
+    "CREDENTIAL",
+    "KEY",
+    "PASSWORD",
+    "SECRET",
+    "TOKEN",
 )
 _MODEL_QUALITY_FAILURE_REASONS = frozenset(
     {
@@ -97,6 +108,10 @@ class DirtyRepositoryError(RuntimeError):
 
 class SourceRepositoryMismatchError(RuntimeError):
     """The requested evidence repository is not the running source tree."""
+
+
+class SourceRepositoryChangedError(RuntimeError):
+    """The evidence source changed while live model trials were running."""
 
 
 @dataclass(frozen=True)
@@ -626,6 +641,7 @@ async def _calibrate(args: argparse.Namespace) -> int:
     models = _selected_models(suite, None)
     cases = cast(list[Mapping[str, object]], suite["cases"])
     reports: list[dict[str, object]] = []
+    infrastructure_failure: Mapping[str, object] | None = None
     for model in models:
         report = await run_model_trials(
             model_alias=model,
@@ -633,9 +649,15 @@ async def _calibrate(args: argparse.Namespace) -> int:
             trials=args.trials,
             env_file=args.env_file,
         )
-        if report.get("status") == "inconclusive":
-            raise InfrastructureUnavailableError(_infrastructure_message(report))
         reports.append(report)
+        if report.get("status") == "inconclusive":
+            infrastructure_failure = report
+            break
+    _verify_source_repository_unchanged(args.repository, fingerprint)
+    if infrastructure_failure is not None:
+        raise InfrastructureUnavailableError(
+            _infrastructure_message(infrastructure_failure)
+        )
     baseline = build_baseline(
         suite=suite,
         model_reports=reports,
@@ -701,6 +723,7 @@ async def _gate(args: argparse.Namespace) -> int:
                 baseline=raw_model_baseline,
             )
         )
+    _verify_source_repository_unchanged(args.repository, fingerprint)
     passed = None if inconclusive else all(bool(item["passed"]) for item in results)
     status = "inconclusive" if inconclusive else ("passed" if passed else "failed")
     gate_report = {
@@ -1249,7 +1272,7 @@ def _safe_error(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"[:2000]
     for name, value in os.environ.items():
         upper = name.upper()
-        if not any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        if not any(marker in upper for marker in _SENSITIVE_ENV_NAME_MARKERS):
             continue
         if len(value) >= 8:
             text = text.replace(value, "[REDACTED]")
@@ -1281,6 +1304,21 @@ def source_repository_fingerprint(repository: Path) -> RepositoryFingerprint:
             "model quality evidence repository must be the running source tree"
         )
     return repository_fingerprint(source_root)
+
+
+def _verify_source_repository_unchanged(
+    repository: Path,
+    initial: RepositoryFingerprint,
+) -> None:
+    current = source_repository_fingerprint(repository)
+    if (
+        current.dirty
+        or current.source_commit != initial.source_commit
+        or current.source_tree != initial.source_tree
+    ):
+        raise SourceRepositoryChangedError(
+            "model quality evidence source changed while trials were running"
+        )
 
 
 def repository_fingerprint(repository: Path) -> RepositoryFingerprint:
@@ -1364,8 +1402,7 @@ def _sanitize_artifact_value(
         sanitized: dict[str, object] = {}
         for raw_key, item in value.items():
             key = str(raw_key)
-            normalized = key.casefold().replace("-", "_")
-            if normalized in _SENSITIVE_ARTIFACT_KEYS:
+            if _is_sensitive_artifact_key(key):
                 continue
             sanitized[key] = _sanitize_artifact_value(item, secrets=secrets)
         return sanitized
@@ -1382,11 +1419,22 @@ def _sanitize_artifact_value(
     return value
 
 
+def _is_sensitive_artifact_key(key: str) -> bool:
+    camel_split = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", camel_split)
+    tokens = {
+        token.casefold()
+        for token in re.split(r"[^A-Za-z0-9]+", normalized)
+        if token
+    }
+    return bool(tokens & _SENSITIVE_ARTIFACT_KEY_TOKENS)
+
+
 def _artifact_secret_values() -> tuple[str, ...]:
     values: list[str] = []
     for name, value in os.environ.items():
         upper = name.upper()
-        if not any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        if not any(marker in upper for marker in _SENSITIVE_ENV_NAME_MARKERS):
             continue
         if len(value) >= 8:
             values.append(value)

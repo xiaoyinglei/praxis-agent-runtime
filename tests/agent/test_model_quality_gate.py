@@ -227,11 +227,20 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     module = _load_gate_module()
     suite = _quality_suite()
     secret = "provider-secret-sentinel"
+    auth_secret = "provider-auth-sentinel"
+    cookie_secret = "provider-cookie-sentinel"
+    credential_secret = "provider-credential-sentinel"
     absolute_path = str(tmp_path / "private" / "approval.txt")
     monkeypatch.setenv("GROQ_API_KEY", secret)
+    monkeypatch.setenv("GROQ_SESSION_AUTH", auth_secret)
+    monkeypatch.setenv("GROQ_SESSION_COOKIE", cookie_secret)
+    monkeypatch.setenv("GROQ_CREDENTIAL", credential_secret)
     raw_case = suite["cases"][0]
     assert isinstance(raw_case, dict)
-    raw_case["task"] = f"Change before_gate to after_gate using {absolute_path}; token {secret}."
+    raw_case["task"] = (
+        f"Change before_gate to after_gate using {absolute_path} token {secret} "
+        f"auth {auth_secret} cookie {cookie_secret} credential {credential_secret}."
+    )
     raw_case["workspace_files"] = {
         "approval.txt": f"before_gate\n{secret}\n"
     }
@@ -269,6 +278,18 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                                     "arguments": {
                                         "file_path": absolute_path,
                                         "Authorization": f"Bearer {secret}",
+                                        "nested": [
+                                            {
+                                                "access_token": "access-token-value",
+                                                "client-secret": "client-secret-value",
+                                                "x_api_key": "x-api-key-value",
+                                                "privateKey": "private-key-value",
+                                                "cookie": "cookie-value",
+                                                "auth": "auth-value",
+                                                "apiKey": "api-key-value",
+                                                "monkey": "banana",
+                                            }
+                                        ],
                                     },
                                     "is_error": False,
                                     "error_code": None,
@@ -333,7 +354,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     payload = json.loads(report.read_text(encoding="utf-8"))
     serialized = json.dumps(payload)
     assert exit_code == 0
-    assert events == ["preflight", "model"]
+    assert events == ["preflight", "model", "preflight"]
     assert payload["source_commit"] == "a" * 40
     assert payload["source_tree"] == "b" * 40
     assert payload["dirty"] is False
@@ -345,7 +366,8 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
             "capability": "approval_continuation",
             "task": (
                 "Change before_gate to after_gate using "
-                "[REDACTED_ABSOLUTE_PATH] token [REDACTED]."
+                "[REDACTED_ABSOLUTE_PATH] token [REDACTED] auth [REDACTED] "
+                "cookie [REDACTED] credential [REDACTED]."
             ),
             "workspace_before": {
                 "input_files/approval.txt": "before_gate\n[REDACTED]\n"
@@ -357,7 +379,18 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     ]
     assert str(tmp_path) not in serialized
     assert secret not in serialized
+    assert auth_secret not in serialized
+    assert cookie_secret not in serialized
+    assert credential_secret not in serialized
     assert "Authorization" not in serialized
+    assert "access_token" not in serialized
+    assert "client-secret" not in serialized
+    assert "x_api_key" not in serialized
+    assert "privateKey" not in serialized
+    assert '"cookie"' not in serialized
+    assert '"auth"' not in serialized
+    assert "apiKey" not in serialized
+    assert '"monkey": "banana"' in serialized
     assert ".env" not in serialized
 
 
@@ -398,7 +431,109 @@ async def test_calibration_preflight_runs_before_model_calls(
     exit_code = await module._calibrate(args)
 
     assert exit_code == 0
-    assert events == ["preflight", "model"]
+    assert events == ["preflight", "model", "preflight"]
+
+
+@pytest.mark.parametrize("command", ["gate", "calibrate"])
+@pytest.mark.parametrize("repository_change", ["dirty", "changed_tree"])
+def test_cli_rechecks_source_after_model_trials_before_writing_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    repository_change: str,
+) -> None:
+    module = _load_gate_module()
+    suite = _quality_suite()
+    repository = tmp_path / "repository"
+    output_path = tmp_path / ("report.json" if command == "gate" else "baseline.json")
+    baseline_path = tmp_path / "input-baseline.json"
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "groq_gpt_oss_120b": {
+                        "trial_count": 1,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    initial = module.RepositoryFingerprint(
+        source_commit="a" * 40,
+        source_tree="b" * 40,
+        dirty=False,
+    )
+    events: list[str] = []
+
+    def preflight(actual_repository: Path) -> object:
+        assert actual_repository == repository
+        events.append("preflight")
+        if events.count("preflight") == 1:
+            return initial
+        if repository_change == "dirty":
+            raise module.DirtyRepositoryError("repository became dirty")
+        return module.RepositoryFingerprint(
+            source_commit="a" * 40,
+            source_tree="c" * 40,
+            dirty=False,
+        )
+
+    async def run_trials(**_kwargs: object) -> dict[str, object]:
+        events.append("model")
+        return _passing_model_report()
+
+    monkeypatch.setattr(module, "source_repository_fingerprint", preflight)
+    monkeypatch.setattr(module, "load_suite", lambda _path: suite)
+    monkeypatch.setattr(module, "run_model_trials", run_trials)
+    monkeypatch.setattr(module, "validate_baseline", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module,
+        "evaluate_model_gate",
+        lambda **_kwargs: {
+            "model_alias": "groq_gpt_oss_120b",
+            "provider_model": "openai/gpt-oss-120b",
+            "passed": True,
+            "observed": _trial_metrics(),
+            "thresholds": {},
+            "failures": [],
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "build_baseline",
+        lambda **_kwargs: pytest.fail("baseline must not be built after source drift"),
+    )
+    argv = [
+        str(SCRIPT_PATH),
+        command,
+        "--repository",
+        str(repository),
+        "--fixture",
+        str(tmp_path / "cases.json"),
+        "--env-file",
+        str(tmp_path / ".env"),
+    ]
+    if command == "gate":
+        argv.extend(
+            [
+                "--baseline",
+                str(baseline_path),
+                "--model",
+                "groq_gpt_oss_120b",
+                "--report",
+                str(output_path),
+            ]
+        )
+    else:
+        argv.extend(["--baseline", str(output_path), "--trials", "3"])
+    monkeypatch.setattr(sys, "argv", argv)
+
+    exit_code = module.main()
+
+    assert exit_code == 2
+    assert events == ["preflight", "model", "preflight"]
+    assert not output_path.exists()
 
 
 @pytest.mark.anyio
@@ -947,11 +1082,13 @@ async def test_gate_approval_infrastructure_report_renders_only_partial_evidence
     rendered = run_record.read_text(encoding="utf-8")
     assert exit_code == 2
     assert "read_file" in rendered
-    assert "Approval case was reached, but approval evidence was not reached." in rendered
+    assert "Approval was not reached." in rendered
+    assert "Approval pause observed: `false`" in rendered
+    assert "Approval kind: `null`" in rendered
+    assert "Approval resumes: `0`" in rendered
     assert "model_provider_failed" in rendered
     assert "RateLimitError" in rendered
     assert "Evaluator verdict: **INCONCLUSIVE**" in rendered
-    assert "Approval resumes:" not in rendered
     assert "-before_gate" not in rendered
     assert "+after_gate" not in rendered
     assert "UNTRUSTED_FINAL_SENTINEL" not in rendered
