@@ -162,7 +162,11 @@ class TestAgentRuntimePolicy:
         assert "read_file.start_line" in GENERIC_SYSTEM_PROMPT
         assert "first concrete edit" in GENERIC_SYSTEM_PROMPT
         assert "twelve inspection" in GENERIC_SYSTEM_PROMPT
-        normalized_prompt = " ".join(GENERIC_SYSTEM_PROMPT.split())
+        normalized_prompt = " ".join(GENERIC_SYSTEM_PROMPT.split()).casefold()
+        assert "reuse a successful read-only inspection result" in (
+            normalized_prompt
+        )
+        assert "never repeat an identical read-only call" in normalized_prompt
         assert "complete coherent change across every affected layer" in (
             normalized_prompt
         )

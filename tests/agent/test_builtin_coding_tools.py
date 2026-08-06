@@ -118,6 +118,15 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         )
 
 
+def test_read_file_aci_prevents_repeated_stable_inspection(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    read_file = _tools_by_name(workspace)["read_file"]
+    description = " ".join(read_file.definition.description.split()).casefold()
+
+    assert "reuse a successful identical read" in description
+    assert "without an intervening workspace change" in description
+
+
 def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:
     summary = b"short test summary: FAILED tests/test_api.py::test_contract\n"
     payload = b"collection started\n" + (b"x" * 60_000) + summary
