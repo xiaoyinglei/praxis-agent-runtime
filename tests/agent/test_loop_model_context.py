@@ -1528,6 +1528,16 @@ async def test_working_state_projects_post_change_file_inspection() -> None:
         "inspected_paths": [changed_path],
         "scope": "file_content",
         "semantic_target_satisfied": "not_evaluated",
+        "guidance": {
+            "literal_file_task": {
+                "action": "finish_if_existing_result_satisfies_task",
+                "maximum_additional_file_inspections": 0,
+                "next_response_tool_calls": 0,
+            },
+            "behavioral_code_task": (
+                "file_content_evidence_does_not_replace_pending_runtime_verification"
+            ),
+        },
     }
     assert evidence["completion_guidance"]["action"] == "finish"
     assert "runtime_workspace_file_changes" not in working_state.content
@@ -1579,9 +1589,15 @@ async def test_working_state_rejects_unrelated_and_stale_file_inspection() -> No
     first_evidence = json.loads(first_working_state.content)["payload"][
         "runtime_evidence"
     ]
-    assert first_evidence["post_change_file_inspection"]["observation"] == (
-        "pending"
-    )
+    pending_inspection = first_evidence["post_change_file_inspection"]
+    assert pending_inspection["observation"] == "pending"
+    assert pending_inspection["guidance"]["literal_file_task"] == {
+        "action": "choose_one_targeted_inspection_then_finish",
+        "choose_exactly_one_of": ["read_file", "search_text"],
+        "maximum_additional_file_inspections": 1,
+        "never_batch_alternatives": True,
+        "do_not_pair_positive_and_negative_searches": True,
+    }
     assert "completion_guidance" not in first_evidence
 
     state["tool_results"].append(

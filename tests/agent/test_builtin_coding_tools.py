@@ -127,8 +127,15 @@ def test_resident_tool_docs_distinguish_content_from_behavior(
     tools = _tools_by_name(open_workspace(tmp_path, create=True))
 
     assert "Reuse a sufficient result" in tools["read_file"].definition.description
-    assert "never reapply the patch" in tools["apply_patch"].definition.description
+    assert "never reapply the patch" in (
+        tools["apply_patch"].definition.description.casefold()
+    )
+    assert "instead of pre-reading" in tools["apply_patch"].definition.description
+    assert "never both" in tools["apply_patch"].definition.description
     assert "non-truncated" in tools["search_text"].definition.description
+    assert "never batch paired confirmations" in (
+        tools["search_text"].definition.description
+    )
     assert "verify code behavior" in tools["run_command"].definition.description
     assert "solely to reconfirm" in tools["run_command"].definition.description
 

@@ -133,7 +133,9 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 "current in-workspace file contents. A targeted post-write search can "
                 "confirm literal presence, or absence only when its exact-file scope is "
                 "reported and non-truncated. Reuse that result while the workspace is "
-                "unchanged."
+                "unchanged. For one literal edit, choose one positive or negative search "
+                "or one read_file call; never batch paired confirmations of the same "
+                "edit."
             ),
             input_schema=_SEARCH_INPUT_SCHEMA,
         ),

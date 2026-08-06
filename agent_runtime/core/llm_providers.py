@@ -829,19 +829,39 @@ def _post_change_file_inspection(
         for path in related_paths:
             inspected_paths.setdefault(path, None)
 
+    observation = "observed" if inspection_tool_call_ids else "pending"
+    if observation == "observed":
+        literal_file_guidance: Mapping[str, JsonValue] = {
+            "action": "finish_if_existing_result_satisfies_task",
+            "maximum_additional_file_inspections": 0,
+            "next_response_tool_calls": 0,
+        }
+    else:
+        literal_file_guidance = {
+            "action": "choose_one_targeted_inspection_then_finish",
+            "choose_exactly_one_of": ("read_file", "search_text"),
+            "maximum_additional_file_inspections": 1,
+            "never_batch_alternatives": True,
+            "do_not_pair_positive_and_negative_searches": True,
+        }
+
     return {
         "authority": "runtime",
         "latest_change_tool_call_id": change_result.tool_call_id,
         "changed_paths": changed_paths,
-        "observation": (
-            "observed" if inspection_tool_call_ids else "pending"
-        ),
+        "observation": observation,
         "inspection_tool_call_ids": tuple(
             inspection_tool_call_ids[-_MAX_POST_CHANGE_FILE_EVIDENCE:]
         ),
         "inspected_paths": tuple(inspected_paths)[-_MAX_POST_CHANGE_FILE_EVIDENCE:],
         "scope": "file_content",
         "semantic_target_satisfied": "not_evaluated",
+        "guidance": {
+            "literal_file_task": literal_file_guidance,
+            "behavioral_code_task": (
+                "file_content_evidence_does_not_replace_pending_runtime_verification"
+            ),
+        },
     }
 
 

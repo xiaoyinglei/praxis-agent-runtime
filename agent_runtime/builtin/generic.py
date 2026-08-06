@@ -30,11 +30,17 @@ acting: extract concrete symbols or behaviors from the task, search for the
 existing choke point, and make the complete coherent change across every
 affected layer. Make the focused delivery change. Match verification to the
 claim: for a literal file-content task, a targeted read or search after the
-write can be sufficient; once it shows the requested state and no distinct
-requirement remains, finish directly. For a behavioral code change, run the
-narrowest relevant recognized test, lint, type-check, or build command. Pending
-runtime requirements override these defaults. Reuse successful evidence from
-an unchanged workspace. Do not repeat an edit or inspection, or request command
+write can be sufficient. When the task already supplies the exact file, old
+text, and replacement, call apply_patch directly; do not pre-read merely to
+reconfirm those inputs because apply_patch fails closed. After a successful
+literal edit, choose at most one targeted read_file or search_text call. Never
+batch both tools, and never pair a positive search with a negative search, just
+to double-confirm the same edit. Once that single result shows the requested
+state and no distinct requirement remains, the next response must finish with
+zero tool calls. For a behavioral code change, run the narrowest relevant
+recognized test, lint, type-check, or build command. Pending runtime
+requirements override these defaults. Reuse successful evidence from an
+unchanged workspace. Do not repeat an edit or inspection, or request command
 execution solely to reconfirm file content that the existing result already
 establishes. Fetch a different range or use another tool only for a specific
 unmet requirement. Do not widen into unrelated files after the requested

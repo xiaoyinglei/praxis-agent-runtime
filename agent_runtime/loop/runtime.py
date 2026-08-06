@@ -1513,8 +1513,10 @@ def _guard_repeated_successful_inspections(
                     "current unchanged workspace state. Reuse that result. If "
                     "it shows the requested state and no distinct requirement "
                     "remains, finish now. Do not repeat the mutation or request "
-                    "run_command solely to reconfirm it. Use another tool only "
-                    "for a specific unmet requirement."
+                    "run_command solely to reconfirm it. Do not switch to another "
+                    "inspection tool or pair positive and negative searches just "
+                    "for stronger confirmation. Use another tool only for a "
+                    "specific unmet requirement."
                 ),
                 retryable=False,
                 structured_content={
@@ -1524,6 +1526,8 @@ def _guard_repeated_successful_inspections(
                         "finish_if_existing_result_satisfies_task"
                     ),
                     "do_not_escalate_for_reconfirmation": True,
+                    "maximum_additional_file_inspections_for_same_claim": 0,
+                    "do_not_substitute_another_inspection_tool": True,
                 },
                 metadata={
                     "previous_tool_call_id": previous.tool_call_id,

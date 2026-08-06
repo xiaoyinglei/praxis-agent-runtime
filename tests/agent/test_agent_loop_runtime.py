@@ -867,10 +867,15 @@ def test_repeated_successful_inspection_requires_new_arguments() -> None:
         "previous_tool_call_id": previous.tool_call_id,
         "recommended_action": "finish_if_existing_result_satisfies_task",
         "do_not_escalate_for_reconfirmation": True,
+        "maximum_additional_file_inspections_for_same_claim": 0,
+        "do_not_substitute_another_inspection_tool": True,
     }
     assert "finish now" in (blocked[0].error_message or "")
     assert "Do not repeat the mutation" in (blocked[0].error_message or "")
     assert "run_command solely to reconfirm" in (
+        blocked[0].error_message or ""
+    )
+    assert "Do not switch to another inspection tool" in (
         blocked[0].error_message or ""
     )
 
