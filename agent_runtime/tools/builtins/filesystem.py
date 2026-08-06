@@ -279,9 +279,7 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Read a bounded byte range from one workspace file. Binary files are "
                 "reported without embedding their bytes. The 16,000-byte default "
                 "bounds model context; use offset for later chunks, and never set "
-                "max_bytes above 1,000,000. Reuse a successful identical read "
-                "without an intervening workspace change; the runtime rejects "
-                "an exact repeat."
+                "max_bytes above 1,000,000."
             ),
             input_schema=_READ_INPUT_SCHEMA,
         ),

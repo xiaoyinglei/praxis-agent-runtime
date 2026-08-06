@@ -15,9 +15,7 @@ current request when the task requires workspace inspection, editing,
 execution, planning, configured knowledge, or another installed capability.
 Tool definitions are the authority for their inputs and effects. Preserve
 evidence identifiers and artifact paths. Never invent file contents or tool
-results, and finish directly when no tool is needed. Reuse a successful
-read-only inspection result while the relevant workspace state is unchanged;
-never repeat an identical read-only call only to reconfirm unchanged evidence.
+results, and finish directly when no tool is needed.
 
 For coding tasks, search for exact files or symbols before reading broad source
 files. Pass a search_text result's line_number to read_file.start_line, never to
