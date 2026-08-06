@@ -80,10 +80,10 @@ agents. Deeper lifecycle details are in the
 The model-quality pages are generated from a clean source commit after the local
 gates pass. Infrastructure failures are reported as **INCONCLUSIVE**, never
 converted into a model score. No test count is treated as proof that an Agent task
-succeeded. The DeepSeek V4 Flash run is intentionally published as a failure:
-the requested mutation was applied and verified in all three approval trials,
-but one approval trial remained paused after `repeated_inspection` and did not
-produce a final answer. The other 14 case executions passed their evaluators.
+succeeded. The table reports the measured verdict and exact case count from the
+linked raw report. A failed result blocks model-quality and readiness claims but
+does not overwrite deterministic runtime-gate results; inspect the expanded trace
+for case-level failure details.
 
 ## Quickstart
 

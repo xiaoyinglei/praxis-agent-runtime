@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -10,6 +11,9 @@ README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
 BENCHMARK = ROOT / "docs" / "benchmark.md"
 RUN_RECORD = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
+MODEL_QUALITY_REPORT = (
+    ROOT / "evals" / "model_quality" / "runs" / "2026-08-06-deepseek-v4-flash.json"
+)
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
 MODEL_CATALOG = ROOT / "configs" / "models.yaml"
 
@@ -175,25 +179,70 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
     readme = _read(README)
     benchmark = _read(BENCHMARK)
     run_record = _read(RUN_RECORD)
+    report = json.loads(_read(MODEL_QUALITY_REPORT))
+
+    assert report["status"] in {"passed", "failed"}
+    assert report["passed"] is (report["status"] == "passed")
+    assert report["source_unchanged"] is True
+    assert report["dirty"] is False
+    assert report["evaluator_version"] == "agent_model_quality_gate_v3"
+    assert len(report["models"]) == 1
+    assert len(report["runs"]) == 1
+
+    verdict = report["status"].upper()
+    model = report["models"][0]
+    run = report["runs"][0]
+    assert model["passed"] is report["passed"]
+    assert run["status"] == "completed"
+
+    cases = [case for trial in run["trials"] for case in trial["cases"]]
+    passed_cases = sum(case["score"]["passed"] is True for case in cases)
+    worst_task_success = min(
+        float(trial["metrics"]["task_success_rate"]) for trial in run["trials"]
+    )
+    task_success_percent = round(worst_task_success * 100)
+    approval_cases = [
+        case for case in cases if case["score"]["case_id"] == "approval_continue"
+    ]
+    passed_approval_cases = sum(
+        case["score"]["passed"] is True for case in approval_cases
+    )
+    conclusion = "PASS" if report["passed"] else "FAIL"
 
     assert license_text.startswith("MIT License\n")
     assert "Copyright (c) 2026 xiaoyinglei" in license_text
-    assert "**FAILED — 14/15 cases passed; worst-trial task success 80%**" in readme
-    assert "one approval trial remained paused after `repeated_inspection`" in readme
-    assert "Overall verdict: **FAILED**" in benchmark
-    assert "source_commit: `1e4c16873f4d6983397d5965b6d527c09d680689`" in benchmark
+    assert (
+        f"**{verdict} — {passed_cases}/{len(cases)} cases passed; "
+        f"worst-trial task success {task_success_percent}%**"
+    ) in readme
+    assert (
+        f"**CONCLUSIVE {conclusion} — {passed_approval_cases}/{len(approval_cases)} "
+        "approval trials completed**"
+    ) in readme
+    assert f"Overall verdict: **{verdict}**" in benchmark
+    assert f"source_commit: `{report['source_commit']}`" in benchmark
     assert "source_unchanged: `true`" in benchmark
     assert "dirty: `false`" in benchmark
     assert "evaluator_version: `agent_model_quality_gate_v3`" in benchmark
-    assert "| `task_success_rate` | `0.8` | `min 1.0` |" in benchmark
-    assert "task_success_rate: observed 0.8 < baseline floor 1.0" in benchmark
+    for metric, observed in model["observed"].items():
+        threshold = model["thresholds"][metric]
+        assert (
+            f"| `{metric}` | `{observed}` | "
+            f"`{threshold['direction']} {threshold['value']}` |"
+        ) in benchmark
+    for failure in model["failures"]:
+        assert failure in benchmark
     assert "Manifest status: **validated only**" in benchmark
 
-    for identity in ("deepseek_v4_flash", "deepseek", "deepseek-v4-flash"):
+    for identity in (run["model_alias"], run["provider"], run["provider_model"]):
         assert identity in run_record
-    assert "Overall verdict: **FAILED**" in run_record
-    assert "Error code: `\"repeated_inspection\"`" in run_record
-    assert "Workspace assertions passed: `true`" in run_record
-    assert "Evaluator verdict: **FAILED**" in run_record
-    assert "Evaluator verdict: **PASSED**" in run_record
-    assert "2026-08-06-deepseek-v4-flash.json" in run_record
+    assert f"Overall verdict: **{verdict}**" in run_record
+    assert f"source_commit: `{report['source_commit']}`" in run_record
+    assert run_record.count("Workspace assertions passed: `true`") >= len(approval_cases)
+    assert (
+        run_record.count("Evaluator verdict: **PASSED**") == passed_approval_cases
+    )
+    assert run_record.count("Evaluator verdict: **FAILED**") == (
+        len(approval_cases) - passed_approval_cases
+    )
+    assert MODEL_QUALITY_REPORT.name in run_record
