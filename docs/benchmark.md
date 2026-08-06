@@ -4,14 +4,14 @@ Overall verdict: **PASSED**
 
 ## Evidence provenance
 
-- source_commit: `38b971a17a25a2fbd80d6fbbe9e313b9e7cf7aab`
-- source_tree: `986c46d013e8a9bf77ea7d852c06897cbb60a0bc`
+- source_commit: `b9e7ca30f8f469ef29d608661c9f084ae182093a`
+- source_tree: `2a2329993aa51cf10ff33bc2f46fba333e721341`
 - source_unchanged: `true`
 - dirty: `false`
 - suite_id: `agent-model-tool-quality-v1`
 - suite_revision: `suite_064a22c3535430e148e8`
 - evaluator_version: `agent_model_quality_gate_v3`
-- measured_at: `2026-08-06T14:31:38.875390+00:00`
+- measured_at: `2026-08-06T14:52:43.690064+00:00`
 - Redacted raw report: [2026-08-06-deepseek-v4-flash.json](../evals/model_quality/runs/2026-08-06-deepseek-v4-flash.json)
 
 ## Environment
@@ -70,21 +70,21 @@ Overall verdict: **PASSED**
 
 | Model | Trial | Case | Tool calls | Model calls | Latency ms | Input tokens | Output tokens | Total tokens |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `deepseek_v4_flash` | `1` | `exact_file_read` | `1` | `2` | `5823.884666198865` | `8571` | `153` | `8724` |
-| `deepseek_v4_flash` | `1` | `symbol_search_then_read` | `2` | `3` | `3700.647875899449` | `13753` | `251` | `14004` |
-| `deepseek_v4_flash` | `1` | `missing_file_recovery` | `2` | `3` | `4325.591332977638` | `13341` | `297` | `13638` |
-| `deepseek_v4_flash` | `1` | `approval_continue` | `2` | `3` | `8086.3622080069035` | `13567` | `829` | `14396` |
-| `deepseek_v4_flash` | `1` | `single_failure_no_retry` | `1` | `2` | `1676.8677500076592` | `8258` | `57` | `8315` |
-| `deepseek_v4_flash` | `2` | `exact_file_read` | `1` | `2` | `2871.851959032938` | `8626` | `185` | `8811` |
-| `deepseek_v4_flash` | `2` | `symbol_search_then_read` | `2` | `3` | `5362.613917095587` | `13859` | `329` | `14188` |
-| `deepseek_v4_flash` | `2` | `missing_file_recovery` | `2` | `3` | `4391.472792020068` | `13232` | `247` | `13479` |
-| `deepseek_v4_flash` | `2` | `approval_continue` | `2` | `3` | `10807.177040958777` | `13394` | `1025` | `14419` |
-| `deepseek_v4_flash` | `2` | `single_failure_no_retry` | `1` | `2` | `4718.672832241282` | `8291` | `442` | `8733` |
-| `deepseek_v4_flash` | `3` | `exact_file_read` | `1` | `2` | `2283.1925419159234` | `8558` | `146` | `8704` |
-| `deepseek_v4_flash` | `3` | `symbol_search_then_read` | `2` | `3` | `3925.064583076164` | `13671` | `231` | `13902` |
-| `deepseek_v4_flash` | `3` | `missing_file_recovery` | `2` | `3` | `5164.285126142204` | `13434` | `354` | `13788` |
-| `deepseek_v4_flash` | `3` | `approval_continue` | `2` | `3` | `7651.055208174512` | `13153` | `702` | `13855` |
-| `deepseek_v4_flash` | `3` | `single_failure_no_retry` | `1` | `2` | `3370.724498992786` | `8300` | `200` | `8500` |
+| `deepseek_v4_flash` | `1` | `exact_file_read` | `1` | `2` | `8963.368250057101` | `8633` | `168` | `8801` |
+| `deepseek_v4_flash` | `1` | `symbol_search_then_read` | `2` | `3` | `3700.890251202509` | `13615` | `168` | `13783` |
+| `deepseek_v4_flash` | `1` | `missing_file_recovery` | `2` | `3` | `5224.570082267746` | `13369` | `290` | `13659` |
+| `deepseek_v4_flash` | `1` | `approval_continue` | `2` | `3` | `9468.98008394055` | `13497` | `895` | `14392` |
+| `deepseek_v4_flash` | `1` | `single_failure_no_retry` | `1` | `2` | `3153.574125142768` | `8342` | `105` | `8447` |
+| `deepseek_v4_flash` | `2` | `exact_file_read` | `1` | `2` | `2988.350415835157` | `8592` | `141` | `8733` |
+| `deepseek_v4_flash` | `2` | `symbol_search_then_read` | `2` | `3` | `4635.299290996045` | `13829` | `255` | `14084` |
+| `deepseek_v4_flash` | `2` | `missing_file_recovery` | `2` | `3` | `4952.284709084779` | `13406` | `284` | `13690` |
+| `deepseek_v4_flash` | `2` | `approval_continue` | `2` | `3` | `17483.117500087246` | `13430` | `1705` | `15135` |
+| `deepseek_v4_flash` | `2` | `single_failure_no_retry` | `1` | `2` | `3133.7859593331814` | `8344` | `212` | `8556` |
+| `deepseek_v4_flash` | `3` | `exact_file_read` | `1` | `2` | `2791.6957908309996` | `8604` | `121` | `8725` |
+| `deepseek_v4_flash` | `3` | `symbol_search_then_read` | `2` | `3` | `5343.548043165356` | `13817` | `261` | `14078` |
+| `deepseek_v4_flash` | `3` | `missing_file_recovery` | `2` | `3` | `5391.309915808961` | `13482` | `319` | `13801` |
+| `deepseek_v4_flash` | `3` | `approval_continue` | `2` | `3` | `18053.717749891803` | `13356` | `1713` | `15069` |
+| `deepseek_v4_flash` | `3` | `single_failure_no_retry` | `1` | `2` | `3883.8066251482815` | `8294` | `223` | `8517` |
 
 ## 30-task coding-agent protocol
 
