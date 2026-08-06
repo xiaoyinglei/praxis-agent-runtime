@@ -225,7 +225,72 @@ def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
     read_result = ToolResult(
         tool_call_id=read_call.tool_call_id,
         tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "updated",
+            "size_bytes": 7,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    binary_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 7,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": True,
+        },
+    )
+    beyond_eof_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 7,
+            "offset": 7,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    empty_file_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 0,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    incomplete_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
         structured_content={"path": "src/runtime.py", "content": "updated"},
+    )
+    mismatched_range_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "pdated",
+            "size_bytes": 7,
+            "offset": 1,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
     )
     search_call = ToolCall(
         tool_call_id="tc-search-current",
@@ -255,6 +320,16 @@ def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
     assert runtime_file_inspection_paths(read_result, call=read_call) == (
         "src/runtime.py",
     )
+    assert runtime_file_inspection_paths(binary_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(beyond_eof_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(empty_file_read, call=read_call) == (
+        "src/runtime.py",
+    )
+    assert runtime_file_inspection_paths(incomplete_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(
+        mismatched_range_read,
+        call=read_call,
+    ) == ()
     assert runtime_file_inspection_paths(search_result, call=search_call) == (
         "src/runtime.py",
     )

@@ -1090,7 +1090,11 @@ def runtime_file_inspection_paths(
             if isinstance(returned_path, str)
             else None
         )
-        if normalized_requested is None or normalized_requested != normalized_returned:
+        if (
+            normalized_requested is None
+            or normalized_requested != normalized_returned
+            or not _read_file_returned_content(output, call=call)
+        ):
             return ()
         return (normalized_requested,)
     if result.tool_name != "search_text":
@@ -1138,6 +1142,84 @@ def runtime_file_inspection_paths(
     if normalized_requested is None or normalized_requested != normalized_searched:
         return ()
     return (normalized_requested,)
+
+
+def _read_file_returned_content(
+    output: Mapping[str, object],
+    *,
+    call: ToolCall,
+) -> bool:
+    """Reject binary, metadata-only, and out-of-range read receipts."""
+
+    content = output.get("content")
+    size_bytes = output.get("size_bytes")
+    offset = output.get("offset")
+    if (
+        not isinstance(content, str)
+        or not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 0
+        or not isinstance(offset, int)
+        or isinstance(offset, bool)
+        or offset < 0
+        or not isinstance(output.get("truncated"), bool)
+        or output.get("is_binary") is not False
+    ):
+        return False
+
+    requested_offset = call.arguments.get("offset", 0)
+    requested_start_line = call.arguments.get("start_line")
+    requested_max_lines = call.arguments.get("max_lines")
+    if (
+        not isinstance(requested_offset, int)
+        or isinstance(requested_offset, bool)
+        or requested_offset < 0
+        or (
+            requested_max_lines is not None
+            and (
+                not isinstance(requested_max_lines, int)
+                or isinstance(requested_max_lines, bool)
+                or requested_max_lines < 1
+            )
+        )
+    ):
+        return False
+    line_mode = (
+        requested_start_line is not None
+        or requested_max_lines is not None
+    )
+    if line_mode:
+        expected_start_line = (
+            1 if requested_start_line is None else requested_start_line
+        )
+        if (
+            requested_offset != 0
+            or not isinstance(expected_start_line, int)
+            or isinstance(expected_start_line, bool)
+            or expected_start_line < 1
+            or output.get("start_line") != expected_start_line
+        ):
+            return False
+    elif output.get("start_line") is not None or offset != requested_offset:
+        return False
+
+    if size_bytes > 0:
+        return offset < size_bytes and bool(content)
+
+    return (
+        offset == 0
+        and content == ""
+        and output.get("truncated") is False
+        and requested_offset == 0
+        and (
+            requested_start_line is None
+            or (
+                isinstance(requested_start_line, int)
+                and not isinstance(requested_start_line, bool)
+                and requested_start_line == 1
+            )
+        )
+    )
 
 
 def _valid_sha256(value: object) -> bool:

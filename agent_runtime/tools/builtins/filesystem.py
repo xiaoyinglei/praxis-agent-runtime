@@ -283,7 +283,8 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "literal file content. Reuse a sufficient result while the workspace "
                 "is unchanged; request another range only for content not yet observed. "
                 "For one literal edit, choose this tool or search_text once, never both "
-                "as paired confirmation."
+                "as paired confirmation. Binary metadata and a range starting at or "
+                "past end-of-file do not verify text content."
             ),
             input_schema=_READ_INPUT_SCHEMA,
         ),

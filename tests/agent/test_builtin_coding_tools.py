@@ -127,6 +127,9 @@ def test_resident_tool_docs_distinguish_content_from_behavior(
     tools = _tools_by_name(open_workspace(tmp_path, create=True))
 
     assert "Reuse a sufficient result" in tools["read_file"].definition.description
+    assert "past end-of-file do not verify text content" in (
+        tools["read_file"].definition.description
+    )
     assert "never reapply the patch" in (
         tools["apply_patch"].definition.description.casefold()
     )

@@ -1502,7 +1502,11 @@ async def test_working_state_projects_post_change_file_inspection() -> None:
             structured_content={
                 "path": changed_path,
                 "content": "updated\n",
+                "size_bytes": 8,
+                "offset": 0,
+                "start_line": None,
                 "truncated": False,
+                "is_binary": False,
             },
         ),
     ]
@@ -1546,6 +1550,87 @@ async def test_working_state_projects_post_change_file_inspection() -> None:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("read_arguments", "read_output"),
+    [
+        (
+            {"path": "src/runtime.py", "offset": 0},
+            {
+                "path": "src/runtime.py",
+                "content": "",
+                "size_bytes": 8,
+                "offset": 0,
+                "start_line": None,
+                "truncated": False,
+                "is_binary": True,
+            },
+        ),
+        (
+            {"path": "src/runtime.py", "offset": 8},
+            {
+                "path": "src/runtime.py",
+                "content": "",
+                "size_bytes": 8,
+                "offset": 8,
+                "start_line": None,
+                "truncated": False,
+                "is_binary": False,
+            },
+        ),
+    ],
+)
+async def test_working_state_rejects_non_content_file_reads(
+    read_arguments: Mapping[str, JsonValue],
+    read_output: Mapping[str, JsonValue],
+) -> None:
+    gateway = _RecordingGateway()
+    state = _state("post-change-non-content-read")
+    changed_path = "src/runtime.py"
+    change_call = _runtime_call(
+        "tc-change-non-content-read",
+        "apply_patch",
+        {"file_path": changed_path},
+    )
+    read_call = _runtime_call(
+        "tc-read-non-content",
+        "read_file",
+        read_arguments,
+    )
+    state["canonical_tool_calls"].update(
+        {
+            change_call.tool_call_id: change_call,
+            read_call.tool_call_id: read_call,
+        }
+    )
+    state["tool_results"] = [
+        _changed_file_result(change_call.tool_call_id, changed_path),
+        ToolResult(
+            tool_call_id=read_call.tool_call_id,
+            tool_name=read_call.tool_name,
+            structured_content=read_output,
+        ),
+    ]
+
+    await _provider(gateway, names=()).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    working_state = next(
+        message
+        for message in gateway.calls[0]["request"].messages
+        if '"event_type":"working_state"' in message.content
+    )
+    evidence = json.loads(working_state.content)["payload"]["runtime_evidence"]
+    inspection = evidence["post_change_file_inspection"]
+    assert inspection["observation"] == "pending"
+    assert inspection["inspection_tool_call_ids"] == []
+    assert inspection["inspected_paths"] == []
+    assert "completion_guidance" not in evidence
+
+
+@pytest.mark.anyio
 async def test_working_state_rejects_unrelated_and_stale_file_inspection() -> None:
     state = _state("post-change-file-inspection-negative")
     changed_path = "src/runtime.py"
@@ -1570,7 +1655,15 @@ async def test_working_state_rejects_unrelated_and_stale_file_inspection() -> No
         ToolResult(
             tool_call_id=unrelated_read.tool_call_id,
             tool_name=unrelated_read.tool_name,
-            structured_content={"path": "src/other.py", "content": "other\n"},
+            structured_content={
+                "path": "src/other.py",
+                "content": "other\n",
+                "size_bytes": 6,
+                "offset": 0,
+                "start_line": None,
+                "truncated": False,
+                "is_binary": False,
+            },
         ),
     ]
     first_gateway = _RecordingGateway()
@@ -1692,7 +1785,15 @@ async def test_working_state_uses_stop_hook_verification_truth(
         ToolResult(
             tool_call_id=read_call.tool_call_id,
             tool_name=read_call.tool_name,
-            structured_content={"path": changed_path, "content": "updated\n"},
+            structured_content={
+                "path": changed_path,
+                "content": "updated\n",
+                "size_bytes": 8,
+                "offset": 0,
+                "start_line": None,
+                "truncated": False,
+                "is_binary": False,
+            },
         ),
         ToolResult(
             tool_call_id=command_call.tool_call_id,
