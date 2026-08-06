@@ -1,17 +1,17 @@
 # Model quality benchmark
 
-Overall verdict: **FAILED**
+Overall verdict: **PASSED**
 
 ## Evidence provenance
 
-- source_commit: `48e5eb0191ff2279e40cb294ffcf845a8a016e13`
-- source_tree: `94c353fe62ef7f09157eeca883a351f1db42df52`
+- source_commit: `38b971a17a25a2fbd80d6fbbe9e313b9e7cf7aab`
+- source_tree: `986c46d013e8a9bf77ea7d852c06897cbb60a0bc`
 - source_unchanged: `true`
 - dirty: `false`
 - suite_id: `agent-model-tool-quality-v1`
 - suite_revision: `suite_064a22c3535430e148e8`
 - evaluator_version: `agent_model_quality_gate_v3`
-- measured_at: `2026-08-06T09:43:16.967520+00:00`
+- measured_at: `2026-08-06T14:31:38.875390+00:00`
 - Redacted raw report: [2026-08-06-deepseek-v4-flash.json](../evals/model_quality/runs/2026-08-06-deepseek-v4-flash.json)
 
 ## Environment
@@ -32,7 +32,7 @@ Overall verdict: **FAILED**
 - Provider model: `deepseek-v4-flash`
 - Trials: `3`
 - Infrastructure status: **CONCLUSIVE**
-- Evaluator verdict: **FAILED**
+- Evaluator verdict: **PASSED**
 
 | Metric | Observed | Threshold |
 | --- | ---: | --- |
@@ -40,17 +40,11 @@ Overall verdict: **FAILED**
 | `argument_validity_rate` | `1.0` | `min 1.0` |
 | `failure_recovery_rate` | `1.0` | `min 1.0` |
 | `file_tool_selection_rate` | `1.0` | `min 1.0` |
-| `mean_model_calls_per_case` | `3.2` | `max 3.0` |
-| `mean_tool_calls_per_case` | `2.4` | `max 2.0` |
+| `mean_model_calls_per_case` | `2.6` | `max 3.0` |
+| `mean_tool_calls_per_case` | `1.6` | `max 2.0` |
 | `redundant_tool_call_rate` | `0.0` | `max 0.0` |
 | `repeated_failure_control_rate` | `1.0` | `min 1.0` |
-| `task_success_rate` | `0.8` | `min 1.0` |
-
-Reported failures:
-
-- task_success_rate: observed 0.8 < baseline floor 1.0
-- mean_tool_calls_per_case: observed 2.4 > baseline ceiling 2.0
-- mean_model_calls_per_case: observed 3.2 > baseline ceiling 3.0
+| `task_success_rate` | `1.0` | `min 1.0` |
 
 ## Case results
 
@@ -59,38 +53,38 @@ Reported failures:
 | `deepseek_v4_flash` | `1` | `exact_file_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `1` | `symbol_search_then_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `1` | `missing_file_recovery` | `failure_recovery` | **PASSED** |
-| `deepseek_v4_flash` | `1` | `approval_continue` | `approval_continuation` | **FAILED** |
+| `deepseek_v4_flash` | `1` | `approval_continue` | `approval_continuation` | **PASSED** |
 | `deepseek_v4_flash` | `1` | `single_failure_no_retry` | `repeated_failure_control` | **PASSED** |
 | `deepseek_v4_flash` | `2` | `exact_file_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `2` | `symbol_search_then_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `2` | `missing_file_recovery` | `failure_recovery` | **PASSED** |
-| `deepseek_v4_flash` | `2` | `approval_continue` | `approval_continuation` | **FAILED** |
+| `deepseek_v4_flash` | `2` | `approval_continue` | `approval_continuation` | **PASSED** |
 | `deepseek_v4_flash` | `2` | `single_failure_no_retry` | `repeated_failure_control` | **PASSED** |
 | `deepseek_v4_flash` | `3` | `exact_file_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `3` | `symbol_search_then_read` | `file_tool_selection` | **PASSED** |
 | `deepseek_v4_flash` | `3` | `missing_file_recovery` | `failure_recovery` | **PASSED** |
-| `deepseek_v4_flash` | `3` | `approval_continue` | `approval_continuation` | **FAILED** |
+| `deepseek_v4_flash` | `3` | `approval_continue` | `approval_continuation` | **PASSED** |
 | `deepseek_v4_flash` | `3` | `single_failure_no_retry` | `repeated_failure_control` | **PASSED** |
 
 ## Per-case usage
 
 | Model | Trial | Case | Tool calls | Model calls | Latency ms | Input tokens | Output tokens | Total tokens |
 | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `deepseek_v4_flash` | `1` | `exact_file_read` | `1` | `2` | `5438.894835300744` | `7724` | `190` | `7914` |
-| `deepseek_v4_flash` | `1` | `symbol_search_then_read` | `2` | `3` | `6793.128416873515` | `12548` | `321` | `12869` |
-| `deepseek_v4_flash` | `1` | `missing_file_recovery` | `4` | `4` | `9200.436001177877` | `17140` | `576` | `17716` |
-| `deepseek_v4_flash` | `1` | `approval_continue` | `4` | `5` | `20008.09920905158` | `22256` | `2111` | `24367` |
-| `deepseek_v4_flash` | `1` | `single_failure_no_retry` | `1` | `2` | `2900.5583750549704` | `7450` | `220` | `7670` |
-| `deepseek_v4_flash` | `2` | `exact_file_read` | `1` | `2` | `3012.360041961074` | `7770` | `171` | `7941` |
-| `deepseek_v4_flash` | `2` | `symbol_search_then_read` | `2` | `3` | `7404.86199897714` | `12352` | `215` | `12567` |
-| `deepseek_v4_flash` | `2` | `missing_file_recovery` | `3` | `3` | `5989.8909570183605` | `12380` | `384` | `12764` |
-| `deepseek_v4_flash` | `2` | `approval_continue` | `4` | `5` | `22608.967332169414` | `22140` | `1797` | `23937` |
-| `deepseek_v4_flash` | `2` | `single_failure_no_retry` | `1` | `2` | `5518.3193339034915` | `7468` | `210` | `7678` |
-| `deepseek_v4_flash` | `3` | `exact_file_read` | `1` | `2` | `3058.431833051145` | `7700` | `148` | `7848` |
-| `deepseek_v4_flash` | `3` | `symbol_search_then_read` | `2` | `3` | `4610.109667060897` | `12508` | `290` | `12798` |
-| `deepseek_v4_flash` | `3` | `missing_file_recovery` | `3` | `4` | `6674.206709023565` | `16768` | `514` | `17282` |
-| `deepseek_v4_flash` | `3` | `approval_continue` | `3` | `4` | `16849.822042277083` | `16543` | `1378` | `17921` |
-| `deepseek_v4_flash` | `3` | `single_failure_no_retry` | `1` | `2` | `2859.4645420089364` | `7431` | `125` | `7556` |
+| `deepseek_v4_flash` | `1` | `exact_file_read` | `1` | `2` | `5823.884666198865` | `8571` | `153` | `8724` |
+| `deepseek_v4_flash` | `1` | `symbol_search_then_read` | `2` | `3` | `3700.647875899449` | `13753` | `251` | `14004` |
+| `deepseek_v4_flash` | `1` | `missing_file_recovery` | `2` | `3` | `4325.591332977638` | `13341` | `297` | `13638` |
+| `deepseek_v4_flash` | `1` | `approval_continue` | `2` | `3` | `8086.3622080069035` | `13567` | `829` | `14396` |
+| `deepseek_v4_flash` | `1` | `single_failure_no_retry` | `1` | `2` | `1676.8677500076592` | `8258` | `57` | `8315` |
+| `deepseek_v4_flash` | `2` | `exact_file_read` | `1` | `2` | `2871.851959032938` | `8626` | `185` | `8811` |
+| `deepseek_v4_flash` | `2` | `symbol_search_then_read` | `2` | `3` | `5362.613917095587` | `13859` | `329` | `14188` |
+| `deepseek_v4_flash` | `2` | `missing_file_recovery` | `2` | `3` | `4391.472792020068` | `13232` | `247` | `13479` |
+| `deepseek_v4_flash` | `2` | `approval_continue` | `2` | `3` | `10807.177040958777` | `13394` | `1025` | `14419` |
+| `deepseek_v4_flash` | `2` | `single_failure_no_retry` | `1` | `2` | `4718.672832241282` | `8291` | `442` | `8733` |
+| `deepseek_v4_flash` | `3` | `exact_file_read` | `1` | `2` | `2283.1925419159234` | `8558` | `146` | `8704` |
+| `deepseek_v4_flash` | `3` | `symbol_search_then_read` | `2` | `3` | `3925.064583076164` | `13671` | `231` | `13902` |
+| `deepseek_v4_flash` | `3` | `missing_file_recovery` | `2` | `3` | `5164.285126142204` | `13434` | `354` | `13788` |
+| `deepseek_v4_flash` | `3` | `approval_continue` | `2` | `3` | `7651.055208174512` | `13153` | `702` | `13855` |
+| `deepseek_v4_flash` | `3` | `single_failure_no_retry` | `1` | `2` | `3370.724498992786` | `8300` | `200` | `8500` |
 
 ## 30-task coding-agent protocol
 
