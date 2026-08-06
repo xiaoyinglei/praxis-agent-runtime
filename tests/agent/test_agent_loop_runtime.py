@@ -862,6 +862,40 @@ def test_repeated_successful_inspection_requires_new_arguments() -> None:
     assert blocked[0].error_code == "repeated_inspection"
     assert blocked[0].retryable is False
     assert blocked[0].metadata["previous_tool_call_id"] == previous.tool_call_id
+    assert blocked[0].structured_content == {
+        "repeated_inspection": True,
+        "previous_tool_call_id": previous.tool_call_id,
+        "recommended_action": "finish_if_existing_result_satisfies_task",
+        "do_not_escalate_for_reconfirmation": True,
+        "maximum_additional_file_inspections_for_same_claim": 0,
+        "do_not_substitute_another_inspection_tool": True,
+    }
+    assert "finish now" in (blocked[0].error_message or "")
+    assert "Do not repeat the mutation" in (blocked[0].error_message or "")
+    assert "run_command solely to reconfirm" in (
+        blocked[0].error_message or ""
+    )
+    assert "Do not switch to another inspection tool" in (
+        blocked[0].error_message or ""
+    )
+
+    state["tool_results"].append(
+        ToolResult(
+            tool_call_id="command-changed-workspace",
+            tool_name="run_command",
+            metadata={
+                "runtime_workspace_write": True,
+                "workspace_tree_before_sha256": "a" * 64,
+                "workspace_tree_after_sha256": "b" * 64,
+            },
+        )
+    )
+    executable_after_change, blocked_after_change = (
+        _guard_repeated_successful_inspections(state, (repeated,))
+    )
+
+    assert executable_after_change == (repeated,)
+    assert blocked_after_change == ()
 
 
 def test_canonical_tool_arguments_materialize_declared_defaults() -> None:

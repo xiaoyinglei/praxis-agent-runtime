@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
-    from agent_runtime.result import AgentToolCall
+    from agent_runtime.result import AgentResult, AgentToolCall
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_cases.json"
@@ -43,6 +43,8 @@ MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
 EVALUATOR_VERSION = "agent_model_quality_gate_v3"
 _RUNTIME_INPUT_FILE_PREFIX = ".praxis/runtime/input_files/"
+_MAX_FINAL_PAUSE_REASON_CHARS = 2000
+_MAX_FINAL_PAUSE_TOOL_NAMES = 32
 _ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
     r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
@@ -166,6 +168,9 @@ class CaseObservation:
     diagnostic_error_types: tuple[str, ...] = ()
     infrastructure_failure: bool = False
     error: str = ""
+    final_pause_request_kind: str | None = None
+    final_pause_reason: str | None = None
+    final_pause_tool_names: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, object]:
         payload = asdict(self)
@@ -503,7 +508,7 @@ async def run_live_case(
     control_plane: object,
     case: Mapping[str, object],
 ) -> CaseObservation:
-    from agent_runtime import Agent, AgentResult
+    from agent_runtime import Agent
 
     case_id = str(case["id"])
     capability = str(case["capability"])
@@ -546,6 +551,9 @@ async def run_live_case(
                     approval_resumes = 1
 
             evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
+            final_pause_kind, final_pause_reason, final_pause_tool_names = (
+                _final_pause_evidence(result)
+            )
             workspace_ok = _workspace_assertions_pass(
                 workspace,
                 workspace_assertions,
@@ -576,6 +584,9 @@ async def run_live_case(
                     result.status,
                     result.stop_reason,
                 ),
+                final_pause_request_kind=final_pause_kind,
+                final_pause_reason=final_pause_reason,
+                final_pause_tool_names=final_pause_tool_names,
             )
         except Exception as exc:
             return CaseObservation(
@@ -605,6 +616,27 @@ async def run_live_case(
             store = getattr(agent, "_turn_store", None)
             if store is not None:
                 store.close()
+
+
+def _final_pause_evidence(
+    result: AgentResult,
+) -> tuple[str | None, str | None, tuple[str, ...]]:
+    if result.status != "paused":
+        return None, None, ()
+    reason = result.needs_user_input
+    pause = result.pause
+    return (
+        None if pause is None else pause.kind,
+        None if reason is None else reason[:_MAX_FINAL_PAUSE_REASON_CHARS],
+        (
+            ()
+            if pause is None
+            else tuple(
+                item.tool_name
+                for item in pause.tool_calls[:_MAX_FINAL_PAUSE_TOOL_NAMES]
+            )
+        ),
+    )
 
 
 def _is_declared_apply_patch_approval(
@@ -1466,6 +1498,12 @@ def _observation_from_payload(value: object) -> CaseObservation:
         ),
         infrastructure_failure=(boolean("infrastructure_failure") if "infrastructure_failure" in payload else False),
         error=str(payload.get("error", "")),
+        final_pause_request_kind=text_or_none("final_pause_request_kind"),
+        final_pause_reason=text_or_none("final_pause_reason"),
+        final_pause_tool_names=_string_sequence(
+            payload.get("final_pause_tool_names", ()),
+            label="final_pause_tool_names",
+        ),
     )
 
 

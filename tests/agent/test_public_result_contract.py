@@ -48,6 +48,7 @@ def test_public_result_dtos_are_frozen_and_have_the_stable_surface() -> None:
         "insufficient_evidence",
         "plan",
         "plan_events",
+        "needs_user_input",
     )
     assert not hasattr(AgentResult, "run_id")
     assert "Any" not in inspect.getsource(result_module)
@@ -247,6 +248,7 @@ def test_internal_projection_builds_stable_result_dtos_without_internal_objects(
         citations=[citation],
         groundedness_flag=True,
         insufficient_evidence_flag=False,
+        needs_user_input="Allow read_file?",
         human_input_request=human_request,
         workspace_path="/workspace",
         runtime_diagnostics=[diagnostic],
@@ -283,6 +285,7 @@ def test_internal_projection_builds_stable_result_dtos_without_internal_objects(
     assert public.turn_id == "turn-1"
     assert not hasattr(public, "session_id")
     assert public.stop_reason == "approval_required"
+    assert public.needs_user_input == "Allow read_file?"
     assert public.workspace_path == "/workspace"
     assert public.groundedness is True
     assert public.insufficient_evidence is False
@@ -387,6 +390,21 @@ def test_internal_projection_builds_stable_result_dtos_without_internal_objects(
         public.tool_calls[0].arguments["path"] = "changed"  # type: ignore[index]
     with pytest.raises(TypeError):
         public.pause.context["attempt"] = 2  # type: ignore[index]
+
+
+def test_internal_projection_preserves_untyped_pause_reason() -> None:
+    raw = AgentRunResult(
+        turn_id="turn-untyped-pause",
+        status="paused",
+        needs_user_input="Choose a target branch before continuing.",
+        human_input_request=None,
+    )
+
+    public = AgentResult._from_internal(raw)
+
+    assert public.status == "paused"
+    assert public.pause is None
+    assert public.needs_user_input == "Choose a target branch before continuing."
 
 
 def test_public_result_restores_input_files_from_resumed_turn() -> None:

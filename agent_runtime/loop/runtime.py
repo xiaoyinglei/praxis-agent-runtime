@@ -33,6 +33,7 @@ from agent_runtime.core.observations import (
     ObservationBatch,
     ObservationExtractor,
     grounded_workspace_paths,
+    runtime_workspace_change,
 )
 from agent_runtime.core.output_models import ValidatedFinalOutput
 from agent_runtime.core.runtime_diagnostics import (
@@ -1413,6 +1414,8 @@ async def _remaining_llm_budget(handles: Any) -> int | None:
 def _delivery_cycle_results(state: LoopState) -> list[ToolResult]:
     cycle: list[ToolResult] = []
     for result in reversed(state["tool_results"]):
+        if runtime_workspace_change(result) is not None:
+            break
         if result.tool_name != "update_plan" and result.tool_name not in _EXPLORATION_TOOL_NAMES:
             break
         cycle.append(result)
@@ -1506,12 +1509,26 @@ def _guard_repeated_successful_inspections(
                 is_error=True,
                 error_code="repeated_inspection",
                 error_message=(
-                    "This exact read-only inspection already succeeded without "
-                    "an intervening delivery action. Use the existing result, "
-                    "narrow or change the arguments, choose a different tool, "
-                    "or make the concrete delivery change."
+                    "This exact read-only inspection already succeeded in the "
+                    "current unchanged workspace state. Reuse that result. If "
+                    "it shows the requested state and no distinct requirement "
+                    "remains, finish now. Do not repeat the mutation or request "
+                    "run_command solely to reconfirm it. Do not switch to another "
+                    "inspection tool or pair positive and negative searches just "
+                    "for stronger confirmation. Use another tool only for a "
+                    "specific unmet requirement."
                 ),
                 retryable=False,
+                structured_content={
+                    "repeated_inspection": True,
+                    "previous_tool_call_id": previous.tool_call_id,
+                    "recommended_action": (
+                        "finish_if_existing_result_satisfies_task"
+                    ),
+                    "do_not_escalate_for_reconfirmation": True,
+                    "maximum_additional_file_inspections_for_same_claim": 0,
+                    "do_not_substitute_another_inspection_tool": True,
+                },
                 metadata={
                     "previous_tool_call_id": previous.tool_call_id,
                 },

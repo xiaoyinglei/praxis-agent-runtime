@@ -73,17 +73,17 @@ agents. Deeper lifecycle details are in the
 | Evidence | What it establishes | Current state |
 | --- | --- | --- |
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
-| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **FAILED — 12/15 cases passed; worst-trial task success 80%** |
-| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE FAIL — 0/3 approval trials completed** |
+| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **PASSED — 15/15 cases passed; worst-trial task success 100%**; worst-trial mean tool calls 1.6 |
+| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE PASS — 3/3 approval trials completed**; 2 tool calls per trial |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
 The model-quality pages are generated from a clean source commit after the local
 gates pass. Infrastructure failures are reported as **INCONCLUSIVE**, never
 converted into a model score. No test count is treated as proof that an Agent task
 succeeded. The table reports the measured verdict and exact case count from the
-linked raw report. A failed result blocks model-quality and readiness claims but
-does not overwrite deterministic runtime-gate results; inspect the expanded trace
-for case-level failure details.
+linked raw report. A failed result would block model-quality and readiness claims
+but would not overwrite deterministic runtime-gate results; inspect the expanded
+trace for case-level evidence.
 
 ## Quickstart
 

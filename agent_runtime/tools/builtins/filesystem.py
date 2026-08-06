@@ -279,7 +279,12 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Read a bounded byte range from one workspace file. Binary files are "
                 "reported without embedding their bytes. The 16,000-byte default "
                 "bounds model context; use offset for later chunks, and never set "
-                "max_bytes above 1,000,000."
+                "max_bytes above 1,000,000. A targeted read after a write can confirm "
+                "literal file content. Reuse a sufficient result while the workspace "
+                "is unchanged; request another range only for content not yet observed. "
+                "For one literal edit, choose this tool or search_text once, never both "
+                "as paired confirmation. Binary metadata and a range starting at or "
+                "past end-of-file do not verify text content."
             ),
             input_schema=_READ_INPUT_SCHEMA,
         ),
@@ -318,7 +323,13 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Edit an existing UTF-8 workspace file by exact text replacement. "
                 "Without replace_all, the old text must occur exactly once. The write "
                 "is atomically installed and does not create new files. Verification "
-                "toolchains under .venv and node_modules are read-only."
+                "toolchains under .venv and node_modules are read-only. After a "
+                "successful literal edit, use at most one targeted read_file or "
+                "search_text call, never both, then finish when it proves the requested "
+                "state. If the task already supplies the exact file, old text, and new "
+                "text, call apply_patch directly instead of pre-reading merely to "
+                "reconfirm them; the replacement checks fail closed. Never reapply the "
+                "patch merely to reconfirm it."
             ),
             input_schema=_PATCH_INPUT_SCHEMA,
         ),

@@ -68,6 +68,13 @@ class StopHookOutcome(BaseModel):
         return self.action == "halt"
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeVerificationEvidence:
+    attempt_tool_call_ids: tuple[str, ...]
+    successful_tool_call_ids: tuple[str, ...]
+    satisfied: bool
+
+
 class StopHook(Protocol):
     async def evaluate(
         self,
@@ -318,7 +325,7 @@ class GoalContractStopHook:
                 and constraint.expected_value is True
             )
         )
-        if _verification_succeeded_after_latest_change(state):
+        if runtime_verification_after_latest_change(state).satisfied:
             context_bindings.extend(
                 ContextBinding(
                     binding_id=(
@@ -450,7 +457,9 @@ _UNSAFE_VERIFICATION_SHELL_SYNTAX = re.compile(
 )
 
 
-def _verification_succeeded_after_latest_change(state: LoopState) -> bool:
+def runtime_verification_after_latest_change(
+    state: LoopState,
+) -> RuntimeVerificationEvidence:
     tool_results = list(state.get("tool_results", ()))
     calls = state.get("canonical_tool_calls", {})
     latest_change_index = max(
@@ -462,9 +471,9 @@ def _verification_succeeded_after_latest_change(state: LoopState) -> bool:
         default=-1,
     )
     if latest_change_index < 0:
-        return False
+        return RuntimeVerificationEvidence((), (), False)
 
-    attempts: list[bool] = []
+    attempts: list[tuple[str, bool]] = []
     for result in tool_results[latest_change_index + 1 :]:
         if result.tool_name != "run_command":
             continue
@@ -476,8 +485,18 @@ def _verification_succeeded_after_latest_change(state: LoopState) -> bool:
         command = call.arguments.get("command")
         if not isinstance(command, str) or not _is_verification_command(command):
             continue
-        attempts.append(_command_result_succeeded(result))
-    return bool(attempts) and all(attempts)
+        attempts.append(
+            (result.tool_call_id, _command_result_succeeded(result))
+        )
+    return RuntimeVerificationEvidence(
+        attempt_tool_call_ids=tuple(tool_call_id for tool_call_id, _success in attempts),
+        successful_tool_call_ids=tuple(
+            tool_call_id
+            for tool_call_id, success in attempts
+            if success
+        ),
+        satisfied=bool(attempts) and all(success for _tool_call_id, success in attempts),
+    )
 
 
 def _is_runtime_workspace_write(
@@ -931,6 +950,7 @@ def _structured_items(
 
 __all__ = [
     "GoalContractStopHook",
+    "RuntimeVerificationEvidence",
     "StopHook",
     "StopHookBinding",
     "StopHookOutcome",
@@ -938,4 +958,5 @@ __all__ = [
     "StopVerdict",
     "StructuredOutputStopHook",
     "build_stop_hooks",
+    "runtime_verification_after_latest_change",
 ]

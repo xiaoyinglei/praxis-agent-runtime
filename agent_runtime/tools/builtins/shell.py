@@ -151,7 +151,9 @@ def create_run_command_tool(
                 "closed before execution when hardlinked workspace files could "
                 "bypass path containment. For implementation tasks, locate the "
                 "affected code before execution and prefer focused verification "
-                "over a full-repository test run."
+                "over a full-repository test run. Use recognized read-only commands "
+                "to verify code behavior; do not execute a process solely to reconfirm "
+                "unchanged literal file content already established by a read or search."
             ),
             input_schema=_COMMAND_INPUT_SCHEMA,
         ),

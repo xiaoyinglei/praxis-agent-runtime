@@ -109,6 +109,7 @@ class SearchTextOutput(BaseModel):
     matches: list[SearchTextMatch]
     total_matches: int = Field(ge=0)
     truncated: bool = False
+    searched_file_path: str | None = None
 
 
 _SEARCH_INPUT_SCHEMA, _validate_search_model = pydantic_input(SearchTextInput)
@@ -129,7 +130,12 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Directory searches first diversify results across matching files and "
                 "prioritize product source over agent-support directories before filling "
                 "remaining slots. Symlinks are not followed, so every call observes only "
-                "current in-workspace file contents."
+                "current in-workspace file contents. A targeted post-write search can "
+                "confirm literal presence, or absence only when its exact-file scope is "
+                "reported and non-truncated. Reuse that result while the workspace is "
+                "unchanged. For one literal edit, choose one positive or negative search "
+                "or one read_file call; never batch paired confirmations of the same "
+                "edit."
             ),
             input_schema=_SEARCH_INPUT_SCHEMA,
         ),
@@ -152,7 +158,7 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 ),
             ),
         ),
-        execution_revision="builtin-search-text-v4-relevant-diverse-files",
+        execution_revision="builtin-search-text-v5-exact-file-provenance",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -185,6 +191,11 @@ def _search_text(
     request: SearchTextInput,
 ) -> SearchTextOutput:
     files = _searchable_files(workspace, request.path, request.glob)
+    exact_file_target = _exact_file_search_target(
+        workspace,
+        request.path,
+        files=files,
+    )
     expression = (
         re.compile(request.pattern)
         if _uses_regular_expression(request.pattern, request.regex)
@@ -193,6 +204,7 @@ def _search_text(
     matches: list[SearchTextMatch] = []
     overflow: list[SearchTextMatch] = []
     truncated = False
+    searched_file_path: str | None = None
     per_file_limit = max(1, (request.max_results + 4) // 5)
 
     for path in files:
@@ -204,6 +216,8 @@ def _search_text(
             truncated = True
         lines = raw.decode("utf-8", errors="replace").splitlines()
         relative = path.relative_to(workspace.root).as_posix()
+        if exact_file_target is not None and path == exact_file_target:
+            searched_file_path = relative
         file_match_count = 0
         for index, line in enumerate(lines):
             found = expression.search(line) if expression is not None else None
@@ -245,6 +259,7 @@ def _search_text(
                         matches=matches,
                         total_matches=len(matches),
                         truncated=True,
+                        searched_file_path=searched_file_path,
                     )
                 continue
             truncated = True
@@ -256,7 +271,26 @@ def _search_text(
         matches=returned,
         total_matches=len(returned),
         truncated=truncated,
+        searched_file_path=searched_file_path,
     )
+
+
+def _exact_file_search_target(
+    workspace: WorkspaceRuntime,
+    value: str,
+    *,
+    files: tuple[Path, ...],
+) -> Path | None:
+    lexical = workspace.resolve_path(value or ".")
+    try:
+        target = workspace.ensure_within_workspace(lexical)
+    except (OSError, ValueError):
+        return None
+    if lexical.is_symlink() or not target.is_file():
+        return None
+    if len(files) != 1 or files[0] != target:
+        return None
+    return target
 
 
 def _searchable_files(

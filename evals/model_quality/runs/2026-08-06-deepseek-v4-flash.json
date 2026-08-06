@@ -50,27 +50,23 @@
   ],
   "dirty": false,
   "evaluator_version": "agent_model_quality_gate_v3",
-  "measured_at": "2026-08-06T09:43:16.967520+00:00",
+  "measured_at": "2026-08-06T14:52:43.690064+00:00",
   "models": [
     {
-      "failures": [
-        "task_success_rate: observed 0.8 < baseline floor 1.0",
-        "mean_tool_calls_per_case: observed 2.4 > baseline ceiling 2.0",
-        "mean_model_calls_per_case: observed 3.2 > baseline ceiling 3.0"
-      ],
+      "failures": [],
       "model_alias": "deepseek_v4_flash",
       "observed": {
         "approval_continuation_rate": 1.0,
         "argument_validity_rate": 1.0,
         "failure_recovery_rate": 1.0,
         "file_tool_selection_rate": 1.0,
-        "mean_model_calls_per_case": 3.2,
-        "mean_tool_calls_per_case": 2.4,
+        "mean_model_calls_per_case": 2.6,
+        "mean_tool_calls_per_case": 1.6,
         "redundant_tool_call_rate": 0.0,
         "repeated_failure_control_rate": 1.0,
-        "task_success_rate": 0.8
+        "task_success_rate": 1.0
       },
-      "passed": false,
+      "passed": true,
       "provider_model": "deepseek-v4-flash",
       "thresholds": {
         "approval_continuation_rate": {
@@ -112,7 +108,7 @@
       }
     }
   ],
-  "passed": false,
+  "passed": true,
   "runs": [
     {
       "model_alias": "deepseek_v4_flash",
@@ -126,33 +122,33 @@
           "argument_validity_rate": 1.0,
           "failure_recovery_rate": 1.0,
           "file_tool_selection_rate": 1.0,
-          "mean_model_calls_per_case": 3.2,
-          "mean_tool_calls_per_case": 2.4,
+          "mean_model_calls_per_case": 2.6,
+          "mean_tool_calls_per_case": 1.6,
           "redundant_tool_call_rate": 0.0,
           "repeated_failure_control_rate": 1.0,
-          "task_success_rate": 0.8
+          "task_success_rate": 1.0
         },
         {
           "approval_continuation_rate": 1.0,
           "argument_validity_rate": 1.0,
           "failure_recovery_rate": 1.0,
           "file_tool_selection_rate": 1.0,
-          "mean_model_calls_per_case": 3.0,
-          "mean_tool_calls_per_case": 2.2,
+          "mean_model_calls_per_case": 2.6,
+          "mean_tool_calls_per_case": 1.6,
           "redundant_tool_call_rate": 0.0,
           "repeated_failure_control_rate": 1.0,
-          "task_success_rate": 0.8
+          "task_success_rate": 1.0
         },
         {
           "approval_continuation_rate": 1.0,
           "argument_validity_rate": 1.0,
           "failure_recovery_rate": 1.0,
           "file_tool_selection_rate": 1.0,
-          "mean_model_calls_per_case": 3.0,
-          "mean_tool_calls_per_case": 2.0,
+          "mean_model_calls_per_case": 2.6,
+          "mean_tool_calls_per_case": 1.6,
           "redundant_tool_call_rate": 0.0,
           "repeated_failure_control_rate": 1.0,
-          "task_success_rate": 0.8
+          "task_success_rate": 1.0
         }
       ],
       "trials": [
@@ -171,12 +167,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 7724,
-                "latency_ms": 5438.894835300744,
+                "input_tokens": 8633,
+                "latency_ms": 8963.368250057101,
                 "model_calls": 2,
-                "output_tokens": 190,
-                "runtime_input_namespace": "08119476-2413-4cb9-bd56-9180269b5f06",
+                "output_tokens": 168,
+                "runtime_input_namespace": "8d3fb478-c308-4601-9c69-9be11da0cf52",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -186,7 +185,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/08119476-2413-4cb9-bd56-9180269b5f06/exact.txt",
+                      "path": ".praxis/runtime/input_files/8d3fb478-c308-4601-9c69-9be11da0cf52/exact.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -202,17 +201,17 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/08119476-2413-4cb9-bd56-9180269b5f06/exact.txt",
+                      "path": ".praxis/runtime/input_files/8d3fb478-c308-4601-9c69-9be11da0cf52/exact.txt",
                       "size_bytes": 19,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_c6e3978e06b99fa5aff4",
+                    "tool_call_id": "tc_ff13d568ae2bfff22a97",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 18814,
+                "tool_schema_bytes": 21286,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -244,555 +243,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 12548,
-                "latency_ms": 6793.128416873515,
+                "input_tokens": 13615,
+                "latency_ms": 3700.890251202509,
                 "model_calls": 3,
-                "output_tokens": 321,
-                "runtime_input_namespace": "818d6d69-8e8e-40bf-9d14-c9e187c25594",
-                "status": "done",
-                "stop_reason": "accepted",
-                "tool_calls": [
-                  {
-                    "arguments": {
-                      "context_lines": 2,
-                      "glob": null,
-                      "max_results": 40,
-                      "path": ".praxis/runtime/input_files/818d6d69-8e8e-40bf-9d14-c9e187c25594",
-                      "pattern": "MODEL_QUALITY_TARGET",
-                      "regex": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "matches": [
-                        {
-                          "context_after": [],
-                          "context_before": [],
-                          "file_path": ".praxis/runtime/input_files/818d6d69-8e8e-40bf-9d14-c9e187c25594/target.py",
-                          "line_content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'",
-                          "line_number": 1,
-                          "match_end": 20,
-                          "match_start": 0
-                        }
-                      ],
-                      "total_matches": 1,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_875d43ac0f062bb8a289",
-                    "tool_name": "search_text",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/818d6d69-8e8e-40bf-9d14-c9e187c25594/target.py",
-                      "start_line": 1
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'\n",
-                      "encoding": "utf-8",
-                      "end_line": 1,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/818d6d69-8e8e-40bf-9d14-c9e187c25594/target.py",
-                      "size_bytes": 42,
-                      "start_line": 1,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_3ed8874219737ce1bece",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  }
-                ],
-                "tool_schema_bytes": 28221,
-                "workspace_assertions_passed": true
-              },
-              "score": {
-                "capability": "file_tool_selection",
-                "capability_passed": true,
-                "case_id": "symbol_search_then_read",
-                "core_success": true,
-                "expected_sequence_matched": true,
-                "first_tool_matched": true,
-                "invalid_tool_calls": 0,
-                "model_call_count": 3,
-                "passed": true,
-                "redundant_tool_calls": 0,
-                "tool_call_count": 2,
-                "valid_tool_calls": 2
-              }
-            },
-            {
-              "observation": {
-                "answer": "RECOVERED_842",
-                "approval_kind": null,
-                "approval_pause_observed": false,
-                "approval_resumes": 0,
-                "capability": "failure_recovery",
-                "case_id": "missing_file_recovery",
-                "diagnostic_codes": [
-                  "tool_call_metrics",
-                  "tool_call_metrics",
-                  "tool_call_metrics"
-                ],
-                "diagnostic_error_types": [],
-                "error": "",
-                "infrastructure_failure": false,
-                "input_tokens": 17140,
-                "latency_ms": 9200.436001177877,
-                "model_calls": 4,
-                "output_tokens": 576,
-                "runtime_input_namespace": "b2d9465b-0549-4ec8-9bc2-fed753579d13",
-                "status": "done",
-                "stop_reason": "accepted",
-                "tool_calls": [
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": "input_files/report.txt",
-                      "start_line": null
-                    },
-                    "error_code": "runner_failed",
-                    "error_message": "tool runner failed",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": true,
-                    "structured_output": null,
-                    "tool_call_id": "tc_9fc95f385f0f6895f5ee",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "glob": null,
-                      "limit": 200,
-                      "path": "input_files"
-                    },
-                    "error_code": "runner_failed",
-                    "error_message": "tool runner failed",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": true,
-                    "structured_output": null,
-                    "tool_call_id": "tc_faeb249d252f4925902e",
-                    "tool_name": "list_files",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "glob": null,
-                      "limit": 200,
-                      "path": ".praxis/runtime/input_files/b2d9465b-0549-4ec8-9bc2-fed753579d13"
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "entries": [
-                        {
-                          "is_directory": false,
-                          "is_symlink": false,
-                          "name": "report-final.txt",
-                          "path": ".praxis/runtime/input_files/b2d9465b-0549-4ec8-9bc2-fed753579d13/report-final.txt",
-                          "size_bytes": 14
-                        }
-                      ],
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_d4badcdb1c04291d0af9",
-                    "tool_name": "list_files",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/b2d9465b-0549-4ec8-9bc2-fed753579d13/report-final.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "RECOVERED_842\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/b2d9465b-0549-4ec8-9bc2-fed753579d13/report-final.txt",
-                      "size_bytes": 14,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_275e4cd7c38726050541",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  }
-                ],
-                "tool_schema_bytes": 37628,
-                "workspace_assertions_passed": true
-              },
-              "score": {
-                "capability": "failure_recovery",
-                "capability_passed": true,
-                "case_id": "missing_file_recovery",
-                "core_success": true,
-                "expected_sequence_matched": true,
-                "first_tool_matched": true,
-                "invalid_tool_calls": 0,
-                "model_call_count": 4,
-                "passed": true,
-                "redundant_tool_calls": 0,
-                "tool_call_count": 4,
-                "valid_tool_calls": 4
-              }
-            },
-            {
-              "observation": {
-                "answer": null,
-                "approval_kind": "tool_approval",
-                "approval_pause_observed": true,
-                "approval_resumes": 1,
-                "capability": "approval_continuation",
-                "case_id": "approval_continue",
-                "diagnostic_codes": [
-                  "tool_call_metrics",
-                  "tool_call_metrics",
-                  "tool_call_metrics",
-                  "tool_call_metrics"
-                ],
-                "diagnostic_error_types": [],
-                "error": "",
-                "infrastructure_failure": false,
-                "input_tokens": 22256,
-                "latency_ms": 20008.09920905158,
-                "model_calls": 5,
-                "output_tokens": 2111,
-                "runtime_input_namespace": "3525824c-984b-4ea3-b179-31d44472922e",
-                "status": "paused",
-                "stop_reason": null,
-                "tool_calls": [
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "before_gate\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "size_bytes": 12,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_d769d1d6b915a4e45865",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "file_path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "new_string": "after_gate",
-                      "old_string": "before_gate",
-                      "replace_all": false
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "file_path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "message": "patch applied",
-                      "occurrences": 1,
-                      "replaced": true
-                    },
-                    "tool_call_id": "tc_f94ec40854185ec5f52d",
-                    "tool_name": "apply_patch",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "after_gate\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "size_bytes": 11,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_dfe0471d8b928645ad43",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": "repeated_inspection",
-                    "error_message": "This exact read-only inspection already succeeded without an intervening delivery action. Use the existing result, narrow or change the arguments, choose a different tool, or make the concrete delivery change.",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": null,
-                    "tool_call_id": "tc_34f79d44b3c426271234",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  }
-                ],
-                "tool_schema_bytes": 47035,
-                "workspace_assertions_passed": true
-              },
-              "score": {
-                "capability": "approval_continuation",
-                "capability_passed": true,
-                "case_id": "approval_continue",
-                "core_success": false,
-                "expected_sequence_matched": true,
-                "first_tool_matched": false,
-                "invalid_tool_calls": 0,
-                "model_call_count": 5,
-                "passed": false,
-                "redundant_tool_calls": 0,
-                "tool_call_count": 4,
-                "valid_tool_calls": 4
-              }
-            },
-            {
-              "observation": {
-                "answer": "FILE_UNAVAILABLE",
-                "approval_kind": null,
-                "approval_pause_observed": false,
-                "approval_resumes": 0,
-                "capability": "repeated_failure_control",
-                "case_id": "single_failure_no_retry",
-                "diagnostic_codes": [
-                  "tool_call_metrics"
-                ],
-                "diagnostic_error_types": [],
-                "error": "",
-                "infrastructure_failure": false,
-                "input_tokens": 7450,
-                "latency_ms": 2900.5583750549704,
-                "model_calls": 2,
-                "output_tokens": 220,
-                "runtime_input_namespace": "cb8485b5-6a6b-4212-ad49-8adcab4763cb",
-                "status": "done",
-                "stop_reason": "accepted",
-                "tool_calls": [
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": "input_files/definitely-missing.txt",
-                      "start_line": null
-                    },
-                    "error_code": "runner_failed",
-                    "error_message": "tool runner failed",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": true,
-                    "structured_output": null,
-                    "tool_call_id": "tc_e63f295c259b40d2da7c",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  }
-                ],
-                "tool_schema_bytes": 18814,
-                "workspace_assertions_passed": true
-              },
-              "score": {
-                "capability": "repeated_failure_control",
-                "capability_passed": true,
-                "case_id": "single_failure_no_retry",
-                "core_success": true,
-                "expected_sequence_matched": true,
-                "first_tool_matched": true,
-                "invalid_tool_calls": 0,
-                "model_call_count": 2,
-                "passed": true,
-                "redundant_tool_calls": 0,
-                "tool_call_count": 1,
-                "valid_tool_calls": 1
-              }
-            }
-          ],
-          "informational_metrics": {
-            "mean_input_tokens_per_case": 13423.6,
-            "mean_latency_ms_per_case": 8868.223367491737,
-            "mean_output_tokens_per_case": 683.6,
-            "mean_tool_schema_bytes_per_case": 30102.4
-          },
-          "metrics": {
-            "approval_continuation_rate": 1.0,
-            "argument_validity_rate": 1.0,
-            "failure_recovery_rate": 1.0,
-            "file_tool_selection_rate": 1.0,
-            "mean_model_calls_per_case": 3.2,
-            "mean_tool_calls_per_case": 2.4,
-            "redundant_tool_call_rate": 0.0,
-            "repeated_failure_control_rate": 1.0,
-            "task_success_rate": 0.8
-          },
-          "trial": 1
-        },
-        {
-          "cases": [
-            {
-              "observation": {
-                "answer": "QUALITY_GATE_EXACT",
-                "approval_kind": null,
-                "approval_pause_observed": false,
-                "approval_resumes": 0,
-                "capability": "file_tool_selection",
-                "case_id": "exact_file_read",
-                "diagnostic_codes": [
-                  "tool_call_metrics"
-                ],
-                "diagnostic_error_types": [],
-                "error": "",
-                "infrastructure_failure": false,
-                "input_tokens": 7770,
-                "latency_ms": 3012.360041961074,
-                "model_calls": 2,
-                "output_tokens": 171,
-                "runtime_input_namespace": "2be6f7f7-eef6-4d1f-b2f1-e839ea2f26f9",
-                "status": "done",
-                "stop_reason": "accepted",
-                "tool_calls": [
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/2be6f7f7-eef6-4d1f-b2f1-e839ea2f26f9/exact.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "QUALITY_GATE_EXACT\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/2be6f7f7-eef6-4d1f-b2f1-e839ea2f26f9/exact.txt",
-                      "size_bytes": 19,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_ea55b3ef0574aafc1a1a",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  }
-                ],
-                "tool_schema_bytes": 18814,
-                "workspace_assertions_passed": true
-              },
-              "score": {
-                "capability": "file_tool_selection",
-                "capability_passed": true,
-                "case_id": "exact_file_read",
-                "core_success": true,
-                "expected_sequence_matched": true,
-                "first_tool_matched": true,
-                "invalid_tool_calls": 0,
-                "model_call_count": 2,
-                "passed": true,
-                "redundant_tool_calls": 0,
-                "tool_call_count": 1,
-                "valid_tool_calls": 1
-              }
-            },
-            {
-              "observation": {
-                "answer": "TARGET_VALUE_731",
-                "approval_kind": null,
-                "approval_pause_observed": false,
-                "approval_resumes": 0,
-                "capability": "file_tool_selection",
-                "case_id": "symbol_search_then_read",
-                "diagnostic_codes": [
-                  "tool_call_metrics",
-                  "tool_call_metrics"
-                ],
-                "diagnostic_error_types": [],
-                "error": "",
-                "infrastructure_failure": false,
-                "input_tokens": 12352,
-                "latency_ms": 7404.86199897714,
-                "model_calls": 3,
-                "output_tokens": 215,
-                "runtime_input_namespace": "1838c12d-cae2-49d3-adc8-34eb00422d9e",
+                "output_tokens": 168,
+                "runtime_input_namespace": "1ae8426b-a68f-4fe8-bfea-d5cc6c780ce2",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -815,17 +274,18 @@
                         {
                           "context_after": [],
                           "context_before": [],
-                          "file_path": ".praxis/runtime/input_files/1838c12d-cae2-49d3-adc8-34eb00422d9e/target.py",
+                          "file_path": ".praxis/runtime/input_files/1ae8426b-a68f-4fe8-bfea-d5cc6c780ce2/target.py",
                           "line_content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'",
                           "line_number": 1,
                           "match_end": 20,
                           "match_start": 0
                         }
                       ],
+                      "searched_file_path": null,
                       "total_matches": 1,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_0226342f3aef7a079d8f",
+                    "tool_call_id": "tc_e7795ec23981219809af",
                     "tool_name": "search_text",
                     "truncated": false
                   },
@@ -835,7 +295,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/1838c12d-cae2-49d3-adc8-34eb00422d9e/target.py",
+                      "path": ".praxis/runtime/input_files/1ae8426b-a68f-4fe8-bfea-d5cc6c780ce2/target.py",
                       "start_line": null
                     },
                     "error_code": null,
@@ -851,17 +311,17 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/1838c12d-cae2-49d3-adc8-34eb00422d9e/target.py",
+                      "path": ".praxis/runtime/input_files/1ae8426b-a68f-4fe8-bfea-d5cc6c780ce2/target.py",
                       "size_bytes": 42,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_52fa46fd69d02231dd10",
+                    "tool_call_id": "tc_301c257081fe1a30ac91",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 28221,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -893,12 +353,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 12380,
-                "latency_ms": 5989.8909570183605,
+                "input_tokens": 13369,
+                "latency_ms": 5224.570082267746,
                 "model_calls": 3,
-                "output_tokens": 384,
-                "runtime_input_namespace": "e004f1af-8ca5-4f0e-842f-d5019cb01449",
+                "output_tokens": 290,
+                "runtime_input_namespace": "98a83914-0a5f-4b36-a02a-851819705390",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -917,24 +380,8 @@
                     "latency_ms": null,
                     "retryable": true,
                     "structured_output": null,
-                    "tool_call_id": "tc_0f1d2ba7f4606dc183fa",
+                    "tool_call_id": "tc_2d395a251ededb5b071d",
                     "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "glob": null,
-                      "limit": 200,
-                      "path": "input_files"
-                    },
-                    "error_code": "runner_failed",
-                    "error_message": "tool runner failed",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": true,
-                    "structured_output": null,
-                    "tool_call_id": "tc_c861460d6e08fa2d238f",
-                    "tool_name": "list_files",
                     "truncated": false
                   },
                   {
@@ -943,7 +390,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/e004f1af-8ca5-4f0e-842f-d5019cb01449/report-final.txt",
+                      "path": ".praxis/runtime/input_files/98a83914-0a5f-4b36-a02a-851819705390/report-final.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -959,17 +406,17 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/e004f1af-8ca5-4f0e-842f-d5019cb01449/report-final.txt",
+                      "path": ".praxis/runtime/input_files/98a83914-0a5f-4b36-a02a-851819705390/report-final.txt",
                       "size_bytes": 14,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_fb3f2ff3a284ef02105b",
+                    "tool_call_id": "tc_2ca9652b474eb0ea9edf",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 28221,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -983,13 +430,13 @@
                 "model_call_count": 3,
                 "passed": true,
                 "redundant_tool_calls": 0,
-                "tool_call_count": 3,
-                "valid_tool_calls": 3
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
               }
             },
             {
               "observation": {
-                "answer": null,
+                "answer": "The change is confirmed complete.\n\n**Result:** The unique text `before_gate` in `.praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt` was replaced with `after_gate` via `apply_patch` (1 occurrence replaced, patch applied successfully).\n\n**Verification:** A follow-up read of the file confirms its content is now exactly:\n```\nafter_gate\n```\n(11 bytes, UTF-8, previously 12 bytes with `before_gate`). The requested change is done.",
                 "approval_kind": "tool_approval",
                 "approval_pause_observed": true,
                 "approval_resumes": 1,
@@ -997,55 +444,25 @@
                 "case_id": "approval_continue",
                 "diagnostic_codes": [
                   "tool_call_metrics",
-                  "tool_call_metrics",
-                  "tool_call_metrics",
                   "tool_call_metrics"
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 22140,
-                "latency_ms": 22608.967332169414,
-                "model_calls": 5,
-                "output_tokens": 1797,
-                "runtime_input_namespace": "1fc9227f-a572-485f-8e71-d7396cbcc126",
-                "status": "paused",
-                "stop_reason": null,
+                "input_tokens": 13497,
+                "latency_ms": 9468.98008394055,
+                "model_calls": 3,
+                "output_tokens": 895,
+                "runtime_input_namespace": "bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae",
+                "status": "done",
+                "stop_reason": "accepted",
                 "tool_calls": [
                   {
                     "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "before_gate\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
-                      "size_bytes": 12,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_3d4f2acbcfe5f06cf153",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "file_path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
+                      "file_path": ".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt",
                       "new_string": "after_gate",
                       "old_string": "before_gate",
                       "replace_all": false
@@ -1056,12 +473,12 @@
                     "latency_ms": null,
                     "retryable": false,
                     "structured_output": {
-                      "file_path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
+                      "file_path": ".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt",
                       "message": "patch applied",
                       "occurrences": 1,
                       "replaced": true
                     },
-                    "tool_call_id": "tc_37259b61a1f58b41fa4d",
+                    "tool_call_id": "tc_a518c2aae35da91db71c",
                     "tool_name": "apply_patch",
                     "truncated": false
                   },
@@ -1071,7 +488,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
+                      "path": ".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -1087,51 +504,32 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
+                      "path": ".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt",
                       "size_bytes": 11,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_82587cf5e70511539d4a",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": "repeated_inspection",
-                    "error_message": "This exact read-only inspection already succeeded without an intervening delivery action. Use the existing result, narrow or change the arguments, choose a different tool, or make the concrete delivery change.",
-                    "is_error": true,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": null,
-                    "tool_call_id": "tc_8895a93777b31f8655bb",
+                    "tool_call_id": "tc_f4a246e40d524d4a66e6",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 47035,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
                 "capability": "approval_continuation",
                 "capability_passed": true,
                 "case_id": "approval_continue",
-                "core_success": false,
+                "core_success": true,
                 "expected_sequence_matched": true,
-                "first_tool_matched": false,
+                "first_tool_matched": true,
                 "invalid_tool_calls": 0,
-                "model_call_count": 5,
-                "passed": false,
+                "model_call_count": 3,
+                "passed": true,
                 "redundant_tool_calls": 0,
-                "tool_call_count": 4,
-                "valid_tool_calls": 4
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
               }
             },
             {
@@ -1147,12 +545,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 7468,
-                "latency_ms": 5518.3193339034915,
+                "input_tokens": 8342,
+                "latency_ms": 3153.574125142768,
                 "model_calls": 2,
-                "output_tokens": 210,
-                "runtime_input_namespace": "531d6d31-3d67-43ef-8b6c-e4b2c6c887ed",
+                "output_tokens": 105,
+                "runtime_input_namespace": "a09f3e20-3f13-4210-a38b-5c406738fda8",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -1171,12 +572,12 @@
                     "latency_ms": null,
                     "retryable": true,
                     "structured_output": null,
-                    "tool_call_id": "tc_99bba1a52cfb3a678741",
+                    "tool_call_id": "tc_56136d903620bbb48c6d",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 18814,
+                "tool_schema_bytes": 21286,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -1196,23 +597,23 @@
             }
           ],
           "informational_metrics": {
-            "mean_input_tokens_per_case": 12422.0,
-            "mean_latency_ms_per_case": 8906.879932805896,
-            "mean_output_tokens_per_case": 555.4,
-            "mean_tool_schema_bytes_per_case": 28221.0
+            "mean_input_tokens_per_case": 11491.2,
+            "mean_latency_ms_per_case": 6102.276558522135,
+            "mean_output_tokens_per_case": 325.2,
+            "mean_tool_schema_bytes_per_case": 27671.8
           },
           "metrics": {
             "approval_continuation_rate": 1.0,
             "argument_validity_rate": 1.0,
             "failure_recovery_rate": 1.0,
             "file_tool_selection_rate": 1.0,
-            "mean_model_calls_per_case": 3.0,
-            "mean_tool_calls_per_case": 2.2,
+            "mean_model_calls_per_case": 2.6,
+            "mean_tool_calls_per_case": 1.6,
             "redundant_tool_call_rate": 0.0,
             "repeated_failure_control_rate": 1.0,
-            "task_success_rate": 0.8
+            "task_success_rate": 1.0
           },
-          "trial": 2
+          "trial": 1
         },
         {
           "cases": [
@@ -1229,12 +630,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 7700,
-                "latency_ms": 3058.431833051145,
+                "input_tokens": 8592,
+                "latency_ms": 2988.350415835157,
                 "model_calls": 2,
-                "output_tokens": 148,
-                "runtime_input_namespace": "372119ac-86b7-401a-9249-55a3fe3a5a9e",
+                "output_tokens": 141,
+                "runtime_input_namespace": "c59e6e55-229a-463d-887e-2cc15ff7e7ac",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -1244,7 +648,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/372119ac-86b7-401a-9249-55a3fe3a5a9e/exact.txt",
+                      "path": ".praxis/runtime/input_files/c59e6e55-229a-463d-887e-2cc15ff7e7ac/exact.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -1260,17 +664,17 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/372119ac-86b7-401a-9249-55a3fe3a5a9e/exact.txt",
+                      "path": ".praxis/runtime/input_files/c59e6e55-229a-463d-887e-2cc15ff7e7ac/exact.txt",
                       "size_bytes": 19,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_2b8b07dd8d06818f332f",
+                    "tool_call_id": "tc_578af16db52b62260f6f",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 18814,
+                "tool_schema_bytes": 21286,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -1302,12 +706,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 12508,
-                "latency_ms": 4610.109667060897,
+                "input_tokens": 13829,
+                "latency_ms": 4635.299290996045,
                 "model_calls": 3,
-                "output_tokens": 290,
-                "runtime_input_namespace": "dc76d706-f5e8-487d-bb91-583e0dd63b65",
+                "output_tokens": 255,
+                "runtime_input_namespace": "b3fdf72b-35f2-4553-a6aa-326f44284a94",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -1316,7 +723,7 @@
                       "context_lines": 2,
                       "glob": null,
                       "max_results": 40,
-                      "path": ".praxis/runtime/input_files/dc76d706-f5e8-487d-bb91-583e0dd63b65",
+                      "path": ".praxis/runtime/input_files/b3fdf72b-35f2-4553-a6aa-326f44284a94",
                       "pattern": "MODEL_QUALITY_TARGET",
                       "regex": null
                     },
@@ -1330,17 +737,18 @@
                         {
                           "context_after": [],
                           "context_before": [],
-                          "file_path": ".praxis/runtime/input_files/dc76d706-f5e8-487d-bb91-583e0dd63b65/target.py",
+                          "file_path": ".praxis/runtime/input_files/b3fdf72b-35f2-4553-a6aa-326f44284a94/target.py",
                           "line_content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'",
                           "line_number": 1,
                           "match_end": 20,
                           "match_start": 0
                         }
                       ],
+                      "searched_file_path": null,
                       "total_matches": 1,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_d9ae10a4a69f4545dc54",
+                    "tool_call_id": "tc_ab1e87cc5f0faaf208dd",
                     "tool_name": "search_text",
                     "truncated": false
                   },
@@ -1350,8 +758,8 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/dc76d706-f5e8-487d-bb91-583e0dd63b65/target.py",
-                      "start_line": 1
+                      "path": ".praxis/runtime/input_files/b3fdf72b-35f2-4553-a6aa-326f44284a94/target.py",
+                      "start_line": null
                     },
                     "error_code": null,
                     "error_message": null,
@@ -1361,22 +769,22 @@
                     "structured_output": {
                       "content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'\n",
                       "encoding": "utf-8",
-                      "end_line": 1,
+                      "end_line": null,
                       "is_binary": false,
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/dc76d706-f5e8-487d-bb91-583e0dd63b65/target.py",
+                      "path": ".praxis/runtime/input_files/b3fdf72b-35f2-4553-a6aa-326f44284a94/target.py",
                       "size_bytes": 42,
-                      "start_line": 1,
+                      "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_31fc40d449045102d11d",
+                    "tool_call_id": "tc_d458852d4e8dfd7a6975",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 28221,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -1404,17 +812,19 @@
                 "case_id": "missing_file_recovery",
                 "diagnostic_codes": [
                   "tool_call_metrics",
-                  "tool_call_metrics",
                   "tool_call_metrics"
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 16768,
-                "latency_ms": 6674.206709023565,
-                "model_calls": 4,
-                "output_tokens": 514,
-                "runtime_input_namespace": "768a5be2-4763-4205-b78e-3593d143e984",
+                "input_tokens": 13406,
+                "latency_ms": 4952.284709084779,
+                "model_calls": 3,
+                "output_tokens": 284,
+                "runtime_input_namespace": "a9d15b30-979c-43b1-8bac-c67f84caa7c6",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -1433,35 +843,8 @@
                     "latency_ms": null,
                     "retryable": true,
                     "structured_output": null,
-                    "tool_call_id": "tc_8f1b18658d98aac8163b",
+                    "tool_call_id": "tc_5fff8836a3ff41bd88d2",
                     "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "glob": null,
-                      "limit": 200,
-                      "path": ".praxis/runtime/input_files/768a5be2-4763-4205-b78e-3593d143e984"
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "entries": [
-                        {
-                          "is_directory": false,
-                          "is_symlink": false,
-                          "name": "report-final.txt",
-                          "path": ".praxis/runtime/input_files/768a5be2-4763-4205-b78e-3593d143e984/report-final.txt",
-                          "size_bytes": 14
-                        }
-                      ],
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_e27fc01604bb3449a577",
-                    "tool_name": "list_files",
                     "truncated": false
                   },
                   {
@@ -1470,7 +853,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/768a5be2-4763-4205-b78e-3593d143e984/report-final.txt",
+                      "path": ".praxis/runtime/input_files/a9d15b30-979c-43b1-8bac-c67f84caa7c6/report-final.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -1486,17 +869,17 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/768a5be2-4763-4205-b78e-3593d143e984/report-final.txt",
+                      "path": ".praxis/runtime/input_files/a9d15b30-979c-43b1-8bac-c67f84caa7c6/report-final.txt",
                       "size_bytes": 14,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_12199c5836e4283b9fd5",
+                    "tool_call_id": "tc_3b8e7db4f769e6ab351a",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 37628,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -1507,16 +890,16 @@
                 "expected_sequence_matched": true,
                 "first_tool_matched": true,
                 "invalid_tool_calls": 0,
-                "model_call_count": 4,
+                "model_call_count": 3,
                 "passed": true,
                 "redundant_tool_calls": 0,
-                "tool_call_count": 3,
-                "valid_tool_calls": 3
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
               }
             },
             {
               "observation": {
-                "answer": null,
+                "answer": "Done. The change was applied and confirmed:\n\n- **Patch applied:** `apply_patch` replaced the unique text `before_gate` → `after_gate` in `.praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt` (1 occurrence replaced).\n- **Confirmed:** A follow-up read of the file shows its content is now exactly `after_gate\\n` (UTF-8, 11 bytes), matching the requested state.\n\nCompletion confirmed.",
                 "approval_kind": "tool_approval",
                 "approval_pause_observed": true,
                 "approval_resumes": 1,
@@ -1524,54 +907,25 @@
                 "case_id": "approval_continue",
                 "diagnostic_codes": [
                   "tool_call_metrics",
-                  "tool_call_metrics",
                   "tool_call_metrics"
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 16543,
-                "latency_ms": 16849.822042277083,
-                "model_calls": 4,
-                "output_tokens": 1378,
-                "runtime_input_namespace": "bd5d1293-ec3d-4f23-b0a0-7b0ab264faee",
-                "status": "paused",
-                "stop_reason": null,
+                "input_tokens": 13430,
+                "latency_ms": 17483.117500087246,
+                "model_calls": 3,
+                "output_tokens": 1705,
+                "runtime_input_namespace": "5663e08c-e1ca-4f4d-8c62-7f05029c6dd9",
+                "status": "done",
+                "stop_reason": "accepted",
                 "tool_calls": [
                   {
                     "arguments": {
-                      "encoding": "utf-8",
-                      "max_bytes": 16000,
-                      "max_lines": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
-                      "start_line": null
-                    },
-                    "error_code": null,
-                    "error_message": null,
-                    "is_error": false,
-                    "latency_ms": null,
-                    "retryable": false,
-                    "structured_output": {
-                      "content": "before_gate\n",
-                      "encoding": "utf-8",
-                      "end_line": null,
-                      "is_binary": false,
-                      "next_line": null,
-                      "next_offset": null,
-                      "offset": 0,
-                      "path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
-                      "size_bytes": 12,
-                      "start_line": null,
-                      "truncated": false
-                    },
-                    "tool_call_id": "tc_e2da71e2c466d3be04a4",
-                    "tool_name": "read_file",
-                    "truncated": false
-                  },
-                  {
-                    "arguments": {
-                      "file_path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
+                      "file_path": ".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt",
                       "new_string": "after_gate",
                       "old_string": "before_gate",
                       "replace_all": false
@@ -1582,12 +936,12 @@
                     "latency_ms": null,
                     "retryable": false,
                     "structured_output": {
-                      "file_path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
+                      "file_path": ".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt",
                       "message": "patch applied",
                       "occurrences": 1,
                       "replaced": true
                     },
-                    "tool_call_id": "tc_b2e6ac64e6538d6296a9",
+                    "tool_call_id": "tc_10ab6f06835a5784e9b7",
                     "tool_name": "apply_patch",
                     "truncated": false
                   },
@@ -1597,7 +951,7 @@
                       "max_bytes": 16000,
                       "max_lines": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
+                      "path": ".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt",
                       "start_line": null
                     },
                     "error_code": null,
@@ -1613,32 +967,32 @@
                       "next_line": null,
                       "next_offset": null,
                       "offset": 0,
-                      "path": ".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt",
+                      "path": ".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt",
                       "size_bytes": 11,
                       "start_line": null,
                       "truncated": false
                     },
-                    "tool_call_id": "tc_dc77d408a0e79b067936",
+                    "tool_call_id": "tc_f6d08af6cbbbfee7ca34",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 37628,
+                "tool_schema_bytes": 31929,
                 "workspace_assertions_passed": true
               },
               "score": {
                 "capability": "approval_continuation",
                 "capability_passed": true,
                 "case_id": "approval_continue",
-                "core_success": false,
+                "core_success": true,
                 "expected_sequence_matched": true,
-                "first_tool_matched": false,
+                "first_tool_matched": true,
                 "invalid_tool_calls": 0,
-                "model_call_count": 4,
-                "passed": false,
+                "model_call_count": 3,
+                "passed": true,
                 "redundant_tool_calls": 0,
-                "tool_call_count": 3,
-                "valid_tool_calls": 3
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
               }
             },
             {
@@ -1654,12 +1008,15 @@
                 ],
                 "diagnostic_error_types": [],
                 "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
                 "infrastructure_failure": false,
-                "input_tokens": 7431,
-                "latency_ms": 2859.4645420089364,
+                "input_tokens": 8344,
+                "latency_ms": 3133.7859593331814,
                 "model_calls": 2,
-                "output_tokens": 125,
-                "runtime_input_namespace": "178ea449-ec9c-43d2-8de3-d9928e78f7c6",
+                "output_tokens": 212,
+                "runtime_input_namespace": "d3016fba-9f7e-49ef-a81f-0faed387701f",
                 "status": "done",
                 "stop_reason": "accepted",
                 "tool_calls": [
@@ -1678,12 +1035,12 @@
                     "latency_ms": null,
                     "retryable": true,
                     "structured_output": null,
-                    "tool_call_id": "tc_9ce2b494d5923aa6b23d",
+                    "tool_call_id": "tc_09e4c1bccb682ef76149",
                     "tool_name": "read_file",
                     "truncated": false
                   }
                 ],
-                "tool_schema_bytes": 18814,
+                "tool_schema_bytes": 21286,
                 "workspace_assertions_passed": true
               },
               "score": {
@@ -1703,21 +1060,484 @@
             }
           ],
           "informational_metrics": {
-            "mean_input_tokens_per_case": 12190.0,
-            "mean_latency_ms_per_case": 6810.406958684325,
-            "mean_output_tokens_per_case": 491.0,
-            "mean_tool_schema_bytes_per_case": 28221.0
+            "mean_input_tokens_per_case": 11520.2,
+            "mean_latency_ms_per_case": 6638.567575067282,
+            "mean_output_tokens_per_case": 519.4,
+            "mean_tool_schema_bytes_per_case": 27671.8
           },
           "metrics": {
             "approval_continuation_rate": 1.0,
             "argument_validity_rate": 1.0,
             "failure_recovery_rate": 1.0,
             "file_tool_selection_rate": 1.0,
-            "mean_model_calls_per_case": 3.0,
-            "mean_tool_calls_per_case": 2.0,
+            "mean_model_calls_per_case": 2.6,
+            "mean_tool_calls_per_case": 1.6,
             "redundant_tool_call_rate": 0.0,
             "repeated_failure_control_rate": 1.0,
-            "task_success_rate": 0.8
+            "task_success_rate": 1.0
+          },
+          "trial": 2
+        },
+        {
+          "cases": [
+            {
+              "observation": {
+                "answer": "QUALITY_GATE_EXACT",
+                "approval_kind": null,
+                "approval_pause_observed": false,
+                "approval_resumes": 0,
+                "capability": "file_tool_selection",
+                "case_id": "exact_file_read",
+                "diagnostic_codes": [
+                  "tool_call_metrics"
+                ],
+                "diagnostic_error_types": [],
+                "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
+                "infrastructure_failure": false,
+                "input_tokens": 8604,
+                "latency_ms": 2791.6957908309996,
+                "model_calls": 2,
+                "output_tokens": 121,
+                "runtime_input_namespace": "37425a5e-e98c-4e7d-9c7b-e746acf0087b",
+                "status": "done",
+                "stop_reason": "accepted",
+                "tool_calls": [
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/37425a5e-e98c-4e7d-9c7b-e746acf0087b/exact.txt",
+                      "start_line": null
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "content": "QUALITY_GATE_EXACT\n",
+                      "encoding": "utf-8",
+                      "end_line": null,
+                      "is_binary": false,
+                      "next_line": null,
+                      "next_offset": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/37425a5e-e98c-4e7d-9c7b-e746acf0087b/exact.txt",
+                      "size_bytes": 19,
+                      "start_line": null,
+                      "truncated": false
+                    },
+                    "tool_call_id": "tc_592491ad6a707a7d4fdf",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  }
+                ],
+                "tool_schema_bytes": 21286,
+                "workspace_assertions_passed": true
+              },
+              "score": {
+                "capability": "file_tool_selection",
+                "capability_passed": true,
+                "case_id": "exact_file_read",
+                "core_success": true,
+                "expected_sequence_matched": true,
+                "first_tool_matched": true,
+                "invalid_tool_calls": 0,
+                "model_call_count": 2,
+                "passed": true,
+                "redundant_tool_calls": 0,
+                "tool_call_count": 1,
+                "valid_tool_calls": 1
+              }
+            },
+            {
+              "observation": {
+                "answer": "TARGET_VALUE_731",
+                "approval_kind": null,
+                "approval_pause_observed": false,
+                "approval_resumes": 0,
+                "capability": "file_tool_selection",
+                "case_id": "symbol_search_then_read",
+                "diagnostic_codes": [
+                  "tool_call_metrics",
+                  "tool_call_metrics"
+                ],
+                "diagnostic_error_types": [],
+                "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
+                "infrastructure_failure": false,
+                "input_tokens": 13817,
+                "latency_ms": 5343.548043165356,
+                "model_calls": 3,
+                "output_tokens": 261,
+                "runtime_input_namespace": "7602c269-3ee8-4093-9549-6767489162f7",
+                "status": "done",
+                "stop_reason": "accepted",
+                "tool_calls": [
+                  {
+                    "arguments": {
+                      "context_lines": 2,
+                      "glob": null,
+                      "max_results": 40,
+                      "path": ".praxis/runtime/input_files/7602c269-3ee8-4093-9549-6767489162f7",
+                      "pattern": "MODEL_QUALITY_TARGET",
+                      "regex": null
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "matches": [
+                        {
+                          "context_after": [],
+                          "context_before": [],
+                          "file_path": ".praxis/runtime/input_files/7602c269-3ee8-4093-9549-6767489162f7/target.py",
+                          "line_content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'",
+                          "line_number": 1,
+                          "match_end": 20,
+                          "match_start": 0
+                        }
+                      ],
+                      "searched_file_path": null,
+                      "total_matches": 1,
+                      "truncated": false
+                    },
+                    "tool_call_id": "tc_3385a335c4ec0812d734",
+                    "tool_name": "search_text",
+                    "truncated": false
+                  },
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/7602c269-3ee8-4093-9549-6767489162f7/target.py",
+                      "start_line": null
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "content": "MODEL_QUALITY_TARGET = 'TARGET_VALUE_731'\n",
+                      "encoding": "utf-8",
+                      "end_line": null,
+                      "is_binary": false,
+                      "next_line": null,
+                      "next_offset": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/7602c269-3ee8-4093-9549-6767489162f7/target.py",
+                      "size_bytes": 42,
+                      "start_line": null,
+                      "truncated": false
+                    },
+                    "tool_call_id": "tc_3b6a48f4772eed65c3db",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  }
+                ],
+                "tool_schema_bytes": 31929,
+                "workspace_assertions_passed": true
+              },
+              "score": {
+                "capability": "file_tool_selection",
+                "capability_passed": true,
+                "case_id": "symbol_search_then_read",
+                "core_success": true,
+                "expected_sequence_matched": true,
+                "first_tool_matched": true,
+                "invalid_tool_calls": 0,
+                "model_call_count": 3,
+                "passed": true,
+                "redundant_tool_calls": 0,
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
+              }
+            },
+            {
+              "observation": {
+                "answer": "RECOVERED_842",
+                "approval_kind": null,
+                "approval_pause_observed": false,
+                "approval_resumes": 0,
+                "capability": "failure_recovery",
+                "case_id": "missing_file_recovery",
+                "diagnostic_codes": [
+                  "tool_call_metrics",
+                  "tool_call_metrics"
+                ],
+                "diagnostic_error_types": [],
+                "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
+                "infrastructure_failure": false,
+                "input_tokens": 13482,
+                "latency_ms": 5391.309915808961,
+                "model_calls": 3,
+                "output_tokens": 319,
+                "runtime_input_namespace": "1a157895-2fc4-4141-a560-d0661812db65",
+                "status": "done",
+                "stop_reason": "accepted",
+                "tool_calls": [
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": "input_files/report.txt",
+                      "start_line": null
+                    },
+                    "error_code": "runner_failed",
+                    "error_message": "tool runner failed",
+                    "is_error": true,
+                    "latency_ms": null,
+                    "retryable": true,
+                    "structured_output": null,
+                    "tool_call_id": "tc_9ff6666d552d6a3f3566",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  },
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/1a157895-2fc4-4141-a560-d0661812db65/report-final.txt",
+                      "start_line": null
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "content": "RECOVERED_842\n",
+                      "encoding": "utf-8",
+                      "end_line": null,
+                      "is_binary": false,
+                      "next_line": null,
+                      "next_offset": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/1a157895-2fc4-4141-a560-d0661812db65/report-final.txt",
+                      "size_bytes": 14,
+                      "start_line": null,
+                      "truncated": false
+                    },
+                    "tool_call_id": "tc_472618347cd9b57c2e09",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  }
+                ],
+                "tool_schema_bytes": 31929,
+                "workspace_assertions_passed": true
+              },
+              "score": {
+                "capability": "failure_recovery",
+                "capability_passed": true,
+                "case_id": "missing_file_recovery",
+                "core_success": true,
+                "expected_sequence_matched": true,
+                "first_tool_matched": true,
+                "invalid_tool_calls": 0,
+                "model_call_count": 3,
+                "passed": true,
+                "redundant_tool_calls": 0,
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
+              }
+            },
+            {
+              "observation": {
+                "answer": "The change is complete and confirmed:\n\n- **Edit applied:** `apply_patch` replaced the unique text `before_gate` with `after_gate` in `approval.txt` (1 occurrence replaced, patch reported applied).\n- **Verified:** A follow-up read of `.praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt` shows the file content is now exactly `after_gate\\n` (11 bytes, UTF-8).\n\nThe requested state is in place — the file no longer contains `before_gate`.",
+                "approval_kind": "tool_approval",
+                "approval_pause_observed": true,
+                "approval_resumes": 1,
+                "capability": "approval_continuation",
+                "case_id": "approval_continue",
+                "diagnostic_codes": [
+                  "tool_call_metrics",
+                  "tool_call_metrics"
+                ],
+                "diagnostic_error_types": [],
+                "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
+                "infrastructure_failure": false,
+                "input_tokens": 13356,
+                "latency_ms": 18053.717749891803,
+                "model_calls": 3,
+                "output_tokens": 1713,
+                "runtime_input_namespace": "b9ce15fb-97bc-4bd0-8600-57591b70864c",
+                "status": "done",
+                "stop_reason": "accepted",
+                "tool_calls": [
+                  {
+                    "arguments": {
+                      "file_path": ".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt",
+                      "new_string": "after_gate",
+                      "old_string": "before_gate",
+                      "replace_all": false
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "file_path": ".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt",
+                      "message": "patch applied",
+                      "occurrences": 1,
+                      "replaced": true
+                    },
+                    "tool_call_id": "tc_1e6f94015b8d9ab60bd7",
+                    "tool_name": "apply_patch",
+                    "truncated": false
+                  },
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt",
+                      "start_line": null
+                    },
+                    "error_code": null,
+                    "error_message": null,
+                    "is_error": false,
+                    "latency_ms": null,
+                    "retryable": false,
+                    "structured_output": {
+                      "content": "after_gate\n",
+                      "encoding": "utf-8",
+                      "end_line": null,
+                      "is_binary": false,
+                      "next_line": null,
+                      "next_offset": null,
+                      "offset": 0,
+                      "path": ".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt",
+                      "size_bytes": 11,
+                      "start_line": null,
+                      "truncated": false
+                    },
+                    "tool_call_id": "tc_4f3bcb231adbe4d083e5",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  }
+                ],
+                "tool_schema_bytes": 31929,
+                "workspace_assertions_passed": true
+              },
+              "score": {
+                "capability": "approval_continuation",
+                "capability_passed": true,
+                "case_id": "approval_continue",
+                "core_success": true,
+                "expected_sequence_matched": true,
+                "first_tool_matched": true,
+                "invalid_tool_calls": 0,
+                "model_call_count": 3,
+                "passed": true,
+                "redundant_tool_calls": 0,
+                "tool_call_count": 2,
+                "valid_tool_calls": 2
+              }
+            },
+            {
+              "observation": {
+                "answer": "FILE_UNAVAILABLE",
+                "approval_kind": null,
+                "approval_pause_observed": false,
+                "approval_resumes": 0,
+                "capability": "repeated_failure_control",
+                "case_id": "single_failure_no_retry",
+                "diagnostic_codes": [
+                  "tool_call_metrics"
+                ],
+                "diagnostic_error_types": [],
+                "error": "",
+                "final_pause_reason": null,
+                "final_pause_request_kind": null,
+                "final_pause_tool_names": [],
+                "infrastructure_failure": false,
+                "input_tokens": 8294,
+                "latency_ms": 3883.8066251482815,
+                "model_calls": 2,
+                "output_tokens": 223,
+                "runtime_input_namespace": "abd47358-0302-4194-8c1d-b730fea1a524",
+                "status": "done",
+                "stop_reason": "accepted",
+                "tool_calls": [
+                  {
+                    "arguments": {
+                      "encoding": "utf-8",
+                      "max_bytes": 16000,
+                      "max_lines": null,
+                      "offset": 0,
+                      "path": "input_files/definitely-missing.txt",
+                      "start_line": null
+                    },
+                    "error_code": "runner_failed",
+                    "error_message": "tool runner failed",
+                    "is_error": true,
+                    "latency_ms": null,
+                    "retryable": true,
+                    "structured_output": null,
+                    "tool_call_id": "tc_699523934092be50a532",
+                    "tool_name": "read_file",
+                    "truncated": false
+                  }
+                ],
+                "tool_schema_bytes": 21286,
+                "workspace_assertions_passed": true
+              },
+              "score": {
+                "capability": "repeated_failure_control",
+                "capability_passed": true,
+                "case_id": "single_failure_no_retry",
+                "core_success": true,
+                "expected_sequence_matched": true,
+                "first_tool_matched": true,
+                "invalid_tool_calls": 0,
+                "model_call_count": 2,
+                "passed": true,
+                "redundant_tool_calls": 0,
+                "tool_call_count": 1,
+                "valid_tool_calls": 1
+              }
+            }
+          ],
+          "informational_metrics": {
+            "mean_input_tokens_per_case": 11510.6,
+            "mean_latency_ms_per_case": 7092.81562496908,
+            "mean_output_tokens_per_case": 527.4,
+            "mean_tool_schema_bytes_per_case": 27671.8
+          },
+          "metrics": {
+            "approval_continuation_rate": 1.0,
+            "argument_validity_rate": 1.0,
+            "failure_recovery_rate": 1.0,
+            "file_tool_selection_rate": 1.0,
+            "mean_model_calls_per_case": 2.6,
+            "mean_tool_calls_per_case": 1.6,
+            "redundant_tool_call_rate": 0.0,
+            "repeated_failure_control_rate": 1.0,
+            "task_success_rate": 1.0
           },
           "trial": 3
         }
@@ -1732,10 +1552,10 @@
     "python_version": "3.12.12"
   },
   "schema_version": 1,
-  "source_commit": "48e5eb0191ff2279e40cb294ffcf845a8a016e13",
-  "source_tree": "94c353fe62ef7f09157eeca883a351f1db42df52",
+  "source_commit": "b9e7ca30f8f469ef29d608661c9f084ae182093a",
+  "source_tree": "2a2329993aa51cf10ff33bc2f46fba333e721341",
   "source_unchanged": true,
-  "status": "failed",
+  "status": "passed",
   "suite_id": "agent-model-tool-quality-v1",
   "suite_revision": "suite_064a22c3535430e148e8"
 }

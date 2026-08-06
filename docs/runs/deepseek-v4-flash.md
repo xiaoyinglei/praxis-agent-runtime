@@ -1,15 +1,15 @@
 # Approval-continuation model run
 
-Overall verdict: **FAILED**
+Overall verdict: **PASSED**
 
-- source_commit: `48e5eb0191ff2279e40cb294ffcf845a8a016e13`
-- source_tree: `94c353fe62ef7f09157eeca883a351f1db42df52`
+- source_commit: `b9e7ca30f8f469ef29d608661c9f084ae182093a`
+- source_tree: `2a2329993aa51cf10ff33bc2f46fba333e721341`
 - source_unchanged: `true`
 - dirty: `false`
 - suite_id: `agent-model-tool-quality-v1`
 - suite_revision: `suite_064a22c3535430e148e8`
 - evaluator_version: `agent_model_quality_gate_v3`
-- measured_at: `2026-08-06T09:43:16.967520+00:00`
+- measured_at: `2026-08-06T14:52:43.690064+00:00`
 - Redacted raw report: [2026-08-06-deepseek-v4-flash.json](../../evals/model_quality/runs/2026-08-06-deepseek-v4-flash.json)
 
 ## Model identity and infrastructure
@@ -26,49 +26,33 @@ Change the unique text before_gate to after_gate in the attached approval.txt us
 
 ### Tool trace
 
-1. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","start_line":null}`
-   - Result: `{"content":"before_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","size_bytes":12,"start_line":null,"truncated":false}`
+1. `apply_patch`
+   - Arguments: `{"file_path":".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
+   - Result: `{"file_path":".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
    - Error code: `null`
    - Error message: `null`
    - Retryable: `false`
    - Truncated: `false`
    - Tool latency ms: `null`
-2. `apply_patch`
-   - Arguments: `{"file_path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
-   - Result: `{"file_path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
+2. `read_file`
+   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt","start_line":null}`
+   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
    - Error code: `null`
    - Error message: `null`
-   - Retryable: `false`
-   - Truncated: `false`
-   - Tool latency ms: `null`
-3. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","start_line":null}`
-   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
-   - Error code: `null`
-   - Error message: `null`
-   - Retryable: `false`
-   - Truncated: `false`
-   - Tool latency ms: `null`
-4. `read_file` error
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/3525824c-984b-4ea3-b179-31d44472922e/approval.txt","start_line":null}`
-   - Result: `null`
-   - Error code: `"repeated_inspection"`
-   - Error message: `"This exact read-only inspection already succeeded without an intervening delivery action. Use the existing result, narrow or change the arguments, choose a different tool, or make the concrete delivery change."`
    - Retryable: `false`
    - Truncated: `false`
    - Tool latency ms: `null`
 
 ### Runtime observation
 
-- Stop reason: `null`
+- Stop reason: `"accepted"`
 - Verification — workspace assertions passed: `true`
-- Tool calls: `4`
-- Model calls: `5`
-- Latency ms: `20008.09920905158`
-- Input tokens: `22256`
-- Output tokens: `2111`
-- Total tokens: `24367`
+- Tool calls: `2`
+- Model calls: `3`
+- Latency ms: `9468.98008394055`
+- Input tokens: `13497`
+- Output tokens: `895`
+- Total tokens: `14392`
 
 ### Approval and resume
 
@@ -92,62 +76,46 @@ Workspace assertions passed: `true`
 
 ### Final answer
 
-<none>
+The change is confirmed complete. **Result:** The unique text `before_gate` in `.praxis/runtime/input_files/bc12e7b6-7f9c-4662-bb54-7f67d0b0c9ae/approval.txt` was replaced with `after_gate` via `apply_patch` (1 occurrence replaced, patch applied successfully). **Verification:** A follow-up read of the file confirms its content is now exactly: ``` after_gate ``` (11 bytes, UTF-8, previously 12 bytes with `before_gate`). The requested change is done.
 
 ### Evaluator verdict
 
-Evaluator verdict: **FAILED**
+Evaluator verdict: **PASSED**
 
-- Core success: `false`
+- Core success: `true`
 - Capability passed: `true`
 
 ## `deepseek_v4_flash` trial 2
 
 ### Tool trace
 
-1. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","start_line":null}`
-   - Result: `{"content":"before_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","size_bytes":12,"start_line":null,"truncated":false}`
+1. `apply_patch`
+   - Arguments: `{"file_path":".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
+   - Result: `{"file_path":".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
    - Error code: `null`
    - Error message: `null`
    - Retryable: `false`
    - Truncated: `false`
    - Tool latency ms: `null`
-2. `apply_patch`
-   - Arguments: `{"file_path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
-   - Result: `{"file_path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
+2. `read_file`
+   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt","start_line":null}`
+   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
    - Error code: `null`
    - Error message: `null`
-   - Retryable: `false`
-   - Truncated: `false`
-   - Tool latency ms: `null`
-3. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","start_line":null}`
-   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
-   - Error code: `null`
-   - Error message: `null`
-   - Retryable: `false`
-   - Truncated: `false`
-   - Tool latency ms: `null`
-4. `read_file` error
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/1fc9227f-a572-485f-8e71-d7396cbcc126/approval.txt","start_line":null}`
-   - Result: `null`
-   - Error code: `"repeated_inspection"`
-   - Error message: `"This exact read-only inspection already succeeded without an intervening delivery action. Use the existing result, narrow or change the arguments, choose a different tool, or make the concrete delivery change."`
    - Retryable: `false`
    - Truncated: `false`
    - Tool latency ms: `null`
 
 ### Runtime observation
 
-- Stop reason: `null`
+- Stop reason: `"accepted"`
 - Verification — workspace assertions passed: `true`
-- Tool calls: `4`
-- Model calls: `5`
-- Latency ms: `22608.967332169414`
-- Input tokens: `22140`
-- Output tokens: `1797`
-- Total tokens: `23937`
+- Tool calls: `2`
+- Model calls: `3`
+- Latency ms: `17483.117500087246`
+- Input tokens: `13430`
+- Output tokens: `1705`
+- Total tokens: `15135`
 
 ### Approval and resume
 
@@ -171,38 +139,30 @@ Workspace assertions passed: `true`
 
 ### Final answer
 
-<none>
+Done. The change was applied and confirmed: - **Patch applied:** `apply_patch` replaced the unique text `before_gate` → `after_gate` in `.praxis/runtime/input_files/5663e08c-e1ca-4f4d-8c62-7f05029c6dd9/approval.txt` (1 occurrence replaced). - **Confirmed:** A follow-up read of the file shows its content is now exactly `after_gate\n` (UTF-8, 11 bytes), matching the requested state. Completion confirmed.
 
 ### Evaluator verdict
 
-Evaluator verdict: **FAILED**
+Evaluator verdict: **PASSED**
 
-- Core success: `false`
+- Core success: `true`
 - Capability passed: `true`
 
 ## `deepseek_v4_flash` trial 3
 
 ### Tool trace
 
-1. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","start_line":null}`
-   - Result: `{"content":"before_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","size_bytes":12,"start_line":null,"truncated":false}`
+1. `apply_patch`
+   - Arguments: `{"file_path":".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
+   - Result: `{"file_path":".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
    - Error code: `null`
    - Error message: `null`
    - Retryable: `false`
    - Truncated: `false`
    - Tool latency ms: `null`
-2. `apply_patch`
-   - Arguments: `{"file_path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","new_string":"after_gate","old_string":"before_gate","replace_all":false}`
-   - Result: `{"file_path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","message":"patch applied","occurrences":1,"replaced":true}`
-   - Error code: `null`
-   - Error message: `null`
-   - Retryable: `false`
-   - Truncated: `false`
-   - Tool latency ms: `null`
-3. `read_file`
-   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","start_line":null}`
-   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/bd5d1293-ec3d-4f23-b0a0-7b0ab264faee/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
+2. `read_file`
+   - Arguments: `{"encoding":"utf-8","max_bytes":16000,"max_lines":null,"offset":0,"path":".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt","start_line":null}`
+   - Result: `{"content":"after_gate\n","encoding":"utf-8","end_line":null,"is_binary":false,"next_line":null,"next_offset":null,"offset":0,"path":".praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt","size_bytes":11,"start_line":null,"truncated":false}`
    - Error code: `null`
    - Error message: `null`
    - Retryable: `false`
@@ -211,14 +171,14 @@ Evaluator verdict: **FAILED**
 
 ### Runtime observation
 
-- Stop reason: `null`
+- Stop reason: `"accepted"`
 - Verification — workspace assertions passed: `true`
-- Tool calls: `3`
-- Model calls: `4`
-- Latency ms: `16849.822042277083`
-- Input tokens: `16543`
-- Output tokens: `1378`
-- Total tokens: `17921`
+- Tool calls: `2`
+- Model calls: `3`
+- Latency ms: `18053.717749891803`
+- Input tokens: `13356`
+- Output tokens: `1713`
+- Total tokens: `15069`
 
 ### Approval and resume
 
@@ -242,11 +202,11 @@ Workspace assertions passed: `true`
 
 ### Final answer
 
-<none>
+The change is complete and confirmed: - **Edit applied:** `apply_patch` replaced the unique text `before_gate` with `after_gate` in `approval.txt` (1 occurrence replaced, patch reported applied). - **Verified:** A follow-up read of `.praxis/runtime/input_files/b9ce15fb-97bc-4bd0-8600-57591b70864c/approval.txt` shows the file content is now exactly `after_gate\n` (11 bytes, UTF-8). The requested state is in place — the file no longer contains `before_gate`.
 
 ### Evaluator verdict
 
-Evaluator verdict: **FAILED**
+Evaluator verdict: **PASSED**
 
-- Core success: `false`
+- Core success: `true`
 - Capability passed: `true`

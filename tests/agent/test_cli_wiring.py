@@ -19,7 +19,7 @@ from agent_runtime.cli import (
     agent_app,
 )
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
-from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
+from agent_runtime.result import AgentPause, AgentResult, AgentToolCall, AgentUsage
 from agent_runtime.runtime.builder import build_agent_service
 from agent_runtime.service import AgentRunRequest
 from agent_runtime.streaming.events import (
@@ -271,6 +271,8 @@ def _result(
     tool_calls: tuple[AgentToolCall, ...] = (),
     plan: AgentPlan | None = None,
     plan_events: tuple[PlanEvent, ...] = (),
+    pause: AgentPause | None = None,
+    needs_user_input: str | None = None,
 ) -> AgentResult:
     return AgentResult(
         answer=answer,
@@ -283,12 +285,13 @@ def _result(
         diagnostics=(),
         turn_id="turn-test",
         stop_reason=None,
-        pause=None,
+        pause=pause,
         workspace_path=None,
         groundedness=False,
         insufficient_evidence=False,
         plan=plan,
         plan_events=plan_events,
+        needs_user_input=needs_user_input,
     )
 
 
@@ -374,6 +377,45 @@ def test_cli_does_not_repeat_an_answer_that_was_already_streamed(
     )
 
     assert "already visible" not in capsys.readouterr().out
+
+
+def test_cli_shows_untyped_pause_reason_exactly_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reason = "Choose a target branch before continuing."
+
+    _display_agent_result(
+        _result(
+            status="paused",
+            needs_user_input=reason,
+        ),
+        verbose=False,
+    )
+
+    output = capsys.readouterr().out
+    assert f"暂停原因: {reason}" in output
+    assert output.count(reason) == 1
+
+
+def test_cli_leaves_typed_pause_question_to_pause_handler(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    question = "Allow apply_patch?"
+
+    _display_agent_result(
+        _result(
+            status="paused",
+            pause=AgentPause(
+                request_id="request-approval",
+                kind="tool_approval",
+                question=question,
+            ),
+            needs_user_input=question,
+        ),
+        verbose=False,
+    )
+
+    assert question not in capsys.readouterr().out
 
 
 def test_cli_shows_the_persisted_update_plan_without_verbose(

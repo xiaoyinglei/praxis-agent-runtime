@@ -39,11 +39,13 @@ from agent_runtime.tools.tool import (
 from agent_runtime.workspace import workspace_tree_sha256
 
 _NETWORK_APPROVAL_SUFFIX = "::network"
+_MAX_PRECISE_WORKSPACE_FILE_TARGETS = 8
 _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
     {
         "after_sha256",
         "before_sha256",
         "runtime_workspace_write",
+        "runtime_workspace_file_changes",
         "workspace_changed",
         "workspace_tree_after_sha256",
         "workspace_tree_before_sha256",
@@ -166,6 +168,7 @@ class _PreparedExecution:
     started_at: float
     workspace_root: Path | None
     workspace_tree_before_sha256: str | None
+    workspace_file_before_sha256: tuple[tuple[str, str], ...]
 
 
 class _CancelledTimeoutError(Exception):
@@ -571,6 +574,15 @@ class ToolExecutor:
             if workspace_root is not None
             else None
         )
+        workspace_file_before_sha256 = (
+            await asyncio.to_thread(
+                _workspace_file_target_snapshots,
+                workspace_root,
+                resolved,
+            )
+            if workspace_root is not None
+            else ()
+        )
         await _emit_record(record_sink, execution_record)
         return _PreparedExecution(
             call=call,
@@ -584,6 +596,7 @@ class ToolExecutor:
             started_at=started_at,
             workspace_root=workspace_root,
             workspace_tree_before_sha256=workspace_tree_before_sha256,
+            workspace_file_before_sha256=workspace_file_before_sha256,
         )
 
     async def _require_approval(
@@ -870,10 +883,16 @@ class ToolExecutor:
                     workspace_tree_sha256,
                     prepared.workspace_root,
                 )
+                file_changes = await asyncio.to_thread(
+                    _changed_workspace_file_snapshots,
+                    prepared.workspace_root,
+                    prepared.workspace_file_before_sha256,
+                )
                 before_sha256 = prepared.workspace_tree_before_sha256
                 metadata.update(
                     {
                         "runtime_workspace_write": True,
+                        "runtime_workspace_file_changes": file_changes,
                         "workspace_tree_before_sha256": before_sha256,
                         "workspace_tree_after_sha256": after_sha256,
                         "workspace_tree_changed": bool(
@@ -906,6 +925,78 @@ class ToolExecutor:
             except Exception:
                 pass
         return ToolExecution(result=result, record=record, trace=trace)
+
+
+def _workspace_file_target_snapshots(
+    workspace_root: Path,
+    resolved: ResolvedToolUse,
+) -> tuple[tuple[str, str], ...]:
+    """Snapshot bounded concrete write targets using workspace-relative paths."""
+
+    try:
+        root = workspace_root.resolve(strict=True)
+    except OSError:
+        return ()
+
+    targets: dict[str, Path] = {}
+    for target in resolved.targets:
+        if target.kind != "workspace_path":
+            continue
+        try:
+            path = Path(target.value).resolve(strict=True)
+            relative = path.relative_to(root).as_posix()
+        except (OSError, ValueError):
+            return ()
+        if not relative or not path.is_file():
+            return ()
+        targets.setdefault(relative, path)
+
+    if not targets or len(targets) > _MAX_PRECISE_WORKSPACE_FILE_TARGETS:
+        return ()
+    try:
+        return tuple(
+            (relative, _file_sha256(path))
+            for relative, path in targets.items()
+        )
+    except OSError:
+        return ()
+
+
+def _changed_workspace_file_snapshots(
+    workspace_root: Path,
+    before_snapshots: Sequence[tuple[str, str]],
+) -> tuple[Mapping[str, JsonValue], ...]:
+    if not before_snapshots:
+        return ()
+    try:
+        root = workspace_root.resolve(strict=True)
+        changes: list[Mapping[str, JsonValue]] = []
+        for relative, before_sha256 in before_snapshots:
+            path = (root / relative).resolve(strict=True)
+            path.relative_to(root)
+            if not path.is_file():
+                return ()
+            after_sha256 = _file_sha256(path)
+            if after_sha256 == before_sha256:
+                continue
+            changes.append(
+                {
+                    "path": relative,
+                    "before_sha256": before_sha256,
+                    "after_sha256": after_sha256,
+                }
+            )
+        return tuple(changes)
+    except (OSError, ValueError):
+        return ()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def resolve_execution_boundary(

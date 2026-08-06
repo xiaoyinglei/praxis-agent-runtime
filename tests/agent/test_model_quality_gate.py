@@ -333,10 +333,10 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                             "tool_schema_bytes": 400,
                             "approval_pause_observed": True,
                             "approval_kind": "tool_approval",
-                                "approval_resumes": 1,
-                                "workspace_assertions_passed": True,
-                                "runtime_input_namespace": "turn-123",
-                                "stop_reason": "completed",
+                            "approval_resumes": 1,
+                            "workspace_assertions_passed": True,
+                            "runtime_input_namespace": "turn-123",
+                            "stop_reason": "completed",
                             "diagnostic_error_types": [],
                             "error": f"diagnostic {secret}",
                             "infrastructure_failure": False,
@@ -498,6 +498,30 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert secret not in rendered
 
 
+def test_artifact_sanitizer_redacts_final_pause_reason(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    secret = "pause-reason-secret-sentinel"
+    absolute_path = str(tmp_path / "private" / "approval.txt")
+    monkeypatch.setenv("GROQ_API_KEY", secret)
+
+    sanitized = module._sanitize_artifact(
+        {
+            "final_pause_reason": (
+                f"Allow verification at {absolute_path} using {secret}."
+            )
+        }
+    )
+
+    assert sanitized == {
+        "final_pause_reason": (
+            "Allow verification at [REDACTED_ABSOLUTE_PATH] using [REDACTED]."
+        )
+    }
+
+
 def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> None:
     module = _load_gate_module()
     from agent_runtime.result import AgentToolCall
@@ -533,6 +557,81 @@ def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> Non
     assert evidence.retryable is True
     assert evidence.truncated is True
     assert evidence.latency_ms is None
+
+
+def test_final_pause_evidence_is_bounded_and_status_aware() -> None:
+    module = _load_gate_module()
+    typed_pause = SimpleNamespace(
+        kind="tool_approval",
+        tool_calls=tuple(
+            SimpleNamespace(tool_name=f"tool_{index}") for index in range(33)
+        ),
+    )
+
+    kind, reason, tool_names = module._final_pause_evidence(
+        SimpleNamespace(
+            status="paused",
+            needs_user_input="x" * 2001,
+            pause=typed_pause,
+        )
+    )
+
+    assert kind == "tool_approval"
+    assert reason == "x" * 2000
+    assert tool_names == tuple(f"tool_{index}" for index in range(32))
+
+    assert module._final_pause_evidence(
+        SimpleNamespace(
+            status="paused",
+            needs_user_input="Choose a target branch.",
+            pause=None,
+        )
+    ) == (None, "Choose a target branch.", ())
+    assert module._final_pause_evidence(
+        SimpleNamespace(
+            status="done",
+            needs_user_input="stale reason",
+            pause=typed_pause,
+        )
+    ) == (None, None, ())
+
+
+def test_observation_payload_round_trips_final_pause_evidence_and_defaults_old_artifacts() -> None:
+    module = _load_gate_module()
+    observation = module.CaseObservation(
+        case_id="approval_continue",
+        capability="approval_continuation",
+        status="paused",
+        answer=None,
+        tool_calls=(),
+        model_calls=2,
+        input_tokens=10,
+        output_tokens=5,
+        latency_ms=12.5,
+        tool_schema_bytes=400,
+        approval_pause_observed=True,
+        approval_kind="tool_approval",
+        approval_resumes=1,
+        workspace_assertions_passed=True,
+        final_pause_request_kind="tool_approval",
+        final_pause_reason="Allow run_command?",
+        final_pause_tool_names=("run_command",),
+    )
+
+    restored = module._observation_from_payload(observation.payload())
+
+    assert restored.final_pause_request_kind == "tool_approval"
+    assert restored.final_pause_reason == "Allow run_command?"
+    assert restored.final_pause_tool_names == ("run_command",)
+
+    old_payload = observation.payload()
+    old_payload.pop("final_pause_request_kind")
+    old_payload.pop("final_pause_reason")
+    old_payload.pop("final_pause_tool_names")
+    restored_old = module._observation_from_payload(old_payload)
+    assert restored_old.final_pause_request_kind is None
+    assert restored_old.final_pause_reason is None
+    assert restored_old.final_pause_tool_names == ()
 
 
 @pytest.mark.parametrize(
@@ -578,6 +677,7 @@ async def test_run_live_case_leaves_workspace_change_checks_to_the_evaluator(
                 ),
                 stop_reason=None,
                 diagnostics=(),
+                needs_user_input=None,
                 pause=None,
             )
 
@@ -640,6 +740,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
             status: str,
             answer: str | None = None,
             pause_tool_name: str = "apply_patch",
+            pause_reason: str = "Allow apply_patch?",
             workspace_write: bool = True,
             workspace_path: str | None = None,
         ) -> object:
@@ -651,6 +752,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
                 turn_id="turn-123",
                 stop_reason=None,
                 diagnostics=(),
+                needs_user_input=(pause_reason if status == "paused" else None),
                 pause=(
                     SimpleNamespace(
                         kind="tool_approval",
@@ -695,6 +797,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
                 return self.result(
                     status="paused",
                     pause_tool_name="run_command",
+                    pause_reason="Allow run_command?",
                     workspace_write=True,
                     workspace_path=str(self.workspace),
                 )
@@ -741,6 +844,125 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
     assert observation.approval_resumes == 1
     assert observation.workspace_assertions_passed is True
     assert observation.runtime_input_namespace == "turn-123"
+    assert observation.final_pause_request_kind == "tool_approval"
+    assert observation.final_pause_reason == "Allow run_command?"
+    assert observation.final_pause_tool_names == ("run_command",)
+
+
+@pytest.mark.anyio
+async def test_run_live_case_records_untyped_pause_after_declared_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_gate_module()
+    resume_actions: list[str] = []
+    from agent_runtime.result import AgentToolCall
+
+    usage = SimpleNamespace(
+        model_calls=3,
+        input_tokens=80,
+        output_tokens=16,
+        latency_ms=100.0,
+        tool_schema_bytes=400,
+    )
+
+    class FakeAgent:
+        def __init__(self, *, workspace_path: Path, **_kwargs: object) -> None:
+            self._turn_store = None
+            self.runtime_file = (
+                workspace_path
+                / ".praxis/runtime/input_files/turn-123/approval.txt"
+            )
+            self.runtime_file.parent.mkdir(parents=True)
+            self.runtime_file.write_text("before_gate\n", encoding="utf-8")
+            self.calls: tuple[AgentToolCall, ...] = ()
+
+        async def arun(self, _task: str, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                status="paused",
+                answer=None,
+                tool_calls=self.calls,
+                usage=usage,
+                turn_id="turn-123",
+                stop_reason=None,
+                diagnostics=(),
+                needs_user_input="Allow apply_patch?",
+                pause=SimpleNamespace(
+                    kind="tool_approval",
+                    tool_calls=(SimpleNamespace(tool_name="apply_patch"),),
+                    context={
+                        "approval_scope": "tool",
+                        "network_requested": False,
+                        "workspace_write": True,
+                        "workspace_path": str(self.runtime_file),
+                    },
+                ),
+            )
+
+        async def aresume(self, _turn_id: str, action: str) -> object:
+            resume_actions.append(action)
+            self.runtime_file.write_text("after_gate\n", encoding="utf-8")
+            self.calls = (
+                AgentToolCall(
+                    "patch",
+                    "apply_patch",
+                    {
+                        "file_path": (
+                            ".praxis/runtime/input_files/turn-123/approval.txt"
+                        ),
+                        "old_string": "before_gate",
+                        "new_string": "after_gate",
+                    },
+                ),
+            )
+            return SimpleNamespace(
+                status="paused",
+                answer=None,
+                tool_calls=self.calls,
+                usage=usage,
+                turn_id="turn-123",
+                stop_reason=None,
+                diagnostics=(),
+                needs_user_input="Choose whether to run another verification step.",
+                pause=None,
+            )
+
+    import agent_runtime
+
+    monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
+    observation = await module.run_live_case(
+        model_alias="groq_gpt_oss_120b",
+        control_plane=object(),
+        case={
+            "id": "approval_continue",
+            "capability": "approval_continuation",
+            "task": "Change before_gate to after_gate.",
+            "workspace_files": {"approval.txt": "before_gate\n"},
+            "workspace_assertions": {
+                "input_files/approval.txt": "after_gate\n"
+            },
+            "expected_tool_calls": [
+                {
+                    "tool_name": "apply_patch",
+                    "arguments": {
+                        "file_path": "input_files/approval.txt",
+                        "old_string": "before_gate",
+                        "new_string": "after_gate",
+                    },
+                }
+            ],
+            "auto_approve": True,
+        },
+    )
+
+    assert resume_actions == ["allow_once"]
+    assert observation.status == "paused"
+    assert observation.approval_resumes == 1
+    assert observation.workspace_assertions_passed is True
+    assert observation.final_pause_request_kind is None
+    assert observation.final_pause_reason == (
+        "Choose whether to run another verification step."
+    )
+    assert observation.final_pause_tool_names == ()
 
 
 @pytest.mark.anyio

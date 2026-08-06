@@ -166,6 +166,13 @@ class TestAgentRuntimePolicy:
         assert "complete coherent change across every affected layer" in (
             normalized_prompt
         )
+        assert "literal file-content task" in normalized_prompt
+        assert "behavioral code change" in normalized_prompt
+        assert "Pending runtime requirements override" in normalized_prompt
+        assert "request command execution solely to reconfirm" in normalized_prompt
+        assert "do not pre-read merely to reconfirm" in normalized_prompt
+        assert "Never batch both tools" in normalized_prompt
+        assert "next response must finish with zero tool calls" in normalized_prompt
         assert "smallest coherent change" not in normalized_prompt
 
     def test_definition_rejects_negative_output_validation_retries(self) -> None:

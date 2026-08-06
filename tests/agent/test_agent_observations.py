@@ -7,6 +7,8 @@ from agent_runtime.core.observations import (
     ObservationExtractor,
     StructuredObservation,
     grounded_workspace_paths,
+    runtime_file_inspection_paths,
+    runtime_workspace_file_changes,
 )
 from agent_runtime.tools.builtins.filesystem import (
     FileEntry,
@@ -120,6 +122,221 @@ def test_grounded_paths_apply_the_published_search_default() -> None:
     )
 
     assert paths == (".",)
+
+
+def test_executor_file_change_attestation_fails_closed() -> None:
+    valid = ToolResult(
+        tool_call_id="tc-write",
+        tool_name="apply_patch",
+        metadata={
+            "runtime_workspace_write": True,
+            "workspace_tree_before_sha256": "a" * 64,
+            "workspace_tree_after_sha256": "b" * 64,
+            "runtime_workspace_file_changes": (
+                {
+                    "path": "src/runtime.py",
+                    "before_sha256": "c" * 64,
+                    "after_sha256": "d" * 64,
+                },
+            ),
+        },
+    )
+    malformed = ToolResult(
+        tool_call_id="tc-malformed-write",
+        tool_name="apply_patch",
+        metadata={
+            **dict(valid.metadata),
+            "runtime_workspace_file_changes": (
+                {
+                    "path": "../outside.py",
+                    "before_sha256": "c" * 64,
+                    "after_sha256": "d" * 64,
+                },
+            ),
+        },
+    )
+    over_bound = ToolResult(
+        tool_call_id="tc-over-bound-write",
+        tool_name="apply_patch",
+        metadata={
+            **dict(valid.metadata),
+            "runtime_workspace_file_changes": tuple(
+                {
+                    "path": f"src/file-{index}.py",
+                    "before_sha256": f"{index:x}" * 64,
+                    "after_sha256": f"{index + 1:x}" * 64,
+                }
+                for index in range(9)
+            ),
+        },
+    )
+
+    assert runtime_workspace_file_changes(valid) == (
+        ("src/runtime.py", "c" * 64, "d" * 64),
+    )
+    assert runtime_workspace_file_changes(malformed) == ()
+    assert runtime_workspace_file_changes(over_bound) == ()
+
+
+def test_same_name_write_receipt_cannot_ground_a_file() -> None:
+    origin = ToolCallOrigin(
+        request_id="forged-write",
+        toolset_revision="forged-write-tools",
+        exposed_tool_names=("apply_patch",),
+    )
+    call = ToolCall(
+        tool_call_id="tc-forged-write",
+        tool_name="apply_patch",
+        arguments={"file_path": "src/forged.py"},
+        origin=origin,
+    )
+    result = ToolResult(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        structured_content={
+            "file_path": "src/forged.py",
+            "replaced": True,
+        },
+        metadata={
+            "runtime_workspace_write": True,
+            "workspace_tree_before_sha256": "a" * 64,
+            "workspace_tree_after_sha256": "b" * 64,
+        },
+    )
+
+    assert grounded_workspace_paths(
+        tool_results=(result,),
+        tool_calls={call.tool_call_id: call},
+    ) == ()
+
+
+def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
+    origin = ToolCallOrigin(
+        request_id="inspect-file",
+        toolset_revision="inspect-file-tools",
+        exposed_tool_names=("read_file", "search_text"),
+    )
+    read_call = ToolCall(
+        tool_call_id="tc-read-current",
+        tool_name="read_file",
+        arguments={"path": "src/runtime.py"},
+        origin=origin,
+    )
+    read_result = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "updated",
+            "size_bytes": 7,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    binary_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 7,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": True,
+        },
+    )
+    beyond_eof_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 7,
+            "offset": 7,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    empty_file_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "",
+            "size_bytes": 0,
+            "offset": 0,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    incomplete_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={"path": "src/runtime.py", "content": "updated"},
+    )
+    mismatched_range_read = ToolResult(
+        tool_call_id=read_call.tool_call_id,
+        tool_name=read_call.tool_name,
+        structured_content={
+            "path": "src/runtime.py",
+            "content": "pdated",
+            "size_bytes": 7,
+            "offset": 1,
+            "start_line": None,
+            "truncated": False,
+            "is_binary": False,
+        },
+    )
+    search_call = ToolCall(
+        tool_call_id="tc-search-current",
+        tool_name="search_text",
+        arguments={"pattern": "removed", "path": "src/runtime.py"},
+        origin=origin,
+    )
+    search_result = ToolResult(
+        tool_call_id=search_call.tool_call_id,
+        tool_name=search_call.tool_name,
+        structured_content={
+            "matches": (),
+            "total_matches": 0,
+            "truncated": False,
+            "searched_file_path": "src/runtime.py",
+        },
+    )
+    truncated_search = ToolResult(
+        tool_call_id=search_call.tool_call_id,
+        tool_name=search_call.tool_name,
+        structured_content={
+            **dict(search_result.structured_content or {}),
+            "truncated": True,
+        },
+    )
+
+    assert runtime_file_inspection_paths(read_result, call=read_call) == (
+        "src/runtime.py",
+    )
+    assert runtime_file_inspection_paths(binary_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(beyond_eof_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(empty_file_read, call=read_call) == (
+        "src/runtime.py",
+    )
+    assert runtime_file_inspection_paths(incomplete_read, call=read_call) == ()
+    assert runtime_file_inspection_paths(
+        mismatched_range_read,
+        call=read_call,
+    ) == ()
+    assert runtime_file_inspection_paths(search_result, call=search_call) == (
+        "src/runtime.py",
+    )
+    assert runtime_file_inspection_paths(
+        truncated_search,
+        call=search_call,
+    ) == ()
 
 
 def test_canonical_read_file_observation_preserves_content_and_locator() -> None:

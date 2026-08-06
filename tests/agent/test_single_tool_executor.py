@@ -13,7 +13,10 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.observations import runtime_workspace_change
+from agent_runtime.core.observations import (
+    runtime_workspace_change,
+    runtime_workspace_file_changes,
+)
 from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.executor import (
     ExecutionBoundary,
@@ -426,6 +429,46 @@ async def test_executor_attests_every_successful_workspace_write(
         metadata["workspace_tree_before_sha256"]
         != metadata["workspace_tree_after_sha256"]
     )
+    assert metadata["runtime_workspace_file_changes"] == ()
+
+
+@pytest.mark.anyio
+async def test_executor_attests_changed_concrete_file_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "changed.txt"
+    target.write_text("before\n", encoding="utf-8")
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("after\n", encoding="utf-8")
+        return {"value": "written"}
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(target)),
+                ToolTarget(kind="workspace_path", value=str(target)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    [(path, before_sha256, after_sha256)] = runtime_workspace_file_changes(
+        execution.result
+    )
+    assert path == "changed.txt"
+    assert len(before_sha256) == 64
+    assert len(after_sha256) == 64
+    assert before_sha256 != after_sha256
+    assert before_sha256 not in str(execution.result.structured_content)
+    assert after_sha256 not in str(execution.result.structured_content)
 
 
 @pytest.mark.anyio
@@ -463,6 +506,13 @@ async def test_executor_attests_partial_change_when_write_runner_fails(
 async def test_executor_strips_forged_workspace_attestation_from_read_tool() -> None:
     forged = {
         "runtime_workspace_write": True,
+        "runtime_workspace_file_changes": (
+            {
+                "path": "already-there.py",
+                "before_sha256": "c" * 64,
+                "after_sha256": "d" * 64,
+            },
+        ),
         "workspace_tree_changed": True,
         "workspace_tree_before_sha256": "a" * 64,
         "workspace_tree_after_sha256": "b" * 64,
