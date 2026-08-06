@@ -170,44 +170,30 @@ def test_runbook_defaults_are_bound_to_the_model_catalog() -> None:
     assert "显式可选" in runbook
 
 
-def test_license_and_pre_live_evidence_pages_are_explicit() -> None:
+def test_license_and_live_evidence_pages_are_explicit() -> None:
     license_text = _read(LICENSE)
+    readme = _read(README)
     benchmark = _read(BENCHMARK)
     run_record = _read(RUN_RECORD)
 
     assert license_text.startswith("MIT License\n")
     assert "Copyright (c) 2026 xiaoyinglei" in license_text
-    assert "PENDING — NOT YET MEASURED" in benchmark
-    assert "5 cases × 3 trials" in benchmark
-    assert "manifest validated" in benchmark
-    assert "not a release gate" in benchmark
-    for field in (
-        "source commit",
-        "UTC timestamp",
-        "model identity",
-        "environment",
-        "task success",
-        "capability rates",
-        "tool calls",
-        "model calls",
-        "latency",
-        "token usage",
-        "failures",
-        "infrastructure status",
-    ):
-        assert field in benchmark
+    assert "**FAILED — 14/15 cases passed; worst-trial task success 80%**" in readme
+    assert "one approval trial remained paused after `repeated_inspection`" in readme
+    assert "Overall verdict: **FAILED**" in benchmark
+    assert "source_commit: `1e4c16873f4d6983397d5965b6d527c09d680689`" in benchmark
+    assert "source_unchanged: `true`" in benchmark
+    assert "dirty: `false`" in benchmark
+    assert "evaluator_version: `agent_model_quality_gate_v3`" in benchmark
+    assert "| `task_success_rate` | `0.8` | `min 1.0` |" in benchmark
+    assert "task_success_rate: observed 0.8 < baseline floor 1.0" in benchmark
+    assert "Manifest status: **validated only**" in benchmark
 
     for identity in ("deepseek_v4_flash", "deepseek", "deepseek-v4-flash"):
         assert identity in run_record
-    for field in (
-        "task",
-        "redacted tool trace",
-        "approval event",
-        "validated fixture before/after assertion contract",
-        "final answer",
-        "evaluator verdict",
-        "raw JSON",
-    ):
-        assert field in run_record
-    assert "PENDING — NOT YET MEASURED" in run_record
-    assert "approval_continuation" in run_record
+    assert "Overall verdict: **FAILED**" in run_record
+    assert "Error code: `\"repeated_inspection\"`" in run_record
+    assert "Workspace assertions passed: `true`" in run_record
+    assert "Evaluator verdict: **FAILED**" in run_record
+    assert "Evaluator verdict: **PASSED**" in run_record
+    assert "2026-08-06-deepseek-v4-flash.json" in run_record

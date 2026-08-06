@@ -73,14 +73,17 @@ agents. Deeper lifecycle details are in the
 | Evidence | What it establishes | Current state |
 | --- | --- | --- |
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
-| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **PENDING — NOT YET MEASURED** |
-| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **PENDING — NOT YET MEASURED** |
+| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **FAILED — 14/15 cases passed; worst-trial task success 80%** |
+| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE FAIL — 2/3 approval trials completed** |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
 The model-quality pages are generated from a clean source commit after the local
 gates pass. Infrastructure failures are reported as **INCONCLUSIVE**, never
 converted into a model score. No test count is treated as proof that an Agent task
-succeeded.
+succeeded. The DeepSeek V4 Flash run is intentionally published as a failure:
+the requested mutation was applied and verified in all three approval trials,
+but one approval trial remained paused after `repeated_inspection` and did not
+produce a final answer. The other 14 case executions passed their evaluators.
 
 ## Quickstart
 
