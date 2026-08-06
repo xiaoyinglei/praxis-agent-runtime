@@ -218,6 +218,213 @@ def _render_payload(
     )
 
 
+def _v3_paused_payload(tmp_path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = "agent_model_quality_gate_v3"
+    cases = payload["runs"][0]["trials"][0]["cases"]
+    for case in cases:
+        case["observation"]["runtime_input_namespace"] = "turn-123"
+    approval_case = cases[0]
+    observation = approval_case["observation"]
+    observation.update(
+        status="paused",
+        answer=None,
+        stop_reason="approval_required",
+        final_pause_request_kind="tool_approval",
+        final_pause_reason="Allow run_command for verification?",
+        final_pause_tool_names=["run_command"],
+    )
+    approval_case["score"].update(
+        passed=False,
+        core_success=True,
+        capability_passed=False,
+    )
+    return payload, observation
+
+
+def test_renderer_accepts_old_v3_artifact_without_final_pause_fields(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = "agent_model_quality_gate_v3"
+    for case in payload["runs"][0]["trials"][0]["cases"]:
+        case["observation"]["runtime_input_namespace"] = "turn-123"
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="old-v3-without-final-pause",
+    )
+
+    assert "### Final pause" not in run_record
+
+
+def test_renderer_accepts_empty_final_pause_fields_on_non_paused_observations(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload = _report_payload(tmp_path)
+    payload["evaluator_version"] = "agent_model_quality_gate_v3"
+    for case in payload["runs"][0]["trials"][0]["cases"]:
+        observation = case["observation"]
+        observation.update(
+            runtime_input_namespace="turn-123",
+            final_pause_request_kind=None,
+            final_pause_reason=None,
+            final_pause_tool_names=[],
+        )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="current-v3-empty-final-pause",
+    )
+
+    assert "### Final pause" not in run_record
+
+
+def test_renderer_shows_bounded_final_pause_evidence(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload, _observation = _v3_paused_payload(tmp_path)
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="final-pause-evidence",
+    )
+
+    assert "### Final pause" in run_record
+    assert '- Request kind: `"tool_approval"`' in run_record
+    assert '- Reason: `"Allow run_command for verification?"`' in run_record
+    assert '- Pending tools: `["run_command"]`' in run_record
+    assert "No answer was reported before final pause." in run_record
+    assert "### Final answer" not in run_record
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid", "message"),
+    [
+        (
+            "final_pause_request_kind",
+            123,
+            "final_pause_request_kind must be text or null",
+        ),
+        (
+            "final_pause_reason",
+            123,
+            "final_pause_reason must be text or null",
+        ),
+        (
+            "final_pause_reason",
+            "x" * 2001,
+            "final_pause_reason exceeds 2000 characters",
+        ),
+        (
+            "final_pause_tool_names",
+            "run_command",
+            "final_pause_tool_names must be a sequence",
+        ),
+        (
+            "final_pause_tool_names",
+            ["run_command", 123],
+            "final_pause_tool_names entries must be text",
+        ),
+        (
+            "final_pause_tool_names",
+            [f"tool_{index}" for index in range(33)],
+            "final_pause_tool_names exceeds 32 entries",
+        ),
+    ],
+)
+def test_renderer_rejects_invalid_final_pause_evidence(
+    tmp_path: Path,
+    field: str,
+    invalid: object,
+    message: str,
+) -> None:
+    module = _load_report_module()
+    payload, observation = _v3_paused_payload(tmp_path)
+    observation[field] = invalid
+    report_path = tmp_path / f"invalid-{field}.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
+
+
+def test_renderer_rejects_final_pause_evidence_on_non_paused_observation(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload, observation = _v3_paused_payload(tmp_path)
+    observation["status"] = "done"
+    report_path = tmp_path / "final-pause-on-done.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="final pause evidence requires paused status",
+    ):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
+
+
+def test_renderer_rejects_final_pause_tools_without_request_kind(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload, observation = _v3_paused_payload(tmp_path)
+    observation["final_pause_request_kind"] = None
+    report_path = tmp_path / "final-pause-tools-without-kind.json"
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="final_pause_tool_names require a request kind",
+    ):
+        module.render_model_quality_report(
+            report_path,
+            benchmark_path=tmp_path / "benchmark.md",
+            run_record_path=tmp_path / "run.md",
+        )
+
+
+def test_renderer_redacts_absolute_paths_in_final_pause_reason(
+    tmp_path: Path,
+) -> None:
+    module = _load_report_module()
+    payload, observation = _v3_paused_payload(tmp_path)
+    posix_path = "/Users/private/workspace/approval.txt"
+    windows_path = r"C:\private\workspace\approval.txt"
+    observation["final_pause_reason"] = (
+        f"Inspect {posix_path} and {windows_path} before continuing."
+    )
+
+    _benchmark, run_record = _render_payload(
+        module,
+        payload,
+        tmp_path,
+        name="redacted-final-pause",
+    )
+
+    assert posix_path not in run_record
+    assert windows_path not in run_record
+    assert run_record.count("[REDACTED_ABSOLUTE_PATH]") >= 2
+
+
 def _make_inconclusive_with_completed_prefix(
     payload: dict[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:

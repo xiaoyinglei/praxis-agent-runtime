@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = ROOT / "docs" / "benchmark.md"
 DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
 _TOOL_TRACE_VALUE_LIMIT = 1600
+_MAX_FINAL_PAUSE_REASON_CHARS = 2000
+_MAX_FINAL_PAUSE_TOOL_NAMES = 32
 _MAX_APPROVAL_RESUMES_BY_EVALUATOR = {
     "agent_model_quality_gate_v1": 1,
     "agent_model_quality_gate_v2": 5,
@@ -508,6 +510,27 @@ def _render_approval_record(
                 "",
             ]
         )
+        observation_status = str(observation.get("status"))
+        if observation_status == "paused":
+            request_kind = observation.get("final_pause_request_kind")
+            reason = observation.get("final_pause_reason")
+            pending_tools = _sequence(
+                observation.get("final_pause_tool_names", ()),
+                label="final_pause_tool_names",
+            )
+            lines.extend(
+                [
+                    "### Final pause",
+                    "",
+                    "- Request kind: "
+                    f"`{_scalar(None if request_kind is None else _safe_text(str(request_kind)))}`",
+                    "- Reason: "
+                    f"`{_scalar(None if reason is None else _safe_text(str(reason)))}`",
+                    "- Pending tools: "
+                    f"`{_scalar([_safe_text(str(item)) for item in pending_tools])}`",
+                    "",
+                ]
+            )
         approval_pause_observed = (
             observation.get("approval_pause_observed") is True
             and observation.get("approval_kind") == "tool_approval"
@@ -653,10 +676,6 @@ def _render_approval_record(
                     "",
                     "Workspace assertions passed: `true`",
                     "",
-                    "### Final answer",
-                    "",
-                    _safe_text(str(observation.get("answer") or "<none>")),
-                    "",
                 ]
             )
         else:
@@ -669,9 +688,37 @@ def _render_approval_record(
                     "The fixture assertion contract failed; expected before/after "
                     "values are not rendered as observed evidence.",
                     "",
-                    "### Observed final answer",
+                ]
+            )
+        answer = observation.get("answer")
+        if observation_status == "paused":
+            if isinstance(answer, str) and answer:
+                lines.extend(
+                    [
+                        "### Observed answer before final pause",
+                        "",
+                        _safe_text(answer),
+                        "",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "No answer was reported before final pause.",
+                        "",
+                    ]
+                )
+        else:
+            answer_heading = (
+                "### Final answer"
+                if workspace_assertions_passed is True
+                else "### Observed final answer"
+            )
+            lines.extend(
+                [
+                    answer_heading,
                     "",
-                    _safe_text(str(observation.get("answer") or "<none>")),
+                    _safe_text(str(answer or "<none>")),
                     "",
                 ]
             )
@@ -827,6 +874,11 @@ def _validate_run_cases(
                 raise ValueError(
                     f"model quality report {alias}.{case_id}.status is invalid"
                 )
+            _validate_final_pause_evidence(
+                observation,
+                label=f"{alias}.{case_id}",
+                observation_status=observation_status,
+            )
             approval_pause_observed = observation.get("approval_pause_observed")
             if not isinstance(approval_pause_observed, bool):
                 raise ValueError(
@@ -990,6 +1042,64 @@ def _validate_run_cases(
     if run_status == "inconclusive" and trials and not infrastructure_observed:
         raise ValueError(
             f"model quality report inconclusive run for {alias} has inconsistent case evidence"
+        )
+
+
+def _validate_final_pause_evidence(
+    observation: Mapping[str, object],
+    *,
+    label: str,
+    observation_status: str,
+) -> None:
+    request_kind = observation.get("final_pause_request_kind")
+    if request_kind is not None and not isinstance(request_kind, str):
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_request_kind must be text or null"
+        )
+
+    reason = observation.get("final_pause_reason")
+    if reason is not None and not isinstance(reason, str):
+        raise ValueError(
+            f"model quality report {label}.final_pause_reason must be text or null"
+        )
+    if isinstance(reason, str) and len(reason) > _MAX_FINAL_PAUSE_REASON_CHARS:
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_reason exceeds "
+            f"{_MAX_FINAL_PAUSE_REASON_CHARS} characters"
+        )
+
+    raw_tool_names = observation.get("final_pause_tool_names", ())
+    if not isinstance(raw_tool_names, Sequence) or isinstance(
+        raw_tool_names,
+        (str, bytes),
+    ):
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_tool_names must be a sequence"
+        )
+    if not all(isinstance(item, str) for item in raw_tool_names):
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_tool_names entries must be text"
+        )
+    if len(raw_tool_names) > _MAX_FINAL_PAUSE_TOOL_NAMES:
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_tool_names exceeds "
+            f"{_MAX_FINAL_PAUSE_TOOL_NAMES} entries"
+        )
+    if raw_tool_names and not request_kind:
+        raise ValueError(
+            "model quality report "
+            f"{label}.final_pause_tool_names require a request kind"
+        )
+
+    has_final_pause_evidence = bool(request_kind or reason or raw_tool_names)
+    if has_final_pause_evidence and observation_status != "paused":
+        raise ValueError(
+            f"model quality report {label} final pause evidence requires paused status"
         )
 
 
