@@ -58,8 +58,11 @@ field also exposes the human-readable reason for untyped pauses.
 ### CLI projection
 
 When a paused result has no typed `pause` object but has
-`needs_user_input`, print that reason on existing paused-result surfaces. Do
-not synthesize a decision, prompt for a new action, or resume automatically.
+`needs_user_input`, `_display_agent_result` prints that reason exactly once.
+The shared display function covers `agent run`, `agent resume`, and chat. The
+existing typed-request prompt remains owned by `_handle_pause`; the new branch
+must not duplicate it. Do not synthesize a decision, prompt for a new action,
+or resume automatically.
 
 ### Model-quality observation
 
@@ -73,15 +76,19 @@ These describe the final result returned by `run_live_case`, not the initial
 declared approval. Existing `approval_kind` and `approval_resumes` retain their
 current meanings and continue to drive the unchanged evaluator.
 
-For a final typed pause, the request kind and bounded tool-name list come from
-`AgentResult.pause`. For an untyped pause, the request kind remains `None`, the
-tool-name list is empty, and `final_pause_reason` carries
-`needs_user_input`. Completed and failed results store null/empty values.
+For every final paused result, `final_pause_reason` comes from
+`AgentResult.needs_user_input`. For a final typed pause, the request kind and
+tool-name list come from `AgentResult.pause`. For an untyped pause, the request
+kind remains `None` and the tool-name list is empty. Completed and failed
+results store null/empty values.
 
 The existing whole-artifact sanitizer remains the final write boundary for
 environment secrets and absolute paths. The reason is also bounded before it
-enters the observation so a malformed provider response cannot expand the
-report without limit.
+enters the observation to the first 2,000 Unicode code points. The pending
+tool-name list is limited to the first 32 request entries; tool names already
+come from the canonical runtime registry. These exact bounds make malformed
+provider output unable to expand the report without limit and keep tests
+deterministic.
 
 ### Report compatibility and rendering
 
