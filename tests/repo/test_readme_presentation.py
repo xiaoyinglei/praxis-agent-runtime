@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
 BENCHMARK = ROOT / "docs" / "benchmark.md"
-RUN_RECORD = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
+RUN_RECORD = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
 MODEL_CATALOG = ROOT / "configs" / "models.yaml"
 
@@ -197,7 +197,7 @@ def test_license_and_pre_live_evidence_pages_are_explicit() -> None:
     ):
         assert field in benchmark
 
-    for identity in ("groq_gpt_oss_120b", "groq", "openai/gpt-oss-120b"):
+    for identity in ("deepseek_v4_flash", "deepseek", "deepseek-v4-flash"):
         assert identity in run_record
     for field in (
         "task",

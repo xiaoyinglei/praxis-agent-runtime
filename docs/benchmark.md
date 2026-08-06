@@ -9,9 +9,9 @@ commit passes the deterministic local gates. Until then, there is no PASS score.
 
 ## Scope
 
-- Model alias: `groq_gpt_oss_120b`
-- Provider: `groq`
-- Provider model: `openai/gpt-oss-120b`
+- Model alias: `deepseek_v4_flash`
+- Provider: `deepseek`
+- Provider model: `deepseek-v4-flash`
 - Repetitions: **5 cases × 3 trials**
 - Evaluator: the committed model-quality gate and its versioned suite identity
 
@@ -51,7 +51,7 @@ The generated report records these exact fields or projections:
 
 The checked-in machine-readable evidence will live under
 `evals/model_quality/runs/` and is rendered into this page plus the expanded
-[approval-continuation record](runs/groq-gpt-oss-120b.md). The renderer supplies
+[approval-continuation record](runs/deepseek-v4-flash.md). The renderer supplies
 the concrete filename only after the actual run; this pending page does not link
 to a nonexistent or invented JSON artifact.
 

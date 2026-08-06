@@ -105,6 +105,9 @@ def _inconclusive_model_report(
     *,
     case_id: str = "approval_continue",
     capability: str = "approval_continuation",
+    model_alias: str = "groq_gpt_oss_120b",
+    provider: str = "groq",
+    provider_model: str = "openai/gpt-oss-120b",
 ) -> dict[str, object]:
     observation = module.CaseObservation(
         case_id=case_id,
@@ -128,9 +131,9 @@ def _inconclusive_model_report(
     )
     return {
         "status": "inconclusive",
-        "model_alias": "groq_gpt_oss_120b",
-        "provider": "groq",
-        "provider_model": "openai/gpt-oss-120b",
+        "model_alias": model_alias,
+        "provider": provider,
+        "provider_model": provider_model,
         "trial_count": 3,
         "trial_metrics": [],
         "trials": [
@@ -1183,7 +1186,7 @@ async def test_gate_records_control_plane_initialization_failure_before_cases(
         fixture=FIXTURE_PATH,
         baseline=BASELINE_PATH,
         env_file=tmp_path / ".env",
-        models=["groq_gpt_oss_120b"],
+        models=["deepseek_v4_flash"],
         report=report_path,
     )
 
@@ -1278,7 +1281,7 @@ def test_cli_returns_two_and_writes_report_for_control_plane_initialization_fail
             "--env-file",
             str(tmp_path / ".env"),
             "--model",
-            "groq_gpt_oss_120b",
+            "deepseek_v4_flash",
             "--report",
             str(report_path),
         ],
@@ -1390,6 +1393,9 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
             module,
             case_id="exact_file_read",
             capability="file_tool_selection",
+            model_alias="deepseek_v4_flash",
+            provider="deepseek",
+            provider_model="deepseek-v4-flash",
         )
 
     monkeypatch.setattr(module, "run_model_trials", run_trials)
@@ -1398,7 +1404,7 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
         json.dumps(
             {
                 "models": {
-                    "groq_gpt_oss_120b": {
+                    "deepseek_v4_flash": {
                         "trial_count": 3,
                         "thresholds": {},
                     }
@@ -1413,7 +1419,7 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
         fixture=tmp_path / "cases.json",
         baseline=baseline,
         env_file=tmp_path / ".env",
-        models=["groq_gpt_oss_120b"],
+        models=["deepseek_v4_flash"],
         report=report_path,
     )
 
@@ -1586,10 +1592,7 @@ def test_fixture_locks_models_and_quality_capabilities() -> None:
     payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
     assert payload["schema_version"] == 1
-    assert payload["models"] == [
-        "qwen3_5_9b_mlx_4bit",
-        "groq_gpt_oss_120b",
-    ]
+    assert payload["models"] == ["deepseek_v4_flash"]
     assert {case["capability"] for case in payload["cases"]} == {
         "file_tool_selection",
         "failure_recovery",

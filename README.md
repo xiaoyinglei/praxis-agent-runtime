@@ -74,7 +74,7 @@ agents. Deeper lifecycle details are in the
 | --- | --- | --- |
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
 | [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **PENDING — NOT YET MEASURED** |
-| [Expanded Groq run](docs/runs/groq-gpt-oss-120b.md) | Approval, continuation, mutation, validation, and redacted trace | **PENDING — NOT YET MEASURED** |
+| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **PENDING — NOT YET MEASURED** |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
 The model-quality pages are generated from a clean source commit after the local
@@ -242,7 +242,7 @@ Focused references:
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — common runtime and RAG failures
 - [Product contract](docs/design/agent_product_contract.md) — public lifecycle and boundaries
 - [Model-quality benchmark](docs/benchmark.md) — current live-evidence methodology and verdict
-- [Expanded Groq run](docs/runs/groq-gpt-oss-120b.md) — human-readable approval-continuation evidence
+- [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) — human-readable approval-continuation evidence
 - [Evaluation archive](docs/EVALUATION.md) — historical retrieval baselines with provenance notes
 - [MIT license](LICENSE) — use and redistribution terms
 

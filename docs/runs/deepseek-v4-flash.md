@@ -1,4 +1,4 @@
-# Groq GPT-OSS 120B: approval continuation
+# DeepSeek V4 Flash: approval continuation
 
 > **PENDING — NOT YET MEASURED**
 
@@ -11,9 +11,9 @@ candidate.
 
 | Field | Value |
 | --- | --- |
-| Alias | `groq_gpt_oss_120b` |
-| Provider | `groq` |
-| Provider model | `openai/gpt-oss-120b` |
+| Alias | `deepseek_v4_flash` |
+| Provider | `deepseek` |
+| Provider model | `deepseek-v4-flash` |
 | Measurement status | **PENDING — NOT YET MEASURED** |
 
 ## Expanded evidence contract

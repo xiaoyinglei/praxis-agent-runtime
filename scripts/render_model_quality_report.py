@@ -15,7 +15,7 @@ from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BENCHMARK_PATH = ROOT / "docs" / "benchmark.md"
-DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "groq-gpt-oss-120b.md"
+DEFAULT_RUN_RECORD_PATH = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
 _TOOL_TRACE_VALUE_LIMIT = 1600
 _MAX_APPROVAL_RESUMES_BY_EVALUATOR = {
     "agent_model_quality_gate_v1": 1,

@@ -24,6 +24,12 @@ def _load_report_module():
     return module
 
 
+def test_renderer_defaults_to_deepseek_v4_flash_run_record() -> None:
+    module = _load_report_module()
+
+    assert module.DEFAULT_RUN_RECORD_PATH.name == "deepseek-v4-flash.md"
+
+
 def _report_payload(tmp_path: Path) -> dict[str, object]:
     approval_observation = {
         "case_id": "approval_continue",
