@@ -73,8 +73,8 @@ agents. Deeper lifecycle details are in the
 | Evidence | What it establishes | Current state |
 | --- | --- | --- |
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
-| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **FAILED — 14/15 cases passed; worst-trial task success 80%** |
-| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE FAIL — 2/3 approval trials completed** |
+| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **FAILED — 12/15 cases passed; worst-trial task success 80%** |
+| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE FAIL — 0/3 approval trials completed** |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
 The model-quality pages are generated from a clean source commit after the local
