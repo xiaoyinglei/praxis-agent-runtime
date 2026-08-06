@@ -322,6 +322,9 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{result.answer}")
 
+    if result.status == "paused" and result.pause is None and result.needs_user_input:
+        print(f"\n暂停原因: {result.needs_user_input}")
+
     plan_summary = _format_plan_summary(result)
     if plan_summary:
         print(plan_summary)
