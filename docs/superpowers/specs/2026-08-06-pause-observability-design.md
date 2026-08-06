@@ -32,6 +32,16 @@ gate consequently cannot distinguish:
 4. Render the same evidence in the human-readable approval run record.
 5. Keep existing evaluator-v3 reports and baselines readable.
 
+## Completeness requirement
+
+This is an end-to-end contract repair, not an SDK-only patch. The change is
+incomplete unless the same pause reason survives every public and evidence
+boundary named in this specification: internal result, public SDK result,
+shared CLI display, raw model-quality observation, report validation, and
+rendered run record. YAGNI limits unrelated feature work; it must not be used
+to omit one of these required surfaces or the typed, untyped, second-approval,
+compatibility, bound, and redaction regressions.
+
 ## Non-goals
 
 - Do not change pause, approval, checkpoint, resume, or completion semantics.
