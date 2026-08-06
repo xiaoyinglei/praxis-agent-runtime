@@ -140,6 +140,7 @@ class AgentResult:
     insufficient_evidence: bool
     plan: AgentPlan | None
     plan_events: tuple[PlanEvent, ...]
+    needs_user_input: str | None = None
 
     @classmethod
     def _from_internal(
@@ -168,6 +169,7 @@ class AgentResult:
             insufficient_evidence=result.insufficient_evidence_flag,
             plan=(None if result.plan is None else result.plan.model_copy(deep=True)),
             plan_events=tuple(event.model_copy(deep=True) for event in result.plan_events),
+            needs_user_input=result.needs_user_input,
         )
 
 
