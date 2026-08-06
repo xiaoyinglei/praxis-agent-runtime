@@ -485,6 +485,11 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     benchmark = benchmark_path.read_text(encoding="utf-8")
     run_record = run_record_path.read_text(encoding="utf-8")
     rendered = benchmark + run_record
+    assert benchmark.startswith("# Agent tool-use reliability benchmark\n")
+    assert "not a general coding or reasoning benchmark" in benchmark
+    assert "## What the agent was asked to do" in benchmark
+    assert "Resume an edit after approval" in benchmark
+    assert "### Exact evaluated instructions" in benchmark
     assert "Overall verdict: **FAILED**" in benchmark
     assert "source_commit: `" + "a" * 40 + "`" in benchmark
     assert "source_tree: `" + "b" * 40 + "`" in benchmark
@@ -769,8 +774,17 @@ def test_generated_pages_preserve_the_pending_evidence_contract(
     )
 
     for required in (
+        "# Agent tool-use reliability benchmark",
         "Overall verdict: **FAILED**",
-        "## Evidence provenance",
+        "not a general coding or reasoning benchmark",
+        "fixed set of controlled, machine-checkable file-tool scenarios",
+        "## Result at a glance",
+        "## What the agent was asked to do",
+        "User request",
+        "What counts as a pass",
+        "## What this result means",
+        "## Technical evidence",
+        "### Evidence provenance",
         "source_commit",
         "source_tree",
         "source_unchanged",
@@ -780,8 +794,8 @@ def test_generated_pages_preserve_the_pending_evidence_contract(
         "evaluator_version",
         "measured_at",
         "Redacted raw report",
-        "## Environment",
-        "## Model results",
+        "### Environment",
+        "### Raw model metrics",
         "Provider model",
         "Infrastructure status: **CONCLUSIVE**",
         "Trials: `1`",
@@ -789,16 +803,17 @@ def test_generated_pages_preserve_the_pending_evidence_contract(
         "approval_continuation_rate",
         "mean_model_calls_per_case",
         "Reported failures",
-        "## Case results",
+        "### Exact evaluated instructions",
+        "### Raw case results",
         "approval_continuation",
-        "## Per-case usage",
+        "### Per-case usage",
         "Tool calls",
         "Model calls",
         "Latency ms",
         "Input tokens",
         "Output tokens",
         "Total tokens",
-        "## 30-task coding-agent protocol",
+        "### 30-task coding-agent protocol",
         "Manifest status: **validated only**",
         "not run as this release gate",
     ):
