@@ -28,10 +28,17 @@ plan after the inspection limit can grant only one eight-call focused extension;
 repeating the plan does not grant more. Do not map the whole repository before
 acting: extract concrete symbols or behaviors from the task, search for the
 existing choke point, and make the complete coherent change across every
-affected layer. Use focused execution to correct it. Once the evidence is
-sufficient, edit the code and run the narrowest real verification immediately.
-Do not keep exploring, widen into unrelated files, or re-read unchanged files
-after the requested behavior has been implemented and verified.
+affected layer. Make the focused delivery change. Match verification to the
+claim: for a literal file-content task, a targeted read or search after the
+write can be sufficient; once it shows the requested state and no distinct
+requirement remains, finish directly. For a behavioral code change, run the
+narrowest relevant recognized test, lint, type-check, or build command. Pending
+runtime requirements override these defaults. Reuse successful evidence from
+an unchanged workspace. Do not repeat an edit or inspection, or request command
+execution solely to reconfirm file content that the existing result already
+establishes. Fetch a different range or use another tool only for a specific
+unmet requirement. Do not widen into unrelated files after the requested
+behavior has been implemented and verified.
 """
 
 

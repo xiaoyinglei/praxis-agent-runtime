@@ -33,11 +33,14 @@ from agent_runtime.core.model_request import (
 )
 from agent_runtime.core.observations import (
     grounded_workspace_paths,
+    runtime_file_inspection_paths,
     runtime_workspace_change,
+    runtime_workspace_file_changes,
 )
 from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile
 from agent_runtime.core.turn_contracts import ToolCallPlan
 from agent_runtime.loop.state import LoopState, ModelTurnDraft, ModelTurnEnvelope
+from agent_runtime.loop.stop_hooks import runtime_verification_after_latest_change
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import (
     LLMGateway,
@@ -50,6 +53,7 @@ from agent_runtime.tools.tool import JsonValue, Tool, ToolCallOrigin
 
 _MAX_WORKING_STATE_GROUNDED_PATHS = 32
 _MAX_WORKING_STATE_LOCATORS = 32
+_MAX_POST_CHANGE_FILE_EVIDENCE = 8
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
 _MODEL_TOOL_CALL_REJECTED_EVENT = "model_tool_call_rejected"
 _TOOL_CALL_CORRECTION_EVENT = "tool_call_correction"
@@ -654,10 +658,18 @@ def _working_state_message(
         (index for index, result in enumerate(state["tool_results"]) if runtime_workspace_change(result) is not None),
         default=-1,
     )
-    verification_tool_call_ids = tuple(
-        result.tool_call_id
-        for result in state["tool_results"][latest_change_index + 1 :]
-        if (latest_change_index >= 0 and result.tool_name == "run_command" and not result.is_error)
+    verification_evidence = runtime_verification_after_latest_change(state)
+    verification_tool_call_ids = verification_evidence.successful_tool_call_ids
+    post_change_file_inspection = _post_change_file_inspection(
+        state,
+        latest_change_index=latest_change_index,
+    )
+    verification_constraint_pending = any(
+        constraint.required
+        and constraint.expected_value is True
+        and constraint.constraint_type == "verification_after_change"
+        and not verification_evidence.satisfied
+        for constraint in (() if goal_spec is None else goal_spec.constraints)
     )
     runtime_requirements = tuple(
         {
@@ -667,7 +679,10 @@ def _working_state_message(
             "observation": (
                 "observed"
                 if (constraint.constraint_type == "workspace_change" and workspace_change_tool_call_ids)
-                or (constraint.constraint_type == "verification_after_change" and verification_tool_call_ids)
+                or (
+                    constraint.constraint_type == "verification_after_change"
+                    and verification_evidence.satisfied
+                )
                 else "pending"
             ),
             "requirement": _runtime_requirement_description(constraint.constraint_type),
@@ -685,6 +700,7 @@ def _working_state_message(
         and not memory_state.verified_workspace_paths
         and plan is None
         and not runtime_requirements
+        and post_change_file_inspection is None
         and goal_spec is None
     ):
         return None
@@ -722,6 +738,45 @@ def _working_state_message(
     known_locators = _project_working_locators(
         memory_state.known_locators,
     )
+    runtime_evidence: dict[str, JsonValue] = {
+        "authority": "runtime",
+        "grounded_paths": grounded_paths,
+        "grounded_path_count": len(verified_grounded_paths),
+        "grounded_paths_truncated": (len(grounded_paths) < len(verified_grounded_paths)),
+        "recent_observations": tuple(
+            {
+                "tool_call_id": observation.tool_call_id,
+                "tool_name": observation.tool_name,
+                "status": observation.status,
+                "error": observation.error,
+                "warnings": tuple(observation.warnings),
+            }
+            for observation in memory_state.recent_observations
+            if (observation.tool_call_id not in protected_tool_call_ids)
+        ),
+        "known_locators": tuple(cast(Mapping[str, JsonValue], locator) for locator in known_locators),
+        "known_locator_count": len(memory_state.known_locators),
+        "known_locators_compacted": (len(known_locators) < len(memory_state.known_locators)),
+        "workspace_change_tool_call_ids": tuple(workspace_change_tool_call_ids),
+        "verification_tool_call_ids": verification_tool_call_ids,
+    }
+    if post_change_file_inspection is not None:
+        runtime_evidence["post_change_file_inspection"] = post_change_file_inspection
+        if (
+            post_change_file_inspection["observation"] == "observed"
+            and not verification_constraint_pending
+        ):
+            runtime_evidence["completion_guidance"] = {
+                "authority": "runtime",
+                "condition": "literal_file_task_and_existing_result_satisfies_target",
+                "action": "finish",
+                "prohibited_reconfirmation": (
+                    "repeat_inspection",
+                    "repeat_mutation",
+                    "run_command_only_to_reconfirm_file_content",
+                ),
+            }
+
     return context_event_message(
         "working_state",
         {
@@ -736,30 +791,58 @@ def _working_state_message(
             ),
             "plan_claims": plan_payload,
             "runtime_requirements": runtime_requirements,
-            "runtime_evidence": {
-                "authority": "runtime",
-                "grounded_paths": grounded_paths,
-                "grounded_path_count": len(verified_grounded_paths),
-                "grounded_paths_truncated": (len(grounded_paths) < len(verified_grounded_paths)),
-                "recent_observations": tuple(
-                    {
-                        "tool_call_id": observation.tool_call_id,
-                        "tool_name": observation.tool_name,
-                        "status": observation.status,
-                        "error": observation.error,
-                        "warnings": tuple(observation.warnings),
-                    }
-                    for observation in memory_state.recent_observations
-                    if (observation.tool_call_id not in protected_tool_call_ids)
-                ),
-                "known_locators": tuple(cast(Mapping[str, JsonValue], locator) for locator in known_locators),
-                "known_locator_count": len(memory_state.known_locators),
-                "known_locators_compacted": (len(known_locators) < len(memory_state.known_locators)),
-                "workspace_change_tool_call_ids": tuple(workspace_change_tool_call_ids),
-                "verification_tool_call_ids": verification_tool_call_ids,
-            },
+            "runtime_evidence": runtime_evidence,
         },
     )
+
+
+def _post_change_file_inspection(
+    state: LoopState,
+    *,
+    latest_change_index: int,
+) -> Mapping[str, JsonValue] | None:
+    if latest_change_index < 0:
+        return None
+    change_result = state["tool_results"][latest_change_index]
+    if change_result.is_error:
+        return None
+    changed_paths = tuple(
+        path
+        for path, _before_sha256, _after_sha256 in runtime_workspace_file_changes(change_result)
+    )
+    if not changed_paths:
+        return None
+
+    changed_path_set = frozenset(changed_paths)
+    inspection_tool_call_ids: list[str] = []
+    inspected_paths: dict[str, None] = {}
+    calls = state["canonical_tool_calls"]
+    for result in state["tool_results"][latest_change_index + 1 :]:
+        paths = runtime_file_inspection_paths(
+            result,
+            call=calls.get(result.tool_call_id),
+        )
+        related_paths = tuple(path for path in paths if path in changed_path_set)
+        if not related_paths:
+            continue
+        inspection_tool_call_ids.append(result.tool_call_id)
+        for path in related_paths:
+            inspected_paths.setdefault(path, None)
+
+    return {
+        "authority": "runtime",
+        "latest_change_tool_call_id": change_result.tool_call_id,
+        "changed_paths": changed_paths,
+        "observation": (
+            "observed" if inspection_tool_call_ids else "pending"
+        ),
+        "inspection_tool_call_ids": tuple(
+            inspection_tool_call_ids[-_MAX_POST_CHANGE_FILE_EVIDENCE:]
+        ),
+        "inspected_paths": tuple(inspected_paths)[-_MAX_POST_CHANGE_FILE_EVIDENCE:],
+        "scope": "file_content",
+        "semantic_target_satisfied": "not_evaluated",
+    }
 
 
 def _runtime_requirement_description(constraint_type: str) -> str:

@@ -15,6 +15,8 @@ from agent_runtime.knowledge import (
 from agent_runtime.memory.models import MemoryRef
 from agent_runtime.tools.tool import ToolCall, ToolResult
 
+_MAX_RUNTIME_WORKSPACE_FILE_CHANGES = 8
+
 
 class EvidenceRef(BaseModel):
     evidence_id: str | None = None
@@ -929,8 +931,8 @@ def grounded_workspace_paths(
                 requested_path = "."
             add(requested_path)
         if isinstance(result.structured_content, Mapping):
-            if result.tool_name in {"read_file", "apply_patch"}:
-                add(result.structured_content.get("path") or result.structured_content.get("file_path"))
+            if result.tool_name == "read_file":
+                add(result.structured_content.get("path"))
             elif result.tool_name == "list_files":
                 entries = result.structured_content.get("entries")
                 if not isinstance(entries, Sequence) or isinstance(
@@ -946,6 +948,7 @@ def grounded_workspace_paths(
                         if isinstance(entry, Mapping):
                             add(entry.get("path"))
             elif result.tool_name == "search_text":
+                add(result.structured_content.get("searched_file_path"))
                 matches = result.structured_content.get("matches")
                 if isinstance(matches, Sequence) and not isinstance(
                     matches,
@@ -954,12 +957,11 @@ def grounded_workspace_paths(
                     for match in matches:
                         if isinstance(match, Mapping):
                             add(match.get("file_path"))
+        for path, _before_sha256, _after_sha256 in runtime_workspace_file_changes(result):
+            add(path)
         change = runtime_workspace_change(result)
-        if change is None:
-            continue
-        add(change[0])
-        if call is not None:
-            add(call.arguments.get("file_path") or call.arguments.get("path"))
+        if change is not None and change[0] != ".":
+            add(change[0])
     return tuple(grounded)
 
 
@@ -1015,6 +1017,127 @@ def runtime_workspace_snapshot(
     ):
         return None
     return before_sha256, after_sha256
+
+
+def runtime_workspace_file_changes(
+    result: ToolResult,
+) -> tuple[tuple[str, str, str], ...]:
+    """Return executor-attested concrete file changes, failing closed."""
+
+    if runtime_workspace_snapshot(result) is None:
+        return ()
+    raw_changes = result.metadata.get("runtime_workspace_file_changes")
+    if not isinstance(raw_changes, Sequence) or isinstance(raw_changes, (str, bytes)):
+        return ()
+    if len(raw_changes) > _MAX_RUNTIME_WORKSPACE_FILE_CHANGES:
+        return ()
+
+    changes: list[tuple[str, str, str]] = []
+    seen_paths: set[str] = set()
+    for raw_change in raw_changes:
+        if not isinstance(raw_change, Mapping):
+            return ()
+        path = raw_change.get("path")
+        before_sha256 = raw_change.get("before_sha256")
+        after_sha256 = raw_change.get("after_sha256")
+        normalized_path = (
+            _normalize_grounded_workspace_path(path)
+            if isinstance(path, str)
+            else None
+        )
+        if (
+            normalized_path in {None, "."}
+            or normalized_path in seen_paths
+            or not _valid_sha256(before_sha256)
+            or not _valid_sha256(after_sha256)
+            or before_sha256 == after_sha256
+        ):
+            return ()
+        assert normalized_path is not None
+        assert isinstance(before_sha256, str)
+        assert isinstance(after_sha256, str)
+        seen_paths.add(normalized_path)
+        changes.append((normalized_path, before_sha256, after_sha256))
+    return tuple(changes)
+
+
+def runtime_file_inspection_paths(
+    result: ToolResult,
+    *,
+    call: ToolCall | None,
+) -> tuple[str, ...]:
+    """Return file paths whose current contents a successful tool observed."""
+
+    if (
+        result.is_error
+        or call is None
+        or call.tool_call_id != result.tool_call_id
+        or call.tool_name != result.tool_name
+        or not isinstance(result.structured_content, Mapping)
+    ):
+        return ()
+    output = result.structured_content
+    if result.tool_name == "read_file":
+        requested_path = call.arguments.get("path")
+        returned_path = output.get("path")
+        normalized_requested = (
+            _normalize_grounded_workspace_path(requested_path)
+            if isinstance(requested_path, str)
+            else None
+        )
+        normalized_returned = (
+            _normalize_grounded_workspace_path(returned_path)
+            if isinstance(returned_path, str)
+            else None
+        )
+        if normalized_requested is None or normalized_requested != normalized_returned:
+            return ()
+        return (normalized_requested,)
+    if result.tool_name != "search_text":
+        return ()
+
+    matches = output.get("matches")
+    if not isinstance(matches, Sequence) or isinstance(matches, (str, bytes)):
+        return ()
+    matched_paths: dict[str, None] = {}
+    for match in matches:
+        if not isinstance(match, Mapping):
+            return ()
+        raw_path = match.get("file_path")
+        normalized_path = (
+            _normalize_grounded_workspace_path(raw_path)
+            if isinstance(raw_path, str)
+            else None
+        )
+        if normalized_path is None:
+            return ()
+        matched_paths.setdefault(normalized_path, None)
+    if matched_paths:
+        return tuple(matched_paths)
+
+    total_matches = output.get("total_matches")
+    if (
+        not isinstance(total_matches, int)
+        or isinstance(total_matches, bool)
+        or total_matches != 0
+        or output.get("truncated") is not False
+    ):
+        return ()
+    requested_path = call.arguments.get("path")
+    searched_path = output.get("searched_file_path")
+    normalized_requested = (
+        _normalize_grounded_workspace_path(requested_path)
+        if isinstance(requested_path, str)
+        else None
+    )
+    normalized_searched = (
+        _normalize_grounded_workspace_path(searched_path)
+        if isinstance(searched_path, str)
+        else None
+    )
+    if normalized_requested is None or normalized_requested != normalized_searched:
+        return ()
+    return (normalized_requested,)
 
 
 def _valid_sha256(value: object) -> bool:
@@ -1136,7 +1259,9 @@ __all__ = [
     "ObservationExtractor",
     "StructuredObservation",
     "grounded_workspace_paths",
+    "runtime_file_inspection_paths",
     "runtime_workspace_change",
+    "runtime_workspace_file_changes",
     "runtime_workspace_snapshot",
     "tool_result_progress_error",
 ]

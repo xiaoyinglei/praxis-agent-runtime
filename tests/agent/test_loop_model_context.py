@@ -66,6 +66,8 @@ from agent_runtime.tools.tool import (
     NormalizedToolOutput,
     ResolvedToolUse,
     Tool,
+    ToolCall,
+    ToolCallOrigin,
     ToolContentBlock,
     ToolDefinition,
     ToolResult,
@@ -196,6 +198,42 @@ def _state(run_id: str = "loop-context") -> LoopState:
     return create_loop_state(
         current_message="Explain the policy with sources.",
         run_config=_run_config(run_id),
+    )
+
+
+def _runtime_call(
+    call_id: str,
+    tool_name: str,
+    arguments: Mapping[str, JsonValue],
+) -> ToolCall:
+    return ToolCall(
+        tool_call_id=call_id,
+        tool_name=tool_name,
+        arguments=arguments,
+        origin=ToolCallOrigin(
+            request_id=f"request-{call_id}",
+            toolset_revision="runtime-evidence-tools",
+            exposed_tool_names=(tool_name,),
+        ),
+    )
+
+
+def _changed_file_result(call_id: str, path: str) -> ToolResult:
+    return ToolResult(
+        tool_call_id=call_id,
+        tool_name="apply_patch",
+        metadata={
+            "runtime_workspace_write": True,
+            "workspace_tree_before_sha256": "a" * 64,
+            "workspace_tree_after_sha256": "b" * 64,
+            "runtime_workspace_file_changes": (
+                {
+                    "path": path,
+                    "before_sha256": "c" * 64,
+                    "after_sha256": "d" * 64,
+                },
+            ),
+        },
     )
 
 
@@ -1433,6 +1471,251 @@ async def test_pending_runtime_goal_requirements_are_visible_in_working_state() 
             ),
         },
     ]
+
+
+@pytest.mark.anyio
+async def test_working_state_projects_post_change_file_inspection() -> None:
+    gateway = _RecordingGateway()
+    state = _state("post-change-file-inspection")
+    changed_path = "src/runtime.py"
+    change_call = _runtime_call(
+        "tc-change-runtime",
+        "apply_patch",
+        {"file_path": changed_path},
+    )
+    read_call = _runtime_call(
+        "tc-read-runtime",
+        "read_file",
+        {"path": changed_path},
+    )
+    state["canonical_tool_calls"].update(
+        {
+            change_call.tool_call_id: change_call,
+            read_call.tool_call_id: read_call,
+        }
+    )
+    state["tool_results"] = [
+        _changed_file_result(change_call.tool_call_id, changed_path),
+        ToolResult(
+            tool_call_id=read_call.tool_call_id,
+            tool_name=read_call.tool_name,
+            structured_content={
+                "path": changed_path,
+                "content": "updated\n",
+                "truncated": False,
+            },
+        ),
+    ]
+
+    await _provider(gateway, names=()).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    working_state = next(
+        message
+        for message in gateway.calls[0]["request"].messages
+        if '"event_type":"working_state"' in message.content
+    )
+    evidence = json.loads(working_state.content)["payload"]["runtime_evidence"]
+    assert evidence["post_change_file_inspection"] == {
+        "authority": "runtime",
+        "latest_change_tool_call_id": change_call.tool_call_id,
+        "changed_paths": [changed_path],
+        "observation": "observed",
+        "inspection_tool_call_ids": [read_call.tool_call_id],
+        "inspected_paths": [changed_path],
+        "scope": "file_content",
+        "semantic_target_satisfied": "not_evaluated",
+    }
+    assert evidence["completion_guidance"]["action"] == "finish"
+    assert "runtime_workspace_file_changes" not in working_state.content
+    assert "c" * 64 not in working_state.content
+    assert "d" * 64 not in working_state.content
+
+
+@pytest.mark.anyio
+async def test_working_state_rejects_unrelated_and_stale_file_inspection() -> None:
+    state = _state("post-change-file-inspection-negative")
+    changed_path = "src/runtime.py"
+    change_call = _runtime_call(
+        "tc-change-negative",
+        "apply_patch",
+        {"file_path": changed_path},
+    )
+    unrelated_read = _runtime_call(
+        "tc-read-unrelated",
+        "read_file",
+        {"path": "src/other.py"},
+    )
+    state["canonical_tool_calls"].update(
+        {
+            change_call.tool_call_id: change_call,
+            unrelated_read.tool_call_id: unrelated_read,
+        }
+    )
+    state["tool_results"] = [
+        _changed_file_result(change_call.tool_call_id, changed_path),
+        ToolResult(
+            tool_call_id=unrelated_read.tool_call_id,
+            tool_name=unrelated_read.tool_name,
+            structured_content={"path": "src/other.py", "content": "other\n"},
+        ),
+    ]
+    first_gateway = _RecordingGateway()
+
+    await _provider(first_gateway, names=()).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    first_working_state = next(
+        message
+        for message in first_gateway.calls[0]["request"].messages
+        if '"event_type":"working_state"' in message.content
+    )
+    first_evidence = json.loads(first_working_state.content)["payload"][
+        "runtime_evidence"
+    ]
+    assert first_evidence["post_change_file_inspection"]["observation"] == (
+        "pending"
+    )
+    assert "completion_guidance" not in first_evidence
+
+    state["tool_results"].append(
+        ToolResult(
+            tool_call_id="tc-unknown-path-change",
+            tool_name="run_command",
+            metadata={
+                "runtime_workspace_write": True,
+                "workspace_tree_before_sha256": "e" * 64,
+                "workspace_tree_after_sha256": "f" * 64,
+            },
+        )
+    )
+    second_gateway = _RecordingGateway()
+
+    await _provider(second_gateway, names=()).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    assert all(
+        '"event_type":"working_state"' not in message.content
+        for message in second_gateway.calls[0]["request"].messages
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("command", "workspace_write", "is_error", "expected_observation"),
+    [
+        ("printf ok", False, False, "pending"),
+        ("uv run pytest -q tests/test_runtime.py", False, True, "pending"),
+        ("uv run pytest -q tests/test_runtime.py", True, False, "pending"),
+        ("uv run pytest -q tests/test_runtime.py", False, False, "observed"),
+    ],
+)
+async def test_working_state_uses_stop_hook_verification_truth(
+    command: str,
+    workspace_write: bool,
+    is_error: bool,
+    expected_observation: str,
+) -> None:
+    gateway = _RecordingGateway()
+    goal = GoalSpec(
+        original_query="Change and verify runtime behavior.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            )
+        ],
+    )
+    state = _state(
+        "working-state-shared-verification-"
+        f"{workspace_write}-{is_error}-{expected_observation}"
+    )
+    changed_path = "src/runtime.py"
+    change_call = _runtime_call(
+        "tc-change-shared-verification",
+        "apply_patch",
+        {"file_path": changed_path},
+    )
+    read_call = _runtime_call(
+        "tc-read-shared-verification",
+        "read_file",
+        {"path": changed_path},
+    )
+    command_call = _runtime_call(
+        "tc-command-shared-verification",
+        "run_command",
+        {
+            "command": command,
+            "workspace_write": workspace_write,
+        },
+    )
+    state["canonical_tool_calls"].update(
+        {
+            change_call.tool_call_id: change_call,
+            read_call.tool_call_id: read_call,
+            command_call.tool_call_id: command_call,
+        }
+    )
+    command_metadata = (
+        {"operation_id": "operation-command-write"}
+        if workspace_write
+        else {}
+    )
+    state["tool_results"] = [
+        _changed_file_result(change_call.tool_call_id, changed_path),
+        ToolResult(
+            tool_call_id=read_call.tool_call_id,
+            tool_name=read_call.tool_name,
+            structured_content={"path": changed_path, "content": "updated\n"},
+        ),
+        ToolResult(
+            tool_call_id=command_call.tool_call_id,
+            tool_name=command_call.tool_name,
+            structured_content={
+                "exit_code": 1 if is_error else 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+            is_error=is_error,
+            error_code="command_failed" if is_error else None,
+            error_message="verification failed" if is_error else None,
+            metadata=command_metadata,
+        ),
+    ]
+
+    await _provider(gateway, names=(), goal_spec=goal).next_turn(
+        state,
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    working_state = next(
+        message
+        for message in gateway.calls[0]["request"].messages
+        if '"event_type":"working_state"' in message.content
+    )
+    payload = json.loads(working_state.content)["payload"]
+    [requirement] = payload["runtime_requirements"]
+    assert requirement["observation"] == expected_observation
+    evidence = payload["runtime_evidence"]
+    if expected_observation == "observed":
+        assert evidence["verification_tool_call_ids"] == [
+            command_call.tool_call_id
+        ]
+        assert evidence["completion_guidance"]["action"] == "finish"
+    else:
+        assert evidence["verification_tool_call_ids"] == []
+        assert "completion_guidance" not in evidence
 
 
 @pytest.mark.anyio

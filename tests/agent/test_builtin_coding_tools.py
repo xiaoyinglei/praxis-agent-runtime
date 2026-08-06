@@ -11,7 +11,10 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.observations import runtime_workspace_change
+from agent_runtime.core.observations import (
+    runtime_workspace_change,
+    runtime_workspace_file_changes,
+)
 from agent_runtime.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
@@ -116,6 +119,18 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
             isinstance(schema, Mapping) and schema.get("description")
             for schema in properties.values()
         )
+
+
+def test_resident_tool_docs_distinguish_content_from_behavior(
+    tmp_path: Path,
+) -> None:
+    tools = _tools_by_name(open_workspace(tmp_path, create=True))
+
+    assert "Reuse a sufficient result" in tools["read_file"].definition.description
+    assert "never reapply the patch" in tools["apply_patch"].definition.description
+    assert "non-truncated" in tools["search_text"].definition.description
+    assert "verify code behavior" in tools["run_command"].definition.description
+    assert "solely to reconfirm" in tools["run_command"].definition.description
 
 
 def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:
@@ -256,6 +271,11 @@ async def test_filesystem_tools_list_read_patch_and_expose_changes_immediately(
         patched.result.metadata["workspace_tree_before_sha256"]
         != patched.result.metadata["workspace_tree_after_sha256"]
     )
+    [(changed_path, before_sha256, after_sha256)] = (
+        runtime_workspace_file_changes(patched.result)
+    )
+    assert changed_path == "src/example.py"
+    assert before_sha256 != after_sha256
     assert old_search.result.structured_content is not None
     assert old_search.result.structured_content["matches"] == ()
     assert new_search.result.structured_content is not None
@@ -528,6 +548,9 @@ async def test_search_text_supports_literal_regex_path_glob_context_and_limits(
     )
 
     assert literal.result.structured_content is not None
+    assert literal.result.structured_content["searched_file_path"] == (
+        "src/one.py"
+    )
     literal_matches = literal.result.structured_content["matches"]
     assert len(literal_matches) == 1
     assert literal_matches[0]["file_path"] == "src/one.py"
@@ -549,6 +572,70 @@ async def test_search_text_supports_literal_regex_path_glob_context_and_limits(
     assert limited.result.structured_content["total_matches"] == 1
     assert limited.result.structured_content["truncated"] is True
     assert invalid_regex.result.error_code == "invalid_arguments"
+
+
+@pytest.mark.anyio
+async def test_search_text_reports_only_exact_text_file_provenance(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    source = workspace.root / "src"
+    source.mkdir()
+    (source / "only.txt").write_text("alpha\n", encoding="utf-8")
+    (source / "binary.bin").write_bytes(b"alpha\x00omega")
+    (source / "large.txt").write_text(
+        "x" * (search_module._MAX_SEARCH_FILE_BYTES + 1),
+        encoding="utf-8",
+    )
+    search = _tools_by_name(workspace)["search_text"]
+
+    exact = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/only.txt"},
+        workspace=workspace,
+    )
+    excluded = await _execute(
+        search,
+        {
+            "pattern": "missing",
+            "path": "src/only.txt",
+            "glob": "*.py",
+        },
+        workspace=workspace,
+    )
+    binary = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/binary.bin"},
+        workspace=workspace,
+    )
+    directory = await _execute(
+        search,
+        {
+            "pattern": "missing",
+            "path": "src",
+            "glob": "only.txt",
+        },
+        workspace=workspace,
+    )
+    truncated = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/large.txt"},
+        workspace=workspace,
+    )
+
+    assert exact.result.structured_content is not None
+    assert exact.result.structured_content["searched_file_path"] == (
+        "src/only.txt"
+    )
+    assert exact.result.structured_content["truncated"] is False
+    for execution in (excluded, binary, directory):
+        assert execution.result.structured_content is not None
+        assert execution.result.structured_content["searched_file_path"] is None
+    assert truncated.result.structured_content is not None
+    assert truncated.result.structured_content["searched_file_path"] == (
+        "src/large.txt"
+    )
+    assert truncated.result.structured_content["truncated"] is True
 
 
 @pytest.mark.anyio
