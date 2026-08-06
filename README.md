@@ -73,17 +73,17 @@ agents. Deeper lifecycle details are in the
 | Evidence | What it establishes | Current state |
 | --- | --- | --- |
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
-| [Model-quality benchmark](docs/benchmark.md) | Five capabilities, three trials each, evaluator and infrastructure status | **PASSED — 15/15 cases passed; worst-trial task success 100%**; worst-trial mean tool calls 1.6 |
+| [Tool-use reliability benchmark](docs/benchmark.md) | Five fixed, controlled ACI scenarios, repeated three times each | **PASSED — 15/15 scenario executions passed**; worst-trial mean tool calls 1.6 |
 | [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE PASS — 3/3 approval trials completed**; 2 tool calls per trial |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
-The model-quality pages are generated from a clean source commit after the local
-gates pass. Infrastructure failures are reported as **INCONCLUSIVE**, never
-converted into a model score. No test count is treated as proof that an Agent task
-succeeded. The table reports the measured verdict and exact case count from the
-linked raw report. A failed result would block model-quality and readiness claims
-but would not overwrite deterministic runtime-gate results; inspect the expanded
-trace for case-level evidence.
+The tool-use reliability page is generated from a clean source commit after the
+local gates pass. It measures five narrow behaviors: direct file reading, search
+then read, recovery from a renamed file, approval and resume, and stopping after a
+confirmed failure. It does not claim broad coding ability. Infrastructure failures
+are reported as **INCONCLUSIVE**, never converted into a model score. The table
+reports the measured verdict and exact execution count from the linked raw report;
+inspect the expanded trace for case-level evidence.
 
 ## Quickstart
 
@@ -244,7 +244,7 @@ Focused references:
 - [Runbook](docs/RUNBOOK.md) — models, services, private knowledge, and operations
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — common runtime and RAG failures
 - [Product contract](docs/design/agent_product_contract.md) — public lifecycle and boundaries
-- [Model-quality benchmark](docs/benchmark.md) — current live-evidence methodology and verdict
+- [Tool-use reliability benchmark](docs/benchmark.md) — plain-language scenarios, scope, and current live result
 - [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) — human-readable approval-continuation evidence
 - [Evaluation archive](docs/EVALUATION.md) — historical retrieval baselines with provenance notes
 - [MIT license](LICENSE) — use and redistribution terms

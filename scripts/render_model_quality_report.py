@@ -48,6 +48,42 @@ _SENSITIVE_KEY_TOKENS = frozenset(
 )
 
 
+_CASE_PRESENTATION: dict[str, tuple[str, str, str]] = {
+    "exact_file_read": (
+        "Read a known file directly",
+        "Open a file whose path is already known and return the value inside it.",
+        "Read the specified file with a valid call, return the correct value, and make no invalid tool calls.",
+    ),
+    "symbol_search_then_read": (
+        "Find an unknown file, then read it",
+        "Find which file contains a named symbol, open that file, and return its value.",
+        "Use valid search-then-read calls in that order and return the correct value.",
+    ),
+    "missing_file_recovery": (
+        "Recover when a file was renamed",
+        "Try an old report path and, when it is missing, locate and read the renamed report.",
+        "Observe the expected failed read, later read the renamed file successfully, and return its contents.",
+    ),
+    "approval_continue": (
+        "Resume an edit after approval",
+        "Replace one value in a text file, then confirm that the requested value is present.",
+        "Pause for approval, resume, apply the requested edit exactly once, and leave the expected file content.",
+    ),
+    "single_failure_no_retry": (
+        "Stop after a confirmed missing file",
+        "Try a known-missing file once and report that it is unavailable.",
+        "Make the required failed read once, issue no other tool calls, and report that the file is unavailable.",
+    ),
+}
+
+_CAPABILITY_PRESENTATION = {
+    "file_tool_selection": "choose the appropriate file tools",
+    "failure_recovery": "recover from an expected tool failure",
+    "approval_continuation": "continue correctly after approval",
+    "repeated_failure_control": "avoid repeating a confirmed failure",
+}
+
+
 def render_model_quality_report(
     report_path: Path,
     *,
@@ -212,6 +248,11 @@ def _render_benchmark(
     raw_report_reference: str,
 ) -> str:
     verdict = _verdict(report)
+    metadata = [
+        _mapping(item, label="case metadata")
+        for item in _sequence(report.get("case_metadata"), label="case_metadata")
+    ]
+    rendered_cases = _iter_cases(report)
     runtime_platform = _mapping(
         report.get("runtime_platform"),
         label="runtime_platform",
@@ -221,40 +262,111 @@ def _render_benchmark(
         label="model run",
     )
     lines = [
-        "# Model quality benchmark",
+        "# Agent tool-use reliability benchmark",
         "",
         f"Overall verdict: **{verdict}**",
         "",
-        "## Evidence provenance",
+        "This is a narrow Agent-Computer Interface (ACI) reliability gate.",
+        "It is not a general coding or reasoning benchmark. It checks whether a model",
+        "can follow a fixed set of controlled, machine-checkable file-tool scenarios.",
         "",
-        f"- source_commit: `{_required_text(report, 'source_commit')}`",
-        f"- source_tree: `{_required_text(report, 'source_tree')}`",
-        "- source_unchanged: `true`",
-        "- dirty: `false`",
-        f"- suite_id: `{_required_text(report, 'suite_id')}`",
-        f"- suite_revision: `{_required_text(report, 'suite_revision')}`",
-        f"- evaluator_version: `{_required_text(report, 'evaluator_version')}`",
-        f"- measured_at: `{_required_text(report, 'measured_at')}`",
-        f"- Redacted raw report: [{Path(raw_report_reference).name}]({raw_report_reference})",
+        "Synthetic marker values make each result machine-checkable. They are test",
+        "fixtures, not examples of realistic user content. The exact instructions and",
+        "machine-readable identifiers remain available under Technical evidence.",
         "",
-        "## Environment",
+        "## Result at a glance",
         "",
-        "| Field | Value |",
-        "| --- | --- |",
-        *(
-            f"| `{field}` | `{_cell(_required_text(runtime_platform, field))}` |"
-            for field in (
-                "os",
-                "os_release",
-                "architecture",
-                "python_version",
-                "python_implementation",
-            )
-        ),
-        "",
-        "## Model results",
-        "",
+        "| Model | Scenarios | Trials per scenario | Passed executions | Gate result |",
+        "| --- | ---: | ---: | ---: | --- |",
     ]
+    for raw_model in _sequence(report.get("models"), label="models"):
+        model = _mapping(raw_model, label="model result")
+        model_alias = _required_text(model, "model_alias")
+        run = runs[model_alias]
+        trial_count = _integer(run.get("trial_count"), label="trial_count")
+        model_cases = [
+            case for case in rendered_cases if case.model_alias == model_alias
+        ]
+        expected_executions = len(metadata) * trial_count
+        lines.append(
+            "| "
+            f"`{_cell(_required_text(model, 'provider_model'))}` | `{len(metadata)}` | "
+            f"`{trial_count}` | {_execution_summary(model_cases, expected_executions)} | "
+            f"**{_boolean_verdict(model.get('passed'))}** |"
+        )
+    lines.extend(
+        [
+            "",
+            "A passing execution means both the requested outcome and the scenario's",
+            "tool-use rule were satisfied. Counts are taken from the linked report, not",
+            "entered by hand.",
+            "",
+            "## What the agent was asked to do",
+            "",
+            "| Scenario | User request | What counts as a pass | Observed result |",
+            "| --- | --- | --- | ---: |",
+        ]
+    )
+    expected_per_scenario = sum(
+        _integer(run.get("trial_count"), label="trial_count") for run in runs.values()
+    )
+    for item in metadata:
+        case_id = _required_text(item, "case_id")
+        capability = _required_text(item, "capability")
+        title, user_task, passing_behavior = _case_presentation(
+            case_id=case_id,
+            capability=capability,
+            exact_task=_required_text(item, "task"),
+        )
+        scenario_cases = [case for case in rendered_cases if case.case_id == case_id]
+        lines.append(
+            f"| **{_cell(title)}** | {_cell(user_task)} | {_cell(passing_behavior)} | "
+            f"{_execution_summary(scenario_cases, expected_per_scenario)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## What this result means",
+            "",
+            "A pass shows that the evaluated model followed the reported small, controlled",
+            "tool workflows consistently under this runtime and evaluator.",
+            "It does **not** establish broad programming ability, repository-scale planning",
+            "quality, or safety outside the tested boundaries. The separate 30-task",
+            "coding-agent manifest has only been validated and was not scored in this run.",
+            "",
+            "## Technical evidence",
+            "",
+            "### Evidence provenance",
+            "",
+            f"- source_commit: `{_required_text(report, 'source_commit')}`",
+            f"- source_tree: `{_required_text(report, 'source_tree')}`",
+            "- source_unchanged: `true`",
+            "- dirty: `false`",
+            f"- suite_id: `{_required_text(report, 'suite_id')}`",
+            f"- suite_revision: `{_required_text(report, 'suite_revision')}`",
+            f"- evaluator_version: `{_required_text(report, 'evaluator_version')}`",
+            f"- measured_at: `{_required_text(report, 'measured_at')}`",
+            f"- Redacted raw report: [{Path(raw_report_reference).name}]({raw_report_reference})",
+            "",
+            "### Environment",
+            "",
+            "| Field | Value |",
+            "| --- | --- |",
+            *(
+                f"| `{field}` | `{_cell(_required_text(runtime_platform, field))}` |"
+                for field in (
+                    "os",
+                    "os_release",
+                    "architecture",
+                    "python_version",
+                    "python_implementation",
+                )
+            ),
+            "",
+            "### Raw model metrics",
+            "",
+        ]
+    )
     for raw_model in _sequence(report.get("models"), label="models"):
         model = _mapping(raw_model, label="model result")
         model_alias = _required_text(model, "model_alias")
@@ -265,7 +377,7 @@ def _render_benchmark(
         )
         lines.extend(
             [
-                f"### `{model_alias}`",
+                f"#### `{model_alias}`",
                 "",
                 f"- Provider: `{_required_text(run, 'provider')}`",
                 f"- Provider model: `{_required_text(model, 'provider_model')}`",
@@ -281,21 +393,28 @@ def _render_benchmark(
                 [
                     f"- Infrastructure stage: `{_scalar(infrastructure.get('stage'))}`",
                     f"- Stop reason: `{_scalar(infrastructure.get('stop_reason'))}`",
-                    "- Diagnostic error types: "
-                    f"`{_scalar(infrastructure.get('diagnostic_error_types'))}`",
+                    f"- Diagnostic error types: `{_scalar(infrastructure.get('diagnostic_error_types'))}`",
                     "",
                 ]
             )
-        observed = _mapping(model.get("observed"), label=f"{model_alias} observed metrics")
-        thresholds = _mapping(model.get("thresholds"), label=f"{model_alias} thresholds")
+        observed = _mapping(
+            model.get("observed"), label=f"{model_alias} observed metrics"
+        )
+        thresholds = _mapping(
+            model.get("thresholds"), label=f"{model_alias} thresholds"
+        )
         if observed:
             lines.extend(["| Metric | Observed | Threshold |", "| --- | ---: | --- |"])
             for metric, value in observed.items():
                 raw_threshold = thresholds.get(metric)
                 threshold = _threshold_text(raw_threshold)
-                lines.append(f"| `{_cell(metric)}` | `{_scalar(value)}` | {threshold} |")
+                lines.append(
+                    f"| `{_cell(metric)}` | `{_scalar(value)}` | {threshold} |"
+                )
             lines.append("")
-        failures = _string_sequence(model.get("failures", ()), label=f"{model_alias} failures")
+        failures = _string_sequence(
+            model.get("failures", ()), label=f"{model_alias} failures"
+        )
         if failures:
             lines.append("Reported failures:")
             lines.append("")
@@ -304,13 +423,29 @@ def _render_benchmark(
 
     lines.extend(
         [
-            "## Case results",
+            "### Exact evaluated instructions",
+            "",
+            "| Case ID | Capability | Exact instruction sent to the model |",
+            "| --- | --- | --- |",
+        ]
+    )
+    for item in metadata:
+        lines.append(
+            "| "
+            f"`{_cell(_required_text(item, 'case_id'))}` | "
+            f"`{_cell(_required_text(item, 'capability'))}` | "
+            f"{_cell(_safe_text(_required_text(item, 'task')))} |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Raw case results",
             "",
             "| Model | Trial | Case | Capability | Verdict |",
             "| --- | ---: | --- | --- | --- |",
         ]
     )
-    for case in _iter_cases(report):
+    for case in rendered_cases:
         lines.append(
             "| "
             f"`{_cell(case.model_alias)}` | `{case.trial}` | `{_cell(case.case_id)}` | "
@@ -319,14 +454,14 @@ def _render_benchmark(
     lines.append("")
     lines.extend(
         [
-            "## Per-case usage",
+            "### Per-case usage",
             "",
             "| Model | Trial | Case | Tool calls | Model calls | Latency ms | "
             "Input tokens | Output tokens | Total tokens |",
             "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for case in _iter_cases(report):
+    for case in rendered_cases:
         tool_calls = _sequence(
             case.observation.get("tool_calls"),
             label=f"{case.case_id} tool_calls",
@@ -343,7 +478,7 @@ def _render_benchmark(
     lines.extend(
         [
             "",
-            "## 30-task coding-agent protocol",
+            "### 30-task coding-agent protocol",
             "",
             "- Manifest: `evals/code_agent/benchmark_v1.json`",
             "- Manifest status: **validated only**",
@@ -797,6 +932,42 @@ def _iter_cases(report: Mapping[str, object]) -> list[_RenderedCase]:
                     )
                 )
     return rendered
+
+
+def _case_presentation(
+    *,
+    case_id: str,
+    capability: str,
+    exact_task: str,
+) -> tuple[str, str, str]:
+    presentation = _CASE_PRESENTATION.get(case_id)
+    if presentation is not None:
+        return presentation
+    title = case_id.replace("_", " ").strip().capitalize()
+    capability_text = _CAPABILITY_PRESENTATION.get(
+        capability,
+        capability.replace("_", " "),
+    )
+    return (
+        title,
+        _safe_text(exact_task),
+        f"Complete the requested outcome and {capability_text}.",
+    )
+
+
+def _execution_summary(cases: Sequence[_RenderedCase], expected: int) -> str:
+    if expected <= 0:
+        raise ValueError(
+            "model quality report expected execution count must be positive"
+        )
+    reached = len(cases)
+    if reached > expected:
+        raise ValueError("model quality report has more case executions than expected")
+    passed = sum(case.verdict == "PASSED" for case in cases)
+    summary = f"**{passed}/{expected} passed**"
+    if reached < expected:
+        summary += f"; {reached}/{expected} reached"
+    return summary
 
 
 def _approval_metadata(report: Mapping[str, object]) -> Mapping[str, object]:

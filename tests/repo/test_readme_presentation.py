@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 
 import yaml
 
@@ -14,6 +17,7 @@ RUN_RECORD = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
 MODEL_QUALITY_REPORT = (
     ROOT / "evals" / "model_quality" / "runs" / "2026-08-06-deepseek-v4-flash.json"
 )
+MODEL_QUALITY_RENDERER = ROOT / "scripts" / "render_model_quality_report.py"
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
 MODEL_CATALOG = ROOT / "configs" / "models.yaml"
 
@@ -174,6 +178,33 @@ def test_runbook_defaults_are_bound_to_the_model_catalog() -> None:
     assert "显式可选" in runbook
 
 
+def test_checked_in_live_evidence_pages_match_renderer() -> None:
+    with (
+        NamedTemporaryFile(dir=BENCHMARK.parent, suffix=".md") as benchmark_file,
+        NamedTemporaryFile(dir=RUN_RECORD.parent, suffix=".md") as run_record_file,
+    ):
+        benchmark = Path(benchmark_file.name)
+        run_record = Path(run_record_file.name)
+        subprocess.run(
+            [
+                sys.executable,
+                str(MODEL_QUALITY_RENDERER),
+                str(MODEL_QUALITY_REPORT),
+                "--benchmark",
+                str(benchmark),
+                "--run-record",
+                str(run_record),
+            ],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert benchmark.read_text(encoding="utf-8") == _read(BENCHMARK)
+        assert run_record.read_text(encoding="utf-8") == _read(RUN_RECORD)
+
+
 def test_license_and_live_evidence_pages_are_explicit() -> None:
     license_text = _read(LICENSE)
     readme = _read(README)
@@ -197,10 +228,6 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
 
     cases = [case for trial in run["trials"] for case in trial["cases"]]
     passed_cases = sum(case["score"]["passed"] is True for case in cases)
-    worst_task_success = min(
-        float(trial["metrics"]["task_success_rate"]) for trial in run["trials"]
-    )
-    task_success_percent = round(worst_task_success * 100)
     approval_cases = [
         case for case in cases if case["score"]["case_id"] == "approval_continue"
     ]
@@ -212,14 +239,42 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
     assert license_text.startswith("MIT License\n")
     assert "Copyright (c) 2026 xiaoyinglei" in license_text
     assert (
-        f"**{verdict} — {passed_cases}/{len(cases)} cases passed; "
-        f"worst-trial task success {task_success_percent}%**"
+        f"**{verdict} — {passed_cases}/{len(cases)} scenario executions passed**"
     ) in readme
     assert (
         f"**CONCLUSIVE {conclusion} — {passed_approval_cases}/{len(approval_cases)} "
         "approval trials completed**"
     ) in readme
     assert f"Overall verdict: **{verdict}**" in benchmark
+    assert benchmark.startswith("# Agent tool-use reliability benchmark\n")
+    assert "not a general coding or reasoning benchmark" in benchmark
+    assert "fixed set of controlled, machine-checkable file-tool scenarios" in benchmark
+    assert "deterministic file-tool" not in benchmark
+    assert "## What the agent was asked to do" in benchmark
+    for scenario in (
+        "Read a known file directly",
+        "Find an unknown file, then read it",
+        "Recover when a file was renamed",
+        "Resume an edit after approval",
+        "Stop after a confirmed missing file",
+    ):
+        assert scenario in benchmark
+    for pass_contract in (
+        "Read the specified file with a valid call",
+        "Use valid search-then-read calls in that order",
+        "Observe the expected failed read",
+        "apply the requested edit exactly once",
+        "issue no other tool calls",
+    ):
+        assert pass_contract in benchmark
+    for overstated_contract in (
+        "avoid extra tool calls",
+        "without looping",
+        "verify the changed file before finishing",
+    ):
+        assert overstated_contract not in benchmark
+    assert "does **not** establish broad programming ability" in benchmark
+    assert "### Exact evaluated instructions" in benchmark
     assert f"source_commit: `{report['source_commit']}`" in benchmark
     assert "source_unchanged: `true`" in benchmark
     assert "dirty: `false`" in benchmark
