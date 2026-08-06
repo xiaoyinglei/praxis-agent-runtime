@@ -3,8 +3,8 @@
 ## Status
 
 Approach A was selected interactively on 2026-08-06. This revision addresses
-two independent specification-review rounds and is pending final re-review and
-explicit user approval before implementation.
+two independent specification-review rounds and was independently approved on
+2026-08-06. It is pending explicit user approval before implementation.
 
 ## Context
 
@@ -186,7 +186,8 @@ Instead, extend the existing executor-owned write snapshot at the ACI boundary:
    runtime-resolved `ToolTarget` values. Select only `kind="workspace_path"`
    targets that resolve beneath the executor's workspace root and identify a
    concrete regular file, not a directory or unresolved path.
-2. Bound precise target collection to eight files. If the resolved use exceeds
+2. Normalize and deduplicate precise targets in deterministic order, then
+   bound collection to eight files. If the deduplicated resolved use exceeds
    that bound or contains an invalid target, keep the whole-tree snapshot but
    emit no precise-file attestation.
 3. Hash each selected file immediately before execution and again at the
@@ -430,49 +431,53 @@ with a focused failing regression.
    change do not project observed evidence.
 6. A whole-workspace change with no precise grounded target omits the
    file-level object.
-7. IDs and paths retain the newest eight entries in deterministic
-   chronological order; no content or absolute paths enter the projection.
+7. Resolved write targets are normalized and deduplicated before the
+   eight-file attestation bound. Projected IDs and paths retain the newest
+   eight entries in deterministic chronological order.
+8. Protected path/hash triples never enter a model-visible tool payload or
+   `working_state`; only derived relative paths and call IDs are projected, with
+   no content or absolute paths.
 
 ### Completion-guidance tests
 
-8. Observed post-change content evidence with no pending command constraint
+9. Observed post-change content evidence with no pending command constraint
    produces the conditional finish/no-reconfirmation guidance.
-9. A pending `verification_after_change` constraint suppresses that guidance.
+10. A pending `verification_after_change` constraint suppresses that guidance.
    Unrecognized commands, `workspace_write=true` commands, and failed
    recognized verification attempts keep it pending; at least one recognized
    read-only attempt and success of every such attempt mark it observed.
-10. The stop hook and working-state projection consume the same verification
+11. The stop hook and working-state projection consume the same verification
    calculation and expose the same recognized successful call IDs.
-11. File-content evidence never populates `verification_tool_call_ids` or marks
+12. File-content evidence never populates `verification_tool_call_ids` or marks
    behavioral verification observed.
 
 ### Prompt and tool-contract tests
 
-12. The generic prompt explicitly distinguishes literal content proof from
+13. The generic prompt explicitly distinguishes literal content proof from
    behavioral command verification and preserves runtime-requirement authority.
-13. The prompt forbids repeated mutation and command escalation used only for
+14. The prompt forbids repeated mutation and command escalation used only for
     unchanged-content reconfirmation.
-14. `apply_patch`, `read_file`, `search_text`, and `run_command` descriptions
+15. `apply_patch`, `read_file`, `search_text`, and `run_command` descriptions
     carry bounded, consistent post-change guidance without changing effects or
     approval classification.
-15. `search_text` output reports `searched_file_path` only for an exact file
+16. `search_text` output reports `searched_file_path` only for an exact file
     target actually scanned as text, including regressions for glob exclusion,
     binary input, broad directories containing exactly one file, multiple-file
     scope, truncation, and deterministic normalization.
 
 ### Runtime feedback and safety tests
 
-16. The repeated-inspection error text and structured payload direct the model
+17. The repeated-inspection error text and structured payload direct the model
     to finish when the existing result is sufficient and forbid redundant
     mutation/command escalation.
-17. A different file, a distinct range needed after a truncated read, and a
+18. A different file, a distinct range needed after a truncated read, and a
     distinct literal condition remain executable.
-18. The same read is blocked in an unchanged delivery cycle but executes again
+19. The same read is blocked in an unchanged delivery cycle but executes again
     after any runtime-observed workspace change, including an unknown-path
     command write.
-19. An approval-resume flow projects post-change inspection evidence without
+20. An approval-resume flow projects post-change inspection evidence without
     changing the number or kind of approvals.
-20. Existing write and command approval, pause, checkpoint, and resume tests
+21. Existing write and command approval, pause, checkpoint, and resume tests
     remain unchanged and green.
 
 ## Verification and rollout
