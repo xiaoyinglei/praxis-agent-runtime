@@ -3,7 +3,7 @@
 ## Status
 
 Approach A was selected interactively on 2026-08-06. This revision addresses
-the first independent specification review and is pending re-review and
+two independent specification-review rounds and is pending final re-review and
 explicit user approval before implementation.
 
 ## Context
@@ -100,11 +100,13 @@ whether the returned content satisfies the user's literal requirement.
   accepts executor-owned before/after evidence.
 - A post-change inspection exists only for a non-error `read_file` or
   `search_text` result after the latest accepted change.
-- A current executor tree delta is not enough to attribute a change to an
-  `apply_patch` target. The non-error resident-tool receipt, canonical target,
-  structured output, and normalized metadata path must agree.
-- Canonical validated tool arguments and runtime-normalized result paths are
-  the only path inputs. Model prose and plan claims never create this signal.
+- A current executor tree delta, tool name, or tool-authored receipt is not
+  enough to attribute a change to a file. Only executor-protected before/after
+  hashes for a resolved concrete file target can create that binding.
+- Executor-protected resolved target paths are the only source of changed-file
+  identity. Canonical validated inspection arguments and runtime-normalized
+  inspection-result paths may bind later reads/searches to that identity.
+  Model prose, tool-authored receipts, and plan claims never create it.
 - An inspection before the latest change is stale and must not count.
 - A failed inspection, `list_files`, `find_tools`, or an unrelated-file read
   must not count.
@@ -174,29 +176,50 @@ contents, diffs, command output, absolute paths, or model-authored prose.
 
 ### 2. Ground the changed file fail closed
 
-Add one small runtime-evidence helper at the existing observation boundary,
-using the accepted `ToolResult` and its canonical `ToolCall`:
+Do not try to prove builtin identity from `ToolResult.tool_name`, an execution
+revision, or self-reported patch fields. `AgentService` accepts caller-supplied
+registries, so a custom same-name tool can imitate all of those values.
 
-1. Reject the result unless `runtime_workspace_change` confirms a tree or
-   legacy file change, the result is non-error, and the registered tool is the
-   resident `apply_patch`.
-2. Require `structured_content.replaced is True` and require the normalized
-   canonical `file_path`, structured-output `file_path`, and normalized
-   result-metadata `file_path` to be the same concrete workspace-relative
-   path.
-3. Only then bind the executor-owned tree delta to that single-file target.
-   The success receipt establishes that the builtin performed the requested
-   replacement; the tree delta establishes that the executor observed a real
-   workspace change around it.
-4. Reject an errored or no-op patch even if an unrelated concurrent mutation
-   caused its before/after tree hashes to differ. Reject missing or mismatched
-   receipts and paths.
-5. For a command write or any whole-workspace change with no precise trusted
-   target, return no changed file path. Do not guess from command text or later
-   model claims.
+Instead, extend the existing executor-owned write snapshot at the ACI boundary:
 
-This helper may be private or module-internal; it must not create a new public
-SDK contract.
+1. During preparation of a tool use with `WRITE_WORKSPACE`, inspect its
+   runtime-resolved `ToolTarget` values. Select only `kind="workspace_path"`
+   targets that resolve beneath the executor's workspace root and identify a
+   concrete regular file, not a directory or unresolved path.
+2. Bound precise target collection to eight files. If the resolved use exceeds
+   that bound or contains an invalid target, keep the whole-tree snapshot but
+   emit no precise-file attestation.
+3. Hash each selected file immediately before execution and again at the
+   executor finish boundary. Store only changed path/hash triples in new
+   protected metadata, for example
+   `runtime_workspace_file_changes`. Add that key to
+   `_PROTECTED_WORKSPACE_METADATA_KEYS`, strip any tool-provided value, and
+   reconstruct it exclusively from the prepared resolved targets and observed
+   bytes.
+4. Normalize paths relative to the workspace root and require valid distinct
+   before/after SHA-256 values. Never expose absolute paths or file content.
+5. Add `runtime_workspace_file_changes(result)` at the existing observation
+   boundary to validate and return only that executor attestation. A tool name,
+   canonical argument, structured output, ordinary metadata, or manifest claim
+   cannot substitute for it.
+
+The post-change file signal still requires a non-error result and a whole-tree
+change accepted by `runtime_workspace_change`. It uses the latest accepted
+whole-workspace change as its temporal boundary and binds a file only when the
+same result also carries a protected changed-file attestation. Thus:
+
+- a normal resident `apply_patch` gets a precise target because its resolved
+  use names the file and the executor observes that file's hash change;
+- an errored/no-op patch plus an unrelated concurrent tree delta creates no
+  precise-file evidence;
+- a custom same-name tool cannot forge the protected attestation;
+- a custom tool that genuinely changes an executor-resolved concrete file may
+  produce truthful generic file-change evidence, independent of its brand;
+- a command write normally resolves to the workspace directory and therefore
+  remains an unknown-path whole-workspace change.
+
+These helpers remain internal and do not create a public SDK contract. The
+protected metadata is runtime evidence, not model-visible tool-authored proof.
 
 ### 3. Detect only inspections after the latest change
 
@@ -209,17 +232,22 @@ Starting immediately after the latest change result, scan successful
   equals a changed path. Truncation does not erase that positive match, but it
   prevents any whole-file absence claim.
 - A zero-match `search_text` result relates only when the tool output proves
-  that exactly one eligible file was actually searched, that path equals the
-  changed path, and `truncated is False`. Canonical path equality by itself is
-  insufficient because a glob can exclude the target.
+  that the exact canonical target was a file actually scanned as text, that
+  runtime-returned path equals the changed path, and `truncated is False`.
+  Canonical path equality by itself is insufficient because a glob can exclude
+  the target and the searcher can skip a binary file.
 - Extend `SearchTextOutput` with defaulted, normalized
-  `searched_file_path: str | None`. Populate it only when `_searchable_files`
-  selected exactly one file; otherwise use `None`. The working-state detector
-  may use a zero-match result only when this runtime-returned path binds the
-  changed file. This adds provenance, not a semantic-success verdict.
-- A broad empty directory search, a glob-excluded exact target, a multiple-file
-  empty search, or any truncated empty search does not establish a file
-  inspection.
+  `searched_file_path: str | None`. Populate it only when the canonical `path`
+  resolved to a file, the optional glob admitted that same file, and the search
+  loop actually read and processed it as text. Set it only after the binary
+  check and text decoding step; otherwise use `None`. A directory input never
+  populates this exact-file provenance, even when it happens to contain only
+  one eligible file. The working-state detector may use a zero-match result
+  only when this runtime-returned path binds the changed file. This adds
+  provenance, not a semantic-success verdict.
+- A broad empty directory search, a broad single-file directory search, a
+  glob-excluded exact target, a binary exact target, a multiple-file empty
+  search, or any truncated empty search does not establish a file inspection.
 - Partial reads still count as inspections, not as semantic success. The model
   must decide whether the observed range contains enough evidence.
 - If a later real change occurs, discard every prior inspection for this
@@ -381,65 +409,70 @@ with a focused failing regression.
 
 ### Runtime evidence tests
 
-1. A non-error, `replaced=true` `apply_patch` whose canonical, structured, and
-   metadata paths agree, followed by a successful same-file `read_file`,
-   projects `observation="observed"`, the correct change and inspection IDs,
-   normalized relative paths, file-content scope, and no semantic-success
-   claim.
+1. A non-error `apply_patch` with an executor-protected changed-file
+   attestation, followed by a successful same-file `read_file`, projects
+   `observation="observed"`, the correct change and inspection IDs, normalized
+   relative paths, file-content scope, and no semantic-success claim.
 2. An errored or no-op patch with an unrelated concurrent tree delta, a
-   missing receipt, and mismatched canonical/output/metadata paths all fail
-   closed and do not ground a changed file.
-3. A positive same-file `search_text` match after the change projects observed
+   directory or out-of-workspace resolved target, an over-bound target set,
+   and malformed protected path/hash entries all fail closed and do not ground
+   a changed file.
+3. A same-name nonresident/fake tool cannot ground a path by forging canonical
+   arguments, structured output, ordinary metadata, execution revision, or
+   manifest fields. Its forged protected metadata is stripped; only a real
+   executor-observed hash change to a resolved concrete target can ground it.
+4. A positive same-file `search_text` match after the change projects observed
    evidence. A zero-match search does so only with matching
    `searched_file_path` provenance and `truncated=false`.
-4. A glob-excluded exact target, truncated empty search, broad or multiple-file
-   empty search, pre-change read, failed read, unrelated-path read,
-   `list_files`, and read made stale by a later change do not project observed
-   evidence.
-5. A whole-workspace change with no precise grounded target omits the
+5. A glob-excluded or binary exact target, truncated empty search, broad empty
+   directory containing zero, one, or multiple files, pre-change read, failed
+   read, unrelated-path read, `list_files`, and read made stale by a later
+   change do not project observed evidence.
+6. A whole-workspace change with no precise grounded target omits the
    file-level object.
-6. IDs and paths retain the newest eight entries in deterministic
+7. IDs and paths retain the newest eight entries in deterministic
    chronological order; no content or absolute paths enter the projection.
 
 ### Completion-guidance tests
 
-7. Observed post-change content evidence with no pending command constraint
+8. Observed post-change content evidence with no pending command constraint
    produces the conditional finish/no-reconfirmation guidance.
-8. A pending `verification_after_change` constraint suppresses that guidance.
+9. A pending `verification_after_change` constraint suppresses that guidance.
    Unrecognized commands, `workspace_write=true` commands, and failed
    recognized verification attempts keep it pending; at least one recognized
    read-only attempt and success of every such attempt mark it observed.
-9. The stop hook and working-state projection consume the same verification
+10. The stop hook and working-state projection consume the same verification
    calculation and expose the same recognized successful call IDs.
-10. File-content evidence never populates `verification_tool_call_ids` or marks
+11. File-content evidence never populates `verification_tool_call_ids` or marks
    behavioral verification observed.
 
 ### Prompt and tool-contract tests
 
-11. The generic prompt explicitly distinguishes literal content proof from
+12. The generic prompt explicitly distinguishes literal content proof from
    behavioral command verification and preserves runtime-requirement authority.
-12. The prompt forbids repeated mutation and command escalation used only for
+13. The prompt forbids repeated mutation and command escalation used only for
     unchanged-content reconfirmation.
-13. `apply_patch`, `read_file`, `search_text`, and `run_command` descriptions
+14. `apply_patch`, `read_file`, `search_text`, and `run_command` descriptions
     carry bounded, consistent post-change guidance without changing effects or
     approval classification.
-14. `search_text` output reports `searched_file_path` only when exactly one
-    eligible file was searched, including regressions for glob exclusion,
-    multiple-file scope, and deterministic normalization.
+15. `search_text` output reports `searched_file_path` only for an exact file
+    target actually scanned as text, including regressions for glob exclusion,
+    binary input, broad directories containing exactly one file, multiple-file
+    scope, truncation, and deterministic normalization.
 
 ### Runtime feedback and safety tests
 
-15. The repeated-inspection error text and structured payload direct the model
+16. The repeated-inspection error text and structured payload direct the model
     to finish when the existing result is sufficient and forbid redundant
     mutation/command escalation.
-16. A different file, a distinct range needed after a truncated read, and a
+17. A different file, a distinct range needed after a truncated read, and a
     distinct literal condition remain executable.
-17. The same read is blocked in an unchanged delivery cycle but executes again
+18. The same read is blocked in an unchanged delivery cycle but executes again
     after any runtime-observed workspace change, including an unknown-path
     command write.
-18. An approval-resume flow projects post-change inspection evidence without
+19. An approval-resume flow projects post-change inspection evidence without
     changing the number or kind of approvals.
-19. Existing write and command approval, pause, checkpoint, and resume tests
+20. Existing write and command approval, pause, checkpoint, and resume tests
     remain unchanged and green.
 
 ## Verification and rollout
@@ -460,6 +493,10 @@ After focused tests pass:
 
 - The model receives runtime-owned, latest-change-bound file-inspection state
   without a fabricated semantic-success claim.
+- Changed-file identity comes only from executor-protected resolved-target
+  hashes; same-name or self-reporting tools cannot forge it.
+- A zero-match search counts only for an exact file target actually scanned as
+  non-binary text with a non-truncated result.
 - Literal file tasks have a clear terminal path once successful targeted
   post-change inspection evidence is sufficient.
 - Behavioral changes and explicit `verification_after_change` constraints
