@@ -2,9 +2,9 @@
 
 ## Status
 
-Approach A was selected interactively on 2026-08-06. This written design is
-pending independent specification review and explicit user approval before
-implementation.
+Approach A was selected interactively on 2026-08-06. This revision addresses
+the first independent specification review and is pending re-review and
+explicit user approval before implementation.
 
 ## Context
 
@@ -100,6 +100,9 @@ whether the returned content satisfies the user's literal requirement.
   accepts executor-owned before/after evidence.
 - A post-change inspection exists only for a non-error `read_file` or
   `search_text` result after the latest accepted change.
+- A current executor tree delta is not enough to attribute a change to an
+  `apply_patch` target. The non-error resident-tool receipt, canonical target,
+  structured output, and normalized metadata path must agree.
 - Canonical validated tool arguments and runtime-normalized result paths are
   the only path inputs. Model prose and plan claims never create this signal.
 - An inspection before the latest change is stale and must not count.
@@ -164,22 +167,33 @@ The object describes observation history only. In particular,
 `semantic_target_satisfied="not_evaluated"` prevents the field name from being
 misread as a runtime completion verdict.
 
-The projection is bounded to the latest change, at most eight inspection call
-IDs, and at most eight normalized workspace-relative paths. It never repeats
-file contents, diffs, command output, absolute paths, or model-authored prose.
+The projection is bounded to the latest change, the newest eight inspection
+call IDs, and the newest eight normalized workspace-relative paths, preserving
+chronological order inside each retained suffix. It never repeats file
+contents, diffs, command output, absolute paths, or model-authored prose.
 
 ### 2. Ground the changed file fail closed
 
 Add one small runtime-evidence helper at the existing observation boundary,
 using the accepted `ToolResult` and its canonical `ToolCall`:
 
-1. Reject the result unless `runtime_workspace_change` confirms a change.
-2. For the resident `apply_patch`, normalize its canonical `file_path`. The
-   executor-owned workspace tree delta proves a real change, and the validated
-   single-file call identifies its target.
-3. Preserve a concrete legacy path returned by accepted protected metadata.
-4. For a whole-workspace write with no precise target, return no changed file
-   path. Do not guess from command text or later model claims.
+1. Reject the result unless `runtime_workspace_change` confirms a tree or
+   legacy file change, the result is non-error, and the registered tool is the
+   resident `apply_patch`.
+2. Require `structured_content.replaced is True` and require the normalized
+   canonical `file_path`, structured-output `file_path`, and normalized
+   result-metadata `file_path` to be the same concrete workspace-relative
+   path.
+3. Only then bind the executor-owned tree delta to that single-file target.
+   The success receipt establishes that the builtin performed the requested
+   replacement; the tree delta establishes that the executor observed a real
+   workspace change around it.
+4. Reject an errored or no-op patch even if an unrelated concurrent mutation
+   caused its before/after tree hashes to differ. Reject missing or mismatched
+   receipts and paths.
+5. For a command write or any whole-workspace change with no precise trusted
+   target, return no changed file path. Do not guess from command text or later
+   model claims.
 
 This helper may be private or module-internal; it must not create a new public
 SDK contract.
@@ -191,11 +205,21 @@ Starting immediately after the latest change result, scan successful
 
 - `read_file` relates to the change only when its normalized canonical `path`
   equals a grounded changed path.
-- `search_text` relates when its normalized canonical file target equals a
-  changed path or a runtime-returned match path equals a changed path.
-- A search targeted exactly at the changed file counts even when it returns no
-  matches, because absence can be the requested literal condition. A broad
-  empty directory search does not establish a file binding.
+- A positive `search_text` result relates when a runtime-returned match path
+  equals a changed path. Truncation does not erase that positive match, but it
+  prevents any whole-file absence claim.
+- A zero-match `search_text` result relates only when the tool output proves
+  that exactly one eligible file was actually searched, that path equals the
+  changed path, and `truncated is False`. Canonical path equality by itself is
+  insufficient because a glob can exclude the target.
+- Extend `SearchTextOutput` with defaulted, normalized
+  `searched_file_path: str | None`. Populate it only when `_searchable_files`
+  selected exactly one file; otherwise use `None`. The working-state detector
+  may use a zero-match result only when this runtime-returned path binds the
+  changed file. This adds provenance, not a semantic-success verdict.
+- A broad empty directory search, a glob-excluded exact target, a multiple-file
+  empty search, or any truncated empty search does not establish a file
+  inspection.
 - Partial reads still count as inspections, not as semantic success. The model
   must decide whether the observed range contains enough evidence.
 - If a later real change occurs, discard every prior inspection for this
@@ -204,8 +228,8 @@ Starting immediately after the latest change result, scan successful
 ### 4. Add conditional completion guidance
 
 When related post-change file-content evidence is observed and no required
-`verification_after_change` constraint is pending, add a compact sibling
-object under `runtime_evidence`:
+`verification_after_change` constraint is pending under the same predicate
+used by the stop hook, add a compact sibling object under `runtime_evidence`:
 
 ```json
 {
@@ -223,19 +247,33 @@ object under `runtime_evidence`:
 ```
 
 This guidance is conditional rather than a completion decision. If a pending
-behavioral verification constraint exists, omit it; the existing
-`runtime_requirements` projection continues to identify the required command
-evidence. If the task itself makes a behavioral claim even without an explicit
-runtime constraint, the system prompt still requires the narrowest relevant
-command.
+behavioral verification constraint exists, omit it. The current working-state
+projection is too permissive because it treats any non-error post-change
+`run_command` as verification, while the stop hook accepts only recognized,
+read-only verification commands and keeps the requirement pending when any
+recognized attempt fails.
+
+Move that calculation behind one shared runtime-evidence helper consumed by
+both the stop hook and `_working_state_message`. It identifies the latest
+runtime workspace-write boundary, recognized read-only verification attempts
+after it, their successful IDs, and whether at least one attempt exists and
+all such attempts succeeded. Unrecognized commands and
+`workspace_write=true` commands are not verification evidence; a failed
+recognized attempt keeps the constraint pending. The working-state
+`verification_tool_call_ids` and each runtime requirement's observation must
+come from this shared result. If the task itself makes a behavioral claim even
+without an explicit runtime constraint, the system prompt still requires the
+narrowest relevant command.
 
 ### 5. Replace the ambiguous generic verification rule
 
 Update `GENERIC_SYSTEM_PROMPT` with one consistent verification ladder:
 
-1. For a literal file-content task, one targeted read or search after the
-   successful write can be sufficient. If it shows the requested state and no
-   distinct requirement remains, finish directly.
+1. For a literal file-content task, a targeted read or search after the
+   successful write can be sufficient. Once the available result shows the
+   requested state and no distinct requirement remains, finish directly;
+   fetch another range or scope only when a named part of the target remains
+   unobserved.
 2. For a behavioral code change, run the narrowest relevant recognized test,
    lint, type-check, or build command.
 3. A pending runtime requirement has authority over either default.
@@ -251,16 +289,23 @@ standards; it makes the kind of evidence proportional to the claim.
 
 Keep tool descriptions concise, but make the resident ACI self-contained:
 
-- `apply_patch`: after a successful literal content edit, use at most one
-  targeted content inspection; never reapply the patch merely to reconfirm it.
+- `apply_patch`: after a successful literal content edit, use only the
+  distinct targeted inspection needed to establish the requested state;
+  never reapply the patch merely to reconfirm it.
 - `read_file`: a targeted post-change read can confirm literal file content;
-  reuse the result while the workspace is unchanged.
+  reuse a sufficient result while the workspace is unchanged, while allowing
+  a different range when truncation leaves a specific target unobserved.
 - `search_text`: a targeted post-change search can confirm presence or absence
-  of literal content; do not repeat it against unchanged state.
+  of literal content only within its reported, non-truncated search scope; do
+  not repeat it against unchanged state.
+- `run_command`: use recognized read-only commands to verify code behavior;
+  do not request process execution solely to reconfirm unchanged literal file
+  content already established by a read or search.
 
 The descriptions must continue to document existing inputs, bounds, and
-effects. No input/output schema, effect, approval classification, or execution
-revision changes are needed because execution semantics do not change.
+effects. `search_text` alone adds the defaulted provenance field described
+above and bumps its execution revision because its output contract changes.
+No tool effect or approval classification changes.
 
 ### 7. Make `repeated_inspection` terminal when appropriate
 
@@ -284,9 +329,14 @@ tool payloads receive the same ACI:
 }
 ```
 
-The guard still blocks only the same stable inspection in the same delivery
-cycle. It does not block narrowed arguments, a genuinely different file, or a
-command required by a specific behavioral contract.
+The guard still blocks only the same stable inspection in the same unchanged
+delivery cycle. Change `_delivery_cycle_results` so every
+`runtime_workspace_change(result)` is a hard cycle boundary, including a
+workspace-changing `run_command` whose concrete file paths are unknown. The
+same read before and after such a change must execute again; otherwise the
+error would incorrectly describe stale evidence as current. A narrowed range,
+a genuinely different file or literal requirement, and a command required by
+a specific behavioral contract also remain executable.
 
 ## Decision flow
 
@@ -318,9 +368,10 @@ runtime-observed workspace change
 | Surface | File-content task | Behavioral code task | Redundant reconfirmation |
 | --- | --- | --- | --- |
 | Working state | Exposes post-change related inspection | Keeps command requirement separate | Emits conditional finish guidance only when safe |
-| System prompt | One targeted post-change read/search may suffice | Requires narrow recognized command | Forbids repeat read/write or command-only reconfirmation |
-| `apply_patch` docs | Directs one targeted content check | Does not claim behavior is verified | Forbids reapplying the patch to reconfirm |
+| System prompt | Sufficient targeted post-change read/search may suffice | Requires narrow recognized command | Forbids repeat read/write or command-only reconfirmation |
+| `apply_patch` docs | Directs only necessary distinct content checks | Does not claim behavior is verified | Forbids reapplying the patch to reconfirm |
 | `read_file` / `search_text` docs | Identifies content-proof scope | Does not substitute for tests | Requires reuse on unchanged state |
+| `run_command` docs | Rejects process use for content-only reconfirmation | Identifies recognized commands as behavioral evidence | Forbids escalation solely to reconfirm unchanged content |
 | `repeated_inspection` | Says finish if existing result satisfies target | Allows a specifically required different verification | Forbids repeat mutation or process escalation solely to reconfirm |
 
 ## Testing strategy
@@ -330,45 +381,65 @@ with a focused failing regression.
 
 ### Runtime evidence tests
 
-1. A successful `apply_patch` followed by a successful same-file `read_file`
+1. A non-error, `replaced=true` `apply_patch` whose canonical, structured, and
+   metadata paths agree, followed by a successful same-file `read_file`,
    projects `observation="observed"`, the correct change and inspection IDs,
    normalized relative paths, file-content scope, and no semantic-success
    claim.
-2. A same-file `search_text` after the change also projects observed evidence,
-   including an exact-file zero-match absence check.
-3. A pre-change read, failed read, unrelated-path read, `list_files`, broad
-   empty search, and read made stale by a later change do not project observed
+2. An errored or no-op patch with an unrelated concurrent tree delta, a
+   missing receipt, and mismatched canonical/output/metadata paths all fail
+   closed and do not ground a changed file.
+3. A positive same-file `search_text` match after the change projects observed
+   evidence. A zero-match search does so only with matching
+   `searched_file_path` provenance and `truncated=false`.
+4. A glob-excluded exact target, truncated empty search, broad or multiple-file
+   empty search, pre-change read, failed read, unrelated-path read,
+   `list_files`, and read made stale by a later change do not project observed
    evidence.
-4. A whole-workspace change with no precise grounded target omits the
+5. A whole-workspace change with no precise grounded target omits the
    file-level object.
-5. IDs and paths are deterministically bounded; no content or absolute paths
-   enter the new projection.
+6. IDs and paths retain the newest eight entries in deterministic
+   chronological order; no content or absolute paths enter the projection.
 
 ### Completion-guidance tests
 
-6. Observed post-change content evidence with no pending command constraint
+7. Observed post-change content evidence with no pending command constraint
    produces the conditional finish/no-reconfirmation guidance.
-7. A pending `verification_after_change` constraint suppresses that guidance
-   and remains pending until a recognized successful post-change command.
-8. File-content evidence never populates `verification_tool_call_ids` or marks
+8. A pending `verification_after_change` constraint suppresses that guidance.
+   Unrecognized commands, `workspace_write=true` commands, and failed
+   recognized verification attempts keep it pending; at least one recognized
+   read-only attempt and success of every such attempt mark it observed.
+9. The stop hook and working-state projection consume the same verification
+   calculation and expose the same recognized successful call IDs.
+10. File-content evidence never populates `verification_tool_call_ids` or marks
    behavioral verification observed.
 
 ### Prompt and tool-contract tests
 
-9. The generic prompt explicitly distinguishes literal content proof from
+11. The generic prompt explicitly distinguishes literal content proof from
    behavioral command verification and preserves runtime-requirement authority.
-10. The prompt forbids repeated mutation and command escalation used only for
+12. The prompt forbids repeated mutation and command escalation used only for
     unchanged-content reconfirmation.
-11. `apply_patch`, `read_file`, and `search_text` descriptions carry bounded,
-    consistent post-change guidance without changing schemas or effects.
+13. `apply_patch`, `read_file`, `search_text`, and `run_command` descriptions
+    carry bounded, consistent post-change guidance without changing effects or
+    approval classification.
+14. `search_text` output reports `searched_file_path` only when exactly one
+    eligible file was searched, including regressions for glob exclusion,
+    multiple-file scope, and deterministic normalization.
 
 ### Runtime feedback and safety tests
 
-12. The repeated-inspection error text and structured payload direct the model
+15. The repeated-inspection error text and structured payload direct the model
     to finish when the existing result is sufficient and forbid redundant
     mutation/command escalation.
-13. A genuinely different inspection remains executable.
-14. Existing write and command approval, pause, checkpoint, and resume tests
+16. A different file, a distinct range needed after a truncated read, and a
+    distinct literal condition remain executable.
+17. The same read is blocked in an unchanged delivery cycle but executes again
+    after any runtime-observed workspace change, including an unknown-path
+    command write.
+18. An approval-resume flow projects post-change inspection evidence without
+    changing the number or kind of approvals.
+19. Existing write and command approval, pause, checkpoint, and resume tests
     remain unchanged and green.
 
 ## Verification and rollout
@@ -389,8 +460,8 @@ After focused tests pass:
 
 - The model receives runtime-owned, latest-change-bound file-inspection state
   without a fabricated semantic-success claim.
-- Literal file tasks have a clear terminal path after one successful targeted
-  post-change inspection.
+- Literal file tasks have a clear terminal path once successful targeted
+  post-change inspection evidence is sufficient.
 - Behavioral changes and explicit `verification_after_change` constraints
   still require real command evidence.
 - A repeated stable inspection explicitly directs completion and explicitly
