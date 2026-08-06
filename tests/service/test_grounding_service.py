@@ -4,12 +4,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import rag.retrieval.grounding_service as grounding_module
+from agent_runtime.text import DEFAULT_TOKENIZER_FALLBACK_MODEL
 from rag.assembly import TokenAccountingService, TokenizerContract
 from rag.ingest.asset_anchors import asset_anchor
 from rag.retrieval.grounding_service import GroundingBudgets, GroundingService
 from rag.schema.core import AssetRecord, LayoutMetaCacheRecord, SectionLocatorRecord, SectionRecord
 from rag.schema.query import EvidenceItem, GroundingTarget
-from rag.utils.text import DEFAULT_TOKENIZER_FALLBACK_MODEL
 
 
 def _token_accounting() -> TokenAccountingService:

@@ -5,9 +5,9 @@ from dataclasses import replace
 
 import pytest
 
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import (
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

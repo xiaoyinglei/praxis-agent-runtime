@@ -5,6 +5,9 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
+from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.gateway import LLMGateway
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from rag.assembly import (
     AssemblyDiagnostics,
     AssemblyRequest,
@@ -13,8 +16,6 @@ from rag.assembly import (
     CapabilityCatalog,
     ChatCapabilityBinding,
     ProviderConfig,
-    TokenAccountingService,
-    TokenizerContract,
 )
 from rag.assembly.support import build_provider
 from rag.ingest.parsers import (
@@ -41,7 +42,6 @@ from rag.ingest.retrievalsummarizer import RetrievalSummarizer, RetrievalSummary
 from rag.ingest.section_refiner import SectionRefiner
 from rag.ingest.table_executor import TableExecutor, _AssetMetadataRepo, _RangeReadableObjectStore
 from rag.providers.generation import AnswerGenerationService, AnswerGenerator, GeneratorBinding
-from rag.providers.llm_gateway import LLMGateway
 from rag.query_pipeline import _QueryPipeline
 from rag.retrieval.authorization_service import AuthorizationService
 from rag.retrieval.context import (
@@ -67,7 +67,6 @@ from rag.retrieval.reranker import ModelBackedRerankService
 from rag.retrieval.synthesis_service import SynthesisService
 from rag.schema.core import Document, ProcessingStateRecord, Source, SourceType, StorageTier
 from rag.schema.graph import GraphEdge, GraphNode
-from rag.schema.llm import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage, LLMStageBudget
 from rag.schema.runtime import CacheEntry, DataContractMetadataRepo, ProviderAttempt, VisualDescriptionRepo
 from rag.storage import StorageBundle, StorageConfig
 from rag.storage.data_contract_service import DataContractService
@@ -160,7 +159,7 @@ class _ChatGeneratorAdapter:
         method = getattr(backend, "generate_text_with_usage", None)
         if callable(method):
             return method(prompt=prompt, **kwargs)
-        from rag.schema.llm import LLMProviderResult
+        from agent_runtime.modeling.contracts import LLMProviderResult
 
         return LLMProviderResult(value=self.generate_text(prompt=prompt, **kwargs))
 
@@ -175,11 +174,9 @@ class _ChatGeneratorAdapter:
         method = getattr(backend, "generate_structured_with_usage", None)
         if callable(method):
             return method(prompt=prompt, schema=schema, **kwargs)
-        from rag.schema.llm import LLMProviderResult
+        from agent_runtime.modeling.contracts import LLMProviderResult
 
-        return LLMProviderResult(
-            value=self.generate_structured(prompt=prompt, schema=schema, **kwargs)
-        )
+        return LLMProviderResult(value=self.generate_structured(prompt=prompt, schema=schema, **kwargs))
 
 
 class _LazySummaryGeneratorAdapter:
@@ -291,13 +288,10 @@ class RAGRuntime:
     assembly_service: CapabilityAssemblyService = field(default_factory=CapabilityAssemblyService, repr=False)
     telemetry_service: TelemetryService | None = None
     vlm_repo: VisualDescriptionRepo | None = None
-    generation_config: object | None = None  # GenerationConfig from rag.models.config
+    generation_config: object | None = None  # GenerationConfig from agent_runtime.modeling.config
     chat_context_window_tokens: int = 32_768
     llm_stage_budgets: dict[LLMCallStage, LLMStageBudget] = field(
-        default_factory=lambda: {
-            stage: budget.model_copy()
-            for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()
-        }
+        default_factory=lambda: {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}
     )
     capability_bundle: CapabilityBundle = field(init=False, repr=False)
     token_contract: TokenizerContract = field(init=False, repr=False)
@@ -340,11 +334,7 @@ class RAGRuntime:
             generation_config=generation_config,
             chat_context_window_tokens=chat_context_window_tokens,
             llm_stage_budgets=(
-                llm_stage_budgets
-                or {
-                    stage: budget.model_copy()
-                    for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()
-                }
+                llm_stage_budgets or {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}
             ),
         )
 
@@ -383,9 +373,7 @@ class RAGRuntime:
                 llm_client=_ChatGeneratorAdapter(binding),
                 token_accounting=self.token_accounting,
                 config=self._summary_config(strict_generation=strict_generation),
-                gateway=self._gateway_for_chat_binding(
-                    _ChatGeneratorAdapter(binding)
-                ),
+                gateway=self._gateway_for_chat_binding(_ChatGeneratorAdapter(binding)),
             )
         )
 
@@ -404,9 +392,7 @@ class RAGRuntime:
                     raw_text_mode=raw_text_mode,
                     strict_generation=strict_generation,
                 ),
-                gateway=self._gateway_for_chat_binding(
-                    _LazySummaryGeneratorAdapter(binding=chat_binding)
-                ),
+                gateway=self._gateway_for_chat_binding(_LazySummaryGeneratorAdapter(binding=chat_binding)),
             )
         )
 
@@ -431,9 +417,7 @@ class RAGRuntime:
             return summary_config
         return replace(
             summary_config,
-            max_output_tokens=(
-                summary_config.max_output_tokens if max_tokens is None else int(max_tokens)
-            ),
+            max_output_tokens=(summary_config.max_output_tokens if max_tokens is None else int(max_tokens)),
             temperature=summary_config.temperature if temperature is None else float(temperature),
         )
 
@@ -523,10 +507,7 @@ class RAGRuntime:
         *,
         continue_on_error: bool = False,
     ) -> BatchIngestResult:
-        requests = [
-            self._coerce_direct_content_item(item, index=index)
-            for index, item in enumerate(items, start=1)
-        ]
+        requests = [self._coerce_direct_content_item(item, index=index) for index, item in enumerate(items, start=1)]
         return self.insert_many(requests, continue_on_error=continue_on_error)
 
     def query(
@@ -741,9 +722,7 @@ class RAGRuntime:
                 llm_client=_LazySummaryGeneratorAdapter(binding=chat_binding),
                 token_accounting=self.token_accounting,
                 config=self._summary_config(),
-                gateway=self._gateway_for_chat_binding(
-                    _LazySummaryGeneratorAdapter(binding=chat_binding)
-                ),
+                gateway=self._gateway_for_chat_binding(_LazySummaryGeneratorAdapter(binding=chat_binding)),
             ),
             embedder=embedding_binding,
             metadata_repo=cast(MetadataWriterRepo, self.stores.metadata_repo),
@@ -763,9 +742,7 @@ class RAGRuntime:
                 object_store=self.stores.object_store,
                 token_accounting=self.token_accounting,
                 rerank_binding=(
-                    self.capability_bundle.rerank_bindings[0]
-                    if self.capability_bundle.rerank_bindings
-                    else None
+                    self.capability_bundle.rerank_bindings[0] if self.capability_bundle.rerank_bindings else None
                 ),
                 s3_circuit_breaker=s3_breaker,
             ),
@@ -861,17 +838,23 @@ class RAGRuntime:
         vec_repo: VectorSearchRepoProtocol = cast(VectorSearchRepoProtocol, self.stores.vector_repo)
         return RetrievalService(
             RetrievalServiceConfig(
-                vector_retriever=cast(RetrieverFn, retrieval_factory.vector_retriever_from_repo(
-                    vec_repo,
-                    bundle.embedding_bindings,
-                )),
+                vector_retriever=cast(
+                    RetrieverFn,
+                    retrieval_factory.vector_retriever_from_repo(
+                        vec_repo,
+                        bundle.embedding_bindings,
+                    ),
+                ),
                 local_retriever=(lambda _query, _scope, _understanding: []),
                 global_retriever=(lambda _query, _scope, _understanding: []),
                 section_retriever=(lambda _query, _scope, _understanding: []),
-                special_retriever=cast(RetrieverFn, retrieval_factory.special_retriever_from_repo(
-                    vec_repo,
-                    bundle.embedding_bindings,
-                )),
+                special_retriever=cast(
+                    RetrieverFn,
+                    retrieval_factory.special_retriever_from_repo(
+                        vec_repo,
+                        bundle.embedding_bindings,
+                    ),
+                ),
                 metadata_retriever=(lambda _query, _scope, _understanding: []),
                 graph_expander=retrieval_factory.graph_expander,
                 web_retriever=retrieval_factory.web_retriever,
@@ -1117,5 +1100,6 @@ class RAGRuntime:
                 payload["file_path"] = Path(payload["file_path"])
             return IngestRequest(**payload)
         raise TypeError(f"unsupported content item type: {type(item).__name__}")
+
 
 __all__ = ["RAGRuntime", "_RUNTIME_CONTRACT_KEY", "_RUNTIME_CONTRACT_NAMESPACE"]

@@ -139,8 +139,8 @@ def test_parity_fixtures_do_not_import_deleted_tool_contracts() -> None:
     forbidden = (
         "ToolSpec",
         "ToolExecutionService",
-        "rag.agent.tools.spec",
-        "rag.agent.core.tool_execution",
+        "agent_runtime.tools.spec",
+        "agent_runtime.core.tool_execution",
     )
     source = "\n".join(path.read_text(encoding="utf-8") for path in PARITY_FILES)
     for token in forbidden:

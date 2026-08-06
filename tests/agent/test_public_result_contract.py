@@ -6,6 +6,14 @@ from dataclasses import FrozenInstanceError, fields
 import pytest
 
 import agent_runtime.result as result_module
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.model_request import ModelCallRecord
+from agent_runtime.core.runtime_diagnostics import (
+    AgentLatencyProfile,
+    RuntimeDiagnostic,
+    ToolCallMetrics,
+)
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import (
     AgentCitation,
@@ -17,16 +25,8 @@ from agent_runtime.result import (
     AgentToolSummary,
     AgentUsage,
 )
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.model_request import ModelCallRecord
-from rag.agent.core.runtime_diagnostics import (
-    AgentLatencyProfile,
-    RuntimeDiagnostic,
-    ToolCallMetrics,
-)
-from rag.agent.service import AgentRunResult
-from rag.agent.tools.tool import ToolResult
-from rag.schema.llm import LLMUsage
+from agent_runtime.service import AgentRunResult
+from agent_runtime.tools.tool import ToolResult
 from rag.schema.query import AnswerCitation, EvidenceItem, GroundingTarget
 
 
@@ -86,6 +86,40 @@ def test_public_result_dtos_are_frozen_and_have_the_stable_surface() -> None:
     for value in frozen_values:
         with pytest.raises(FrozenInstanceError):
             value.__setattr__(next(iter(value.__dataclass_fields__)), "changed")
+
+
+def test_agent_run_result_serializes_nested_immutable_grounding_target() -> None:
+    evidence = AgentEvidence(
+        evidence_id="e-1",
+        doc_id=7,
+        citation_anchor="report#summary",
+        text="Revenue increased.",
+        score=0.91,
+        grounding_target={
+            "kind": "section",
+            "section_path": ("Summary", "Revenue"),
+            "raw_locator": {"page": 2, "labels": ("finance",)},
+        },
+    )
+    result = AgentRunResult(
+        turn_id="turn-json",
+        status="done",
+        evidence=[evidence],
+        citations=[AgentCitation(citation_id="c-1", evidence_id="e-1", record_type="section")],
+    )
+
+    payload = result.model_dump(mode="json")
+    assert payload["evidence"][0]["grounding_target"] == {
+        "kind": "section",
+        "section_path": ["Summary", "Revenue"],
+        "raw_locator": {"page": 2, "labels": ["finance"]},
+    }
+    assert isinstance(payload["evidence"][0]["grounding_target"], dict)
+    restored = AgentRunResult.model_validate_json(result.model_dump_json())
+    assert isinstance(restored.evidence[0], AgentEvidence)
+    assert isinstance(restored.citations[0], AgentCitation)
+    with pytest.raises(TypeError):
+        restored.evidence[0].grounding_target["kind"] = "asset"  # type: ignore[index]
 
 
 def test_internal_projection_builds_stable_result_dtos_without_internal_objects() -> None:
@@ -375,18 +409,11 @@ def test_internal_projection_preserves_the_single_turn_identity() -> None:
         tool_results=[ToolResult(tool_call_id="legacy-call", tool_name="read_file")],
     )
     continuation = result.model_copy(update={"turn_id": "turn-continuation"})
-    legacy_without_arguments = result.model_copy(
-        update={"tool_call_arguments": None}
-    )
+    legacy_without_arguments = result.model_copy(update={"tool_call_arguments": None})
 
     assert AgentResult._from_internal(result).turn_id == "turn-root"
     assert AgentResult._from_internal(result).tool_calls[0].arguments is None
-    assert (
-        AgentResult._from_internal(legacy_without_arguments)
-        .tool_calls[0]
-        .arguments
-        is None
-    )
+    assert AgentResult._from_internal(legacy_without_arguments).tool_calls[0].arguments is None
     assert AgentResult._from_internal(continuation).turn_id == "turn-continuation"
     assert not hasattr(AgentResult._from_internal(result), "session_id")
 

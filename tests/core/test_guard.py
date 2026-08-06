@@ -3,10 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
-import pytest
-
 from rag.utils.guard import CircuitBreaker, CircuitConfig, RateLimiter, guarded
-
 
 # ═══════════════════════════════════════════════════
 # RateLimiter tests

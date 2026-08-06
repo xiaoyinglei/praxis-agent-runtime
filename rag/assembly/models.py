@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 
 AssemblyStatus = Literal["valid", "degraded", "invalid"]
 IssueSeverity = Literal["info", "warning", "error"]

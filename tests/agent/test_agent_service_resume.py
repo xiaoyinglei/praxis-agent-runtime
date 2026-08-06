@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import agent_checkpoint_serde
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.human_input import HumanInputRequest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, ModelTurnDraft
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import (
+from agent_runtime.core.checkpointing import agent_checkpoint_serde
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.human_input import HumanInputRequest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.service import AgentRunRequest, AgentService
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -25,12 +25,12 @@ from rag.agent.tools.tool import (
     ToolEffect,
     json_schema_input,
 )
-from rag.agent.turns import (
+from agent_runtime.turns import (
     RuntimeBinding,
     TurnStatus,
     TurnStore,
 )
-from rag.agent.workspace import open_workspace
+from agent_runtime.workspace import open_workspace
 
 
 class _FinishProvider:

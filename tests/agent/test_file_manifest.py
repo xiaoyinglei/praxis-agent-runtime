@@ -14,13 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.file_manifest import (
+from agent_runtime.file_manifest import (
     FileManifest,
     FileManifestEntry,
     SheetPreview,
     build_file_manifest,
 )
-from rag.agent.workspace import WorkspaceRuntime
+from agent_runtime.workspace import WorkspaceRuntime
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -323,7 +323,7 @@ class TestProbeEnhancements:
 
 class TestLoopStateIntegration:
     def _make_config(self):
-        from rag.agent.core.context import AgentRunConfig
+        from agent_runtime.core.context import AgentRunConfig
 
         return AgentRunConfig(
             turn_id="test",
@@ -331,8 +331,8 @@ class TestLoopStateIntegration:
         )
 
     def test_create_loop_state_with_manifest(self) -> None:
-        from rag.agent.file_manifest import FileManifest
-        from rag.agent.loop.state import create_loop_state
+        from agent_runtime.file_manifest import FileManifest
+        from agent_runtime.loop.state import create_loop_state
 
         manifest = FileManifest(
             files=[],
@@ -346,7 +346,7 @@ class TestLoopStateIntegration:
         assert state["file_manifest"].files == []
 
     def test_create_loop_state_without_manifest(self) -> None:
-        from rag.agent.loop.state import create_loop_state
+        from agent_runtime.loop.state import create_loop_state
 
         config = self._make_config()
         state = create_loop_state(current_message="test", run_config=config)
@@ -485,7 +485,7 @@ class TestFileFirstPath:
 
 class TestLegacyPrimitiveClosure:
     def test_primitive_ops_exports_checkpoint_stable_models_only(self) -> None:
-        import rag.agent.primitive_ops as primitive_ops
+        import agent_runtime.primitive_ops as primitive_ops
 
         assert set(primitive_ops.__all__) == {
             "CandidateHeaderRow",
@@ -499,14 +499,14 @@ class TestLegacyPrimitiveClosure:
     def test_primitive_runner_files_are_removed(self) -> None:
         root = Path(__file__).resolve().parents[2]
 
-        assert not (root / "rag/agent/runner/__init__.py").exists()
-        assert not (root / "rag/agent/runner/python_runner.py").exists()
+        assert not (root / "agent_runtime/runner/__init__.py").exists()
+        assert not (root / "agent_runtime/runner/python_runner.py").exists()
 
     def test_production_has_no_primitive_executor_references(self) -> None:
         root = Path(__file__).resolve().parents[2]
         forbidden = (
             "PrimitiveOps",
-            "rag.agent.runner",
+            "agent_runtime.runner",
             "RunPythonInput",
             "RunPythonInlineInput",
             "RunPythonOutput",
@@ -527,7 +527,7 @@ class TestLegacyPrimitiveClosure:
 
     def test_observations_do_not_special_case_removed_primitive_tools(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        source = (root / "rag/agent/core/observations.py").read_text(encoding="utf-8")
+        source = (root / "agent_runtime/core/observations.py").read_text(encoding="utf-8")
 
         assert '"write_file"' not in source
         assert '"run_python"' not in source

@@ -6,15 +6,14 @@ import logging
 
 import pytest
 
-from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
-from rag.agent.core.checkpointing import _migrate_legacy_state, agent_checkpoint_serde
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.observations import StructuredObservation
-from rag.agent.loop.state import (
+from agent_runtime.core.checkpointing import _migrate_legacy_state, agent_checkpoint_serde
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.observations import StructuredObservation
+from agent_runtime.loop.state import (
     StopHookFeedback,
     create_loop_state,
 )
-from rag.agent.loop.substate import (
+from agent_runtime.loop.substate import (
     DeferredToolState,
     DiscoveryCandidate,
     DiscoveryEvent,
@@ -22,6 +21,7 @@ from rag.agent.loop.substate import (
     MemoryState,
     PlanState,
 )
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 
 
 def _run_config(run_id: str = "pr1-test") -> AgentRunConfig:
@@ -289,7 +289,7 @@ def test_checkpoint_serde_roundtrips_substate_models(
             known_locators=[
                 {
                     "source_tool": "search_text",
-                    "path": "rag/agent/loop/runtime.py",
+                    "path": "agent_runtime/loop/runtime.py",
                     "line_number": 718,
                 }
             ],

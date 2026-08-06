@@ -13,22 +13,22 @@ from typing import Any
 
 import pytest
 
-from rag.agent.core.observations import runtime_workspace_change
-from rag.agent.tools.builtins.shell import create_run_command_tool
-from rag.agent.tools.executor import (
+from agent_runtime.core.observations import runtime_workspace_change
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.tools.executor import (
     ExecutionBoundary,
     ExecutionStatus,
     ToolExecutionRecord,
     ToolExecutor,
 )
-from rag.agent.tools.permissions import (
+from agent_runtime.tools.permissions import (
     CanUseToolResult,
     ToolExecutionContext,
     ToolGuardError,
     UseToolDecision,
     can_use_tool,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     NormalizedToolOutput,
@@ -43,7 +43,7 @@ from rag.agent.tools.tool import (
     ToolTarget,
     ToolValidationError,
 )
-from rag.agent.workspace import open_workspace
+from agent_runtime.workspace import open_workspace
 
 
 def _origin(*exposed_names: str) -> ToolCallOrigin:
@@ -1575,15 +1575,15 @@ async def test_batch_serializes_unknown_read_target_against_a_write() -> None:
 def test_task3_modules_do_not_import_legacy_execution_paths() -> None:
     root = Path(__file__).parents[2]
     forbidden = (
-        "rag.agent.tooling",
+        "agent_runtime.tooling",
         "ToolExecutionService",
         "ApprovalPolicy",
-        "rag.agent.tools.registry",
+        "agent_runtime.tools.registry",
     )
 
     for relative in (
-        "rag/agent/tools/permissions.py",
-        "rag/agent/tools/executor.py",
+        "agent_runtime/tools/permissions.py",
+        "agent_runtime/tools/executor.py",
     ):
         source = (root / relative).read_text(encoding="utf-8")
         assert not any(name in source for name in forbidden)

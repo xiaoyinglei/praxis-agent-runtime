@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         Source,
     )
     from rag.schema.graph import GraphEdge, GraphNode
-    from rag.schema.query import KnowledgeArtifact, RetrievalSignals
+    from rag.schema.query import RetrievalSignals
 
 
 class RuntimeMode(StrEnum):

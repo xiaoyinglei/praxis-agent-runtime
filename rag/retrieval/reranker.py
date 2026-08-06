@@ -6,9 +6,9 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from agent_runtime.text import keyword_overlap, search_terms
 from rag.schema.model_protocols import Reranker
 from rag.schema.query import GroundingTarget, RetrievalSignals
-from rag.utils.text import keyword_overlap, search_terms
 
 CandidateKind = Literal[
     "doc_summary",
@@ -75,36 +75,42 @@ class RerankCandidate:
 
 @dataclass(frozen=True, slots=True)
 class CandidatePoolPolicy:
-    family_keep_limits: dict[str, int] = field(default_factory=lambda: {
-        "dense": 8,
-        "sparse": 8,
-        "hybrid": 12,
-        "asset": 8,
-        "lexical": 8,
-        "grounding": 12,
-        "fallback": 6,
-        "unknown": 6,
-    })
-    family_relative_score_floor: dict[str, float] = field(default_factory=lambda: {
-        "dense": 0.20,
-        "sparse": 0.15,
-        "hybrid": 0.20,
-        "asset": 0.10,
-        "lexical": 0.05,
-        "grounding": 0.05,
-        "fallback": 0.05,
-        "unknown": 0.10,
-    })
-    family_absolute_score_floor: dict[str, float] = field(default_factory=lambda: {
-        "dense": 0.01,
-        "sparse": 0.01,
-        "hybrid": 0.01,
-        "asset": 0.001,
-        "lexical": 0.001,
-        "grounding": 0.001,
-        "fallback": 0.001,
-        "unknown": 0.001,
-    })
+    family_keep_limits: dict[str, int] = field(
+        default_factory=lambda: {
+            "dense": 8,
+            "sparse": 8,
+            "hybrid": 12,
+            "asset": 8,
+            "lexical": 8,
+            "grounding": 12,
+            "fallback": 6,
+            "unknown": 6,
+        }
+    )
+    family_relative_score_floor: dict[str, float] = field(
+        default_factory=lambda: {
+            "dense": 0.20,
+            "sparse": 0.15,
+            "hybrid": 0.20,
+            "asset": 0.10,
+            "lexical": 0.05,
+            "grounding": 0.05,
+            "fallback": 0.05,
+            "unknown": 0.10,
+        }
+    )
+    family_absolute_score_floor: dict[str, float] = field(
+        default_factory=lambda: {
+            "dense": 0.01,
+            "sparse": 0.01,
+            "hybrid": 0.01,
+            "asset": 0.001,
+            "lexical": 0.001,
+            "grounding": 0.001,
+            "fallback": 0.001,
+            "unknown": 0.001,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,8 +375,7 @@ class IndustrialRerankService:
         min_output_candidates: int | None = None,
     ) -> tuple[list[_ScoredCandidate], PreRerankDiagnostics]:
         working = [
-            _ScoredCandidate(candidate=candidate, retrieval_score=candidate.retrieval_score)
-            for candidate in candidates
+            _ScoredCandidate(candidate=candidate, retrieval_score=candidate.retrieval_score) for candidate in candidates
         ]
         deduplicated, deduplicated_count = self._deduplicate(working)
         governed, governance_filtered_count = self._filter_governance(deduplicated)
@@ -531,10 +536,7 @@ class IndustrialRerankService:
         special_targets: set[str] = set()
         requested_pages: set[str] = set()
         if retrieval_signals is not None:
-            focus_terms = list(
-                retrieval_signals.structure_constraints.focus_terms
-                or retrieval_signals.quoted_terms
-            )
+            focus_terms = list(retrieval_signals.structure_constraints.focus_terms or retrieval_signals.quoted_terms)
             special_targets = set(retrieval_signals.special_targets)
             requested_pages = {str(page) for page in retrieval_signals.metadata_filters.page_numbers}
         for candidate in candidates:
@@ -741,11 +743,14 @@ def _normalize_candidate(candidate: object, *, rank: int) -> RerankCandidate:
         return candidate if candidate.raw_candidate is not None else _copy_with_raw(candidate, candidate)
     metadata = _candidate_metadata(candidate)
     grounding_target = _grounding_target(candidate, metadata)
-    doc_id = _first_int(
-        getattr(candidate, "doc_id", None),
-        metadata.get("doc_id"),
-        None if grounding_target is None else grounding_target.doc_id,
-    ) or 0
+    doc_id = (
+        _first_int(
+            getattr(candidate, "doc_id", None),
+            metadata.get("doc_id"),
+            None if grounding_target is None else grounding_target.doc_id,
+        )
+        or 0
+    )
     source_id = _first_int(
         getattr(candidate, "source_id", None),
         metadata.get("source_id"),
@@ -764,20 +769,18 @@ def _normalize_candidate(candidate: object, *, rank: int) -> RerankCandidate:
     candidate_kind = _candidate_kind(candidate, metadata, grounding_target, section_id, asset_id)
     candidate_id = _candidate_id(candidate, metadata, grounding_target, candidate_kind, doc_id, section_id, asset_id)
     retrieval_channels = tuple(str(item) for item in (getattr(candidate, "retrieval_channels", None) or ()))
-    score = _first_float(
-        getattr(candidate, "final_score", None),
-        getattr(candidate, "fusion_score", None),
-        getattr(candidate, "rrf_score", None),
-        getattr(candidate, "score", None),
-        metadata.get("score"),
-    ) or 0.0
-    section_path = tuple(
-        str(item)
-        for item in (
-            getattr(candidate, "section_path", None)
-            or metadata.get("section_path")
-            or ()
+    score = (
+        _first_float(
+            getattr(candidate, "final_score", None),
+            getattr(candidate, "fusion_score", None),
+            getattr(candidate, "rrf_score", None),
+            getattr(candidate, "score", None),
+            metadata.get("score"),
         )
+        or 0.0
+    )
+    section_path = tuple(
+        str(item) for item in (getattr(candidate, "section_path", None) or metadata.get("section_path") or ())
     )
     return RerankCandidate(
         candidate_id=candidate_id,
@@ -861,9 +864,7 @@ def _candidate_kind(
     asset_id: int | None,
 ) -> CandidateKind:
     explicit = (
-        getattr(candidate, "candidate_kind", None)
-        or metadata.get("candidate_kind")
-        or metadata.get("record_type")
+        getattr(candidate, "candidate_kind", None) or metadata.get("candidate_kind") or metadata.get("record_type")
     )
     if explicit in {
         "doc_summary",

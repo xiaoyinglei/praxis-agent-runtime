@@ -7,18 +7,19 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from rag.agent.core.context import TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy, ToolPolicy
-from rag.agent.core.model_request import ModelCallRecord
-from rag.agent.core.output_models import ValidatedFinalOutput
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import LoopState, ModelTurnDraft
-from rag.agent.service import AgentRunRequest, AgentRunResult, AgentService
-from rag.agent.tools.builtins.shell import create_run_command_tool
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.selection import ToolConfigurationError
-from rag.agent.tools.tool import (
+from agent_runtime.core.context import TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy, ToolPolicy
+from agent_runtime.core.model_request import ModelCallRecord
+from agent_runtime.core.output_models import ValidatedFinalOutput
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.runtime import ModelTurnEnvelope
+from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.modeling.contracts import LLMUsage
+from agent_runtime.service import AgentRunRequest, AgentRunResult, AgentService
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.selection import ToolConfigurationError
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -31,9 +32,8 @@ from rag.agent.tools.tool import (
     ToolTarget,
     json_schema_input,
 )
-from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
-from rag.agent.workspace import open_workspace
-from rag.schema.llm import LLMUsage
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
+from agent_runtime.workspace import open_workspace
 
 
 class _StructuredAnswer(BaseModel):
@@ -560,9 +560,7 @@ async def test_service_builds_manifest_for_imported_input_files(
     )
 
     assert result.status == "done"
-    assert provider.paths == (
-        ".rag/agent_runtime/input_files/service-input-manifest/fixture.txt",
-    )
+    assert provider.paths == (".praxis/" + "runtime/input_files/service-input-manifest/fixture.txt",)
 
 
 def test_result_restores_configured_concrete_final_output() -> None:

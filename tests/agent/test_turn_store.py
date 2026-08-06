@@ -7,16 +7,16 @@ from uuid import UUID
 
 import pytest
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.messages import ModelMessage, canonical_json_text
-from rag.agent.core.model_request import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.messages import ModelMessage, canonical_json_text
+from agent_runtime.core.model_request import (
     canonical_transcript_revision,
     project_transcript_compaction,
 )
-from rag.agent.loop.state import create_loop_state
-from rag.agent.memory.compactor import LoopContextCompactor
-from rag.agent.memory.models import MemoryPolicy
-from rag.agent.turns import (
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.memory.compactor import LoopContextCompactor
+from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.turns import (
     RuntimeBinding,
     TurnStateError,
     TurnStatus,

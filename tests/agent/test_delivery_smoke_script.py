@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
+from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
 
 
 def _load_smoke_module():
@@ -40,6 +40,7 @@ def test_delivery_cases_cover_the_locked_public_matrix() -> None:
         "cache_usage",
         "mlx_local_envelope",
         "ollama_local_envelope",
+        "praxis_demo",
     } == set(cases)
     assert cases["direct_answer"].expected_tools == ()
     assert cases["direct_answer"].expected_answer_exact == "4"
@@ -70,6 +71,13 @@ def test_delivery_cases_cover_the_locked_public_matrix() -> None:
     assert cases["cache_usage"].expected_answer_exact == "cache_visible"
     assert cases["mlx_local_envelope"].provider == "mlx"
     assert cases["ollama_local_envelope"].provider == "ollama"
+    assert cases["praxis_demo"].public_agent is True
+    assert cases["praxis_demo"].expected_tools == (
+        "read_file",
+        "apply_patch",
+        "read_file",
+        "run_command",
+    )
 
 
 def test_exact_answer_assertion_rejects_substring_false_positive() -> None:
@@ -103,6 +111,7 @@ async def test_fake_delivery_matrix_proves_public_runtime_invariants() -> None:
     by_name = {result.name: result for result in results}
 
     assert len(results) == 12
+    assert "praxis_demo" not in by_name
     assert all(result.passed for result in results), {
         result.name: result.error for result in results if not result.passed
     }
@@ -186,6 +195,194 @@ async def test_fake_delivery_matrix_proves_public_runtime_invariants() -> None:
         assert local.result_content_kinds == ("structured",)
 
 
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_praxis_demo_uses_public_agent_and_captures_real_trace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_runtime import Agent
+
+    module = _load_smoke_module()
+    calls: list[tuple[str, dict[str, object]]] = []
+    original_arun = Agent.arun
+
+    async def tracked_arun(
+        self: Agent,
+        task: str,
+        **kwargs: object,
+    ):
+        calls.append((task, kwargs))
+        return await original_arun(self, task, **kwargs)
+
+    monkeypatch.setattr(Agent, "arun", tracked_arun)
+
+    results = await module.run_matrix(
+        model="fake",
+        fake_model=True,
+        only={"praxis_demo"},
+    )
+
+    assert len(calls) == 1
+    assert calls[0][1]["allow_write_tools"] is True
+    assert calls[0][1]["allow_execute_tools"] is True
+    assert calls[0][1]["event_sink"] is not None
+    assert len(results) == 1
+    demo = results[0]
+    assert demo.passed, demo.error
+    assert demo.status == "done"
+    assert demo.answer == "praxis demo complete"
+    assert demo.tools == (
+        "read_file",
+        "apply_patch",
+        "read_file",
+        "run_command",
+    )
+    assert demo.workspace_assertions_passed is True
+    assert demo.workspace_diff == (
+        "--- a/praxis_demo.py\n"
+        "+++ b/praxis_demo.py\n"
+        "@@ -1 +1 @@\n"
+        '-STATUS = "draft"\n'
+        '+STATUS = "ready"'
+    )
+    assert [
+        line for line in demo.event_lines if "tool:start" in line
+    ] == [
+        "[inspect] tool:start read_file praxis_demo.py",
+        "[patch] tool:start apply_patch praxis_demo.py",
+        "[verify] tool:start read_file praxis_demo.py",
+        "[verify] tool:start run_command make verify",
+    ]
+    assert demo.event_lines[-1] == (
+        "[complete] status=done answer=praxis demo complete"
+    )
+    rendered = "\n".join(demo.event_lines)
+    assert "/Users/" not in rendered
+    assert "delivery_smoke_" not in rendered
+    assert "api_key" not in rendered.casefold()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "absolute_path",
+    [
+        "/opt/praxis/demo.py",
+        r"C:\Users\alice\praxis\demo.py",
+        r"\\build-server\workspace\praxis\demo.py",
+    ],
+)
+async def test_public_demo_exception_redacts_absolute_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    absolute_path: str,
+) -> None:
+    from agent_runtime import Agent
+
+    module = _load_smoke_module()
+
+    async def fail_with_local_path(
+        self: Agent,
+        task: str,
+        **kwargs: object,
+    ) -> object:
+        del self, task, kwargs
+        raise RuntimeError(f"runtime failed at {absolute_path}")
+
+    monkeypatch.setattr(Agent, "arun", fail_with_local_path)
+
+    results = await module.run_matrix(
+        model="fake",
+        fake_model=True,
+        only={"praxis_demo"},
+    )
+
+    assert len(results) == 1
+    assert results[0].passed is False
+    assert absolute_path not in results[0].error
+    assert "[absolute-path]" in results[0].error
+
+
+@pytest.mark.parametrize(
+    "absolute_path",
+    [
+        "/var/tmp/praxis/demo.py",
+        r"D:\work\praxis\demo.py",
+        r"\\fileserver\share\praxis\demo.py",
+    ],
+)
+def test_demo_diff_redacts_absolute_paths(absolute_path: str) -> None:
+    module = _load_smoke_module()
+    raw_diff = f"--- a/praxis_demo.py\n+++ {absolute_path}\n+ready"
+
+    sanitized = module._sanitize_demo_diff(raw_diff)
+
+    assert absolute_path not in sanitized
+    assert "[absolute-path]" in sanitized
+    assert sanitized.endswith("+ready")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("fake_model", [False, True])
+async def test_default_matrix_skips_the_explicit_demo(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_model: bool,
+) -> None:
+    module = _load_smoke_module()
+    seen: list[str] = []
+
+    async def record_case(
+        case: object,
+        *,
+        model: str,
+        fake_model: bool,
+    ) -> object:
+        del model, fake_model
+        seen.append(case.name)
+        return object()
+
+    monkeypatch.setattr(module, "run_case", record_case)
+
+    await module.run_matrix(model="model", fake_model=fake_model)
+
+    assert "praxis_demo" not in seen
+
+
+@pytest.mark.anyio
+async def test_default_fake_matrix_does_not_enter_demo_without_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent_runtime.tools.builtins import shell as shell_module
+
+    module = _load_smoke_module()
+    entered: list[str] = []
+
+    async def record_public_demo(
+        case: object,
+        *,
+        model: str,
+        fake_model: bool,
+    ) -> object:
+        del model, fake_model
+        entered.append(case.name)
+        return object()
+
+    monkeypatch.setattr(
+        shell_module,
+        "_SANDBOX_EXEC_PATH",
+        str(tmp_path / "missing-sandbox-exec"),
+    )
+    monkeypatch.setattr(
+        module,
+        "_run_public_agent_case",
+        record_public_demo,
+    )
+
+    results = await module.run_matrix(model="fake", fake_model=True)
+
+    assert len(results) == 12
+    assert entered == []
+
+
 def test_verbose_output_reports_revision_wire_schema_error_and_cache_data() -> None:
     module = _load_smoke_module()
     result = module.SmokeResult(
@@ -229,6 +426,6 @@ def test_smoke_source_no_longer_imports_legacy_tool_surface() -> None:
         Path(__file__).parents[2] / "scripts" / "agent_delivery_smoke.py"
     ).read_text(encoding="utf-8")
 
-    assert "rag.agent.tooling" not in source
+    assert "agent_runtime.tooling" not in source
     assert "ToolSurfaceRequest" not in source
     assert "tool_surface_request" not in source

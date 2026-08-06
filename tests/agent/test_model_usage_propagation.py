@@ -5,16 +5,17 @@ from collections.abc import Mapping
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
+from agent_runtime.core.checkpointing import LangGraphCheckpointStore, agent_checkpoint_serde
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.model_request import ModelCallRecord
+from agent_runtime.loop.runtime import ModelTurnEnvelope
+from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.result import AgentResult
-from rag.agent.core.checkpointing import LangGraphCheckpointStore, agent_checkpoint_serde
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.model_request import ModelCallRecord
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import LoopState, ModelTurnDraft
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import (
+from agent_runtime.service import AgentRunRequest, AgentService
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -24,7 +25,6 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.schema.llm import LLMUsage
 
 
 def _tool() -> Tool:
@@ -122,9 +122,7 @@ async def test_provider_usage_reaches_checkpoint_internal_and_public_results() -
         checkpointer=checkpointer,
     )
 
-    internal = await service.run(
-        AgentRunRequest(message="Answer.", turn_id=run_id)
-    )
+    internal = await service.run(AgentRunRequest(message="Answer.", turn_id=run_id))
     public = AgentResult._from_internal(internal)
     loaded = await LangGraphCheckpointStore(
         checkpointer,

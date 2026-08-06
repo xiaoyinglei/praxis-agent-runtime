@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from rag.agent.memory.compactor import WorkingMemoryCompactor
+from agent_runtime.memory.compactor import WorkingMemoryCompactor
 
 
 def test_compacts_old_messages_into_bounded_summary_and_tail() -> None:

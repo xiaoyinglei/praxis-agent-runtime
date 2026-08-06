@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -9,18 +10,19 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 from agent_runtime import RAGKnowledgeConfig
-from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
-from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
-from agent_runtime.runtime.builder import build_agent_service
-from rag.agent import cli as cli_module
-from rag.agent.cli import (
+from agent_runtime import cli as cli_module
+from agent_runtime.agent import Agent
+from agent_runtime.cli import (
     _CLIToolEventDisplay,
     _display_agent_result,
     _load_knowledge_config,
     agent_app,
 )
-from rag.agent.service import AgentRunRequest
-from rag.agent.streaming.events import (
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
+from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
+from agent_runtime.runtime.builder import build_agent_service
+from agent_runtime.service import AgentRunRequest
+from agent_runtime.streaming.events import (
     EventType,
     StreamEvent,
     recovery_event,
@@ -30,14 +32,14 @@ from rag.agent.streaming.events import (
     tool_use_result,
     tool_use_start,
 )
-from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchOutput
-from rag.agent.tools.integrations.mcp import (
+from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
+from agent_runtime.tools.integrations.knowledge import KnowledgeSearchOutput
+from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
     create_mcp_tools,
 )
-from rag.agent.tools.integrations.skills import create_skill_tools
-from rag.agent.workspace import open_workspace
+from agent_runtime.tools.integrations.skills import create_skill_tools
+from agent_runtime.workspace import open_workspace
 
 
 class _ModelRegistry:
@@ -46,6 +48,45 @@ class _ModelRegistry:
     def resolve_for_node(self, **kwargs: object) -> object:
         del kwargs
         raise AssertionError("model resolution is not needed for assembly")
+
+
+def test_cli_defaults_use_praxis_runtime_paths() -> None:
+    assert cli_module.DEFAULT_MODEL_SESSION_PATH == Path(".praxis/model_session.json")
+    assert cli_module.DEFAULT_CHECKPOINT_PATH == Path(".praxis/checkpoints.sqlite")
+
+
+def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    legacy_root = tmp_path / ".rag"
+    legacy_checkpoint = legacy_root / "agent_checkpoints.sqlite"
+    legacy_session = legacy_root / "agent_model_session.json"
+    legacy_session_text = '{"current_model_id":"legacy-sentinel"}'
+    legacy_root.mkdir()
+    legacy_checkpoint.write_bytes(b"legacy checkpoint sentinel")
+    legacy_session.write_text(legacy_session_text, encoding="utf-8")
+
+    agent = Agent()
+    assert agent.checkpoint_db == Path(".praxis/checkpoints.sqlite")
+    assert agent.model_session_path == Path(".praxis/model_session.json")
+    store = agent._get_turn_store()
+    try:
+        current = agent.current_model()
+        switched = agent.switch_model(current.id)
+
+        assert switched.id == current.id
+        assert cli_module.DEFAULT_CHECKPOINT_PATH.is_file()
+        assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
+            "current_model_id": current.id
+        }
+        assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
+        assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
+    finally:
+        store.close()
+        if agent._model_control_plane is not None:
+            agent._model_control_plane.close()
 
 
 @pytest.mark.parametrize(

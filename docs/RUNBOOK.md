@@ -1,23 +1,27 @@
-# 运行手册
+# Praxis 运行手册
 
 > 从 [README.md](../README.md) 拆分出来。安装、服务管理、端到端运行命令。
+> `praxis-agent-runtime` 只是本地构建的 distribution metadata；当前未发布到 PyPI，
+> 所有命令均从 source checkout 运行。
 
 ## 安装
 
-安装依赖：
+先进入已克隆的仓库，再安装依赖：
 
 ```bash
+cd /path/to/praxis-agent-runtime
 uv sync
 ```
 
-如果要临时走云端模型，再准备 `.env`；默认本地 Qwen 不需要 API key：
+默认 chat 模型使用 Groq，先在 `.env` 中提供它声明的密钥：
 
 ```bash
 cat > .env <<'EOF'
-MIMO_API_KEY=your_mimo_key
-DEEPSEEK_API_KEY=your_deepseek_key_optional
+GROQ_API_KEY=your_groq_key
 EOF
 ```
+
+本地 Qwen chat 是显式可选路径，选择它时不需要云端 API key。
 
 确认基础设施：
 
@@ -36,8 +40,8 @@ lsof -nP -iTCP:6379 -sTCP:LISTEN
 | Postgres | `5432` | metadata |
 | Redis | `6379` | cache |
 | Optional local Qwen generation service | `8080` | 本地 OpenAI-compatible chat |
-| Embedding service | `9090` | `mlx-community/Qwen3-Embedding-4B-4bit-DWQ` |
-| Rerank service | `9092` | `BAAI/bge-reranker-v2-m3` |
+| Embedding service | `9090` | `mlx-community/Qwen3-Embedding-8B-4bit-DWQ` |
+| Rerank service | `9092` | `Qwen/Qwen3-Reranker-4B` |
 
 ## 模型服务管理
 
@@ -45,15 +49,16 @@ lsof -nP -iTCP:6379 -sTCP:LISTEN
 
 | 能力 | 默认别名 | 实际模型 / 服务 |
 | --- | --- | --- |
-| 生成 / 摘要 / Agent tool decision | `qwen3_8b_mlx_4bit` | `mlx-community/Qwen3-8B-4bit`，OpenAI-compatible，`127.0.0.1:8080` |
-| Embedding | `qwen3_embedding_4b_4bit_dwq` | `mlx-community/Qwen3-Embedding-4B-4bit-DWQ`，HTTP service，`127.0.0.1:9090` |
-| Rerank | `bge_reranker_v2_m3` | `BAAI/bge-reranker-v2-m3`，HTTP service，`127.0.0.1:9092` |
+| 生成 / 摘要 / Agent tool decision | `groq_gpt_oss_120b` | `openai/gpt-oss-120b`，Groq，`GROQ_API_KEY` |
+| Embedding | `qwen3_embedding_8b_4bit_dwq` | `mlx-community/Qwen3-Embedding-8B-4bit-DWQ`，HTTP service，`127.0.0.1:9090` |
+| Rerank | `qwen3_reranker_4b` | `Qwen/Qwen3-Reranker-4B`，HTTP service，`127.0.0.1:9092` |
 
 内存策略：
 
-- 默认 chat 走本地 Qwen 服务。`agent run --model qwen3_8b_mlx_4bit`
-  会先检查 `runtime.health_url`，未启动时按 `runtime.launch_command`
-  自动拉起 `127.0.0.1:8080` 的 OpenAI-compatible server。
+- 默认 chat 走 `groq_gpt_oss_120b`，不会因为省略 `--model` 而启动本地 MLX 服务。
+- 显式可选的 `agent run --model qwen3_8b_mlx_4bit` 会先检查
+  `runtime.health_url`，未启动时按 `runtime.launch_command` 自动拉起
+  `127.0.0.1:8080` 的 OpenAI-compatible server。
 - 入库和查询需要 embedding；建议启动 embedding HTTP 服务，避免每条命令重复加载模型。
 - rerank 是可选服务，默认省内存时关闭。
 - 切换 embedding 模型后必须换新的 Milvus collection prefix，旧向量不能混用。
@@ -66,16 +71,20 @@ lsof -nP -iTCP:6379 -sTCP:LISTEN
 ```bash
 uv run agent model list
 uv run agent model current
-uv run agent model switch mimo_cloud
+uv run agent model switch groq_gpt_oss_120b
 ```
 
-`agent model switch` 写 `.rag/agent_model_session.json`。临时只跑一次其他模型时，用
-`agent run --model mimo_cloud ...`，不要改 `configs/models.yaml`。
+`agent model switch` 写入 `.praxis/` 目录中的 `model_session.json`。临时只跑一次其他模型时，用
+`agent run --model qwen3_8b_mlx_4bit ...`，不要改 `configs/models.yaml`。
+
+早期版本写在 `.rag/` 中的 `agent_checkpoints.sqlite` 和
+`agent_model_session.json` 不迁移、不读取、也不删除；新的运行从 `.praxis/`
+中的全新状态开始，RAG 知识数据则继续留在 `.rag/`。
 
 先检查是否已经有同模型服务，避免重复常驻占内存：
 
 ```bash
-ps aux | rg -i 'embedding-service|rerank-service|Qwen3-Embedding|bge-reranker|mlx_lm|vllm|ollama|uvicorn' \
+ps aux | rg -i 'embedding-service|rerank-service|Qwen3-Embedding|Qwen3-Reranker|mlx_lm|vllm|ollama|uvicorn' \
   | rg -v 'rg -i|exec_command'
 
 lsof -nP -iTCP -sTCP:LISTEN \
@@ -87,9 +96,9 @@ lsof -nP -iTCP -sTCP:LISTEN \
 ```bash
 screen -S rag_embedding_9090 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_embedding_9090 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run rag embedding-service \
-  --model mlx-community/Qwen3-Embedding-4B-4bit-DWQ \
+  --model mlx-community/Qwen3-Embedding-8B-4bit-DWQ \
   --port 9090 \
   --batch-size 1
 '
@@ -102,23 +111,23 @@ rerank 是可选服务。需要重排时再启动。注意 `9091` 被 Milvus 占
 ```bash
 screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_rerank_9092 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run rag rerank-service \
-  --model BAAI/bge-reranker-v2-m3 \
+  --model Qwen/Qwen3-Reranker-4B \
   --port 9092 \
   --batch-size 4 \
   --max-length 1024
 '
 ```
 
-可选：手动预热默认本地 Qwen chat 服务。通常不需要；Agent 会按
-`configs/models.yaml` 的 runtime 配置自动启动。手动预热适合提前加载模型、
-减少第一次请求等待：
+显式可选：手动预热本地 `qwen3_8b_mlx_4bit` chat 服务。这不是默认
+chat 路径；当显式选择该 alias 时，Agent 也可按 `configs/models.yaml` 的
+runtime 配置自动启动。手动预热只用于减少首次请求等待：
 
 ```bash
 screen -S rag_qwen_8080 -X quit >/dev/null 2>&1 || true
 screen -dmS rag_qwen_8080 zsh -lc '
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 uv run python -m mlx_lm.server \
   --model mlx-community/Qwen3-8B-4bit \
   --host 127.0.0.1 \
@@ -146,14 +155,16 @@ screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 
 ## 私有文档端到端运行手册
 
-先准备 embedding 服务；rerank 默认不开，需要时再按"常用开关"打开。默认 chat 走 `configs/models.yaml` 中的 `qwen3_8b_mlx_4bit`，Agent 会按 runtime 配置自动检查和启动本地 chat 服务。
+先准备 embedding 服务；rerank 默认不开，需要时再按"常用开关"打开。默认
+chat 走 `configs/models.yaml` 中的 `groq_gpt_oss_120b`，需要已导出或在
+`.env` 中配置 `GROQ_API_KEY`；它不会自动启动本地 chat 服务。
 
 ### 统一变量
 
 入库和 Agent 的 `RAGKnowledgeConfig` 必须指向同一套 `STORAGE_ROOT / VECTOR_PREFIX`。Milvus 连接信息只通过 `AGENT_VECTOR_DSN` 注入 Agent，不写入 knowledge config 或 Turn binding。切换 embedding 模型或想重建干净索引时，换新的 `STORAGE_ROOT` 和 `VECTOR_PREFIX`。
 
 ```bash
-cd "/Users/leixiaoying/LLM/RAG学习"
+cd /path/to/praxis-agent-runtime
 
 # 数据位置：按实际数据改这两个变量。
 export INPUT_PATH="/absolute/path/to/one-file.docx"
@@ -356,7 +367,7 @@ uv run agent chat
 | 已入库的文档证据问题 | `agent run ... --knowledge-config <path>`，模型会按需调用 `search_knowledge` |
 | Agent 直接读本地文件 | `agent run ... --file "/path/to/file.xlsx"` |
 | 查看/切换当前 chat 模型 | `agent model list/current/switch <model_id>`；这是 session state，不改 YAML |
-| 一次性指定模型 | 默认不需要；如要临时走云端可用 `--model mimo_cloud` |
+| 一次性指定模型 | 默认是 Groq；显式可选本地路径可用 `--model qwen3_8b_mlx_4bit` |
 | 恢复常驻 embedding | `export RAG_EMBEDDING_SERVICE_URL=http://127.0.0.1:9090` |
 
 ### 快速 smoke 测试

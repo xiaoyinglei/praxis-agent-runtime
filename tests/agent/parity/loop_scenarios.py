@@ -8,29 +8,29 @@ from tempfile import TemporaryDirectory
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.context import TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.finalization import FinishCandidateBuilder
-from rag.agent.core.goal_contract import GoalDeliverable, GoalSpec
-from rag.agent.core.human_input import HumanInputResponse
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import AgentLoop, LoopEventSink, ModelTurnEnvelope
-from rag.agent.loop.state import LoopState, LoopTransition, ModelTurnDraft
-from rag.agent.loop.stop_hooks import StopHookRunner, build_stop_hooks
-from rag.agent.memory.compactor import LoopCompactionResult, LoopContextCompactor
-from rag.agent.memory.models import MemoryPolicy
-from rag.agent.memory.store import WorkspaceMemoryStore
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import JsonValue, Tool, ToolEffect
-from rag.agent.workspace import WorkspaceRuntime
+from agent_runtime.core.context import TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.finalization import FinishCandidateBuilder
+from agent_runtime.core.goal_contract import GoalDeliverable, GoalSpec
+from agent_runtime.core.human_input import HumanInputResponse
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.runtime import AgentLoop, LoopEventSink, ModelTurnEnvelope
+from agent_runtime.loop.state import LoopState, LoopTransition, ModelTurnDraft
+from agent_runtime.loop.stop_hooks import StopHookRunner, build_stop_hooks
+from agent_runtime.memory.compactor import LoopCompactionResult, LoopContextCompactor
+from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.memory.store import WorkspaceMemoryStore
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import JsonValue, Tool, ToolEffect
+from agent_runtime.workspace import WorkspaceRuntime
 from tests.agent.parity.fixtures import (
     PARITY_SCENARIO_NAMES,
     _definition,

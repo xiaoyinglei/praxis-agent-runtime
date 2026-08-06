@@ -37,7 +37,9 @@ def test_authorization_service_resolves_user_scoped_doc_ids_and_policy() -> None
 class _MetadataFallbackResolver:
     def list_sources(self):
         return [
-            Source(source_id=7, source_type=SourceType.MARKDOWN, location="docs/a.md", content_hash="", owner_id="alice"),
+            Source(
+                source_id=7, source_type=SourceType.MARKDOWN, location="docs/a.md", content_hash="", owner_id="alice"
+            ),
             Source(source_id=8, source_type=SourceType.MARKDOWN, location="docs/b.md", content_hash="", owner_id="bob"),
         ]
 

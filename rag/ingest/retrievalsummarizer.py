@@ -4,12 +4,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from rag.assembly import TokenAccountingService, TokenizerContract
+from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.modeling.gateway import LLMGateway
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+from agent_runtime.text import text_unit_count
 from rag.ingest.parsers.util import normalize_whitespace
-from rag.providers.llm_gateway import LLMGateway
 from rag.schema.core import ParsedSection
-from rag.schema.llm import LLMCallStage
-from rag.utils.text import text_unit_count
 
 
 class TextGenerationClient(Protocol):
@@ -389,14 +389,8 @@ class RetrievalSummarizer:
         sampled_text: str,
     ) -> str:
         toc_path = " > ".join(section.toc_path) if section.toc_path else document_title
-        heading_level = (
-            str(section.heading_level) if section.heading_level is not None else "unknown"
-        )
-        page_range = (
-            f"{section.page_range[0]}-{section.page_range[1]}"
-            if section.page_range is not None
-            else "unknown"
-        )
+        heading_level = str(section.heading_level) if section.heading_level is not None else "unknown"
+        page_range = f"{section.page_range[0]}-{section.page_range[1]}" if section.page_range is not None else "unknown"
 
         return f"""
 You are generating a retrieval summary for a document-grounded RAG system.
@@ -612,8 +606,7 @@ Child retrieval summaries:
     @staticmethod
     def _normalize_summary_output(text: str) -> str:
         lines = [
-            normalize_whitespace(line)
-            for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            normalize_whitespace(line) for line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
         ]
         return "\n".join(line for line in lines if line).strip()
 

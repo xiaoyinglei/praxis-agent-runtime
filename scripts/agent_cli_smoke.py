@@ -13,14 +13,14 @@ from pathlib import Path
 import click
 from typer.main import get_command
 
-from rag.agent.cli import (
+from agent_runtime.cli import (
     _CLIToolEventDisplay,
     _display_pending_recovery,
     _print_chat_help,
     agent_app,
 )
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.streaming.events import (
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.streaming.events import (
     EventType,
     StreamEvent,
     recovery_event,
@@ -28,7 +28,7 @@ from rag.agent.streaming.events import (
     tool_use_error,
     tool_use_start,
 )
-from rag.agent.turns import (
+from agent_runtime.turns import (
     RuntimeBinding,
     TurnStatus,
     TurnStore,

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from agent_runtime.core.goal_contract import GoalConstraint, GoalSpec
 from agent_runtime.planning import PlanStep, PlanTracker
-from rag.agent.core.goal_contract import GoalConstraint, GoalSpec
-from rag.agent.tools.builtins.planning import UpdatePlanInput
+from agent_runtime.tools.builtins.planning import UpdatePlanInput
 
 
 def test_goal_fingerprint_covers_the_complete_structured_goal() -> None:

@@ -14,9 +14,8 @@ from __future__ import annotations
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Any
 
 import pandas as pd
 
@@ -32,20 +31,20 @@ _CONCISE_HEADER_LENGTH = 15
 
 
 class HeaderKind(Enum):
-    SINGLE = auto()         # 单行表头
-    MULTI_LEVEL = auto()    # 多级表头（连续两行以上）
-    TITLED = auto()         # 标题行 + 单行表头
-    INFERRED = auto()       # 真实表头在数据中（Unnamed 修复）
-    NONE = auto()           # 无表头，纯数据
+    SINGLE = auto()  # 单行表头
+    MULTI_LEVEL = auto()  # 多级表头（连续两行以上）
+    TITLED = auto()  # 标题行 + 单行表头
+    INFERRED = auto()  # 真实表头在数据中（Unnamed 修复）
+    NONE = auto()  # 无表头，纯数据
 
 
 @dataclass(frozen=True, slots=True)
 class HeaderDetectionResult:
     header_kind: HeaderKind
     header_row_indices: tuple[int, ...]  # 在原始 sheet 中的行号（0-based）
-    data_start_row: int                 # 第一行数据在原始 sheet 中的行号
-    normalized_columns: list[str]        # 归一化后的列名
-    confidence: float                    # 0.0 ~ 1.0
+    data_start_row: int  # 第一行数据在原始 sheet 中的行号
+    normalized_columns: list[str]  # 归一化后的列名
+    confidence: float  # 0.0 ~ 1.0
     warnings: tuple[str, ...]
 
     @property
@@ -74,18 +73,13 @@ def detect_header(
 
     total_rows, total_cols = df.shape
     scan_rows = min(total_rows, max_scan_rows)
-    rows: list[list[str]] = [
-        [_normalize_cell(df.iat[r, c]) for c in range(total_cols)]
-        for r in range(scan_rows)
-    ]
+    rows: list[list[str]] = [[_normalize_cell(df.iat[r, c]) for c in range(total_cols)] for r in range(scan_rows)]
 
     # ── 1. 按行打分 ──
     scores = _score_rows(rows, total_cols)
 
     # ── 2. 识别表头行簇 ──
-    header_indices, kind, confidence, warnings = _detect_header_cluster(
-        scores, rows, total_cols
-    )
+    header_indices, kind, confidence, warnings = _detect_header_cluster(scores, rows, total_cols)
 
     # ── 3. 生成列名 ──
     normalized_columns = _build_columns(header_indices, rows, total_cols, kind)
@@ -133,9 +127,17 @@ def _score_rows(rows: list[list[str]], total_cols: int) -> list[dict[str, float]
         nc = len(non_empty)
 
         if nc == 0:
-            results.append({"_score": 0.0, "_text_ratio": 0.0, "_unique_ratio": 0.0,
-                           "_conciseness": 0.0, "_density": 0.0, "_transition": 0.0,
-                           "_numeric_ratio": 0.0})
+            results.append(
+                {
+                    "_score": 0.0,
+                    "_text_ratio": 0.0,
+                    "_unique_ratio": 0.0,
+                    "_conciseness": 0.0,
+                    "_density": 0.0,
+                    "_transition": 0.0,
+                    "_numeric_ratio": 0.0,
+                }
+            )
             continue
 
         text_count = sum(1 for v in non_empty if _looks_like_text(v))
@@ -143,7 +145,9 @@ def _score_rows(rows: list[list[str]], total_cols: int) -> list[dict[str, float]
         unique_count = _count_unique_in_context(row, rows, r_idx)
         downstream = max(len(rows) - r_idx - 1, 1)
         avg_len = sum(len(v) for v in non_empty) / nc
-        conciseness = 1.0 if avg_len <= _CONCISE_HEADER_LENGTH else max(0.0, 1.0 - (avg_len - _CONCISE_HEADER_LENGTH) / 60.0)
+        conciseness = (
+            1.0 if avg_len <= _CONCISE_HEADER_LENGTH else max(0.0, 1.0 - (avg_len - _CONCISE_HEADER_LENGTH) / 60.0)
+        )
         density = nc / max(total_cols, 1)
         transition = _transition_score(rows, r_idx, total_cols)
 
@@ -169,15 +173,17 @@ def _score_rows(rows: list[list[str]], total_cols: int) -> list[dict[str, float]
             - numeric_penalty
         )
 
-        results.append({
-            "_score": score,
-            "_text_ratio": text_ratio,
-            "_unique_ratio": unique_ratio,
-            "_conciseness": conciseness,
-            "_density": density,
-            "_transition": transition,
-            "_numeric_ratio": numeric_ratio,
-        })
+        results.append(
+            {
+                "_score": score,
+                "_text_ratio": text_ratio,
+                "_unique_ratio": unique_ratio,
+                "_conciseness": conciseness,
+                "_density": density,
+                "_transition": transition,
+                "_numeric_ratio": numeric_ratio,
+            }
+        )
 
     return results
 
@@ -190,14 +196,14 @@ def _looks_like_text(value: str) -> bool:
     if len(stripped) > _MAX_HEADER_CELL_LENGTH:
         return False
     # 纯数字（含负号、小数点、百分号、科学计数法）
-    if re.match(r'^-?[\d,.]+%?$', stripped.replace(' ', '').replace(',', '').replace('，', '')):
+    if re.match(r"^-?[\d,.]+%?$", stripped.replace(" ", "").replace(",", "").replace("，", "")):
         return False
-    if re.match(r'^-?\d+\.?\d*[eE][+-]?\d+$', stripped):
+    if re.match(r"^-?\d+\.?\d*[eE][+-]?\d+$", stripped):
         return False
     # 日期格式
-    if re.match(r'^\d{1,4}[-/年]\d{1,2}[-/月]\d{1,2}[日号]?$', stripped):
+    if re.match(r"^\d{1,4}[-/年]\d{1,2}[-/月]\d{1,2}[日号]?$", stripped):
         return False
-    if re.match(r'^\d+:\d+', stripped):
+    if re.match(r"^\d+:\d+", stripped):
         return False
     return True
 
@@ -265,7 +271,8 @@ def _detect_header_cluster(
     n = len(scores)
 
     candidates = [
-        i for i in range(n)
+        i
+        for i in range(n)
         if scores[i]["_score"] >= _MIN_HEADER_SCORE
         and scores[i]["_text_ratio"] >= 0.5
         and scores[i]["_numeric_ratio"] == 0.0
@@ -346,8 +353,7 @@ def _classify_kind(
                 if s["_density"] < 0.4 and non_empty:
                     return HeaderKind.TITLED
         if idx > 0 and any(
-            scores[j]["_score"] < 0.2 and sum(1 for v in rows[j] if str(v).strip()) > 0
-            for j in range(idx)
+            scores[j]["_score"] < 0.2 and sum(1 for v in rows[j] if str(v).strip()) > 0 for j in range(idx)
         ):
             return HeaderKind.INFERRED
         return HeaderKind.SINGLE

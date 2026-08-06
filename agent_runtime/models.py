@@ -8,16 +8,16 @@ from pathlib import Path
 from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 
-from rag.agent.core.llm_config import ModelProvider
-from rag.agent.core.llm_config import ModelSpec as InternalModelSpec
-from rag.agent.core.llm_registry import (
+from agent_runtime.core.llm_config import ModelProvider
+from agent_runtime.core.llm_config import ModelSpec as InternalModelSpec
+from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
     ModelResolver,
     ResolvedModel,
     UnknownModelAliasError,
 )
-from rag.models.config import GenerationConfig
+from agent_runtime.modeling.config import GenerationConfig
 
 ModelLocation = Literal["local", "cloud"]
 ModelSwitchRequester = Literal["user", "agent", "system"]
@@ -70,17 +70,13 @@ class ModelCatalog:
         if not specs:
             raise ValueError("model catalog must not be empty")
         if default_model_id not in specs:
-            raise UnknownModelAliasError(
-                f"Default model {default_model_id!r} not found in catalog"
-            )
+            raise UnknownModelAliasError(f"Default model {default_model_id!r} not found in catalog")
         self._specs = dict(specs)
         self.default_model_id = default_model_id
 
     @classmethod
     def from_config_file(cls, path: Path) -> ModelCatalog:
-        return cls.from_registry(
-            ModelRegistry(ModelRegistry._load_yaml_file(path))
-        )
+        return cls.from_registry(ModelRegistry(ModelRegistry._load_yaml_file(path)))
 
     @classmethod
     def from_env(cls, env_path: str = ".env") -> ModelCatalog:
@@ -89,8 +85,7 @@ class ModelCatalog:
     @classmethod
     def from_registry(cls, registry: ModelRegistry) -> ModelCatalog:
         specs = {
-            model_id: _to_public_spec(model_id, registry.get_model_spec(model_id))
-            for model_id in registry.model_ids
+            model_id: _to_public_spec(model_id, registry.get_model_spec(model_id)) for model_id in registry.model_ids
         }
         return cls(specs=specs, default_model_id=registry.default_model)
 
@@ -157,9 +152,7 @@ class ModelPolicy:
         spec = catalog.get(target_model_id)
         allowed = self._allowed_ids_for(requested_by)
         if allowed is not None and target_model_id not in allowed:
-            raise ModelPolicyError(
-                f"Model {target_model_id!r} is not allowed for {requested_by} requests"
-            )
+            raise ModelPolicyError(f"Model {target_model_id!r} is not allowed for {requested_by} requests")
         return spec
 
     def _allowed_ids_for(
@@ -187,9 +180,7 @@ class ModelControlPlane:
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
     ) -> None:
         if not catalog.has(state.current_model_id):
-            raise UnknownModelAliasError(
-                f"Model alias {state.current_model_id!r} not found in catalog"
-            )
+            raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
         self.catalog = catalog
         self.state = state
         self.policy = policy or ModelPolicy()
@@ -364,9 +355,7 @@ def _load_session_state(
     else:
         state = ModelSessionState(current_model_id=catalog.default_model_id)
     if not catalog.has(state.current_model_id):
-        raise UnknownModelAliasError(
-            f"Model alias {state.current_model_id!r} not found in catalog"
-        )
+        raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
     return state
 
 

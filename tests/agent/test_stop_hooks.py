@@ -7,16 +7,16 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.finalization import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.finalization import (
     FinishCandidateBuilder,
     FinishCandidateBuildError,
 )
-from rag.agent.core.goal_contract import GoalConstraint, GoalDeliverable, GoalSpec
-from rag.agent.core.output_finalizer import OutputValidationExhaustedError
-from rag.agent.loop.state import ModelTurnDraft, create_loop_state
-from rag.agent.loop.stop_hooks import (
+from agent_runtime.core.goal_contract import GoalConstraint, GoalDeliverable, GoalSpec
+from agent_runtime.core.output_finalizer import OutputValidationExhaustedError
+from agent_runtime.loop.state import ModelTurnDraft, create_loop_state
+from agent_runtime.loop.stop_hooks import (
     GoalContractStopHook,
     StopHookBinding,
     StopHookRunner,
@@ -24,8 +24,8 @@ from rag.agent.loop.stop_hooks import (
     StructuredOutputStopHook,
     build_stop_hooks,
 )
-from rag.agent.tools.tool import ToolCall, ToolCallOrigin, ToolResult
-from rag.agent.workspace import workspace_tree_sha256
+from agent_runtime.tools.tool import ToolCall, ToolCallOrigin, ToolResult
+from agent_runtime.workspace import workspace_tree_sha256
 
 
 class _StructuredAnswer(BaseModel):

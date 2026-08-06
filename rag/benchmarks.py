@@ -22,6 +22,7 @@ import httpx
 from datasets import load_dataset
 from tqdm.auto import tqdm
 
+from agent_runtime.text import load_env_file
 from rag import AssemblyRequest, CapabilityRequirements, RAGRuntime, StorageComponentConfig, StorageConfig
 from rag.assembly import AssemblyConfig, AssemblyOverrides, CapabilityAssemblyService, ProviderConfig, TokenizerConfig
 from rag.ingest.pipeline import IngestRequest
@@ -34,7 +35,6 @@ from rag.schema.runtime import (
     DataContractMetadataRepo,
     RuntimeMode,
 )
-from rag.utils.text import load_env_file
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
         def reset_embedding_stats(self) -> None: ...
         def embedding_runtime_info(self) -> dict[str, object]: ...
         def embedding_stats(self) -> dict[str, object]: ...
+
 
 FIQA_DATASET = "fiqa"
 MEDICAL_RETRIEVAL_DATASET = "medical_retrieval"
@@ -279,6 +280,7 @@ class BenchmarkPerQueryResult:
     reciprocal_rank: float
     ndcg: float
     latency_ms: float
+
     def as_json(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
@@ -311,6 +313,7 @@ class BenchmarkRunSummary:
     ndcg_at_10: float
     avg_latency_ms: float
     p95_latency_ms: float
+
     @property
     def queries_per_second(self) -> float:
         if self.avg_latency_ms <= 0:
@@ -475,14 +478,8 @@ class RetrievalBenchmarkEvaluator:
         metadata = cast(DataContractMetadataRepo, self.runtime.stores.metadata_repo)
         documents = metadata.list_documents()
         document_count = len(documents)
-        section_count = sum(
-            len(metadata.list_sections(doc_id=document.doc_id))
-            for document in documents
-        )
-        asset_count = sum(
-            len(metadata.list_assets(doc_id=document.doc_id))
-            for document in documents
-        )
+        section_count = sum(len(metadata.list_sections(doc_id=document.doc_id)) for document in documents)
+        asset_count = sum(len(metadata.list_assets(doc_id=document.doc_id)) for document in documents)
         vector_count = sum(
             self.runtime.stores.vector_repo.count_vectors(item_kind=item_kind)
             for item_kind in ("doc_summary", "section_summary", "asset_summary")
@@ -1406,8 +1403,7 @@ def compute_doc_ranking_metrics(
         reverse=True,
     )[:top_k]
     ideal_dcg = sum(
-        (2**relevance - 1) / math.log2(index + 1)
-        for index, relevance in enumerate(ideal_relevances, start=1)
+        (2**relevance - 1) / math.log2(index + 1) for index, relevance in enumerate(ideal_relevances, start=1)
     )
     ndcg = 0.0 if ideal_dcg == 0.0 else dcg / ideal_dcg
 
@@ -1535,12 +1531,8 @@ def write_dataset_baseline_summary(
             "Recall@10_delta": round(
                 _to_float(target.get("Recall@10", 0.0)) - _to_float(reference.get("Recall@10", 0.0)), 6
             ),
-            "MRR@10_delta": round(
-                _to_float(target.get("MRR@10", 0.0)) - _to_float(reference.get("MRR@10", 0.0)), 6
-            ),
-            "NDCG@10_delta": round(
-                _to_float(target.get("NDCG@10", 0.0)) - _to_float(reference.get("NDCG@10", 0.0)), 6
-            ),
+            "MRR@10_delta": round(_to_float(target.get("MRR@10", 0.0)) - _to_float(reference.get("MRR@10", 0.0)), 6),
+            "NDCG@10_delta": round(_to_float(target.get("NDCG@10", 0.0)) - _to_float(reference.get("NDCG@10", 0.0)), 6),
             "avg_latency_ms_delta": round(
                 _to_float(target.get("avg_latency_ms", 0.0)) - _to_float(reference.get("avg_latency_ms", 0.0)), 3
             ),
@@ -1566,7 +1558,6 @@ def write_dataset_baseline_summary(
     write_json(path, payload)
 
 
-
 def append_jsonl(path: Path, payload: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -1580,7 +1571,6 @@ def write_json(path: Path, payload: Mapping[str, object]) -> None:
         handle.write("\n")
 
 
-
 def iter_jsonl(path: Path) -> Iterator[dict[str, object]]:
     opener = gzip.open if path.suffix == ".gz" else open
     with opener(path, "rt", encoding="utf-8") as handle:
@@ -1592,7 +1582,6 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, object]]:
             if not isinstance(payload, dict):
                 raise ValueError(f"Expected JSON object in {path}, got {type(payload).__name__}")
             yield payload
-
 
 
 def build_runtime_for_benchmark(
@@ -1995,13 +1984,16 @@ def _download_file_with_progress(
     with httpx.stream("GET", url, follow_redirects=True, timeout=timeout_seconds) as response:
         response.raise_for_status()
         total = _coerce_content_length(response.headers.get("Content-Length"))
-        with temporary_path.open("wb") as handle, tqdm(
-            total=total,
-            desc=desc,
-            unit="B",
-            unit_scale=True,
-            unit_divisor=1024,
-        ) as progress:
+        with (
+            temporary_path.open("wb") as handle,
+            tqdm(
+                total=total,
+                desc=desc,
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+            ) as progress,
+        ):
             for chunk in response.iter_bytes():
                 if not chunk:
                     continue
@@ -2029,7 +2021,6 @@ def _required_zip_member(zf: zipfile.ZipFile, suffix: str) -> str:
     raise FileNotFoundError(f"Archive does not contain required member ending with {suffix!r}")
 
 
-
 def _extract_zip_member(zf: zipfile.ZipFile, member: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload = zf.read(member)
@@ -2039,12 +2030,10 @@ def _extract_zip_member(zf: zipfile.ZipFile, member: str, destination: Path) -> 
         handle.write(payload)
 
 
-
 def _coerce_required_str(value: object, *, field_name: str) -> str:
     if isinstance(value, str) and value.strip():
         return value.strip()
     raise ValueError(f"Missing required string field: {field_name}")
-
 
 
 def _coerce_optional_str(value: object) -> str | None:
@@ -2054,7 +2043,6 @@ def _coerce_optional_str(value: object) -> str | None:
         stripped = value.strip()
         return stripped or None
     return str(value)
-
 
 
 def _stringify_metadata(value: object) -> dict[str, str]:
@@ -2071,7 +2059,6 @@ def _stringify_metadata(value: object) -> dict[str, str]:
         else:
             metadata[key] = str(item)
     return metadata
-
 
 
 def _embedding_model_name(runtime: RAGRuntime) -> str | None:
@@ -2101,11 +2088,9 @@ def _benchmark_embedding_provider(runtime: RAGRuntime) -> _EmbeddingBackend | No
     return cast(_EmbeddingBackend, backend)
 
 
-
 def _mean(values: Iterable[float]) -> float:
     items = list(values)
     return 0.0 if not items else statistics.fmean(items)
-
 
 
 def _p95(values: Iterable[float]) -> float:
@@ -2119,7 +2104,6 @@ def _p95(values: Iterable[float]) -> float:
     return items[index]
 
 
-
 def _coerce_float(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
@@ -2129,7 +2113,6 @@ def _coerce_float(value: object) -> float | None:
         except ValueError:
             return None
     return None
-
 
 
 def _coerce_str(value: object) -> str | None:

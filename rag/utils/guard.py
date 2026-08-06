@@ -5,10 +5,11 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Generator
+from typing import Any
 
 _logger = logging.getLogger("rag.guard")
 
@@ -58,7 +59,9 @@ class RateLimiter:
         max_global: int | None = None,
         max_concurrent: int | None = None,
     ) -> None:
-        self._window_seconds = window_seconds if window_seconds is not None else _env_float("RAG_RATE_WINDOW_SECONDS", 60.0)
+        self._window_seconds = (
+            window_seconds if window_seconds is not None else _env_float("RAG_RATE_WINDOW_SECONDS", 60.0)
+        )
         self._max_per_user = max_per_user if max_per_user is not None else _env_int("RAG_RATE_MAX_PER_USER", 60)
         self._max_global = max_global if max_global is not None else _env_int("RAG_RATE_MAX_GLOBAL", 300)
         max_conc = max_concurrent if max_concurrent is not None else _env_int("RAG_RATE_MAX_CONCURRENT", 10)

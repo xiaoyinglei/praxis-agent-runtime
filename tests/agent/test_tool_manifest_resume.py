@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core import checkpointing as checkpointing_module
-from rag.agent.core.checkpointing import (
+from agent_runtime.core import checkpointing as checkpointing_module
+from agent_runtime.core.checkpointing import (
     CanonicalToolCheckpoint,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
@@ -19,9 +19,9 @@ from rag.agent.core.checkpointing import (
     encode_tool_checkpoint,
     reconcile_tool_manifest,
 )
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.model_request import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.model_request import (
     ModelSettings,
     bind_model_call_record,
     build_model_request,
@@ -29,9 +29,10 @@ from rag.agent.core.model_request import (
     build_tool_manifest,
     model_call_record_payload,
 )
-from rag.agent.core.turn_contracts import ToolCallPlan, ToolManifestDriftStatus
-from rag.agent.loop.state import create_loop_state
-from rag.agent.tools.tool import (
+from agent_runtime.core.turn_contracts import ToolCallPlan, ToolManifestDriftStatus
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.modeling.contracts import normalize_llm_usage
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -43,7 +44,6 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.schema.llm import normalize_llm_usage
 
 _FIXTURE = Path(__file__).parent / "fixtures/checkpoints/legacy_tool_state_v1.json"
 

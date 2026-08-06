@@ -7,15 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.core import model_request as model_request_module
-from rag.agent.core.messages import (
+from agent_runtime.core import model_request as model_request_module
+from agent_runtime.core.messages import (
     ModelMessage,
     context_event_message,
 )
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ToolCall as ModelToolCall,
 )
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ContextBlock,
     ModelSettings,
     StableModelContext,
@@ -25,7 +25,7 @@ from rag.agent.core.model_request import (
     canonical_model_request_json,
     stable_context_json,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -501,10 +501,9 @@ def test_canonical_request_module_is_dormant_and_provider_neutral() -> None:
     assert not any(
         module.startswith(
             (
-                "rag.agent.loop",
-                "rag.agent.service",
-                "rag.agent.tooling",
-                "agent_runtime",
+                "agent_runtime.loop",
+                "agent_runtime.service",
+                "agent_runtime.tooling",
             )
         )
         for module in imports

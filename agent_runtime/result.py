@@ -6,15 +6,15 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+from agent_runtime.knowledge import AgentCitation, AgentEvidence, agent_citation_from_value, agent_evidence_from_value
+from agent_runtime.modeling.contracts import LLMUsage
 from agent_runtime.planning import AgentPlan, PlanEvent
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.tool import JsonValue, ToolResult
-from rag.schema.llm import LLMUsage
-from rag.schema.query import AnswerCitation, EvidenceItem, GroundingTarget
+from agent_runtime.tools.tool import JsonValue, ToolResult
 
 if TYPE_CHECKING:
-    from rag.agent.service import AgentRunResult
+    from agent_runtime.service import AgentRunResult
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
 type AgentPauseKind = Literal[
@@ -56,51 +56,6 @@ class AgentToolCall:
                 "structured_output",
                 _freeze_json_value(self.structured_output),
             )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentEvidence:
-    evidence_id: str
-    doc_id: int
-    citation_anchor: str
-    text: str
-    score: float
-    benchmark_doc_id: str | None = None
-    source_id: int | None = None
-    evidence_kind: str = "internal"
-    record_type: str | None = None
-    file_name: str | None = None
-    section_path: tuple[str, ...] = ()
-    page_start: int | None = None
-    page_end: int | None = None
-    source_type: str | None = None
-    retrieval_channels: tuple[str, ...] = ()
-    retrieval_family: str | None = None
-    grounding_target: Mapping[str, JsonValue] | None = None
-
-    def __post_init__(self) -> None:
-        if self.grounding_target is not None:
-            object.__setattr__(
-                self,
-                "grounding_target",
-                _freeze_json_mapping(self.grounding_target),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentCitation:
-    citation_id: str
-    evidence_id: str
-    record_type: str
-    file_name: str | None = None
-    section_path: tuple[str, ...] = ()
-    page_start: int | None = None
-    page_end: int | None = None
-    citation_anchor: str | None = None
-    doc_id: int | None = None
-    benchmark_doc_id: str | None = None
-    source_id: int | None = None
-    source_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,63 +204,12 @@ def _project_tool_call(
     )
 
 
-def _project_evidence(item: EvidenceItem) -> AgentEvidence:
-    return AgentEvidence(
-        evidence_id=item.evidence_id,
-        doc_id=item.doc_id,
-        benchmark_doc_id=item.benchmark_doc_id,
-        source_id=item.source_id,
-        citation_anchor=item.citation_anchor,
-        text=item.text,
-        score=item.score,
-        evidence_kind=item.evidence_kind,
-        record_type=item.record_type,
-        file_name=item.file_name,
-        section_path=tuple(item.section_path),
-        page_start=item.page_start,
-        page_end=item.page_end,
-        source_type=item.source_type,
-        retrieval_channels=tuple(item.retrieval_channels),
-        retrieval_family=item.retrieval_family,
-        grounding_target=_project_grounding_target(item.grounding_target),
-    )
+def _project_evidence(item: object) -> AgentEvidence:
+    return agent_evidence_from_value(item)
 
 
-def _project_grounding_target(
-    target: GroundingTarget | None,
-) -> Mapping[str, JsonValue] | None:
-    if target is None:
-        return None
-    return MappingProxyType(
-        {
-            "kind": target.kind,
-            "doc_id": target.doc_id,
-            "source_id": target.source_id,
-            "section_id": target.section_id,
-            "asset_id": target.asset_id,
-            "page_start": target.page_start,
-            "page_end": target.page_end,
-            "section_path": tuple(target.section_path),
-            "raw_locator": MappingProxyType(dict(target.raw_locator)),
-        }
-    )
-
-
-def _project_citation(item: AnswerCitation) -> AgentCitation:
-    return AgentCitation(
-        citation_id=item.citation_id,
-        file_name=item.file_name,
-        section_path=tuple(item.section_path),
-        page_start=item.page_start,
-        page_end=item.page_end,
-        evidence_id=item.evidence_id,
-        record_type=item.record_type,
-        citation_anchor=item.citation_anchor,
-        doc_id=item.doc_id,
-        benchmark_doc_id=item.benchmark_doc_id,
-        source_id=item.source_id,
-        source_type=item.source_type,
-    )
+def _project_citation(item: object) -> AgentCitation:
+    return agent_citation_from_value(item)
 
 
 def _project_diagnostic(item: RuntimeDiagnostic) -> AgentDiagnostic:

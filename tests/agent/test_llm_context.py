@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.llm_context import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.llm_context import (
     AgentLLMContextAssembler,
     AgentLLMContextOverflowError,
 )
-from rag.agent.loop.state import LoopState, create_loop_state
-from rag.schema.llm import LLMCallStage, LLMStageBudget
+from agent_runtime.loop.state import LoopState, create_loop_state
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 
 
 class _CharacterTokenAccounting:

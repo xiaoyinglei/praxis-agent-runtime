@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from rag.agent.core.observations import (
+from agent_runtime.core.observations import (
     ComputationResult,
     ContextUnit,
     EvidenceRef,
@@ -8,13 +8,13 @@ from rag.agent.core.observations import (
     StructuredObservation,
     grounded_workspace_paths,
 )
-from rag.agent.tools.builtins.filesystem import (
+from agent_runtime.tools.builtins.filesystem import (
     FileEntry,
     ListFilesOutput,
     ReadFileOutput,
 )
-from rag.agent.tools.builtins.search import SearchTextMatch, SearchTextOutput
-from rag.agent.tools.tool import ToolCall, ToolCallOrigin, ToolResult
+from agent_runtime.tools.builtins.search import SearchTextMatch, SearchTextOutput
+from agent_runtime.tools.tool import ToolCall, ToolCallOrigin, ToolResult
 from rag.schema.query import AnswerCitation, EvidenceItem
 
 
@@ -165,14 +165,14 @@ def test_search_text_observation_preserves_patchable_source_locators() -> None:
     output = SearchTextOutput(
         matches=[
             SearchTextMatch(
-                file_path="rag/agent/loop/runtime.py",
+                file_path="agent_runtime/loop/runtime.py",
                 line_number=718,
                 line_content="                    _stream_tool_use_result(",
                 match_start=20,
                 match_end=43,
             ),
             SearchTextMatch(
-                file_path="rag/agent/cli.py",
+                file_path="agent_runtime/cli.py",
                 line_number=111,
                 line_content="    def _render_tool_result(self, event: StreamEvent) -> None:",
                 match_start=8,
@@ -192,12 +192,12 @@ def test_search_text_observation_preserves_patchable_source_locators() -> None:
     assert update["locators"] == [
         {
             "source_tool": "search_text",
-            "path": "rag/agent/loop/runtime.py",
+            "path": "agent_runtime/loop/runtime.py",
             "line_number": 718,
         },
         {
             "source_tool": "search_text",
-            "path": "rag/agent/cli.py",
+            "path": "agent_runtime/cli.py",
             "line_number": 111,
         },
     ]
@@ -214,9 +214,7 @@ def test_empty_search_is_not_a_successful_plan_observation() -> None:
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"
@@ -256,8 +254,10 @@ def test_neutral_rag_observation_preserves_evidence_and_citations() -> None:
 
     update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
-    assert update["evidence"] == [evidence]
-    assert update["citations"] == [citation]
+    assert update["evidence"][0].evidence_id == evidence.evidence_id
+    assert update["citations"][0].citation_id == citation.citation_id
+    assert type(update["evidence"][0]).__module__ == "agent_runtime.knowledge"
+    assert type(update["citations"][0]).__module__ == "agent_runtime.knowledge"
     assert update["evidence_refs"] == [
         EvidenceRef(
             evidence_id="ev-policy",
@@ -428,9 +428,7 @@ def test_nonzero_command_is_not_a_successful_plan_observation() -> None:
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"
@@ -442,16 +440,14 @@ def test_noop_patch_is_not_a_successful_plan_observation() -> None:
         tool_call_id="tc-noop-patch",
         tool_name="apply_patch",
         structured_content={
-            "file_path": "rag/agent/loop/runtime.py",
+            "file_path": "agent_runtime/loop/runtime.py",
             "replaced": False,
             "occurrences": 0,
             "message": "No change.",
         },
     )
 
-    update = ObservationExtractor().reduce_tool_results(
-        {"tool_results": [result]}
-    )
+    update = ObservationExtractor().reduce_tool_results({"tool_results": [result]})
 
     [observation] = update["structured_observations"]
     assert observation.status == "error"

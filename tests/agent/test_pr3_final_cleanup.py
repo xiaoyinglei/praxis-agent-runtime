@@ -7,29 +7,29 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     _migrate_legacy_state,
     agent_checkpoint_serde,
 )
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.messages import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.messages import (
     ModelMessage,
     tool_result_message,
 )
-from rag.agent.core.messages import (
+from agent_runtime.core.messages import (
     ToolCall as ModelToolCall,
 )
-from rag.agent.core.model_request import StableModelContext
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import (
+from agent_runtime.core.model_request import StableModelContext
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import (
     PendingToolCall,
     ToolCallLedger,
     create_loop_state,
 )
-from rag.agent.loop.substate import MemoryState
-from rag.agent.tools.tool import ToolContentBlock, ToolResult
-from rag.models.config import GenerationConfig
-from rag.schema.llm import LLMCallStage
+from agent_runtime.loop.substate import MemoryState
+from agent_runtime.modeling.config import GenerationConfig
+from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.tools.tool import ToolContentBlock, ToolResult
 
 
 def _production_source(relative_path: str) -> str:
@@ -45,9 +45,9 @@ def _config() -> AgentRunConfig:
 
 
 def test_runtime_helpers_have_one_canonical_owner() -> None:
-    cli_source = _production_source("rag/agent/cli.py")
-    loop_source = _production_source("rag/agent/loop/runtime.py")
-    sink_source = _production_source("rag/agent/streaming/sink.py")
+    cli_source = _production_source("agent_runtime/cli.py")
+    loop_source = _production_source("agent_runtime/loop/runtime.py")
+    sink_source = _production_source("agent_runtime/streaming/sink.py")
 
     assert "def _build_model_control_plane(" not in cli_source
     assert "def _format_public_tool_summary(" not in cli_source
@@ -66,45 +66,31 @@ def test_runtime_helpers_have_one_canonical_owner() -> None:
 
 
 def test_substate_does_not_import_its_owner_module() -> None:
-    tree = ast.parse(_production_source("rag/agent/loop/substate.py"))
-    imports = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    tree = ast.parse(_production_source("agent_runtime/loop/substate.py"))
+    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
-    assert "rag.agent.loop.state" not in imports
+    assert "agent_runtime.loop.state" not in imports
 
 
 def test_local_runtime_only_type_checks_public_model_contract() -> None:
     tree = ast.parse(_production_source("agent_runtime/local_runtime.py"))
-    runtime_imports = {
-        node.module
-        for node in tree.body
-        if isinstance(node, ast.ImportFrom)
-    }
+    runtime_imports = {node.module for node in tree.body if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime.models" not in runtime_imports
 
 
 def test_memory_digest_does_not_depend_on_checkpointing() -> None:
-    compactor_tree = ast.parse(_production_source("rag/agent/memory/compactor.py"))
-    compactor_imports = {
-        node.module
-        for node in ast.walk(compactor_tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    compactor_tree = ast.parse(_production_source("agent_runtime/memory/compactor.py"))
+    compactor_imports = {node.module for node in ast.walk(compactor_tree) if isinstance(node, ast.ImportFrom)}
 
-    assert "rag.agent.core.checkpointing" not in compactor_imports
-    assert "def _digest_text(" not in _production_source(
-        "rag/agent/core/checkpointing.py"
-    )
+    assert "agent_runtime.core.checkpointing" not in compactor_imports
+    assert "def _digest_text(" not in _production_source("agent_runtime/core/checkpointing.py")
 
 
 def test_orphaned_persistent_memory_capability_is_removed() -> None:
     root = Path(__file__).resolve().parents[2]
     state = create_loop_state(current_message="cleanup", run_config=_config())
-    persistent_sources = root / "rag/agent/memory/persistent"
+    persistent_sources = root / "agent_runtime/memory/persistent"
 
     assert not tuple(persistent_sources.glob("*.py"))
     assert not (root / "tests/agent/test_persistent_memory.py").exists()
@@ -124,7 +110,7 @@ def test_orphaned_persistent_memory_capability_is_removed() -> None:
     }.isdisjoint(GenerationConfig.__dataclass_fields__)
 
 
-def test_checkpoint_decode_discards_removed_persistent_memory_snapshot() -> None:
+def test_checkpoint_decode_rejects_legacy_memory_state_identity() -> None:
     legacy_payload = base64.b64decode(
         "yAFdBZS3cmFnLmFnZW50Lmxvb3Auc3Vic3RhdGWrTWVtb3J5U3RhdGWL"
         "r3dvcmtpbmdfc3VtbWFyecCvZXh0cmFjdGVkX2ZhY3RzkLNyZWNlbnRf"
@@ -137,46 +123,37 @@ def test_checkpoint_decode_discards_removed_persistent_memory_snapshot() -> None
         "ZGVsX3ZhbGlkYXRlX2pzb24="
     )
 
-    restored = agent_checkpoint_serde().loads_typed(
-        ("msgpack", legacy_payload)
-    )
+    restored = agent_checkpoint_serde().loads_typed(("msgpack", legacy_payload))
 
-    assert isinstance(restored, MemoryState)
-    assert restored.memory_warnings == ["legacy"]
-    assert not hasattr(restored, "persistent")
+    assert isinstance(restored, dict)
+    assert not isinstance(restored, MemoryState)
+    assert restored["memory_warnings"] == ["legacy"]
+    assert restored["persistent"]["index_ref"] == "MEMORY.md"
 
 
 def test_model_provider_contracts_do_not_import_loop_implementation() -> None:
     for relative_path in (
-        "rag/agent/core/llm_providers.py",
-        "rag/agent/core/model_provider_runtime.py",
+        "agent_runtime/core/llm_providers.py",
+        "agent_runtime/core/model_provider_runtime.py",
     ):
         tree = ast.parse(_production_source(relative_path))
-        imports = {
-            node.module
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-        }
+        imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
-        assert "rag.agent.loop.runtime" not in imports
+        assert "agent_runtime.loop.runtime" not in imports
 
 
 def test_checkpoint_legacy_alias_does_not_import_public_facade() -> None:
-    tree = ast.parse(_production_source("rag/agent/core/checkpointing.py"))
-    imports = {
-        node.module
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-    }
+    tree = ast.parse(_production_source("agent_runtime/core/checkpointing.py"))
+    imports = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
     assert "agent_runtime" not in imports
 
 
 def test_json_contract_helpers_are_not_reimplemented_by_consumers() -> None:
     for relative_path in (
-        "rag/agent/core/messages.py",
-        "rag/agent/core/model_request.py",
-        "rag/agent/tools/selection.py",
+        "agent_runtime/core/messages.py",
+        "agent_runtime/core/model_request.py",
+        "agent_runtime/tools/selection.py",
     ):
         source = _production_source(relative_path)
         assert "def _thaw_json(" not in source
@@ -310,7 +287,7 @@ def test_deprecated_fields_are_absent_from_new_and_migrated_state() -> None:
 
 def test_removed_agent_state_module_stays_gone() -> None:
     with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("rag.agent.state")
+        importlib.import_module("agent_runtime.state")
 
 
 def test_live_state_serde_preserves_final_result_and_ledger() -> None:

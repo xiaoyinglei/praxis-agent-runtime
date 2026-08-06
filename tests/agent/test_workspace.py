@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.workspace import (
+from agent_runtime.workspace import (
     WorkspacePathError,
     WorkspaceRuntime,
     create_temp_workspace,
@@ -57,25 +57,29 @@ class TestWorkspaceInitialize:
 
 
 class TestWorkspaceProperties:
+    def test_runtime_root_uses_praxis_namespace(self, tmp_path: Path) -> None:
+        ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
+        assert ws.runtime_root == tmp_path / ".praxis" / "runtime"
+
     def test_input_files(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.input_files == tmp_path / ".rag" / "agent_runtime" / "input_files"
+        assert ws.input_files == tmp_path / ".praxis" / "runtime" / "input_files"
 
     def test_scratch(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.scratch == tmp_path / ".rag" / "agent_runtime" / "scratch"
+        assert ws.scratch == tmp_path / ".praxis" / "runtime" / "scratch"
 
     def test_artifacts(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.artifacts == tmp_path / ".rag" / "agent_runtime" / "artifacts"
+        assert ws.artifacts == tmp_path / ".praxis" / "runtime" / "artifacts"
 
     def test_reports(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.reports == tmp_path / ".rag" / "agent_runtime" / "reports"
+        assert ws.reports == tmp_path / ".praxis" / "runtime" / "reports"
 
     def test_logs(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.logs == tmp_path / ".rag" / "agent_runtime" / "logs"
+        assert ws.logs == tmp_path / ".praxis" / "runtime" / "logs"
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +328,7 @@ class TestWorkspaceTreeSha256:
         ignored.write_bytes(b"runtime")
         assert workspace_tree_sha256(repository) == baseline
 
-        runtime_log = repository / ".rag" / "agent_runtime" / "logs" / "run.log"
+        runtime_log = repository / ".praxis" / "runtime" / "logs" / "run.log"
         runtime_log.parent.mkdir(parents=True)
         runtime_log.write_text("runtime\n", encoding="utf-8")
         assert workspace_tree_sha256(repository) == baseline
@@ -448,20 +452,20 @@ class TestImportFiles:
 
 class TestUniqueDest:
     def test_no_collision(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest == tmp_path / "file.txt"
 
     def test_collision_appends_counter(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("existing")
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest.name == "file__1.txt"
 
     def test_multiple_collisions(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("1")
         (tmp_path / "file__1.txt").write_text("2")

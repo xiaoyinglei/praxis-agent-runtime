@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import pytest
 
-from rag.ingest.retrievalsummarizer import (
-    RetrievalSummarizer,
-    RetrievalSummaryConfig,
-)
-from rag.ingest.table_sampler import TABLE_POLICY_COMPUTE_ONLY, profile_markdown_table, profile_table_data
-from rag.providers.llm_gateway import LLMGateway
-from rag.schema.core import ParsedSection
-from rag.schema.llm import (
+from agent_runtime.modeling.contracts import (
     LLMCallStage,
     LLMProviderResult,
     LLMStageBudget,
     LLMUsage,
 )
+from agent_runtime.modeling.gateway import LLMGateway
+from rag.ingest.retrievalsummarizer import (
+    RetrievalSummarizer,
+    RetrievalSummaryConfig,
+)
+from rag.ingest.table_sampler import TABLE_POLICY_COMPUTE_ONLY, profile_markdown_table, profile_table_data
+from rag.schema.core import ParsedSection
 
 
 class _WordTokenAccounting:

@@ -5,7 +5,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     ArtifactReference,
     CancellationMode,
     InterruptBehavior,

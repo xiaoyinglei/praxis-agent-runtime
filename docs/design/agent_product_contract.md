@@ -1,4 +1,4 @@
-# Agent 产品契约
+# Praxis 产品契约
 
 日期：2026-07-22
 状态：当前实施依据
@@ -8,7 +8,8 @@
 
 ## 产品主语
 
-Agent 只有一种执行：用户给出当前消息，运行一个 Turn，得到一个
+Praxis 是一个 trusted-local workspace agent runtime。Agent 只有一种执行：
+用户给出当前消息，运行一个 Turn，得到一个
 `AgentResult`。
 
 - `run()` / `arun()` 执行当前消息。
@@ -56,7 +57,7 @@ canonical history，不会回填覆盖当前请求。
 ## Workspace 和配置
 
 - `workspace_path` 是 Agent 可读写的用户项目根目录。
-- Agent 自身的 scratch、log 和外部附件位于 `.rag/agent_runtime/`，不在项目根目录伪造业务目录。
+- Agent 自身的 scratch、log 和外部附件位于 `.praxis/` 下的 `runtime/`，不在项目根目录伪造业务目录。
 - workspace 内的附件直接引用，不复制；workspace 外的附件按 Turn 归档。
 - 清单只包含当前请求明确传入的文件，不将旧 Turn 的附件偷渡到新 Turn。
 - 环境变量优先级是：已导出的进程环境、`AGENT_ENV_FILE`、当前 workspace `.env`、linked worktree 共享 `.env`。

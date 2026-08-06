@@ -10,21 +10,21 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.tools.builtins import shell as shell_module
-from rag.agent.tools.builtins.shell import (
+from agent_runtime.tools.builtins import shell as shell_module
+from agent_runtime.tools.builtins.shell import (
     RunCommandOutput,
     create_run_command_tool,
 )
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import (
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
     JsonValue,
     Tool,
     ToolCall,
     ToolCallOrigin,
     ToolEffect,
 )
-from rag.agent.workspace import WorkspaceRuntime, open_workspace
+from agent_runtime.workspace import WorkspaceRuntime, open_workspace
 
 
 def _validated_arguments(

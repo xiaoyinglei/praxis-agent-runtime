@@ -5,15 +5,15 @@ from pathlib import Path
 
 import pytest
 
-from rag.agent.tools.builtins import (
+from agent_runtime.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
 )
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.selection import find_tools
-from rag.agent.tools.tool import Tool, ToolCall, ToolCallOrigin, ToolResult
-from rag.agent.workspace import WorkspaceRuntime, open_workspace
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.selection import find_tools
+from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin, ToolResult
+from agent_runtime.workspace import WorkspaceRuntime, open_workspace
 
 
 def _tools(workspace: WorkspaceRuntime) -> dict[str, Tool]:

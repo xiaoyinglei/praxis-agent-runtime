@@ -6,10 +6,10 @@ from pathlib import Path
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
-import rag.agent.cli as agent_cli
+import agent_runtime.cli as agent_cli
 import rag.cli as cli
+from agent_runtime.cli import agent_app
 from rag import StorageConfig
-from rag.agent.cli import agent_app
 from rag.cli import app
 from rag.retrieval.models import BuiltContext, PublicQueryResult
 from rag.schema.query import GroundedAnswer
@@ -179,8 +179,8 @@ def test_cli_main_delegates_to_typer_app(monkeypatch: MonkeyPatch) -> None:
 def test_project_metadata_exposes_agent_as_primary_console_script() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
 
-    assert pyproject["project"]["name"] == "agent-runtime"
-    assert pyproject["project"]["scripts"]["agent"] == "rag.agent.cli:agent_app"
+    assert pyproject["project"]["name"] == "praxis-agent-runtime"
+    assert pyproject["project"]["scripts"]["agent"] == "agent_runtime.cli:agent_app"
     assert pyproject["project"]["scripts"]["rag"] == "rag.cli:app"
 
 

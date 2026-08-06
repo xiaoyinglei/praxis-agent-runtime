@@ -6,8 +6,8 @@ from collections.abc import Callable
 import httpx
 import pytest
 
-from rag.providers.embedding_http import EmbeddingHttpClient
 from rag.embedding_service import embedding_space_for_model
+from rag.providers.embedding_http import EmbeddingHttpClient
 
 
 class _FakeTransport(httpx.BaseTransport):

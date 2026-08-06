@@ -10,13 +10,13 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from agent_runtime.runtime.mcp import open_product_mcp_tools
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations.mcp import (
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
     create_mcp_tools,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import JsonValue, ToolCall, ToolCallOrigin
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import JsonValue, ToolCall, ToolCallOrigin
 
 _MCP_SERVER_SCRIPT = textwrap.dedent(
     """\

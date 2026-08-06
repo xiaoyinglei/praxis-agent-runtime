@@ -15,32 +15,49 @@ import pytest
 import agent_runtime
 from agent_runtime import Agent, AgentResult, AgentUsage
 from agent_runtime import agent as agent_module
+from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.knowledge_providers.rag import LazyRAGKnowledgeProvider
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.runtime import builder as runtime_builder
-from rag.agent.core.runtime_diagnostics import AgentLatencyProfile
-from rag.agent.service import AgentRunResult
-from rag.agent.streaming.events import EventType, StreamEvent
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchInput
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import ToolCall, ToolCallOrigin
-from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
+from agent_runtime.service import AgentRunResult
+from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations.knowledge import KnowledgeSearchInput
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 
 
 def test_agent_runtime_exports_sdk_facade() -> None:
+    from agent_runtime import AgentPlan, PlanEvent, PlanStep
+    from agent_runtime.planning import (
+        AgentPlan as PlanningAgentPlan,
+    )
+    from agent_runtime.planning import (
+        PlanEvent as PlanningPlanEvent,
+    )
+    from agent_runtime.planning import (
+        PlanStep as PlanningPlanStep,
+    )
+
     assert Agent is not None
+    assert AgentPlan is PlanningAgentPlan
     assert AgentResult is not None
     assert AgentUsage is not None
+    assert PlanEvent is PlanningPlanEvent
+    assert PlanStep is PlanningPlanStep
     assert agent_runtime.__all__ == [
         "Agent",
         "AgentEventSink",
+        "AgentPlan",
         "AgentResult",
         "AgentUsage",
         "EventType",
         "ModelNotAvailableError",
         "ModelSpec",
+        "PlanEvent",
+        "PlanStep",
         "RAGKnowledgeConfig",
         "StreamEvent",
     ]
@@ -56,9 +73,9 @@ def test_agent_runtime_exports_sdk_facade() -> None:
 
 def test_agent_public_signatures_are_exact() -> None:
     constructor = (
-        "(*, model: 'str | None' = None, checkpoint_db: 'Path | None' = None, "
+        "(*, model: 'str | None' = None, checkpoint_db: 'Path | None' = PosixPath('.praxis/checkpoints.sqlite'), "
         "workspace_path: 'Path | str | None' = None, "
-        "model_session_path: 'Path | None' = None, "
+        "model_session_path: 'Path | None' = PosixPath('.praxis/model_session.json'), "
         "knowledge: 'RAGKnowledgeConfig | None' = None) -> 'None'"
     )
     run = (
@@ -155,7 +172,7 @@ def test_agent_facade_run_maps_public_request_to_internal_service(
         built.append({"runtime": runtime, **kwargs})
         return _Service()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", fail_rag_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", fail_rag_runtime)
     monkeypatch.setattr(runtime_builder, "build_agent_service", build_service)
 
     result = Agent(model="qwen3_14b_mlx_4bit").run(
@@ -180,7 +197,7 @@ def test_agent_facade_run_maps_public_request_to_internal_service(
     assert built == [
         {
             "runtime": None,
-            "checkpoint_db": None,
+            "checkpoint_db": Path(".praxis/checkpoints.sqlite"),
             "checkpointer": built[0]["checkpointer"],
             "model_alias": "qwen3_14b_mlx_4bit",
             "model_control_plane": built[0]["model_control_plane"],
@@ -267,10 +284,7 @@ def test_agent_facade_defaults_to_real_change_and_post_change_verification(
 
     goal = requests[0].goal_spec
     assert goal is not None
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -309,10 +323,7 @@ def test_agent_facade_builds_explicit_completion_goal(
     goal = requests[0].goal_spec
     assert goal is not None
     assert goal.original_query == "Fix the implementation."
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -376,10 +387,7 @@ def test_agent_facade_requires_post_change_verification_when_execution_is_allowe
 
     goal = requests[0].goal_spec
     assert goal is not None
-    assert [
-        (item.constraint_id, item.constraint_type, item.expected_value)
-        for item in goal.constraints
-    ] == [
+    assert [(item.constraint_id, item.constraint_type, item.expected_value) for item in goal.constraints] == [
         ("workspace_change", "workspace_change", True),
         (
             "verification_after_change",
@@ -571,7 +579,7 @@ def test_agent_facade_registers_knowledge_runner_lazily(monkeypatch: pytest.Monk
         built.append({"runtime": runtime, **kwargs})
         return _Service()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", fail_rag_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", fail_rag_runtime)
     monkeypatch.setattr(runtime_builder, "build_agent_service", build_service)
 
     result = Agent(
@@ -839,7 +847,7 @@ async def test_lazy_knowledge_provider_search_uses_typed_final_contract(
     def build_runtime(**_: object) -> tuple[object, tuple[object, ...]]:
         return runtime, ()
 
-    monkeypatch.setattr(runtime_builder, "build_optional_rag_runtime", build_runtime)
+    monkeypatch.setattr("agent_runtime.knowledge_providers.rag._build_optional_rag_runtime", build_runtime)
 
     provider = LazyRAGKnowledgeProvider(config=RAGKnowledgeConfig(vector_backend="sqlite"))
     result = await provider.search_knowledge(
@@ -888,8 +896,8 @@ async def test_knowledge_initialization_redacts_vector_secret_from_all_public_su
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    from rag.agent.cli import _display_agent_result
-    from rag.agent.tools.tool import ToolResult
+    from agent_runtime.cli import _display_agent_result
+    from agent_runtime.tools.tool import ToolResult
 
     marker = "secret-vector-dsn-MARKER"
 

@@ -12,7 +12,6 @@ Exit code 1: anti-patterns detected.
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

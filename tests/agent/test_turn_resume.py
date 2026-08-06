@@ -9,23 +9,23 @@ from dataclasses import replace
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.messages import ModelMessage
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import LoopPause, LoopState, ModelTurnDraft
-from rag.agent.memory.compactor import LoopContextCompactor
-from rag.agent.memory.models import MemoryPolicy
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.tools.builtins.shell import create_run_command_tool
-from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
-from rag.agent.tools.registry import ToolRegistry
-from rag.agent.tools.tool import (
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.core.messages import ModelMessage
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.runtime import ModelTurnEnvelope
+from agent_runtime.loop.state import LoopPause, LoopState, ModelTurnDraft
+from agent_runtime.memory.compactor import LoopContextCompactor
+from agent_runtime.memory.models import MemoryPolicy
+from agent_runtime.service import AgentRunRequest, AgentService
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.tools.executor import ExecutionStatus, ToolExecutionRecord
+from agent_runtime.tools.registry import ToolRegistry
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -35,13 +35,13 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.agent.turns import (
+from agent_runtime.turns import (
     RuntimeBinding,
     TurnStateError,
     TurnStatus,
     TurnStore,
 )
-from rag.agent.workspace import open_workspace
+from agent_runtime.workspace import open_workspace
 
 
 class _PauseProvider:

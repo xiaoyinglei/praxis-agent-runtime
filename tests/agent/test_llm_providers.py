@@ -5,13 +5,15 @@ from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
-from rag.agent.core.messages import ModelMessage, StopReason, ToolUseResult
-from rag.agent.loop.runtime import ModelTurnEnvelope
-from rag.agent.loop.state import create_loop_state
-from rag.agent.tools.tool import (
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.llm_providers import LLMLoopModelTurnProvider
+from agent_runtime.core.messages import ModelMessage, StopReason, ToolUseResult
+from agent_runtime.loop.runtime import ModelTurnEnvelope
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget, LLMUsage
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -21,8 +23,6 @@ from rag.agent.tools.tool import (
     ToolDefinition,
     json_schema_input,
 )
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
-from rag.schema.llm import LLMCallStage, LLMStageBudget, LLMUsage
 
 
 def _tool(name: str) -> Tool:
@@ -129,7 +129,7 @@ class TestLLMLoopModelTurnProviderBasic:
 
     def test_module_exports_expected_symbols(self) -> None:
         """Verify the module exports the expected public API after cleanup."""
-        import rag.agent.core.llm_providers as m
+        import agent_runtime.core.llm_providers as m
 
         assert hasattr(m, "LLMLoopModelTurnProvider")
         assert hasattr(m, "LoopModelDecision")
@@ -138,7 +138,7 @@ class TestLLMLoopModelTurnProviderBasic:
 
     def test_retrieval_hint_code_is_removed(self) -> None:
         """Verify LLMRetrievalHintProvider no longer exists in the module."""
-        import rag.agent.core.llm_providers as m
+        import agent_runtime.core.llm_providers as m
 
         assert not hasattr(m, "LLMRetrievalHintProvider")
         assert not hasattr(m, "create_default_providers")
@@ -230,9 +230,7 @@ async def test_model_defaults_and_reasoning_continuation_reach_canonical_message
     assert request.settings.max_output_tokens == 32_768
     assert request.settings.temperature == 1.0
     assert request.settings.top_p == 0.95
-    assert request.settings.provider_options == {
-        "thinking": {"type": "enabled"}
-    }
+    assert request.settings.provider_options == {"thinking": {"type": "enabled"}}
     assert envelope.assistant_message == ModelMessage(
         role="assistant",
         content="",

@@ -7,11 +7,11 @@ from types import MappingProxyType
 
 import pytest
 
-from rag.agent.tools import selection as selection_module
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.selection import create_find_tools_tool, find_tools
-from rag.agent.tools.tool import (
+from agent_runtime.tools import selection as selection_module
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.selection import create_find_tools_tool, find_tools
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -356,11 +356,10 @@ def test_selection_module_has_no_runtime_state_or_routing_dependencies() -> None
     assert not any(
         module.startswith(
             (
-                "rag.agent.loop",
-                "rag.agent.core.checkpointing",
-                "rag.agent.tooling",
-                "rag.agent.capabilities",
-                "agent_runtime",
+                "agent_runtime.loop",
+                "agent_runtime.core.checkpointing",
+                "agent_runtime.tooling",
+                "agent_runtime.capabilities",
             )
         )
         for module in imports

@@ -10,18 +10,18 @@ from pathlib import Path
 import pytest
 from langgraph.checkpoint.memory import MemorySaver
 
-from rag.agent.core.checkpointing import (
+from agent_runtime.core.checkpointing import (
     CheckpointStore,
     LangGraphCheckpointStore,
     agent_checkpoint_serde,
 )
-from rag.agent.core.context import AgentRunConfig, TurnRegistry
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.finalization import FinishCandidateBuilder
-from rag.agent.core.human_input import HumanInputResponse
-from rag.agent.core.model_request import build_tool_manifest
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.runtime import (
+from agent_runtime.core.context import AgentRunConfig, TurnRegistry
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.finalization import FinishCandidateBuilder
+from agent_runtime.core.human_input import HumanInputResponse
+from agent_runtime.core.model_request import build_tool_manifest
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.runtime import (
     AgentLoop,
     LoopEventSink,
     ModelTurnEnvelope,
@@ -30,31 +30,32 @@ from rag.agent.loop.runtime import (
     _guard_repeated_successful_inspections,
     _matching_tool_failures_since_recovery,
 )
-from rag.agent.loop.state import (
+from agent_runtime.loop.state import (
     LoopState,
     LoopTransition,
     ModelTurnDraft,
     create_loop_state,
 )
-from rag.agent.loop.stop_hooks import StopHookRunner
-from rag.agent.memory.compactor import LoopCompactionResult
-from rag.agent.skills.catalog import SkillCatalog
-from rag.agent.skills.loader import scan_and_load_skills
-from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import EventType, StreamEvent, text_delta
-from rag.agent.tools.executor import (
+from agent_runtime.loop.stop_hooks import StopHookRunner
+from agent_runtime.memory.compactor import LoopCompactionResult
+from agent_runtime.modeling.gateway import LLMToolCallValidationError
+from agent_runtime.skills.catalog import SkillCatalog
+from agent_runtime.skills.loader import scan_and_load_skills
+from agent_runtime.skills.runtime import SkillRuntime
+from agent_runtime.streaming.events import EventType, StreamEvent, text_delta
+from agent_runtime.tools.executor import (
     ExecutionStatus,
     ToolExecutionRecord,
     ToolExecutor,
 )
-from rag.agent.tools.integrations.skills import create_invoke_skill_tool
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.selection import (
+from agent_runtime.tools.integrations.skills import create_invoke_skill_tool
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.selection import (
     FindToolMatch,
     FindToolsOutput,
     create_find_tools_tool,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -69,7 +70,6 @@ from rag.agent.tools.tool import (
     ToolResult,
     json_schema_input,
 )
-from rag.providers.llm_gateway import LLMToolCallValidationError
 
 
 class _SequenceProvider:
@@ -297,7 +297,6 @@ async def test_model_tool_result_next_turn_and_finish() -> None:
     ]
 
 
-
 @pytest.mark.anyio
 async def test_repeated_failure_evidence_is_fingerprinted_in_model_transcript() -> None:
     failure_text = "same failing test output\n" * 100
@@ -329,10 +328,7 @@ async def test_repeated_failure_evidence_is_fingerprinted_in_model_transcript() 
         _tool("run_command", fail_with_variable_duration),
         normalize_output=normalize_failure,
     )
-    calls = tuple(
-        ToolCallPlan.create("run_command", {"value": command})
-        for command in ("pytest -q", "pytest --quiet")
-    )
+    calls = tuple(ToolCallPlan.create("run_command", {"value": command}) for command in ("pytest -q", "pytest --quiet"))
     state = create_loop_state(
         current_message="Run the verification command.",
         run_config=_config("loop-fold-repeated-failure-evidence"),
@@ -341,17 +337,11 @@ async def test_repeated_failure_evidence_is_fingerprinted_in_model_transcript() 
     state["resident_tool_names"] = ["run_command"]
 
     result = await _loop(
-        provider=_SequenceProvider(
-            [ModelTurnDraft(action="finish", final_answer="Captured.")]
-        ),
+        provider=_SequenceProvider([ModelTurnDraft(action="finish", final_answer="Captured.")]),
         tools=(tool,),
     ).run(state)
 
-    tool_messages = [
-        json.loads(message.content)
-        for message in result["turn_transcript"]
-        if message.role == "tool"
-    ]
+    tool_messages = [json.loads(message.content) for message in result["turn_transcript"] if message.role == "tool"]
     assert len(tool_messages) == 2
     assert tool_messages[0]["structured_content"]["stderr"] == failure_text
     repeated = tool_messages[1]["structured_content"]
@@ -669,9 +659,7 @@ async def test_provider_error_retries_then_fails() -> None:
 @pytest.mark.anyio
 async def test_provider_error_redacts_credential_identifier_from_state() -> None:
     credential_id = "ak-provider-credential-123456"
-    provider = _SequenceProvider(
-        [RuntimeError(f"429 rate limit for <{credential_id}>")]
-    )
+    provider = _SequenceProvider([RuntimeError(f"429 rate limit for <{credential_id}>")])
 
     result = await _loop(provider=provider, max_model_retries=0).run(
         create_loop_state(
@@ -683,10 +671,7 @@ async def test_provider_error_redacts_credential_identifier_from_state() -> None
     assert result["terminal"] is not None
     assert credential_id not in (result["terminal"].error or "")
     assert "[REDACTED]" in (result["terminal"].error or "")
-    assert all(
-        credential_id not in item.message
-        for item in result["runtime_diagnostics"]
-    )
+    assert all(credential_id not in item.message for item in result["runtime_diagnostics"])
     assert result["latest_transition"] is not None
     assert credential_id not in result["latest_transition"].model_dump_json()
 
@@ -724,13 +709,8 @@ async def test_provider_tool_validation_does_not_consume_transport_retry() -> No
     provider = _SequenceProvider(
         [
             LLMToolCallValidationError(
-                validation_error=(
-                    "Tool call validation failed: timeout_seconds exceeds maximum"
-                ),
-                failed_generation=(
-                    '<function=run_command>{"command":"pytest -q",'
-                    '"timeout_seconds":1000}</function>'
-                ),
+                validation_error=("Tool call validation failed: timeout_seconds exceeds maximum"),
+                failed_generation=('<function=run_command>{"command":"pytest -q","timeout_seconds":1000}</function>'),
             ),
             RuntimeError("request timed out"),
             ModelTurnDraft(action="finish", final_answer="recovered"),
@@ -746,10 +726,7 @@ async def test_provider_tool_validation_does_not_consume_transport_retry() -> No
 
     assert result["status"] == "completed"
     assert result["iteration"] == 3
-    assert any(
-        item.code == "model_tool_call_rejected"
-        for item in result["runtime_diagnostics"]
-    )
+    assert any(item.code == "model_tool_call_rejected" for item in result["runtime_diagnostics"])
 
 
 @pytest.mark.anyio
@@ -980,9 +957,7 @@ def test_unrelated_read_success_does_not_reset_failed_command_circuit() -> None:
         ),
     ]
 
-    assert _matching_tool_failures_since_recovery(state, retried) == (
-        state["tool_results"][0],
-    )
+    assert _matching_tool_failures_since_recovery(state, retried) == (state["tool_results"][0],)
 
     state["tool_results"].append(
         ToolResult(
@@ -1057,10 +1032,7 @@ async def test_novel_grounded_inspection_is_not_capped_by_prior_call_count() -> 
     )
     state["resident_tool_names"] = ["read_file"]
     state["memory_state"].verified_workspace_paths = ["src/novel.py"]
-    state["tool_results"] = [
-        ToolResult(tool_call_id=f"seed-{index}", tool_name="read_file")
-        for index in range(25)
-    ]
+    state["tool_results"] = [ToolResult(tool_call_id=f"seed-{index}", tool_name="read_file") for index in range(25)]
     schema: dict[str, JsonValue] = {
         "type": "object",
         "properties": {"path": {"type": "string"}},
@@ -1069,16 +1041,11 @@ async def test_novel_grounded_inspection_is_not_capped_by_prior_call_count() -> 
     }
 
     result = await _loop(
-        provider=_SequenceProvider(
-            [ModelTurnDraft(action="finish", final_answer="Inspected.")]
-        ),
+        provider=_SequenceProvider([ModelTurnDraft(action="finish", final_answer="Inspected.")]),
         tools=(
             _tool(
                 "read_file",
-                lambda arguments: (
-                    attempts.append(str(arguments["path"]))
-                    or arguments["path"]
-                ),
+                lambda arguments: attempts.append(str(arguments["path"])) or arguments["path"],
                 schema=schema,
             ),
         ),

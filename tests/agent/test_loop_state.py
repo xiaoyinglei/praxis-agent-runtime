@@ -5,11 +5,11 @@ import logging
 import pytest
 from pydantic import ValidationError
 
-from rag.agent.core.checkpointing import agent_checkpoint_serde
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import (
+from agent_runtime.core.checkpointing import agent_checkpoint_serde
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+from agent_runtime.core.turn_contracts import ToolCallPlan
+from agent_runtime.loop.state import (
     MAX_LOOP_MEMORY_WARNINGS,
     MAX_STOP_HOOK_FEEDBACK,
     LoopPause,
@@ -26,9 +26,9 @@ from rag.agent.loop.state import (
     materialize_model_turn,
     replace_latest_transition,
 )
-from rag.agent.loop.state import LoopState as AgentState
-from rag.agent.loop.state import create_loop_state as create_agent_state
-from rag.agent.loop.substate import (
+from agent_runtime.loop.state import LoopState as AgentState
+from agent_runtime.loop.state import create_loop_state as create_agent_state
+from agent_runtime.loop.substate import (
     DeferredToolState,
     FinishState,
     MemoryState,

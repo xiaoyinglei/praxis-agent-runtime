@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import inspect
 
-from rag.agent.core.context import AgentRunConfig
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.llm_context import AgentLLMContextAssembler
-from rag.agent.core.observations import ObservationBatch, StructuredObservation
-from rag.agent.loop.runtime import AgentLoop
-from rag.agent.loop.state import create_loop_state
-from rag.agent.memory.injector import ContextBuilder
-from rag.agent.tools.tool import ToolContentBlock, ToolResult
-from rag.schema.llm import LLMCallStage, LLMStageBudget
+from agent_runtime.core.context import AgentRunConfig
+from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core.llm_context import AgentLLMContextAssembler
+from agent_runtime.core.observations import ObservationBatch, StructuredObservation
+from agent_runtime.loop.runtime import AgentLoop
+from agent_runtime.loop.state import create_loop_state
+from agent_runtime.memory.injector import ContextBuilder
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+from agent_runtime.tools.tool import ToolContentBlock, ToolResult
 
 
 class _CharacterTokenAccounting:
@@ -65,9 +65,7 @@ def test_observations_update_typed_working_state_without_flat_channels() -> None
     AgentLoop._merge_observations(state, batch)
 
     assert state["memory_state"].recent_observations == batch.structured_observations
-    assert state["memory_state"].known_locators == [
-        {"doc_id": 7, "section_id": 3}
-    ]
+    assert state["memory_state"].known_locators == [{"doc_id": 7, "section_id": 3}]
     assert {
         "structured_observations",
         "evidence",

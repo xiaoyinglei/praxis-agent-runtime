@@ -1,3 +1,4 @@
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from rag.assembly.bindings import (
     CapabilityBinding,
     ChatCapabilityBinding,
@@ -24,7 +25,6 @@ from rag.assembly.models import (
     TokenizerConfig,
 )
 from rag.assembly.service import CapabilityAssemblyService
-from rag.assembly.tokenizer import TokenAccountingService, TokenizerContract
 
 __all__ = [
     "AssemblyConfig",

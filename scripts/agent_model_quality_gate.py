@@ -17,9 +17,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import importlib.util
 import json
 import math
 import os
+import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -28,13 +31,40 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from agent_runtime.result import AgentToolCall
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_cases.json"
 DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
+EVALUATOR_VERSION = "agent_model_quality_gate_v3"
+_RUNTIME_INPUT_FILE_PREFIX = ".praxis/runtime/input_files/"
+_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
+)
+_SENSITIVE_ARTIFACT_KEY_TOKENS = frozenset(
+    {
+        "apikey",
+        "auth",
+        "authorization",
+        "cookie",
+        "credential",
+        "credentials",
+        "env",
+        "environment",
+        "header",
+        "headers",
+        "key",
+        "password",
+        "secret",
+        "token",
+    }
+)
 _MODEL_QUALITY_FAILURE_REASONS = frozenset(
     {
         "invalid_model_turn",
@@ -71,6 +101,25 @@ class InfrastructureUnavailableError(RuntimeError):
     """The live sample could not measure model tool-use quality."""
 
 
+class DirtyRepositoryError(RuntimeError):
+    """Live evidence cannot be attributed to a repository with changes."""
+
+
+class SourceRepositoryMismatchError(RuntimeError):
+    """The requested evidence repository is not the running source tree."""
+
+
+class SourceRepositoryChangedError(RuntimeError):
+    """The evidence source changed while live model trials were running."""
+
+
+@dataclass(frozen=True)
+class RepositoryFingerprint:
+    source_commit: str
+    source_tree: str
+    dirty: bool
+
+
 @dataclass(frozen=True)
 class ToolCallEvidence:
     tool_call_id: str
@@ -78,6 +127,11 @@ class ToolCallEvidence:
     arguments: dict[str, object]
     is_error: bool
     error_code: str | None
+    structured_output: object | None = None
+    error_message: str | None = None
+    retryable: bool = False
+    truncated: bool = False
+    latency_ms: float | None = None
 
     @property
     def key(self) -> str:
@@ -106,6 +160,7 @@ class CaseObservation:
     approval_kind: str | None
     approval_resumes: int
     workspace_assertions_passed: bool
+    runtime_input_namespace: str | None = None
     stop_reason: str | None = None
     diagnostic_codes: tuple[str, ...] = ()
     diagnostic_error_types: tuple[str, ...] = ()
@@ -360,11 +415,18 @@ async def run_model_trials(
 
     from agent_runtime.models import ModelControlPlane
 
-    control_plane = ModelControlPlane.from_env(
-        env_path=str(env_file),
-        initial_model_id=model_alias,
-    )
-    spec = control_plane.current_model()
+    try:
+        control_plane = ModelControlPlane.from_env(
+            env_path=str(env_file),
+            initial_model_id=model_alias,
+        )
+        spec = control_plane.current_model()
+    except (FileNotFoundError, KeyError, RuntimeError, ValueError) as exc:
+        return _initialization_inconclusive_report(
+            model_alias=model_alias,
+            trials=trials,
+            error_type=type(exc).__name__,
+        )
     trial_payloads: list[dict[str, object]] = []
     trial_metrics: list[dict[str, float]] = []
     for trial_index in range(1, trials + 1):
@@ -382,7 +444,28 @@ async def run_model_trials(
                 case=case,
             )
             observations.append(observation)
-            _raise_for_infrastructure((observation,), model_alias=model_alias)
+            if observation.infrastructure_failure:
+                return {
+                    "status": "inconclusive",
+                    "model_alias": model_alias,
+                    "provider": spec.provider,
+                    "provider_model": spec.provider_model,
+                    "trial_count": trials,
+                    "trial_metrics": trial_metrics,
+                    "trials": [
+                        *trial_payloads,
+                        {
+                            "trial": trial_index,
+                            "metrics": None,
+                            "informational_metrics": None,
+                            "cases": _partial_case_payloads(
+                                cases[: len(observations)],
+                                observations,
+                            ),
+                        },
+                    ],
+                    "infrastructure_failure": _infrastructure_payload(observation),
+                }
         metrics, scored = score_trial(cases, observations)
         trial_metrics.append(metrics)
         trial_payloads.append(
@@ -404,6 +487,7 @@ async def run_model_trials(
             }
         )
     return {
+        "status": "completed",
         "model_alias": model_alias,
         "provider": spec.provider,
         "provider_model": spec.provider_model,
@@ -431,6 +515,7 @@ async def run_live_case(
         source.mkdir()
         workspace.mkdir()
         files = _write_source_files(source, _mapping(case.get("workspace_files", {})))
+        workspace_assertions = _mapping(case.get("workspace_assertions", {}))
         agent = Agent(
             model=model_alias,
             checkpoint_db=root / "checkpoint.sqlite3",
@@ -442,27 +527,29 @@ async def run_live_case(
         approval_resumes = 0
         result: AgentResult | None = None
         try:
-            result = await agent.arun(str(case["task"]), files=files)
+            result = await agent.arun(
+                str(case["task"]),
+                files=files,
+                require_workspace_change=False,
+            )
             if bool(case.get("auto_approve", False)) and result.status == "paused":
                 pause_observed = True
-                approval_kind = None if result.pause is None else result.pause.kind
-                if approval_kind == "tool_approval":
+                current_kind = None if result.pause is None else result.pause.kind
+                approval_kind = current_kind
+                if _is_declared_apply_patch_approval(
+                    case,
+                    result.pause,
+                    workspace=workspace,
+                    turn_id=result.turn_id,
+                ):
                     result = await agent.aresume(result.turn_id, "allow_once")
                     approval_resumes = 1
 
-            evidence = tuple(
-                ToolCallEvidence(
-                    tool_call_id=call.tool_call_id,
-                    tool_name=call.tool_name,
-                    arguments=_mutable_json_mapping(call.arguments or {}),
-                    is_error=call.is_error,
-                    error_code=call.error_code,
-                )
-                for call in result.tool_calls
-            )
+            evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)
             workspace_ok = _workspace_assertions_pass(
                 workspace,
-                _mapping(case.get("workspace_assertions", {})),
+                workspace_assertions,
+                turn_id=result.turn_id,
             )
             return CaseObservation(
                 case_id=case_id,
@@ -479,6 +566,7 @@ async def run_live_case(
                 approval_kind=approval_kind,
                 approval_resumes=approval_resumes,
                 workspace_assertions_passed=workspace_ok,
+                runtime_input_namespace=result.turn_id,
                 stop_reason=result.stop_reason,
                 diagnostic_codes=tuple(item.code for item in result.diagnostics),
                 diagnostic_error_types=tuple(
@@ -505,6 +593,9 @@ async def run_live_case(
                 approval_kind=approval_kind,
                 approval_resumes=approval_resumes,
                 workspace_assertions_passed=False,
+                runtime_input_namespace=(
+                    None if result is None else result.turn_id
+                ),
                 diagnostic_codes=(type(exc).__name__,),
                 diagnostic_error_types=(type(exc).__name__,),
                 infrastructure_failure=True,
@@ -516,10 +607,64 @@ async def run_live_case(
                 store.close()
 
 
+def _is_declared_apply_patch_approval(
+    case: Mapping[str, object],
+    pause: object | None,
+    *,
+    workspace: Path,
+    turn_id: str,
+) -> bool:
+    """Authorize one declared patch in the disposable benchmark workspace."""
+
+    if pause is None or getattr(pause, "kind", None) != "tool_approval":
+        return False
+    if str(case.get("capability", "")) != "approval_continuation":
+        return False
+    expected_calls = case.get("expected_tool_calls", ())
+    if (
+        not isinstance(expected_calls, Sequence)
+        or isinstance(expected_calls, (str, bytes))
+        or len(expected_calls) != 1
+    ):
+        return False
+    expected_call = _mapping(expected_calls[0])
+    if expected_call.get("tool_name") != "apply_patch":
+        return False
+    arguments = _mapping(expected_call.get("arguments"))
+    expected_path = arguments.get("file_path")
+    if not isinstance(expected_path, str) or not expected_path.startswith("input_files/"):
+        return False
+    relative_parts = expected_path.removeprefix("input_files/").split("/")
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        return False
+    tool_calls = tuple(getattr(pause, "tool_calls", ()))
+    if len(tool_calls) != 1 or getattr(tool_calls[0], "tool_name", None) != "apply_patch":
+        return False
+    context = getattr(pause, "context", {})
+    if not isinstance(context, Mapping):
+        return False
+    workspace_target = context.get("workspace_path")
+    if not isinstance(workspace_target, str):
+        return False
+    expected_target = (
+        workspace
+        / _RUNTIME_INPUT_FILE_PREFIX
+        / turn_id
+        / Path(*relative_parts)
+    ).resolve()
+    return bool(
+        context.get("approval_scope") == "tool"
+        and context.get("network_requested") is False
+        and context.get("workspace_write") is True
+        and Path(workspace_target).resolve() == expected_target
+    )
+
+
 def build_baseline(
     *,
     suite: Mapping[str, object],
     model_reports: Sequence[Mapping[str, object]],
+    fingerprint: RepositoryFingerprint,
 ) -> dict[str, object]:
     models: dict[str, object] = {}
     for report in model_reports:
@@ -541,7 +686,11 @@ def build_baseline(
         "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
         "measured_at": datetime.now(UTC).isoformat(),
-        "git_commit": _git_commit(),
+        "git_commit": fingerprint.source_commit,
+        "source_commit": fingerprint.source_commit,
+        "source_tree": fingerprint.source_tree,
+        "dirty": fingerprint.dirty,
+        "evaluator_version": EVALUATOR_VERSION,
         "threshold_method": THRESHOLD_METHOD,
         "models": models,
     }
@@ -552,19 +701,33 @@ def build_baseline(
 async def _calibrate(args: argparse.Namespace) -> int:
     if args.trials < MIN_CALIBRATION_TRIALS:
         raise ValueError(f"calibration requires at least {MIN_CALIBRATION_TRIALS} real trials")
+    fingerprint = source_repository_fingerprint(args.repository)
     suite = load_suite(args.fixture)
     models = _selected_models(suite, None)
     cases = cast(list[Mapping[str, object]], suite["cases"])
-    reports = [
-        await run_model_trials(
+    reports: list[dict[str, object]] = []
+    infrastructure_failure: Mapping[str, object] | None = None
+    for model in models:
+        report = await run_model_trials(
             model_alias=model,
             cases=cases,
             trials=args.trials,
             env_file=args.env_file,
         )
-        for model in models
-    ]
-    baseline = build_baseline(suite=suite, model_reports=reports)
+        reports.append(report)
+        if report.get("status") == "inconclusive":
+            infrastructure_failure = report
+            break
+    _verify_source_repository_unchanged(args.repository, fingerprint)
+    if infrastructure_failure is not None:
+        raise InfrastructureUnavailableError(
+            _infrastructure_message(infrastructure_failure)
+        )
+    baseline = build_baseline(
+        suite=suite,
+        model_reports=reports,
+        fingerprint=fingerprint,
+    )
     args.baseline.parent.mkdir(parents=True, exist_ok=True)
     args.baseline.write_text(_pretty_json(baseline), encoding="utf-8")
     print(f"wrote measured baseline: {args.baseline}")
@@ -574,6 +737,7 @@ async def _calibrate(args: argparse.Namespace) -> int:
 
 
 async def _gate(args: argparse.Namespace) -> int:
+    fingerprint = source_repository_fingerprint(args.repository)
     suite = load_suite(args.fixture)
     baseline = json.loads(args.baseline.read_text(encoding="utf-8"))
     validate_baseline(baseline, suite=suite)
@@ -584,6 +748,7 @@ async def _gate(args: argparse.Namespace) -> int:
     cases = cast(list[Mapping[str, object]], suite["cases"])
     reports: list[dict[str, object]] = []
     results: list[dict[str, object]] = []
+    inconclusive = False
     for model in models:
         raw_model_baseline = baseline_models.get(model)
         if not isinstance(raw_model_baseline, Mapping):
@@ -596,6 +761,21 @@ async def _gate(args: argparse.Namespace) -> int:
             env_file=args.env_file,
         )
         reports.append(report)
+        if report.get("status") == "inconclusive":
+            results.append(
+                {
+                    "model_alias": model,
+                    "provider_model": report["provider_model"],
+                    "status": "inconclusive",
+                    "passed": None,
+                    "observed": {},
+                    "thresholds": {},
+                    "failures": [],
+                    "infrastructure_failure": report["infrastructure_failure"],
+                }
+            )
+            inconclusive = True
+            break
         current_metrics = [
             _float_metric_mapping(item, label=f"model {model} trial")
             for item in cast(Sequence[object], report["trial_metrics"])
@@ -608,25 +788,49 @@ async def _gate(args: argparse.Namespace) -> int:
                 baseline=raw_model_baseline,
             )
         )
+    _verify_source_repository_unchanged(args.repository, fingerprint)
+    passed = None if inconclusive else all(bool(item["passed"]) for item in results)
+    status = "inconclusive" if inconclusive else ("passed" if passed else "failed")
     gate_report = {
         "schema_version": 1,
+        "status": status,
+        "source_commit": fingerprint.source_commit,
+        "source_tree": fingerprint.source_tree,
+        "source_unchanged": True,
+        "dirty": fingerprint.dirty,
+        "runtime_platform": runtime_platform_metadata(),
+        "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
-        "baseline_path": str(args.baseline),
+        "evaluator_version": EVALUATOR_VERSION,
+        "case_metadata": _case_metadata(suite),
+        "baseline_path": _redacted_artifact_path(
+            args.baseline,
+            repository=args.repository,
+        ),
         "measured_at": datetime.now(UTC).isoformat(),
-        "passed": all(bool(item["passed"]) for item in results),
+        "passed": passed,
         "models": results,
         "runs": reports,
     }
     if args.report is not None:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(_pretty_json(gate_report), encoding="utf-8")
+        args.report.write_text(
+            _pretty_json(_sanitize_artifact(gate_report)),
+            encoding="utf-8",
+        )
         print(f"wrote gate report: {args.report}")
     for result in results:
-        marker = "PASS" if result["passed"] else "FAIL"
+        marker = (
+            "INCONCLUSIVE"
+            if result["passed"] is None
+            else ("PASS" if result["passed"] else "FAIL")
+        )
         print(f"{marker} {result['model_alias']}")
         for failure in cast(Sequence[str], result["failures"]):
             print(f"  {failure}")
-    return 0 if gate_report["passed"] else 1
+    if inconclusive:
+        return 2
+    return 0 if passed else 1
 
 
 def _score_case(
@@ -655,7 +859,11 @@ def _score_case(
         label="expected_tool_calls",
     )
     sequence_ok = (
-        _contains_ordered_calls(calls, expected_calls)
+        _contains_ordered_calls(
+            calls,
+            expected_calls,
+            runtime_input_namespace=observation.runtime_input_namespace,
+        )
         if expected_calls
         else _contains_ordered_sequence(names, expected_sequence)
     )
@@ -670,18 +878,30 @@ def _score_case(
             raise ValueError("require_first_tool must be a boolean")
         capability_passed = (first_ok or not require_first) and sequence_ok and invalid_calls == 0
     elif capability == "failure_recovery":
-        capability_passed = _failure_recovered(case, calls)
+        capability_passed = _failure_recovered(
+            case,
+            calls,
+            runtime_input_namespace=observation.runtime_input_namespace,
+        )
     elif capability == "approval_continuation":
         if expected_calls:
             approval_spec = expected_calls[0]
-            approved_calls = [call for call in calls if _call_matches(call, approval_spec)]
+            approved_calls = [
+                call
+                for call in calls
+                if _call_matches(
+                    call,
+                    approval_spec,
+                    runtime_input_namespace=observation.runtime_input_namespace,
+                )
+            ]
         else:
             approval_tool = expected_sequence[0] if expected_sequence else str(expected_first or "")
             approved_calls = [call for call in calls if call.tool_name == approval_tool]
         capability_passed = (
             observation.approval_pause_observed
             and observation.approval_kind == "tool_approval"
-            and observation.approval_resumes == 1
+            and observation.approval_resumes >= 1
             and len(approved_calls) == 1
             and not approved_calls[0].is_error
         )
@@ -697,7 +917,16 @@ def _score_case(
             label="expected_failed_call",
         )
         failure_matched = (
-            bool(calls) and calls[0].is_error and (expected_failed is None or _call_matches(calls[0], expected_failed))
+            bool(calls)
+            and calls[0].is_error
+            and (
+                expected_failed is None
+                or _call_matches(
+                    calls[0],
+                    expected_failed,
+                    runtime_input_namespace=observation.runtime_input_namespace,
+                )
+            )
         )
         capability_passed = first_ok and failure_matched and max_failed <= allowed and len(calls) == 1
     else:  # pragma: no cover - load_suite rejects this first
@@ -747,9 +976,86 @@ def _raise_for_infrastructure(
     )
 
 
+def _partial_case_payloads(
+    cases: Sequence[Mapping[str, object]],
+    observations: Sequence[CaseObservation],
+) -> list[dict[str, object]]:
+    payloads: list[dict[str, object]] = []
+    for case, observation in zip(cases, observations, strict=True):
+        score = (
+            {
+                "case_id": observation.case_id,
+                "capability": observation.capability,
+                "passed": None,
+                "core_success": None,
+                "capability_passed": None,
+                "inconclusive": True,
+            }
+            if observation.infrastructure_failure
+            else _score_case(case, observation)
+        )
+        payloads.append(
+            {
+                "observation": observation.payload(),
+                "score": score,
+            }
+        )
+    return payloads
+
+
+def _initialization_inconclusive_report(
+    *,
+    model_alias: str,
+    trials: int,
+    error_type: str,
+) -> dict[str, object]:
+    failure = {
+        "case_id": None,
+        "stage": "model_control_plane_initialization",
+        "stop_reason": "model_control_plane_initialization_failed",
+        "diagnostic_error_types": [error_type],
+    }
+    return {
+        "status": "inconclusive",
+        "model_alias": model_alias,
+        "provider": "unavailable",
+        "provider_model": "unavailable",
+        "trial_count": trials,
+        "trial_metrics": [],
+        "trials": [],
+        "infrastructure_failure": failure,
+    }
+
+
+def _infrastructure_payload(observation: CaseObservation) -> dict[str, object]:
+    return {
+        "case_id": observation.case_id,
+        "stop_reason": observation.stop_reason,
+        "diagnostic_error_types": list(observation.diagnostic_error_types),
+    }
+
+
+def _infrastructure_message(report: Mapping[str, object]) -> str:
+    failure = _mapping(report.get("infrastructure_failure"))
+    error_types = ",".join(
+        _string_sequence(
+            failure.get("diagnostic_error_types", ()),
+            label="diagnostic_error_types",
+        )
+    ) or "unknown"
+    location = failure.get("case_id") or failure.get("stage") or "unknown"
+    return (
+        f"{report.get('model_alias', 'model')} live quality sample is infrastructure-inconclusive: "
+        f"{location}"
+        f"(stop_reason={failure.get('stop_reason') or 'unknown'}, error_types={error_types})"
+    )
+
+
 def _failure_recovered(
     case: Mapping[str, object],
     calls: Sequence[ToolCallEvidence],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     expected_failed = _optional_call_spec(
         case.get("expected_failed_call"),
@@ -761,12 +1067,29 @@ def _failure_recovered(
     )
     if expected_failed is not None and expected_recovery is not None:
         failure_index = next(
-            (index for index, call in enumerate(calls) if call.is_error and _call_matches(call, expected_failed)),
+            (
+                index
+                for index, call in enumerate(calls)
+                if call.is_error
+                and _call_matches(
+                    call,
+                    expected_failed,
+                    runtime_input_namespace=runtime_input_namespace,
+                )
+            ),
             None,
         )
         if failure_index is None:
             return False
-        return any(not call.is_error and _call_matches(call, expected_recovery) for call in calls[failure_index + 1 :])
+        return any(
+            not call.is_error
+            and _call_matches(
+                call,
+                expected_recovery,
+                runtime_input_namespace=runtime_input_namespace,
+            )
+            for call in calls[failure_index + 1 :]
+        )
 
     intentional_tool = case.get("intentional_error_tool")
     if not isinstance(intentional_tool, str) or not calls:
@@ -814,14 +1137,43 @@ def _mutable_json_value(value: object) -> object:
     return value
 
 
+def _tool_call_evidence(call: AgentToolCall) -> ToolCallEvidence:
+    structured_output = (
+        None
+        if call.structured_output is None
+        else _mutable_json_value(call.structured_output)
+    )
+    return ToolCallEvidence(
+        tool_call_id=call.tool_call_id,
+        tool_name=call.tool_name,
+        arguments=_mutable_json_mapping(call.arguments or {}),
+        is_error=call.is_error,
+        error_code=call.error_code,
+        structured_output=structured_output,
+        error_message=call.error_message,
+        retryable=call.retryable,
+        truncated=call.truncated,
+        latency_ms=call.latency_ms,
+    )
+
+
 def _workspace_assertions_pass(
     workspace: Path,
     assertions: Mapping[str, object],
+    *,
+    turn_id: str | None = None,
 ) -> bool:
     for relative, expected in assertions.items():
         if not isinstance(expected, str):
             return False
         path = workspace / relative
+        if turn_id is not None and relative.startswith("input_files/"):
+            path = (
+                workspace
+                / _RUNTIME_INPUT_FILE_PREFIX
+                / turn_id
+                / relative.removeprefix("input_files/")
+            )
         if not path.is_file() or path.read_text(encoding="utf-8") != expected:
             return False
     return True
@@ -895,12 +1247,18 @@ def _call_spec(value: object, *, label: str) -> Mapping[str, object]:
 def _contains_ordered_calls(
     calls: Sequence[ToolCallEvidence],
     expected: Sequence[Mapping[str, object]],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     if not expected:
         return True
     expected_index = 0
     for call in calls:
-        if not _call_matches(call, expected[expected_index]):
+        if call.is_error or not _call_matches(
+            call,
+            expected[expected_index],
+            runtime_input_namespace=runtime_input_namespace,
+        ):
             continue
         expected_index += 1
         if expected_index == len(expected):
@@ -911,11 +1269,50 @@ def _contains_ordered_calls(
 def _call_matches(
     call: ToolCallEvidence,
     spec: Mapping[str, object],
+    *,
+    runtime_input_namespace: str | None = None,
 ) -> bool:
     if call.tool_name != spec.get("tool_name"):
         return False
     arguments = _mapping(spec.get("arguments"))
-    return all(call.arguments.get(name) == value for name, value in arguments.items())
+    return all(
+        _argument_matches(
+            name=name,
+            actual=call.arguments.get(name),
+            expected=value,
+            runtime_input_namespace=runtime_input_namespace,
+        )
+        for name, value in arguments.items()
+    )
+
+
+def _argument_matches(
+    *,
+    name: str,
+    actual: object,
+    expected: object,
+    runtime_input_namespace: str | None,
+) -> bool:
+    if actual == expected:
+        return True
+    if (
+        name not in {"path", "file_path"}
+        or not isinstance(actual, str)
+        or not isinstance(expected, str)
+        or not expected.startswith("input_files/")
+        or not actual.startswith(_RUNTIME_INPUT_FILE_PREFIX)
+        or runtime_input_namespace is None
+    ):
+        return False
+    runtime_parts = actual.removeprefix(_RUNTIME_INPUT_FILE_PREFIX).split("/")
+    if len(runtime_parts) < 2 or any(
+        part in {"", ".", ".."} for part in runtime_parts
+    ):
+        return False
+    if runtime_parts[0] != runtime_input_namespace:
+        return False
+    logical_path = "input_files/" + "/".join(runtime_parts[1:])
+    return logical_path == expected
 
 
 def _float_metric_mapping(value: object, *, label: str) -> dict[str, float]:
@@ -981,6 +1378,24 @@ def _observation_from_payload(value: object) -> CaseObservation:
         error_code = call.get("error_code")
         if error_code is not None and not isinstance(error_code, str):
             raise ValueError("raw observation tool call error_code must be text")
+        error_message = call.get("error_message")
+        if error_message is not None and not isinstance(error_message, str):
+            raise ValueError("raw observation tool call error_message must be text")
+        retryable = call.get("retryable", False)
+        if not isinstance(retryable, bool):
+            raise ValueError("raw observation tool call retryable must be boolean")
+        truncated = call.get("truncated", False)
+        if not isinstance(truncated, bool):
+            raise ValueError("raw observation tool call truncated must be boolean")
+        latency_ms = call.get("latency_ms")
+        if latency_ms is not None and (
+            isinstance(latency_ms, bool)
+            or not isinstance(latency_ms, (int, float))
+            or latency_ms < 0
+        ):
+            raise ValueError(
+                "raw observation tool call latency_ms must be null or non-negative numeric"
+            )
         calls.append(
             ToolCallEvidence(
                 tool_call_id=str(call.get("tool_call_id", "")),
@@ -988,6 +1403,15 @@ def _observation_from_payload(value: object) -> CaseObservation:
                 arguments=dict(arguments),
                 is_error=is_error,
                 error_code=error_code,
+                structured_output=_mutable_json_value(
+                    call.get("structured_output")
+                ),
+                error_message=error_message,
+                retryable=retryable,
+                truncated=truncated,
+                latency_ms=(
+                    None if latency_ms is None else float(latency_ms)
+                ),
             )
         )
 
@@ -1030,6 +1454,7 @@ def _observation_from_payload(value: object) -> CaseObservation:
             label="approval_resumes",
         ),
         workspace_assertions_passed=boolean("workspace_assertions_passed"),
+        runtime_input_namespace=text_or_none("runtime_input_namespace"),
         stop_reason=text_or_none("stop_reason"),
         diagnostic_codes=_string_sequence(
             payload.get("diagnostic_codes", ()),
@@ -1059,23 +1484,188 @@ def _selected_models(
 def _safe_error(exc: Exception) -> str:
     text = f"{type(exc).__name__}: {exc}"[:2000]
     for name, value in os.environ.items():
-        upper = name.upper()
-        if not any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+        if not _is_sensitive_artifact_key(name):
             continue
         if len(value) >= 8:
             text = text.replace(value, "[REDACTED]")
     return text
 
 
-def _git_commit() -> str:
+def source_repository_fingerprint(repository: Path) -> RepositoryFingerprint:
+    requested = repository.resolve()
+    source_root = ROOT.resolve()
+    git_root = Path(
+        _git_text(repository, "rev-parse", "--show-toplevel")
+    ).resolve()
+    runtime_source = (source_root / "agent_runtime").resolve()
+    runtime_spec = importlib.util.find_spec("agent_runtime")
+    runtime_origin = (
+        None
+        if runtime_spec is None or runtime_spec.origin is None
+        else Path(runtime_spec.origin).resolve()
+    )
+    if (
+        requested != source_root
+        or git_root != source_root
+        or not runtime_source.is_dir()
+        or not runtime_source.is_relative_to(source_root)
+        or runtime_origin is None
+        or not runtime_origin.is_relative_to(runtime_source)
+    ):
+        raise SourceRepositoryMismatchError(
+            "model quality evidence repository must be the running source tree"
+        )
+    return repository_fingerprint(source_root)
+
+
+def _verify_source_repository_unchanged(
+    repository: Path,
+    initial: RepositoryFingerprint,
+) -> None:
+    current = source_repository_fingerprint(repository)
+    if (
+        current.dirty
+        or current.source_commit != initial.source_commit
+        or current.source_tree != initial.source_tree
+    ):
+        raise SourceRepositoryChangedError(
+            "model quality evidence source changed while trials were running"
+        )
+
+
+def repository_fingerprint(repository: Path) -> RepositoryFingerprint:
+    source_commit = _git_text(repository, "rev-parse", "HEAD")
+    source_tree = _git_text(repository, "rev-parse", "HEAD^{tree}")
+    status = _git_text(
+        repository,
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+    )
+    if status:
+        raise DirtyRepositoryError("model quality evidence requires a clean repository")
+    return RepositoryFingerprint(
+        source_commit=source_commit,
+        source_tree=source_tree,
+        dirty=False,
+    )
+
+
+def runtime_platform_metadata() -> dict[str, str]:
+    """Return the safe, path-free runtime identity committed with gate evidence."""
+
+    return {
+        "os": platform.system() or "unknown",
+        "os_release": platform.release() or "unknown",
+        "architecture": platform.machine() or "unknown",
+        "python_version": platform.python_version() or "unknown",
+        "python_implementation": platform.python_implementation() or "unknown",
+    }
+
+
+def _git_text(repository: Path, *args: str) -> str:
     completed = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=ROOT,
+        ["git", *args],
+        cwd=repository,
         check=False,
         capture_output=True,
         text=True,
     )
-    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "unknown git error"
+        raise RuntimeError(f"git {' '.join(args)} failed: {detail}")
+    return completed.stdout.strip()
+
+
+def _case_metadata(suite: Mapping[str, object]) -> list[dict[str, object]]:
+    raw_cases = suite.get("cases")
+    if not isinstance(raw_cases, Sequence) or isinstance(raw_cases, (str, bytes)):
+        raise ValueError("model quality suite cases are invalid")
+    metadata: list[dict[str, object]] = []
+    for raw_case in raw_cases:
+        case = _mapping(raw_case)
+        before = {
+            _input_file_path(str(path)): content
+            for path, content in _mapping(case.get("workspace_files", {})).items()
+        }
+        after = dict(_mapping(case.get("workspace_assertions", {})))
+        metadata.append(
+            {
+                "case_id": str(case["id"]),
+                "capability": str(case["capability"]),
+                "task": str(case["task"]),
+                "workspace_before": before,
+                "workspace_after": after,
+            }
+        )
+    return metadata
+
+
+def _input_file_path(path: str) -> str:
+    return path if path.startswith("input_files/") else f"input_files/{path}"
+
+
+def _redacted_artifact_path(path: Path, *, repository: Path) -> str:
+    try:
+        return path.resolve().relative_to(repository.resolve()).as_posix()
+    except ValueError:
+        return path.name
+
+
+def _sanitize_artifact(value: object) -> object:
+    secrets = _artifact_secret_values()
+    return _sanitize_artifact_value(value, secrets=secrets)
+
+
+def _sanitize_artifact_value(
+    value: object,
+    *,
+    secrets: Sequence[str],
+) -> object:
+    if isinstance(value, Mapping):
+        sanitized: dict[str, object] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            if _is_sensitive_artifact_key(key):
+                continue
+            sanitized[key] = _sanitize_artifact_value(item, secrets=secrets)
+        return sanitized
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_sanitize_artifact_value(item, secrets=secrets) for item in value]
+    if isinstance(value, str):
+        sanitized_text = value
+        for secret in secrets:
+            sanitized_text = sanitized_text.replace(secret, "[REDACTED]")
+        sanitized_text = _WINDOWS_ABSOLUTE_PATH_PATTERN.sub(
+            "[REDACTED_ABSOLUTE_PATH]",
+            sanitized_text,
+        )
+        return _ABSOLUTE_PATH_PATTERN.sub(
+            "[REDACTED_ABSOLUTE_PATH]",
+            sanitized_text,
+        )
+    return value
+
+
+def _is_sensitive_artifact_key(key: str) -> bool:
+    camel_split = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", camel_split)
+    tokens = {
+        token.casefold()
+        for token in re.split(r"[^A-Za-z0-9]+", normalized)
+        if token
+    }
+    return bool(tokens & _SENSITIVE_ARTIFACT_KEY_TOKENS)
+
+
+def _artifact_secret_values() -> tuple[str, ...]:
+    values: list[str] = []
+    for name, value in os.environ.items():
+        if not _is_sensitive_artifact_key(name):
+            continue
+        if len(value) >= 8:
+            values.append(value)
+    return tuple(values)
 
 
 def _pretty_json(value: object) -> str:
@@ -1095,6 +1685,12 @@ def _parser() -> argparse.ArgumentParser:
         help="Run the baseline trial count and fail on model-quality regression.",
     )
     for command in (calibrate, gate):
+        command.add_argument(
+            "--repository",
+            type=Path,
+            default=ROOT,
+            help="Clean Git repository whose committed source is being evaluated.",
+        )
         command.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE_PATH)
         command.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE_PATH)
         command.add_argument(

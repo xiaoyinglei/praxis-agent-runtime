@@ -7,15 +7,15 @@ from typing import Any
 
 import pytest
 
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations import knowledge as knowledge_module
-from rag.agent.tools.integrations.knowledge import (
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations import knowledge as knowledge_module
+from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchOutput,
     create_knowledge_tools,
     create_search_knowledge_tool,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import Tool, ToolCall, ToolCallOrigin
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
 
 
 def _call(arguments: Mapping[str, Any]) -> ToolCall:

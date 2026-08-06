@@ -13,16 +13,17 @@ from uuid import uuid4
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelControlPlane, ModelSpec
 from agent_runtime.result import AgentPause, AgentResult, _project_pause
-from rag.agent.streaming.events import StreamEvent
+from agent_runtime.streaming.events import StreamEvent
+from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
     from langgraph.checkpoint.base import BaseCheckpointSaver
 
+    from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
     from agent_runtime.knowledge_providers.rag import LazyRAGKnowledgeProvider
-    from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-    from rag.agent.service import AgentRunRequest, AgentService
-    from rag.agent.tools.tool import Tool
-    from rag.agent.turns import RuntimeBinding, TurnStore
+    from agent_runtime.service import AgentRunRequest, AgentService
+    from agent_runtime.tools.tool import Tool
+    from agent_runtime.turns import RuntimeBinding, TurnStore
 
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
 logger = logging.getLogger(__name__)
@@ -39,9 +40,9 @@ class Agent:
         self,
         *,
         model: str | None = None,
-        checkpoint_db: Path | None = None,
+        checkpoint_db: Path | None = DEFAULT_CHECKPOINT_PATH,
         workspace_path: Path | str | None = None,
-        model_session_path: Path | None = None,
+        model_session_path: Path | None = DEFAULT_MODEL_SESSION_PATH,
         knowledge: RAGKnowledgeConfig | None = None,
     ) -> None:
         if knowledge is not None and not isinstance(
@@ -111,11 +112,7 @@ class Agent:
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
-        runtime_agent = (
-            self
-            if previous_turn_id is None
-            else self._agent_for_previous_turn(previous_turn_id)
-        )
+        runtime_agent = self if previous_turn_id is None else self._agent_for_previous_turn(previous_turn_id)
         request = runtime_agent._turn_request(
             task,
             previous_turn_id=previous_turn_id,
@@ -198,8 +195,8 @@ class Agent:
         allow_write_tools: bool,
         allow_execute_tools: bool,
     ) -> AgentRunRequest:
-        from rag.agent.core.goal_contract import GoalConstraint, GoalSpec
-        from rag.agent.service import AgentRunRequest
+        from agent_runtime.core.goal_contract import GoalConstraint, GoalSpec
+        from agent_runtime.service import AgentRunRequest
 
         turn_id = str(uuid4())
         goal_constraints = [
@@ -269,11 +266,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
     ) -> AsyncIterator[StreamEvent]:
-        runtime_agent = (
-            self
-            if previous_turn_id is None
-            else self._agent_for_previous_turn(previous_turn_id)
-        )
+        runtime_agent = self if previous_turn_id is None else self._agent_for_previous_turn(previous_turn_id)
         request = runtime_agent._turn_request(
             task,
             previous_turn_id=previous_turn_id,
@@ -299,7 +292,7 @@ class Agent:
         self,
         turn_id: str,
     ) -> AgentPause | None:
-        from rag.agent.turns import TurnStatus
+        from agent_runtime.turns import TurnStatus
 
         turn = self._get_turn_store().get_turn(turn_id)
         if turn.status in {TurnStatus.COMPLETED, TurnStatus.FAILED}:
@@ -372,24 +365,20 @@ class Agent:
         stream_sink: AgentEventSink | None = None,
     ) -> tuple[AgentService, LazyRAGKnowledgeProvider | None]:
         from agent_runtime.runtime.builder import build_agent_service
-        from rag.agent.skills.catalog import SkillCatalog
-        from rag.agent.skills.loader import scan_and_load_skills
-        from rag.agent.skills.policy import SkillPolicy
-        from rag.agent.skills.runtime import SkillRuntime
-        from rag.agent.tools.integrations.skills import create_skill_tools
-        from rag.agent.tools.integrations.subagent import (
+        from agent_runtime.skills.catalog import SkillCatalog
+        from agent_runtime.skills.loader import scan_and_load_skills
+        from agent_runtime.skills.policy import SkillPolicy
+        from agent_runtime.skills.runtime import SkillRuntime
+        from agent_runtime.text import load_env_file
+        from agent_runtime.tools.integrations.skills import create_skill_tools
+        from agent_runtime.tools.integrations.subagent import (
             SubagentInput,
             create_subagent_tool,
         )
-        from rag.agent.workspace import open_workspace
-        from rag.utils.text import load_env_file
+        from agent_runtime.workspace import open_workspace
 
         startup_started_at = time.perf_counter()
-        load_env_file(
-            ".env"
-            if self.workspace_path is None
-            else self.workspace_path / ".env"
-        )
+        load_env_file(".env" if self.workspace_path is None else self.workspace_path / ".env")
         try:
             model_control_plane = self._get_model_control_plane()
         except Exception:
@@ -434,7 +423,7 @@ class Agent:
                 )
 
             async def run_subagent(arguments: object) -> dict[str, object]:
-                from rag.agent.service import AgentRunRequest
+                from agent_runtime.service import AgentRunRequest
 
                 payload = SubagentInput.model_validate(arguments)
                 child_task = payload.task
@@ -487,7 +476,17 @@ class Agent:
                     ],
                     "citations": [
                         {
-                            **item.model_dump(mode="json"),
+                            "citation_id": item.citation_id,
+                            "evidence_id": item.evidence_id,
+                            "record_type": item.record_type,
+                            "file_name": item.file_name,
+                            "section_path": list(item.section_path),
+                            "page_start": item.page_start,
+                            "page_end": item.page_end,
+                            "doc_id": item.doc_id,
+                            "benchmark_doc_id": item.benchmark_doc_id,
+                            "source_id": item.source_id,
+                            "source_type": item.source_type,
                             "citation_anchor": item.citation_anchor or "",
                         }
                         for item in child.citations[:20]
@@ -519,20 +518,20 @@ class Agent:
 
     def _get_turn_store(self) -> TurnStore:
         if self._turn_store is None:
-            from rag.agent.turns import TurnStore
+            from agent_runtime.turns import TurnStore
 
             self._turn_store = TurnStore(self.checkpoint_db)
         return self._turn_store
 
     def _get_checkpointer(self) -> BaseCheckpointSaver[str]:
         if self._checkpointer is None:
-            from rag.agent.core.checkpointing import create_agent_checkpointer
+            from agent_runtime.core.checkpointing import create_agent_checkpointer
 
             self._checkpointer = create_agent_checkpointer(self.checkpoint_db)
         return self._checkpointer
 
     def _runtime_binding(self) -> RuntimeBinding:
-        from rag.agent.turns import RuntimeBinding
+        from agent_runtime.turns import RuntimeBinding
 
         model_alias = self.model
         if self._model_control_plane is not None:

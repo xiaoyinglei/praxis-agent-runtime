@@ -26,99 +26,6 @@ wheels = [
 ]
 
 [[package]]
-name = "agent-runtime"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "beautifulsoup4" },
-    { name = "boto3" },
-    { name = "docling" },
-    { name = "duckdb" },
-    { name = "fastapi" },
-    { name = "flagembedding" },
-    { name = "hf-transfer" },
-    { name = "httpx", extra = ["socks"] },
-    { name = "huggingface-hub" },
-    { name = "jsonschema" },
-    { name = "langchain-openai" },
-    { name = "langgraph" },
-    { name = "langgraph-checkpoint-sqlite" },
-    { name = "matplotlib" },
-    { name = "mcp" },
-    { name = "mlx-lm" },
-    { name = "neo4j" },
-    { name = "openai" },
-    { name = "openpyxl" },
-    { name = "pandas" },
-    { name = "pillow" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic" },
-    { name = "pymilvus" },
-    { name = "pymupdf" },
-    { name = "python-docx" },
-    { name = "pyyaml" },
-    { name = "rank-bm25" },
-    { name = "redis" },
-    { name = "tiktoken" },
-    { name = "transformers" },
-    { name = "typer" },
-    { name = "uvicorn" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "import-linter" },
-    { name = "mypy" },
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "beautifulsoup4", specifier = ">=4.13.3" },
-    { name = "boto3", specifier = ">=1.40.0" },
-    { name = "docling", specifier = ">=2.82.0" },
-    { name = "duckdb", specifier = ">=1.2.0" },
-    { name = "fastapi", specifier = ">=0.136.1" },
-    { name = "flagembedding", specifier = ">=1.3.5" },
-    { name = "hf-transfer", specifier = ">=0.1.9" },
-    { name = "httpx", extras = ["socks"], specifier = ">=0.28.1" },
-    { name = "huggingface-hub", specifier = ">=0.36.2" },
-    { name = "jsonschema", specifier = ">=4.26.0" },
-    { name = "langchain-openai", specifier = ">=1.2.1" },
-    { name = "langgraph", specifier = ">=1.1.8" },
-    { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.0" },
-    { name = "matplotlib", specifier = ">=3.8" },
-    { name = "mcp", specifier = ">=1.27.0" },
-    { name = "mlx-lm", specifier = ">=0.31.2" },
-    { name = "neo4j", specifier = ">=5.28.2" },
-    { name = "openai", specifier = ">=1.72.0" },
-    { name = "openpyxl", specifier = ">=3.1.5" },
-    { name = "pandas", specifier = ">=2.0" },
-    { name = "pillow", specifier = ">=11.2.1" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2.9" },
-    { name = "pydantic", specifier = ">=2.11.0" },
-    { name = "pymilvus", specifier = ">=2.6.0" },
-    { name = "pymupdf", specifier = ">=1.26.0" },
-    { name = "python-docx", specifier = ">=1.2.0" },
-    { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "rank-bm25", specifier = ">=0.2.2" },
-    { name = "redis", specifier = ">=6.4.0" },
-    { name = "tiktoken", specifier = ">=0.9.0" },
-    { name = "transformers", specifier = ">=4.57.6" },
-    { name = "typer", specifier = ">=0.15.2" },
-    { name = "uvicorn", specifier = ">=0.46.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "import-linter", specifier = ">=2.11" },
-    { name = "mypy", specifier = ">=1.15.0" },
-    { name = "pytest", specifier = ">=8.3.5" },
-    { name = "ruff", specifier = ">=0.11.0" },
-]
-
-[[package]]
 name = "aiohappyeyeballs"
 version = "2.6.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2561,6 +2468,99 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/85/68/7717bd9e63ed254617a7d3dc9260904fb736d6ea203e58ffddcb186c64e4/polyfactory-3.3.0.tar.gz", hash = "sha256:237258b6ff43edf362ffd1f68086bb796466f786adfa002b0ac256dbf2246e9a", size = 348668, upload-time = "2026-02-22T09:46:28.01Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/34/b6f19941adcdaf415b5e8a8d577499f5b6a76b59cbae37f9b125a9ffe9f2/polyfactory-3.3.0-py3-none-any.whl", hash = "sha256:686abcaa761930d3df87b91e95b26b8d8cb9fdbbbe0b03d5f918acff5c72606e", size = 62707, upload-time = "2026-02-22T09:46:25.985Z" },
+]
+
+[[package]]
+name = "praxis-agent-runtime"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "beautifulsoup4" },
+    { name = "boto3" },
+    { name = "docling" },
+    { name = "duckdb" },
+    { name = "fastapi" },
+    { name = "flagembedding" },
+    { name = "hf-transfer" },
+    { name = "httpx", extra = ["socks"] },
+    { name = "huggingface-hub" },
+    { name = "jsonschema" },
+    { name = "langchain-openai" },
+    { name = "langgraph" },
+    { name = "langgraph-checkpoint-sqlite" },
+    { name = "matplotlib" },
+    { name = "mcp" },
+    { name = "mlx-lm" },
+    { name = "neo4j" },
+    { name = "openai" },
+    { name = "openpyxl" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic" },
+    { name = "pymilvus" },
+    { name = "pymupdf" },
+    { name = "python-docx" },
+    { name = "pyyaml" },
+    { name = "rank-bm25" },
+    { name = "redis" },
+    { name = "tiktoken" },
+    { name = "transformers" },
+    { name = "typer" },
+    { name = "uvicorn" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "import-linter" },
+    { name = "mypy" },
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "beautifulsoup4", specifier = ">=4.13.3" },
+    { name = "boto3", specifier = ">=1.40.0" },
+    { name = "docling", specifier = ">=2.82.0" },
+    { name = "duckdb", specifier = ">=1.2.0" },
+    { name = "fastapi", specifier = ">=0.136.1" },
+    { name = "flagembedding", specifier = ">=1.3.5" },
+    { name = "hf-transfer", specifier = ">=0.1.9" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.28.1" },
+    { name = "huggingface-hub", specifier = ">=0.36.2" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
+    { name = "langchain-openai", specifier = ">=1.2.1" },
+    { name = "langgraph", specifier = ">=1.1.8" },
+    { name = "langgraph-checkpoint-sqlite", specifier = ">=3.1.0" },
+    { name = "matplotlib", specifier = ">=3.8" },
+    { name = "mcp", specifier = ">=1.27.0" },
+    { name = "mlx-lm", specifier = ">=0.31.2" },
+    { name = "neo4j", specifier = ">=5.28.2" },
+    { name = "openai", specifier = ">=1.72.0" },
+    { name = "openpyxl", specifier = ">=3.1.5" },
+    { name = "pandas", specifier = ">=2.0" },
+    { name = "pillow", specifier = ">=11.2.1" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2.9" },
+    { name = "pydantic", specifier = ">=2.11.0" },
+    { name = "pymilvus", specifier = ">=2.6.0" },
+    { name = "pymupdf", specifier = ">=1.26.0" },
+    { name = "python-docx", specifier = ">=1.2.0" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
+    { name = "rank-bm25", specifier = ">=0.2.2" },
+    { name = "redis", specifier = ">=6.4.0" },
+    { name = "tiktoken", specifier = ">=0.9.0" },
+    { name = "transformers", specifier = ">=4.57.6" },
+    { name = "typer", specifier = ">=0.15.2" },
+    { name = "uvicorn", specifier = ">=0.46.0" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "import-linter", specifier = ">=2.11" },
+    { name = "mypy", specifier = ">=1.15.0" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "ruff", specifier = ">=0.11.0" },
 ]
 
 [[package]]
