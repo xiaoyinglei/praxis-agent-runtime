@@ -921,7 +921,10 @@ class AgentService:
         user_input: str | None = None,
     ) -> AgentRunResult:
         persisted_turn = self._turn_store.get_turn(turn_id)
-        if persisted_turn.runtime != self._runtime_binding:
+        if not _runtime_binding_can_resume(
+            configured=self._runtime_binding,
+            persisted=persisted_turn.runtime,
+        ):
             raise TurnStateError(
                 f"Turn {turn_id} resume runtime does not match its persisted runtime"
             )
@@ -1307,6 +1310,21 @@ def _resume_request(state: LoopState) -> HumanInputRequest | None:
     if request is None and state["pause"] is not None:
         request = state["pause"].request
     return request
+
+
+def _runtime_binding_can_resume(
+    *,
+    configured: RuntimeBinding,
+    persisted: RuntimeBinding,
+) -> bool:
+    return (
+        configured.model_alias == persisted.model_alias
+        and configured.knowledge == persisted.knowledge
+        and (
+            configured.workspace_path is None
+            or configured.workspace_path == persisted.workspace_path
+        )
+    )
 
 
 def _pending_request(
