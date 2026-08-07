@@ -398,7 +398,12 @@ class AgentService:
         requested_workspace: str | None,
     ) -> RuntimeBinding:
         if previous_turn_id is not None:
-            return self._turn_store.get_turn(previous_turn_id).runtime
+            previous = self._turn_store.get_turn(previous_turn_id).runtime
+            return previous.model_copy(
+                update={
+                    "model_alias": self._runtime_binding.model_alias or previous.model_alias,
+                }
+            )
         if self._runtime_binding.workspace_path is not None:
             return self._runtime_binding
         if requested_workspace is not None:
@@ -915,6 +920,14 @@ class AgentService:
         action: str,
         user_input: str | None = None,
     ) -> AgentRunResult:
+        persisted_turn = self._turn_store.get_turn(turn_id)
+        if not _runtime_binding_can_resume(
+            configured=self._runtime_binding,
+            persisted=persisted_turn.runtime,
+        ):
+            raise TurnStateError(
+                f"Turn {turn_id} resume runtime does not match its persisted runtime"
+            )
         turn = self._turn_store.prepare_turn_for_resume(turn_id)
         started_at = time.perf_counter()
         checkpoint_store = LangGraphCheckpointStore(
@@ -1297,6 +1310,21 @@ def _resume_request(state: LoopState) -> HumanInputRequest | None:
     if request is None and state["pause"] is not None:
         request = state["pause"].request
     return request
+
+
+def _runtime_binding_can_resume(
+    *,
+    configured: RuntimeBinding,
+    persisted: RuntimeBinding,
+) -> bool:
+    return (
+        configured.model_alias == persisted.model_alias
+        and configured.knowledge == persisted.knowledge
+        and (
+            configured.workspace_path is None
+            or configured.workspace_path == persisted.workspace_path
+        )
+    )
 
 
 def _pending_request(

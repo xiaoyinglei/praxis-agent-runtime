@@ -77,6 +77,33 @@ uv run agent model switch groq_gpt_oss_120b
 `agent model switch` 写入 `.praxis/` 目录中的 `model_session.json`。临时只跑一次其他模型时，用
 `agent run --model qwen3_8b_mlx_4bit ...`，不要改 `configs/models.yaml`。
 
+交互式 `agent chat` 复用同一个 catalog、policy 和 session state，不维护第二套
+alias 或路由：
+
+```text
+uv run agent chat
+> /model
+当前模型: groq_gpt_oss_120b
+可用模型:
+* groq_gpt_oss_120b  ...
+  qwen3_8b_mlx_4bit  ...
+切换: /model <alias>
+> /model qwen3_8b_mlx_4bit
+已切换模型: qwen3_8b_mlx_4bit
+```
+
+也可写 `/model switch <alias>`；`/model current` 只看当前详情，`/model list`
+只列 catalog。成功切换后，当前聊天的下一条消息继续使用原来的
+`previous_turn_id` 历史，但新 Turn 会绑定新 alias，因此不需要退出、重启或
+`/new`。输入不存在或被 policy 拒绝的 alias 时，CLI 会显示错误和所有可用
+alias，原选择保持不变，而且校验阶段不会发起 provider 请求。
+
+模型绑定以 Turn 为单位持久化：重新用 `agent chat --previous-turn-id <id>` 或
+`--last` 进入历史链时，先恢复该 Turn 的模型、workspace 和 knowledge binding；
+之后仍可用 `/model <alias>` 给下一个 Turn 换模。`agent resume` 是恢复同一个暂停/
+中断 Turn，不是新建后续 Turn，因此始终使用 checkpoint 所属 Turn 的原模型；
+session state 后来切到别的 alias 也不会影响 resume。
+
 早期版本写在 `.rag/` 中的 `agent_checkpoints.sqlite` 和
 `agent_model_session.json` 不迁移、不读取、也不删除；新的运行从 `.praxis/`
 中的全新状态开始，RAG 知识数据则继续留在 `.rag/`。
@@ -366,7 +393,7 @@ uv run agent chat
 | 普通制度问答 | 直接问 `agent run` |
 | 已入库的文档证据问题 | `agent run ... --knowledge-config <path>`，模型会按需调用 `search_knowledge` |
 | Agent 直接读本地文件 | `agent run ... --file "/path/to/file.xlsx"` |
-| 查看/切换当前 chat 模型 | `agent model list/current/switch <model_id>`；这是 session state，不改 YAML |
+| 查看/切换当前 chat 模型 | chat 外用 `agent model list/current/switch <model_id>`；chat 内用 `/model` 与 `/model <alias>`；都是 session state，不改 YAML |
 | 一次性指定模型 | 默认是 Groq；显式可选本地路径可用 `--model qwen3_8b_mlx_4bit` |
 | 恢复常驻 embedding | `export RAG_EMBEDDING_SERVICE_URL=http://127.0.0.1:9090` |
 

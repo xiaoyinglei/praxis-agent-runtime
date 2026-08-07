@@ -6,10 +6,13 @@ from uuid import UUID
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.core.definition import AgentRuntimePolicy
+from agent_runtime.core import model_provider_runtime
+from agent_runtime.core.definition import AgentRuntimePolicy, ModelSelectionPolicy
+from agent_runtime.core.llm_registry import ModelRegistry
 from agent_runtime.core.messages import ModelMessage
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.loop.state import LoopState, ModelTurnDraft
+from agent_runtime.models import ModelControlPlane
 from agent_runtime.runtime import builder as runtime_builder
 from agent_runtime.service import AgentRunRequest, AgentRunResult, AgentService
 from agent_runtime.tools.registry import ToolRegistry
@@ -107,6 +110,124 @@ async def test_followup_history_is_derived_from_previous_turn(
         ),
     ]
     await service.aclose()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_followup_uses_selected_model_and_preserves_previous_history(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    store = TurnStore(tmp_path / "agent.sqlite")
+    provider = _HistoryProvider()
+    first_service = AgentService(
+        definition=AgentRuntimePolicy.test_factory(),
+        tool_registry=ToolRegistry(),
+        model_turn_provider=provider,
+        workspace=workspace,
+        turn_store=store,
+        runtime_binding=RuntimeBinding(
+            model_alias="model-a",
+            workspace_path=str(workspace.root),
+        ),
+    )
+    first = await first_service.run(AgentRunRequest(message="remember cobalt"))
+    second_service = AgentService(
+        definition=AgentRuntimePolicy.test_factory(),
+        tool_registry=ToolRegistry(),
+        model_turn_provider=provider,
+        workspace=workspace,
+        turn_store=store,
+        runtime_binding=RuntimeBinding(
+            model_alias="model-b",
+            workspace_path=str(workspace.root),
+        ),
+    )
+
+    second = await second_service.run(
+        AgentRunRequest(
+            message="what did I say?",
+            previous_turn_id=first.turn_id,
+        )
+    )
+
+    assert store.get_turn(first.turn_id).runtime.model_alias == "model-a"
+    assert store.get_turn(second.turn_id).runtime.model_alias == "model-b"
+    assert provider.contexts[-1] == (
+        "what did I say?",
+        (
+            ModelMessage(role="user", content="remember cobalt"),
+            ModelMessage(role="assistant", content="answer:remember cobalt"),
+        ),
+    )
+    await first_service.aclose()
+    await second_service.aclose()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_agent_switch_changes_the_model_resolved_for_the_next_linked_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _HistoryProvider()
+    resolved_aliases: list[str] = []
+
+    def resolve_model(self: ModelRegistry, alias: str) -> object:
+        del self
+        resolved_aliases.append(alias)
+        return object()
+
+    def create_provider(
+        registry: ModelControlPlane,
+        selection: ModelSelectionPolicy,
+        **kwargs: object,
+    ) -> _HistoryProvider:
+        del kwargs
+        registry.resolve_for_node(
+            node_model=selection.tool_decision_model,
+            node_name="tool_decision",
+        )
+        return provider
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-moonshot-key")
+    monkeypatch.setattr(ModelRegistry, "resolve", resolve_model)
+    monkeypatch.setattr(
+        model_provider_runtime,
+        "create_loop_model_turn_provider",
+        create_provider,
+    )
+    database = tmp_path / "agent.sqlite"
+    agent = Agent(
+        model="groq_gpt_oss_120b",
+        checkpoint_db=database,
+        workspace_path=tmp_path / "workspace",
+        model_session_path=None,
+    )
+
+    first = await agent.arun(
+        "remember cobalt",
+        require_workspace_change=False,
+    )
+    agent.switch_model("kimi_cloud")
+    second = await agent.arun(
+        "what did I say?",
+        previous_turn_id=first.turn_id,
+        require_workspace_change=False,
+    )
+
+    assert resolved_aliases == ["groq_gpt_oss_120b", "kimi_cloud"]
+    assert provider.contexts[-1] == (
+        "what did I say?",
+        (
+            ModelMessage(role="user", content="remember cobalt"),
+            ModelMessage(role="assistant", content="answer:remember cobalt"),
+        ),
+    )
+    store = TurnStore(database)
+    assert store.get_turn(first.turn_id).runtime.model_alias == "groq_gpt_oss_120b"
+    assert store.get_turn(second.turn_id).runtime.model_alias == "kimi_cloud"
     store.close()
 
 

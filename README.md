@@ -110,6 +110,29 @@ uv run agent model current
 uv run agent model switch <model-alias>
 ```
 
+The same control plane is available inside an interactive chat. Bare `/model`
+shows the current model and every alias from `configs/models.yaml`; switch with
+the direct alias form:
+
+```text
+$ uv run agent chat
+> /model
+当前模型: groq_gpt_oss_120b
+可用模型:
+* groq_gpt_oss_120b  ...
+  qwen3_8b_mlx_4bit  ...
+切换: /model <alias>
+> /model qwen3_8b_mlx_4bit
+已切换模型: qwen3_8b_mlx_4bit
+```
+
+The next message keeps the current conversation history and creates a new Turn
+bound to the selected alias; no restart or `/new` is required. An invalid alias
+prints the available aliases, keeps the previous model, and does not contact a
+provider. Each completed/paused Turn retains its own immutable model binding,
+so `agent resume` always continues a checkpoint with that Turn's original
+model even if the session selection changed later.
+
 Run a read-only task explicitly:
 
 ```bash

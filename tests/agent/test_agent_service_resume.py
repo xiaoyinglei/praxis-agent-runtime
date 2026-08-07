@@ -27,6 +27,7 @@ from agent_runtime.tools.tool import (
 )
 from agent_runtime.turns import (
     RuntimeBinding,
+    TurnStateError,
     TurnStatus,
     TurnStore,
 )
@@ -137,6 +138,8 @@ def _service(
     checkpointer: MemorySaver | None = None,
     execution_revision: str = "remote-v1",
     model_turn_provider: _FinishProvider | _SlowToolCallingProvider | None = None,
+    model_alias: str | None = None,
+    bind_workspace: bool = True,
 ) -> AgentService:
     registry = ToolRegistry()
     registry.register(_tool(calls, execution_revision=execution_revision))
@@ -147,7 +150,10 @@ def _service(
         checkpointer=checkpointer,
         workspace=open_workspace(workspace_path),
         turn_store=turn_store,
-        runtime_binding=RuntimeBinding(workspace_path=str(workspace_path)),
+        runtime_binding=RuntimeBinding(
+            model_alias=model_alias,
+            workspace_path=str(workspace_path) if bind_workspace else None,
+        ),
     )
 
 
@@ -199,6 +205,40 @@ async def test_default_checkpointer_resumes_on_same_service_without_replay(
     assert calls == ["once"]
     assert resumed.tool_results[0].is_error is False
     assert turn_store.get_turn(paused.turn_id).status is TurnStatus.COMPLETED
+
+
+@pytest.mark.anyio
+async def test_resume_accepts_workspace_allocated_when_the_turn_started(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    turn_store = TurnStore(tmp_path / "agent.sqlite")
+    service = _service(
+        calls,
+        turn_store=turn_store,
+        workspace_path=tmp_path,
+        model_alias="model-a",
+        bind_workspace=False,
+    )
+    _call, paused = await _pause(
+        service,
+        turn_store=turn_store,
+        value="allocated",
+    )
+    persisted = turn_store.get_turn(paused.turn_id)
+    assert persisted.runtime == RuntimeBinding(
+        model_alias="model-a",
+        workspace_path=str(tmp_path),
+    )
+
+    resumed = await service.resume_turn(
+        turn_id=paused.turn_id,
+        action="allow_once",
+        user_input=None,
+    )
+
+    assert resumed.status == "done"
+    assert calls == ["allocated"]
 
 
 @pytest.mark.anyio
@@ -276,6 +316,44 @@ async def test_resume_uses_same_codec_across_service_boundary(
 
     assert resumed.status == "done"
     assert calls == ["persisted"]
+
+
+@pytest.mark.anyio
+async def test_resume_rejects_a_service_bound_to_a_different_model(
+    tmp_path: Path,
+) -> None:
+    checkpointer = MemorySaver(serde=agent_checkpoint_serde())
+    calls: list[str] = []
+    turn_store = TurnStore(tmp_path / "agent.sqlite")
+    first = _service(
+        calls,
+        turn_store=turn_store,
+        workspace_path=tmp_path,
+        checkpointer=checkpointer,
+        model_alias="model-a",
+    )
+    _call, paused = await _pause(
+        first,
+        turn_store=turn_store,
+        value="persisted",
+    )
+    wrong_model = _service(
+        calls,
+        turn_store=turn_store,
+        workspace_path=tmp_path,
+        checkpointer=checkpointer,
+        model_alias="model-b",
+    )
+
+    with pytest.raises(TurnStateError, match="resume runtime does not match"):
+        await wrong_model.resume_turn(
+            turn_id=paused.turn_id,
+            action="allow_once",
+            user_input=None,
+        )
+
+    assert turn_store.get_turn(paused.turn_id).status is TurnStatus.PAUSED
+    assert calls == []
 
 
 @pytest.mark.anyio
