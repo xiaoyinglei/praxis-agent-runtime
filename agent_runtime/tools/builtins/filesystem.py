@@ -175,6 +175,8 @@ class ReadFileOutput(BaseModel):
     )
     truncated: bool
     is_binary: bool
+    binary_format: str | None = None
+    recommended_tool: str | None = None
     encoding: str
 
 
@@ -277,7 +279,8 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
             name="read_file",
             description=(
                 "Read a bounded byte range from one workspace file. Binary files are "
-                "reported without embedding their bytes. The 16,000-byte default "
+                "reported without embedding their bytes; supported spreadsheets and "
+                "PDFs explicitly route to inspect_data_file. The 16,000-byte default "
                 "bounds model context; use offset for later chunks, and never set "
                 "max_bytes above 1,000,000. A targeted read after a write can confirm "
                 "literal file content. Reuse a sufficient result while the workspace "
@@ -293,11 +296,7 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
             workspace,
             ReadFileInput.model_validate(arguments),
         ),
-        normalize_output=lambda raw: _normalize_model(
-            raw,
-            model=ReadFileOutput,
-            schema=_READ_OUTPUT_SCHEMA,
-        ),
+        normalize_output=_normalize_read_file,
         output_schema=_READ_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda arguments: _workspace_use(
@@ -305,7 +304,7 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
             str(arguments["path"]),
             effects=frozenset({ToolEffect.READ_WORKSPACE}),
         ),
-        execution_revision="builtin-read-file-v1",
+        execution_revision="builtin-read-file-v2-binary-routing",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -412,11 +411,15 @@ def _read_file(
 
     size = target.stat().st_size
     with target.open("rb") as stream:
+        prefix = stream.read(8_192)
         stream.seek(request.offset)
         raw = stream.read(request.max_bytes + 1)
     truncated = len(raw) > request.max_bytes
     bounded = raw[: request.max_bytes]
-    is_binary = b"\x00" in bounded
+    binary_format = _binary_format(target, prefix)
+    is_binary = binary_format is not None or b"\x00" in bounded
+    if is_binary and binary_format is None:
+        binary_format = "binary"
     content = "" if is_binary else bounded.decode(request.encoding, errors="replace")
     return ReadFileOutput(
         path=request.path,
@@ -429,6 +432,12 @@ def _read_file(
         next_line=None,
         truncated=truncated,
         is_binary=is_binary,
+        binary_format=binary_format,
+        recommended_tool=(
+            "inspect_data_file"
+            if binary_format in {"pdf", "xlsx", "xlsm"}
+            else None
+        ),
         encoding=request.encoding,
     )
 
@@ -438,6 +447,30 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
     start_line = request.start_line or 1
     max_lines = request.max_lines or 200
     with target.open("rb") as stream:
+        prefix = stream.read(8_192)
+        binary_format = _binary_format(target, prefix)
+        if binary_format is not None or b"\x00" in prefix:
+            binary_format = binary_format or "binary"
+            return ReadFileOutput(
+                path=request.path,
+                content="",
+                size_bytes=size,
+                offset=0,
+                next_offset=None,
+                start_line=start_line,
+                end_line=None,
+                next_line=None,
+                truncated=False,
+                is_binary=True,
+                binary_format=binary_format,
+                recommended_tool=(
+                    "inspect_data_file"
+                    if binary_format in {"pdf", "xlsx", "xlsm"}
+                    else None
+                ),
+                encoding=request.encoding,
+            )
+        stream.seek(0)
         for _line_number in range(1, start_line):
             if not stream.readline():
                 return ReadFileOutput(
@@ -501,8 +534,58 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
             next_line=(start_line + complete_lines if line_limited else None),
             truncated=truncated,
             is_binary=is_binary,
+            binary_format="binary" if is_binary else None,
+            recommended_tool=None,
             encoding=request.encoding,
         )
+
+
+def _binary_format(path: Path, prefix: bytes) -> str | None:
+    suffix = path.suffix.casefold()
+    if prefix.startswith(b"%PDF-"):
+        return "pdf"
+    if prefix.startswith(b"PK\x03\x04"):
+        return {
+            ".xlsx": "xlsx",
+            ".xlsm": "xlsm",
+            ".docx": "docx",
+            ".pptx": "pptx",
+            ".zip": "zip",
+        }.get(suffix, "zip")
+    if prefix.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "ole_compound_document"
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    return None
+
+
+def _normalize_read_file(raw: object) -> NormalizedToolOutput:
+    validated = ReadFileOutput.model_validate(raw)
+    structured = json_schema_output(
+        _READ_OUTPUT_SCHEMA,
+        validated.model_dump(mode="json"),
+    )
+    if validated.is_binary:
+        recommendation = (
+            " Use inspect_data_file on this path."
+            if validated.recommended_tool == "inspect_data_file"
+            else " Use a tool designed for this binary format."
+        )
+        return NormalizedToolOutput(
+            structured_content=structured,
+            is_error=True,
+            error_code="binary_file_requires_inspection",
+            error_message=(
+                f"read_file does not decode {validated.binary_format or 'binary'} "
+                f"content.{recommendation} Do not retry read_file on the same path."
+            ),
+            retryable=False,
+        )
+    return NormalizedToolOutput(structured_content=structured)
 
 
 def _apply_patch(

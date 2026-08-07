@@ -55,8 +55,9 @@ Turn -> Loop -> ACI / ToolExecutor -> workspace
   to it through `previous_turn_id`.
 - **Loop** — the bounded model/tool cycle that plans, observes results, and
   decides whether to continue, pause, fail, or finish.
-- **ACI** — typed, documented tool contracts for files, search, patching,
-  commands, plans, knowledge, skills, and integrations.
+- **ACI** — typed, documented tool contracts for files, structured data,
+  managed Python, search, patching, commands, plans, knowledge, skills, and
+  integrations.
 - **Approval** — write and execute capabilities remain distinct and can pause
   before a destructive effect.
 - **Checkpoint** — pending and interrupted Turns persist so the same operation
@@ -160,7 +161,7 @@ existing paused or interrupted Turn. Async applications can use `arun()`,
 | Capability | Public route | Typical work |
 | --- | --- | --- |
 | **Files and code** | `agent` / `agent_runtime.Agent` | Discover, read, search, patch, inspect diffs, run bounded verification |
-| **Data and documents** | Workspace tools plus Python execution | Inspect CSV, JSON, spreadsheets, PDFs, and document-derived artifacts |
+| **Data and documents** | `inspect_data_file` + sandboxed `execute_python` | Inspect CSV/TSV/JSON/XLSX/XLSM/PDF inputs; calculate, transform, chart, and structurally verify generated artifacts without a workspace `.venv` |
 | **Private knowledge** | Explicit `RAGKnowledgeConfig` | Retrieve cited evidence from a configured local knowledge index |
 | **Extensions** | Workspace Skills, configured MCP servers, and bounded subagent delegation | Add installed ACI capabilities without replacing the core loop |
 
@@ -210,11 +211,15 @@ repository, or an untrusted operator into a safe workload.
 - Read/execute and workspace-write capabilities are distinct. Writes and command
   execution can require approval; `.git` mutations remain outside the default
   workspace-write boundary.
-- Real `run_command` execution currently requires macOS
+- Real `run_command` and `execute_python` execution currently require macOS
   `/usr/bin/sandbox-exec` and a Seatbelt profile. If that executable is absent,
   the tool will fail closed with `sandbox_unavailable`; on other platforms it is
   unavailable, and this repository has no equivalent command-sandbox safety
   evidence. The fake sandbox fixtures are test-only and are not safety evidence.
+- `inspect_data_file` returns bounded previews, structural validity, and a
+  runtime-computed SHA-256. That proves which artifact was inspected; it does
+  not by itself prove that a formula, statistical method, or business conclusion
+  is semantically correct.
 - RAG evidence quality depends on parsing, indexing, retrieval configuration, and
   the source documents. A citation is traceability, not automatic truth.
 - Model and provider availability is external infrastructure. Timeouts, quota,

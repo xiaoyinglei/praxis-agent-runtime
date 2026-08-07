@@ -24,8 +24,10 @@ RESIDENT_TOOL_NAMES = (
     "search_text",
     "list_files",
     "read_file",
+    "inspect_data_file",
     "apply_patch",
     "run_command",
+    "execute_python",
     "update_plan",
 )
 

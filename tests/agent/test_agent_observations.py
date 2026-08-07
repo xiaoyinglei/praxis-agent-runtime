@@ -214,7 +214,7 @@ def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
     origin = ToolCallOrigin(
         request_id="inspect-file",
         toolset_revision="inspect-file-tools",
-        exposed_tool_names=("read_file", "search_text"),
+        exposed_tool_names=("read_file", "search_text", "inspect_data_file"),
     )
     read_call = ToolCall(
         tool_call_id="tc-read-current",
@@ -308,6 +308,21 @@ def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
             "searched_file_path": "src/runtime.py",
         },
     )
+    data_call = ToolCall(
+        tool_call_id="tc-inspect-data-current",
+        tool_name="inspect_data_file",
+        arguments={"path": "reports/summary.xlsx"},
+        origin=origin,
+    )
+    data_result = ToolResult(
+        tool_call_id=data_call.tool_call_id,
+        tool_name=data_call.tool_name,
+        structured_content={
+            "path": "reports/summary.xlsx",
+            "valid": True,
+            "sha256": "a" * 64,
+        },
+    )
     truncated_search = ToolResult(
         tool_call_id=search_call.tool_call_id,
         tool_name=search_call.tool_name,
@@ -337,6 +352,9 @@ def test_runtime_file_inspection_paths_require_bounded_real_scope() -> None:
         truncated_search,
         call=search_call,
     ) == ()
+    assert runtime_file_inspection_paths(data_result, call=data_call) == (
+        "reports/summary.xlsx",
+    )
 
 
 def test_canonical_read_file_observation_preserves_content_and_locator() -> None:

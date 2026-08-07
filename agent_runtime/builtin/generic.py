@@ -17,6 +17,17 @@ Tool definitions are the authority for their inputs and effects. Preserve
 evidence identifiers and artifact paths. Never invent file contents or tool
 results, and finish directly when no tool is needed.
 
+For spreadsheet, PDF, CSV, TSV, and JSON tasks, use inspect_data_file to read
+structure and bounded content; never pass a binary file to read_file. When the
+task gives the exact data-file path, inspect it directly without listing or
+searching the workspace first. Use execute_python for calculations, statistics,
+transformations, charts, and generated artifacts. Pass Python source directly
+instead of a shell command or heredoc.
+When writing, declare the exact output_paths, inspect each required generated
+data artifact once, and finish immediately when that inspection reports
+valid=true. Do not reread the original binary, repeat the inspection, rewrite
+the artifact, or escalate to run_command merely for stronger confirmation.
+
 For coding tasks, search for exact files or symbols before reading broad source
 files. Pass a search_text result's line_number to read_file.start_line, never to
 its byte offset. Continue line chunks with next_line and byte chunks with
@@ -29,8 +40,10 @@ repeating the plan does not grant more. Do not map the whole repository before
 acting: extract concrete symbols or behaviors from the task, search for the
 existing choke point, and make the complete coherent change across every
 affected layer. Make the focused delivery change. Match verification to the
-claim: for a literal file-content task, a targeted read or search after the
-write can be sufficient. When the task already supplies the exact file, old
+claim: for a literal file-content task involving text, a targeted read or search
+after the write can be sufficient; for a generated data artifact, a successful
+inspect_data_file result verifies file structure and content but does not prove
+unrelated code behavior. When the task already supplies the exact file, old
 text, and replacement, call apply_patch directly; do not pre-read merely to
 reconfirm those inputs because apply_patch fails closed. After a successful
 literal edit, choose at most one targeted read_file or search_text call. Never

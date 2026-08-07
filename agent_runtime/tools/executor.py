@@ -52,6 +52,9 @@ _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
         "workspace_tree_changed",
     }
 )
+_MISSING_WORKSPACE_FILE_SHA256 = hashlib.sha256(
+    b"praxis-workspace-file-missing-v1"
+).hexdigest()
 
 
 class ExecutionBoundary(StrEnum):
@@ -943,11 +946,11 @@ def _workspace_file_target_snapshots(
         if target.kind != "workspace_path":
             continue
         try:
-            path = Path(target.value).resolve(strict=True)
+            path = _resolve_workspace_file_target(root, target.value)
             relative = path.relative_to(root).as_posix()
         except (OSError, ValueError):
             return ()
-        if not relative or not path.is_file():
+        if not relative or (path.exists() and not path.is_file()):
             return ()
         targets.setdefault(relative, path)
 
@@ -955,7 +958,12 @@ def _workspace_file_target_snapshots(
         return ()
     try:
         return tuple(
-            (relative, _file_sha256(path))
+            (
+                relative,
+                _file_sha256(path)
+                if path.is_file()
+                else _MISSING_WORKSPACE_FILE_SHA256,
+            )
             for relative, path in targets.items()
         )
     except OSError:
@@ -972,11 +980,12 @@ def _changed_workspace_file_snapshots(
         root = workspace_root.resolve(strict=True)
         changes: list[Mapping[str, JsonValue]] = []
         for relative, before_sha256 in before_snapshots:
-            path = (root / relative).resolve(strict=True)
-            path.relative_to(root)
-            if not path.is_file():
-                return ()
-            after_sha256 = _file_sha256(path)
+            path = _resolve_workspace_file_target(root, str(root / relative))
+            after_sha256 = (
+                _file_sha256(path)
+                if path.is_file()
+                else _MISSING_WORKSPACE_FILE_SHA256
+            )
             if after_sha256 == before_sha256:
                 continue
             changes.append(
@@ -989,6 +998,27 @@ def _changed_workspace_file_snapshots(
         return tuple(changes)
     except (OSError, ValueError):
         return ()
+
+
+def _resolve_workspace_file_target(root: Path, value: str) -> Path:
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    lexical = Path(os.path.abspath(candidate))
+    lexical.relative_to(root)
+
+    missing_names: list[str] = []
+    ancestor = lexical
+    while not ancestor.exists():
+        if ancestor == ancestor.parent:
+            raise ValueError("workspace target has no existing ancestor")
+        missing_names.append(ancestor.name)
+        ancestor = ancestor.parent
+    resolved = ancestor.resolve(strict=True)
+    for name in reversed(missing_names):
+        resolved /= name
+    resolved.relative_to(root)
+    return resolved
 
 
 def _file_sha256(path: Path) -> str:

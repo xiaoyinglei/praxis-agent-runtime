@@ -1465,10 +1465,11 @@ async def test_pending_runtime_goal_requirements_are_visible_in_working_state() 
             "constraint_type": "verification_after_change",
             "expected_value": True,
             "observation": "pending",
-            "requirement": (
-                "A recognized verification command must succeed after the "
-                "latest workspace change; pre-change commands do not satisfy this."
-            ),
+                "requirement": (
+                    "A recognized behavior check or exact generated-artifact "
+                    "inspection must succeed after the latest workspace change; "
+                    "stale or failed checks do not satisfy this."
+                ),
         },
     ]
 

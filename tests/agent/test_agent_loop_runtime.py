@@ -872,7 +872,7 @@ def test_repeated_successful_inspection_requires_new_arguments() -> None:
     }
     assert "finish now" in (blocked[0].error_message or "")
     assert "Do not repeat the mutation" in (blocked[0].error_message or "")
-    assert "run_command solely to reconfirm" in (
+    assert "run_command or execute_python solely to reconfirm" in (
         blocked[0].error_message or ""
     )
     assert "Do not switch to another inspection tool" in (
@@ -896,6 +896,58 @@ def test_repeated_successful_inspection_requires_new_arguments() -> None:
 
     assert executable_after_change == (repeated,)
     assert blocked_after_change == ()
+
+
+def test_repeated_structured_data_inspection_finishes_instead_of_escalating() -> None:
+    state = create_loop_state(
+        current_message="Create and verify analysis.xlsx.",
+        run_config=_config("loop-repeated-data-inspection"),
+    )
+    origin = ToolCallOrigin(
+        request_id="data-inspection-request",
+        toolset_revision="data-inspection-tools",
+        exposed_tool_names=("inspect_data_file", "execute_python"),
+    )
+    previous = ToolCall(
+        tool_call_id="inspect-data-previous",
+        tool_name="inspect_data_file",
+        arguments={"path": "analysis.xlsx"},
+        origin=origin,
+    )
+    repeated = ToolCall(
+        tool_call_id="inspect-data-repeated",
+        tool_name="inspect_data_file",
+        arguments={"path": "analysis.xlsx"},
+        origin=origin,
+    )
+    state["canonical_tool_calls"][previous.tool_call_id] = previous
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id=previous.tool_call_id,
+            tool_name=previous.tool_name,
+            structured_content={
+                "path": "analysis.xlsx",
+                "valid": True,
+                "sha256": "a" * 64,
+            },
+        )
+    ]
+
+    executable, blocked = _guard_repeated_successful_inspections(
+        state,
+        (repeated,),
+    )
+
+    assert executable == ()
+    assert len(blocked) == 1
+    assert blocked[0].error_code == "repeated_inspection"
+    assert blocked[0].structured_content is not None
+    assert blocked[0].structured_content["recommended_action"] == (
+        "finish_if_existing_result_satisfies_task"
+    )
+    assert "execute_python solely to reconfirm" in (
+        blocked[0].error_message or ""
+    )
 
 
 def test_canonical_tool_arguments_materialize_declared_defaults() -> None:

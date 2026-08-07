@@ -830,6 +830,12 @@ def _post_change_file_inspection(
             inspected_paths.setdefault(path, None)
 
     observation = "observed" if inspection_tool_call_ids else "pending"
+    data_artifact = any(
+        path.casefold().endswith(
+            (".xlsx", ".xlsm", ".pdf", ".csv", ".tsv", ".json")
+        )
+        for path in changed_paths
+    )
     if observation == "observed":
         literal_file_guidance: Mapping[str, JsonValue] = {
             "action": "finish_if_existing_result_satisfies_task",
@@ -839,7 +845,11 @@ def _post_change_file_inspection(
     else:
         literal_file_guidance = {
             "action": "choose_one_targeted_inspection_then_finish",
-            "choose_exactly_one_of": ("read_file", "search_text"),
+            "choose_exactly_one_of": (
+                ("inspect_data_file",)
+                if data_artifact
+                else ("read_file", "search_text")
+            ),
             "maximum_additional_file_inspections": 1,
             "never_batch_alternatives": True,
             "do_not_pair_positive_and_negative_searches": True,
@@ -854,7 +864,11 @@ def _post_change_file_inspection(
             inspection_tool_call_ids[-_MAX_POST_CHANGE_FILE_EVIDENCE:]
         ),
         "inspected_paths": tuple(inspected_paths)[-_MAX_POST_CHANGE_FILE_EVIDENCE:],
-        "scope": "file_content",
+        "scope": (
+            "data_file_structure_and_content"
+            if data_artifact
+            else "file_content"
+        ),
         "semantic_target_satisfied": "not_evaluated",
         "guidance": {
             "literal_file_task": literal_file_guidance,
@@ -872,8 +886,9 @@ def _runtime_requirement_description(constraint_type: str) -> str:
             "prose and pre-change verification do not satisfy this."
         )
     return (
-        "A recognized verification command must succeed after the latest "
-        "workspace change; pre-change commands do not satisfy this."
+        "A recognized behavior check or exact generated-artifact inspection "
+        "must succeed after the latest workspace change; stale or failed checks "
+        "do not satisfy this."
     )
 
 

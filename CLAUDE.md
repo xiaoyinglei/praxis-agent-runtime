@@ -63,14 +63,16 @@ agent CLI / agent_runtime.Agent
 
 ## ACI 与工具面
 
-六个基础 coding tools 按固定顺序常驻：
+八个基础 workspace tools 按固定顺序常驻：
 
 1. `search_text`
 2. `list_files`
 3. `read_file`
-4. `apply_patch`
-5. `run_command`
-6. `update_plan`
+4. `inspect_data_file`
+5. `apply_patch`
+6. `run_command`
+7. `execute_python`
+8. `update_plan`
 
 工具的 schema、描述、effect、target、超时、取消和输出边界都是 ACI 合同，
 模型 prompt 或 README 不能覆盖它们。
