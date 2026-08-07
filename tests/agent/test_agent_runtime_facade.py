@@ -735,6 +735,62 @@ async def test_agent_aresume_projects_stable_turn_result(
 
 
 @pytest.mark.anyio
+async def test_agent_resume_uses_the_paused_turn_model_after_session_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[dict[str, object]] = []
+
+    class _Service:
+        async def resume_turn(
+            self,
+            *,
+            turn_id: str,
+            action: str,
+            user_input: str | None,
+        ) -> AgentRunResult:
+            del action, user_input
+            return AgentRunResult(
+                turn_id=turn_id,
+                status="done",
+                final_answer="resumed on original model",
+            )
+
+    def build_service(runtime: object, **kwargs: object) -> _Service:
+        built.append({"runtime": runtime, **kwargs})
+        return _Service()
+
+    monkeypatch.setattr(runtime_builder, "build_agent_service", build_service)
+    agent = Agent(
+        model="groq_gpt_oss_120b",
+        checkpoint_db=tmp_path / "agent.sqlite",
+        workspace_path=tmp_path,
+        model_session_path=None,
+    )
+    store = agent._get_turn_store()
+    paused = store.begin_turn(
+        "paused task",
+        RuntimeBinding(
+            model_alias="groq_gpt_oss_120b",
+            workspace_path=str(tmp_path.resolve()),
+        ),
+    )
+    store.mark_paused(paused.turn_id)
+    agent.switch_model("kimi_cloud")
+
+    result = await agent.aresume(paused.turn_id, "continue")
+
+    assert result.answer == "resumed on original model"
+    assert built[0]["model_alias"] == "groq_gpt_oss_120b"
+    control_plane = built[0]["model_control_plane"]
+    assert isinstance(control_plane, ModelControlPlane)
+    assert control_plane.current_model().id == "groq_gpt_oss_120b"
+    runtime_binding = built[0]["runtime_binding"]
+    assert isinstance(runtime_binding, RuntimeBinding)
+    assert runtime_binding.model_alias == "groq_gpt_oss_120b"
+
+
+@pytest.mark.anyio
 async def test_agent_pending_input_returns_none_for_completed_turn(
     tmp_path: Path,
 ) -> None:

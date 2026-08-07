@@ -56,6 +56,7 @@ class Agent:
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self._model_control_plane: ModelControlPlane | None = None
+        self._followup_model_id: str | None = None
         self._turn_store: TurnStore | None = None
         self._checkpointer: BaseCheckpointSaver[str] | None = None
 
@@ -66,11 +67,14 @@ class Agent:
         return self._get_model_control_plane().current_model()
 
     def switch_model(self, model_id: str) -> ModelSpec:
-        return self._get_model_control_plane().switch_model(
+        spec = self._get_model_control_plane().switch_model(
             model_id,
             requested_by="user",
             persist=self.model_session_path is not None,
         )
+        self.model = spec.id
+        self._followup_model_id = spec.id
+        return spec
 
     def run(
         self,
@@ -237,7 +241,12 @@ class Agent:
 
     def _agent_for_previous_turn(self, turn_id: str) -> Agent:
         turn = self._get_turn_store().get_turn(turn_id)
-        return self._agent_for_binding(turn.runtime)
+        binding = turn.runtime
+        if self._followup_model_id is not None:
+            binding = binding.model_copy(
+                update={"model_alias": self._followup_model_id},
+            )
+        return self._agent_for_binding(binding)
 
     def _agent_for_turn(self, turn_id: str) -> Agent:
         turn = self._get_turn_store().prepare_turn_for_resume(turn_id)

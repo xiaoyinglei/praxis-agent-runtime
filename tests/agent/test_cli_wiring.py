@@ -39,6 +39,7 @@ from agent_runtime.tools.integrations.mcp import (
     create_mcp_tools,
 )
 from agent_runtime.tools.integrations.skills import create_skill_tools
+from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 from agent_runtime.workspace import open_workspace
 
 
@@ -225,6 +226,61 @@ def test_agent_run_can_store_model_session_outside_workspace(
     )
 
     assert facade_options[0]["model_session_path"] == model_session_path
+
+
+def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_workspace = tmp_path / "caller"
+    turn_workspace = tmp_path / "turn-workspace"
+    caller_workspace.mkdir()
+    turn_workspace.mkdir()
+    database = tmp_path / "agent.sqlite"
+    knowledge = RAGKnowledgeConfig(
+        storage_root=tmp_path / "knowledge",
+        vector_backend="sqlite",
+    )
+    store = TurnStore(database)
+    previous = store.begin_turn(
+        "remember cobalt",
+        RuntimeBinding(
+            model_alias="qwen3_5_9b_mlx_4bit",
+            workspace_path=str(turn_workspace.resolve()),
+            knowledge=knowledge,
+        ),
+    )
+    store.mark_terminal(previous.turn_id, TurnStatus.COMPLETED)
+    store.close()
+    facade_options: list[dict[str, object]] = []
+    loop_options: list[dict[str, object]] = []
+
+    def create_facade(**kwargs: object) -> object:
+        facade_options.append(kwargs)
+        return object()
+
+    async def chat_loop(_facade: object, **kwargs: object) -> None:
+        loop_options.append(kwargs)
+
+    monkeypatch.chdir(caller_workspace)
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+    monkeypatch.setattr(cli_module, "_chat_facade_loop", chat_loop)
+
+    cli_module.agent_chat(
+        previous_turn_id=previous.turn_id,
+        checkpoint_db=database,
+    )
+
+    assert facade_options == [
+        {
+            "model": "qwen3_5_9b_mlx_4bit",
+            "checkpoint_db": database,
+            "workspace_path": str(turn_workspace.resolve()),
+            "model_session_path": cli_module.DEFAULT_MODEL_SESSION_PATH,
+            "knowledge": knowledge,
+        }
+    ]
+    assert loop_options[0]["previous_turn_id"] == previous.turn_id
 
 
 def test_agent_run_forwards_workspace_change_contract(

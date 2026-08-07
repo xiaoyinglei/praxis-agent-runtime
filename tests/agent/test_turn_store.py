@@ -13,6 +13,7 @@ from agent_runtime.core.model_request import (
     canonical_transcript_revision,
     project_transcript_compaction,
 )
+from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.loop.state import create_loop_state
 from agent_runtime.memory.compactor import LoopContextCompactor
 from agent_runtime.memory.models import MemoryPolicy
@@ -24,10 +25,16 @@ from agent_runtime.turns import (
 )
 
 
-def _runtime(workspace: Path, *, model: str = "test-model") -> RuntimeBinding:
+def _runtime(
+    workspace: Path,
+    *,
+    model: str = "test-model",
+    knowledge: RAGKnowledgeConfig | None = None,
+) -> RuntimeBinding:
     return RuntimeBinding(
         model_alias=model,
         workspace_path=str(workspace.resolve()),
+        knowledge=knowledge,
     )
 
 
@@ -62,7 +69,7 @@ def test_turn_store_links_followups_without_session(tmp_path: Path) -> None:
     store.close()
 
 
-def test_followup_requires_terminal_predecessor_and_same_runtime(tmp_path: Path) -> None:
+def test_followup_requires_terminal_predecessor(tmp_path: Path) -> None:
     store = TurnStore(tmp_path / "agent.sqlite")
     runtime = _runtime(tmp_path)
     first = store.begin_turn("first", runtime)
@@ -70,11 +77,59 @@ def test_followup_requires_terminal_predecessor_and_same_runtime(tmp_path: Path)
     with pytest.raises(TurnStateError, match="only terminal Turns"):
         store.begin_turn("too early", runtime, previous_turn_id=first.turn_id)
 
+    store.close()
+
+
+def test_followup_may_bind_a_different_model_alias(tmp_path: Path) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    first = store.begin_turn("first", _runtime(tmp_path, model="model-a"))
     store.mark_terminal(first.turn_id, TurnStatus.COMPLETED)
+
+    second = store.begin_turn(
+        "use another model",
+        _runtime(tmp_path, model="model-b"),
+        previous_turn_id=first.turn_id,
+    )
+
+    assert second.previous_turn_id == first.turn_id
+    assert store.get_turn(first.turn_id).runtime.model_alias == "model-a"
+    assert store.get_turn(second.turn_id).runtime.model_alias == "model-b"
+    store.close()
+
+
+@pytest.mark.parametrize("resource", ["workspace", "knowledge"])
+def test_followup_rejects_non_model_runtime_changes(
+    tmp_path: Path,
+    resource: str,
+) -> None:
+    knowledge = RAGKnowledgeConfig(
+        storage_root=tmp_path / "knowledge-a",
+        vector_backend="sqlite",
+    )
+    store = TurnStore(tmp_path / "agent.sqlite")
+    first = store.begin_turn(
+        "first",
+        _runtime(tmp_path, model="model-a", knowledge=knowledge),
+    )
+    store.mark_terminal(first.turn_id, TurnStatus.COMPLETED)
+    workspace = tmp_path if resource == "knowledge" else tmp_path / "other-workspace"
+    followup_knowledge = (
+        RAGKnowledgeConfig(
+            storage_root=tmp_path / "knowledge-b",
+            vector_backend="sqlite",
+        )
+        if resource == "knowledge"
+        else knowledge
+    )
+
     with pytest.raises(TurnStateError, match="runtime does not match"):
         store.begin_turn(
             "different runtime",
-            _runtime(tmp_path, model="other-model"),
+            _runtime(
+                workspace,
+                model="model-b",
+                knowledge=followup_knowledge,
+            ),
             previous_turn_id=first.turn_id,
         )
     store.close()

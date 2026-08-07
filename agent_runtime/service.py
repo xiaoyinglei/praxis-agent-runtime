@@ -398,7 +398,12 @@ class AgentService:
         requested_workspace: str | None,
     ) -> RuntimeBinding:
         if previous_turn_id is not None:
-            return self._turn_store.get_turn(previous_turn_id).runtime
+            previous = self._turn_store.get_turn(previous_turn_id).runtime
+            return previous.model_copy(
+                update={
+                    "model_alias": self._runtime_binding.model_alias or previous.model_alias,
+                }
+            )
         if self._runtime_binding.workspace_path is not None:
             return self._runtime_binding
         if requested_workspace is not None:
@@ -915,6 +920,11 @@ class AgentService:
         action: str,
         user_input: str | None = None,
     ) -> AgentRunResult:
+        persisted_turn = self._turn_store.get_turn(turn_id)
+        if persisted_turn.runtime != self._runtime_binding:
+            raise TurnStateError(
+                f"Turn {turn_id} resume runtime does not match its persisted runtime"
+            )
         turn = self._turn_store.prepare_turn_for_resume(turn_id)
         started_at = time.perf_counter()
         checkpoint_store = LangGraphCheckpointStore(

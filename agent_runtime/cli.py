@@ -671,7 +671,6 @@ async def _chat_facade_loop(
             _handle_model_slash_command(
                 query,
                 agent=facade,
-                allow_switch=current_turn_id is None,
             )
             model_alias = facade.current_model().id
             continue
@@ -719,21 +718,31 @@ def _print_current_model(spec: ModelSpec) -> None:
     print(f"location: {spec.location}")
 
 
+def _print_model_menu(agent: Agent) -> None:
+    current = agent.current_model()
+    print(f"当前模型: {current.id}")
+    print("可用模型:")
+    for line in format_model_rows(
+        agent.models(),
+        current_model_id=current.id,
+    ):
+        print(line)
+    print("切换: /model <alias>")
+
+
 def _handle_model_slash_command(
     query: str,
     *,
     agent: Agent | None,
-    allow_switch: bool = True,
 ) -> None:
     if agent is None:
         print("模型控制平面不可用。")
         return
     parts = query.split()
-    action = parts[1] if len(parts) > 1 else "current"
-    switch_requested = action in {"switch", "use"} or (len(parts) == 2 and action not in {"current", "list"})
-    if switch_requested and not allow_switch:
-        print("当前上下文的模型绑定已冻结；请先使用 /new，再切换模型。")
+    if len(parts) == 1:
+        _print_model_menu(agent)
         return
+    action = parts[1] if len(parts) > 1 else "current"
     try:
         if action == "list":
             for line in format_model_rows(
@@ -758,6 +767,7 @@ def _handle_model_slash_command(
             return
     except (ModelPolicyError, UnknownModelAliasError) as exc:
         print(f"模型切换失败: {exc}")
+        _print_model_menu(agent)
         return
     print("用法: /model [current|list|switch <model_id>]")
 
@@ -833,6 +843,14 @@ def _latest_completed_cli_turn(
         store.close()
 
 
+def _cli_turn(checkpoint_db: Path, turn_id: str) -> TurnRecord:
+    store = TurnStore(checkpoint_db)
+    try:
+        return store.get_turn(turn_id)
+    finally:
+        store.close()
+
+
 @agent_app.command(name="chat")
 def agent_chat(
     previous_turn_id: Annotated[
@@ -886,6 +904,7 @@ def agent_chat(
     if previous_turn_id is not None and last:
         raise typer.BadParameter("--previous-turn-id 与 --last 不能同时使用")
     effective_previous_turn_id = previous_turn_id
+    continued_turn: TurnRecord | None = None
     if last:
         latest = _latest_completed_cli_turn(
             checkpoint_db,
@@ -894,18 +913,30 @@ def agent_chat(
         if latest is None:
             raise typer.BadParameter("当前工作区没有可继续的 Turn")
         effective_previous_turn_id = latest.turn_id
+        continued_turn = latest
     if effective_previous_turn_id is not None and knowledge_config is not None:
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
         raise typer.BadParameter(
             "继续已有 Turn 时不能传 --model；模型已由前一个 Turn 绑定"
         )
+    if effective_previous_turn_id is not None and continued_turn is None:
+        continued_turn = _cli_turn(checkpoint_db, effective_previous_turn_id)
+    if continued_turn is None:
+        facade_model = model
+        facade_workspace: Path | str = Path.cwd()
+        facade_knowledge = _load_knowledge_config(knowledge_config)
+    else:
+        binding = continued_turn.runtime
+        facade_model = binding.model_alias
+        facade_workspace = binding.workspace_path or Path.cwd()
+        facade_knowledge = binding.knowledge
     facade = _create_agent_facade(
-        model=model,
+        model=facade_model,
         checkpoint_db=checkpoint_db,
-        workspace_path=Path.cwd(),
+        workspace_path=facade_workspace,
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
-        knowledge=_load_knowledge_config(knowledge_config),
+        knowledge=facade_knowledge,
     )
     _run_cli_async(
         _chat_facade_loop(

@@ -158,7 +158,7 @@ class TurnStore:
                             "only terminal Turns can receive a follow-up"
                         )
                     previous_runtime = RuntimeBinding.model_validate_json(str(previous["runtime_json"]))
-                    if previous_runtime != runtime:
+                    if not _followup_runtime_matches(previous_runtime, runtime):
                         raise TurnStateError(
                             f"Turn {effective_previous_id} runtime does not match the follow-up runtime"
                         )
@@ -890,6 +890,16 @@ def _canonical_runtime_json(raw: str, *, owner_id: str) -> str:
         detail = _runtime_binding_error_detail(exc)
         raise ValueError(f"Invalid RuntimeBinding for Turn {owner_id}: {detail}") from None
     return binding.model_dump_json()
+
+
+def _followup_runtime_matches(
+    previous: RuntimeBinding,
+    followup: RuntimeBinding,
+) -> bool:
+    return (
+        previous.workspace_path == followup.workspace_path
+        and previous.knowledge == followup.knowledge
+    )
 
 
 def _runtime_binding_from_payload(payload: dict[str, Any]) -> RuntimeBinding:

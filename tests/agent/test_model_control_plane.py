@@ -9,7 +9,11 @@ import yaml
 from typer.testing import CliRunner
 
 from agent_runtime.cli import agent_app
-from agent_runtime.core.llm_registry import ModelNotAvailableError, ModelRegistry
+from agent_runtime.core.llm_registry import (
+    ModelNotAvailableError,
+    ModelRegistry,
+    UnknownModelAliasError,
+)
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
 from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from agent_runtime.models import (
@@ -302,6 +306,35 @@ def test_model_session_state_persists_without_rewriting_yaml(tmp_path: Path) -> 
     )
     assert restored.current_model().id == "mimo_cloud"
     assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(config_path))
+    resolved_aliases: list[str] = []
+
+    def resolve_model(self: ModelRegistry, alias: str) -> object:
+        del self
+        resolved_aliases.append(alias)
+        return object()
+
+    monkeypatch.setattr(ModelRegistry, "resolve", resolve_model)
+    control = ModelControlPlane.from_env(
+        initial_model_id="local_qwen",
+        session_path=session_path,
+    )
+
+    with pytest.raises(UnknownModelAliasError, match="missing"):
+        control.switch_model("missing", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+    assert resolved_aliases == []
+    assert not session_path.exists()
 
 
 def test_agent_model_cli_uses_session_state_not_yaml(
