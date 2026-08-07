@@ -102,8 +102,10 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         "search_text",
         "list_files",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
     )
     assert tuple(tool.definition.name for tool in tools) == RESIDENT_CODING_TOOL_NAMES
@@ -141,6 +143,12 @@ def test_resident_tool_docs_distinguish_content_from_behavior(
     )
     assert "verify code behavior" in tools["run_command"].definition.description
     assert "solely to reconfirm" in tools["run_command"].definition.description
+    assert "without returning raw binary bytes" in (
+        tools["inspect_data_file"].definition.description
+    )
+    assert "does not use shell heredocs" in (
+        tools["execute_python"].definition.description
+    )
 
 
 def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:

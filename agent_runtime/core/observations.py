@@ -291,6 +291,7 @@ def _answer_text(tool_name: str, output: BaseModel | _OutputView | None) -> str 
         "asset_read_slice",
         "list_files",
         "read_file",
+        "inspect_data_file",
     }:
         return None
     text = getattr(output, "text", None)
@@ -463,6 +464,9 @@ def _context_units_from_output(
     if result.tool_name == "read_file":
         unit = _read_file_context_unit(output, tool_call_id=result.tool_call_id)
         return [] if unit is None else [unit]
+    if result.tool_name == "inspect_data_file":
+        unit = _data_file_context_unit(output, tool_call_id=result.tool_call_id)
+        return [] if unit is None else [unit]
     return []
 
 
@@ -575,6 +579,32 @@ def _read_file_context_unit(
     )
 
 
+def _data_file_context_unit(
+    output: BaseModel | _OutputView,
+    *,
+    tool_call_id: str,
+) -> ContextUnit | None:
+    path = getattr(output, "path", None)
+    if not isinstance(path, str) or not path.strip():
+        return None
+    summary = getattr(output, "summary", None)
+    return ContextUnit(
+        unit_id=f"workspace_data_file:{path}",
+        unit_type="workspace_data_file",
+        locator={
+            "source_tool": "inspect_data_file",
+            "path": path,
+            "format": getattr(output, "format", None),
+            "size_bytes": getattr(output, "size_bytes", None),
+            "sha256": getattr(output, "sha256", None),
+        },
+        preview=(summary[:1000] if isinstance(summary, str) else None),
+        content_ref=tool_call_id,
+        capabilities=["inspect_data_file", "execute_python"],
+        metadata={"source_tool": "inspect_data_file"},
+    )
+
+
 def _asset_context_unit(
     tool_name: str,
     locator: dict[str, object],
@@ -683,6 +713,16 @@ def _workspace_tool_locators_from_output(
         return [_workspace_file_locator(file_info, source_tool="list_files") for file_info in entries or []]
     if tool_name == "read_file":
         return [_read_file_locator(output)]
+    if tool_name == "inspect_data_file":
+        return [
+            {
+                "source_tool": "inspect_data_file",
+                "path": getattr(output, "path", None),
+                "format": getattr(output, "format", None),
+                "size_bytes": getattr(output, "size_bytes", None),
+                "sha256": getattr(output, "sha256", None),
+            }
+        ]
     if tool_name == "search_text":
         matches = getattr(output, "matches", [])
         locators: list[dict[str, object]] = []
@@ -925,13 +965,20 @@ def grounded_workspace_paths(
         if result.is_error:
             continue
         call = calls.get(result.tool_call_id)
-        if call is not None and result.tool_name in {"list_files", "search_text", "read_file"}:
+        if call is not None and result.tool_name in {
+            "list_files",
+            "search_text",
+            "read_file",
+            "inspect_data_file",
+        }:
             requested_path = call.arguments.get("path")
             if requested_path is None and result.tool_name in {"list_files", "search_text"}:
                 requested_path = "."
             add(requested_path)
         if isinstance(result.structured_content, Mapping):
             if result.tool_name == "read_file":
+                add(result.structured_content.get("path"))
+            elif result.tool_name == "inspect_data_file":
                 add(result.structured_content.get("path"))
             elif result.tool_name == "list_files":
                 entries = result.structured_content.get("entries")
@@ -1077,6 +1124,27 @@ def runtime_file_inspection_paths(
     ):
         return ()
     output = result.structured_content
+    if result.tool_name == "inspect_data_file":
+        requested_path = call.arguments.get("path")
+        returned_path = output.get("path")
+        normalized_requested = (
+            _normalize_grounded_workspace_path(requested_path)
+            if isinstance(requested_path, str)
+            else None
+        )
+        normalized_returned = (
+            _normalize_grounded_workspace_path(returned_path)
+            if isinstance(returned_path, str)
+            else None
+        )
+        if (
+            normalized_requested is None
+            or normalized_requested != normalized_returned
+            or output.get("valid") is not True
+            or not _valid_sha256(output.get("sha256"))
+        ):
+            return ()
+        return (normalized_requested,)
     if result.tool_name == "read_file":
         requested_path = call.arguments.get("path")
         returned_path = output.get("path")

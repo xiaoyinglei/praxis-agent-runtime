@@ -17,6 +17,7 @@ from agent_runtime.core.observations import (
     ContextBinding,
     EvidenceRef,
     runtime_workspace_change,
+    runtime_workspace_file_changes,
     runtime_workspace_snapshot,
 )
 from agent_runtime.core.output_finalizer import (
@@ -335,8 +336,9 @@ class GoalContractStopHook:
                     constraint_id=constraint.constraint_id,
                     status="satisfied",
                     rationale=(
-                        "Every recognized verification command after the latest "
-                        "workspace change completed successfully."
+                        "Every recognized behavior check or exact artifact "
+                        "inspection after the latest workspace change completed "
+                        "successfully."
                     ),
                 )
                 for constraint in verification_constraints
@@ -473,8 +475,38 @@ def runtime_verification_after_latest_change(
     if latest_change_index < 0:
         return RuntimeVerificationEvidence((), (), False)
 
+    changed_files = {
+        path: after_sha256
+        for path, _before_sha256, after_sha256 in runtime_workspace_file_changes(
+            tool_results[latest_change_index]
+        )
+    }
     attempts: list[tuple[str, bool]] = []
     for result in tool_results[latest_change_index + 1 :]:
+        if result.tool_name == "inspect_data_file":
+            call = calls.get(result.tool_call_id)
+            if call is None:
+                continue
+            requested_path = call.arguments.get("path")
+            normalized_path = _normalized_workspace_relative_path(requested_path)
+            expected_sha256 = (
+                changed_files.get(normalized_path)
+                if normalized_path is not None
+                else None
+            )
+            if expected_sha256 is None or normalized_path is None:
+                continue
+            attempts.append(
+                (
+                    result.tool_call_id,
+                    _data_inspection_result_succeeded(
+                        result,
+                        path=normalized_path,
+                        expected_sha256=expected_sha256,
+                    ),
+                )
+            )
+            continue
         if result.tool_name != "run_command":
             continue
         call = calls.get(result.tool_call_id)
@@ -510,7 +542,7 @@ def _is_runtime_workspace_write(
         return True
     call = calls.get(result.tool_call_id)
     return bool(
-        result.tool_name == "run_command"
+        result.tool_name in {"run_command", "execute_python"}
         and call is not None
         and call.arguments.get("workspace_write") is True
         and isinstance(result.metadata.get("operation_id"), str)
@@ -628,6 +660,32 @@ def _command_result_succeeded(result: ToolResult) -> bool:
         and output.get("timed_out") is False
         and output.get("sandbox_error") in (None, "")
     )
+
+
+def _data_inspection_result_succeeded(
+    result: ToolResult,
+    *,
+    path: str,
+    expected_sha256: str,
+) -> bool:
+    output = result.structured_content
+    return bool(
+        not result.is_error
+        and isinstance(output, Mapping)
+        and output.get("valid") is True
+        and _normalized_workspace_relative_path(output.get("path")) == path
+        and output.get("sha256") == expected_sha256
+    )
+
+
+def _normalized_workspace_relative_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    path = PurePath(value)
+    if path.is_absolute() or ".." in path.parts:
+        return None
+    normalized = path.as_posix()
+    return None if normalized in {"", "."} else normalized
 
 
 def _is_verification_command(command: str) -> bool:

@@ -756,6 +756,101 @@ async def test_write_enabled_command_is_a_workspace_change_with_later_verificati
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
+    ("inspected_path", "inspected_sha256", "expected_action"),
+    [
+        ("analysis.xlsx", "e" * 64, "accept"),
+        ("unrelated.xlsx", "e" * 64, "block"),
+        ("analysis.xlsx", "f" * 64, "block"),
+    ],
+)
+async def test_generated_data_artifact_inspection_verifies_exact_latest_output(
+    inspected_path: str,
+    inspected_sha256: str,
+    expected_action: str,
+) -> None:
+    goal = GoalSpec(
+        original_query="Create and verify analysis.xlsx.",
+        constraints=[
+            GoalConstraint(
+                constraint_id="workspace_change",
+                constraint_type="workspace_change",
+                expected_value=True,
+            ),
+            GoalConstraint(
+                constraint_id="verification_after_change",
+                constraint_type="verification_after_change",
+                expected_value=True,
+            ),
+        ],
+    )
+    origin = ToolCallOrigin(
+        request_id="data-artifact-request",
+        toolset_revision="data-artifact-tools",
+        exposed_tool_names=("execute_python", "inspect_data_file"),
+    )
+    state = _state()
+    state["tool_results"] = [
+        ToolResult(
+            tool_call_id="write-data",
+            tool_name="execute_python",
+            structured_content={
+                "exit_code": 0,
+                "timed_out": False,
+                "sandbox_error": None,
+            },
+            metadata={
+                "runtime_workspace_write": True,
+                "workspace_tree_changed": True,
+                "workspace_tree_before_sha256": "c" * 64,
+                "workspace_tree_after_sha256": "d" * 64,
+                "runtime_workspace_file_changes": (
+                    {
+                        "path": "analysis.xlsx",
+                        "before_sha256": "a" * 64,
+                        "after_sha256": "e" * 64,
+                    },
+                ),
+            },
+        ),
+        ToolResult(
+            tool_call_id="inspect-data",
+            tool_name="inspect_data_file",
+            structured_content={
+                "path": inspected_path,
+                "valid": True,
+                "sha256": inspected_sha256,
+            },
+        ),
+    ]
+    state["canonical_tool_calls"] = {
+        "write-data": ToolCall(
+            tool_call_id="write-data",
+            tool_name="execute_python",
+            arguments={
+                "code": "create_workbook()",
+                "workspace_write": True,
+                "output_paths": ("analysis.xlsx",),
+            },
+            origin=origin,
+        ),
+        "inspect-data": ToolCall(
+            tool_call_id="inspect-data",
+            tool_name="inspect_data_file",
+            arguments={"path": inspected_path},
+            origin=origin,
+        ),
+    }
+
+    verdict = await GoalContractStopHook(goal_spec=goal).evaluate(
+        state=state,
+        candidate="Created and structurally verified analysis.xlsx.",
+    )
+
+    assert verdict.action == expected_action
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
     "late_write_metadata",
     [
         pytest.param(_tree_change_metadata(), id="current-attestation"),

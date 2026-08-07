@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import math
 import os
+import platform
 import signal
 import stat
+import sys
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -24,6 +26,7 @@ from agent_runtime.tools.tool import (
     ToolDefinition,
     ToolEffect,
     ToolTarget,
+    ToolValidationError,
     json_schema_output,
     pydantic_input,
 )
@@ -109,10 +112,119 @@ class RunCommandOutput(BaseModel):
     sandbox_error: str | None = None
 
 
+class ManagedPythonInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str = Field(
+        min_length=1,
+        max_length=100_000,
+        description=(
+            "Python source code executed directly by the managed Praxis "
+            "interpreter. Pass plain code, not a shell command or heredoc."
+        ),
+    )
+    working_dir: str = Field(
+        default=".",
+        max_length=4096,
+        description="Workspace-relative working directory for the Python code.",
+    )
+    output_paths: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Workspace-relative files the code intends to create or replace. "
+            "Required when workspace_write=true so the runtime can attest the "
+            "generated artifacts."
+        ),
+    )
+    timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=_MAX_COMMAND_TIMEOUT_SECONDS * _MILLISECONDS_PER_SECOND,
+        description=(
+            "Execution timeout in seconds. Values from 1000 through 600000 are "
+            "accepted as an unambiguous millisecond form and normalized to seconds."
+        ),
+    )
+    network: bool = Field(
+        default=False,
+        description=(
+            "Request outbound network access. It is disabled by default and "
+            "requires separate approval."
+        ),
+    )
+    workspace_write: bool = Field(
+        default=False,
+        description=(
+            "Request workspace write access. Enabling it is destructive and "
+            "requires explicit approval; .git, .venv, and node_modules remain "
+            "read-only."
+        ),
+    )
+
+    @field_validator("timeout_seconds")
+    @classmethod
+    def normalize_timeout_milliseconds(cls, value: float) -> float:
+        return RunCommandInput.normalize_timeout_milliseconds(value)
+
+
+class ManagedPythonOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stdout: str
+    stderr: str
+    exit_code: int
+    timed_out: bool
+    truncated: bool
+    duration_ms: float = Field(ge=0)
+    execution_mode: Literal["managed_python_sandbox"] = (
+        "managed_python_sandbox"
+    )
+    python_version: str
+    network_enabled: bool = False
+    sandbox_error: str | None = None
+
+
 _COMMAND_INPUT_SCHEMA, _validate_command_input = pydantic_input(RunCommandInput)
 _COMMAND_OUTPUT_SCHEMA, _unused_command_output_validator = pydantic_input(
     RunCommandOutput
 )
+_PYTHON_INPUT_SCHEMA, _validate_python_input_base = pydantic_input(
+    ManagedPythonInput
+)
+_PYTHON_OUTPUT_SCHEMA, _unused_python_output_validator = pydantic_input(
+    ManagedPythonOutput
+)
+
+
+def _validate_python_input(
+    arguments: Mapping[str, JsonValue],
+) -> Mapping[str, JsonValue]:
+    validated = _validate_python_input_base(arguments)
+    raw_paths = validated.get("output_paths")
+    output_paths = raw_paths if isinstance(raw_paths, tuple) else ()
+    if validated.get("workspace_write") is True and not output_paths:
+        raise ToolValidationError(
+            path="$.output_paths",
+            message="at least one output path is required when workspace_write=true",
+        )
+    for index, value in enumerate(output_paths):
+        if not isinstance(value, str) or not value.strip():
+            raise ToolValidationError(
+                path=f"$.output_paths[{index}]",
+                message="output path must be a non-empty string",
+            )
+        if len(value) > 4096:
+            raise ToolValidationError(
+                path=f"$.output_paths[{index}]",
+                message="output path must contain at most 4096 characters",
+            )
+    if len(set(output_paths)) != len(output_paths):
+        raise ToolValidationError(
+            path="$.output_paths",
+            message="output paths must be unique",
+        )
+    return validated
 
 
 def create_run_command_tool(
@@ -169,6 +281,66 @@ def create_run_command_tool(
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
         execution_revision="builtin-run-command-v6-protected-toolchain",
+        idempotent=False,
+        concurrency_safe=False,
+        cancellation_mode=CancellationMode.MANAGED_PROCESS,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=hard_timeout_seconds,
+        max_model_output_bytes=150_000,
+        approval_profile=ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
+    )
+
+
+def create_execute_python_tool(
+    workspace: WorkspaceRuntime,
+    *,
+    hard_timeout_seconds: float = 605.0,
+    termination_grace_seconds: float = 0.5,
+) -> Tool:
+    if (
+        isinstance(termination_grace_seconds, bool)
+        or not isinstance(termination_grace_seconds, (int, float))
+        or not math.isfinite(termination_grace_seconds)
+        or termination_grace_seconds <= 0
+    ):
+        raise ValueError("termination_grace_seconds must be positive and finite")
+
+    async def run(arguments: Mapping[str, JsonValue]) -> ManagedPythonOutput:
+        return await _execute_managed_python(
+            workspace,
+            ManagedPythonInput.model_validate(arguments),
+            termination_grace_seconds=float(termination_grace_seconds),
+        )
+
+    return Tool(
+        definition=ToolDefinition(
+            name="execute_python",
+            description=(
+                "Run plain Python source with the managed Praxis interpreter in "
+                "a restricted OS sandbox. Unlike run_command, this works when the "
+                "task workspace has no .venv and does not use shell heredocs. Use "
+                "it for spreadsheet transforms, PDF analysis, CSV/JSON processing, "
+                "statistics, and charts with the runtime's installed libraries "
+                "such as pandas, openpyxl, PyMuPDF, SciPy, and matplotlib. The "
+                "workspace is read-only by default. For generated files, set "
+                "workspace_write=true and list every intended output in "
+                "output_paths; then call inspect_data_file once on each required "
+                "artifact and finish. Do not invoke a shell or create a heredoc "
+                "from the Python code merely to repeat inspection."
+            ),
+            input_schema=_PYTHON_INPUT_SCHEMA,
+        ),
+        validate_input=_validate_python_input,
+        run=run,
+        normalize_output=_normalize_managed_python_output,
+        output_schema=_PYTHON_OUTPUT_SCHEMA,
+        static_effects=frozenset(
+            {ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}
+        ),
+        resolve_use=lambda arguments: _resolve_managed_python_use(
+            workspace, arguments
+        ),
+        execution_revision="builtin-execute-python-v1-managed-runtime",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -297,6 +469,139 @@ async def _run_command(
     return output
 
 
+async def _execute_managed_python(
+    workspace: WorkspaceRuntime,
+    request: ManagedPythonInput,
+    *,
+    termination_grace_seconds: float,
+) -> ManagedPythonOutput:
+    cwd = workspace.ensure_within_workspace(
+        workspace.resolve_path(request.working_dir or ".")
+    )
+    if not cwd.is_dir():
+        raise NotADirectoryError(
+            f"workspace working directory not found: {request.working_dir}"
+        )
+
+    started_at = time.monotonic()
+    if not (
+        os.path.isfile(_SANDBOX_EXEC_PATH)
+        and os.access(_SANDBOX_EXEC_PATH, os.X_OK)
+    ):
+        return _python_sandbox_error(
+            started_at=started_at,
+            message=(
+                "managed Python sandbox is unavailable; refusing unsandboxed "
+                "execution"
+            ),
+            code="sandbox_unavailable",
+        )
+
+    preflight_issue = _workspace_sandbox_preflight_issue(
+        workspace.root,
+        allow_workspace_write=request.workspace_write,
+    )
+    if preflight_issue is not None:
+        error_code, error_message = preflight_issue
+        return _python_sandbox_error(
+            started_at=started_at,
+            message=error_message,
+            code=error_code,
+        )
+
+    with tempfile.TemporaryDirectory(
+        prefix="run-python-",
+        dir=workspace.scratch,
+    ) as temporary_root:
+        script_path = Path(temporary_root) / "praxis_task.py"
+        script_path.write_text(request.code, encoding="utf-8")
+        environment = _command_environment(
+            workspace_root=workspace.root,
+            temporary_root=temporary_root,
+        )
+        environment["PYTHONNOUSERSITE"] = "1"
+        sandbox_profile = _build_command_sandbox_profile(
+            workspace_root=workspace.root,
+            temporary_root=temporary_root,
+            allow_network=request.network,
+            allow_workspace_write=request.workspace_write,
+            additional_read_roots=_runtime_python_read_roots(),
+        )
+        process = await asyncio.create_subprocess_exec(
+            _SANDBOX_EXEC_PATH,
+            "-p",
+            sandbox_profile,
+            sys.executable,
+            "-I",
+            "-B",
+            str(script_path),
+            cwd=str(cwd),
+            env=environment,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        communication = asyncio.create_task(process.communicate())
+        timed_out = False
+        try:
+            done, _pending = await asyncio.wait(
+                {communication},
+                timeout=request.timeout_seconds,
+            )
+            if communication not in done:
+                timed_out = True
+                await _terminate_process_group(
+                    process,
+                    grace_seconds=termination_grace_seconds,
+                )
+            stdout_bytes, stderr_bytes = await communication
+        except asyncio.CancelledError:
+            await _terminate_process_group(
+                process,
+                grace_seconds=termination_grace_seconds,
+            )
+            try:
+                await communication
+            except Exception:
+                pass
+            raise
+
+        stdout, stdout_truncated = _bounded_stream(stdout_bytes)
+        stderr, stderr_truncated = _bounded_stream(stderr_bytes)
+        if timed_out and not stderr:
+            stderr = "Python code timed out and its process group was terminated"
+        return ManagedPythonOutput(
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=(
+                process.returncode if process.returncode is not None else -1
+            ),
+            timed_out=timed_out,
+            truncated=stdout_truncated or stderr_truncated,
+            duration_ms=(time.monotonic() - started_at) * 1000,
+            python_version=platform.python_version(),
+            network_enabled=request.network,
+        )
+
+
+def _python_sandbox_error(
+    *,
+    started_at: float,
+    message: str,
+    code: str,
+) -> ManagedPythonOutput:
+    return ManagedPythonOutput(
+        stdout="",
+        stderr=message,
+        exit_code=-1,
+        timed_out=False,
+        truncated=False,
+        duration_ms=(time.monotonic() - started_at) * 1000,
+        python_version=platform.python_version(),
+        sandbox_error=code,
+    )
+
+
 def _command_environment(
     *,
     workspace_root: os.PathLike[str] | str,
@@ -342,6 +647,7 @@ def _build_command_sandbox_profile(
     temporary_root: os.PathLike[str] | str,
     allow_network: bool,
     allow_workspace_write: bool = False,
+    additional_read_roots: Sequence[os.PathLike[str] | str] = (),
 ) -> str:
     workspace = _escape_seatbelt_string(
         str(os.path.realpath(workspace_root))
@@ -349,9 +655,17 @@ def _build_command_sandbox_profile(
     temporary = _escape_seatbelt_string(
         str(os.path.realpath(temporary_root))
     )
+    trusted_roots = {
+        path.resolve() for path in _trusted_toolchain_roots(workspace_root)
+    }
+    trusted_roots.update(
+        Path(path).expanduser().resolve()
+        for path in additional_read_roots
+        if Path(path).expanduser().exists()
+    )
     trusted_toolchains = tuple(
         _escape_seatbelt_string(str(path))
-        for path in _trusted_toolchain_roots(workspace_root)
+        for path in sorted(trusted_roots, key=str)
     )
     trusted_toolchain_reads = "".join(
         f'  (subpath "{path}")\n' for path in trusted_toolchains
@@ -494,6 +808,20 @@ def _trusted_toolchain_roots(
                 trusted.add(root / relative.parts[0])
             break
     return tuple(sorted(trusted, key=str))
+
+
+def _runtime_python_read_roots() -> tuple[Path, ...]:
+    candidates = (
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.executable).parent.parent,
+    )
+    return tuple(
+        sorted(
+            {path.expanduser().resolve() for path in candidates if path.exists()},
+            key=str,
+        )
+    )
 
 
 def _workspace_sandbox_preflight_issue(
@@ -850,6 +1178,47 @@ def _resolve_command_use(
     )
 
 
+def _resolve_managed_python_use(
+    workspace: WorkspaceRuntime,
+    arguments: Mapping[str, JsonValue],
+) -> ResolvedToolUse:
+    cwd = workspace.ensure_within_workspace(
+        workspace.resolve_path(str(arguments["working_dir"]) or ".")
+    )
+    effects = {
+        ToolEffect.READ_WORKSPACE,
+        ToolEffect.EXECUTE_PROCESS,
+    }
+    output_targets: list[ToolTarget] = []
+    raw_output_paths = arguments.get("output_paths")
+    output_paths = raw_output_paths if isinstance(raw_output_paths, tuple) else ()
+    if arguments.get("workspace_write") is True:
+        effects.update({ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE})
+        for raw_path in output_paths:
+            if not isinstance(raw_path, str):
+                raise ValueError("output path must be a string")
+            target = workspace.ensure_within_workspace(
+                workspace.resolve_path(raw_path)
+            )
+            output_targets.append(
+                ToolTarget(kind="workspace_path", value=str(target))
+            )
+    else:
+        output_targets.append(
+            ToolTarget(kind="workspace_path", value=str(workspace.root))
+        )
+    if arguments.get("network") is True:
+        effects.add(ToolEffect.NETWORK)
+    return ResolvedToolUse(
+        effects=frozenset(effects),
+        targets=(
+            *output_targets,
+            ToolTarget(kind="cwd_path", value=str(cwd)),
+            ToolTarget(kind="execution_mode", value="restricted_sandbox"),
+        ),
+    )
+
+
 def _normalize_command_output(raw: object) -> NormalizedToolOutput:
     validated = RunCommandOutput.model_validate(raw)
     structured = json_schema_output(
@@ -887,8 +1256,49 @@ def _normalize_command_output(raw: object) -> NormalizedToolOutput:
     return NormalizedToolOutput(structured_content=structured)
 
 
+def _normalize_managed_python_output(raw: object) -> NormalizedToolOutput:
+    validated = ManagedPythonOutput.model_validate(raw)
+    structured = json_schema_output(
+        _PYTHON_OUTPUT_SCHEMA,
+        validated.model_dump(mode="json"),
+    )
+    if validated.timed_out:
+        return NormalizedToolOutput(
+            structured_content=structured,
+            is_error=True,
+            error_code="timeout_cancelled",
+            error_message=(
+                "Python code timed out and its process group was terminated"
+            ),
+            retryable=False,
+        )
+    if validated.sandbox_error is not None:
+        return NormalizedToolOutput(
+            structured_content=structured,
+            is_error=True,
+            error_code=validated.sandbox_error,
+            error_message=validated.stderr,
+            retryable=False,
+        )
+    if validated.exit_code != 0:
+        return NormalizedToolOutput(
+            structured_content=structured,
+            is_error=True,
+            error_code="python_failed",
+            error_message=(
+                f"Python code exited with status {validated.exit_code}; inspect "
+                "stdout/stderr and change the code rather than retrying unchanged"
+            ),
+            retryable=False,
+        )
+    return NormalizedToolOutput(structured_content=structured)
+
+
 __all__ = [
     "RunCommandInput",
     "RunCommandOutput",
+    "ManagedPythonInput",
+    "ManagedPythonOutput",
+    "create_execute_python_tool",
     "create_run_command_tool",
 ]

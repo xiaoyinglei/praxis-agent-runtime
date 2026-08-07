@@ -98,8 +98,10 @@ _NATIVE_TOOL_SET = frozenset(
         "list_files",
         "search_text",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
         "find_tools",
     }
@@ -107,8 +109,19 @@ _NATIVE_TOOL_SET = frozenset(
 
 _REPEATED_TOOL_FAILURE_CODE = "repeated_tool_failure"
 _MAX_RETRYABLE_IDENTICAL_FAILURES = 2
-_EXPLORATION_TOOL_NAMES = frozenset({"list_files", "search_text", "read_file", "run_command", "find_tools"})
-_STABLE_INSPECTION_TOOL_NAMES = frozenset({"list_files", "search_text", "read_file", "find_tools"})
+_EXPLORATION_TOOL_NAMES = frozenset(
+    {
+        "list_files",
+        "search_text",
+        "read_file",
+        "inspect_data_file",
+        "run_command",
+        "find_tools",
+    }
+)
+_STABLE_INSPECTION_TOOL_NAMES = frozenset(
+    {"list_files", "search_text", "read_file", "inspect_data_file", "find_tools"}
+)
 
 
 def _add_model_latency(state: LoopState, latency_ms: float) -> None:
@@ -1513,7 +1526,7 @@ def _guard_repeated_successful_inspections(
                     "current unchanged workspace state. Reuse that result. If "
                     "it shows the requested state and no distinct requirement "
                     "remains, finish now. Do not repeat the mutation or request "
-                    "run_command solely to reconfirm it. Do not switch to another "
+                    "run_command or execute_python solely to reconfirm it. Do not switch to another "
                     "inspection tool or pair positive and negative searches just "
                     "for stronger confirmation. Use another tool only for a "
                     "specific unmet requirement."

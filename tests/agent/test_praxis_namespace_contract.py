@@ -119,8 +119,10 @@ def test_coding_reference_tracks_the_current_praxis_runtime() -> None:
         "search_text",
         "list_files",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
         "find_tools",
     ):
