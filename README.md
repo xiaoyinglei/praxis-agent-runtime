@@ -76,6 +76,7 @@ agents. Deeper lifecycle details are in the
 | [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
 | [Tool-use reliability benchmark](docs/benchmark.md) | Five fixed, controlled ACI scenarios, repeated three times each | **PASSED — 15/15 scenario executions passed**; worst-trial mean tool calls 1.6 |
 | [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE PASS — 3/3 approval trials completed**; 2 tool calls per trial |
+| [Real non-code data ACI run](docs/runs/deepseek-v4-flash-data-aci.md) | One combined Excel, PDF, and statistical-analysis Turn with managed Python, approval, artifact read-back, and independent acceptance | **CONCLUSIVE FUNCTIONAL PASS — 3/3 artifacts accepted**; one trial, not a reliability benchmark |
 | [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
 
 The tool-use reliability page is generated from a clean source commit after the
@@ -251,6 +252,7 @@ Focused references:
 - [Product contract](docs/design/agent_product_contract.md) — public lifecycle and boundaries
 - [Tool-use reliability benchmark](docs/benchmark.md) — plain-language scenarios, scope, and current live result
 - [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) — human-readable approval-continuation evidence
+- [Real non-code data ACI run](docs/runs/deepseek-v4-flash-data-aci.md) — one real combined Excel/PDF/statistics Turn with independent artifact acceptance
 - [Evaluation archive](docs/EVALUATION.md) — historical retrieval baselines with provenance notes
 - [MIT license](LICENSE) — use and redistribution terms
 
