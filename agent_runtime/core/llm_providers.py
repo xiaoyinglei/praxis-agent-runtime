@@ -290,12 +290,7 @@ class LLMLoopModelTurnProvider:
             provider_wire_hash=response.provider_wire_hash,
             usage=response.usage,
         )
-        assistant_message = ModelMessage(
-            role="assistant",
-            content=turn.text,
-            reasoning_content=turn.reasoning_content,
-            tool_calls=tuple(turn.tool_calls),
-        )
+        assistant_message = _assistant_message_from_turn(turn)
         return ModelTurnEnvelope(
             draft=_draft_from_turn(turn, request=request),
             request=request,
@@ -988,6 +983,31 @@ def _draft_from_turn(
     return ModelTurnDraft(
         action="finish",
         final_answer=turn.text or "The model returned an empty final response.",
+    )
+
+
+def _assistant_message_from_turn(turn: ToolUseResult) -> ModelMessage | None:
+    """Return only provider-replayable assistant history.
+
+    Some reasoning models can consume their entire output budget before
+    producing visible content or a tool call.  Persisting that response as an
+    assistant message leaves ``content=null`` and no ``tool_calls`` on resume,
+    which OpenAI-compatible providers reject.  The model-call record and pause
+    reason still preserve what happened; the unusable wire message must not
+    enter canonical conversation history.
+    """
+
+    if (
+        turn.stop_reason is StopReason.MAX_TOKENS
+        and not turn.text
+        and not turn.tool_calls
+    ):
+        return None
+    return ModelMessage(
+        role="assistant",
+        content=turn.text,
+        reasoning_content=turn.reasoning_content,
+        tool_calls=tuple(turn.tool_calls),
     )
 
 

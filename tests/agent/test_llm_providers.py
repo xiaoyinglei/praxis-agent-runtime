@@ -236,3 +236,36 @@ async def test_model_defaults_and_reasoning_continuation_reach_canonical_message
         content="",
         reasoning_content="I should inspect README.md first.",
     )
+
+
+@pytest.mark.anyio
+async def test_max_tokens_reasoning_only_is_not_persisted_as_empty_assistant_message() -> None:
+    gateway = _CanonicalGateway(
+        ToolUseResult(
+            text="",
+            reasoning_content="I ran out of budget before emitting the next tool call.",
+            tool_calls=[],
+            stop_reason=StopReason.MAX_TOKENS,
+            raw_stop_reason="length",
+        )
+    )
+    provider = LLMLoopModelTurnProvider(
+        gateway,
+        model="deepseek-v4-flash",
+        provider="openai-compatible",
+        supports_native_tools=True,
+        registry_snapshot=MappingProxyType({}),
+        resident_tool_names=(),
+    )
+
+    envelope = await provider.next_turn(
+        _state(),
+        definition=_definition(),
+        budget_remaining=10_000,
+    )
+
+    assert envelope.draft.action == "pause"
+    assert envelope.draft.pause_reason == (
+        "Model output reached its configured token limit."
+    )
+    assert envelope.assistant_message is None
