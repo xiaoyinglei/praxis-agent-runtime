@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from rag.agent.core.messages import ModelMessage
+from rag.agent.streaming.events import (
+    EventType,
+    ItemStatus,
+    TurnItemKind,
+    item_completed,
+)
 from rag.agent.turns import (
     RuntimeBinding,
     TurnStateError,
@@ -113,6 +121,178 @@ def test_turn_store_persists_runtime_lineage_and_messages(tmp_path: Path) -> Non
     assert restored.get_turn(first.turn_id).runtime == runtime
     assert restored.history_before_turn(second.turn_id)[-1].content == "answer"
     restored.close()
+
+
+def test_turn_store_replays_one_shared_durable_order_across_items_and_lifecycle(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    store = TurnStore(database)
+    turn = store.begin_turn("start", _runtime(tmp_path))
+    commit_item = getattr(store, "commit_completed_item", None)
+    replay_turn = getattr(store, "replay_turn_events", None)
+    assert commit_item is not None
+    assert replay_turn is not None
+
+    first_item = item_completed(
+        turn_id=turn.turn_id,
+        item_id="agent:first",
+        item_kind=TurnItemKind.AGENT_MESSAGE,
+        status=ItemStatus.SUCCESS,
+        iteration=1,
+        data={"content": "first", "tool_calls": []},
+    )
+    first_ordinal = commit_item(
+        first_item,
+        message=ModelMessage(role="assistant", content="first"),
+        started_at_ms=first_item.timestamp_ms - 5,
+    )
+    store.mark_paused(turn.turn_id)
+    store.claim_for_resume(
+        turn.turn_id,
+        lease_owner="worker-2",
+        lease_seconds=30,
+    )
+    second_item = item_completed(
+        turn_id=turn.turn_id,
+        item_id="agent:second",
+        item_kind=TurnItemKind.AGENT_MESSAGE,
+        status=ItemStatus.SUCCESS,
+        iteration=2,
+        data={"content": "second", "tool_calls": []},
+    )
+    second_ordinal = commit_item(
+        second_item,
+        message=ModelMessage(role="assistant", content="second"),
+        started_at_ms=second_item.timestamp_ms - 5,
+    )
+    store.mark_terminal(turn.turn_id, TurnStatus.COMPLETED)
+
+    replayed = replay_turn(turn.turn_id)
+    assert first_ordinal == 1
+    assert second_ordinal == 4
+    assert [record.durable_ordinal for record in replayed] == list(range(6))
+    assert [record.event.type for record in replayed] == [
+        EventType.TURN_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_PAUSED,
+        EventType.TURN_RESUMED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
+    ]
+    assert store.turn_history(turn.turn_id) == (
+        ModelMessage(role="user", content="start"),
+        ModelMessage(role="assistant", content="first"),
+        ModelMessage(role="assistant", content="second"),
+    )
+    store.close()
+
+    reopened = TurnStore(database)
+    assert [
+        record.event.type for record in reopened.replay_turn_events(turn.turn_id)
+    ] == [record.event.type for record in replayed]
+    reopened.close()
+
+
+def test_completed_item_commit_is_idempotent_but_divergence_fails_closed(
+    tmp_path: Path,
+) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    turn = store.begin_turn("idempotent", _runtime(tmp_path))
+    commit_item = getattr(store, "commit_completed_item", None)
+    assert commit_item is not None
+    event = item_completed(
+        turn_id=turn.turn_id,
+        item_id="tool:one",
+        item_kind=TurnItemKind.TOOL,
+        status=ItemStatus.SUCCESS,
+        data={"result": "ok"},
+    )
+
+    first = commit_item(event, started_at_ms=10)
+    same_delivery_with_new_timestamp = item_completed(
+        turn_id=turn.turn_id,
+        item_id="tool:one",
+        item_kind=TurnItemKind.TOOL,
+        status=ItemStatus.SUCCESS,
+        data={"result": "ok"},
+    )
+    assert commit_item(same_delivery_with_new_timestamp, started_at_ms=10) == first
+
+    divergent = item_completed(
+        turn_id=turn.turn_id,
+        item_id="tool:one",
+        item_kind=TurnItemKind.TOOL,
+        status=ItemStatus.SUCCESS,
+        data={"result": "different"},
+    )
+    with pytest.raises(RuntimeError, match="completed item conflict"):
+        commit_item(divergent, started_at_ms=10)
+    assert len(store.replay_turn_events(turn.turn_id)) == 2
+    store.close()
+
+
+def test_pre_v2_turn_database_is_transactionally_projected_for_replay(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "legacy.sqlite"
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE agent_turns (
+            turn_id TEXT PRIMARY KEY,
+            previous_turn_id TEXT,
+            status TEXT NOT NULL,
+            user_message TEXT NOT NULL,
+            runtime_json TEXT NOT NULL,
+            lease_owner TEXT,
+            lease_expires_at REAL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE agent_turn_messages (
+            turn_id TEXT NOT NULL,
+            message_index INTEGER NOT NULL,
+            payload_json TEXT NOT NULL,
+            PRIMARY KEY(turn_id, message_index)
+        );
+        """
+    )
+    turn_id = "00000000-0000-4000-8000-000000000001"
+    connection.execute(
+        """
+        INSERT INTO agent_turns VALUES (?, NULL, 'completed', ?, ?, NULL, NULL, 1.0, 2.0)
+        """,
+        (turn_id, "legacy user", _runtime(tmp_path).model_dump_json()),
+    )
+    for index, message in enumerate(
+        (
+            {"role": "user", "content": "legacy user", "tool_calls": []},
+            {"role": "assistant", "content": "legacy answer", "tool_calls": []},
+        )
+    ):
+        connection.execute(
+            "INSERT INTO agent_turn_messages VALUES (?, ?, ?)",
+            (turn_id, index, json.dumps(message, separators=(",", ":"))),
+        )
+    connection.commit()
+    connection.close()
+
+    store = TurnStore(database)
+    replayed = store.replay_turn_events(turn_id)
+    assert [record.durable_ordinal for record in replayed] == [0, 1, 2, 3]
+    assert [record.event.type for record in replayed] == [
+        EventType.TURN_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
+    ]
+    assert all(
+        record.event.item_kind is TurnItemKind.LEGACY_MESSAGE
+        for record in replayed[1:3]
+    )
+    assert store.get_turn(turn_id).status is TurnStatus.COMPLETED
+    store.close()
 
 
 def test_turn_status_and_resume_lease_lifecycle(tmp_path: Path) -> None:
