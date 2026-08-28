@@ -6,7 +6,14 @@ from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentResult, AgentUsage
-from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+)
+from agent_runtime.streaming.sink import LegacyStreamProjectionSink
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -27,10 +34,14 @@ __all__ = [
     "AgentResult",
     "AgentUsage",
     "EventType",
+    "ItemDeltaKind",
+    "ItemStatus",
+    "LegacyStreamProjectionSink",
     "ModelNotAvailableError",
     "ModelSpec",
     "PlanEvent",
     "PlanStep",
     "RAGKnowledgeConfig",
     "StreamEvent",
+    "TurnItemKind",
 ]

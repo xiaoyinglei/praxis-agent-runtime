@@ -715,7 +715,7 @@ def _demo_event_lines(
     status: str,
     answer: str | None,
 ) -> tuple[tuple[str, ...], str]:
-    from agent_runtime import EventType
+    from agent_runtime import EventType, ItemStatus, TurnItemKind
 
     lines: list[str] = []
     phases_by_tool_id: dict[str, str] = {}
@@ -725,6 +725,51 @@ def _demo_event_lines(
         event_type = getattr(event, "type", None)
         data = getattr(event, "data", {})
         if not isinstance(data, Mapping):
+            continue
+        item_kind = getattr(event, "item_kind", None)
+        if (
+            event_type is EventType.ITEM_STARTED
+            and item_kind in {TurnItemKind.TOOL, TurnItemKind.COMMAND}
+        ):
+            tool_name = str(data.get("tool_name", item_kind.value))
+            tool_id = str(getattr(event, "item_id", "") or "")
+            if tool_name == "read_file":
+                phase = "inspect" if read_count == 0 else "verify"
+                read_count += 1
+            elif tool_name == "apply_patch":
+                phase = "patch"
+            else:
+                phase = "verify"
+            phases_by_tool_id[tool_id] = phase
+            subject = _demo_event_subject(
+                tool_name,
+                str(data.get("input_preview", "")),
+            )
+            suffix = f" {subject}" if subject else ""
+            lines.append(f"[{phase}] tool:start {tool_name}{suffix}")
+            continue
+        if (
+            event_type is EventType.ITEM_COMPLETED
+            and item_kind in {TurnItemKind.TOOL, TurnItemKind.COMMAND}
+        ):
+            tool_id = str(getattr(event, "item_id", "") or "")
+            result = data.get("result")
+            result_data = result if isinstance(result, Mapping) else {}
+            tool_name = str(result_data.get("tool_name", item_kind.value))
+            phase = phases_by_tool_id.get(tool_id, "verify")
+            if getattr(event, "status", None) is ItemStatus.SUCCESS:
+                lines.append(f"[{phase}] tool:ok {tool_name}")
+                metadata = result_data.get("metadata")
+                if tool_name == "apply_patch" and isinstance(metadata, Mapping):
+                    raw_diff = metadata.get("diff")
+                    if isinstance(raw_diff, str):
+                        workspace_diff = _sanitize_demo_diff(raw_diff)
+            else:
+                lines.append(f"[{phase}] tool:error")
+            continue
+        if event_type is EventType.TURN_COMPLETED:
+            reason = _sanitize_demo_fragment(data.get("reason", data.get("status", "unknown")))
+            lines.append(f"[complete] turn:end reason={reason}")
             continue
         if event_type is EventType.TOOL_USE_START:
             tool_name = str(data.get("tool_name", "tool"))

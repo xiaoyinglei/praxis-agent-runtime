@@ -74,8 +74,15 @@ from agent_runtime.memory.store import WorkspaceMemoryStore
 from agent_runtime.planning import AgentPlan, PlanEvent
 from agent_runtime.skills.catalog import SkillCatalog
 from agent_runtime.skills.runtime import SkillRuntime
-from agent_runtime.streaming.events import StreamEvent
-from agent_runtime.streaming.sink import StreamEventSink
+from agent_runtime.streaming.events import (
+    EventType,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    item_completed,
+    item_started,
+)
+from agent_runtime.streaming.sink import DurableStreamEventSink, StreamEventSink
 from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
 from agent_runtime.tools.executor import (
     ExecutionStatus,
@@ -102,6 +109,19 @@ from agent_runtime.workspace import (
 logger = logging.getLogger(__name__)
 _TURN_LEASE_SECONDS = 300.0
 _TURN_LEASE_HEARTBEAT_SECONDS = 60.0
+_PUBLIC_STREAM_EVENT_TYPES = frozenset(
+    {
+        EventType.TURN_STARTED,
+        EventType.TURN_PAUSED,
+        EventType.TURN_RESUMED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_COMPLETED,
+        EventType.TURN_ABORTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    }
+)
 type _ResumeDecision = Literal[
     "allow_once",
     "deny",
@@ -349,8 +369,10 @@ class AgentService:
             turn_id = effective_request.turn_id
             if turn_id is None:
                 raise RuntimeError("Turn allocation did not produce a turn_id")
-            async for event in self._execute_streaming(effective_request):
-                yield event
+            stream = self._execute_streaming(effective_request)
+            async with aclosing(stream) as events:
+                async for event in events:
+                    yield event
 
     @asynccontextmanager
     async def _open_turn(
@@ -384,7 +406,7 @@ class AgentService:
             )
             yield effective_request
         except (asyncio.CancelledError, GeneratorExit):
-            self._interrupt_turn(turn.turn_id)
+            self._abort_turn(turn.turn_id)
             raise
         except Exception:
             self._fail_turn(turn.turn_id)
@@ -430,6 +452,17 @@ class AgentService:
         lease_task = self._start_lease_heartbeat(run_config)
         state: LoopState | None = None
         workspace: WorkspaceRuntime | None = None
+        durable_sink: DurableStreamEventSink | None = None
+        finalized = False
+
+        def _wrap_stream_sink(live_sink: StreamEventSink) -> StreamEventSink:
+            nonlocal durable_sink
+            durable_sink = DurableStreamEventSink(
+                turn_store=self._turn_store,
+                live_sink=live_sink,
+            )
+            return durable_sink
+
         try:
             (
                 state,
@@ -442,9 +475,38 @@ class AgentService:
                 request,
                 run_config=run_config,
             )
-            async for event in loop.run_streaming(state):
-                yield event
+            yield self._turn_store.replay_turn_events(run_config.turn_id)[0].event
+            loop_events = loop.run_streaming(
+                state,
+                sink_wrapper=_wrap_stream_sink,
+            )
+            async with aclosing(loop_events) as active_events:
+                async for event in active_events:
+                    if event.type in _PUBLIC_STREAM_EVENT_TYPES:
+                        yield event
+            self._finalize_state(
+                state,
+                started_at=started_at,
+                tool_trace_start=tool_trace_start,
+            )
+            if state["status"] == "paused":
+                await checkpoint_store.save_snapshot(
+                    state,
+                    reason="service_pause_finalized",
+                )
+            if state["status"] in {"completed", "failed"}:
+                TurnRegistry.remove(run_config.turn_id)
+            if state["status"] != "running":
+                self._sync_turn(state)
+                finalized = True
+                yield self._turn_store.replay_turn_events(
+                    run_config.turn_id
+                )[-1].event
+            if workspace is not None:
+                self._workspace_by_turn[run_config.turn_id] = workspace
         except (asyncio.CancelledError, GeneratorExit):
+            if durable_sink is not None:
+                await durable_sink.close_open_items()
             TurnRegistry.remove(run_config.turn_id)
             raise
         except Exception:
@@ -452,7 +514,7 @@ class AgentService:
             raise
         finally:
             try:
-                if state is not None:
+                if state is not None and not finalized:
                     self._finalize_state(
                         state,
                         started_at=started_at,
@@ -508,7 +570,16 @@ class AgentService:
                 request,
                 run_config=run_config,
             )
-            result_state = await loop.run(state)
+            if self._stream_sink is not None:
+                await self._stream_sink.emit(
+                    self._turn_store.replay_turn_events(
+                        run_config.turn_id
+                    )[0].event
+                )
+            result_state = await self._run_loop_with_canonical_history(
+                loop,
+                state,
+            )
         except asyncio.CancelledError:
             TurnRegistry.remove(run_config.turn_id)
             raise
@@ -528,12 +599,41 @@ class AgentService:
         if result_state["status"] in {"completed", "failed"}:
             TurnRegistry.remove(run_config.turn_id)
         self._sync_turn(result_state)
+        if self._stream_sink is not None:
+            await self._stream_sink.emit(
+                self._turn_store.replay_turn_events(
+                    run_config.turn_id
+                )[-1].event
+            )
         self._workspace_by_turn[run_config.turn_id] = workspace
         return AgentRunResult.from_loop_result(
             result_state,
             definition=self._policy,
             workspace_path=str(workspace.root),
         )
+
+    async def _run_loop_with_canonical_history(
+        self,
+        loop: AgentLoop,
+        state: LoopState,
+    ) -> LoopState:
+        """Run one execution phase through the canonical durable Item sink."""
+
+        loop_events = loop.run_streaming(
+            state,
+            sink_wrapper=lambda live_sink: DurableStreamEventSink(
+                turn_store=self._turn_store,
+                live_sink=live_sink,
+            ),
+        )
+        async with aclosing(loop_events) as active_events:
+            async for event in active_events:
+                if (
+                    self._stream_sink is not None
+                    and event.type in _PUBLIC_STREAM_EVENT_TYPES
+                ):
+                    await self._stream_sink.emit(event)
+        return state
 
     def _sync_turn(self, state: LoopState) -> None:
         run_config = state["run_config"]
@@ -567,6 +667,14 @@ class AgentService:
         turn = self._turn_store.get_turn(turn_id)
         if turn.status is TurnStatus.RUNNING:
             self._turn_store.mark_interrupted(turn_id)
+
+    def _abort_turn(self, turn_id: str) -> None:
+        turn = self._turn_store.get_turn(turn_id)
+        if turn.status is TurnStatus.RUNNING:
+            self._turn_store.mark_aborted(
+                turn_id,
+                reason="stream_cancelled",
+            )
 
     def _fail_turn(self, turn_id: str) -> None:
         turn = self._turn_store.get_turn(turn_id)
@@ -942,6 +1050,16 @@ class AgentService:
             raise RuntimeError(f"Checkpoint identity does not match Turn {turn_id}")
         current_request = _resume_request(restored)
         resolving_reconciliation = current_request is not None and current_request.kind == "tool_reconciliation"
+        reconciliation_tool_call_id = (
+            current_request.context.get("tool_call_id")
+            if resolving_reconciliation and current_request is not None
+            else None
+        )
+        reconciliation_record = (
+            restored["tool_execution_records"].get(reconciliation_tool_call_id)
+            if isinstance(reconciliation_tool_call_id, str)
+            else None
+        )
         if action != "abort" and not resolving_reconciliation:
             drift_result = await self._reconcile_manifest(
                 restored,
@@ -961,6 +1079,10 @@ class AgentService:
         )
         lease_task = self._start_turn_lease_heartbeat(turn_id)
         try:
+            if self._stream_sink is not None:
+                await self._stream_sink.emit(
+                    self._turn_store.replay_turn_events(turn_id)[-1].event
+                )
             if response is not None:
                 state = await checkpoint_store.apply_human_response(response)
             else:
@@ -969,6 +1091,58 @@ class AgentService:
                 state["pause"] = None
                 state["approval_request"] = None
                 state["approval_response"] = None
+            if (
+                resolving_reconciliation
+                and response is not None
+                and reconciliation_record is not None
+            ):
+                prefix = (
+                    "command"
+                    if reconciliation_record.tool_name == "run_command"
+                    else "tool"
+                )
+                parent_item_id = (
+                    f"{prefix}:{turn_id}:{reconciliation_record.tool_call_id}:"
+                    f"{reconciliation_record.attempt_count}"
+                )
+                reconciliation_item_id = (
+                    f"reconciliation:{turn_id}:{response.request_id}"
+                )
+                completed = item_completed(
+                    turn_id=turn_id,
+                    item_id=reconciliation_item_id,
+                    item_kind=TurnItemKind.RECONCILIATION,
+                    status=ItemStatus.SUCCESS,
+                    data={
+                        "tool_call_id": reconciliation_record.tool_call_id,
+                        "operation_id": reconciliation_record.operation_id,
+                        "decision": response.decision,
+                    },
+                    iteration=state["iteration"],
+                    parent_item_id=parent_item_id,
+                )
+                if self._stream_sink is None:
+                    self._turn_store.commit_completed_item(completed)
+                else:
+                    reconciliation_sink = DurableStreamEventSink(
+                        turn_store=self._turn_store,
+                        live_sink=self._stream_sink,
+                    )
+                    try:
+                        await reconciliation_sink.emit(
+                            item_started(
+                                turn_id=turn_id,
+                                item_id=reconciliation_item_id,
+                                item_kind=TurnItemKind.RECONCILIATION,
+                                iteration=state["iteration"],
+                                data={"decision": response.decision},
+                                parent_item_id=parent_item_id,
+                            )
+                        )
+                        await reconciliation_sink.emit(completed)
+                    except BaseException:
+                        await reconciliation_sink.close_open_items()
+                        raise
             self._hydrate_turn_state(state, turn_id=turn_id)
             if user_input is not None and not abort:
                 message = ModelMessage(role="user", content=user_input)
@@ -1001,7 +1175,17 @@ class AgentService:
                     state,
                     reason="user_aborted",
                 )
-                self._sync_turn(state)
+                self._turn_store.sync_turn_messages(
+                    turn_id,
+                    state["turn_transcript"],
+                )
+                self._turn_store.mark_aborted(
+                    turn_id,
+                    reason="user_aborted",
+                )
+                if self._stream_sink is not None:
+                    for record in self._turn_store.replay_turn_events(turn_id)[-2:]:
+                        await self._stream_sink.emit(record.event)
                 TurnRegistry.remove(turn_id)
                 workspace = self._workspace or create_temp_workspace()
                 return AgentRunResult.from_loop_result(
@@ -1020,6 +1204,10 @@ class AgentService:
                 workspace=workspace,
                 started_at=started_at,
             )
+        except (asyncio.CancelledError, GeneratorExit):
+            self._abort_turn(turn_id)
+            TurnRegistry.remove(turn_id)
+            raise
         except BaseException:
             self._interrupt_turn(turn_id)
             TurnRegistry.remove(turn_id)
@@ -1051,7 +1239,7 @@ class AgentService:
             workspace=workspace,
         )
         tool_trace_start = len(self._tool_executor.traces)
-        result_state = await loop.run(state)
+        result_state = await self._run_loop_with_canonical_history(loop, state)
         self._finalize_state(
             result_state,
             started_at=started_at,
@@ -1065,6 +1253,10 @@ class AgentService:
         if result_state["status"] in {"completed", "failed"}:
             TurnRegistry.remove(turn_id)
         self._sync_turn(result_state)
+        if self._stream_sink is not None:
+            await self._stream_sink.emit(
+                self._turn_store.replay_turn_events(turn_id)[-1].event
+            )
         self._workspace_by_turn[turn_id] = workspace
         return AgentRunResult.from_loop_result(
             result_state,
@@ -1081,7 +1273,10 @@ class AgentService:
         turn = self._turn_store.get_turn(turn_id)
         before = self._turn_store.history_before_turn(turn_id)
         persisted_turn = self._turn_store.turn_history(turn_id)
-        checkpoint_turn = tuple(state.get("turn_transcript", ()))
+        checkpoint_turn = tuple(
+            snapshot_model_message(message)
+            for message in state.get("turn_transcript", ())
+        )
         if checkpoint_turn[: len(persisted_turn)] == persisted_turn:
             current = checkpoint_turn
         elif persisted_turn[: len(checkpoint_turn)] == checkpoint_turn:

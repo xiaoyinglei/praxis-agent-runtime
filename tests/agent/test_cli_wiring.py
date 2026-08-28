@@ -24,7 +24,13 @@ from agent_runtime.runtime.builder import build_agent_service
 from agent_runtime.service import AgentRunRequest
 from agent_runtime.streaming.events import (
     EventType,
+    ItemDeltaKind,
+    ItemStatus,
     StreamEvent,
+    TurnItemKind,
+    item_completed,
+    item_delta,
+    item_started,
     recovery_event,
     text_delta,
     tool_use_error,
@@ -88,6 +94,54 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
         store.close()
         if agent._model_control_plane is not None:
             agent._model_control_plane.close()
+
+
+@pytest.mark.anyio
+async def test_cli_renders_canonical_text_tool_and_plan_items(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = _CLIToolEventDisplay()
+    await display.emit(
+        item_delta(
+            turn_id="turn-1",
+            item_id="agent:turn-1:1",
+            item_kind=TurnItemKind.AGENT_MESSAGE,
+            delta_kind=ItemDeltaKind.TEXT,
+            delta="answer\n",
+        )
+    )
+    await display.emit(
+        item_started(
+            turn_id="turn-1",
+            item_id="tool:turn-1:call-1:1",
+            item_kind=TurnItemKind.TOOL,
+            data={"tool_name": "read_file", "input_preview": "path='a.py'"},
+        )
+    )
+    await display.emit(
+        item_completed(
+            turn_id="turn-1",
+            item_id="tool:turn-1:call-1:1",
+            item_kind=TurnItemKind.TOOL,
+            status=ItemStatus.SUCCESS,
+            data={"result": {"tool_name": "read_file", "structured_content": {"ok": True}}},
+        )
+    )
+    await display.emit(
+        item_completed(
+            turn_id="turn-1",
+            item_id="update_plan:turn-1:2",
+            item_kind=TurnItemKind.PLAN,
+            status=ItemStatus.SUCCESS,
+            data={"plan": {"revision": 2, "steps": []}, "event": {}},
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "answer" in output
+    assert "→ read_file: path='a.py'" in output
+    assert "✓ read_file: {'ok': True}" in output
+    assert "计划 (revision 2)" in output
 
 
 @pytest.mark.parametrize(

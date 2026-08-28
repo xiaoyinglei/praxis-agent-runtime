@@ -17,6 +17,7 @@ from agent_runtime.core.observations import (
     runtime_workspace_change,
     runtime_workspace_file_changes,
 )
+from agent_runtime.tools.builtins import shell as shell_module
 from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.executor import (
     ExecutionBoundary,
@@ -43,6 +44,8 @@ from agent_runtime.tools.tool import (
     ToolContentBlock,
     ToolDefinition,
     ToolEffect,
+    ToolProgress,
+    ToolProgressKind,
     ToolTarget,
     ToolValidationError,
 )
@@ -84,6 +87,7 @@ def _tool(
     *,
     validate_input: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     run: Callable[[Mapping[str, Any]], object] | None = None,
+    stream: Callable[..., object] | None = None,
     normalize_output: Callable[[object], NormalizedToolOutput] | None = None,
     resolve_use: Callable[[Mapping[str, Any]], ResolvedToolUse] | None = None,
     static_effects: frozenset[ToolEffect] = frozenset({ToolEffect.READ_WORKSPACE}),
@@ -123,6 +127,7 @@ def _tool(
         timeout_seconds=timeout_seconds,
         max_model_output_bytes=max_model_output_bytes,
         approval_profile=approval_profile,
+        stream=stream,
     )
 
 
@@ -280,6 +285,52 @@ async def test_execution_record_is_prepared_then_started_before_runner() -> None
     ]
     assert execution.record is not None
     assert execution.record.status is ExecutionStatus.COMPLETED
+
+
+@pytest.mark.anyio
+async def test_streaming_runner_is_awaited_after_started_record() -> None:
+    events: list[str] = []
+
+    async def record_sink(record: ToolExecutionRecord) -> None:
+        events.append(f"record:{record.status.value}")
+
+    async def progress_sink(progress: ToolProgress) -> None:
+        events.append(f"progress:{progress.kind.value}:{progress.content}")
+
+    async def stream_runner(
+        arguments: Mapping[str, Any],
+        sink: Callable[[ToolProgress], object],
+    ) -> object:
+        events.append("stream_runner")
+        await sink(ToolProgress(ToolProgressKind.PROGRESS, str(arguments["value"])))
+        return {"value": "done"}
+
+    executor = ToolExecutor(
+        {
+            "demo": _tool(
+                run=lambda _arguments: (_ for _ in ()).throw(
+                    AssertionError("non-stream runner must not execute")
+                ),
+                stream=stream_runner,
+            )
+        }
+    )
+
+    execution = await executor.execute(
+        _call(),
+        context=_context(),
+        record_sink=record_sink,
+        progress_sink=progress_sink,
+    )
+
+    assert events == [
+        "record:prepared",
+        "record:started",
+        "stream_runner",
+        "progress:progress:ok",
+        "record:completed",
+    ]
+    assert execution.result.is_error is False
 
 
 @pytest.mark.anyio
@@ -896,6 +947,49 @@ async def test_sandbox_auto_approval_keeps_network_approval_separate(
 
     assert execution.result.error_code == "approval_required"
     assert execution.result.metadata["approval_scope"] == "network"
+
+
+@pytest.mark.anyio
+async def test_run_command_streams_stdout_and_stderr_before_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sandbox = tmp_path / "sandbox-exec"
+    sandbox.write_text(
+        "#!/bin/sh\nshift 2\nexec \"$@\"\n",
+        encoding="utf-8",
+    )
+    sandbox.chmod(0o755)
+    monkeypatch.setattr(shell_module, "_SANDBOX_EXEC_PATH", str(sandbox))
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    tool = create_run_command_tool(workspace)
+    call = _call(
+        "run_command",
+        arguments={
+            "command": "printf stdout-value; printf stderr-value >&2",
+        },
+    )
+    progress: list[ToolProgress] = []
+
+    async def progress_sink(item: ToolProgress) -> None:
+        progress.append(item)
+
+    execution = await ToolExecutor({"run_command": tool}).execute(
+        call,
+        context=_context(
+            workspace_root=workspace.root,
+            auto_approve_sandboxed=True,
+        ),
+        progress_sink=progress_sink,
+    )
+
+    assert [(item.kind, item.content) for item in progress] == [
+        (ToolProgressKind.STDOUT, "stdout-value"),
+        (ToolProgressKind.STDERR, "stderr-value"),
+    ]
+    assert execution.result.is_error is False
+    assert execution.result.structured_content["stdout"] == "stdout-value"
+    assert execution.result.structured_content["stderr"] == "stderr-value"
 
 
 @pytest.mark.anyio

@@ -5,7 +5,7 @@ import hashlib
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -69,23 +69,34 @@ from agent_runtime.planning import (
 )
 from agent_runtime.streaming.events import (
     EventType,
+    ItemDeltaKind,
+    ItemStatus,
     StreamEvent,
-    compact_layer,
-    loop_end,
+    TurnItemKind,
+    item_completed,
+    item_delta,
+    item_started,
     next_sequence,
-    recovery_event,
-    tool_use_error,
-    tool_use_result,
-    tool_use_start,
-    turn_end,
-    turn_start,
 )
 from agent_runtime.streaming.sink import StreamEventSink
 from agent_runtime.tools.builtins.planning import UpdatePlanInput
-from agent_runtime.tools.executor import ToolExecutionRecord, ToolExecutor
+from agent_runtime.tools.executor import (
+    ExecutionStatus,
+    ToolExecution,
+    ToolExecutionRecord,
+    ToolExecutor,
+)
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.selection import FIND_TOOLS_NAME, reduce_tool_activation
-from agent_runtime.tools.tool import JsonValue, Tool, ToolCall, ToolCallOrigin, ToolResult
+from agent_runtime.tools.tool import (
+    JsonValue,
+    Tool,
+    ToolCall,
+    ToolCallOrigin,
+    ToolProgress,
+    ToolProgressKind,
+    ToolResult,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -215,13 +226,18 @@ class AgentLoop:
         if self._stream_sink is not None:
             await self._stream_sink.emit(event)
 
-    async def run_streaming(self, state: LoopState) -> AsyncGenerator[StreamEvent, None]:
+    async def run_streaming(
+        self,
+        state: LoopState,
+        *,
+        sink_wrapper: Callable[[StreamEventSink], StreamEventSink] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Yield StreamEvents as the loop runs.  One queue sink, no monkey patches."""
         from agent_runtime.streaming.sink import QueueStreamEventSink
 
         sink = QueueStreamEventSink()
         original = self._stream_sink
-        self._set_stream_sink(sink)
+        self._set_stream_sink(sink if sink_wrapper is None else sink_wrapper(sink))
 
         run_task: asyncio.Task[LoopState] | None = None
         try:
@@ -239,13 +255,24 @@ class AgentLoop:
             await run_task
 
         except BaseException:
-            await sink.close()
+            disconnect_live = getattr(self._stream_sink, "disconnect_live", None)
+            if callable(disconnect_live):
+                disconnect_live()
             if run_task is not None and not run_task.done():
                 run_task.cancel()
+            await sink.close()
+            if run_task is not None and not run_task.done():
                 try:
                     await run_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            close_open_items = getattr(
+                self._stream_sink,
+                "close_open_items",
+                None,
+            )
+            if callable(close_open_items):
+                await close_open_items()
             raise
 
         finally:
@@ -301,13 +328,6 @@ class AgentLoop:
             if not await self._compact(state):
                 return state
 
-            await self._emit_stream(
-                turn_start(
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"] + 1,
-                )
-            )
-
             # Model turn — call the LLM, handle errors, return (turn | None)
             state["iteration"] += 1
             turn, retries = await self._model_turn(
@@ -337,13 +357,6 @@ class AgentLoop:
                     detail={"phase": "scheduled", "tool_call_ids": [c.tool_call_id for c in turn.tool_calls]},
                     checkpoint_reason="tool_calls_scheduled",
                 )
-                await self._emit_stream(
-                    turn_end(
-                        turn_id=state["run_config"].turn_id,
-                        iteration=state["iteration"],
-                        stop_reason="tool_use",
-                    )
-                )
                 continue
 
             await self._transition(
@@ -351,13 +364,6 @@ class AgentLoop:
             )
 
             if turn.action == "pause":
-                await self._emit_stream(
-                    turn_end(
-                        turn_id=state["run_config"].turn_id,
-                        iteration=state["iteration"],
-                        stop_reason="pause",
-                    )
-                )
                 await self._pause(
                     state,
                     reason=cast(str, turn.pause_reason),
@@ -368,23 +374,8 @@ class AgentLoop:
                 return state
 
             # finish
-            await self._emit_stream(
-                turn_end(
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"],
-                    stop_reason="end_turn",
-                )
-            )
             if await self._evaluate_finish(state, turn):
                 return state
-
-        await self._emit_stream(
-            loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=state["terminal"].stop_reason if state.get("terminal") else "loop_exited",
-                total_turns=state["iteration"],
-            )
-        )
         return state
 
     async def _compact(self, state: LoopState) -> bool:
@@ -409,14 +400,6 @@ class AgentLoop:
         )
         replace_latest_transition(state, transition)
         await self._event_sink.emit(transition)
-        await self._emit_stream(
-            compact_layer(
-                channels=list(result.channels),
-                warnings=list(result.warnings),
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         return True
 
     async def _model_turn(
@@ -591,14 +574,6 @@ class AgentLoop:
         )
         replace_latest_transition(state, tr)
         await self._event_sink.emit(tr)
-        await self._emit_stream(
-            compact_layer(
-                channels=list(result.channels),
-                warnings=list(result.warnings),
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         return None, 0  # caller will retry (turn is None, but state is still running)
 
     async def _handle_invalid_turn(
@@ -642,14 +617,6 @@ class AgentLoop:
             return None, retries
 
         retries += 1
-        await self._emit_stream(
-            recovery_event(
-                strategy="model_retry",
-                detail=f"attempt={retries}, error={str(exc)[:200]}",
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         await self._transition(
             state,
             reason="retry",
@@ -691,14 +658,6 @@ class AgentLoop:
                     ),
                 ),
             )
-            await self._emit_stream(
-                recovery_event(
-                    strategy="tool_call_correction",
-                    detail=redact_sensitive_text(exc.validation_error)[:200],
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"],
-                )
-            )
             await self._transition(
                 state,
                 reason="retry",
@@ -729,14 +688,6 @@ class AgentLoop:
             return None, retries
 
         retries += 1
-        await self._emit_stream(
-            recovery_event(
-                strategy="model_retry",
-                detail=f"attempt={retries}, error={safe_error[:200]}",
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         await self._transition(
             state,
             reason="retry",
@@ -762,16 +713,6 @@ class AgentLoop:
             state,
             circuit_checked_calls,
         )
-        for call in executable_calls:
-            await self._emit_stream(
-                tool_use_start(
-                    tool_name=call.tool_name,
-                    tool_id=call.tool_call_id,
-                    input_preview=_tool_input_preview(call.arguments),
-                    turn_id=turn_id,
-                    iteration=turn,
-                )
-            )
         context = replace(
             self._execution_context,
             approved_tool_call_ids=frozenset(state["approved_tool_call_ids"]),
@@ -780,12 +721,158 @@ class AgentLoop:
                 frozenset() if self._skill_runtime is None else self._skill_runtime.validated_active_skill_ids(state)
             ),
         )
-        executions = await self._tool_executor.execute_batch(
-            executable_calls,
-            context=context,
-            records=state["tool_execution_records"],
-            record_sink=self._checkpoint_store.write_execution_record,
-        )
+        started_items: dict[
+            str,
+            tuple[str, TurnItemKind, int],
+        ] = {}
+        completed_items: set[str] = set()
+        completed_execution_order: list[ToolExecution] = []
+        durable_execution_order: list[ToolExecution] = []
+        non_durable_execution_order: list[ToolExecution] = []
+        transcript_execution_results: list[ToolResult] = []
+        calls_by_id = {call.tool_call_id: call for call in calls}
+
+        async def record_sink(record: ToolExecutionRecord) -> None:
+            await self._checkpoint_store.write_execution_record(record)
+            if record.status is not ExecutionStatus.STARTED:
+                return
+            if record.tool_name == "update_plan":
+                return
+            item_kind = (
+                TurnItemKind.COMMAND
+                if record.tool_name == "run_command"
+                else TurnItemKind.TOOL
+            )
+            prefix = "command" if item_kind is TurnItemKind.COMMAND else "tool"
+            item_id = (
+                f"{prefix}:{turn_id}:{record.tool_call_id}:"
+                f"{record.attempt_count}"
+            )
+            started_items[record.tool_call_id] = (
+                item_id,
+                item_kind,
+                record.attempt_count,
+            )
+            await self._emit_stream(
+                item_started(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=item_kind,
+                    iteration=turn,
+                    data={
+                        "tool_name": record.tool_name,
+                        "tool_call_id": record.tool_call_id,
+                        "operation_id": record.operation_id,
+                        "attempt": record.attempt_count,
+                        "input_preview": _tool_input_preview(
+                            calls_by_id[record.tool_call_id].arguments
+                        ),
+                    },
+                )
+            )
+
+        def progress_sink_for(
+            call_id: str,
+        ) -> Callable[[ToolProgress], Awaitable[None]]:
+            async def progress_sink(progress: ToolProgress) -> None:
+                item = started_items.get(call_id)
+                if item is None:
+                    raise RuntimeError(
+                        "tool progress arrived before durable STARTED record"
+                    )
+                item_id, item_kind, _attempt = item
+                delta_kind = (
+                    ItemDeltaKind.COMMAND_STDOUT
+                    if item_kind is TurnItemKind.COMMAND
+                    and progress.kind is ToolProgressKind.STDOUT
+                    else ItemDeltaKind.COMMAND_STDERR
+                    if item_kind is TurnItemKind.COMMAND
+                    and progress.kind is ToolProgressKind.STDERR
+                    else ItemDeltaKind.TOOL_PROGRESS
+                )
+                await self._emit_stream(
+                    item_delta(
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_kind=item_kind,
+                        delta_kind=delta_kind,
+                        delta=progress.content,
+                        iteration=turn,
+                    )
+                )
+
+            return progress_sink
+
+        async def execution_sink(execution: ToolExecution) -> None:
+            completed_execution_order.append(execution)
+            item = started_items.get(execution.result.tool_call_id)
+            if item is None:
+                non_durable_execution_order.append(execution)
+                return
+            durable_execution_order.append(execution)
+            item_id, item_kind, _attempt = item
+            record = execution.record
+            transcript_execution_results.append(execution.result)
+            transcript_result = _tool_results_for_transcript(
+                state,
+                transcript_execution_results,
+            )[-1]
+            status = (
+                ItemStatus.OUTCOME_UNKNOWN
+                if record is not None
+                and record.status is ExecutionStatus.OUTCOME_UNKNOWN
+                else ItemStatus.FAILED
+                if execution.result.is_error
+                else ItemStatus.SUCCESS
+            )
+            error = (
+                execution.result.error_message
+                or execution.result.error_code
+                or "tool execution failed"
+                if status in {ItemStatus.FAILED, ItemStatus.OUTCOME_UNKNOWN}
+                else None
+            )
+            await self._emit_stream(
+                item_completed(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=item_kind,
+                    status=status,
+                    data={"result": _tool_result_payload(transcript_result)},
+                    iteration=turn,
+                    error=error,
+                )
+            )
+            completed_items.add(execution.result.tool_call_id)
+
+        try:
+            executions = await self._tool_executor.execute_batch(
+                executable_calls,
+                context=context,
+                records=state["tool_execution_records"],
+                record_sink=record_sink,
+                progress_sinks={
+                    call.tool_call_id: progress_sink_for(call.tool_call_id)
+                    for call in executable_calls
+                },
+                execution_sink=execution_sink,
+            )
+        except asyncio.CancelledError:
+            for call_id, (item_id, item_kind, _attempt) in started_items.items():
+                if call_id in completed_items:
+                    continue
+                await self._emit_stream(
+                    item_completed(
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_kind=item_kind,
+                        status=ItemStatus.CANCELLED,
+                        data={},
+                        iteration=turn,
+                    )
+                )
+            raise
+        executions = tuple(completed_execution_order)
         for execution in executions:
             if execution.record is not None:
                 state["tool_execution_records"][execution.record.tool_call_id] = execution.record
@@ -795,21 +882,22 @@ class AgentLoop:
         )
         approval_execution = approval_executions[0] if approval_executions else None
         approval_ids = {execution.result.tool_call_id for execution in approval_executions}
-        results_by_id = {
-            result.tool_call_id: result
-            for result in (
-                *circuit_results,
-                *repeated_inspection_results,
-            )
-        }
-        results_by_id.update(
-            {
-                execution.result.tool_call_id: execution.result
-                for execution in executions
+        ordered_results = [
+            *(execution.result for execution in durable_execution_order),
+            *circuit_results,
+            *repeated_inspection_results,
+            *(
+                execution.result
+                for execution in non_durable_execution_order
                 if execution.result.tool_call_id not in approval_ids
-            }
+            ),
+        ]
+        new_results = list(
+            {
+                result.tool_call_id: result
+                for result in ordered_results
+            }.values()
         )
-        new_results = [results_by_id[call.tool_call_id] for call in calls if call.tool_call_id in results_by_id]
         reconciliation_execution = next(
             (
                 execution
@@ -857,15 +945,6 @@ class AgentLoop:
         )
         for tool_result in new_results:
             if tool_result.is_error:
-                await self._emit_stream(
-                    tool_use_error(
-                        tool_id=tool_result.tool_call_id,
-                        error=tool_result.error_message or "Unknown error",
-                        recoverable=None,
-                        turn_id=turn_id,
-                        iteration=turn,
-                    )
-                )
                 if tool_result.error_code == _REPEATED_TOOL_FAILURE_CODE:
                     failure_count = tool_result.metadata.get("failure_count", 0)
                     detail = f"tool={tool_result.tool_name}, matching_failures={failure_count}"
@@ -878,33 +957,49 @@ class AgentLoop:
                             severity="warning",
                         ),
                     )
-                    await self._emit_stream(
-                        recovery_event(
-                            strategy="tool_failure_circuit_breaker",
-                            detail=detail,
-                            turn_id=turn_id,
-                            iteration=turn,
-                        )
-                    )
-            else:
-                await self._emit_stream(
-                    tool_use_result(
-                        tool_name=tool_result.tool_name,
-                        tool_id=tool_result.tool_call_id,
-                        result=_tool_result_text(tool_result)[:500],
-                        elapsed_ms=None,
-                        details=_tool_result_event_details(tool_result),
-                        turn_id=turn_id,
-                        iteration=turn,
-                    )
-                )
 
-        for plan, event in plan_updates:
+        plan_results = [
+            result
+            for result in new_results
+            if result.tool_name == "update_plan" and not result.is_error
+        ]
+        for (plan, event), plan_result in zip(
+            plan_updates,
+            plan_results,
+            strict=True,
+        ):
+            plan_payload = plan.model_dump(mode="json")
+            event_payload = event.model_dump(mode="json")
+            item_id = f"update_plan:{turn_id}:{plan.revision}"
             await self._emit_stream(
-                _stream_plan_updated(
-                    plan=plan,
-                    event=event,
+                item_started(
                     turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    iteration=turn,
+                )
+            )
+            await self._emit_stream(
+                item_delta(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    delta_kind=ItemDeltaKind.PLAN,
+                    delta=canonical_json_text(cast(JsonValue, plan_payload)),
+                    iteration=turn,
+                )
+            )
+            await self._emit_stream(
+                item_completed(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    status=ItemStatus.SUCCESS,
+                    data={
+                        "plan": cast(JsonValue, plan_payload),
+                        "event": cast(JsonValue, event_payload),
+                        "result": _tool_result_payload(plan_result),
+                    },
                     iteration=turn,
                 )
             )
@@ -1246,13 +1341,6 @@ class AgentLoop:
             detail={"stop_code": outcome.code},
             checkpoint_reason="terminal_completed",
         )
-        await self._emit_stream(
-            loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=outcome.code,
-                total_turns=state["iteration"],
-            )
-        )
 
     async def _fail(
         self,
@@ -1288,14 +1376,6 @@ class AgentLoop:
             },
             checkpoint_reason=checkpoint_reason,
         )
-        # ── 流式事件：loop 结束 ──
-        await self._emit_stream(
-            loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=stop_reason,
-                total_turns=state["iteration"],
-            )
-        )
 
     async def _pause(
         self,
@@ -1319,21 +1399,6 @@ class AgentLoop:
                 "request_kind": (getattr(request, "kind", None) if request is not None else None),
             },
             checkpoint_reason=checkpoint_reason,
-        )
-        if request is not None:
-            await self._emit_stream(
-                _stream_human_input_required(
-                    request=request,
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"],
-                )
-            )
-        await self._emit_stream(
-            loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=str(transition_reason),
-                total_turns=state["iteration"],
-            )
         )
 
     async def _transition(
@@ -1576,6 +1641,16 @@ def _tool_result_transcript_messages(
     state: LoopState,
     results: Sequence[ToolResult],
 ) -> tuple[ModelMessage, ...]:
+    return tuple(
+        tool_result_message(result)
+        for result in _tool_results_for_transcript(state, results)
+    )
+
+
+def _tool_results_for_transcript(
+    state: LoopState,
+    results: Sequence[ToolResult],
+) -> tuple[ToolResult, ...]:
     seen: dict[str, tuple[str, int]] = {}
     prior_failures: list[ToolResult] = []
     for result in reversed(state["tool_results"]):
@@ -1592,16 +1667,16 @@ def _tool_result_transcript_messages(
         )
         seen[fingerprint] = (original_id, count + 1)
 
-    messages: list[ModelMessage] = []
+    visible_results: list[ToolResult] = []
     for result in results:
         if not result.is_error:
             seen.clear()
-            messages.append(tool_result_message(result))
+            visible_results.append(result)
             continue
         fingerprint = _tool_failure_evidence_fingerprint(result)
         previous = None if fingerprint is None else seen.get(fingerprint)
         if fingerprint is None or previous is None:
-            messages.append(tool_result_message(result))
+            visible_results.append(result)
             if fingerprint is not None:
                 seen[fingerprint] = (result.tool_call_id, 1)
             continue
@@ -1617,9 +1692,9 @@ def _tool_result_transcript_messages(
                 "repeat_count": repeat_count,
             },
         )
-        messages.append(tool_result_message(visible_result))
+        visible_results.append(visible_result)
         seen[fingerprint] = (original_id, repeat_count)
-    return tuple(messages)
+    return tuple(visible_results)
 
 
 def _tool_failure_evidence_fingerprint(
@@ -1738,6 +1813,32 @@ def _tool_result_text(result: ToolResult) -> str:
     if result.structured_content is not None:
         return str(result.structured_content)
     return "\n".join(str(block.data.get("text", "")) for block in result.content if block.type == "text")
+
+
+def _tool_result_payload(result: ToolResult) -> dict[str, JsonValue]:
+    return {
+        "tool_call_id": result.tool_call_id,
+        "tool_name": result.tool_name,
+        "content": tuple(
+            {"type": block.type, "data": block.data}
+            for block in result.content
+        ),
+        "structured_content": result.structured_content,
+        "is_error": result.is_error,
+        "error_code": result.error_code,
+        "error_message": result.error_message,
+        "retryable": result.retryable,
+        "truncated": result.truncated,
+        "metadata": _tool_result_event_details(result),
+        "attachments": tuple(
+            {
+                "artifact_id": attachment.artifact_id,
+                "media_type": attachment.media_type,
+                "name": attachment.name,
+            }
+            for attachment in result.attachments
+        ),
+    }
 
 
 def _tool_result_event_details(result: ToolResult) -> dict[str, Any]:

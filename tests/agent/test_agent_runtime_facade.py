@@ -13,7 +13,7 @@ from uuid import UUID
 import pytest
 
 import agent_runtime
-from agent_runtime import Agent, AgentResult, AgentUsage
+from agent_runtime import Agent, AgentResult, AgentUsage, LegacyStreamProjectionSink
 from agent_runtime import agent as agent_module
 from agent_runtime.core.runtime_diagnostics import AgentLatencyProfile
 from agent_runtime.knowledge import RAGKnowledgeConfig
@@ -47,6 +47,7 @@ def test_agent_runtime_exports_sdk_facade() -> None:
     assert AgentUsage is not None
     assert PlanEvent is PlanningPlanEvent
     assert PlanStep is PlanningPlanStep
+    assert LegacyStreamProjectionSink is not None
     assert agent_runtime.__all__ == [
         "Agent",
         "AgentEventSink",
@@ -54,12 +55,16 @@ def test_agent_runtime_exports_sdk_facade() -> None:
         "AgentResult",
         "AgentUsage",
         "EventType",
+        "ItemDeltaKind",
+        "ItemStatus",
+        "LegacyStreamProjectionSink",
         "ModelNotAvailableError",
         "ModelSpec",
         "PlanEvent",
         "PlanStep",
         "RAGKnowledgeConfig",
         "StreamEvent",
+        "TurnItemKind",
     ]
     for removed in (
         "ModelCatalog",
@@ -129,16 +134,21 @@ def test_agent_public_annotations_resolve_without_any() -> None:
 
 def test_stream_event_has_turn_named_json_contract() -> None:
     assert tuple(field.name for field in fields(StreamEvent)) == (
+        "protocol_version",
         "type",
         "turn_id",
+        "item_id",
+        "item_kind",
+        "delta_kind",
+        "status",
         "iteration",
         "sequence",
         "timestamp_ms",
         "data",
-        "span_id",
-        "parent_id",
+        "error",
+        "parent_item_id",
     )
-    event = StreamEvent(type=EventType.TURN_START)
+    event = StreamEvent(type=EventType.TURN_STARTED, turn_id="turn-1")
     assert not hasattr(event, "run_id")
     assert not hasattr(event, "thread_id")
     assert not hasattr(event, "turn")

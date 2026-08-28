@@ -12,6 +12,7 @@ from agent_runtime.core.messages import ModelMessage, StopReason, ToolUseResult
 from agent_runtime.loop.runtime import ModelTurnEnvelope
 from agent_runtime.loop.state import create_loop_state
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget, LLMUsage
+from agent_runtime.modeling.gateway import ProviderDelta
 from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 from agent_runtime.tools.tool import (
     CancellationMode,
@@ -106,6 +107,53 @@ class _CanonicalGateway:
             serializer_revision="provider-wire-v1",
             wire_kind=str(kwargs["provider"]),
         )
+
+
+class _StreamingCanonicalGateway(_CanonicalGateway):
+    def __init__(
+        self,
+        *,
+        turn: ToolUseResult,
+        deltas: tuple[ProviderDelta, ...] = (),
+        error: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self._turn = turn
+        self._deltas = deltas
+        self._error = error
+
+    async def agenerate_model_request(self, **kwargs: object) -> object:
+        self.calls.append(dict(kwargs))
+        sink = kwargs["delta_sink"]
+        assert callable(sink)
+        for delta in self._deltas:
+            await sink(delta)
+        if self._error is not None:
+            raise self._error
+        return SimpleNamespace(
+            turn=self._turn,
+            usage=LLMUsage(
+                input_tokens=2,
+                output_tokens=2,
+                source="provider",
+                logical_input_tokens=2,
+                uncached_input_tokens=2,
+                cache_read_input_tokens=0,
+                cache_write_input_tokens=0,
+                usage_source="provider",
+            ),
+            provider_wire_hash="wire_stream",
+            serializer_revision="provider-wire-v1",
+            wire_kind="openai",
+        )
+
+
+class _CollectingSink:
+    def __init__(self) -> None:
+        self.events: list[object] = []
+
+    async def emit(self, event: object) -> None:
+        self.events.append(event)
 
 
 def _state():
