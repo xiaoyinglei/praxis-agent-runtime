@@ -91,15 +91,15 @@ Turn records project as follows:
 | `turn_failed` | `TURN_COMPLETED` with failed status |
 | `turn_cancelled` | `TURN_ABORTED` with cancelled reason |
 | `turn_abandoned` | `TURN_ABORTED` with abandoned reason |
-| `turn_interrupted` | no terminal v2 event; the preceding cancellation request and Item outcome remain the public tail until reconciliation/resume |
+| `turn_interrupted` | nonterminal `TURN_PAUSED` with `data.status=interrupted` and `data.reason=outcome_unknown` |
 
 Internal Item/operation facts project as follows:
 
 | Harness fact | Public Item projection |
 | --- | --- |
-| `model_response` | one `agent_message` whose public ID is the stable response Item ID; payload contains `content` and validated `tool_calls` |
-| native reasoning channel | one `reasoning` Item keyed by model attempt and channel |
-| native plan channel | one `plan` Item keyed by model attempt and channel |
+| `model_response` | one `agent_message` whose public ID is derived from the model attempt and stored on the response payload; payload contains `content` and validated `tool_calls` |
+| `model_reasoning` | one `reasoning` Item keyed by model attempt and channel |
+| `model_plan` | one `plan` Item keyed by model attempt and channel |
 | accepted final `agent_message` | suppressed when it is only the completion projection of an already published `model_response`; used as `legacy_message` only for migrated history without a source response |
 | `tool_operation_claimed` plus terminal `tool_result` | one operation-attempt `tool` Item; `tool_call` remains inside the parent `agent_message` payload |
 | the same facts for `run_command` | one operation-attempt `command` Item; `command_execution` is an activity projection referencing the same operation ID, never a second outcome |
@@ -109,9 +109,13 @@ Internal Item/operation facts project as follows:
 
 Projection code is exhaustive: an unknown durable kind fails closed in replay
 and tests, rather than being silently skipped. Public tool/command IDs derive
-from `(turn_id, operation_id, attempt_generation)`; model channel IDs derive
-from `(turn_id, model_attempt_id, channel)`. Reopen and live delivery use the
-same derivation function.
+from `(turn_id, operation_id, attempt_generation)`. Every model channel ID
+derives from `(turn_id, model_attempt_id, channel)` before dispatch and is
+stored in the corresponding start/completion payload. The internal
+`model_response` Item ID is not a public Item ID. An `update_plan` snapshot ID
+derives from `(turn_id, canonical_plan_revision)` and is stored with that
+revision. Live, retry, reopen, and replay call the same derivation helpers and
+fail if persisted IDs do not match.
 
 Publicly projectable completion records carry `status`, authoritative `payload`,
 optional `error`, `iteration`, and optional `parent_item_id`. Existing successful
@@ -141,7 +145,8 @@ One Session-owned dispatcher fans one Turn's events into independent bounded
 subscriber channels. `Agent.astream()` and the direct `event_sink` attached to
 the executing call are controlling subscribers: closing/failing them requests
 Turn cancellation. Read-only observers have independent cursors and may detach
-without cancelling execution.
+without cancelling execution. Only controlling subscribers participate in
+producer backpressure.
 
 ```text
 provider/tool callback
@@ -159,6 +164,11 @@ provider/tool callback
   either queue capacity or the subscriber close event; closing therefore wakes
   blocked emitters and getters even when the queue is full. Emitting after close
   raises `EventChannelClosed`.
+- Passive observers receive best-effort transient deltas. If a passive queue is
+  full, the dispatcher closes that observer with `ObserverLagged` and its last
+  committed cursor; it never waits on passive capacity. The observer reconnects
+  from durable history, which intentionally contains no deltas. Durable events
+  are never silently dropped.
 - Controlling close drops undelivered transient deltas, commits cancellation and
   closure facts through the durable path, and leaves them available for replay.
   A passive observer close affects only that observer.
@@ -175,7 +185,7 @@ removed.
 
 ## Model Item lifecycle
 
-Before provider streaming starts, the model operation allocates stable IDs for
+Before provider streaming starts, the model attempt allocates stable IDs for
 the response channels of one Step:
 
 - `agent_message`: text plus validated tool calls;
@@ -190,13 +200,24 @@ publishes `ITEM_STARTED` immediately before committing and publishing
 `ITEM_COMPLETED`. Provider completion commits one authoritative response Item
 before its completion is delivered.
 
+The first reasoning or plan delta also appends an `item_started` record with
+kind `model_reasoning` or `model_plan`, `public_item_id`, `attempt_id`, channel,
+and iteration. Model completion atomically appends their `item_completed`
+records containing the full accumulated `content`, together with the
+authoritative `model_response`, attempt usage/status, and logical operation
+status. These records are the sole replay source for reasoning/plan completion;
+deltas remain transient. Ordinary `update_plan` commits a separate
+plan-revision Item with its derived snapshot ID and complete PlanState payload.
+
 A tool-only response still produces a completed `agent_message` Item whose
 payload contains empty content plus complete validated tool calls. A dedicated
 ordering test requires start then completion with no fabricated delta. Partial
-provider failure closes every started channel as `failed`; cancellation closes
-it as `cancelled`. Non-streaming providers may emit one delta after obtaining
-the full response but the runtime does not fabricate token timing by slicing
-text.
+provider failure closes every started channel as `failed`. Cancellation before
+dispatch, or after the provider acknowledges a definitive stop, closes it as
+`cancelled`; cancellation after dispatch without a confirmed outcome closes it
+as `outcome_unknown` and interrupts the Turn. Non-streaming providers may emit
+one delta after obtaining the full response but the runtime does not fabricate
+token timing by slicing text.
 
 ## Tool and command Item lifecycle
 
@@ -231,13 +252,14 @@ On stream close or task cancellation:
 4. if every operation has a known stopped outcome, commit terminal
    `turn_cancelled` and project `TURN_ABORTED`;
 5. if any operation is `outcome_unknown`, commit `turn_interrupted`, retain the
-   Thread active slot and claims, close the live stream after
-   `TURN_CANCELLATION_REQUESTED`, and require reconciliation before redispatch;
+   Thread active slot and claims, publish nonterminal `TURN_PAUSED` with
+   interruption reason after `TURN_CANCELLATION_REQUESTED`, close the live
+   stream, and require reconciliation before redispatch;
 6. after reconciliation, resume the same Turn with `TURN_RESUMED`, or explicitly
    abandon/cancel it and then project terminal `TURN_ABORTED`.
 
-`turn_interrupted` is an internal nonterminal fact because v2 has no terminal
-claim for an unknown operation. It is not misprojected as `TURN_ABORTED` or a
+`turn_interrupted` is represented by the existing nonterminal
+`TURN_PAUSED` wire event rather than being misprojected as `TURN_ABORTED` or a
 new Turn. No replay sequence may contain an Item after the final Turn event. Provider I/O
 that cannot be interrupted may outlive the Turn only in an isolated daemon
 producer; it cannot block event-loop or Session shutdown.
@@ -270,9 +292,11 @@ post-commit notification is one SQLite transaction boundary. In addition:
 - model completion atomically commits attempt status/usage/provider response
   identity, logical model-operation status, authoritative `model_response`, and
   its context-visible projection under the current attempt generation;
-- tool completion atomically commits the canonical `tool_result`, terminal
-  operation state, result link, claim/resource release, and public completion
-  outcome under the fencing token;
+- proven tool completion atomically commits the canonical `tool_result`,
+  terminal operation state, result link, claim/resource release, and public
+  completion outcome under the fencing token. An `outcome_unknown` completion
+  instead atomically retains its fencing claim/resource ownership, marks
+  reconciliation required, and appends the public unknown outcome;
 - pause/resume atomically validates the Thread active slot, transitions the
   Turn/interactions/approval state, and appends the lifecycle record;
 - Turn completion atomically commits the accepted answer projection, terminal
@@ -312,8 +336,9 @@ Tests must prove the real public path, not only isolated dataclasses:
    zero-text tool-only response;
 5. completed Items and Turn transitions replay identically after SQLite reopen;
 6. deltas never appear in durable records;
-7. bounded per-subscriber queues exert measurable backpressure without one
-   passive observer changing another observer's cursor;
+7. bounded controlling queues exert measurable backpressure, while a full
+   passive observer is detached with its last cursor and cannot block execution
+   or change another observer's cursor;
 8. closing a full stream, a non-reading sink, and a never-returning sink cannot
    hang; a blocked synchronous provider is signalled but never joined;
 9. resume preserves the original Turn and emits `TURN_RESUMED` only;
