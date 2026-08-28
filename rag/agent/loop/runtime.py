@@ -260,6 +260,13 @@ class AgentLoop:
             await run_task
 
         except BaseException:
+            close_open_items = getattr(
+                self._stream_sink,
+                "close_open_items",
+                None,
+            )
+            if callable(close_open_items):
+                await close_open_items()
             await sink.close()
             if run_task is not None and not run_task.done():
                 run_task.cancel()

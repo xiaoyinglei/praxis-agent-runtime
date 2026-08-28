@@ -12,6 +12,7 @@ from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.messages import ModelMessage
 from rag.agent.loop.state import LoopState, ModelTurnDraft
 from rag.agent.service import AgentRunRequest, AgentRunResult, AgentService
+from rag.agent.streaming.events import EventType
 from rag.agent.tools.registry import ToolRegistry
 from rag.agent.turns import RuntimeBinding, TurnStatus, TurnStore
 from rag.agent.workspace import open_workspace
@@ -200,7 +201,7 @@ def test_agent_builder_receives_turn_store_and_runtime_binding(
 
 
 @pytest.mark.anyio
-async def test_stream_close_marks_the_same_turn_interrupted(tmp_path: Path) -> None:
+async def test_stream_close_records_cancellation_and_final_abort(tmp_path: Path) -> None:
     provider = _HistoryProvider()
     service, store = _service(tmp_path, provider)
     stream = service.run_streaming(AgentRunRequest(message="stream"))
@@ -208,6 +209,14 @@ async def test_stream_close_marks_the_same_turn_interrupted(tmp_path: Path) -> N
     await stream.aclose()
 
     assert first_event.turn_id
-    assert store.get_turn(first_event.turn_id).status is TurnStatus.INTERRUPTED
+    assert store.get_turn(first_event.turn_id).status is TurnStatus.FAILED
+    assert [
+        record.event.type
+        for record in store.replay_turn_events(first_event.turn_id)
+    ] == [
+        EventType.TURN_STARTED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_ABORTED,
+    ]
     await service.aclose()
     store.close()

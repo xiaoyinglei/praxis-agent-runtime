@@ -241,7 +241,7 @@ def turn_aborted(turn_id: str, *, reason: str) -> StreamEvent:
     return _turn_lifecycle(
         EventType.TURN_ABORTED,
         turn_id,
-        status="interrupted",
+        status="aborted",
         reason=reason,
     )
 
@@ -375,7 +375,6 @@ def tool_use_start(
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
-    span = f"tool:{tool_id}"
     return StreamEvent(
         type=EventType.TOOL_USE_START,
         turn_id=turn_id,
@@ -399,7 +398,6 @@ def tool_use_progress(
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
-    span = f"tool:{tool_id}"
     d: dict[str, JsonValue] = {"tool_id": tool_id, "progress": progress}
     if percent is not None:
         d["percent"] = percent
@@ -423,7 +421,6 @@ def tool_use_result(
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
-    span = f"tool:{tool_id}"
     return StreamEvent(
         type=EventType.TOOL_USE_RESULT,
         turn_id=turn_id,
@@ -448,7 +445,6 @@ def tool_use_error(
     turn_id: str = "",
     iteration: int = 0,
 ) -> StreamEvent:
-    span = f"tool:{tool_id}"
     return StreamEvent(
         type=EventType.TOOL_USE_ERROR,
         turn_id=turn_id,

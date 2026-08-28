@@ -23,6 +23,7 @@ from rag.agent.streaming.events import (
     ItemStatus,
     StreamEvent,
     TurnItemKind,
+    item_completed,
 )
 from rag.agent.tools.tool import JsonValue
 
@@ -55,11 +56,19 @@ class DurableStreamEventSink:
         self._turn_store = turn_store
         self._live_sink = live_sink
         self._started_at_ms: dict[tuple[str, str], int] = {}
+        self._started_items: dict[tuple[str, str], StreamEvent] = {}
+        self._item_deltas: dict[tuple[str, str], list[str]] = {}
 
     async def emit(self, event: StreamEvent) -> None:
         key = (event.turn_id, event.item_id or "")
         if event.type is EventType.ITEM_STARTED and event.item_id is not None:
             self._started_at_ms[key] = event.timestamp_ms
+            self._started_items[key] = event
+            self._item_deltas[key] = []
+        elif event.type is EventType.ITEM_DELTA:
+            self._item_deltas.setdefault(key, []).append(
+                cast(str, event.data["delta"])
+            )
         elif event.type is EventType.ITEM_COMPLETED:
             message = _completed_item_message(event)
             self._turn_store.commit_completed_item(
@@ -67,7 +76,43 @@ class DurableStreamEventSink:
                 message=message,
                 started_at_ms=self._started_at_ms.pop(key, None),
             )
+            self._started_items.pop(key, None)
+            self._item_deltas.pop(key, None)
         await self._live_sink.emit(event)
+
+    async def close_open_items(self) -> None:
+        """Durably cancel every started Item before its Turn is aborted."""
+
+        for key, started in tuple(self._started_items.items()):
+            if started.item_id is None or started.item_kind is None:
+                continue
+            content = "".join(self._item_deltas.get(key, ()))
+            data: dict[str, JsonValue] = (
+                {"content": content}
+                if started.item_kind
+                in {
+                    TurnItemKind.AGENT_MESSAGE,
+                    TurnItemKind.REASONING,
+                    TurnItemKind.PLAN,
+                }
+                else {}
+            )
+            completed = item_completed(
+                turn_id=started.turn_id,
+                item_id=started.item_id,
+                item_kind=started.item_kind,
+                status=ItemStatus.CANCELLED,
+                data=data,
+                iteration=started.iteration,
+                parent_item_id=started.parent_item_id,
+            )
+            self._turn_store.commit_completed_item(
+                completed,
+                started_at_ms=self._started_at_ms.get(key),
+            )
+            self._started_at_ms.pop(key, None)
+            self._started_items.pop(key, None)
+            self._item_deltas.pop(key, None)
 
 
 class QueueStreamEventSink:
@@ -80,24 +125,48 @@ class QueueStreamEventSink:
         self._queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue(
             maxsize=maxsize
         )
+        self._closed = asyncio.Event()
 
     async def emit(self, event: StreamEvent) -> None:
         """往 queue 里放一个事件。"""
-        await self._queue.put(event)
+        if self._closed.is_set():
+            raise RuntimeError("stream sink is closed")
+        put_task = asyncio.create_task(self._queue.put(event))
+        close_task = asyncio.create_task(self._closed.wait())
+        done, _pending = await asyncio.wait(
+            {put_task, close_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if put_task in done:
+            close_task.cancel()
+            await asyncio.gather(close_task, return_exceptions=True)
+            return
+        put_task.cancel()
+        await asyncio.gather(put_task, return_exceptions=True)
+        raise RuntimeError("stream sink closed during emit")
 
     async def stream(self) -> AsyncGenerator[StreamEvent, None]:
         """消费事件流，直到收到 LOOP_END 或 ABORT。"""
-        while True:
-            event = await self._queue.get()
-            if event is None:
-                break
-            yield event
-            if event.type in {EventType.LOOP_END, EventType.ABORT}:
-                break
+        while not self._closed.is_set() or not self._queue.empty():
+            get_task = asyncio.create_task(self._queue.get())
+            close_task = asyncio.create_task(self._closed.wait())
+            done, _pending = await asyncio.wait(
+                {get_task, close_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if get_task in done:
+                close_task.cancel()
+                await asyncio.gather(close_task, return_exceptions=True)
+                event = get_task.result()
+                if event is not None:
+                    yield event
+                continue
+            get_task.cancel()
+            await asyncio.gather(get_task, return_exceptions=True)
 
     async def close(self) -> None:
         """通知消费者结束。"""
-        await self._queue.put(None)
+        self._closed.set()
 
     @property
     def queue(self) -> asyncio.Queue[StreamEvent | None]:

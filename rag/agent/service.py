@@ -344,8 +344,10 @@ class AgentService:
             turn_id = effective_request.turn_id
             if turn_id is None:
                 raise RuntimeError("Turn allocation did not produce a turn_id")
-            async for event in self._execute_streaming(effective_request):
-                yield event
+            stream = self._execute_streaming(effective_request)
+            async with aclosing(stream) as events:
+                async for event in events:
+                    yield event
 
     @asynccontextmanager
     async def _open_turn(
@@ -381,7 +383,7 @@ class AgentService:
             )
             yield effective_request
         except (asyncio.CancelledError, GeneratorExit):
-            self._interrupt_turn(turn.turn_id)
+            self._abort_turn(turn.turn_id)
             raise
         except Exception:
             self._fail_turn(turn.turn_id)
@@ -422,7 +424,17 @@ class AgentService:
         lease_task = self._start_lease_heartbeat(run_config)
         state: LoopState | None = None
         workspace: WorkspaceRuntime | None = None
+        durable_sink: DurableStreamEventSink | None = None
         finalized = False
+
+        def _wrap_stream_sink(live_sink: StreamEventSink) -> StreamEventSink:
+            nonlocal durable_sink
+            durable_sink = DurableStreamEventSink(
+                turn_store=self._turn_store,
+                live_sink=live_sink,
+            )
+            return durable_sink
+
         try:
             (
                 state,
@@ -436,15 +448,14 @@ class AgentService:
                 run_config=run_config,
             )
             yield self._turn_store.replay_turn_events(run_config.turn_id)[0].event
-            async for event in loop.run_streaming(
+            loop_events = loop.run_streaming(
                 state,
-                sink_wrapper=lambda live_sink: DurableStreamEventSink(
-                    turn_store=self._turn_store,
-                    live_sink=live_sink,
-                ),
-            ):
-                if event.type in _PUBLIC_STREAM_EVENT_TYPES:
-                    yield event
+                sink_wrapper=_wrap_stream_sink,
+            )
+            async with aclosing(loop_events) as active_events:
+                async for event in active_events:
+                    if event.type in _PUBLIC_STREAM_EVENT_TYPES:
+                        yield event
             self._finalize_state(
                 state,
                 started_at=started_at,
@@ -466,6 +477,8 @@ class AgentService:
             if workspace is not None:
                 self._workspace_by_turn[run_config.turn_id] = workspace
         except (asyncio.CancelledError, GeneratorExit):
+            if durable_sink is not None:
+                await durable_sink.close_open_items()
             TurnRegistry.remove(run_config.turn_id)
             raise
         except Exception:
@@ -586,6 +599,14 @@ class AgentService:
         turn = self._turn_store.get_turn(turn_id)
         if turn.status is TurnStatus.RUNNING:
             self._turn_store.mark_interrupted(turn_id)
+
+    def _abort_turn(self, turn_id: str) -> None:
+        turn = self._turn_store.get_turn(turn_id)
+        if turn.status is TurnStatus.RUNNING:
+            self._turn_store.mark_aborted(
+                turn_id,
+                reason="stream_cancelled",
+            )
 
     def _fail_turn(self, turn_id: str) -> None:
         turn = self._turn_store.get_turn(turn_id)
@@ -1052,7 +1073,14 @@ class AgentService:
                     state,
                     reason="user_aborted",
                 )
-                self._sync_turn(state)
+                self._turn_store.sync_turn_messages(
+                    turn_id,
+                    state["turn_transcript"],
+                )
+                self._turn_store.mark_aborted(
+                    turn_id,
+                    reason="user_aborted",
+                )
                 TurnRegistry.remove(turn_id)
                 workspace = self._workspace or create_temp_workspace()
                 return AgentRunResult.from_loop_result(

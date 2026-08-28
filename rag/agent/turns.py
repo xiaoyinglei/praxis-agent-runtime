@@ -620,6 +620,59 @@ class TurnStore:
     ) -> TurnRecord:
         return self._mark_recoverable(turn_id, TurnStatus.INTERRUPTED, reason=reason)
 
+    def mark_aborted(
+        self,
+        turn_id: str,
+        *,
+        reason: str = "cancelled",
+    ) -> TurnRecord:
+        """Atomically record cancellation intent and a final aborted Turn."""
+
+        now = time.time()
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._connection.execute(
+                    "SELECT status FROM agent_turns WHERE turn_id = ?",
+                    (turn_id,),
+                ).fetchone()
+                if row is None:
+                    raise TurnNotFoundError(f"Turn not found: {turn_id}")
+                current = TurnStatus(str(row["status"]))
+                if current is not TurnStatus.RUNNING:
+                    raise TurnStateError(
+                        f"Turn {turn_id} is {current.value}; expected running"
+                    )
+                self._append_lifecycle_unlocked(
+                    turn_id,
+                    event_type=EventType.TURN_CANCELLATION_REQUESTED,
+                    status="cancelling",
+                    reason=reason,
+                    timestamp=now,
+                )
+                self._connection.execute(
+                    """
+                    UPDATE agent_turns
+                    SET status = ?, lease_owner = NULL,
+                        lease_expires_at = NULL, terminal_reason = ?,
+                        updated_at = ?
+                    WHERE turn_id = ?
+                    """,
+                    (TurnStatus.FAILED.value, reason, now, turn_id),
+                )
+                self._append_lifecycle_unlocked(
+                    turn_id,
+                    event_type=EventType.TURN_ABORTED,
+                    status="aborted",
+                    reason=reason,
+                    timestamp=now,
+                )
+                self._connection.commit()
+            except Exception:
+                self._connection.rollback()
+                raise
+        return self.get_turn(turn_id)
+
     def claim_for_resume(
         self,
         turn_id: str,
@@ -841,11 +894,7 @@ class TurnStore:
                 )
                 self._append_lifecycle_unlocked(
                     turn_id,
-                    event_type=(
-                        EventType.TURN_PAUSED
-                        if status is TurnStatus.PAUSED
-                        else EventType.TURN_ABORTED
-                    ),
+                    event_type=EventType.TURN_PAUSED,
                     status=status.value,
                     reason=reason,
                     timestamp=now,

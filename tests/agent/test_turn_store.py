@@ -194,6 +194,30 @@ def test_turn_store_replays_one_shared_durable_order_across_items_and_lifecycle(
     reopened.close()
 
 
+def test_recoverable_interruption_replays_pause_then_resume(tmp_path: Path) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    turn = store.begin_turn("resume me", _runtime(tmp_path))
+
+    store.mark_interrupted(turn.turn_id, reason="worker_lost")
+    store.claim_for_resume(
+        turn.turn_id,
+        lease_owner="worker-2",
+        lease_seconds=30,
+    )
+
+    replayed = store.replay_turn_events(turn.turn_id)
+    assert [record.event.type for record in replayed] == [
+        EventType.TURN_STARTED,
+        EventType.TURN_PAUSED,
+        EventType.TURN_RESUMED,
+    ]
+    assert replayed[1].event.data == {
+        "status": "interrupted",
+        "reason": "worker_lost",
+    }
+    store.close()
+
+
 def test_completed_item_commit_is_idempotent_but_divergence_fails_closed(
     tmp_path: Path,
 ) -> None:

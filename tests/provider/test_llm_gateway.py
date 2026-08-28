@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
@@ -115,6 +116,28 @@ class _StreamingGenerator:
             StreamChunk(type="text_delta", content="one two"),
             StreamChunk(type="message_stop", stop_reason="end_turn"),
         ]
+
+
+class _BlockingStreamingGenerator:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stream_with_tools(self, **_kwargs: object) -> list[StreamChunk]:
+        self.started.set()
+        self.release.wait()
+        return []
+
+
+class _FastStreamingGenerator:
+    def __init__(self) -> None:
+        self.produced = 0
+
+    def stream_with_tools(self, **_kwargs: object):
+        for _index in range(1_000):
+            self.produced += 1
+            yield StreamChunk(type="text_delta", content="x")
+        yield StreamChunk(type="message_stop", stop_reason="end_turn")
 
 
 class _CanonicalNativeGenerator:
@@ -502,6 +525,44 @@ async def test_streaming_gateway_refunds_when_consumer_closes_early() -> None:
     assert await ledger.committed() == 0
     assert await ledger.reserved() == 0
     assert await ledger.remaining() == 20
+
+
+@pytest.mark.anyio
+async def test_sync_provider_bridge_is_bounded_by_consumer_backpressure() -> None:
+    generator = _FastStreamingGenerator()
+    stream = _gateway(generator).astream_with_tools(
+        stage=LLMCallStage.TOOL_DECISION,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+    )
+
+    assert (await stream.__anext__()).content == "x"
+    await asyncio.sleep(0.05)
+
+    assert generator.produced < 100
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_cancelling_permanently_blocked_sync_provider_returns_promptly() -> None:
+    generator = _BlockingStreamingGenerator()
+    stream = _gateway(generator).astream_with_tools(
+        stage=LLMCallStage.TOOL_DECISION,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+    )
+    task = asyncio.create_task(stream.__anext__())
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(generator.started.wait),
+            timeout=0.5,
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+    finally:
+        generator.release.set()
+        await stream.aclose()
 
 
 @pytest.mark.anyio

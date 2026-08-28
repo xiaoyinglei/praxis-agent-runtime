@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import fields
 from types import MappingProxyType, SimpleNamespace
 
@@ -10,7 +11,7 @@ from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
 from rag.agent.core.messages import StopReason, ToolUseResult
 from rag.agent.service import AgentRunRequest, AgentService
 from rag.agent.streaming import events
-from rag.agent.streaming.sink import DurableStreamEventSink
+from rag.agent.streaming.sink import DurableStreamEventSink, QueueStreamEventSink
 from rag.agent.tools.registry import ToolRegistry
 from rag.agent.turns import RuntimeBinding, TurnStore
 from rag.providers.llm_gateway import ProviderDelta, ProviderDeltaChannel
@@ -278,6 +279,18 @@ class _EndToEndGateway:
         )
 
 
+class _BlockingEndToEndGateway(_EndToEndGateway):
+    def __init__(self) -> None:
+        self.block = asyncio.Event()
+
+    async def agenerate_model_request(self, **kwargs):
+        await kwargs["delta_sink"](
+            ProviderDelta(ProviderDeltaChannel.TEXT, "partial")
+        )
+        await self.block.wait()
+        raise AssertionError("blocking gateway should be cancelled")
+
+
 @pytest.mark.anyio
 async def test_service_streams_turn_item_delta_completion_and_durable_history(
     tmp_path,
@@ -335,5 +348,68 @@ async def test_service_streams_turn_item_delta_completion_and_durable_history(
         ("user", "hello"),
         ("assistant", "durable answer"),
     ]
+    await service.aclose()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_full_public_queue_can_close_without_waiting_for_capacity() -> None:
+    sink = QueueStreamEventSink(maxsize=1)
+    await sink.emit(events.turn_started("turn-full"))
+    blocked_emit = asyncio.create_task(
+        sink.emit(events.turn_paused("turn-full", reason="backpressure"))
+    )
+    await asyncio.sleep(0)
+    assert not blocked_emit.done()
+
+    await asyncio.wait_for(sink.close(), timeout=0.1)
+    with pytest.raises(RuntimeError, match="closed during emit"):
+        await asyncio.wait_for(blocked_emit, timeout=0.1)
+
+    replayed = [event async for event in sink.stream()]
+    assert [event.type for event in replayed] == [events.EventType.TURN_STARTED]
+
+
+@pytest.mark.anyio
+async def test_stream_cancellation_closes_partial_item_before_aborted_turn(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    definition = AgentRuntimePolicy.test_factory(
+        system_prompt="Answer directly.",
+        allowed_tools=[],
+    )
+    provider = LLMLoopModelTurnProvider(
+        _BlockingEndToEndGateway(),
+        model="test-model",
+        provider="openai-compatible",
+        supports_native_tools=True,
+        registry_snapshot=MappingProxyType({}),
+        resident_tool_names=(),
+    )
+    service = AgentService(
+        definition=definition,
+        tool_registry=ToolRegistry(),
+        model_turn_provider=provider,
+        turn_store=store,
+        runtime_binding=RuntimeBinding(workspace_path=str(tmp_path)),
+    )
+    stream = service.run_streaming(
+        AgentRunRequest(message="hello", turn_id="turn-cancel")
+    )
+
+    assert (await anext(stream)).type is events.EventType.TURN_STARTED
+    assert (await anext(stream)).type is events.EventType.ITEM_STARTED
+    assert (await anext(stream)).type is events.EventType.ITEM_DELTA
+    await asyncio.wait_for(stream.aclose(), timeout=0.5)
+
+    replayed = store.replay_turn_events("turn-cancel")
+    assert [record.event.type for record in replayed] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_COMPLETED,
+        events.EventType.TURN_CANCELLATION_REQUESTED,
+        events.EventType.TURN_ABORTED,
+    ]
+    assert replayed[1].event.status is events.ItemStatus.CANCELLED
     await service.aclose()
     store.close()
