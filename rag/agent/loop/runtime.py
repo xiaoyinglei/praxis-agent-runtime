@@ -30,6 +30,7 @@ from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
 from rag.agent.core.llm_context import AgentLLMContextOverflowError
 from rag.agent.core.messages import (
     ModelMessage,
+    canonical_json_text,
     context_event_message,
     tool_result_message,
 )
@@ -55,13 +56,31 @@ from rag.agent.loop.state import (
 )
 from rag.agent.loop.stop_hooks import StopHookOutcome, StopHookRunner
 from rag.agent.memory.compactor import LoopCompactionResult
-from rag.agent.streaming.events import EventType, StreamEvent, next_sequence
+from rag.agent.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    item_completed,
+    item_delta,
+    item_started,
+    next_sequence,
+)
 from rag.agent.streaming.sink import StreamEventSink
 from rag.agent.tools.builtins.planning import UpdatePlanInput
-from rag.agent.tools.executor import ToolExecutionRecord, ToolExecutor
+from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord, ToolExecutor
 from rag.agent.tools.permissions import ToolExecutionContext
 from rag.agent.tools.selection import FIND_TOOLS_NAME, reduce_tool_activation
-from rag.agent.tools.tool import JsonValue, Tool, ToolCall, ToolCallOrigin, ToolResult
+from rag.agent.tools.tool import (
+    JsonValue,
+    Tool,
+    ToolCall,
+    ToolCallOrigin,
+    ToolProgress,
+    ToolProgressKind,
+    ToolResult,
+)
 from rag.providers.llm_gateway import (
     LLMContextOverflowError,
     LLMToolCallValidationError,
@@ -730,16 +749,6 @@ class AgentLoop:
             state,
             delivery_calls,
         )
-        for call in executable_calls:
-            await self._emit_stream(
-                _stream_tool_use_start(
-                    tool_name=call.tool_name,
-                    tool_id=call.tool_call_id,
-                    input_preview=_tool_input_preview(call.arguments),
-                    turn_id=turn_id,
-                    iteration=turn,
-                )
-            )
         context = replace(
             self._execution_context,
             approved_tool_call_ids=frozenset(state["approved_tool_call_ids"]),
@@ -748,12 +757,136 @@ class AgentLoop:
                 frozenset() if self._skill_runtime is None else self._skill_runtime.validated_active_skill_ids(state)
             ),
         )
-        executions = await self._tool_executor.execute_batch(
-            executable_calls,
-            context=context,
-            records=state["tool_execution_records"],
-            record_sink=self._checkpoint_store.write_execution_record,
-        )
+        started_items: dict[
+            str,
+            tuple[str, TurnItemKind, int],
+        ] = {}
+        completed_items: set[str] = set()
+
+        async def record_sink(record: ToolExecutionRecord) -> None:
+            await self._checkpoint_store.write_execution_record(record)
+            if record.status is not ExecutionStatus.STARTED:
+                return
+            if record.tool_name == "update_plan":
+                return
+            item_kind = (
+                TurnItemKind.COMMAND
+                if record.tool_name == "run_command"
+                else TurnItemKind.TOOL
+            )
+            prefix = "command" if item_kind is TurnItemKind.COMMAND else "tool"
+            item_id = (
+                f"{prefix}:{turn_id}:{record.tool_call_id}:"
+                f"{record.attempt_count}"
+            )
+            started_items[record.tool_call_id] = (
+                item_id,
+                item_kind,
+                record.attempt_count,
+            )
+            await self._emit_stream(
+                item_started(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=item_kind,
+                    iteration=turn,
+                    data={
+                        "tool_name": record.tool_name,
+                        "operation_id": record.operation_id,
+                        "attempt": record.attempt_count,
+                    },
+                )
+            )
+
+        def progress_sink_for(call_id: str):
+            async def progress_sink(progress: ToolProgress) -> None:
+                item = started_items.get(call_id)
+                if item is None:
+                    raise RuntimeError(
+                        "tool progress arrived before durable STARTED record"
+                    )
+                item_id, item_kind, _attempt = item
+                delta_kind = (
+                    ItemDeltaKind.COMMAND_STDOUT
+                    if item_kind is TurnItemKind.COMMAND
+                    and progress.kind is ToolProgressKind.STDOUT
+                    else ItemDeltaKind.COMMAND_STDERR
+                    if item_kind is TurnItemKind.COMMAND
+                    and progress.kind is ToolProgressKind.STDERR
+                    else ItemDeltaKind.TOOL_PROGRESS
+                )
+                await self._emit_stream(
+                    item_delta(
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_kind=item_kind,
+                        delta_kind=delta_kind,
+                        delta=progress.content,
+                        iteration=turn,
+                    )
+                )
+
+            return progress_sink
+
+        try:
+            executions = await self._tool_executor.execute_batch(
+                executable_calls,
+                context=context,
+                records=state["tool_execution_records"],
+                record_sink=record_sink,
+                progress_sinks={
+                    call.tool_call_id: progress_sink_for(call.tool_call_id)
+                    for call in executable_calls
+                },
+            )
+        except asyncio.CancelledError:
+            for call_id, (item_id, item_kind, _attempt) in started_items.items():
+                if call_id in completed_items:
+                    continue
+                await self._emit_stream(
+                    item_completed(
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_kind=item_kind,
+                        status=ItemStatus.CANCELLED,
+                        data={},
+                        iteration=turn,
+                    )
+                )
+            raise
+        for execution in executions:
+            item = started_items.get(execution.result.tool_call_id)
+            if item is None:
+                continue
+            item_id, item_kind, _attempt = item
+            record = execution.record
+            status = (
+                ItemStatus.OUTCOME_UNKNOWN
+                if record is not None
+                and record.status is ExecutionStatus.OUTCOME_UNKNOWN
+                else ItemStatus.FAILED
+                if execution.result.is_error
+                else ItemStatus.SUCCESS
+            )
+            error = (
+                execution.result.error_message
+                or execution.result.error_code
+                or "tool execution failed"
+                if status in {ItemStatus.FAILED, ItemStatus.OUTCOME_UNKNOWN}
+                else None
+            )
+            await self._emit_stream(
+                item_completed(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=item_kind,
+                    status=status,
+                    data={"result": _tool_result_payload(execution.result)},
+                    iteration=turn,
+                    error=error,
+                )
+            )
+            completed_items.add(execution.result.tool_call_id)
         for execution in executions:
             if execution.record is not None:
                 state["tool_execution_records"][execution.record.tool_call_id] = execution.record
@@ -868,11 +1001,37 @@ class AgentLoop:
                 )
 
         for plan, event in plan_updates:
+            plan_payload = plan.model_dump(mode="json")
+            event_payload = event.model_dump(mode="json")
+            item_id = f"plan:{turn_id}:{plan.revision}"
             await self._emit_stream(
-                _stream_plan_updated(
-                    plan=plan,
-                    event=event,
+                item_started(
                     turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    iteration=turn,
+                )
+            )
+            await self._emit_stream(
+                item_delta(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    delta_kind=ItemDeltaKind.PLAN,
+                    delta=canonical_json_text(cast(JsonValue, plan_payload)),
+                    iteration=turn,
+                )
+            )
+            await self._emit_stream(
+                item_completed(
+                    turn_id=turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.PLAN,
+                    status=ItemStatus.SUCCESS,
+                    data={
+                        "plan": cast(JsonValue, plan_payload),
+                        "event": cast(JsonValue, event_payload),
+                    },
                     iteration=turn,
                 )
             )
@@ -1681,6 +1840,32 @@ def _tool_result_text(result: ToolResult) -> str:
     if result.structured_content is not None:
         return str(result.structured_content)
     return "\n".join(str(block.data.get("text", "")) for block in result.content if block.type == "text")
+
+
+def _tool_result_payload(result: ToolResult) -> dict[str, JsonValue]:
+    return {
+        "tool_call_id": result.tool_call_id,
+        "tool_name": result.tool_name,
+        "content": tuple(
+            {"type": block.type, "data": block.data}
+            for block in result.content
+        ),
+        "structured_content": result.structured_content,
+        "is_error": result.is_error,
+        "error_code": result.error_code,
+        "error_message": result.error_message,
+        "retryable": result.retryable,
+        "truncated": result.truncated,
+        "metadata": result.metadata,
+        "attachments": tuple(
+            {
+                "artifact_id": attachment.artifact_id,
+                "media_type": attachment.media_type,
+                "name": attachment.name,
+            }
+            for attachment in result.attachments
+        ),
+    }
 
 
 def _tool_result_event_details(result: ToolResult) -> dict[str, Any]:

@@ -1395,12 +1395,7 @@ def _message_json(message: ModelMessage) -> str:
 
 
 def _json_text(value: object) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    return canonical_json_text(cast(Any, value))
 
 
 def _epoch_ms(value: float) -> int:

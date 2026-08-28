@@ -19,7 +19,13 @@ from rag.agent.core.messages import ModelMessage
 from rag.agent.core.model_request import build_tool_manifest
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.state import LoopState, ModelTurnDraft, create_loop_state
-from rag.agent.service import AgentRunRequest, AgentService
+from rag.agent.service import AgentRunRequest, AgentRunResult, AgentService
+from rag.agent.streaming.events import (
+    EventType,
+    ItemStatus,
+    TurnItemKind,
+    item_completed,
+)
 from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord
 from rag.agent.tools.registry import ToolRegistry
 from rag.agent.tools.tool import (
@@ -185,6 +191,59 @@ async def test_service_run_uses_agent_loop_and_tool_executor() -> None:
 
 
 @pytest.mark.anyio
+async def test_streaming_service_persists_tool_item_and_tool_message(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    turn_store = TurnStore(tmp_path / "agent.sqlite")
+    service = AgentService(
+        definition=_definition(),
+        tool_registry=_registry(calls),
+        model_turn_provider=_FinishFromResultsProvider(),
+        turn_store=turn_store,
+        runtime_binding=RuntimeBinding(workspace_path=str(tmp_path)),
+    )
+    call = ToolCallPlan.create("write_tool", {"value": "streamed"})
+
+    events = [
+        event
+        async for event in service.run_streaming(
+            AgentRunRequest(
+                message="Write once.",
+                turn_id="service-tool-item",
+                pending_tool_calls=[call],
+            )
+        )
+    ]
+
+    completed = [
+        event
+        for event in events
+        if event.type is EventType.ITEM_COMPLETED
+        and event.item_kind is TurnItemKind.TOOL
+    ]
+    assert len(completed) == 1
+    assert completed[0].data["result"]["structured_content"] == {
+        "text": "wrote:streamed"
+    }
+    assert [
+        record.event.type
+        for record in turn_store.replay_turn_events("service-tool-item")
+    ] == [
+        EventType.TURN_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
+    ]
+    assert [
+        message.role
+        for message in turn_store.turn_history("service-tool-item")
+    ] == ["user", "tool", "assistant"]
+    assert calls == ["streamed"]
+    await service.aclose()
+    turn_store.close()
+
+
+@pytest.mark.anyio
 async def test_service_resume_uses_loop_checkpoint_and_does_not_replay(
     tmp_path: Path,
 ) -> None:
@@ -232,7 +291,9 @@ async def test_service_resume_uses_loop_checkpoint_and_does_not_replay(
 
 
 @pytest.mark.anyio
-async def test_service_exposes_non_idempotent_unknown_as_reconciliation() -> None:
+async def test_service_exposes_non_idempotent_unknown_as_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     run_id = "service-loop-reconciliation"
     config = _config(run_id)
     checkpointer = MemorySaver(serde=agent_checkpoint_serde())
@@ -244,6 +305,9 @@ async def test_service_exposes_non_idempotent_unknown_as_reconciliation() -> Non
     state = create_loop_state(
         current_message="Recover an ambiguous write.",
         run_config=config,
+        turn_transcript=(
+            ModelMessage(role="user", content="Recover an ambiguous write."),
+        ),
         pending_tool_calls=[call],
     )
     state["tool_execution_records"][call.tool_call_id] = ToolExecutionRecord(
@@ -264,6 +328,17 @@ async def test_service_exposes_non_idempotent_unknown_as_reconciliation() -> Non
         RuntimeBinding(),
         turn_id=run_id,
     )
+    parent_item_id = f"tool:{run_id}:{call.tool_call_id}:1"
+    turn_store.commit_completed_item(
+        item_completed(
+            turn_id=run_id,
+            item_id=parent_item_id,
+            item_kind=TurnItemKind.TOOL,
+            status=ItemStatus.OUTCOME_UNKNOWN,
+            data={"result": {}},
+            error="interrupted_outcome_unknown",
+        )
+    )
     turn_store.mark_interrupted(run_id)
     service = AgentService(
         definition=_definition(),
@@ -277,6 +352,29 @@ async def test_service_exposes_non_idempotent_unknown_as_reconciliation() -> Non
 
     assert request.kind == "tool_reconciliation"
     assert request.context["operation_id"] == "op-ambiguous"
+
+    async def finish_resumed_state(*_args, **_kwargs) -> AgentRunResult:
+        return AgentRunResult(turn_id=run_id, status="done", final_answer="reconciled")
+
+    monkeypatch.setattr(
+        service,
+        "_continue_resumed_state",
+        finish_resumed_state,
+    )
+
+    resumed = await service.resume_turn(
+        turn_id=run_id,
+        action="mark_failed",
+    )
+
+    reconciliation = next(
+        record.event
+        for record in turn_store.replay_turn_events(run_id)
+        if record.event.item_kind is TurnItemKind.RECONCILIATION
+    )
+    assert reconciliation.parent_item_id == parent_item_id
+    assert reconciliation.data["decision"] == "mark_failed"
+    assert resumed.status == "done"
     TurnRegistry.remove(run_id)
 
 

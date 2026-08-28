@@ -31,6 +31,7 @@ from rag.agent.tools.tool import (
     ToolCall,
     ToolContentBlock,
     ToolEffect,
+    ToolProgressSink,
     ToolResult,
     ToolTarget,
     ToolValidationError,
@@ -209,6 +210,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         record: ToolExecutionRecord | None = None,
         record_sink: RecordSink | None = None,
+        progress_sink: ToolProgressSink | None = None,
     ) -> ToolExecution:
         trace_count = len(self._traces)
         started_at = time.monotonic()
@@ -222,7 +224,7 @@ class ToolExecutor:
             )
             if isinstance(prepared, ToolExecution):
                 return prepared
-            return await self._invoke(prepared)
+            return await self._invoke(prepared, progress_sink=progress_sink)
         except asyncio.CancelledError:
             if len(self._traces) == trace_count:
                 await self._finish(
@@ -245,6 +247,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         records: Mapping[str, ToolExecutionRecord] | None = None,
         record_sink: RecordSink | None = None,
+        progress_sinks: Mapping[str, ToolProgressSink] | None = None,
     ) -> tuple[ToolExecution, ...]:
         prior_records = records or {}
         completed: dict[int, ToolExecution] = {}
@@ -267,7 +270,15 @@ class ToolExecutor:
             for offset in range(0, len(prepared), limit):
                 batch = prepared[offset : offset + limit]
                 executions = await asyncio.gather(
-                    *(self._invoke(item) for _, item in batch)
+                    *(
+                        self._invoke(
+                            item,
+                            progress_sink=(progress_sinks or {}).get(
+                                item.call.tool_call_id
+                            ),
+                        )
+                        for _, item in batch
+                    )
                 )
                 for (index, _), execution in zip(
                     batch,
@@ -277,7 +288,12 @@ class ToolExecutor:
                     completed[index] = execution
         else:
             for index, item in prepared:
-                completed[index] = await self._invoke(item)
+                completed[index] = await self._invoke(
+                    item,
+                    progress_sink=(progress_sinks or {}).get(
+                        item.call.tool_call_id
+                    ),
+                )
         return tuple(completed[index] for index in range(len(calls)))
 
     async def _prepare(
@@ -617,7 +633,12 @@ class ToolExecutor:
             decision=decision.decision,
         )
 
-    async def _invoke(self, prepared: _PreparedExecution) -> ToolExecution:
+    async def _invoke(
+        self,
+        prepared: _PreparedExecution,
+        *,
+        progress_sink: ToolProgressSink | None = None,
+    ) -> ToolExecution:
         started_record = replace(
             prepared.record,
             status=ExecutionStatus.STARTED,
@@ -631,6 +652,7 @@ class ToolExecutor:
             raw = await _run_with_timeout(
                 prepared.tool,
                 prepared.arguments,
+                progress_sink=progress_sink,
             )
         except _CancelledTimeoutError:
             record = replace(
@@ -961,10 +983,14 @@ def _bound_model_output(
 async def _run_with_timeout(
     tool: Tool,
     arguments: Mapping[str, JsonValue],
+    *,
+    progress_sink: ToolProgressSink | None = None,
 ) -> object:
     loop = asyncio.get_running_loop()
     started_at = loop.time()
-    task = asyncio.create_task(_call_runner(tool, arguments))
+    task = asyncio.create_task(
+        _call_runner(tool, arguments, progress_sink=progress_sink)
+    )
     remote = tool.cancellation_mode in {
         CancellationMode.REMOTE_BEST_EFFORT,
         CancellationMode.NOT_CANCELLABLE,
@@ -1029,11 +1055,22 @@ async def _run_with_timeout(
 async def _call_runner(
     tool: Tool,
     arguments: Mapping[str, JsonValue],
+    *,
+    progress_sink: ToolProgressSink | None,
 ) -> object:
+    if tool.stream is not None:
+        return await tool.stream(
+            arguments,
+            progress_sink or _discard_tool_progress,
+        )
     raw = tool.run(arguments)
     if inspect.isawaitable(raw):
         return await raw
     return raw
+
+
+async def _discard_tool_progress(_progress: object) -> None:
+    return None
 
 
 def _consume_background_task(task: asyncio.Task[object]) -> None:

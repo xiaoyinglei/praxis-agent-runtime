@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import math
 import os
 import signal
@@ -21,6 +22,9 @@ from rag.agent.tools.tool import (
     Tool,
     ToolDefinition,
     ToolEffect,
+    ToolProgress,
+    ToolProgressKind,
+    ToolProgressSink,
     ToolTarget,
     json_schema_output,
     pydantic_input,
@@ -28,6 +32,9 @@ from rag.agent.tools.tool import (
 from rag.agent.workspace import WorkspaceRuntime
 
 _MAX_STREAM_BYTES = 50_000
+_MAX_DELTA_BYTES = 200_000
+_MAX_DELTA_CHUNKS = 512
+_DELTA_CHUNK_BYTES = 4_096
 _SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
 
 
@@ -100,6 +107,17 @@ def create_run_command_tool(
             termination_grace_seconds=float(termination_grace_seconds),
         )
 
+    async def stream(
+        arguments: Mapping[str, JsonValue],
+        progress_sink: ToolProgressSink,
+    ) -> RunCommandOutput:
+        return await _run_command(
+            workspace,
+            RunCommandInput.model_validate(arguments),
+            termination_grace_seconds=float(termination_grace_seconds),
+            progress_sink=progress_sink,
+        )
+
     return Tool(
         definition=ToolDefinition(
             name="run_command",
@@ -132,6 +150,7 @@ def create_run_command_tool(
         interrupt_behavior=InterruptBehavior.CANCEL,
         timeout_seconds=hard_timeout_seconds,
         max_model_output_bytes=150_000,
+        stream=stream,
     )
 
 
@@ -140,6 +159,7 @@ async def _run_command(
     request: RunCommandInput,
     *,
     termination_grace_seconds: float,
+    progress_sink: ToolProgressSink | None = None,
 ) -> RunCommandOutput:
     cwd = workspace.ensure_within_workspace(
         workspace.resolve_path(request.working_dir or "."),
@@ -193,7 +213,27 @@ async def _run_command(
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        communication = asyncio.create_task(process.communicate())
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("command process pipes were not created")
+        progress_budget = _CommandProgressBudget()
+        stdout_task = asyncio.create_task(
+            _read_command_stream(
+                process.stdout,
+                kind=ToolProgressKind.STDOUT,
+                progress_sink=progress_sink,
+                progress_budget=progress_budget,
+            )
+        )
+        stderr_task = asyncio.create_task(
+            _read_command_stream(
+                process.stderr,
+                kind=ToolProgressKind.STDERR,
+                progress_sink=progress_sink,
+                progress_budget=progress_budget,
+            )
+        )
+        wait_task = asyncio.create_task(process.wait())
+        communication = asyncio.gather(stdout_task, stderr_task, wait_task)
         timed_out = False
         try:
             done, _pending = await asyncio.wait(
@@ -206,7 +246,7 @@ async def _run_command(
                     process,
                     grace_seconds=termination_grace_seconds,
                 )
-            stdout_bytes, stderr_bytes = await communication
+            stdout_bytes, stderr_bytes, _returncode = await communication
         except asyncio.CancelledError:
             await _terminate_process_group(
                 process,
@@ -214,8 +254,16 @@ async def _run_command(
             )
             try:
                 await communication
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
+            raise
+        except BaseException:
+            await _terminate_process_group(
+                process,
+                grace_seconds=termination_grace_seconds,
+            )
+            communication.cancel()
+            await asyncio.gather(communication, return_exceptions=True)
             raise
 
         stdout, stdout_truncated = _bounded_stream(stdout_bytes)
@@ -234,6 +282,53 @@ async def _run_command(
             network_enabled=request.network,
         )
     return output
+
+
+class _CommandProgressBudget:
+    def __init__(self) -> None:
+        self._remaining_bytes = _MAX_DELTA_BYTES
+        self._remaining_chunks = _MAX_DELTA_CHUNKS
+        self._lock = asyncio.Lock()
+
+    async def claim(self, value: bytes) -> bytes:
+        async with self._lock:
+            if self._remaining_chunks <= 0 or self._remaining_bytes <= 0:
+                return b""
+            claimed = value[: self._remaining_bytes]
+            self._remaining_bytes -= len(claimed)
+            self._remaining_chunks -= 1
+            return claimed
+
+
+async def _read_command_stream(
+    stream: asyncio.StreamReader,
+    *,
+    kind: ToolProgressKind,
+    progress_sink: ToolProgressSink | None,
+    progress_budget: _CommandProgressBudget,
+) -> bytes:
+    retained = bytearray()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    while True:
+        chunk = await stream.read(_DELTA_CHUNK_BYTES)
+        if not chunk:
+            break
+        retained_limit = _MAX_STREAM_BYTES + 1
+        if len(retained) < retained_limit:
+            retained.extend(chunk[: retained_limit - len(retained)])
+        if progress_sink is None:
+            continue
+        claimed = await progress_budget.claim(chunk)
+        if not claimed:
+            continue
+        content = decoder.decode(claimed, final=False)
+        if content:
+            await progress_sink(ToolProgress(kind=kind, content=content))
+    if progress_sink is not None:
+        final_content = decoder.decode(b"", final=True)
+        if final_content:
+            await progress_sink(ToolProgress(kind=kind, content=final_content))
+    return bytes(retained)
 
 
 def _command_environment(

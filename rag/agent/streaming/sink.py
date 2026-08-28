@@ -17,13 +17,14 @@ import asyncio
 from collections.abc import AsyncGenerator, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
-from rag.agent.core.messages import ModelMessage, ToolCall
+from rag.agent.core.messages import ModelMessage, ToolCall, canonical_json_text
 from rag.agent.streaming.events import (
     EventType,
     ItemStatus,
     StreamEvent,
     TurnItemKind,
 )
+from rag.agent.tools.tool import JsonValue
 
 if TYPE_CHECKING:
     from rag.agent.turns import TurnStore
@@ -104,6 +105,8 @@ class QueueStreamEventSink:
 
 
 def _completed_item_message(event: StreamEvent) -> ModelMessage | None:
+    if event.item_kind in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
+        return _completed_tool_message(event)
     if (
         event.item_kind is not TurnItemKind.AGENT_MESSAGE
         or event.status is not ItemStatus.SUCCESS
@@ -139,4 +142,30 @@ def _completed_item_message(event: StreamEvent) -> ModelMessage | None:
         role="assistant",
         content=content,
         tool_calls=tuple(calls),
+    )
+
+
+def _completed_tool_message(event: StreamEvent) -> ModelMessage | None:
+    result = event.data.get("result")
+    if not isinstance(result, Mapping):
+        return None
+    tool_call_id = result.get("tool_call_id")
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        raise ValueError("completed tool item result requires tool_call_id")
+    content = result.get("content")
+    if not isinstance(content, (list, tuple)):
+        raise ValueError("completed tool item result requires content sequence")
+    payload = {
+        "content": content,
+        "structured_content": result.get("structured_content"),
+        "is_error": result.get("is_error"),
+        "error_code": result.get("error_code"),
+        "error_message": result.get("error_message"),
+        "retryable": result.get("retryable"),
+        "truncated": result.get("truncated"),
+    }
+    return ModelMessage(
+        role="tool",
+        content=canonical_json_text(cast(JsonValue, payload)),
+        tool_call_id=tool_call_id,
     )

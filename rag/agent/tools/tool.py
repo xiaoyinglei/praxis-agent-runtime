@@ -488,6 +488,39 @@ class ToolResult:
 
 type ValidateInput = Callable[[Mapping[str, JsonValue]], Mapping[str, JsonValue]]
 type ToolRunner = Callable[[Mapping[str, JsonValue]], object | Awaitable[object]]
+
+
+class ToolProgressKind(StrEnum):
+    PROGRESS = "progress"
+    STDOUT = "stdout"
+    STDERR = "stderr"
+
+
+@dataclass(frozen=True, slots=True)
+class ToolProgress:
+    kind: ToolProgressKind
+    content: str
+    percent: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ToolProgressKind):
+            raise TypeError("kind must be a ToolProgressKind")
+        if not isinstance(self.content, str):
+            raise TypeError("content must be a string")
+        if self.percent is not None and (
+            isinstance(self.percent, bool)
+            or not isinstance(self.percent, Real)
+            or not math.isfinite(self.percent)
+            or not 0 <= self.percent <= 100
+        ):
+            raise ValueError("percent must be between 0 and 100")
+
+
+type ToolProgressSink = Callable[[ToolProgress], Awaitable[None]]
+type StreamingToolRunner = Callable[
+    [Mapping[str, JsonValue], ToolProgressSink],
+    Awaitable[object],
+]
 type NormalizeOutput = Callable[[object], NormalizedToolOutput]
 type ResolveToolUse = Callable[[Mapping[str, JsonValue]], ResolvedToolUse]
 
@@ -1263,6 +1296,7 @@ class Tool:
     interrupt_behavior: InterruptBehavior
     timeout_seconds: float
     max_model_output_bytes: int
+    stream: StreamingToolRunner | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -1270,6 +1304,8 @@ class Tool:
         for field_name in ("validate_input", "run", "normalize_output", "resolve_use"):
             if not callable(getattr(self, field_name)):
                 raise TypeError(f"{field_name} must be callable")
+        if self.stream is not None and not callable(self.stream):
+            raise TypeError("stream must be callable when provided")
 
         static_effects = frozenset(self.static_effects)
         if any(not isinstance(effect, ToolEffect) for effect in static_effects):

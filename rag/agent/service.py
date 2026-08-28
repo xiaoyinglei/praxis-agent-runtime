@@ -67,7 +67,13 @@ from rag.agent.memory.models import MemoryPolicy
 from rag.agent.memory.store import WorkspaceMemoryStore
 from rag.agent.skills.catalog import SkillCatalog
 from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import EventType, StreamEvent
+from rag.agent.streaming.events import (
+    EventType,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    item_completed,
+)
 from rag.agent.streaming.sink import DurableStreamEventSink, StreamEventSink
 from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
 from rag.agent.tools.executor import (
@@ -96,6 +102,19 @@ from rag.schema.query import AnswerCitation, EvidenceItem
 logger = logging.getLogger(__name__)
 _TURN_LEASE_SECONDS = 300.0
 _TURN_LEASE_HEARTBEAT_SECONDS = 60.0
+_PUBLIC_STREAM_EVENT_TYPES = frozenset(
+    {
+        EventType.TURN_STARTED,
+        EventType.TURN_PAUSED,
+        EventType.TURN_RESUMED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_COMPLETED,
+        EventType.TURN_ABORTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    }
+)
 type _ResumeDecision = Literal[
     "allow_once",
     "deny",
@@ -424,11 +443,7 @@ class AgentService:
                     live_sink=live_sink,
                 ),
             ):
-                if event.type not in {
-                    EventType.TURN_START,
-                    EventType.TURN_END,
-                    EventType.LOOP_END,
-                }:
+                if event.type in _PUBLIC_STREAM_EVENT_TYPES:
                     yield event
             self._finalize_state(
                 state,
@@ -942,6 +957,13 @@ class AgentService:
             raise RuntimeError(f"Checkpoint identity does not match Turn {turn_id}")
         current_request = _resume_request(restored)
         resolving_reconciliation = current_request is not None and current_request.kind == "tool_reconciliation"
+        reconciliation_record = (
+            None
+            if not resolving_reconciliation or current_request is None
+            else restored["tool_execution_records"].get(
+                current_request.context.get("tool_call_id")
+            )
+        )
         if action != "abort" and not resolving_reconciliation:
             drift_result = await self._reconcile_manifest(
                 restored,
@@ -969,6 +991,35 @@ class AgentService:
                 state["pause"] = None
                 state["approval_request"] = None
                 state["approval_response"] = None
+            if (
+                resolving_reconciliation
+                and response is not None
+                and reconciliation_record is not None
+            ):
+                prefix = (
+                    "command"
+                    if reconciliation_record.tool_name == "run_command"
+                    else "tool"
+                )
+                parent_item_id = (
+                    f"{prefix}:{turn_id}:{reconciliation_record.tool_call_id}:"
+                    f"{reconciliation_record.attempt_count}"
+                )
+                self._turn_store.commit_completed_item(
+                    item_completed(
+                        turn_id=turn_id,
+                        item_id=f"reconciliation:{turn_id}:{response.request_id}",
+                        item_kind=TurnItemKind.RECONCILIATION,
+                        status=ItemStatus.SUCCESS,
+                        data={
+                            "tool_call_id": reconciliation_record.tool_call_id,
+                            "operation_id": reconciliation_record.operation_id,
+                            "decision": response.decision,
+                        },
+                        iteration=state["iteration"],
+                        parent_item_id=parent_item_id,
+                    )
+                )
             self._hydrate_turn_state(state, turn_id=turn_id)
             if user_input is not None and not abort:
                 message = ModelMessage(role="user", content=user_input)
@@ -1081,7 +1132,10 @@ class AgentService:
         turn = self._turn_store.get_turn(turn_id)
         before = self._turn_store.history_before_turn(turn_id)
         persisted_turn = self._turn_store.turn_history(turn_id)
-        checkpoint_turn = tuple(state.get("turn_transcript", ()))
+        checkpoint_turn = tuple(
+            snapshot_model_message(message)
+            for message in state.get("turn_transcript", ())
+        )
         if checkpoint_turn[: len(persisted_turn)] == persisted_turn:
             current = checkpoint_turn
         elif persisted_turn[: len(checkpoint_turn)] == checkpoint_turn:

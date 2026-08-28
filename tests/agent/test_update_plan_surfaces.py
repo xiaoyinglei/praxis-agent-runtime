@@ -15,6 +15,7 @@ from rag.agent.core.definition import AgentRuntimePolicy
 from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.state import LoopState, ModelTurnDraft
 from rag.agent.service import AgentRunRequest, AgentService
+from rag.agent.streaming.events import EventType, ItemDeltaKind, TurnItemKind
 from rag.agent.workspace import open_workspace
 
 _PLAN_ARGUMENTS = {
@@ -135,7 +136,16 @@ async def test_update_plan_emits_complete_plan_snapshot_on_stream(
         )
     ]
 
-    plan_event = next(event for event in events if event.type.value == "plan_updated")
+    plan_events = [
+        event for event in events if event.item_kind is TurnItemKind.PLAN
+    ]
+    assert [event.type for event in plan_events] == [
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    ]
+    assert plan_events[1].delta_kind is ItemDeltaKind.PLAN
+    plan_event = plan_events[-1]
     assert plan_event.turn_id == "turn-plan-stream"
     assert not hasattr(plan_event, "session_id")
     assert plan_event.iteration == 1

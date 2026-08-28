@@ -41,7 +41,14 @@ from rag.agent.memory.compactor import LoopCompactionResult
 from rag.agent.skills.catalog import SkillCatalog
 from rag.agent.skills.loader import scan_and_load_skills
 from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import EventType, StreamEvent, text_delta
+from rag.agent.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    text_delta,
+)
 from rag.agent.tools.executor import (
     ExecutionStatus,
     ToolExecutionRecord,
@@ -66,6 +73,8 @@ from rag.agent.tools.tool import (
     ToolContentBlock,
     ToolDefinition,
     ToolEffect,
+    ToolProgress,
+    ToolProgressKind,
     ToolResult,
     json_schema_input,
 )
@@ -190,6 +199,7 @@ def _tool(
     effects: frozenset[ToolEffect] = frozenset(),
     metadata: Mapping[str, JsonValue] | None = None,
     idempotent: bool = True,
+    stream: object | None = None,
 ) -> Tool:
     input_schema = schema or {
         "type": "object",
@@ -228,6 +238,7 @@ def _tool(
         interrupt_behavior=InterruptBehavior.CANCEL,
         timeout_seconds=1.0,
         max_model_output_bytes=4096,
+        stream=stream,  # type: ignore[arg-type]
     )
 
 
@@ -298,6 +309,115 @@ async def test_model_tool_result_next_turn_and_finish() -> None:
 
 
 @pytest.mark.anyio
+async def test_tool_execution_emits_canonical_item_progress_and_completion() -> None:
+    call = ToolCallPlan.create("echo", {"value": "hello"})
+    provider = _SequenceProvider(
+        [ModelTurnDraft(action="finish", final_answer="Final answer.")]
+    )
+    state = create_loop_state(
+        current_message="Echo.",
+        run_config=_config("loop-tool-item"),
+        pending_tool_calls=(call,),
+    )
+    state["resident_tool_names"] = ["echo"]
+
+    async def stream_runner(arguments, progress_sink):
+        await progress_sink(
+            ToolProgress(ToolProgressKind.PROGRESS, "half", percent=50)
+        )
+        return arguments["value"]
+
+    events = await _collect(
+        _loop(
+            provider=provider,
+            tools=(
+                _tool(
+                    "echo",
+                    lambda _arguments: "must not run",
+                    stream=stream_runner,
+                ),
+            ),
+        ).run_streaming(state)
+    )
+
+    canonical = [
+        event
+        for event in events
+        if event.type
+        in {
+            EventType.ITEM_STARTED,
+            EventType.ITEM_DELTA,
+            EventType.ITEM_COMPLETED,
+        }
+    ]
+    assert [event.type for event in canonical] == [
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    ]
+    assert all(event.item_kind is TurnItemKind.TOOL for event in canonical)
+    assert canonical[1].delta_kind is ItemDeltaKind.TOOL_PROGRESS
+    assert canonical[1].data == {"delta": "half"}
+    assert canonical[-1].status is ItemStatus.SUCCESS
+    assert canonical[-1].data["result"]["structured_content"] == {
+        "text": "hello"
+    }
+
+
+@pytest.mark.anyio
+async def test_run_command_uses_one_command_item_with_stdout_and_stderr() -> None:
+    call = ToolCallPlan.create("run_command", {"value": "ignored"})
+    state = create_loop_state(
+        current_message="Run.",
+        run_config=_config("loop-command-item"),
+        pending_tool_calls=(call,),
+    )
+    state["resident_tool_names"] = ["run_command"]
+
+    async def stream_runner(_arguments, progress_sink):
+        await progress_sink(
+            ToolProgress(ToolProgressKind.STDOUT, "out")
+        )
+        await progress_sink(
+            ToolProgress(ToolProgressKind.STDERR, "err")
+        )
+        return "done"
+
+    events = await _collect(
+        _loop(
+            provider=_SequenceProvider(
+                [ModelTurnDraft(action="finish", final_answer="Done.")]
+            ),
+            tools=(
+                _tool(
+                    "run_command",
+                    lambda _arguments: "must not run",
+                    stream=stream_runner,
+                ),
+            ),
+        ).run_streaming(state)
+    )
+
+    command_events = [
+        event
+        for event in events
+        if event.item_kind is TurnItemKind.COMMAND
+    ]
+    assert [event.type for event in command_events] == [
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    ]
+    assert [event.delta_kind for event in command_events[1:3]] == [
+        ItemDeltaKind.COMMAND_STDOUT,
+        ItemDeltaKind.COMMAND_STDERR,
+    ]
+    assert len({event.item_id for event in command_events}) == 1
+    assert not any(event.item_kind is TurnItemKind.TOOL for event in events)
+
+
+@pytest.mark.anyio
 async def test_apply_patch_result_event_exposes_only_cli_diff_details() -> None:
     call = ToolCallPlan.create("apply_patch", {"value": "edit"})
     provider = _SequenceProvider(
@@ -360,8 +480,7 @@ async def test_approval_pause_is_a_checkpointed_human_input_event() -> None:
     assert state["tool_results"] == []
     assert any(event.type is EventType.HUMAN_INPUT_REQUIRED for event in events)
     assert not any(event.type is EventType.TOOL_USE_ERROR for event in events)
-    start = next(event for event in events if event.type is EventType.TOOL_USE_START)
-    assert "public docs" in start.data["input_preview"]
+    assert not any(event.type is EventType.ITEM_STARTED for event in events)
     approval_snapshots = [snapshot for reason, snapshot in checkpoint.snapshots if reason == "tool_pause"]
     assert approval_snapshots[-1]["status"] == "paused"
 
