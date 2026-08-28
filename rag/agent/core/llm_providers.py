@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -30,10 +31,22 @@ from rag.agent.core.turn_contracts import ToolCallPlan
 from rag.agent.loop.runtime import ModelTurnEnvelope
 from rag.agent.loop.state import LoopState, ModelTurnDraft
 from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import text_delta
+from rag.agent.streaming.events import (
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    item_completed,
+    item_delta,
+    item_started,
+)
 from rag.agent.tools.selection import select_tools
-from rag.agent.tools.tool import Tool, ToolCallOrigin
-from rag.providers.llm_gateway import LLMGateway
+from rag.agent.tools.tool import JsonValue, Tool, ToolCallOrigin
+from rag.providers.llm_gateway import (
+    LLMGateway,
+    ProviderDelta,
+    ProviderDeltaChannel,
+)
 from rag.schema.llm import LLMCallStage
 
 
@@ -216,17 +229,33 @@ class LLMLoopModelTurnProvider:
             settings=settings,
         )
         _record_request_sizes(state, request)
-        response = await self._gateway.agenerate_model_request(
-            stage=LLMCallStage.TOOL_DECISION,
-            request=request,
-            provider=self._provider,
-            supports_native_tools=self._supports_native_tools,
-            stream=self._stream_sink is not None,
-            text_delta_sink=self._emit_text_delta,
+        items = _ModelItemEmitter(
+            sink=self._stream_sink,
+            turn_id=state["run_config"].turn_id,
+            iteration=state["iteration"],
         )
-        turn = response.turn
-        if not isinstance(turn, ToolUseResult):
-            raise TypeError("gateway must return a provider-neutral ToolUseResult")
+        try:
+            response = await self._gateway.agenerate_model_request(
+                stage=LLMCallStage.TOOL_DECISION,
+                request=request,
+                provider=self._provider,
+                supports_native_tools=self._supports_native_tools,
+                stream=self._stream_sink is not None,
+                delta_sink=(
+                    items.emit_delta
+                    if self._stream_sink is not None
+                    else None
+                ),
+            )
+            turn = response.turn
+            if not isinstance(turn, ToolUseResult):
+                raise TypeError(
+                    "gateway must return a provider-neutral ToolUseResult"
+                )
+            await items.complete(turn)
+        except BaseException as exc:
+            await items.close_partial(exc)
+            raise
         record = bind_model_call_record(
             request=request,
             provider_wire_hash=response.provider_wire_hash,
@@ -279,14 +308,167 @@ class LLMLoopModelTurnProvider:
             ),
         )
 
-    async def _emit_text_delta(self, value: str) -> None:
-        sink = self._stream_sink
-        if sink is None:
+
+
+class _ModelItemEmitter:
+    """Translate provider channels into canonical Item lifecycles."""
+
+    _KINDS = {
+        ProviderDeltaChannel.TEXT: (
+            TurnItemKind.AGENT_MESSAGE,
+            ItemDeltaKind.TEXT,
+            "agent",
+        ),
+        ProviderDeltaChannel.REASONING: (
+            TurnItemKind.REASONING,
+            ItemDeltaKind.REASONING,
+            "reasoning",
+        ),
+        ProviderDeltaChannel.PLAN: (
+            TurnItemKind.PLAN,
+            ItemDeltaKind.PLAN,
+            "plan",
+        ),
+    }
+
+    def __init__(
+        self,
+        *,
+        sink: object | None,
+        turn_id: str,
+        iteration: int,
+    ) -> None:
+        self._sink = sink
+        self._turn_id = turn_id
+        self._iteration = iteration
+        self._started: set[ProviderDeltaChannel] = set()
+        self._completed: set[ProviderDeltaChannel] = set()
+        self._buffers = {
+            channel: [] for channel in ProviderDeltaChannel
+        }
+
+    async def emit_delta(self, delta: ProviderDelta) -> None:
+        if not isinstance(delta, ProviderDelta):
+            raise TypeError("provider delta sink requires ProviderDelta values")
+        if not delta.content:
             return
-        emit = getattr(sink, "emit", None)
-        if not callable(emit):
+        item_kind, delta_kind, prefix = self._KINDS[delta.channel]
+        item_id = f"{prefix}:{self._turn_id}:{self._iteration}"
+        if delta.channel not in self._started:
+            await self._emit(
+                item_started(
+                    turn_id=self._turn_id,
+                    item_id=item_id,
+                    item_kind=item_kind,
+                    iteration=self._iteration,
+                )
+            )
+            self._started.add(delta.channel)
+        self._buffers[delta.channel].append(delta.content)
+        await self._emit(
+            item_delta(
+                turn_id=self._turn_id,
+                item_id=item_id,
+                item_kind=item_kind,
+                delta_kind=delta_kind,
+                delta=delta.content,
+                iteration=self._iteration,
+            )
+        )
+
+    async def complete(self, turn: ToolUseResult) -> None:
+        if self._sink is None:
             return
-        await emit(text_delta(value))
+        for channel in (
+            ProviderDeltaChannel.REASONING,
+            ProviderDeltaChannel.PLAN,
+        ):
+            if channel in self._started:
+                await self._complete_channel(
+                    channel,
+                    status=ItemStatus.SUCCESS,
+                    data={"content": "".join(self._buffers[channel])},
+                )
+        if ProviderDeltaChannel.TEXT not in self._started:
+            item_kind, _, prefix = self._KINDS[ProviderDeltaChannel.TEXT]
+            await self._emit(
+                item_started(
+                    turn_id=self._turn_id,
+                    item_id=f"{prefix}:{self._turn_id}:{self._iteration}",
+                    item_kind=item_kind,
+                    iteration=self._iteration,
+                )
+            )
+            self._started.add(ProviderDeltaChannel.TEXT)
+        message = ModelMessage(
+            role="assistant",
+            content=turn.text,
+            tool_calls=tuple(turn.tool_calls),
+        )
+        payload = model_message_payload(message)
+        await self._complete_channel(
+            ProviderDeltaChannel.TEXT,
+            status=ItemStatus.SUCCESS,
+            data={
+                "content": payload["content"],
+                "tool_calls": payload["tool_calls"],
+            },
+        )
+
+    async def close_partial(self, exc: BaseException) -> None:
+        status = (
+            ItemStatus.CANCELLED
+            if isinstance(exc, BaseExceptionGroup)
+            and any(
+                isinstance(child, asyncio.CancelledError)
+                for child in exc.exceptions
+            )
+            else ItemStatus.CANCELLED
+            if isinstance(exc, asyncio.CancelledError)
+            else ItemStatus.FAILED
+        )
+        for channel in (
+            ProviderDeltaChannel.REASONING,
+            ProviderDeltaChannel.PLAN,
+            ProviderDeltaChannel.TEXT,
+        ):
+            if channel not in self._started:
+                continue
+            if channel in self._completed:
+                continue
+            await self._complete_channel(
+                channel,
+                status=status,
+                data={"content": "".join(self._buffers[channel])},
+                error=None if status is ItemStatus.CANCELLED else str(exc),
+            )
+
+    async def _complete_channel(
+        self,
+        channel: ProviderDeltaChannel,
+        *,
+        status: ItemStatus,
+        data: dict[str, JsonValue],
+        error: str | None = None,
+    ) -> None:
+        item_kind, _, prefix = self._KINDS[channel]
+        self._completed.add(channel)
+        await self._emit(
+            item_completed(
+                turn_id=self._turn_id,
+                item_id=f"{prefix}:{self._turn_id}:{self._iteration}",
+                item_kind=item_kind,
+                status=status,
+                data=data,
+                iteration=self._iteration,
+                error=error,
+            )
+        )
+
+    async def _emit(self, event: StreamEvent) -> None:
+        emit = getattr(self._sink, "emit", None)
+        if callable(emit):
+            await emit(event)
 
 
 def _project_model_context(

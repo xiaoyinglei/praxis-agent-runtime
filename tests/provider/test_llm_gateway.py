@@ -31,6 +31,8 @@ from rag.providers.llm_gateway import (
     LLMContextOverflowError,
     LLMGateway,
     LLMToolCallValidationError,
+    ProviderDelta,
+    ProviderDeltaChannel,
     StreamChunk,
 )
 from rag.schema.llm import (
@@ -198,6 +200,8 @@ class _CanonicalStreamingGenerator:
     ) -> list[StreamChunk]:
         del messages, tools, kwargs
         return [
+            StreamChunk(type="thinking_delta", content="inspect evidence"),
+            StreamChunk(type="plan_delta", content="read then answer"),
             StreamChunk(type="text_delta", content="stream answer"),
             StreamChunk(
                 type="message_stop",
@@ -504,7 +508,10 @@ async def test_streaming_gateway_refunds_when_consumer_closes_early() -> None:
 async def test_streaming_fallback_parses_sdk_text_completion(
     chat_completion_factory: Callable[..., ChatCompletion],
 ) -> None:
-    response = chat_completion_factory(content="provider answer", tool_calls=None)
+    response = chat_completion_factory(
+        content="provider answer that is deliberately longer than twenty bytes",
+        tool_calls=None,
+    )
 
     chunks = [
         chunk
@@ -518,7 +525,9 @@ async def test_streaming_fallback_parses_sdk_text_completion(
     ]
 
     assert [chunk.type for chunk in chunks] == ["text_delta", "message_stop"]
-    assert chunks[0].content == "provider answer"
+    assert chunks[0].content == (
+        "provider answer that is deliberately longer than twenty bytes"
+    )
     assert chunks[-1].stop_reason == "end_turn"
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.usage_source == "provider"
@@ -716,7 +725,7 @@ async def test_gateway_adapts_one_canonical_request_to_local_envelope(provider: 
 @pytest.mark.anyio
 async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
     request = _canonical_request()
-    deltas: list[str] = []
+    deltas: list[ProviderDelta] = []
 
     result = await _gateway(
         _CanonicalStreamingGenerator(),
@@ -728,10 +737,14 @@ async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
         provider="openai-compatible",
         supports_native_tools=True,
         stream=True,
-        text_delta_sink=deltas.append,
+        delta_sink=deltas.append,
     )
 
     assert result.turn.text == "stream answer"
     assert result.usage.cache_read_input_tokens == 9
     assert result.usage.usage_source == "provider"
-    assert deltas == ["stream answer"]
+    assert deltas == [
+        ProviderDelta(ProviderDeltaChannel.REASONING, "inspect evidence"),
+        ProviderDelta(ProviderDeltaChannel.PLAN, "read then answer"),
+        ProviderDelta(ProviderDeltaChannel.TEXT, "stream answer"),
+    ]

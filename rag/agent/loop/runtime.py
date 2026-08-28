@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, Awaitable, Mapping, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import replace
 from inspect import isawaitable
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -212,13 +212,18 @@ class AgentLoop:
         if self._stream_sink is not None:
             await self._stream_sink.emit(event)
 
-    async def run_streaming(self, state: LoopState) -> AsyncGenerator[StreamEvent, None]:
+    async def run_streaming(
+        self,
+        state: LoopState,
+        *,
+        sink_wrapper: Callable[[StreamEventSink], StreamEventSink] | None = None,
+    ) -> AsyncGenerator[StreamEvent, None]:
         """Yield StreamEvents as the loop runs.  One queue sink, no monkey patches."""
         from rag.agent.streaming.sink import QueueStreamEventSink
 
         sink = QueueStreamEventSink()
         original = self._stream_sink
-        self._set_stream_sink(sink)
+        self._set_stream_sink(sink if sink_wrapper is None else sink_wrapper(sink))
 
         run_task: asyncio.Task[LoopState] | None = None
         try:

@@ -67,8 +67,8 @@ from rag.agent.memory.models import MemoryPolicy
 from rag.agent.memory.store import WorkspaceMemoryStore
 from rag.agent.skills.catalog import SkillCatalog
 from rag.agent.skills.runtime import SkillRuntime
-from rag.agent.streaming.events import StreamEvent
-from rag.agent.streaming.sink import StreamEventSink
+from rag.agent.streaming.events import EventType, StreamEvent
+from rag.agent.streaming.sink import DurableStreamEventSink, StreamEventSink
 from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
 from rag.agent.tools.executor import (
     ExecutionStatus,
@@ -403,6 +403,7 @@ class AgentService:
         lease_task = self._start_lease_heartbeat(run_config)
         state: LoopState | None = None
         workspace: WorkspaceRuntime | None = None
+        finalized = False
         try:
             (
                 state,
@@ -415,8 +416,40 @@ class AgentService:
                 request,
                 run_config=run_config,
             )
-            async for event in loop.run_streaming(state):
-                yield event
+            yield self._turn_store.replay_turn_events(run_config.turn_id)[0].event
+            async for event in loop.run_streaming(
+                state,
+                sink_wrapper=lambda live_sink: DurableStreamEventSink(
+                    turn_store=self._turn_store,
+                    live_sink=live_sink,
+                ),
+            ):
+                if event.type not in {
+                    EventType.TURN_START,
+                    EventType.TURN_END,
+                    EventType.LOOP_END,
+                }:
+                    yield event
+            self._finalize_state(
+                state,
+                started_at=started_at,
+                tool_trace_start=tool_trace_start,
+            )
+            if state["status"] == "paused":
+                await checkpoint_store.save_snapshot(
+                    state,
+                    reason="service_pause_finalized",
+                )
+            if state["status"] in {"completed", "failed"}:
+                TurnRegistry.remove(run_config.turn_id)
+            if state["status"] != "running":
+                self._sync_turn(state)
+                finalized = True
+                yield self._turn_store.replay_turn_events(
+                    run_config.turn_id
+                )[-1].event
+            if workspace is not None:
+                self._workspace_by_turn[run_config.turn_id] = workspace
         except (asyncio.CancelledError, GeneratorExit):
             TurnRegistry.remove(run_config.turn_id)
             raise
@@ -425,7 +458,7 @@ class AgentService:
             raise
         finally:
             try:
-                if state is not None:
+                if state is not None and not finalized:
                     self._finalize_state(
                         state,
                         started_at=started_at,

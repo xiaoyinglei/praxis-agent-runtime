@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from rag.agent.core.definition import AgentRuntimePolicy
+from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
+from rag.agent.core.messages import StopReason, ToolUseResult
+from rag.agent.service import AgentRunRequest, AgentService
 from rag.agent.streaming import events
+from rag.agent.streaming.sink import DurableStreamEventSink
+from rag.agent.tools.registry import ToolRegistry
+from rag.agent.turns import RuntimeBinding, TurnStore
+from rag.providers.llm_gateway import ProviderDelta, ProviderDeltaChannel
+from rag.schema.llm import LLMStageBudget, LLMUsage
 
 
 def test_v2_protocol_types_and_wire_values_are_public() -> None:
@@ -147,3 +157,183 @@ def test_v2_turn_lifecycle_events_are_not_item_scoped() -> None:
         events.EventType.TURN_ABORTED,
     ]
     assert all(event.item_id is None for event in (started, paused, resumed, cancelling, aborted))
+
+
+class _LiveSink:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.events = []
+        self.fail = fail
+
+    async def emit(self, event: events.StreamEvent) -> None:
+        self.events.append(event)
+        if self.fail:
+            raise RuntimeError("live consumer disconnected")
+
+
+@pytest.mark.anyio
+async def test_durable_sink_commits_completed_agent_item_before_live_delivery(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    store.begin_turn("hello", RuntimeBinding(), turn_id="turn-1")
+    live = _LiveSink()
+    sink = DurableStreamEventSink(turn_store=store, live_sink=live)
+    started = events.item_started(
+        turn_id="turn-1",
+        item_id="agent:turn-1:1",
+        item_kind=events.TurnItemKind.AGENT_MESSAGE,
+        iteration=1,
+    )
+    completed = events.item_completed(
+        turn_id="turn-1",
+        item_id="agent:turn-1:1",
+        item_kind=events.TurnItemKind.AGENT_MESSAGE,
+        status=events.ItemStatus.SUCCESS,
+        iteration=1,
+        data={"content": "world", "tool_calls": ()},
+    )
+
+    await sink.emit(started)
+    await sink.emit(
+        events.item_delta(
+            turn_id="turn-1",
+            item_id="agent:turn-1:1",
+            item_kind=events.TurnItemKind.AGENT_MESSAGE,
+            delta_kind=events.ItemDeltaKind.TEXT,
+            delta="world",
+            iteration=1,
+        )
+    )
+    await sink.emit(completed)
+
+    assert [record.event.type for record in store.replay_turn_events("turn-1")] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_COMPLETED,
+    ]
+    assert [(message.role, message.content) for message in store.turn_history("turn-1")] == [
+        ("user", "hello"),
+        ("assistant", "world"),
+    ]
+    assert live.events[-1] == completed
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_live_sink_failure_cannot_rollback_completed_item(tmp_path) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    store.begin_turn("hello", RuntimeBinding(), turn_id="turn-1")
+    sink = DurableStreamEventSink(
+        turn_store=store,
+        live_sink=_LiveSink(fail=True),
+    )
+    completed = events.item_completed(
+        turn_id="turn-1",
+        item_id="agent:turn-1:1",
+        item_kind=events.TurnItemKind.AGENT_MESSAGE,
+        status=events.ItemStatus.SUCCESS,
+        iteration=1,
+        data={"content": "world", "tool_calls": ()},
+    )
+
+    with pytest.raises(RuntimeError, match="disconnected"):
+        await sink.emit(completed)
+
+    replayed = store.replay_turn_events("turn-1")[-1].event
+    assert replayed.type is events.EventType.ITEM_COMPLETED
+    assert replayed.item_id == completed.item_id
+    assert replayed.data == {"content": "world", "tool_calls": []}
+    assert store.turn_history("turn-1")[-1].content == "world"
+    store.close()
+
+
+class _EndToEndGateway:
+    def effective_stage_budget(self, stage, *, kwargs=None) -> LLMStageBudget:
+        del stage, kwargs
+        return LLMStageBudget(max_input_tokens=8_000, max_output_tokens=1_000)
+
+    async def agenerate_model_request(self, **kwargs):
+        await kwargs["delta_sink"](
+            ProviderDelta(ProviderDeltaChannel.TEXT, "durable answer")
+        )
+        return SimpleNamespace(
+            turn=ToolUseResult(
+                text="durable answer",
+                tool_calls=[],
+                stop_reason=StopReason.END_TURN,
+                raw_stop_reason="stop",
+            ),
+            usage=LLMUsage(
+                input_tokens=2,
+                output_tokens=2,
+                source="provider",
+                logical_input_tokens=2,
+                uncached_input_tokens=2,
+                cache_read_input_tokens=0,
+                cache_write_input_tokens=0,
+                usage_source="provider",
+            ),
+            provider_wire_hash="wire_e2e",
+            serializer_revision="provider-wire-v1",
+            wire_kind="openai",
+        )
+
+
+@pytest.mark.anyio
+async def test_service_streams_turn_item_delta_completion_and_durable_history(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    definition = AgentRuntimePolicy.test_factory(
+        system_prompt="Answer directly.",
+        allowed_tools=[],
+    )
+    provider = LLMLoopModelTurnProvider(
+        _EndToEndGateway(),
+        model="test-model",
+        provider="openai-compatible",
+        supports_native_tools=True,
+        registry_snapshot=MappingProxyType({}),
+        resident_tool_names=(),
+    )
+    service = AgentService(
+        definition=definition,
+        tool_registry=ToolRegistry(),
+        model_turn_provider=provider,
+        turn_store=store,
+        runtime_binding=RuntimeBinding(workspace_path=str(tmp_path)),
+    )
+
+    streamed = [
+        event
+        async for event in service.run_streaming(
+            AgentRunRequest(message="hello", turn_id="turn-e2e")
+        )
+    ]
+
+    assert streamed[0].type is events.EventType.TURN_STARTED
+    assert streamed[-1].type is events.EventType.TURN_COMPLETED
+    assert [
+        event.type
+        for event in streamed
+        if event.type
+        in {
+            events.EventType.ITEM_STARTED,
+            events.EventType.ITEM_DELTA,
+            events.EventType.ITEM_COMPLETED,
+        }
+    ] == [
+        events.EventType.ITEM_STARTED,
+        events.EventType.ITEM_DELTA,
+        events.EventType.ITEM_COMPLETED,
+    ]
+    assert [record.event.type for record in store.replay_turn_events("turn-e2e")] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_COMPLETED,
+        events.EventType.TURN_COMPLETED,
+    ]
+    assert [(message.role, message.content) for message in store.turn_history("turn-e2e")] == [
+        ("user", "hello"),
+        ("assistant", "durable answer"),
+    ]
+    await service.aclose()
+    store.close()
