@@ -39,10 +39,13 @@ def test_agent_runtime_exports_sdk_facade() -> None:
         "AgentResult",
         "AgentUsage",
         "EventType",
+        "ItemDeltaKind",
+        "ItemStatus",
         "ModelNotAvailableError",
         "ModelSpec",
         "RAGKnowledgeConfig",
         "StreamEvent",
+        "TurnItemKind",
     ]
     for removed in (
         "ModelCatalog",
@@ -111,16 +114,21 @@ def test_agent_public_annotations_resolve_without_any() -> None:
 
 def test_stream_event_has_turn_named_json_contract() -> None:
     assert tuple(field.name for field in fields(StreamEvent)) == (
+        "protocol_version",
         "type",
         "turn_id",
+        "item_id",
+        "item_kind",
+        "delta_kind",
+        "status",
         "iteration",
         "sequence",
         "timestamp_ms",
         "data",
-        "span_id",
-        "parent_id",
+        "error",
+        "parent_item_id",
     )
-    event = StreamEvent(type=EventType.TURN_START)
+    event = StreamEvent(type=EventType.TURN_STARTED, turn_id="turn-1")
     assert not hasattr(event, "run_id")
     assert not hasattr(event, "thread_id")
     assert not hasattr(event, "turn")

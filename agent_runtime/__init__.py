@@ -5,7 +5,13 @@ from typing import TYPE_CHECKING
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
-from rag.agent.streaming.events import EventType, StreamEvent
+from rag.agent.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+)
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -25,8 +31,11 @@ __all__ = [
     "AgentResult",
     "AgentUsage",
     "EventType",
+    "ItemDeltaKind",
+    "ItemStatus",
     "ModelNotAvailableError",
     "ModelSpec",
     "RAGKnowledgeConfig",
     "StreamEvent",
+    "TurnItemKind",
 ]
