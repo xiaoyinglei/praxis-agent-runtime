@@ -11,7 +11,11 @@ from rag.agent.core.llm_providers import LLMLoopModelTurnProvider
 from rag.agent.core.messages import StopReason, ToolUseResult
 from rag.agent.service import AgentRunRequest, AgentService
 from rag.agent.streaming import events
-from rag.agent.streaming.sink import DurableStreamEventSink, QueueStreamEventSink
+from rag.agent.streaming.sink import (
+    DurableStreamEventSink,
+    LegacyStreamProjectionSink,
+    QueueStreamEventSink,
+)
 from rag.agent.tools.registry import ToolRegistry
 from rag.agent.turns import RuntimeBinding, TurnStore
 from rag.providers.llm_gateway import ProviderDelta, ProviderDeltaChannel
@@ -247,6 +251,165 @@ async def test_live_sink_failure_cannot_rollback_completed_item(tmp_path) -> Non
     store.close()
 
 
+@pytest.mark.anyio
+async def test_synthetic_cancel_is_idempotent_with_producer_cancel_completion(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    store.begin_turn("hello", RuntimeBinding(), turn_id="turn-cancel-item")
+    sink = DurableStreamEventSink(turn_store=store, live_sink=_LiveSink())
+    started = events.item_started(
+        turn_id="turn-cancel-item",
+        item_id="agent:turn-cancel-item:1",
+        item_kind=events.TurnItemKind.AGENT_MESSAGE,
+        iteration=1,
+    )
+    await sink.emit(started)
+    await sink.emit(
+        events.item_delta(
+            turn_id=started.turn_id,
+            item_id=started.item_id,
+            item_kind=started.item_kind,
+            delta_kind=events.ItemDeltaKind.TEXT,
+            delta="partial",
+            iteration=1,
+        )
+    )
+
+    await sink.close_open_items()
+    await sink.close_open_items()
+    await sink.emit(
+        events.item_completed(
+            turn_id=started.turn_id,
+            item_id=started.item_id,
+            item_kind=started.item_kind,
+            status=events.ItemStatus.CANCELLED,
+            data={"content": "partial"},
+            iteration=1,
+        )
+    )
+
+    replayed = store.replay_turn_events("turn-cancel-item")
+    assert [record.event.type for record in replayed] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_COMPLETED,
+    ]
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_legacy_projection_emits_only_legacy_wire_events() -> None:
+    target = _LiveSink()
+    sink = LegacyStreamProjectionSink(target)
+    canonical = (
+        events.turn_started("turn-legacy"),
+        events.item_started(
+            turn_id="turn-legacy",
+            item_id="agent:turn-legacy:1",
+            item_kind=events.TurnItemKind.AGENT_MESSAGE,
+            iteration=1,
+        ),
+        events.item_delta(
+            turn_id="turn-legacy",
+            item_id="agent:turn-legacy:1",
+            item_kind=events.TurnItemKind.AGENT_MESSAGE,
+            delta_kind=events.ItemDeltaKind.TEXT,
+            delta="hello",
+            iteration=1,
+        ),
+        events.item_completed(
+            turn_id="turn-legacy",
+            item_id="agent:turn-legacy:1",
+            item_kind=events.TurnItemKind.AGENT_MESSAGE,
+            status=events.ItemStatus.SUCCESS,
+            data={"content": "hello", "tool_calls": []},
+            iteration=1,
+        ),
+        events.turn_completed("turn-legacy"),
+    )
+
+    for event in canonical:
+        await sink.emit(event)
+
+    assert [event.type for event in target.events] == [
+        events.EventType.TURN_START,
+        events.EventType.TEXT_DELTA,
+        events.EventType.LOOP_END,
+    ]
+    assert not any(
+        event.type
+        in {
+            events.EventType.TURN_STARTED,
+            events.EventType.ITEM_STARTED,
+            events.EventType.ITEM_DELTA,
+            events.EventType.ITEM_COMPLETED,
+            events.EventType.TURN_COMPLETED,
+        }
+        for event in target.events
+    )
+
+
+@pytest.mark.anyio
+async def test_legacy_projection_preserves_tool_id_result_details_and_plan_event() -> None:
+    target = _LiveSink()
+    sink = LegacyStreamProjectionSink(target)
+    await sink.emit(
+        events.item_started(
+            turn_id="turn-legacy",
+            item_id="tool:turn-legacy:call-1:1",
+            item_kind=events.TurnItemKind.TOOL,
+            data={
+                "tool_name": "apply_patch",
+                "tool_call_id": "call-1",
+                "input_preview": "patch='***'",
+            },
+        )
+    )
+    await sink.emit(
+        events.item_completed(
+            turn_id="turn-legacy",
+            item_id="tool:turn-legacy:call-1:1",
+            item_kind=events.TurnItemKind.TOOL,
+            status=events.ItemStatus.SUCCESS,
+            data={
+                "result": {
+                    "tool_name": "apply_patch",
+                    "content": ({"type": "text", "data": {"text": "patched"}},),
+                    "structured_content": None,
+                    "metadata": {
+                        "file_path": "a.py",
+                        "diff": "-old\n+new",
+                        "diff_truncated": False,
+                    },
+                }
+            },
+        )
+    )
+    await sink.emit(
+        events.item_completed(
+            turn_id="turn-legacy",
+            item_id="update_plan:turn-legacy:1",
+            item_kind=events.TurnItemKind.PLAN,
+            status=events.ItemStatus.SUCCESS,
+            data={"plan": {"revision": 1}, "event": {"event_type": "llm_update"}},
+        )
+    )
+
+    assert [event.type for event in target.events] == [
+        events.EventType.TOOL_USE_START,
+        events.EventType.TOOL_USE_RESULT,
+        events.EventType.PLAN_UPDATED,
+    ]
+    assert target.events[0].data["tool_id"] == "call-1"
+    assert target.events[1].data["result"] == "patched"
+    assert target.events[1].data["details"] == {
+        "file_path": "a.py",
+        "diff": "-old\n+new",
+        "diff_truncated": False,
+    }
+    assert target.events[2].data["event"] == {"event_type": "llm_update"}
+
+
 class _EndToEndGateway:
     def effective_stage_budget(self, stage, *, kwargs=None) -> LLMStageBudget:
         del stage, kwargs
@@ -347,6 +510,89 @@ async def test_service_streams_turn_item_delta_completion_and_durable_history(
     assert [(message.role, message.content) for message in store.turn_history("turn-e2e")] == [
         ("user", "hello"),
         ("assistant", "durable answer"),
+    ]
+    await service.aclose()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_nonstream_event_sink_receives_the_same_canonical_protocol(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    live = _LiveSink()
+    service = AgentService(
+        definition=AgentRuntimePolicy.test_factory(
+            system_prompt="Answer directly.",
+            allowed_tools=[],
+        ),
+        tool_registry=ToolRegistry(),
+        model_turn_provider=LLMLoopModelTurnProvider(
+            _EndToEndGateway(),
+            model="test-model",
+            provider="openai-compatible",
+            supports_native_tools=True,
+            registry_snapshot=MappingProxyType({}),
+            resident_tool_names=(),
+        ),
+        stream_sink=live,
+        turn_store=store,
+        runtime_binding=RuntimeBinding(workspace_path=str(tmp_path)),
+    )
+
+    result = await service.run(
+        AgentRunRequest(message="hello", turn_id="turn-event-sink")
+    )
+
+    assert result.status == "done"
+    assert [event.type for event in live.events] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_STARTED,
+        events.EventType.ITEM_DELTA,
+        events.EventType.ITEM_COMPLETED,
+        events.EventType.TURN_COMPLETED,
+    ]
+    assert live.events[0] == store.replay_turn_events("turn-event-sink")[0].event
+    assert live.events[-1] == store.replay_turn_events("turn-event-sink")[-1].event
+    await service.aclose()
+    store.close()
+
+
+@pytest.mark.anyio
+async def test_nonstream_run_without_live_sink_still_persists_agent_item(
+    tmp_path,
+) -> None:
+    store = TurnStore(tmp_path / "turns.sqlite3")
+    service = AgentService(
+        definition=AgentRuntimePolicy.test_factory(
+            system_prompt="Answer directly.",
+            allowed_tools=[],
+        ),
+        tool_registry=ToolRegistry(),
+        model_turn_provider=LLMLoopModelTurnProvider(
+            _EndToEndGateway(),
+            model="test-model",
+            provider="openai-compatible",
+            supports_native_tools=True,
+            registry_snapshot=MappingProxyType({}),
+            resident_tool_names=(),
+        ),
+        turn_store=store,
+        runtime_binding=RuntimeBinding(workspace_path=str(tmp_path)),
+    )
+
+    result = await service.run(
+        AgentRunRequest(message="hello", turn_id="turn-no-live-sink")
+    )
+
+    assert result.status == "done"
+    assert [
+        record.event.type
+        for record in store.replay_turn_events("turn-no-live-sink")
+    ] == [
+        events.EventType.TURN_STARTED,
+        events.EventType.ITEM_COMPLETED,
+        events.EventType.TURN_COMPLETED,
     ]
     await service.aclose()
     store.close()

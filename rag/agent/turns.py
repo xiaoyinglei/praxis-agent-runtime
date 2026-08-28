@@ -303,11 +303,10 @@ class TurnStore:
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
-                self._connection.execute(
+                expired = self._connection.execute(
                     """
-                    UPDATE agent_turns
-                    SET status = ?, lease_owner = NULL,
-                        lease_expires_at = NULL, updated_at = ?
+                    SELECT turn_id
+                    FROM agent_turns
                     WHERE status = ?
                       AND (
                           lease_owner IS NULL
@@ -315,13 +314,30 @@ class TurnStore:
                           OR lease_expires_at <= ?
                       )
                     """,
-                    (
-                        TurnStatus.INTERRUPTED.value,
-                        checked_at,
-                        TurnStatus.RUNNING.value,
-                        checked_at,
-                    ),
-                )
+                    (TurnStatus.RUNNING.value, checked_at),
+                ).fetchall()
+                for expired_row in expired:
+                    expired_turn_id = str(expired_row["turn_id"])
+                    self._connection.execute(
+                        """
+                        UPDATE agent_turns
+                        SET status = ?, lease_owner = NULL,
+                            lease_expires_at = NULL, updated_at = ?
+                        WHERE turn_id = ?
+                        """,
+                        (
+                            TurnStatus.INTERRUPTED.value,
+                            checked_at,
+                            expired_turn_id,
+                        ),
+                    )
+                    self._append_lifecycle_unlocked(
+                        expired_turn_id,
+                        event_type=EventType.TURN_PAUSED,
+                        status=TurnStatus.INTERRUPTED.value,
+                        reason="lease_expired",
+                        timestamp=checked_at,
+                    )
                 row = self._connection.execute(
                     f"""
                     SELECT turn_id, previous_turn_id, status, user_message,
@@ -401,8 +417,12 @@ class TurnStore:
                     (turn_id,),
                 ).fetchall()
                 existing = tuple(str(row["payload_json"]) for row in existing_rows)
-                if len(payloads) < len(existing) or payloads[: len(existing)] != existing:
+                common = min(len(payloads), len(existing))
+                if payloads[:common] != existing[:common]:
                     raise RuntimeError(f"canonical history conflict for Turn {turn_id}")
+                if len(payloads) <= len(existing):
+                    self._connection.commit()
+                    return
                 for index in range(len(existing), len(payloads)):
                     self._connection.execute(
                         """
@@ -441,7 +461,7 @@ class TurnStore:
             try:
                 turn = self._connection.execute(
                     """
-                    SELECT next_durable_ordinal
+                    SELECT next_durable_ordinal, status
                     FROM agent_turns
                     WHERE turn_id = ?
                     """,
@@ -453,7 +473,7 @@ class TurnStore:
                     """
                     SELECT durable_ordinal, item_kind, status, iteration,
                            payload_json, error, parent_item_id,
-                           started_at_ms, message_payload_json
+                           message_payload_json
                     FROM agent_turn_items
                     WHERE turn_id = ? AND item_id = ?
                     """,
@@ -467,7 +487,6 @@ class TurnStore:
                         payload_json,
                         event.error,
                         event.parent_item_id,
-                        started_at_ms,
                         message_json,
                     )
                     actual = (
@@ -477,7 +496,6 @@ class TurnStore:
                         str(existing["payload_json"]),
                         cast(str | None, existing["error"]),
                         cast(str | None, existing["parent_item_id"]),
-                        cast(int | None, existing["started_at_ms"]),
                         cast(str | None, existing["message_payload_json"]),
                     )
                     if actual != expected:
@@ -486,6 +504,13 @@ class TurnStore:
                         )
                     self._connection.commit()
                     return int(existing["durable_ordinal"])
+
+                current_status = TurnStatus(str(turn["status"]))
+                if current_status is not TurnStatus.RUNNING:
+                    raise TurnStateError(
+                        f"Turn {event.turn_id} is {current_status.value}; "
+                        "cannot append a completed item"
+                    )
 
                 durable_ordinal = int(turn["next_durable_ordinal"])
                 self._connection.execute(
@@ -579,7 +604,7 @@ class TurnStore:
                         type=EventType(str(row["event_type"])),
                         turn_id=turn_id,
                         timestamp_ms=int(row["timestamp_ms"]),
-                        data=cast(dict[str, Any], data),
+                        data=data,
                     ),
                 )
             )
@@ -762,6 +787,13 @@ class TurnStore:
                         WHERE turn_id = ?
                         """,
                         (TurnStatus.INTERRUPTED.value, checked_at, turn_id),
+                    )
+                    self._append_lifecycle_unlocked(
+                        turn_id,
+                        event_type=EventType.TURN_PAUSED,
+                        status=TurnStatus.INTERRUPTED.value,
+                        reason="lease_expired",
+                        timestamp=checked_at,
                     )
                 elif status not in {TurnStatus.PAUSED, TurnStatus.INTERRUPTED}:
                     raise TurnStateError(f"Turn {turn_id} is {status.value} and cannot resume")
@@ -1167,9 +1199,7 @@ class TurnStore:
         if status is not TurnStatus.RUNNING:
             event_type = (
                 EventType.TURN_PAUSED
-                if status is TurnStatus.PAUSED
-                else EventType.TURN_ABORTED
-                if status is TurnStatus.INTERRUPTED
+                if status in {TurnStatus.PAUSED, TurnStatus.INTERRUPTED}
                 else EventType.TURN_COMPLETED
             )
             self._connection.execute(

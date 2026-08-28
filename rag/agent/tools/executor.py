@@ -136,6 +136,7 @@ type Externalizer = Callable[
     tuple[NormalizedToolOutput, bool],
 ]
 type TraceSink = Callable[[ToolExecutionTrace], None | Awaitable[None]]
+type ExecutionSink = Callable[[ToolExecution], None | Awaitable[None]]
 type RecordSink = Callable[
     [ToolExecutionRecord],
     None | Awaitable[None],
@@ -248,6 +249,7 @@ class ToolExecutor:
         records: Mapping[str, ToolExecutionRecord] | None = None,
         record_sink: RecordSink | None = None,
         progress_sinks: Mapping[str, ToolProgressSink] | None = None,
+        execution_sink: ExecutionSink | None = None,
     ) -> tuple[ToolExecution, ...]:
         prior_records = records or {}
         completed: dict[int, ToolExecution] = {}
@@ -262,23 +264,26 @@ class ToolExecutor:
             )
             if isinstance(item, ToolExecution):
                 completed[index] = item
+                await _emit_execution(execution_sink, item)
             else:
                 prepared.append((index, item))
+
+        async def invoke(item: _PreparedExecution) -> ToolExecution:
+            execution = await self._invoke(
+                item,
+                progress_sink=(progress_sinks or {}).get(
+                    item.call.tool_call_id
+                ),
+            )
+            await _emit_execution(execution_sink, execution)
+            return execution
 
         if _can_run_in_parallel(tuple(item for _, item in prepared)):
             limit = context.max_parallel_calls
             for offset in range(0, len(prepared), limit):
                 batch = prepared[offset : offset + limit]
                 executions = await asyncio.gather(
-                    *(
-                        self._invoke(
-                            item,
-                            progress_sink=(progress_sinks or {}).get(
-                                item.call.tool_call_id
-                            ),
-                        )
-                        for _, item in batch
-                    )
+                    *(invoke(item) for _, item in batch)
                 )
                 for (index, _), execution in zip(
                     batch,
@@ -288,12 +293,7 @@ class ToolExecutor:
                     completed[index] = execution
         else:
             for index, item in prepared:
-                completed[index] = await self._invoke(
-                    item,
-                    progress_sink=(progress_sinks or {}).get(
-                        item.call.tool_call_id
-                    ),
-                )
+                completed[index] = await invoke(item)
         return tuple(completed[index] for index in range(len(calls)))
 
     async def _prepare(
@@ -1118,6 +1118,17 @@ async def _emit_record(
     if sink is None:
         return
     emitted = sink(record)
+    if inspect.isawaitable(emitted):
+        await emitted
+
+
+async def _emit_execution(
+    sink: ExecutionSink | None,
+    execution: ToolExecution,
+) -> None:
+    if sink is None:
+        return
+    emitted = sink(execution)
     if inspect.isawaitable(emitted):
         await emitted
 

@@ -327,7 +327,7 @@ class _ModelItemEmitter:
         ProviderDeltaChannel.PLAN: (
             TurnItemKind.PLAN,
             ItemDeltaKind.PLAN,
-            "plan",
+            "provider_plan",
         ),
     }
 
@@ -343,7 +343,7 @@ class _ModelItemEmitter:
         self._iteration = iteration
         self._started: set[ProviderDeltaChannel] = set()
         self._completed: set[ProviderDeltaChannel] = set()
-        self._buffers = {
+        self._buffers: dict[ProviderDeltaChannel, list[str]] = {
             channel: [] for channel in ProviderDeltaChannel
         }
 

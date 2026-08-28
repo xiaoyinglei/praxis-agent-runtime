@@ -47,7 +47,9 @@ from rag.agent.streaming.events import (
     ItemStatus,
     StreamEvent,
     TurnItemKind,
-    text_delta,
+    item_completed,
+    item_delta,
+    item_started,
 )
 from rag.agent.tools.executor import (
     ExecutionStatus,
@@ -120,10 +122,32 @@ class _SinkAwareProvider:
         del definition, budget_remaining
         emit = getattr(self._stream_sink, "emit", None)
         if callable(emit):
+            item_id = f"agent:{state['run_config'].turn_id}:{state['iteration']}"
             await emit(
-                text_delta(
-                    "partial",
+                item_started(
                     turn_id=state["run_config"].turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.AGENT_MESSAGE,
+                    iteration=state["iteration"],
+                )
+            )
+            await emit(
+                item_delta(
+                    turn_id=state["run_config"].turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.AGENT_MESSAGE,
+                    delta_kind=ItemDeltaKind.TEXT,
+                    delta="partial",
+                    iteration=state["iteration"],
+                )
+            )
+            await emit(
+                item_completed(
+                    turn_id=state["run_config"].turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.AGENT_MESSAGE,
+                    status=ItemStatus.SUCCESS,
+                    data={"content": "partial", "tool_calls": []},
                     iteration=state["iteration"],
                 )
             )
@@ -444,8 +468,9 @@ async def test_apply_patch_result_event_exposes_only_cli_diff_details() -> None:
 
     events = await _collect(_loop(provider=provider, tools=(tool,)).run_streaming(state))
 
-    result = next(event for event in events if event.type is EventType.TOOL_USE_RESULT)
-    assert result.data["details"] == {
+    result = next(event for event in events if event.type is EventType.ITEM_COMPLETED)
+    assert result.item_kind is TurnItemKind.TOOL
+    assert result.data["result"]["metadata"] == {
         "file_path": "src/example.py",
         "diff": "--- a/src/example.py\n+++ b/src/example.py\n-old\n+new",
         "diff_truncated": False,
@@ -478,9 +503,7 @@ async def test_approval_pause_is_a_checkpointed_human_input_event() -> None:
 
     assert state["status"] == "paused"
     assert state["tool_results"] == []
-    assert any(event.type is EventType.HUMAN_INPUT_REQUIRED for event in events)
-    assert not any(event.type is EventType.TOOL_USE_ERROR for event in events)
-    assert not any(event.type is EventType.ITEM_STARTED for event in events)
+    assert events == []
     approval_snapshots = [snapshot for reason, snapshot in checkpoint.snapshots if reason == "tool_pause"]
     assert approval_snapshots[-1]["status"] == "paused"
 
@@ -689,10 +712,10 @@ async def test_max_turns_stream_does_not_announce_an_unstarted_turn() -> None:
         ).run_streaming(state)
     )
 
-    turn_events = [event for event in events if event.type is EventType.TURN_START]
-    assert [event.iteration for event in turn_events] == [1]
-    assert [event.turn_id for event in turn_events] == ["loop-max-turn-events"]
-    assert all(not hasattr(event, "session_id") for event in turn_events)
+    assert all(
+        event.type in {EventType.ITEM_STARTED, EventType.ITEM_COMPLETED}
+        for event in events
+    )
     assert all(event.sequence > 0 for event in events)
     assert [event.sequence for event in events] == sorted(event.sequence for event in events)
     assert state["status"] == "failed"
@@ -758,12 +781,12 @@ async def test_run_streaming_injects_sink_and_closes() -> None:
         timeout=1,
     )
 
-    text_event = next(event for event in events if event.type is EventType.TEXT_DELTA)
+    text_event = next(event for event in events if event.type is EventType.ITEM_DELTA)
     assert text_event.turn_id == "loop-stream"
     assert not hasattr(text_event, "session_id")
     assert text_event.iteration == 1
     assert text_event.sequence > 0
-    assert events[-1].type is EventType.LOOP_END
+    assert events[-1].type is EventType.ITEM_COMPLETED
 
 
 @pytest.mark.anyio
@@ -1036,12 +1059,7 @@ async def test_repeated_retryable_tool_failure_is_circuited_and_can_recover() ->
         "repeated_tool_failure",
         None,
     ]
-    recovery_event = next(
-        event
-        for event in events
-        if event.type is EventType.RECOVERY and event.data.get("strategy") == "tool_failure_circuit_breaker"
-    )
-    assert "flaky" in str(recovery_event.data["detail"])
+    assert not any(event.type is EventType.RECOVERY for event in events)
 
 
 @pytest.mark.anyio

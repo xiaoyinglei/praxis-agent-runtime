@@ -241,7 +241,7 @@ def test_completed_item_commit_is_idempotent_but_divergence_fails_closed(
         status=ItemStatus.SUCCESS,
         data={"result": "ok"},
     )
-    assert commit_item(same_delivery_with_new_timestamp, started_at_ms=10) == first
+    assert commit_item(same_delivery_with_new_timestamp, started_at_ms=11) == first
 
     divergent = item_completed(
         turn_id=turn.turn_id,
@@ -253,6 +253,29 @@ def test_completed_item_commit_is_idempotent_but_divergence_fails_closed(
     with pytest.raises(RuntimeError, match="completed item conflict"):
         commit_item(divergent, started_at_ms=10)
     assert len(store.replay_turn_events(turn.turn_id)) == 2
+    store.close()
+
+
+def test_new_item_cannot_be_appended_after_terminal_turn(tmp_path: Path) -> None:
+    store = TurnStore(tmp_path / "agent.sqlite")
+    turn = store.begin_turn("terminal", _runtime(tmp_path))
+    store.mark_terminal(turn.turn_id, TurnStatus.COMPLETED)
+
+    with pytest.raises(TurnStateError, match="cannot append"):
+        store.commit_completed_item(
+            item_completed(
+                turn_id=turn.turn_id,
+                item_id="agent:late",
+                item_kind=TurnItemKind.AGENT_MESSAGE,
+                status=ItemStatus.SUCCESS,
+                data={"content": "late", "tool_calls": []},
+            )
+        )
+
+    assert [record.event.type for record in store.replay_turn_events(turn.turn_id)] == [
+        EventType.TURN_STARTED,
+        EventType.TURN_COMPLETED,
+    ]
     store.close()
 
 

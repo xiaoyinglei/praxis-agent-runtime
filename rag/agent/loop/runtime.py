@@ -69,7 +69,12 @@ from rag.agent.streaming.events import (
 )
 from rag.agent.streaming.sink import StreamEventSink
 from rag.agent.tools.builtins.planning import UpdatePlanInput
-from rag.agent.tools.executor import ExecutionStatus, ToolExecutionRecord, ToolExecutor
+from rag.agent.tools.executor import (
+    ExecutionStatus,
+    ToolExecution,
+    ToolExecutionRecord,
+    ToolExecutor,
+)
 from rag.agent.tools.permissions import ToolExecutionContext
 from rag.agent.tools.selection import FIND_TOOLS_NAME, reduce_tool_activation
 from rag.agent.tools.tool import (
@@ -260,6 +265,17 @@ class AgentLoop:
             await run_task
 
         except BaseException:
+            disconnect_live = getattr(self._stream_sink, "disconnect_live", None)
+            if callable(disconnect_live):
+                disconnect_live()
+            if run_task is not None and not run_task.done():
+                run_task.cancel()
+            await sink.close()
+            if run_task is not None and not run_task.done():
+                try:
+                    await run_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             close_open_items = getattr(
                 self._stream_sink,
                 "close_open_items",
@@ -267,13 +283,6 @@ class AgentLoop:
             )
             if callable(close_open_items):
                 await close_open_items()
-            await sink.close()
-            if run_task is not None and not run_task.done():
-                run_task.cancel()
-                try:
-                    await run_task
-                except (asyncio.CancelledError, Exception):
-                    pass
             raise
 
         finally:
@@ -329,13 +338,6 @@ class AgentLoop:
             if not await self._compact(state):
                 return state
 
-            await self._emit_stream(
-                _stream_turn_start(
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"] + 1,
-                )
-            )
-
             # Model turn — call the LLM, handle errors, return (turn | None)
             state["iteration"] += 1
             turn, retries = await self._model_turn(
@@ -366,13 +368,6 @@ class AgentLoop:
                     detail={"phase": "scheduled", "tool_call_ids": [c.tool_call_id for c in turn.tool_calls]},
                     checkpoint_reason="tool_calls_scheduled",
                 )
-                await self._emit_stream(
-                    _stream_turn_end(
-                        turn_id=state["run_config"].turn_id,
-                        iteration=state["iteration"],
-                        stop_reason="tool_use",
-                    )
-                )
                 continue
 
             await self._transition(
@@ -380,13 +375,6 @@ class AgentLoop:
             )
 
             if turn.action == "pause":
-                await self._emit_stream(
-                    _stream_turn_end(
-                        turn_id=state["run_config"].turn_id,
-                        iteration=state["iteration"],
-                        stop_reason="pause",
-                    )
-                )
                 await self._pause(
                     state,
                     reason=cast(str, turn.pause_reason),
@@ -397,23 +385,9 @@ class AgentLoop:
                 return state
 
             # finish
-            await self._emit_stream(
-                _stream_turn_end(
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"],
-                    stop_reason="end_turn",
-                )
-            )
             if await self._evaluate_finish(state, turn):
                 return state
 
-        await self._emit_stream(
-            _stream_loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=state["terminal"].stop_reason if state.get("terminal") else "loop_exited",
-                total_turns=state["iteration"],
-            )
-        )
         return state
 
     async def _compact(self, state: LoopState) -> bool:
@@ -438,14 +412,6 @@ class AgentLoop:
         )
         replace_latest_transition(state, transition)
         await self._event_sink.emit(transition)
-        await self._emit_stream(
-            _stream_compact_layer(
-                channels=list(result.channels),
-                warnings=list(result.warnings),
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         return True
 
     async def _model_turn(
@@ -616,14 +582,6 @@ class AgentLoop:
         )
         replace_latest_transition(state, tr)
         await self._event_sink.emit(tr)
-        await self._emit_stream(
-            _stream_compact_layer(
-                channels=list(result.channels),
-                warnings=list(result.warnings),
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         return None, 0  # caller will retry (turn is None, but state is still running)
 
     async def _handle_invalid_turn(
@@ -667,14 +625,6 @@ class AgentLoop:
             return None, retries
 
         retries += 1
-        await self._emit_stream(
-            _stream_recovery(
-                strategy="model_retry",
-                detail=f"attempt={retries}, error={str(exc)[:200]}",
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         await self._transition(
             state,
             reason="retry",
@@ -727,14 +677,6 @@ class AgentLoop:
                     ),
                 ),
             )
-        await self._emit_stream(
-            _stream_recovery(
-                strategy="model_retry",
-                detail=f"attempt={retries}, error={str(exc)[:200]}",
-                turn_id=state["run_config"].turn_id,
-                iteration=state["iteration"],
-            )
-        )
         await self._transition(
             state,
             reason="retry",
@@ -769,6 +711,10 @@ class AgentLoop:
             tuple[str, TurnItemKind, int],
         ] = {}
         completed_items: set[str] = set()
+        completed_execution_order: list[ToolExecution] = []
+        durable_execution_order: list[ToolExecution] = []
+        non_durable_execution_order: list[ToolExecution] = []
+        calls_by_id = {call.tool_call_id: call for call in calls}
 
         async def record_sink(record: ToolExecutionRecord) -> None:
             await self._checkpoint_store.write_execution_record(record)
@@ -799,13 +745,19 @@ class AgentLoop:
                     iteration=turn,
                     data={
                         "tool_name": record.tool_name,
+                        "tool_call_id": record.tool_call_id,
                         "operation_id": record.operation_id,
                         "attempt": record.attempt_count,
+                        "input_preview": _tool_input_preview(
+                            calls_by_id[record.tool_call_id].arguments
+                        ),
                     },
                 )
             )
 
-        def progress_sink_for(call_id: str):
+        def progress_sink_for(
+            call_id: str,
+        ) -> Callable[[ToolProgress], Awaitable[None]]:
             async def progress_sink(progress: ToolProgress) -> None:
                 item = started_items.get(call_id)
                 if item is None:
@@ -835,36 +787,13 @@ class AgentLoop:
 
             return progress_sink
 
-        try:
-            executions = await self._tool_executor.execute_batch(
-                executable_calls,
-                context=context,
-                records=state["tool_execution_records"],
-                record_sink=record_sink,
-                progress_sinks={
-                    call.tool_call_id: progress_sink_for(call.tool_call_id)
-                    for call in executable_calls
-                },
-            )
-        except asyncio.CancelledError:
-            for call_id, (item_id, item_kind, _attempt) in started_items.items():
-                if call_id in completed_items:
-                    continue
-                await self._emit_stream(
-                    item_completed(
-                        turn_id=turn_id,
-                        item_id=item_id,
-                        item_kind=item_kind,
-                        status=ItemStatus.CANCELLED,
-                        data={},
-                        iteration=turn,
-                    )
-                )
-            raise
-        for execution in executions:
+        async def execution_sink(execution: ToolExecution) -> None:
+            completed_execution_order.append(execution)
             item = started_items.get(execution.result.tool_call_id)
             if item is None:
-                continue
+                non_durable_execution_order.append(execution)
+                return
+            durable_execution_order.append(execution)
             item_id, item_kind, _attempt = item
             record = execution.record
             status = (
@@ -894,6 +823,35 @@ class AgentLoop:
                 )
             )
             completed_items.add(execution.result.tool_call_id)
+
+        try:
+            executions = await self._tool_executor.execute_batch(
+                executable_calls,
+                context=context,
+                records=state["tool_execution_records"],
+                record_sink=record_sink,
+                progress_sinks={
+                    call.tool_call_id: progress_sink_for(call.tool_call_id)
+                    for call in executable_calls
+                },
+                execution_sink=execution_sink,
+            )
+        except asyncio.CancelledError:
+            for call_id, (item_id, item_kind, _attempt) in started_items.items():
+                if call_id in completed_items:
+                    continue
+                await self._emit_stream(
+                    item_completed(
+                        turn_id=turn_id,
+                        item_id=item_id,
+                        item_kind=item_kind,
+                        status=ItemStatus.CANCELLED,
+                        data={},
+                        iteration=turn,
+                    )
+                )
+            raise
+        executions = tuple(completed_execution_order)
         for execution in executions:
             if execution.record is not None:
                 state["tool_execution_records"][execution.record.tool_call_id] = execution.record
@@ -903,18 +861,22 @@ class AgentLoop:
         )
         approval_execution = approval_executions[0] if approval_executions else None
         approval_ids = {execution.result.tool_call_id for execution in approval_executions}
-        results_by_id = {
-            result.tool_call_id: result
-            for result in (*delivery_results, *circuit_results)
-        }
-        results_by_id.update(
-            {
-                execution.result.tool_call_id: execution.result
-                for execution in executions
+        ordered_results = [
+            *(execution.result for execution in durable_execution_order),
+            *delivery_results,
+            *circuit_results,
+            *(
+                execution.result
+                for execution in non_durable_execution_order
                 if execution.result.tool_call_id not in approval_ids
-            }
+            ),
+        ]
+        new_results = list(
+            {
+                result.tool_call_id: result
+                for result in ordered_results
+            }.values()
         )
-        new_results = [results_by_id[call.tool_call_id] for call in calls if call.tool_call_id in results_by_id]
         reconciliation_execution = next(
             (
                 execution
@@ -956,25 +918,9 @@ class AgentLoop:
         delivery_control = _delivery_control_event(state)
         if delivery_control is not None:
             _append_turn_messages(state, (delivery_control,))
-            await self._emit_stream(
-                _stream_recovery(
-                    strategy="delivery_control",
-                    detail=delivery_control.content[:200],
-                    turn_id=turn_id,
-                    iteration=turn,
-                )
-            )
 
         for tool_result in new_results:
             if tool_result.is_error:
-                await self._emit_stream(
-                    _stream_tool_use_error(
-                        tool_id=tool_result.tool_call_id,
-                        error=tool_result.error_message or "Unknown error",
-                        turn_id=turn_id,
-                        iteration=turn,
-                    )
-                )
                 if tool_result.error_code == _REPEATED_TOOL_FAILURE_CODE:
                     failure_count = tool_result.metadata.get("failure_count", 0)
                     detail = f"tool={tool_result.tool_name}, matching_failures={failure_count}"
@@ -987,30 +933,20 @@ class AgentLoop:
                             severity="warning",
                         ),
                     )
-                    await self._emit_stream(
-                        _stream_recovery(
-                            strategy="tool_failure_circuit_breaker",
-                            detail=detail,
-                            turn_id=turn_id,
-                            iteration=turn,
-                        )
-                    )
-            else:
-                await self._emit_stream(
-                    _stream_tool_use_result(
-                        tool_name=tool_result.tool_name,
-                        tool_id=tool_result.tool_call_id,
-                        result=_tool_result_text(tool_result)[:500],
-                        details=_tool_result_event_details(tool_result),
-                        turn_id=turn_id,
-                        iteration=turn,
-                    )
-                )
 
-        for plan, event in plan_updates:
+        plan_results = [
+            result
+            for result in new_results
+            if result.tool_name == "update_plan" and not result.is_error
+        ]
+        for (plan, event), plan_result in zip(
+            plan_updates,
+            plan_results,
+            strict=True,
+        ):
             plan_payload = plan.model_dump(mode="json")
             event_payload = event.model_dump(mode="json")
-            item_id = f"plan:{turn_id}:{plan.revision}"
+            item_id = f"update_plan:{turn_id}:{plan.revision}"
             await self._emit_stream(
                 item_started(
                     turn_id=turn_id,
@@ -1038,6 +974,7 @@ class AgentLoop:
                     data={
                         "plan": cast(JsonValue, plan_payload),
                         "event": cast(JsonValue, event_payload),
+                        "result": _tool_result_payload(plan_result),
                     },
                     iteration=turn,
                 )
@@ -1399,13 +1336,6 @@ class AgentLoop:
             detail={"stop_code": outcome.code},
             checkpoint_reason="terminal_completed",
         )
-        await self._emit_stream(
-            _stream_loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=outcome.code,
-                total_turns=state["iteration"],
-            )
-        )
 
     async def _fail(
         self,
@@ -1440,14 +1370,6 @@ class AgentLoop:
             },
             checkpoint_reason=checkpoint_reason,
         )
-        # ── 流式事件：loop 结束 ──
-        await self._emit_stream(
-            _stream_loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=stop_reason,
-                total_turns=state["iteration"],
-            )
-        )
 
     async def _pause(
         self,
@@ -1471,21 +1393,6 @@ class AgentLoop:
                 "request_kind": (getattr(request, "kind", None) if request is not None else None),
             },
             checkpoint_reason=checkpoint_reason,
-        )
-        if request is not None:
-            await self._emit_stream(
-                _stream_human_input_required(
-                    request=request,
-                    turn_id=state["run_config"].turn_id,
-                    iteration=state["iteration"],
-                )
-            )
-        await self._emit_stream(
-            _stream_loop_end(
-                turn_id=state["run_config"].turn_id,
-                reason=str(transition_reason),
-                total_turns=state["iteration"],
-            )
         )
 
     async def _transition(
@@ -1863,7 +1770,7 @@ def _tool_result_payload(result: ToolResult) -> dict[str, JsonValue]:
         "error_message": result.error_message,
         "retryable": result.retryable,
         "truncated": result.truncated,
-        "metadata": result.metadata,
+        "metadata": _tool_result_event_details(result),
         "attachments": tuple(
             {
                 "artifact_id": attachment.artifact_id,

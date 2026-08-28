@@ -12,6 +12,7 @@ from rag.agent.streaming.events import (
     StreamEvent,
     TurnItemKind,
 )
+from rag.agent.streaming.sink import LegacyStreamProjectionSink
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -33,6 +34,7 @@ __all__ = [
     "EventType",
     "ItemDeltaKind",
     "ItemStatus",
+    "LegacyStreamProjectionSink",
     "ModelNotAvailableError",
     "ModelSpec",
     "RAGKnowledgeConfig",

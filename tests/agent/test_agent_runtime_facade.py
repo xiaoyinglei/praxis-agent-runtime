@@ -13,7 +13,7 @@ from uuid import UUID
 import pytest
 
 import agent_runtime
-from agent_runtime import Agent, AgentResult, AgentUsage
+from agent_runtime import Agent, AgentResult, AgentUsage, LegacyStreamProjectionSink
 from agent_runtime import agent as agent_module
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.knowledge_providers.rag import LazyRAGKnowledgeProvider
@@ -33,6 +33,7 @@ def test_agent_runtime_exports_sdk_facade() -> None:
     assert Agent is not None
     assert AgentResult is not None
     assert AgentUsage is not None
+    assert LegacyStreamProjectionSink is not None
     assert agent_runtime.__all__ == [
         "Agent",
         "AgentEventSink",
@@ -41,6 +42,7 @@ def test_agent_runtime_exports_sdk_facade() -> None:
         "EventType",
         "ItemDeltaKind",
         "ItemStatus",
+        "LegacyStreamProjectionSink",
         "ModelNotAvailableError",
         "ModelSpec",
         "RAGKnowledgeConfig",
