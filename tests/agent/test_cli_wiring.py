@@ -18,10 +18,9 @@ from agent_runtime.cli import (
     _load_knowledge_config,
     agent_app,
 )
+from agent_runtime.harness import RolloutStore
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentPause, AgentResult, AgentToolCall, AgentUsage
-from agent_runtime.runtime.builder import build_agent_service
-from agent_runtime.service import AgentRunRequest
 from agent_runtime.streaming.events import (
     EventType,
     StreamEvent,
@@ -32,23 +31,6 @@ from agent_runtime.streaming.events import (
     tool_use_result,
     tool_use_start,
 )
-from agent_runtime.tools.builtins import RESIDENT_CODING_TOOL_NAMES
-from agent_runtime.tools.integrations.knowledge import KnowledgeSearchOutput
-from agent_runtime.tools.integrations.mcp import (
-    MCPToolDescriptor,
-    create_mcp_tools,
-)
-from agent_runtime.tools.integrations.skills import create_skill_tools
-from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
-from agent_runtime.workspace import open_workspace
-
-
-class _ModelRegistry:
-    default_model = "fake"
-
-    def resolve_for_node(self, **kwargs: object) -> object:
-        del kwargs
-        raise AssertionError("model resolution is not needed for assembly")
 
 
 def test_cli_defaults_use_praxis_runtime_paths() -> None:
@@ -72,20 +54,18 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
     agent = Agent()
     assert agent.checkpoint_db == Path(".praxis/checkpoints.sqlite")
     assert agent.model_session_path == Path(".praxis/model_session.json")
-    store = agent._get_turn_store()
     try:
         current = agent.current_model()
         switched = agent.switch_model(current.id)
 
         assert switched.id == current.id
-        assert cli_module.DEFAULT_CHECKPOINT_PATH.is_file()
+        assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
         assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
             "current_model_id": current.id
         }
         assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
         assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
     finally:
-        store.close()
         if agent._model_control_plane is not None:
             agent._model_control_plane.close()
 
@@ -228,6 +208,33 @@ def test_agent_run_can_store_model_session_outside_workspace(
     assert facade_options[0]["model_session_path"] == model_session_path
 
 
+def test_agent_run_can_disable_workspace_mcp_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+            return _result()
+
+    def create_facade(**kwargs: object) -> _Facade:
+        facade_options.append(kwargs)
+        return _Facade()
+
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+
+    cli_module.agent_run(
+        task="Evaluate built-in tools only.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        disable_workspace_mcp=True,
+        non_interactive=True,
+    )
+
+    assert facade_options[0]["enable_workspace_mcp"] is False
+
+
 def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -241,17 +248,20 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
         storage_root=tmp_path / "knowledge",
         vector_backend="sqlite",
     )
-    store = TurnStore(database)
-    previous = store.begin_turn(
-        "remember cobalt",
-        RuntimeBinding(
-            model_alias="qwen3_5_9b_mlx_4bit",
-            workspace_path=str(turn_workspace.resolve()),
-            knowledge=knowledge,
-        ),
-    )
-    store.mark_terminal(previous.turn_id, TurnStatus.COMPLETED)
-    store.close()
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=turn_workspace)
+        previous = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="remember cobalt",
+            binding_manifest={
+                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "knowledge_config": knowledge.model_dump(mode="json"),
+            },
+        )
+        previous = store.complete_turn(
+            turn_id=previous.turn_id,
+            answer="remembered cobalt",
+        )
     facade_options: list[dict[str, object]] = []
     loop_options: list[dict[str, object]] = []
 
@@ -349,60 +359,6 @@ def _result(
         plan_events=plan_events,
         needs_user_input=needs_user_input,
     )
-
-
-def test_builder_assembles_default_six_tools_in_product_order() -> None:
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-    )
-
-    assert tuple(service._tool_snapshot) == RESIDENT_CODING_TOOL_NAMES
-    assert service._tool_executor._tools is service._tool_snapshot
-    state = service.initial_state(AgentRunRequest(message="Inspect repository."))
-    assert tuple(state["resident_tool_names"]) == RESIDENT_CODING_TOOL_NAMES
-
-
-def test_builder_binds_coding_tools_to_the_supplied_workspace(
-    tmp_path: Path,
-) -> None:
-    workspace = open_workspace(tmp_path / "workspace", create=True)
-    (workspace.root / "visible.txt").write_text("visible", encoding="utf-8")
-
-    service = build_agent_service(
-        workspace,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-    )
-    tool = service._tool_snapshot["list_files"]
-    output = tool.run(tool.validate_input({}))
-
-    assert service._workspace is workspace
-    assert any(entry.name == "visible.txt" for entry in output.entries)
-
-
-@pytest.mark.anyio
-async def test_configured_knowledge_is_a_resident_extension() -> None:
-    async def search(_payload: object, **_kwargs: object) -> object:
-        return KnowledgeSearchOutput(
-            answer_text="configured knowledge",
-            total_found=0,
-        )
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        knowledge_runner=search,  # type: ignore[arg-type]
-    )
-    state = service.initial_state(AgentRunRequest(message="Search docs."))
-
-    assert tuple(service._tool_snapshot) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "search_knowledge",
-    )
-    assert state["resident_tool_names"] == [
-        *RESIDENT_CODING_TOOL_NAMES,
-        "search_knowledge",
-    ]
 
 
 def test_cli_shows_called_tool_names_without_verbose(
@@ -666,90 +622,6 @@ async def test_cli_displays_plan_and_recovery_events(
     assert "✓ Inspect source" in output
     assert "→ Wire CLI" in output
     assert "↻ 恢复: model_retry — attempt 2 of 3" in output
-
-
-def test_builder_passes_canonical_events_to_cli_display() -> None:
-    display = _CLIToolEventDisplay()
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        stream_sink=display,
-    )
-
-    assert service._stream_sink is display
-
-
-def test_builder_installs_hidden_factory_outputs_with_find_tools() -> None:
-    mcp_tools = create_mcp_tools(
-        (
-            MCPToolDescriptor(
-                server_name="docs",
-                tool_name="search",
-                description="Search external documentation.",
-                input_schema={
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-                read_only_hint=True,
-            ),
-        ),
-        lambda _server, _tool, _arguments: {"text": "found"},
-    )
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        mcp_tools=mcp_tools,
-    )
-
-    assert tuple(service._tool_snapshot) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "mcp__docs__search",
-        "find_tools",
-    )
-    automatic_state = service.initial_state(AgentRunRequest(message="Inspect docs."))
-    disabled_state = service.initial_state(
-        AgentRunRequest(
-            message="Inspect docs.",
-            allow_discovery_tools=False,
-        )
-    )
-    assert tuple(automatic_state["resident_tool_names"]) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "find_tools",
-    )
-    assert automatic_state["allow_discovery_tools"] is True
-    assert tuple(disabled_state["resident_tool_names"]) == (RESIDENT_CODING_TOOL_NAMES)
-    assert disabled_state["allow_discovery_tools"] is False
-    assert automatic_state["active_tool_names"] == []
-
-
-def test_builder_makes_skill_gateways_resident_when_skills_are_available(
-    tmp_path: Path,
-) -> None:
-    workspace = open_workspace(tmp_path / "workspace", create=True)
-    skill_tools = create_skill_tools(
-        workspace,
-        invoke_skill=lambda _arguments: {"success": False, "name": "missing"},
-        active_skill_root=lambda _skill_id: None,
-    )
-
-    service = build_agent_service(
-        workspace,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        skill_tools=skill_tools,
-    )
-    state = service.initial_state(AgentRunRequest(message="Use an installed skill."))
-
-    assert tuple(state["resident_tool_names"]) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "invoke_skill",
-        "materialize_skill_asset",
-    )
-    assert "find_tools" not in state["resident_tool_names"]
 
 
 def test_knowledge_config_is_serializable_and_forbids_unknown_fields(

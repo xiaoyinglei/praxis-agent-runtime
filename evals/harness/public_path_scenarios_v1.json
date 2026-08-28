@@ -1,0 +1,60 @@
+{
+  "schema_version": "praxis-public-path-scenarios-v1",
+  "model": "qwen3_5_9b_mlx_4bit",
+  "repetitions": 3,
+  "scenarios": [
+    {
+      "id": "single_file_fix",
+      "mode": "direct",
+      "prompt": "Fix the bug in calculator.py so the focused test passes. Modify the workspace, run exactly `python3 -c \"from calculator import add; assert add(2, 3) == 5\"`, then return a non-empty final answer with zero tool calls.",
+      "files": {
+        "calculator.py": "def add(left: int, right: int) -> int:\n    return left - right\n",
+        "test_calculator.py": "from calculator import add\n\ndef test_add() -> None:\n    assert add(2, 3) == 5\n"
+      },
+      "acceptance_command": ["uv", "run", "pytest", "-q", "test_calculator.py"],
+      "required_changes": ["calculator.py"]
+    },
+    {
+      "id": "cross_file_feature",
+      "mode": "direct",
+      "prompt": "Implement apply_discount in pricing/core.py and export it from pricing/__init__.py. Modify both production files, run exactly `python3 -c \"from pricing import apply_discount; assert apply_discount(200, 0.25) == 150\"`, then return a non-empty final answer with zero tool calls.",
+      "files": {
+        "pricing/__init__.py": "\"\"\"Pricing package.\"\"\"\n",
+        "pricing/core.py": "\"\"\"Pricing calculations.\"\"\"\n",
+        "test_pricing.py": "from pricing import apply_discount\n\ndef test_discount() -> None:\n    assert apply_discount(200, 0.25) == 150\n"
+      },
+      "acceptance_command": ["uv", "run", "pytest", "-q", "test_pricing.py"],
+      "required_changes": ["pricing/__init__.py", "pricing/core.py"]
+    },
+    {
+      "id": "data_artifact",
+      "mode": "direct",
+      "prompt": "Read sales.csv and create summary.json containing exactly the JSON object with rows=3 and total=35. Do not alter sales.csv. Verify summary.json with inspect_data_file, then return a non-empty final answer with zero tool calls.",
+      "files": {
+        "sales.csv": "item,amount\na,10\nb,20\nc,5\n"
+      },
+      "acceptance_command": ["uv", "run", "python", "-c", "import json; assert json.load(open('summary.json')) == {'rows': 3, 'total': 35}"],
+      "required_changes": ["summary.json"]
+    },
+    {
+      "id": "approval_write_command",
+      "mode": "approval",
+      "prompt": "Create approved.txt containing exactly approved-content followed by a newline, read approved.txt once to verify it, then return a non-empty final answer with zero tool calls.",
+      "files": {
+        "README.md": "Approval scenario workspace.\n"
+      },
+      "acceptance_command": ["uv", "run", "python", "-c", "assert open('approved.txt').read() == 'approved-content\\n'"],
+      "required_changes": ["approved.txt"]
+    },
+    {
+      "id": "crash_recovery",
+      "mode": "crash_after_model_tool_call",
+      "prompt": "Read task.txt, then create recovered.txt containing exactly recovered-once followed by a newline. Read recovered.txt once to verify it, then return a non-empty final answer with zero tool calls.",
+      "files": {
+        "task.txt": "Create recovered.txt exactly once.\n"
+      },
+      "acceptance_command": ["uv", "run", "python", "-c", "assert open('recovered.txt').read() == 'recovered-once\\n'"],
+      "required_changes": ["recovered.txt"]
+    }
+  ]
+}

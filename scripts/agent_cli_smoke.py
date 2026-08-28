@@ -19,7 +19,8 @@ from agent_runtime.cli import (
     _print_chat_help,
     agent_app,
 )
-from agent_runtime.core.human_input import HumanInputRequest, ToolCallSummary
+from agent_runtime.harness import RolloutStore
+from agent_runtime.result import AgentPause, AgentToolSummary
 from agent_runtime.streaming.events import (
     EventType,
     StreamEvent,
@@ -27,11 +28,6 @@ from agent_runtime.streaming.events import (
     text_delta,
     tool_use_error,
     tool_use_start,
-)
-from agent_runtime.turns import (
-    RuntimeBinding,
-    TurnStatus,
-    TurnStore,
 )
 
 
@@ -91,20 +87,20 @@ async def _render_canonical_events() -> str:
 
 
 def _render_recovery_commands(turn_id: str, checkpoint_db: Path) -> str:
-    request = HumanInputRequest(
+    request = AgentPause(
         request_id="hir_cli_smoke",
         kind="tool_approval",
         question="Allow patch?",
-        tool_calls=[
-            ToolCallSummary(
+        tool_calls=(
+            AgentToolSummary(
                 tool_call_id="call_patch",
                 tool_name="apply_patch",
                 args_preview="file_path='fixture.txt'",
                 risk_level="medium",
                 reason="Writes the workspace",
-            )
-        ],
-        options=["allow_once", "deny", "abort"],
+            ),
+        ),
+        options=("allow_once", "deny", "abort"),
     )
     output = io.StringIO()
     with redirect_stdout(output):
@@ -123,16 +119,17 @@ def run_smoke() -> CLISmokeResult:
         workspace = root / "workspace"
         workspace.mkdir()
         checkpoint_db = root / "agent.sqlite"
-        store = TurnStore(checkpoint_db)
-        turn = store.begin_turn(
-            "verify CLI projection",
-            RuntimeBinding(
-                model_alias="smoke-model",
-                workspace_path=str(workspace.resolve()),
-            ),
-        )
-        store.mark_terminal(turn.turn_id, TurnStatus.COMPLETED)
-        store.close()
+        with RolloutStore(checkpoint_db) as store:
+            thread = store.create_thread(workspace=workspace)
+            turn = store.start_turn(
+                thread_id=thread.thread_id,
+                user_message="verify CLI projection",
+                binding_manifest={"model_alias": "smoke-model"},
+            )
+            turn = store.complete_turn(
+                turn_id=turn.turn_id,
+                answer="CLI smoke fixture",
+            )
 
         rendered = asyncio.run(_render_canonical_events())
         checks.update(

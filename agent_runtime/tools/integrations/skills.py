@@ -6,7 +6,7 @@ import re
 import shutil
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,6 +21,7 @@ from agent_runtime.tools.tool import (
     ToolEffect,
     ToolTarget,
     ToolValidationError,
+    _thaw_json,
     json_schema_output,
     pydantic_input,
 )
@@ -105,11 +106,27 @@ def create_invoke_skill_tool(
     invoke_skill: SkillInvoker,
     *,
     execution_revision: str = "catalog-v1",
+    available_skill_ids: tuple[str, ...] = (),
 ) -> Tool:
     if not callable(invoke_skill):
         raise TypeError("invoke_skill must be callable")
     if not isinstance(execution_revision, str) or not execution_revision:
         raise ValueError("execution_revision must be non-empty")
+    if any(not isinstance(skill_id, str) or not skill_id for skill_id in available_skill_ids):
+        raise ValueError("available_skill_ids must contain non-empty strings")
+    if len(set(available_skill_ids)) != len(available_skill_ids):
+        raise ValueError("available_skill_ids must be unique")
+    input_schema = _thaw_json(_INVOKE_INPUT_SCHEMA)
+    if not isinstance(input_schema, dict):
+        raise RuntimeError("invoke_skill input schema must be an object")
+    if available_skill_ids:
+        properties = input_schema.get("properties")
+        if not isinstance(properties, dict):
+            raise RuntimeError("invoke_skill schema properties must be an object")
+        name_schema = properties.get("name")
+        if not isinstance(name_schema, dict):
+            raise RuntimeError("invoke_skill name schema must be an object")
+        name_schema["enum"] = list(available_skill_ids)
     return Tool(
         definition=ToolDefinition(
             name="invoke_skill",
@@ -118,7 +135,7 @@ def create_invoke_skill_tool(
                 "activation event containing its instructions. Invoke a matching skill "
                 "before following that workflow; never guess an unlisted skill id."
             ),
-            input_schema=_INVOKE_INPUT_SCHEMA,
+            input_schema=cast(Mapping[str, JsonValue], input_schema),
         ),
         validate_input=_validate_invoke_input,
         run=invoke_skill,
@@ -200,11 +217,13 @@ def create_skill_tools(
     invoke_skill: SkillInvoker,
     active_skill_root: ActiveSkillRoot,
     invoke_execution_revision: str = "catalog-v1",
+    available_skill_ids: tuple[str, ...] = (),
 ) -> tuple[Tool, ...]:
     return (
         create_invoke_skill_tool(
             invoke_skill,
             execution_revision=invoke_execution_revision,
+            available_skill_ids=available_skill_ids,
         ),
         create_materialize_skill_asset_tool(
             workspace,

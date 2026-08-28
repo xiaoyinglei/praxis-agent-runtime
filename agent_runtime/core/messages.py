@@ -1,9 +1,4 @@
-"""Provider-neutral typed messages for the agent loop.
-
-These types are the internal protocol between AgentLoop, ModelTurnProvider,
-and checkpoint storage.  Provider adapters (OpenAI, Anthropic, fallback)
-translate to/from these types at the boundary.
-"""
+"""Provider-neutral typed messages for Harness model adapters."""
 
 from __future__ import annotations
 
@@ -25,7 +20,7 @@ if TYPE_CHECKING:
 
 
 class StopReason(StrEnum):
-    """Normalized stop reason.  AgentLoop control flow depends *only* on this."""
+    """Normalized provider stop reason used by the Harness model boundary."""
 
     TOOL_USE = "tool_use"
     END_TURN = "end_turn"

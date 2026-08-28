@@ -7,12 +7,25 @@ import pytest
 import typer
 
 from agent_runtime import cli
+from agent_runtime.harness import RolloutStore
 from agent_runtime.result import (
     AgentPause,
     AgentResult,
     AgentToolSummary,
     AgentUsage,
 )
+
+
+def _persist_cli_turn(database: Path, workspace: Path) -> str:
+    workspace.mkdir(exist_ok=True)
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="CLI resume fixture",
+            binding_manifest={"model_alias": None},
+        )
+    return turn.turn_id
 
 
 def _result(
@@ -69,10 +82,11 @@ def test_agent_resume_uses_public_facade_and_stable_result(
 
     monkeypatch.setattr(cli, "_create_agent_facade", create_facade)
 
-    turn_id = str(uuid4())
+    database = tmp_path / "agent.sqlite"
+    turn_id = _persist_cli_turn(database, tmp_path / "workspace")
     cli.agent_resume(
         turn_id=turn_id,
-        checkpoint_db=tmp_path / "agent.sqlite",
+        checkpoint_db=database,
         action="allow_once",
     )
 
@@ -81,7 +95,10 @@ def test_agent_resume_uses_public_facade_and_stable_result(
     assert isinstance(resumed[0][2], cli._CLIToolEventDisplay)
     assert facade_options == [
         {
-            "checkpoint_db": tmp_path / "agent.sqlite",
+            "model": None,
+            "checkpoint_db": database,
+            "workspace_path": str((tmp_path / "workspace").resolve()),
+            "knowledge": None,
         }
     ]
 
@@ -121,12 +138,13 @@ def test_agent_resume_without_action_prints_pending_recovery_info(
             raise AssertionError("inspection must not mutate the Turn")
 
     monkeypatch.setattr(cli, "_create_agent_facade", lambda **_kwargs: _Facade())
-    turn_id = str(uuid4())
+    database = tmp_path / "agent.sqlite"
+    turn_id = _persist_cli_turn(database, tmp_path / "workspace")
 
     with pytest.raises(typer.Exit) as exc_info:
         cli.agent_resume(
             turn_id=turn_id,
-            checkpoint_db=tmp_path / "agent.sqlite",
+            checkpoint_db=database,
             action=None,
         )
 
@@ -144,7 +162,8 @@ def test_agent_resume_without_pending_request_offers_continue(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    turn_id = str(uuid4())
+    database = tmp_path / "agent.sqlite"
+    turn_id = _persist_cli_turn(database, tmp_path / "workspace")
 
     class _Facade:
         async def apending_input(
@@ -159,7 +178,7 @@ def test_agent_resume_without_pending_request_offers_continue(
     with pytest.raises(typer.Exit) as exc_info:
         cli.agent_resume(
             turn_id=turn_id,
-            checkpoint_db=tmp_path / "agent.sqlite",
+            checkpoint_db=database,
             action=None,
         )
 

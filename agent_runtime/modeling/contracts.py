@@ -23,6 +23,7 @@ type LLMUsageSource = Literal["provider", "tokenizer_estimate"]
 
 
 class LLMCallStage(StrEnum):
+    AGENT_STEP = "agent_step"
     GOAL_CONTRACT = "goal_contract"
     RETRIEVAL_HINT = "retrieval_hint"
     TOOL_DECISION = "tool_decision"
@@ -180,6 +181,10 @@ class LLMCallResult[T]:
 
 
 DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
+    LLMCallStage.AGENT_STEP: LLMStageBudget(
+        max_input_tokens=64_000,
+        max_output_tokens=32_768,
+    ),
     LLMCallStage.GOAL_CONTRACT: LLMStageBudget(
         max_input_tokens=3_000,
         max_output_tokens=512,

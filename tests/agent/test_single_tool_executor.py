@@ -13,11 +13,11 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.observations import (
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.tools.evidence import (
     runtime_workspace_change,
     runtime_workspace_file_changes,
 )
-from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.executor import (
     ExecutionBoundary,
     ExecutionStatus,

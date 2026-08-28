@@ -5,7 +5,6 @@ Covers:
 - Pandas preview for CSV and XLSX
 - Structured probe with merged cells and formulas
 - Context block generation
-- LoopState file_manifest field
 """
 
 from __future__ import annotations
@@ -317,43 +316,6 @@ class TestProbeEnhancements:
 
 
 # ===================================================================
-# LoopState integration
-# ===================================================================
-
-
-class TestLoopStateIntegration:
-    def _make_config(self):
-        from agent_runtime.core.context import AgentRunConfig
-
-        return AgentRunConfig(
-            turn_id="test",
-            llm_budget_total=1000,
-        )
-
-    def test_create_loop_state_with_manifest(self) -> None:
-        from agent_runtime.file_manifest import FileManifest
-        from agent_runtime.loop.state import create_loop_state
-
-        manifest = FileManifest(
-            files=[],
-            total_size_bytes=0,
-            has_structured_files=False,
-            has_probeable_files=False,
-        )
-        config = self._make_config()
-        state = create_loop_state(current_message="test", run_config=config, file_manifest=manifest)
-        assert state["file_manifest"] is not None
-        assert state["file_manifest"].files == []
-
-    def test_create_loop_state_without_manifest(self) -> None:
-        from agent_runtime.loop.state import create_loop_state
-
-        config = self._make_config()
-        state = create_loop_state(current_message="test", run_config=config)
-        assert state["file_manifest"] is None
-
-
-# ===================================================================
 # Context block rendering
 # ===================================================================
 
@@ -524,11 +486,3 @@ class TestLegacyPrimitiveClosure:
                     offenders[str(path.relative_to(root))] = matches
 
         assert offenders == {}
-
-    def test_observations_do_not_special_case_removed_primitive_tools(self) -> None:
-        root = Path(__file__).resolve().parents[2]
-        source = (root / "agent_runtime/core/observations.py").read_text(encoding="utf-8")
-
-        assert '"write_file"' not in source
-        assert '"run_python"' not in source
-        assert '"structured_probe"' not in source

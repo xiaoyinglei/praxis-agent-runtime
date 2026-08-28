@@ -70,18 +70,11 @@ def _now_ms() -> int:
     return int(time.monotonic() * 1000)
 
 
-_sequence_counter = 0
-
-
-def next_sequence() -> int:
-    global _sequence_counter
-    _sequence_counter += 1
-    return _sequence_counter
-
-
 # ── 工厂函数 ──────────────────────────────────────────────
 
 
+# 这些工厂只生成未持久的 UI 事件，sequence 保持 0。持久事件必须使用
+# RolloutRecord.thread_sequence，不得使用进程全局计数器。
 def text_delta(
     text: str,
     *,
@@ -92,7 +85,6 @@ def text_delta(
         type=EventType.TEXT_DELTA,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         data={"text": text},
     )
 
@@ -110,7 +102,6 @@ def tool_use_start(
         type=EventType.TOOL_USE_START,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         span_id=span,
         data={
             "tool_name": tool_name,
@@ -136,7 +127,6 @@ def tool_use_progress(
         type=EventType.TOOL_USE_PROGRESS,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         span_id=span,
         data=d,
     )
@@ -166,7 +156,6 @@ def tool_use_result(
         type=EventType.TOOL_USE_RESULT,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         span_id=span,
         data=data,
     )
@@ -191,7 +180,6 @@ def tool_use_error(
         type=EventType.TOOL_USE_ERROR,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         span_id=span,
         data=data,
     )
@@ -208,7 +196,6 @@ def compact_layer(
         type=EventType.COMPACT_LAYER,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         data={
             "channels": tuple(channels),
             "warnings": tuple(warnings),
@@ -221,7 +208,6 @@ def turn_start(*, turn_id: str = "", iteration: int = 0) -> StreamEvent:
         type=EventType.TURN_START,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
     )
 
 
@@ -235,7 +221,6 @@ def turn_end(
         type=EventType.TURN_END,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         data={"stop_reason": stop_reason},
     )
 
@@ -249,7 +234,6 @@ def loop_end(
     return StreamEvent(
         type=EventType.LOOP_END,
         turn_id=turn_id,
-        sequence=next_sequence(),
         data={"reason": reason, "total_turns": total_turns},
     )
 
@@ -265,6 +249,5 @@ def recovery_event(
         type=EventType.RECOVERY,
         turn_id=turn_id,
         iteration=iteration,
-        sequence=next_sequence(),
         data={"strategy": strategy, "detail": detail},
     )

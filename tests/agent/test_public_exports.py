@@ -12,6 +12,16 @@ _LEGACY_CLOSURE_EXPORTS = {
 }
 
 _LEGACY_CLOSURE_MODULES = (
+    "agent_runtime.service",
+    "agent_runtime.turns",
+    "agent_runtime.loop",
+    "agent_runtime.memory",
+    "agent_runtime.core.checkpointing",
+    "agent_runtime.core.context",
+    "agent_runtime.core.human_input",
+    "agent_runtime.core.llm_context",
+    "agent_runtime.core.llm_providers",
+    "agent_runtime.core.model_provider_runtime",
     "agent_runtime.core.agent_as_tool",
     "agent_runtime.core.agent_service_factory",
     "agent_runtime.core.agent_tool_contract",
@@ -24,6 +34,16 @@ _LEGACY_CLOSURE_MODULES = (
 )
 
 _LEGACY_CLOSURE_PATHS = (
+    "agent_runtime/service.py",
+    "agent_runtime/turns.py",
+    "agent_runtime/loop",
+    "agent_runtime/memory",
+    "agent_runtime/core/checkpointing.py",
+    "agent_runtime/core/context.py",
+    "agent_runtime/core/human_input.py",
+    "agent_runtime/core/llm_context.py",
+    "agent_runtime/core/llm_providers.py",
+    "agent_runtime/core/model_provider_runtime.py",
     "agent_runtime/core/agent_service_factory.py",
     "agent_runtime/core/compiler.py",
     "agent_runtime/core/subagent_runner.py",
@@ -46,17 +66,20 @@ _ORPHANED_AGENT_PATHS = (
 def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
     import agent_runtime as public_api
     import agent_runtime.core as core
-    from agent_runtime.loop.state import LoopState
-    from agent_runtime.service import AgentRunRequest, AgentRunResult, AgentService
+    from agent_runtime.harness import (
+        RolloutStore,
+        Session,
+        StepContext,
+        ThreadManager,
+        TurnContext,
+    )
     from agent_runtime.tools import Tool, ToolRegistry, ToolResult
 
-    assert core.AgentRuntimePolicy is not None
-    assert core.AgentRunConfig is not None
-    assert core.TurnRegistry is not None
-    assert AgentRunRequest is not None
-    assert AgentRunResult is not None
-    assert AgentService is not None
-    assert LoopState is not None
+    assert RolloutStore is not None
+    assert ThreadManager is not None
+    assert Session is not None
+    assert TurnContext is not None
+    assert StepContext is not None
     assert Tool is not None
     assert ToolRegistry is not None
     assert ToolResult is not None
@@ -73,8 +96,7 @@ def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
         "TurnRegistry",
     ):
         assert not hasattr(public_api, internal_name)
-    assert not hasattr(core, "AgentRegistry")
-    assert not hasattr(core, "derive_child_config")
+    assert core.__all__ == []
     assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(public_api.__all__)
     assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(core.__all__)
     for removed_name in (
@@ -108,10 +130,9 @@ def test_rag_root_does_not_export_agent_contract_surface() -> None:
 
 
 def test_legacy_agent_service_module_no_longer_exports_old_service() -> None:
-    import importlib
+    import importlib.util
 
-    service = importlib.import_module("agent_runtime.service")
-    assert not hasattr(service, "AnalysisAgentService")
+    assert importlib.util.find_spec("agent_runtime.service") is None
 
 
 def test_legacy_agent_modules_are_removed() -> None:

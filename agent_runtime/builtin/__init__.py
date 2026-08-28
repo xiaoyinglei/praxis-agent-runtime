@@ -1,5 +1,5 @@
-"""The single production Agent definition."""
+"""The production Agent system prompt."""
 
-from agent_runtime.builtin.generic import GENERIC_AGENT
+from agent_runtime.builtin.generic import GENERIC_SYSTEM_PROMPT
 
-__all__ = ["GENERIC_AGENT"]
+__all__ = ["GENERIC_SYSTEM_PROMPT"]

@@ -52,9 +52,7 @@ _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
         "workspace_tree_changed",
     }
 )
-_MISSING_WORKSPACE_FILE_SHA256 = hashlib.sha256(
-    b"praxis-workspace-file-missing-v1"
-).hexdigest()
+_MISSING_WORKSPACE_FILE_SHA256 = hashlib.sha256(b"praxis-workspace-file-missing-v1").hexdigest()
 
 
 class ExecutionBoundary(StrEnum):
@@ -74,6 +72,15 @@ class ExecutionStatus(StrEnum):
     # durable prepared/started boundary was made explicit.
     RUNNING = "started"
     UNKNOWN = "outcome_unknown"
+
+
+class ExecutionStartRejectedError(RuntimeError):
+    """A durable scheduler rejected execution before the tool runner was called."""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +163,10 @@ type RecordSink = Callable[
     [ToolExecutionRecord],
     None | Awaitable[None],
 ]
+type PreflightSink = Callable[
+    [ToolExecutionRecord, ResolvedToolUse],
+    None | Awaitable[None],
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +240,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         record: ToolExecutionRecord | None = None,
         record_sink: RecordSink | None = None,
+        preflight_sink: PreflightSink | None = None,
     ) -> ToolExecution:
         trace_count = len(self._traces)
         started_at = time.monotonic()
@@ -238,6 +250,7 @@ class ToolExecutor:
                 context=context,
                 record=record,
                 record_sink=record_sink,
+                preflight_sink=preflight_sink,
                 started_at=started_at,
             )
             if isinstance(prepared, ToolExecution):
@@ -265,6 +278,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         records: Mapping[str, ToolExecutionRecord] | None = None,
         record_sink: RecordSink | None = None,
+        preflight_sink: PreflightSink | None = None,
     ) -> tuple[ToolExecution, ...]:
         prior_records = records or {}
         completed: dict[int, ToolExecution] = {}
@@ -275,6 +289,7 @@ class ToolExecutor:
                 context=context,
                 record=prior_records.get(call.tool_call_id),
                 record_sink=record_sink,
+                preflight_sink=preflight_sink,
                 started_at=time.monotonic(),
             )
             if isinstance(item, ToolExecution):
@@ -286,9 +301,7 @@ class ToolExecutor:
             limit = context.max_parallel_calls
             for offset in range(0, len(prepared), limit):
                 batch = prepared[offset : offset + limit]
-                executions = await asyncio.gather(
-                    *(self._invoke(item) for _, item in batch)
-                )
+                executions = await asyncio.gather(*(self._invoke(item) for _, item in batch))
                 for (index, _), execution in zip(
                     batch,
                     executions,
@@ -307,6 +320,7 @@ class ToolExecutor:
         context: ToolExecutionContext,
         record: ToolExecutionRecord | None,
         record_sink: RecordSink | None,
+        preflight_sink: PreflightSink | None,
         started_at: float,
     ) -> _PreparedExecution | ToolExecution:
         if call.tool_call_id.endswith(_NETWORK_APPROVAL_SUFFIX):
@@ -315,9 +329,7 @@ class ToolExecutor:
                 result=_error_result(
                     call,
                     code="invalid_tool_call_id",
-                    message=(
-                        "tool call ID uses a reserved approval scope suffix"
-                    ),
+                    message=("tool call ID uses a reserved approval scope suffix"),
                     retryable=False,
                 ),
                 record=None,
@@ -535,10 +547,7 @@ class ToolExecutor:
         if (
             ToolEffect.NETWORK in resolved.effects
             and ToolEffect.EXECUTE_PROCESS in resolved.effects
-            and not (
-                decision.decision is UseToolDecision.ASK
-                and decision.approval_scope == "network"
-            )
+            and not (decision.decision is UseToolDecision.ASK and decision.approval_scope == "network")
         ):
             network_decision = CanUseToolResult(
                 UseToolDecision.ASK,
@@ -564,18 +573,14 @@ class ToolExecutor:
             error_code=None,
             requires_reconciliation=False,
         )
+        await _emit_preflight(preflight_sink, execution_record, resolved)
         workspace_root = (
             Path(context.workspace_root)
-            if (
-                context.workspace_root is not None
-                and ToolEffect.WRITE_WORKSPACE in resolved.effects
-            )
+            if (context.workspace_root is not None and ToolEffect.WRITE_WORKSPACE in resolved.effects)
             else None
         )
         workspace_tree_before_sha256 = (
-            await asyncio.to_thread(workspace_tree_sha256, workspace_root)
-            if workspace_root is not None
-            else None
+            await asyncio.to_thread(workspace_tree_sha256, workspace_root) if workspace_root is not None else None
         )
         workspace_file_before_sha256 = (
             await asyncio.to_thread(
@@ -670,7 +675,25 @@ class ToolExecutor:
             error_code=None,
             requires_reconciliation=False,
         )
-        await _emit_record(prepared.record_sink, started_record)
+        try:
+            await _emit_record(prepared.record_sink, started_record)
+        except ExecutionStartRejectedError as rejected:
+            record = replace(
+                prepared.record,
+                status=ExecutionStatus.FAILED,
+                error_code=rejected.code,
+            )
+            return await self._finish(
+                call=prepared.call,
+                result=_error_result(
+                    prepared.call,
+                    code=rejected.code,
+                    message=rejected.message,
+                    retryable=True,
+                ),
+                record=record,
+                prepared=prepared,
+            )
         prepared = replace(prepared, record=started_record)
         try:
             raw = await _run_with_timeout(
@@ -726,9 +749,7 @@ class ToolExecutor:
                 result=_error_result(
                     prepared.call,
                     code="cancelled_outcome_unknown",
-                    message=(
-                        "local waiting was cancelled and the remote outcome is unknown"
-                    ),
+                    message=("local waiting was cancelled and the remote outcome is unknown"),
                     retryable=prepared.tool.idempotent,
                 ),
                 record=record,
@@ -819,11 +840,7 @@ class ToolExecutor:
         )
         record = replace(
             prepared.record,
-            status=(
-                ExecutionStatus.FAILED
-                if result.is_error
-                else ExecutionStatus.COMPLETED
-            ),
+            status=(ExecutionStatus.FAILED if result.is_error else ExecutionStatus.COMPLETED),
             error_code=result.error_code,
         )
         return await self._finish(
@@ -852,6 +869,10 @@ class ToolExecutor:
                 code=code,
                 message=message,
                 retryable=False,
+                metadata={
+                    "runner_completed": True,
+                    "result_processing_failed_stage": code,
+                },
             ),
             record=record,
             prepared=prepared,
@@ -877,9 +898,7 @@ class ToolExecutor:
             decision = prepared.decision.decision
             record_sink = prepared.record_sink
             metadata = {
-                key: value
-                for key, value in result.metadata.items()
-                if key not in _PROTECTED_WORKSPACE_METADATA_KEYS
+                key: value for key, value in result.metadata.items() if key not in _PROTECTED_WORKSPACE_METADATA_KEYS
             }
             if prepared.workspace_root is not None:
                 after_sha256 = await asyncio.to_thread(
@@ -899,9 +918,7 @@ class ToolExecutor:
                         "workspace_tree_before_sha256": before_sha256,
                         "workspace_tree_after_sha256": after_sha256,
                         "workspace_tree_changed": bool(
-                            before_sha256 is not None
-                            and after_sha256 is not None
-                            and before_sha256 != after_sha256
+                            before_sha256 is not None and after_sha256 is not None and before_sha256 != after_sha256
                         ),
                     }
                 )
@@ -960,9 +977,7 @@ def _workspace_file_target_snapshots(
         return tuple(
             (
                 relative,
-                _file_sha256(path)
-                if path.is_file()
-                else _MISSING_WORKSPACE_FILE_SHA256,
+                _file_sha256(path) if path.is_file() else _MISSING_WORKSPACE_FILE_SHA256,
             )
             for relative, path in targets.items()
         )
@@ -981,11 +996,7 @@ def _changed_workspace_file_snapshots(
         changes: list[Mapping[str, JsonValue]] = []
         for relative, before_sha256 in before_snapshots:
             path = _resolve_workspace_file_target(root, str(root / relative))
-            after_sha256 = (
-                _file_sha256(path)
-                if path.is_file()
-                else _MISSING_WORKSPACE_FILE_SHA256
-            )
+            after_sha256 = _file_sha256(path) if path.is_file() else _MISSING_WORKSPACE_FILE_SHA256
             if after_sha256 == before_sha256:
                 continue
             changes.append(
@@ -1054,11 +1065,7 @@ def _resolve_external_approval(
     decision: CanUseToolResult,
 ) -> bool | None:
     del tool, arguments, resolved
-    approval_id = (
-        _network_approval_id(call.tool_call_id)
-        if decision.approval_scope == "network"
-        else call.tool_call_id
-    )
+    approval_id = _network_approval_id(call.tool_call_id) if decision.approval_scope == "network" else call.tool_call_id
     if approval_id in context.denied_tool_call_ids:
         return False
     if approval_id in context.approved_tool_call_ids:
@@ -1082,9 +1089,7 @@ def _bound_model_output(
 ) -> tuple[NormalizedToolOutput, bool]:
     if _model_visible_size(output) <= tool.max_model_output_bytes:
         return output, False
-    if output.structured_content is not None or any(
-        block.type != "text" for block in output.content
-    ):
+    if output.structured_content is not None or any(block.type != "text" for block in output.content):
         raise ToolValidationError(
             path="$",
             message="model output exceeds its byte limit and requires externalization",
@@ -1233,12 +1238,8 @@ def _record_error(
         or record.idempotent != tool.idempotent
     ):
         return "execution_record_mismatch"
-    if (
-        record.status is ExecutionStatus.OUTCOME_UNKNOWN
-        and record.requires_reconciliation
-    ) or (
-        record.status is ExecutionStatus.STARTED
-        and not record.idempotent
+    if (record.status is ExecutionStatus.OUTCOME_UNKNOWN and record.requires_reconciliation) or (
+        record.status is ExecutionStatus.STARTED and not record.idempotent
     ):
         return "tool_reconciliation_required"
     if record.status is ExecutionStatus.COMPLETED:
@@ -1259,14 +1260,25 @@ async def _emit_record(
         await emitted
 
 
+async def _emit_preflight(
+    sink: PreflightSink | None,
+    record: ToolExecutionRecord,
+    resolved: ResolvedToolUse,
+) -> None:
+    if sink is None:
+        return
+    emitted = sink(record, resolved)
+    if inspect.isawaitable(emitted):
+        await emitted
+
+
 def _recorded_outcome_result(
     call: ToolCall,
     record: ToolExecutionRecord,
 ) -> ToolResult:
     completed = record.status is ExecutionStatus.COMPLETED
     text = (
-        "The tool outcome was reconciled as completed; the operation was not "
-        "replayed."
+        "The tool outcome was reconciled as completed; the operation was not replayed."
         if completed
         else "The tool outcome was reconciled as failed; the operation was not replayed."
     )
@@ -1320,9 +1332,7 @@ def _error_result(
     return ToolResult(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,
-        content=(
-            ToolContentBlock(type="text", data={"text": safe_message}),
-        ),
+        content=(ToolContentBlock(type="text", data={"text": safe_message}),),
         is_error=True,
         error_code=code,
         error_message=safe_message,
@@ -1336,11 +1346,7 @@ def _approval_metadata(
     resolved: ResolvedToolUse,
     decision: CanUseToolResult,
 ) -> Mapping[str, JsonValue]:
-    approval_id = (
-        _network_approval_id(call.tool_call_id)
-        if decision.approval_scope == "network"
-        else call.tool_call_id
-    )
+    approval_id = _network_approval_id(call.tool_call_id) if decision.approval_scope == "network" else call.tool_call_id
     metadata: dict[str, JsonValue] = {
         "approval_id": approval_id,
         "approval_scope": decision.approval_scope,
@@ -1363,10 +1369,7 @@ def _network_approval_id(tool_call_id: str) -> str:
 
 def _model_visible_size(output: NormalizedToolOutput) -> int:
     value = {
-        "content": [
-            {"type": block.type, "data": _jsonable(block.data)}
-            for block in output.content
-        ],
+        "content": [{"type": block.type, "data": _jsonable(block.data)} for block in output.content],
         "structured_content": _jsonable(output.structured_content),
     }
     return len(
@@ -1424,9 +1427,7 @@ def _resolved_uses_conflict(
     if not left.targets or not right.targets:
         return True
     return any(
-        _targets_overlap(left_target, right_target)
-        for left_target in left.targets
-        for right_target in right.targets
+        _targets_overlap(left_target, right_target) for left_target in left.targets for right_target in right.targets
     )
 
 

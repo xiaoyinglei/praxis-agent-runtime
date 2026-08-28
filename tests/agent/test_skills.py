@@ -1,7 +1,4 @@
-"""Tests for the skill layer — Phase 1: inline local skills.
-
-Covers: loader, catalog, context, policy, invocation, and integration.
-"""
+"""Tests for the skill catalog, policy, and canonical tool integration."""
 
 from __future__ import annotations
 
@@ -13,28 +10,14 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.context import AgentRunConfig
-from agent_runtime.loop.state import create_loop_state
 from agent_runtime.skills.catalog import SkillCatalog
-from agent_runtime.skills.context import (
-    SKILL_PROMPT_GUIDANCE,
-    build_skills_prompt_section,
-    render_active_loaded_skills,
-    render_loaded_skill,
-    render_skill_listing,
-)
 from agent_runtime.skills.loader import (
     SkillLoadError,
     load_skill_body,
     load_skill_from_file,
     scan_and_load_skills,
 )
-from agent_runtime.skills.models import (
-    SkillInvocation,
-    SkillSource,
-    SkillState,
-    SkillSummary,
-)
+from agent_runtime.skills.models import SkillSource, SkillSummary
 from agent_runtime.skills.policy import SkillPolicy
 from agent_runtime.skills.runtime import SkillRuntime
 from agent_runtime.tools.executor import ToolExecutor
@@ -85,12 +68,6 @@ def _write_skill(
     skill_md = skill_dir / "SKILL.md"
     skill_md.write_text("\n".join(lines))
     return skill_md
-
-
-def _run_config() -> AgentRunConfig:
-    return AgentRunConfig(
-        turn_id="run-test",
-    )
 
 
 # ── Loader tests ─────────────────────────────────────────────────────
@@ -303,142 +280,6 @@ class TestCatalog:
             assert catalog.find("dup") is None
 
 
-# ── Context tests ────────────────────────────────────────────────────
-
-
-class TestContext:
-    def test_guidance_has_blocking_requirement(self):
-        assert "BLOCKING REQUIREMENT" in SKILL_PROMPT_GUIDANCE
-        assert "invoke_skill" in SKILL_PROMPT_GUIDANCE
-
-    def test_render_skill_listing(self):
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "ctx-test", "Context test")
-            manifests = scan_and_load_skills(Path(d), repo_root=Path(d))
-            catalog = SkillCatalog(manifests)
-            listing = render_skill_listing(catalog)
-            assert "<available_skills>" in listing
-            assert "ctx-test" in listing
-
-    def test_render_loaded_skill(self):
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "load-render", "Render test")
-            manifests = scan_and_load_skills(Path(d), repo_root=Path(d))
-            catalog = SkillCatalog(manifests)
-            loaded = catalog.load("load-render", iteration=1)
-            rendered = render_loaded_skill(loaded, args="hello")
-            assert '<loaded_skill id="project:load-render" name="load-render"' in rendered
-            assert "Base directory for this skill:" in rendered
-            assert "Body of load-render." in rendered
-
-    def test_args_substitution(self):
-        """$ARGUMENTS should be replaced in the skill body."""
-        with tempfile.TemporaryDirectory() as d:
-            skill_dir = Path(d) / ".agents" / "skills" / "args-test"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\nname: args-test\ndescription: Test args\n---\nUse $ARGUMENTS to process input."
-            )
-            manifests = scan_and_load_skills(Path(d), repo_root=Path(d))
-            catalog = SkillCatalog(manifests)
-            loaded = catalog.load("args-test", iteration=1)
-            rendered = render_loaded_skill(loaded, args="my-input")
-            assert "my-input" in rendered
-            assert "$ARGUMENTS" not in rendered
-
-    def test_skill_dir_substitution(self):
-        """${SKILL_DIR} should be replaced with the skill's directory path."""
-        with tempfile.TemporaryDirectory() as d:
-            skill_dir = Path(d) / ".agents" / "skills" / "dir-test"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\nname: dir-test\ndescription: Test dir\n---\nReferences are at ${SKILL_DIR}/references/."
-            )
-            manifests = scan_and_load_skills(Path(d), repo_root=Path(d))
-            catalog = SkillCatalog(manifests)
-            loaded = catalog.load("dir-test", iteration=1)
-            rendered = render_loaded_skill(loaded)
-            assert str(skill_dir.resolve()) in rendered
-            assert "${SKILL_DIR}" not in rendered
-
-    def test_skill_substitution_does_not_rewrite_prefixed_variables(self):
-        with tempfile.TemporaryDirectory() as d:
-            skill_dir = Path(d) / ".agents" / "skills" / "safe-vars"
-            skill_dir.mkdir(parents=True)
-            (skill_dir / "SKILL.md").write_text(
-                "---\nname: safe-vars\ndescription: Safe vars\n---\n"
-                "Use $SKILL_DIR/references with $ARGUMENTS.\n"
-                "Keep $SKILL_DIRECTORY and $ARGUMENTS_SUFFIX unchanged."
-            )
-            catalog = SkillCatalog(scan_and_load_skills(Path(d), repo_root=Path(d)))
-            loaded = catalog.load("project:safe-vars", iteration=1)
-
-            rendered = render_loaded_skill(loaded, args="input.xlsx")
-
-            assert f"Use {skill_dir.resolve()}/references with input.xlsx." in rendered
-            assert "$SKILL_DIRECTORY" in rendered
-            assert "$ARGUMENTS_SUFFIX" in rendered
-
-    def test_build_prompt_section(self):
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "prompt-test", "Prompt section test")
-            manifests = scan_and_load_skills(Path(d), repo_root=Path(d))
-            catalog = SkillCatalog(manifests)
-            section = build_skills_prompt_section(catalog)
-            assert SKILL_PROMPT_GUIDANCE in section
-            assert "project:prompt-test" in section
-
-    def test_build_prompt_section_empty_catalog_is_empty(self):
-        assert build_skills_prompt_section(SkillCatalog()) == ""
-
-    def test_build_prompt_section_excludes_loaded_skill_from_available_listing(self):
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "loaded-one", "Already loaded")
-            _write_skill(Path(d), "available-one", "Still available")
-            catalog = SkillCatalog(scan_and_load_skills(Path(d), repo_root=Path(d)))
-            loaded = catalog.load("project:loaded-one", iteration=2)
-            state = SkillState()
-            state.active["project:loaded-one"] = loaded.to_ref()
-
-            section = build_skills_prompt_section(catalog, skill_state=state)
-            available = section.rsplit("<available_skills>", 1)[1].split("</available_skills>", 1)[0]
-
-            assert "project:loaded-one" not in available
-            assert "project:available-one" in available
-            assert '<loaded_skill id="project:loaded-one"' in section
-
-    def test_active_loaded_skills_render_from_state(self):
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "active-test", "Active render test")
-            catalog = SkillCatalog(scan_and_load_skills(Path(d), repo_root=Path(d)))
-            loaded = catalog.load("project:active-test", iteration=2)
-            state = SkillState()
-            state.active["project:active-test"] = loaded.to_ref(args="abc")
-
-            rendered = render_active_loaded_skills(state)
-            assert "<loaded_skills>" in rendered
-            assert '<loaded_skill id="project:active-test"' in rendered
-            assert "Body of active-test." in rendered
-            assert "abc" in rendered
-
-    def test_active_loaded_skill_warns_when_file_changed(self):
-        with tempfile.TemporaryDirectory() as d:
-            skill_md = _write_skill(Path(d), "changed-test", "Changed render test")
-            catalog = SkillCatalog(scan_and_load_skills(Path(d), repo_root=Path(d)))
-            loaded = catalog.load("project:changed-test", iteration=2)
-            state = SkillState()
-            state.active["project:changed-test"] = loaded.to_ref()
-
-            skill_md.write_text(
-                "---\nname: changed-test\ndescription: Changed render test\n---\n# changed-test\n\nChanged body.\n"
-            )
-
-            rendered = render_active_loaded_skills(state)
-
-            assert 'code="skill_content_changed_on_resume"' in rendered
-            assert "Changed body." in rendered
-
-
 # ── Policy tests ─────────────────────────────────────────────────────
 
 
@@ -469,26 +310,6 @@ class TestPolicy:
 
 
 class TestModels:
-    def test_skill_state_default(self):
-        state = SkillState()
-        assert state.visible_skill_ids == ()
-        assert state.visible_skill_names == ()
-        assert state.invoked == ()
-        assert state.active == {}
-        assert state.loaded_skills == {}
-
-    def test_skill_invocation(self):
-        inv = SkillInvocation(
-            name="test",
-            source="project",
-            skill_file="/some/path/SKILL.md",
-            fingerprint="abc123",
-            invoked_at_iteration=3,
-            args="hello",
-        )
-        assert inv.name == "test"
-        assert inv.invoked_at_iteration == 3
-
     def test_skill_summary_render(self):
         s = SkillSummary(
             name="my-skill",
@@ -662,63 +483,23 @@ class TestExternalSkills:
             assert strict.can_autoload(m) is False
 
 
-# ── Integration: SkillState in LoopState ─────────────────────────────
-
-
-class TestSkillStateIntegration:
-    def test_skill_state_in_loop_state(self):
-        """SkillState should be present in a newly created LoopState."""
-        from agent_runtime.core.context import AgentRunConfig
-        from agent_runtime.loop.state import create_loop_state
-
-        run_config = AgentRunConfig(
-            turn_id="r1",
-        )
-        state = create_loop_state(current_message="test", run_config=run_config)
-        assert "skill_state" in state
-        skill_state = state["skill_state"]
-        assert isinstance(skill_state, SkillState)
-        assert skill_state.visible_skill_ids == ()
-        assert skill_state.visible_skill_names == ()
-        assert skill_state.active == {}
-
-    def test_checkpoint_serde_restores_skill_state(self):
-        from agent_runtime.core.checkpointing import agent_checkpoint_serde
-
-        with tempfile.TemporaryDirectory() as d:
-            _write_skill(Path(d), "checkpoint-test", "Checkpoint test")
-            catalog = SkillCatalog(scan_and_load_skills(Path(d), repo_root=Path(d)))
-            loaded = catalog.load("project:checkpoint-test", iteration=1)
-            state = create_loop_state(current_message="test", run_config=_run_config())
-            state["skill_state"].active["project:checkpoint-test"] = loaded.to_ref()
-
-            serde = agent_checkpoint_serde()
-            restored = serde.loads_typed(serde.dumps_typed(state))
-
-            assert isinstance(restored["skill_state"], SkillState)
-            assert "project:checkpoint-test" in restored["skill_state"].active
+# ── Runtime and canonical Tool ACI integration ─────────────────────
 
 
 class TestSkillRuntime:
-    def test_invoke_and_apply_activation_uses_catalog_authority(
+    def test_invoke_uses_catalog_authority(
         self,
         tmp_path: Path,
     ) -> None:
         _write_skill(tmp_path, "runtime-test", "Runtime test")
         catalog = SkillCatalog(scan_and_load_skills(tmp_path, repo_root=tmp_path))
         runtime = SkillRuntime(catalog)
-        state = create_loop_state(current_message="test", run_config=_run_config())
-
         event = runtime.invoke_skill({"name": "project:runtime-test", "args": "input.csv"})
-        runtime.apply_activation_event(state, event, iteration=3)
 
         assert event["success"] is True
         assert event["skill_id"] == "project:runtime-test"
         assert "Body of runtime-test." in str(event["instructions"])
-        active = state["skill_state"].active["project:runtime-test"]
-        assert active.loaded_at_iteration == 3
-        assert active.args == "input.csv"
-        assert runtime.validated_active_skill_ids(state) == frozenset({"project:runtime-test"})
+        assert event["args"] == "input.csv"
 
     def test_invoke_rejects_non_invocable_skill(
         self,
@@ -737,28 +518,30 @@ class TestSkillRuntime:
         assert event["success"] is False
         assert event["error_code"] == "skill_disabled"
 
-    def test_checkpoint_identity_mismatch_is_not_active(
+    def test_invoke_expands_skill_directory_and_arguments_without_prefix_rewrites(
         self,
         tmp_path: Path,
     ) -> None:
-        _write_skill(tmp_path, "identity-test", "Identity test")
-        catalog = SkillCatalog(scan_and_load_skills(tmp_path, repo_root=tmp_path))
-        runtime = SkillRuntime(catalog)
-        state = create_loop_state(current_message="test", run_config=_run_config())
-        loaded = catalog.load("project:identity-test", iteration=1)
-        assert loaded is not None
-        ref = loaded.to_ref()
-        state["skill_state"].active[ref.skill_id] = ref.model_copy(
-            update={"root_dir": str(tmp_path / "different-root")}
+        skill_dir = tmp_path / ".agents" / "skills" / "expanded"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: expanded\ndescription: Expansion test\n---\n"
+            "Use $SKILL_DIR/references with $ARGUMENTS. "
+            "Keep $SKILL_DIRECTORY and $ARGUMENTS_SUFFIX.",
+            encoding="utf-8",
+        )
+        runtime = SkillRuntime(
+            SkillCatalog(scan_and_load_skills(tmp_path, repo_root=tmp_path))
         )
 
-        assert runtime.validated_active_skill_ids(state) == frozenset()
+        event = runtime.invoke_skill(
+            {"name": "project:expanded", "args": "input.csv"}
+        )
 
-        rendered = runtime.render_prompt_context(state)
-
-        assert "different-root" not in rendered
-        assert "<loaded_skill" not in rendered
-
+        instructions = str(event["instructions"])
+        assert f"Use {skill_dir.resolve()}/references with input.csv." in instructions
+        assert "$SKILL_DIRECTORY" in instructions
+        assert "$ARGUMENTS_SUFFIX" in instructions
 
 class TestFinalSkillToolFactories:
     @pytest.mark.anyio

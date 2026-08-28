@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -8,7 +9,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import yaml
 from mcp.client.session import ClientSession
@@ -35,6 +36,81 @@ class _StdioServerConfig:
     tools_allowlist: frozenset[str]
     allow_all_tools: bool
     startup_timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class MCPConfigTrustDecision:
+    config_path: Path
+    source: Literal["product", "workspace", "external"]
+    config_sha256: str
+
+
+def decide_mcp_config_trust(
+    config_path: Path,
+    *,
+    workspace_root: Path | None,
+    trust_workspace: bool,
+    trusted_external_configs: tuple[Path, ...] = (),
+    product_config_root: Path | None = None,
+) -> MCPConfigTrustDecision:
+    """Authorize the exact config bytes before any MCP process can start."""
+    path = Path(config_path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"MCP config does not exist: {path}")
+    product_root = (
+        Path(__file__).resolve().parents[2] / "configs"
+        if product_config_root is None
+        else Path(product_config_root).expanduser().resolve()
+    )
+    workspace = (
+        None
+        if workspace_root is None
+        else Path(workspace_root).expanduser().resolve()
+    )
+    trusted_external = {
+        Path(candidate).expanduser().resolve()
+        for candidate in trusted_external_configs
+    }
+    if path.is_relative_to(product_root):
+        source: Literal["product", "workspace", "external"] = "product"
+    elif workspace is not None and path.is_relative_to(workspace):
+        if not trust_workspace:
+            raise PermissionError(
+                f"workspace MCP config is not trusted: {path}"
+            )
+        source = "workspace"
+    elif path in trusted_external:
+        source = "external"
+    else:
+        raise PermissionError(f"external MCP config is not allowlisted: {path}")
+    return MCPConfigTrustDecision(
+        config_path=path,
+        source=source,
+        config_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+@asynccontextmanager
+async def open_trusted_product_mcp_tools(
+    config_path: Path,
+    *,
+    trust: MCPConfigTrustDecision,
+    diagnostics: list[RuntimeDiagnostic] | None = None,
+    close_timeout_seconds: float = 5.0,
+) -> AsyncIterator[tuple[Tool, ...]]:
+    """Verify a prior trust decision, then and only then start MCP servers."""
+    path = Path(config_path).expanduser().resolve()
+    if path != trust.config_path:
+        raise RuntimeError("MCP config path differs from trust decision")
+    current_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if current_hash != trust.config_sha256:
+        raise RuntimeError("MCP config changed after trust decision")
+    async with open_product_mcp_tools(
+        path,
+        diagnostics=diagnostics,
+        close_timeout_seconds=close_timeout_seconds,
+    ) as tools:
+        yield tools
 
 
 @asynccontextmanager

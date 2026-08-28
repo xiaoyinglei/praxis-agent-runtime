@@ -11,16 +11,16 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.observations import (
-    runtime_workspace_change,
-    runtime_workspace_file_changes,
-)
 from agent_runtime.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
 )
 from agent_runtime.tools.builtins import search as search_module
 from agent_runtime.tools.builtins import shell as shell_module
+from agent_runtime.tools.evidence import (
+    runtime_workspace_change,
+    runtime_workspace_file_changes,
+)
 from agent_runtime.tools.executor import ToolExecution, ToolExecutor
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import (
@@ -96,6 +96,11 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
             "revision": 1,
             "message": "ok",
         },
+    )
+
+    assert all(
+        " finish" not in tool.definition.description.lower()
+        for tool in tools
     )
 
     assert RESIDENT_CODING_TOOL_NAMES == (
@@ -354,6 +359,30 @@ async def test_read_file_supports_source_line_windows_and_continuation(
         workspace=workspace,
     )
     assert mixed_modes.result.error_code == "invalid_arguments"
+
+
+@pytest.mark.anyio
+async def test_read_file_accepts_common_offset_plus_max_lines_aci(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    (workspace.root / "lines.py").write_text(
+        "line_1\nline_2\nline_3\nline_4\nline_5\n",
+        encoding="utf-8",
+    )
+
+    execution = await _execute(
+        _tools_by_name(workspace)["read_file"],
+        {"path": "lines.py", "offset": 3, "max_lines": 2},
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is False
+    assert execution.result.structured_content is not None
+    output = execution.result.structured_content
+    assert output["content"] == "line_3\nline_4\n"
+    assert output["start_line"] == 3
+    assert output["end_line"] == 4
 
 
 @pytest.mark.anyio

@@ -8,13 +8,10 @@ We never reject a skill because of an unknown field.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
-
-from pydantic import BaseModel, Field, model_validator
 
 # ── Skill source ────────────────────────────────────────────────────
 
@@ -133,100 +130,6 @@ class LoadedSkill:
     content: str                   # full SKILL.md body (after frontmatter)
     referenced_base_dir: Path
     loaded_at_iteration: int
-
-    def to_ref(self, *, args: str | None = None) -> LoadedSkillRef:
-        """Return a checkpoint-friendly reference to this loaded skill."""
-        return LoadedSkillRef(
-            skill_id=self.manifest.skill_id,
-            name=self.manifest.name,
-            source=self.manifest.source.value,
-            skill_file=str(self.manifest.skill_file),
-            root_dir=str(self.manifest.root_dir),
-            fingerprint=self.manifest.content_fingerprint,
-            body_fingerprint=hashlib.sha256(self.content.encode("utf-8")).hexdigest(),
-            loaded_at_iteration=self.loaded_at_iteration,
-            args=args,
-        )
-
-
-class LoadedSkillRef(BaseModel):
-    """Checkpoint-friendly active skill reference.
-
-    The full body is intentionally reloaded from disk during prompt assembly.
-    """
-
-    skill_id: str
-    name: str
-    source: str
-    skill_file: str
-    root_dir: str
-    fingerprint: str
-    body_fingerprint: str = ""
-    loaded_at_iteration: int = 0
-    args: str | None = None
-
-
-# ── Skill invocation record ──────────────────────────────────────────
-
-
-@dataclass(frozen=True)
-class SkillInvocation:
-    """Audit record for a single skill invocation."""
-
-    name: str
-    source: str                    # SkillSource.value
-    skill_file: str                # absolute path string
-    fingerprint: str
-    invoked_at_iteration: int
-    args: str | None = None
-    skill_id: str = ""
-
-
-# ── Skill state ──────────────────────────────────────────────────────
-
-
-class SkillState(BaseModel):
-    """Checkpointable skill sub-state stored in LoopState."""
-
-    visible_skill_ids: tuple[str, ...] = ()
-    invoked: tuple[SkillInvocation, ...] = ()
-    active: dict[str, LoadedSkillRef] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _migrate_legacy_fields(cls, value: object) -> object:
-        if not isinstance(value, dict):
-            return value
-        data = dict(value)
-        if "visible_skill_ids" not in data and "visible_skill_names" in data:
-            data["visible_skill_ids"] = data.get("visible_skill_names") or ()
-        if "active" not in data and "loaded_skills" in data:
-            active: dict[str, LoadedSkillRef] = {}
-            for _key, loaded in (data.get("loaded_skills") or {}).items():
-                if isinstance(loaded, LoadedSkillRef):
-                    active[loaded.skill_id] = loaded
-                elif isinstance(loaded, LoadedSkill):
-                    ref = loaded.to_ref()
-                    active[ref.skill_id] = ref
-                elif isinstance(loaded, dict):
-                    try:
-                        ref = LoadedSkillRef.model_validate(loaded)
-                    except Exception:
-                        continue
-                    active[ref.skill_id] = ref
-            data["active"] = active
-        return data
-
-    @property
-    def visible_skill_names(self) -> tuple[str, ...]:
-        """Backward-compatible alias for older tests/callers."""
-        return self.visible_skill_ids
-
-    @property
-    def loaded_skills(self) -> dict[str, LoadedSkillRef]:
-        """Backward-compatible alias for active loaded skills."""
-        return self.active
-
 
 # ── Error codes ──────────────────────────────────────────────────────
 

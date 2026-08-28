@@ -61,7 +61,11 @@ def test_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
         "uv build",
         "uv run python scripts/agent_cli_smoke.py",
         "uv run python scripts/agent_delivery_smoke.py --fake-model --verbose",
-        "uv run python scripts/agent_tool_aci_eval.py --fake-model --json",
+        (
+            "uv run python scripts/agent_harness_acceptance.py validate --schema "
+            "evals/harness/acceptance_v1.json "
+            "--contract docs/design/praxis_harness_architecture.md"
+        ),
         (
             "uv run python scripts/agent_code_benchmark.py validate "
             "evals/code_agent/benchmark_v1.json --repository ."
@@ -92,3 +96,13 @@ def test_mypy_allows_the_platform_only_mlx_dependency_to_be_absent() -> None:
     }
 
     assert {"mlx", "mlx.*"} <= ignored_modules
+
+
+def test_distribution_has_no_langgraph_runtime_dependency() -> None:
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    dependencies = tuple(config["project"]["dependencies"])
+    lock = (ROOT / "uv.lock").read_text(encoding="utf-8")
+
+    assert all("langgraph" not in dependency.lower() for dependency in dependencies)
+    assert 'name = "langgraph"' not in lock
+    assert 'name = "langgraph-checkpoint"' not in lock

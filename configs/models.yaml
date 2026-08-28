@@ -251,6 +251,14 @@ generation:
 # LLM stage budgets: input/output budget by internal LLM stage.
 # ---------------------------------------------------------------------------
 llm_budgets:
+  # One Harness sampling round may produce tool calls or a final answer.
+  # The model declaration supplies the requested output limit; this policy is
+  # only the model-independent ceiling for an agent step.
+  agent_step:
+    max_input_tokens: 64000
+    max_output_tokens: 32768
+    safety_margin_tokens: 512
+
   goal_contract:
     max_input_tokens: 3000
     max_output_tokens: 512

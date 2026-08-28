@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tarfile
@@ -41,6 +42,7 @@ _ARCHITECTURE_LAYERS = frozenset(
 )
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _PROCESS_CLEANUP_GRACE_SECONDS = 1.0
+_MODEL_UNKNOWN_RETRY_LIMIT = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,6 +279,30 @@ def validate_release_shape(manifest: BenchmarkManifest) -> None:
         )
 
 
+def release_run_matrix(
+    manifest: BenchmarkManifest,
+) -> tuple[tuple[BenchmarkTask, str], ...]:
+    """Return the exact release lanes: all primary tasks plus declared controls."""
+
+    validate_release_shape(manifest)
+    return (
+        *((task, manifest.primary_model) for task in manifest.tasks),
+        *((task, manifest.control_model) for task in manifest.tasks if task.control),
+    )
+
+
+def _resolve_agent_command(value: str) -> tuple[str, ...]:
+    if value == "current-runtime":
+        executable = Path(sys.executable).with_name("agent").resolve()
+        if not executable.is_file():
+            raise ValueError(f"current runtime agent entrypoint is missing: {executable}")
+        return (str(executable),)
+    command = tuple(shlex.split(value))
+    if not command:
+        raise ValueError("agent_command must not be empty")
+    return command
+
+
 def evaluate_release_results(
     manifest: BenchmarkManifest,
     results: Sequence[Mapping[str, object]],
@@ -458,6 +484,72 @@ def evaluate_release_results(
         "false_completion_count": false_completions,
         "safety_violation_count": safety_violations,
         "reasons": reasons,
+    }
+
+
+def evaluate_kernel_comparison(
+    manifest: BenchmarkManifest,
+    candidate_results: Sequence[Mapping[str, object]],
+    baseline_results: Sequence[Mapping[str, object]],
+    *,
+    candidate_runtime_fingerprint: str,
+    baseline_runtime_fingerprint: str,
+) -> dict[str, object]:
+    """Compare old and replacement kernels under the same frozen benchmark."""
+
+    candidate = evaluate_release_results(
+        manifest,
+        candidate_results,
+        expected_runtime_fingerprint=candidate_runtime_fingerprint,
+    )
+    baseline = evaluate_release_results(
+        manifest,
+        baseline_results,
+        expected_runtime_fingerprint=baseline_runtime_fingerprint,
+    )
+    threshold_reasons = {
+        "overall_first_pass_rate_below_0.70",
+        "cross_layer_first_pass_rate_below_0.50",
+    }
+    candidate_reasons = candidate.get("reasons")
+    baseline_reasons = baseline.get("reasons")
+    candidate_rate = candidate.get("overall_first_pass_rate")
+    baseline_rate = baseline.get("overall_first_pass_rate")
+    if (
+        not isinstance(candidate_reasons, list)
+        or not isinstance(baseline_reasons, list)
+        or not isinstance(candidate_rate, (int, float))
+        or isinstance(candidate_rate, bool)
+        or not isinstance(baseline_rate, (int, float))
+        or isinstance(baseline_rate, bool)
+    ):
+        raise RuntimeError("release evaluator returned an invalid comparison shape")
+    candidate_reason_strings = tuple(
+        _non_empty_string(reason, field="candidate release reason")
+        for reason in candidate_reasons
+    )
+    baseline_reason_strings = tuple(
+        _non_empty_string(reason, field="baseline release reason")
+        for reason in baseline_reasons
+    )
+    reasons = [
+        *(f"candidate_corpus:{reason}" for reason in candidate_reason_strings if reason not in threshold_reasons),
+        *(f"baseline_corpus:{reason}" for reason in baseline_reason_strings if reason not in threshold_reasons),
+    ]
+    task_count = len(manifest.tasks)
+    candidate_passed = round(float(candidate_rate) * task_count)
+    baseline_passed = round(float(baseline_rate) * task_count)
+    if candidate_passed < baseline_passed:
+        reasons.append("candidate_below_baseline")
+    return {
+        "benchmark_version": manifest.benchmark_version,
+        "manifest_fingerprint": manifest.fingerprint,
+        "candidate_runtime_fingerprint": candidate_runtime_fingerprint,
+        "baseline_runtime_fingerprint": baseline_runtime_fingerprint,
+        "candidate_primary_passed": candidate_passed,
+        "baseline_primary_passed": baseline_passed,
+        "comparison_ready": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
     }
 
 
@@ -652,6 +744,19 @@ def diagnose_run(
             confidence=0.95,
             evidence=("runtime_error:context_overflow",),
         )
+    if (
+        "model_response_incomplete" in combined
+        and "max_output_tokens" in combined
+    ):
+        evidence = ["model_response:incomplete:max_output_tokens"]
+        if "inspection_budget_exhausted" in combined:
+            evidence.append("tool_policy:inspection_budget_exhausted")
+        return Diagnosis(
+            primary=DiagnosisCause.MODEL_CAPABILITY_GAP,
+            secondary=(),
+            confidence=0.95,
+            evidence=tuple(evidence),
+        )
     if facts.stop_reason == "delivery_stalled" or "delivery_stalled" in combined:
         evidence = ["stop_reason:delivery_stalled"]
         inspection_calls = _inspection_call_count(agent_stdout)
@@ -830,6 +935,7 @@ def run_task(
             "--max-turns",
             str(task.budget.max_turns),
             "--require-workspace-change",
+            "--disable-workspace-mcp",
             "--non-interactive",
             "--verbose",
         ]
@@ -840,6 +946,7 @@ def run_task(
             command.append("--allow-execute-tools")
 
         if setup.returncode == 0 and not setup.timed_out:
+            agent_deadline = time.monotonic() + task.budget.timeout_seconds
             agent = _run_command(
                 command,
                 cwd=workspace,
@@ -850,6 +957,44 @@ def run_task(
                 ),
                 progress_label="agent",
             )
+            for retry_index in range(1, _MODEL_UNKNOWN_RETRY_LIMIT + 1):
+                turn_id = _output_field(agent.stdout, "Turn")
+                if (
+                    agent.returncode != 2
+                    or turn_id is None
+                    or not _has_single_unknown_model_operation(
+                        checkpoint_path,
+                        turn_id=turn_id,
+                    )
+                ):
+                    break
+                remaining_seconds = int(agent_deadline - time.monotonic())
+                if remaining_seconds < 1:
+                    break
+                retried = _run_command(
+                    (
+                        *command_prefix,
+                        "resume",
+                        turn_id,
+                        "--action",
+                        "retry",
+                        "--checkpoint-db",
+                        str(checkpoint_path),
+                        "--verbose",
+                    ),
+                    cwd=workspace,
+                    timeout_seconds=remaining_seconds,
+                    live_log_paths=(
+                        artifact_dir / f"agent.retry-{retry_index}.stdout",
+                        artifact_dir / f"agent.retry-{retry_index}.stderr",
+                    ),
+                    progress_label=f"agent-retry-{retry_index}",
+                )
+                agent = _merge_command_results(
+                    agent,
+                    retried,
+                    retry_index=retry_index,
+                )
         else:
             agent = _CommandResult(
                 returncode=setup.returncode,
@@ -964,6 +1109,295 @@ def run_task(
             acceptance=acceptance,
         )
         return record
+
+
+def run_release(
+    *,
+    repository: Path,
+    manifest: BenchmarkManifest,
+    agent_command: Sequence[str],
+    artifacts_root: Path,
+) -> tuple[dict[str, object], tuple[Path, ...]]:
+    """Execute every frozen release lane and evaluate the resulting corpus."""
+
+    result_paths: list[Path] = []
+    for task, model_alias in release_run_matrix(manifest):
+        record = run_task(
+            repository=repository,
+            manifest=manifest,
+            task=task,
+            model_alias=model_alias,
+            agent_command=agent_command,
+            artifacts_root=artifacts_root,
+        )
+        result_paths.append(record.artifact_dir / "result.json")
+    result_payloads = tuple(
+        load_result_record(path, manifest=manifest) for path in result_paths
+    )
+    summary = evaluate_release_results(
+        manifest,
+        result_payloads,
+        expected_runtime_fingerprint=repository_state_fingerprint(repository),
+    )
+    return summary, tuple(result_paths)
+
+
+def _write_release_evidence(
+    *,
+    path: Path,
+    artifacts_root: Path,
+    manifest: BenchmarkManifest,
+    repository: Path,
+    summary: Mapping[str, object],
+    result_paths: Sequence[Path],
+) -> None:
+    root = artifacts_root.expanduser().resolve()
+    expanded = path.expanduser()
+    target = (expanded if expanded.is_absolute() else root / expanded).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("release evidence artifact must be inside artifacts_root")
+    records: list[dict[str, str]] = []
+    for result_path in result_paths:
+        resolved = result_path.resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError("release result path escapes artifacts_root")
+        records.append(
+            {
+                "path": resolved.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+            }
+        )
+    payload = {
+        "schema_version": "praxis-code-agent-release-evidence-v1",
+        "benchmark_version": manifest.benchmark_version,
+        "manifest_fingerprint": manifest.fingerprint,
+        "runtime_fingerprint": repository_state_fingerprint(repository),
+        "primary_model": manifest.primary_model,
+        "control_model": manifest.control_model,
+        "results": records,
+        "gate": dict(summary),
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def load_release_evidence(
+    path: Path,
+    *,
+    artifacts_root: Path,
+    manifest: BenchmarkManifest,
+) -> tuple[str, tuple[Mapping[str, object], ...]]:
+    root = artifacts_root.expanduser().resolve()
+    expanded = path.expanduser()
+    evidence_path = (expanded if expanded.is_absolute() else root / expanded).resolve()
+    if not evidence_path.is_relative_to(root):
+        raise ValueError("release evidence path escapes artifacts_root")
+    payload = _mapping(
+        json.loads(evidence_path.read_text(encoding="utf-8")),
+        field="release evidence",
+    )
+    if payload.get("schema_version") != "praxis-code-agent-release-evidence-v1":
+        raise ValueError("release evidence schema_version is unsupported")
+    if payload.get("manifest_fingerprint") != manifest.fingerprint:
+        raise ValueError("release evidence manifest_fingerprint does not match")
+    runtime_fingerprint = _sha256_fingerprint(
+        payload.get("runtime_fingerprint"),
+        field="release evidence runtime_fingerprint",
+    )
+    raw_records = payload.get("results")
+    if not isinstance(raw_records, Sequence) or isinstance(raw_records, (str, bytes)):
+        raise ValueError("release evidence results must be a sequence")
+    results: list[Mapping[str, object]] = []
+    for raw_record in raw_records:
+        record = _mapping(raw_record, field="release evidence result")
+        relative = _non_empty_string(
+            record.get("path"),
+            field="release evidence result.path",
+        )
+        result_path = (root / relative).resolve()
+        if not result_path.is_relative_to(root):
+            raise ValueError("release evidence result path escapes artifacts_root")
+        expected_hash = _sha256_fingerprint(
+            record.get("sha256"),
+            field="release evidence result.sha256",
+        )
+        if hashlib.sha256(result_path.read_bytes()).hexdigest() != expected_hash:
+            raise ValueError(f"release evidence result sha256 mismatch: {relative}")
+        results.append(load_result_record(result_path, manifest=manifest))
+    return runtime_fingerprint, tuple(results)
+
+
+def _write_comparison_evidence(
+    *,
+    path: Path,
+    artifacts_root: Path,
+    manifest: BenchmarkManifest,
+    comparison: Mapping[str, object],
+    candidate_evidence: Path,
+    baseline_evidence: Path,
+) -> None:
+    root = artifacts_root.expanduser().resolve()
+
+    def resolve(value: Path) -> Path:
+        expanded = value.expanduser()
+        resolved = (expanded if expanded.is_absolute() else root / expanded).resolve()
+        if not resolved.is_relative_to(root):
+            raise ValueError("comparison evidence path escapes artifacts_root")
+        return resolved
+
+    target = resolve(path)
+    candidate_path = resolve(candidate_evidence)
+    baseline_path = resolve(baseline_evidence)
+    payload = {
+        "schema_version": "praxis-code-agent-kernel-comparison-v1",
+        "benchmark_version": manifest.benchmark_version,
+        "manifest_fingerprint": manifest.fingerprint,
+        "candidate_evidence": {
+            "path": candidate_path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(candidate_path.read_bytes()).hexdigest(),
+        },
+        "baseline_evidence": {
+            "path": baseline_path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(baseline_path.read_bytes()).hexdigest(),
+        },
+        "comparison": dict(comparison),
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def run_kernel_comparison(
+    *,
+    repository: Path,
+    manifest: BenchmarkManifest,
+    baseline_commit: str,
+    artifacts_root: Path,
+    evidence_artifact: Path,
+) -> dict[str, object]:
+    """Run the dirty candidate tree and a frozen old-kernel commit, then compare."""
+
+    if re.fullmatch(r"[0-9a-f]{40}", baseline_commit) is None:
+        raise ValueError("baseline_commit must be a full lowercase Git commit")
+    root = artifacts_root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    expanded = evidence_artifact.expanduser()
+    final_evidence = (expanded if expanded.is_absolute() else root / expanded).resolve()
+    if not final_evidence.is_relative_to(root):
+        raise ValueError("kernel comparison evidence path escapes artifacts_root")
+    candidate_evidence = final_evidence.with_name("candidate-release.json")
+    baseline_evidence = final_evidence.with_name("baseline-release.json")
+
+    candidate_summary, candidate_paths = run_release(
+        repository=repository,
+        manifest=manifest,
+        agent_command=_resolve_agent_command("current-runtime"),
+        artifacts_root=root,
+    )
+    _write_release_evidence(
+        path=candidate_evidence,
+        artifacts_root=root,
+        manifest=manifest,
+        repository=repository,
+        summary=candidate_summary,
+        result_paths=candidate_paths,
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="praxis-old-kernel-",
+        dir=root,
+    ) as raw_checkout:
+        baseline_repository = Path(raw_checkout) / "repository"
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                str(repository.expanduser().resolve()),
+                str(baseline_repository),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--quiet", "--detach", baseline_commit],
+            cwd=baseline_repository,
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "uv",
+                "sync",
+                "--frozen",
+                "--offline",
+                "--project",
+                str(baseline_repository),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        validate_repository_bindings(manifest, repository=baseline_repository)
+        baseline_agent = baseline_repository / ".venv" / "bin" / "agent"
+        if not baseline_agent.is_file():
+            raise ValueError("baseline agent entrypoint was not installed")
+        baseline_summary, baseline_paths = run_release(
+            repository=baseline_repository,
+            manifest=manifest,
+            agent_command=(str(baseline_agent.resolve()),),
+            artifacts_root=root,
+        )
+        _write_release_evidence(
+            path=baseline_evidence,
+            artifacts_root=root,
+            manifest=manifest,
+            repository=baseline_repository,
+            summary=baseline_summary,
+            result_paths=baseline_paths,
+        )
+
+    candidate_fingerprint, candidate_results = load_release_evidence(
+        candidate_evidence,
+        artifacts_root=root,
+        manifest=manifest,
+    )
+    baseline_fingerprint, baseline_results = load_release_evidence(
+        baseline_evidence,
+        artifacts_root=root,
+        manifest=manifest,
+    )
+    comparison = evaluate_kernel_comparison(
+        manifest,
+        candidate_results,
+        baseline_results,
+        candidate_runtime_fingerprint=candidate_fingerprint,
+        baseline_runtime_fingerprint=baseline_fingerprint,
+    )
+    _write_comparison_evidence(
+        path=final_evidence,
+        artifacts_root=root,
+        manifest=manifest,
+        comparison=comparison,
+        candidate_evidence=candidate_evidence,
+        baseline_evidence=baseline_evidence,
+    )
+    return comparison
 
 
 def _export_snapshot(repository: Path, commit: str, workspace: Path) -> None:
@@ -1357,8 +1791,49 @@ def _runtime_files(workspace: Path) -> set[str]:
 
 
 def _output_field(output: str, label: str) -> str | None:
-    match = re.search(rf"^{re.escape(label)}:\s*(.+?)\s*$", output, re.MULTILINE)
-    return None if match is None else match.group(1)
+    matches = re.findall(
+        rf"^{re.escape(label)}:\s*(.+?)\s*$",
+        output,
+        re.MULTILINE,
+    )
+    return None if not matches else matches[-1]
+
+
+def _has_single_unknown_model_operation(
+    checkpoint_path: Path,
+    *,
+    turn_id: str,
+) -> bool:
+    if not checkpoint_path.is_file():
+        return False
+    try:
+        with sqlite3.connect(checkpoint_path) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM model_operations "
+                "WHERE turn_id = ? AND status = 'unknown'",
+                (turn_id,),
+            ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row == (1,))
+
+
+def _merge_command_results(
+    previous: _CommandResult,
+    current: _CommandResult,
+    *,
+    retry_index: int,
+) -> _CommandResult:
+    marker = f"\n[benchmark:model-unknown-retry:{retry_index}]\n"
+    return _CommandResult(
+        returncode=current.returncode,
+        stdout=previous.stdout + marker + current.stdout,
+        stderr=previous.stderr + marker + current.stderr,
+        timed_out=previous.timed_out or current.timed_out,
+        leftover_processes=(
+            previous.leftover_processes or current.leftover_processes
+        ),
+    )
 
 
 def _inspection_call_count(output: str) -> int | None:
@@ -1734,6 +2209,11 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
         if (
             any(path == f"{root}/service.py" for root in runtime_roots)
             or path.startswith("agent_runtime/runtime/")
+            or path
+            in {
+                "agent_runtime/harness/composition.py",
+                "agent_runtime/harness/model_adapter.py",
+            }
             or path == "rag/models/catalog.py"
             or any(
                 path
@@ -1746,7 +2226,15 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
             )
         ):
             layers.add("service")
-        if any(path.startswith(f"{root}/loop/") for root in runtime_roots):
+        if (
+            any(path.startswith(f"{root}/loop/") for root in runtime_roots)
+            or path
+            in {
+                "agent_runtime/harness/session.py",
+                "agent_runtime/harness/context.py",
+                "agent_runtime/harness/completion.py",
+            }
+        ):
             layers.add("loop")
         if (
             any(
@@ -1760,6 +2248,11 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
                 or path == f"{root}/planning.py"
                 for root in runtime_roots
             )
+            or path
+            in {
+                "agent_runtime/harness/tool_orchestrator.py",
+                "agent_runtime/harness/tool_router.py",
+            }
         ):
             layers.add("tool")
         if any(
@@ -1770,13 +2263,18 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
                 f"{root}/sessions.py",
             }
             for root in runtime_roots
-        ):
+        ) or path in {
+            "agent_runtime/harness/rollout.py",
+            "agent_runtime/harness/reducer.py",
+            "agent_runtime/harness/thread_manager.py",
+            "agent_runtime/harness/migration.py",
+        }:
             layers.add("turn_checkpoint")
         if any(
             path == f"{root}/result.py"
             or path.startswith(f"{root}/streaming/")
             for root in runtime_roots
-        ):
+        ) or path == "agent_runtime/harness/events.py":
             layers.add("result_events")
     return layers
 
@@ -1813,6 +2311,35 @@ def _build_parser() -> argparse.ArgumentParser:
         help="trusted local command prefix, parsed without a shell",
     )
 
+    run_release_parser = subparsers.add_parser("run-release")
+    run_release_parser.add_argument("manifest", type=Path)
+    run_release_parser.add_argument("--repository", type=Path, default=Path.cwd())
+    run_release_parser.add_argument("--artifacts-root", type=Path)
+    run_release_parser.add_argument("--evidence-artifact", type=Path, required=True)
+    run_release_parser.add_argument(
+        "--agent-command",
+        default="current-runtime",
+        help=(
+            "trusted local command prefix, parsed without a shell; "
+            "current-runtime binds the active uv environment's agent entrypoint"
+        ),
+    )
+
+    compare_release = subparsers.add_parser("compare-release")
+    compare_release.add_argument("manifest", type=Path)
+    compare_release.add_argument("--repository", type=Path, default=Path.cwd())
+    compare_release.add_argument("--artifacts-root", type=Path)
+    compare_release.add_argument("--candidate-evidence", type=Path, required=True)
+    compare_release.add_argument("--baseline-evidence", type=Path, required=True)
+    compare_release.add_argument("--evidence-artifact", type=Path, required=True)
+
+    compare_kernels = subparsers.add_parser("compare-kernels")
+    compare_kernels.add_argument("manifest", type=Path)
+    compare_kernels.add_argument("--repository", type=Path, default=Path.cwd())
+    compare_kernels.add_argument("--artifacts-root", type=Path)
+    compare_kernels.add_argument("--baseline-commit", required=True)
+    compare_kernels.add_argument("--evidence-artifact", type=Path, required=True)
+
     gate = subparsers.add_parser("gate")
     gate.add_argument("manifest", type=Path)
     gate.add_argument("results", nargs="+", type=Path)
@@ -1838,7 +2365,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "run-task":
             task = _task_by_id(manifest, args.task_id)
             model_alias = args.model
-            command = tuple(shlex.split(args.agent_command))
+            command = _resolve_agent_command(args.agent_command)
             record = run_task(
                 repository=args.repository,
                 manifest=manifest,
@@ -1854,6 +2381,91 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "turn_id": record.turn_id,
                 "artifact_dir": str(record.artifact_dir),
             }
+        elif args.command == "run-release":
+            artifacts_root = args.artifacts_root
+            if artifacts_root is None:
+                configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
+                if not configured_root:
+                    raise ValueError(
+                        "run-release requires --artifacts-root or "
+                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
+                    )
+                artifacts_root = Path(configured_root)
+            summary, result_paths = run_release(
+                repository=args.repository,
+                manifest=manifest,
+                agent_command=_resolve_agent_command(args.agent_command),
+                artifacts_root=artifacts_root,
+            )
+            _write_release_evidence(
+                path=args.evidence_artifact,
+                artifacts_root=artifacts_root,
+                manifest=manifest,
+                repository=args.repository,
+                summary=summary,
+                result_paths=result_paths,
+            )
+            payload = summary
+            if not summary["release_ready"]:
+                exit_code = 1
+        elif args.command == "compare-release":
+            artifacts_root = args.artifacts_root
+            if artifacts_root is None:
+                configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
+                if not configured_root:
+                    raise ValueError(
+                        "compare-release requires --artifacts-root or "
+                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
+                    )
+                artifacts_root = Path(configured_root)
+            candidate_fingerprint, candidate_results = load_release_evidence(
+                args.candidate_evidence,
+                artifacts_root=artifacts_root,
+                manifest=manifest,
+            )
+            baseline_fingerprint, baseline_results = load_release_evidence(
+                args.baseline_evidence,
+                artifacts_root=artifacts_root,
+                manifest=manifest,
+            )
+            comparison = evaluate_kernel_comparison(
+                manifest,
+                candidate_results,
+                baseline_results,
+                candidate_runtime_fingerprint=candidate_fingerprint,
+                baseline_runtime_fingerprint=baseline_fingerprint,
+            )
+            _write_comparison_evidence(
+                path=args.evidence_artifact,
+                artifacts_root=artifacts_root,
+                manifest=manifest,
+                comparison=comparison,
+                candidate_evidence=args.candidate_evidence,
+                baseline_evidence=args.baseline_evidence,
+            )
+            payload = comparison
+            if not comparison["comparison_ready"]:
+                exit_code = 1
+        elif args.command == "compare-kernels":
+            artifacts_root = args.artifacts_root
+            if artifacts_root is None:
+                configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
+                if not configured_root:
+                    raise ValueError(
+                        "compare-kernels requires --artifacts-root or "
+                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
+                    )
+                artifacts_root = Path(configured_root)
+            comparison = run_kernel_comparison(
+                repository=args.repository,
+                manifest=manifest,
+                baseline_commit=args.baseline_commit,
+                artifacts_root=artifacts_root,
+                evidence_artifact=args.evidence_artifact,
+            )
+            payload = comparison
+            if not comparison["comparison_ready"]:
+                exit_code = 1
         else:
             result_payloads = [
                 load_result_record(path, manifest=manifest)
