@@ -2666,11 +2666,13 @@ class RolloutStore:
             plan_public_item_id: str | None = None
             plan_snapshot: Mapping[str, Any] | None = None
             if operation_id is not None:
-                public_item_id = derive_operation_public_item_id(
-                    turn_id=turn_id,
-                    operation_id=operation_id,
-                    attempt_generation=int(operation["claim_generation"]),
-                )
+                attempt_generation = int(operation["claim_generation"])
+                if attempt_generation > 0:
+                    public_item_id = derive_operation_public_item_id(
+                        turn_id=turn_id,
+                        operation_id=operation_id,
+                        attempt_generation=attempt_generation,
+                    )
                 if operation["tool_name"] == "update_plan" and frozen_result.get("is_error") is not True:
                     structured = frozen_result.get("structured_content")
                     revision = structured.get("revision") if isinstance(structured, Mapping) else None
@@ -2709,7 +2711,7 @@ class RolloutStore:
                 started_payload.update(
                     {
                         "operation_id": operation_id,
-                        "attempt_generation": int(operation["claim_generation"]),
+                        "attempt_generation": attempt_generation,
                         "public_item_id": public_item_id,
                     }
                 )
@@ -2728,7 +2730,7 @@ class RolloutStore:
                 completed_payload.update(
                     {
                         "operation_id": operation_id,
-                        "attempt_generation": int(operation["claim_generation"]),
+                        "attempt_generation": attempt_generation,
                         "public_item_id": public_item_id,
                     }
                 )

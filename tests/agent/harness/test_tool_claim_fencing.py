@@ -10,7 +10,7 @@ from threading import Event
 import pytest
 
 import agent_runtime.harness as harness
-from agent_runtime.harness import RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RolloutEventReader, RolloutStore, ToolOrchestrator
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
 from agent_runtime.tools.tool import (
@@ -326,6 +326,12 @@ def test_conflicting_orchestrator_never_enters_the_second_runner(
             "succeeded",
         ]
         assert verifier.verify().valid is True
+        replayed = RolloutEventReader(verifier).read(turns[1].thread_id)
+        assert not any(
+            result.event.type.value == "item_started"
+            and result.event.data.get("tool_call_id") == "call-second"
+            for result in replayed
+        )
 
 
 def test_fresh_store_recovers_expired_running_operation_to_unknown_pause(

@@ -16,6 +16,7 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
+    RolloutEventReader,
     RolloutStore,
     RuntimeComposition,
 )
@@ -293,6 +294,12 @@ def test_denied_write_resumes_model_without_invoking_runner(tmp_path: Path) -> N
         assert tool_results[0].payload["error_code"] == "tool_denied"
         assert len(model.requests) == 2
         assert runtime.store.verify().valid is True
+        replayed = RolloutEventReader(runtime.store).read(resumed.thread_id)
+        assert not any(
+            result.event.type.value == "item_started"
+            and result.event.data.get("tool_call_id") == "write-call-1"
+            for result in replayed
+        )
 
 
 def test_approval_resume_survives_fresh_runtime_composition(tmp_path: Path) -> None:
