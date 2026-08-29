@@ -20,6 +20,57 @@ def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
     return thread.thread_id, turn.turn_id
 
 
+def _complete_model_response(
+    store: RolloutStore,
+    *,
+    turn_id: str,
+    text: str,
+) -> None:
+    operation = store.prepare_model_operation(
+        turn_id=turn_id,
+        request_hash=f"request-{turn_id}",
+        context_hash=f"context-{turn_id}",
+        tool_hash=f"tools-{turn_id}",
+        wire_hash=f"wire-{turn_id}",
+        request_ref={"request_id": f"request-{turn_id}"},
+    )
+    attempt = store.dispatch_model_attempt(
+        operation.operation_id,
+        worker_id="projection-worker",
+        lease_seconds=30.0,
+    )
+    assert store.complete_model_attempt(
+        operation_id=operation.operation_id,
+        attempt_id=attempt.attempt_id,
+        generation=attempt.generation,
+        text=text,
+        provider_response_id=f"response-{turn_id}",
+        usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+    )
+
+
+def _completed_answer_count(projected: tuple[object, ...], answer: str) -> int:
+    count = 0
+    for replayed in projected:
+        event = getattr(replayed, "event", None)
+        if event is not None:
+            if (
+                event.type.value == "item_completed"
+                and event.item_kind is not None
+                and event.item_kind.value == "agent_message"
+                and event.data.get("content") == answer
+            ):
+                count += 1
+            continue
+        if (
+            getattr(replayed, "event_type", None) == "item_completed"
+            and getattr(replayed, "data", {}).get("payload", {}).get("text")
+            == answer
+        ):
+            count += 1
+    return count
+
+
 def test_unknown_internal_item_kind_fails_closed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -219,3 +270,16 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
     with RolloutStore(database) as reopened:
         with pytest.raises(RuntimeError, match="persisted public Item ID mismatch"):
             RolloutEventReader(reopened).read(thread_id)
+
+
+def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+        _complete_model_response(store, turn_id=turn_id, text="one answer")
+        store.complete_turn(turn_id=turn_id, answer="one answer")
+
+        projected = RolloutEventReader(store).read(thread_id)
+
+    assert _completed_answer_count(projected, "one answer") == 1

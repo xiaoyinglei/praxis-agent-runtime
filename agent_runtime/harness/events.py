@@ -70,10 +70,13 @@ class RolloutEventReader:
             raise ValueError("thread_id must be non-empty")
         self._store.read_thread(thread_id)
         sequence = 0 if after is None else self._decode(after, thread_id=thread_id)
+        all_records = self._store.list_records(thread_id)
+        duplicate_answer_item_ids = _accepted_answer_item_ids(all_records)
         records = tuple(
             record
-            for record in self._store.list_records(thread_id)
+            for record in all_records
             if record.thread_sequence > sequence
+            and record.payload.get("item_id") not in duplicate_answer_item_ids
         )
         for record in records:
             if record.record_type == "item_started":
@@ -228,3 +231,27 @@ class RolloutEventReader:
         if latest and sequence > latest[-1].thread_sequence:
             raise ValueError("event cursor is ahead of the Thread tail")
         return sequence
+
+
+def _accepted_answer_item_ids(records: tuple[RolloutRecord, ...]) -> frozenset[str]:
+    starts = {
+        str(record.payload["item_id"]): (record.payload.get("kind"), record.producer)
+        for record in records
+        if record.record_type == "item_started"
+        and isinstance(record.payload.get("item_id"), str)
+    }
+    model_texts = {
+        record.payload.get("payload", {}).get("text")
+        for record in records
+        if record.record_type == "item_completed"
+        and starts.get(str(record.payload.get("item_id")), (None, None))[0]
+        == "model_response"
+    }
+    return frozenset(
+        item_id
+        for record in records
+        if record.record_type == "item_completed"
+        and (item_id := str(record.payload.get("item_id"))) in starts
+        and starts[item_id] == ("agent_message", "runtime")
+        and record.payload.get("payload", {}).get("text") in model_texts
+    )
