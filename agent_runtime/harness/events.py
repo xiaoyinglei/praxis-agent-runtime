@@ -138,7 +138,11 @@ class RolloutEventReader:
         projected = self._project_records(all_records, after_thread_sequence=sequence)
         return tuple(
             ReplayEvent(
-                event=replace(event, sequence=index),
+                event=replace(
+                    event,
+                    sequence=index,
+                    timestamp_ms=record.committed_at_ms,
+                ),
                 cursor=self._encode(
                     thread_id=record.thread_id,
                     sequence=record.thread_sequence,
@@ -170,7 +174,11 @@ class RolloutEventReader:
         )
         return tuple(
             ReplayEvent(
-                event=replace(event, sequence=index),
+                event=replace(
+                    event,
+                    sequence=index,
+                    timestamp_ms=record.committed_at_ms,
+                ),
                 cursor=self._encode(
                     thread_id=record.thread_id,
                     sequence=record.thread_sequence,

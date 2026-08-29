@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
 
 from agent_runtime.harness import RolloutEventReader, RolloutStore
+from agent_runtime.streaming import events as stream_events
 
 
 def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
@@ -421,3 +423,29 @@ def test_command_execution_does_not_create_a_second_command_outcome(
             == "call-command"
         ]
     assert len(outcomes) == 1
+
+
+def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    before_ms = int(time.time() * 1000)
+    live = stream_events.turn_started("live-turn")
+    after_ms = int(time.time() * 1000)
+    assert before_ms <= live.timestamp_ms <= after_ms
+    assert live.timestamp_ms > 1_000_000_000_000
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, _turn_id = _start_turn(store, workspace)
+        committed = next(
+            record
+            for record in store.list_records(thread_id)
+            if record.record_type == "turn_started"
+        )
+        monkeypatch.setattr(stream_events, "_now_ms", lambda: 123)
+
+        [replayed] = RolloutEventReader(store).read(thread_id)
+
+    assert replayed.event.timestamp_ms == getattr(committed, "committed_at_ms", -1)

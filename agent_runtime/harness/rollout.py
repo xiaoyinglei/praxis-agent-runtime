@@ -91,6 +91,7 @@ class RolloutRecord:
     producer: str
     payload: Mapping[str, Any]
     payload_hash: str
+    committed_at_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -3258,12 +3259,15 @@ class RolloutStore:
             "SELECT COALESCE(MAX(thread_sequence), 0) + 1 FROM rollout_records WHERE thread_id = ?",
             (thread_id,),
         ).fetchone()[0]
+        committed_at = datetime.now(UTC)
+        committed_at_ms = int(committed_at.timestamp() * 1000)
         cursor = self._connection.execute(
             """
             INSERT INTO rollout_records (
                 record_uuid, thread_id, turn_id, thread_sequence, record_type,
-                payload_schema_version, producer, payload_json, payload_hash, created_at
-            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?)
+                payload_schema_version, producer, payload_json, payload_hash,
+                created_at, committed_at_ms
+            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?)
             """,
             (
                 f"record_{uuid4().hex}",
@@ -3274,7 +3278,8 @@ class RolloutStore:
                 producer,
                 payload_json,
                 payload_hash,
-                datetime.now(UTC).isoformat(),
+                committed_at.isoformat(),
+                committed_at_ms,
             ),
         )
         row = self._connection.execute(
@@ -3651,6 +3656,7 @@ class RolloutStore:
                 payload_json TEXT NOT NULL,
                 payload_hash TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                committed_at_ms INTEGER NOT NULL,
                 UNIQUE(thread_id, thread_sequence)
             );
             CREATE TABLE IF NOT EXISTS store_metadata (
@@ -3794,6 +3800,14 @@ class RolloutStore:
             "INSERT OR IGNORE INTO store_metadata (key, value) VALUES ('store_epoch', ?)",
             (f"epoch_{uuid4().hex}",),
         )
+        rollout_record_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(rollout_records)")
+        }
+        if "committed_at_ms" not in rollout_record_columns:
+            self._connection.execute(
+                "ALTER TABLE rollout_records ADD COLUMN committed_at_ms INTEGER"
+            )
         thread_columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(threads)")}
         if "parent_thread_id" not in thread_columns:
             self._connection.execute("ALTER TABLE threads ADD COLUMN parent_thread_id TEXT")
@@ -4102,7 +4116,19 @@ def _record_snapshot(row: sqlite3.Row) -> RolloutRecord:
         producer=row["producer"],
         payload=_immutable_object(row["payload_json"]),
         payload_hash=row["payload_hash"],
+        committed_at_ms=_committed_at_ms(row),
     )
+
+
+def _committed_at_ms(row: sqlite3.Row) -> int:
+    if "committed_at_ms" in row.keys():
+        value = row["committed_at_ms"]
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    created_at = datetime.fromisoformat(str(row["created_at"]))
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=UTC)
+    return int(created_at.timestamp() * 1000)
 
 
 def _thread_row_payload(row: sqlite3.Row) -> dict[str, Any]:
