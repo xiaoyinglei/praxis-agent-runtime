@@ -11,6 +11,32 @@ from typing import Any
 from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
 
 
+_PUBLIC_ITEM_KINDS = frozenset(
+    {
+        "agent_message",
+        "model_response",
+        "model_reasoning",
+        "model_plan",
+        "tool_result",
+        "command_execution",
+        "plan_state",
+    }
+)
+_SUPPRESSED_ITEM_KINDS = frozenset(
+    {
+        "user_message",
+        "input_file",
+        "model_request",
+        "tool_call",
+        "final_proposal",
+        "completion_decision",
+        "completion_feedback",
+        "context_compaction",
+        "context_message",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class RolloutEvent:
     cursor: str
@@ -44,6 +70,9 @@ class RolloutEventReader:
             for record in self._store.list_records(thread_id)
             if record.thread_sequence > sequence
         )
+        for record in records:
+            if record.record_type == "item_started":
+                self._validate_internal_item_kind(record)
         return tuple(self._event(record) for record in records)
 
     def read_global(
@@ -72,6 +101,13 @@ class RolloutEventReader:
             producer=record.producer,
             data=record.payload,
         )
+
+    @staticmethod
+    def _validate_internal_item_kind(record: RolloutRecord) -> None:
+        kind = record.payload.get("kind")
+        if kind in _PUBLIC_ITEM_KINDS or kind in _SUPPRESSED_ITEM_KINDS:
+            return
+        raise RuntimeError(f"unknown internal Item kind fails closed: {kind!r}")
 
     def _encode(self, *, thread_id: str, sequence: int) -> str:
         encoded = json.dumps(
