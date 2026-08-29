@@ -62,6 +62,38 @@ def test_thread_cursor_rejects_schema_epoch_mismatch(tmp_path: Path) -> None:
             reader.read(thread_id, after=mismatched)
 
 
+def test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        first_thread, _ = _start_turn(store, workspace, "first cursor")
+        second_thread, _ = _start_turn(store, workspace, "second cursor")
+        reader = _reader(store)
+        cursor = reader.read(first_thread)[-1].cursor
+
+        with pytest.raises(ValueError, match="different thread"):
+            reader.read(second_thread, after=cursor)
+
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
+        payload["thread_sequence"] = 10_000
+        ahead = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+        with pytest.raises(ValueError, match="ahead"):
+            reader.read(first_thread, after=ahead)
+
+        payload["thread_sequence"] = 0
+        payload["store_epoch"] = "different-store"
+        wrong_store = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+        with pytest.raises(ValueError, match="store epoch"):
+            reader.read(first_thread, after=wrong_store)
+
+
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(
     tmp_path: Path,
 ) -> None:
