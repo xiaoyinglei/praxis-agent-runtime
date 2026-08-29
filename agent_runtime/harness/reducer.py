@@ -465,7 +465,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-_PAYLOAD_UPCASTERS = {1: _identity_v1}
+_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1}
 
 
 def _advance(

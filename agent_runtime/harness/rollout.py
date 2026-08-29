@@ -18,9 +18,25 @@ from typing import Any
 from uuid import uuid4
 
 from agent_runtime.harness.reducer import ProjectionState, apply_record
+from agent_runtime.streaming.events import (
+    derive_model_public_item_id,
+    derive_operation_public_item_id,
+    derive_plan_public_item_id,
+)
 
 _REDUCER_VERSION = 1
 logger = logging.getLogger(__name__)
+
+
+def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
+    return {
+        channel: derive_model_public_item_id(
+            turn_id=turn_id,
+            model_attempt_id=attempt_id,
+            channel=channel,
+        )
+        for channel in ("agent_message", "reasoning", "plan")
+    }
 
 
 class ResourceClaimConflictError(RuntimeError):
@@ -1301,6 +1317,10 @@ class RolloutStore:
                         "operation_id": operation_id,
                         "attempt_id": attempt_id,
                         "generation": 1,
+                        "public_item_ids": _model_public_item_ids(
+                            turn_id=turn_id,
+                            attempt_id=attempt_id,
+                        ),
                         **hashes,
                         "request_ref": frozen_ref,
                     },
@@ -1558,6 +1578,10 @@ class RolloutStore:
                     "previous_attempt_id": operation["active_attempt_id"],
                     "attempt_id": attempt_id,
                     "generation": generation,
+                    "public_item_ids": _model_public_item_ids(
+                        turn_id=str(operation["turn_id"]),
+                        attempt_id=attempt_id,
+                    ),
                 },
             )
             turn = self._connection.execute(
@@ -1646,6 +1670,11 @@ class RolloutStore:
                     },
                 )
                 return False
+            public_item_id = derive_model_public_item_id(
+                turn_id=str(operation["turn_id"]),
+                model_attempt_id=attempt_id,
+                channel="agent_message",
+            )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -1658,6 +1687,7 @@ class RolloutStore:
                     "provider_response_id": provider_response_id,
                     "usage": frozen_usage,
                     "response_item_id": response_item_id,
+                    "public_item_id": public_item_id,
                 },
             )
             self._append_and_reduce(
@@ -1665,7 +1695,13 @@ class RolloutStore:
                 turn_id=operation["turn_id"],
                 record_type="item_started",
                 producer="model",
-                payload={"item_id": response_item_id, "kind": "model_response"},
+                payload={
+                    "item_id": response_item_id,
+                    "kind": "model_response",
+                    "attempt_id": attempt_id,
+                    "channel": "agent_message",
+                    "public_item_id": public_item_id,
+                },
             )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
@@ -1674,6 +1710,9 @@ class RolloutStore:
                 producer="model",
                 payload={
                     "item_id": response_item_id,
+                    "attempt_id": attempt_id,
+                    "channel": "agent_message",
+                    "public_item_id": public_item_id,
                     "payload": {
                         "text": text,
                         "tool_calls": frozen_tool_calls,
@@ -1887,6 +1926,11 @@ class RolloutStore:
                     )
             generation = int(operation["claim_generation"]) + 1
             fencing_token = f"fence_{uuid4().hex}"
+            public_item_id = derive_operation_public_item_id(
+                turn_id=str(operation["turn_id"]),
+                operation_id=operation_id,
+                attempt_generation=generation,
+            )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -1899,6 +1943,7 @@ class RolloutStore:
                     "claim_owner": worker_id,
                     "lease_expires_at": claimed_at + lease_seconds,
                     "attempt_count": int(operation["attempt_count"]) + 1,
+                    "public_item_id": public_item_id,
                 },
             )
         return self.read_tool_operation(operation_id)
@@ -2108,6 +2153,11 @@ class RolloutStore:
                 and observed_at <= float(operation["lease_expires_at"])
             )
             record_type = "tool_operation_outcome_committed" if is_current else "tool_operation_stale_result"
+            public_item_id = derive_operation_public_item_id(
+                turn_id=str(operation["turn_id"]),
+                operation_id=operation_id,
+                attempt_generation=claim_generation,
+            )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -2122,6 +2172,7 @@ class RolloutStore:
                     "error_code": error_code,
                     "requires_reconciliation": requires_reconciliation,
                     "observed_at": observed_at,
+                    "public_item_id": public_item_id,
                 },
             )
             if is_current and status == "unknown":
@@ -2579,7 +2630,7 @@ class RolloutStore:
             thread_id = str(turn["thread_id"])
             if operation_id is not None:
                 operation = self._connection.execute(
-                    "SELECT status FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
+                    "SELECT * FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
                     (operation_id, turn_id),
                 ).fetchone()
                 if operation is None:
@@ -2610,19 +2661,89 @@ class RolloutStore:
                     raise RuntimeError(f"turn is not running: {turn_id}")
             elif turn["status"] != "running":
                 raise RuntimeError(f"turn is not running: {turn_id}")
+            public_item_id: str | None = None
+            plan_public_item_id: str | None = None
+            plan_snapshot: Mapping[str, Any] | None = None
+            if operation_id is not None:
+                public_item_id = derive_operation_public_item_id(
+                    turn_id=turn_id,
+                    operation_id=operation_id,
+                    attempt_generation=int(operation["claim_generation"]),
+                )
+                if operation["tool_name"] == "update_plan" and frozen_result.get("is_error") is not True:
+                    structured = frozen_result.get("structured_content")
+                    revision = structured.get("revision") if isinstance(structured, Mapping) else None
+                    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                        raise RuntimeError("successful update_plan result requires a canonical revision")
+                    call = self._connection.execute(
+                        """
+                        SELECT payload_json FROM items
+                        WHERE turn_id = ? AND kind = 'tool_call' AND status = 'completed'
+                        ORDER BY sequence
+                        """,
+                        (turn_id,),
+                    ).fetchall()
+                    matching_calls = [
+                        json.loads(row["payload_json"])
+                        for row in call
+                        if json.loads(row["payload_json"]).get("tool_call_id")
+                        == operation["tool_call_id"]
+                    ]
+                    if len(matching_calls) != 1:
+                        raise RuntimeError("successful update_plan result requires one canonical ToolCall")
+                    arguments = matching_calls[0].get("arguments")
+                    if not isinstance(arguments, Mapping):
+                        raise RuntimeError("successful update_plan ToolCall arguments are malformed")
+                    plan_public_item_id = derive_plan_public_item_id(
+                        turn_id=turn_id,
+                        revision=revision,
+                    )
+                    plan_snapshot = {
+                        "revision": revision,
+                        "plan": arguments.get("plan", []),
+                        "explanation": arguments.get("explanation"),
+                    }
+            started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
+            if public_item_id is not None:
+                started_payload.update(
+                    {
+                        "operation_id": operation_id,
+                        "attempt_generation": int(operation["claim_generation"]),
+                        "public_item_id": public_item_id,
+                    }
+                )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 record_type="item_started",
                 producer="tool",
-                payload={"item_id": item_id, "kind": "tool_result"},
+                payload=started_payload,
             )
+            completed_payload: dict[str, Any] = {
+                "item_id": item_id,
+                "payload": frozen_result,
+            }
+            if public_item_id is not None:
+                completed_payload.update(
+                    {
+                        "operation_id": operation_id,
+                        "attempt_generation": int(operation["claim_generation"]),
+                        "public_item_id": public_item_id,
+                    }
+                )
+            if plan_public_item_id is not None:
+                completed_payload.update(
+                    {
+                        "plan_public_item_id": plan_public_item_id,
+                        "plan_snapshot": plan_snapshot,
+                    }
+                )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="tool",
-                payload={"item_id": item_id, "payload": frozen_result},
+                payload=completed_payload,
             )
             if operation_id is not None:
                 self._append_and_reduce(
@@ -3142,7 +3263,7 @@ class RolloutStore:
             INSERT INTO rollout_records (
                 record_uuid, thread_id, turn_id, thread_sequence, record_type,
                 payload_schema_version, producer, payload_json, payload_hash, created_at
-            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?)
             """,
             (
                 f"record_{uuid4().hex}",

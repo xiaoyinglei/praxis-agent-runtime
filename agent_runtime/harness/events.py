@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
+from agent_runtime.streaming.events import (
+    derive_model_public_item_id,
+    derive_operation_public_item_id,
+    derive_plan_public_item_id,
+)
 
 
 _PUBLIC_ITEM_KINDS = frozenset(
@@ -73,6 +78,7 @@ class RolloutEventReader:
         for record in records:
             if record.record_type == "item_started":
                 self._validate_internal_item_kind(record)
+            self._validate_public_item_ids(record)
         return tuple(self._event(record) for record in records)
 
     def read_global(
@@ -108,6 +114,83 @@ class RolloutEventReader:
         if kind in _PUBLIC_ITEM_KINDS or kind in _SUPPRESSED_ITEM_KINDS:
             return
         raise RuntimeError(f"unknown internal Item kind fails closed: {kind!r}")
+
+    @classmethod
+    def _validate_public_item_ids(cls, record: RolloutRecord) -> None:
+        payload = record.payload
+        if record.turn_id is None:
+            return
+        if record.record_type in {"model_operation_prepared", "model_retry_prepared"}:
+            attempt_id = payload.get("attempt_id")
+            if not isinstance(attempt_id, str):
+                return
+            persisted = payload.get("public_item_ids")
+            if persisted is None and record.payload_schema_version == 1:
+                return
+            if not isinstance(persisted, Mapping):
+                raise RuntimeError("persisted public Item ID mapping is missing")
+            for channel in ("agent_message", "reasoning", "plan"):
+                cls._require_public_item_id(
+                    persisted.get(channel),
+                    derive_model_public_item_id(
+                        turn_id=record.turn_id,
+                        model_attempt_id=attempt_id,
+                        channel=channel,
+                    ),
+                )
+        attempt_id = payload.get("attempt_id")
+        channel = payload.get("channel")
+        if isinstance(attempt_id, str) and isinstance(channel, str):
+            cls._require_public_item_id(
+                payload.get("public_item_id"),
+                derive_model_public_item_id(
+                    turn_id=record.turn_id,
+                    model_attempt_id=attempt_id,
+                    channel=channel,
+                ),
+            )
+        operation_id = payload.get("operation_id")
+        generation = payload.get("attempt_generation", payload.get("claim_generation"))
+        if (
+            isinstance(operation_id, str)
+            and isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation > 0
+            and record.record_type
+            in {
+                "tool_operation_claimed",
+                "tool_operation_outcome_committed",
+                "tool_operation_stale_result",
+                "item_started",
+                "item_completed",
+            }
+        ):
+            cls._require_public_item_id(
+                payload.get("public_item_id"),
+                derive_operation_public_item_id(
+                    turn_id=record.turn_id,
+                    operation_id=operation_id,
+                    attempt_generation=generation,
+                ),
+            )
+        plan_snapshot = payload.get("plan_snapshot")
+        if isinstance(plan_snapshot, Mapping):
+            revision = plan_snapshot.get("revision")
+            if isinstance(revision, int) and not isinstance(revision, bool):
+                cls._require_public_item_id(
+                    payload.get("plan_public_item_id"),
+                    derive_plan_public_item_id(
+                        turn_id=record.turn_id,
+                        revision=revision,
+                    ),
+                )
+
+    @staticmethod
+    def _require_public_item_id(persisted: object, expected: str) -> None:
+        if persisted != expected:
+            raise RuntimeError(
+                "persisted public Item ID mismatch; durable history requires repair"
+            )
 
     def _encode(self, *, thread_id: str, sequence: int) -> str:
         encoded = json.dumps(
