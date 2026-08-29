@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import agent_runtime
 from agent_runtime.agent import Agent
 from agent_runtime.harness import (
     HarnessModelRequest,
@@ -277,10 +278,6 @@ async def test_legacy_projection_preserves_tool_id_result_details_and_plan_event
     assert target.events[2].data["event"] == {"event_type": "llm_update"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 2 ports Rollout records to the canonical v2 public envelope",
-)
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -295,7 +292,9 @@ def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) 
         replayed = RolloutEventReader(store).read(thread.thread_id)
 
     assert replayed
-    assert all(isinstance(record, events.StreamEvent) for record in replayed)
+    assert getattr(agent_runtime, "ReplayEvent", None) is not None
+    assert all(isinstance(record.event, events.StreamEvent) for record in replayed)
+    assert all(record.event.protocol_version == 2 for record in replayed)
 
 
 class _StaticHarnessModel:
