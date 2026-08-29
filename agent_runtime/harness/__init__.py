@@ -3,7 +3,7 @@
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.composition import RuntimeComposition
 from agent_runtime.harness.context import RolloutContextManager
-from agent_runtime.harness.events import RolloutEvent, RolloutEventReader
+from agent_runtime.harness.events import ReplayEvent, RolloutEvent, RolloutEventReader
 from agent_runtime.harness.facade import HarnessAgent
 from agent_runtime.harness.migration import (
     LegacyMigrationReport,
@@ -79,6 +79,7 @@ __all__ = [
     "ModelDispatchPreflightError",
     "ModelOperationSnapshot",
     "PreparedModelCall",
+    "ReplayEvent",
     "RolloutRecord",
     "RolloutContextManager",
     "RolloutEvent",
