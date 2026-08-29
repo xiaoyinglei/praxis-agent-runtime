@@ -207,15 +207,44 @@ class RolloutEventReader:
             and isinstance(record.payload.get("item_id"), str)
         }
         duplicate_answer_ids = _accepted_answer_item_ids(records)
+        model_attempts_by_item = {
+            str(record.payload["response_item_id"]): str(record.payload["attempt_id"])
+            for record in records
+            if record.record_type == "model_attempt_completed"
+            and isinstance(record.payload.get("response_item_id"), str)
+            and isinstance(record.payload.get("attempt_id"), str)
+        }
+        tool_operations_by_item = {
+            str(record.payload["result_item_id"]): str(record.payload["operation_id"])
+            for record in records
+            if record.record_type == "tool_operation_result_linked"
+            and isinstance(record.payload.get("result_item_id"), str)
+            and isinstance(record.payload.get("operation_id"), str)
+        }
+        tool_generations_by_operation = {
+            str(record.payload["operation_id"]): int(record.payload["claim_generation"])
+            for record in records
+            if record.record_type == "tool_operation_claimed"
+            and isinstance(record.payload.get("operation_id"), str)
+            and isinstance(record.payload.get("claim_generation"), int)
+        }
         completed_operations = {
             (
-                str(record.payload["operation_id"]),
-                int(record.payload["attempt_generation"]),
+                operation_id,
+                tool_generations_by_operation[operation_id],
             )
             for record in records
             if record.record_type == "item_completed"
-            and isinstance(record.payload.get("operation_id"), str)
-            and isinstance(record.payload.get("attempt_generation"), int)
+            and isinstance(record.payload.get("item_id"), str)
+            and (
+                operation_id := (
+                    str(record.payload["operation_id"])
+                    if isinstance(record.payload.get("operation_id"), str)
+                    else tool_operations_by_item.get(str(record.payload["item_id"]))
+                )
+            )
+            is not None
+            and operation_id in tool_generations_by_operation
         }
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
@@ -225,6 +254,9 @@ class RolloutEventReader:
                 completed_item_ids=completed_item_ids,
                 duplicate_answer_ids=duplicate_answer_ids,
                 completed_operations=completed_operations,
+                model_attempts_by_item=model_attempts_by_item,
+                tool_operations_by_item=tool_operations_by_item,
+                tool_generations_by_operation=tool_generations_by_operation,
             )
             if record.thread_sequence > after_thread_sequence:
                 projected.extend((record, event) for event in events)
@@ -238,6 +270,9 @@ class RolloutEventReader:
         completed_item_ids: set[str],
         duplicate_answer_ids: frozenset[str],
         completed_operations: set[tuple[str, int]],
+        model_attempts_by_item: Mapping[str, str],
+        tool_operations_by_item: Mapping[str, str],
+        tool_generations_by_operation: Mapping[str, int],
     ) -> tuple[StreamEvent, ...]:
         lifecycle = self._project_lifecycle(record)
         if lifecycle is not None:
@@ -248,13 +283,25 @@ class RolloutEventReader:
         if record.record_type == "tool_operation_claimed":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
+            generation = record.payload.get("claim_generation")
+            if (
+                not isinstance(public_item_id, str)
+                and record.payload_schema_version == 1
+                and record.turn_id is not None
+                and isinstance(operation_id, str)
+                and isinstance(generation, int)
+            ):
+                public_item_id = derive_operation_public_item_id(
+                    turn_id=record.turn_id,
+                    operation_id=operation_id,
+                    attempt_generation=generation,
+                )
             if (
                 record.turn_id is None
                 or not isinstance(operation_id, str)
                 or not isinstance(public_item_id, str)
             ):
                 raise RuntimeError("claimed tool operation is missing public identity")
-            generation = record.payload.get("claim_generation")
             if not isinstance(generation, int) or (
                 operation_id,
                 generation,
@@ -284,10 +331,40 @@ class RolloutEventReader:
                 return ()
             if kind in {"tool_result", "command_execution"}:
                 return ()
-            return (self._project_item_started(record, kind=str(kind)),)
+            legacy_public_item_id = _legacy_model_public_item_id(
+                record,
+                kind=str(kind),
+                model_attempts_by_item=model_attempts_by_item,
+            )
+            return (
+                self._project_item_started(
+                    record,
+                    kind=str(kind),
+                    derived_public_item_id=legacy_public_item_id,
+                ),
+            )
         elif kind == "tool_result" and record.record_type == "item_completed":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
+            if (
+                record.payload_schema_version == 1
+                and isinstance(item_id, str)
+                and not isinstance(operation_id, str)
+            ):
+                operation_id = tool_operations_by_item.get(item_id)
+            if (
+                record.payload_schema_version == 1
+                and record.turn_id is not None
+                and isinstance(operation_id, str)
+                and not isinstance(public_item_id, str)
+            ):
+                generation = tool_generations_by_operation.get(operation_id)
+                if generation is not None:
+                    public_item_id = derive_operation_public_item_id(
+                        turn_id=record.turn_id,
+                        operation_id=operation_id,
+                        attempt_generation=generation,
+                    )
             if isinstance(operation_id, str) and isinstance(public_item_id, str):
                 if record.turn_id is None:
                     raise RuntimeError("tool result is missing turn identity")
@@ -327,7 +404,18 @@ class RolloutEventReader:
                 return ()
             if kind == "command_execution":
                 return ()
-            return (self._project_item_completed(record, kind=str(kind)),)
+            legacy_public_item_id = _legacy_model_public_item_id(
+                record,
+                kind=str(kind),
+                model_attempts_by_item=model_attempts_by_item,
+            )
+            return (
+                self._project_item_completed(
+                    record,
+                    kind=str(kind),
+                    derived_public_item_id=legacy_public_item_id,
+                ),
+            )
         if record.record_type in _SUPPRESSED_RECORD_TYPES:
             return ()
         raise RuntimeError(f"unknown durable Rollout record type: {record.record_type!r}")
@@ -377,7 +465,12 @@ class RolloutEventReader:
         return None
 
     @staticmethod
-    def _project_item_started(record: RolloutRecord, *, kind: str) -> StreamEvent:
+    def _project_item_started(
+        record: RolloutRecord,
+        *,
+        kind: str,
+        derived_public_item_id: str | None = None,
+    ) -> StreamEvent:
         if record.turn_id is None:
             raise RuntimeError("public Item start is missing turn_id")
         internal_item_id = record.payload.get("item_id")
@@ -385,6 +478,8 @@ class RolloutEventReader:
             raise RuntimeError("public Item start is missing item_id")
         item_kind = _public_item_kind(kind)
         public_item_id = record.payload.get("public_item_id")
+        if not isinstance(public_item_id, str):
+            public_item_id = derived_public_item_id
         if not isinstance(public_item_id, str):
             if item_kind is TurnItemKind.LEGACY_MESSAGE:
                 public_item_id = internal_item_id
@@ -407,7 +502,12 @@ class RolloutEventReader:
         )
 
     @staticmethod
-    def _project_item_completed(record: RolloutRecord, *, kind: str) -> StreamEvent:
+    def _project_item_completed(
+        record: RolloutRecord,
+        *,
+        kind: str,
+        derived_public_item_id: str | None = None,
+    ) -> StreamEvent:
         if record.turn_id is None:
             raise RuntimeError("public Item completion is missing turn_id")
         internal_item_id = record.payload.get("item_id")
@@ -415,6 +515,8 @@ class RolloutEventReader:
             raise RuntimeError("public Item completion is missing item_id")
         item_kind = _public_item_kind(kind)
         public_item_id = record.payload.get("public_item_id")
+        if not isinstance(public_item_id, str):
+            public_item_id = derived_public_item_id
         if not isinstance(public_item_id, str):
             if item_kind is TurnItemKind.LEGACY_MESSAGE:
                 public_item_id = internal_item_id
@@ -515,6 +617,8 @@ class RolloutEventReader:
                 "item_completed",
             }
         ):
+            if payload.get("public_item_id") is None and record.payload_schema_version == 1:
+                return
             cls._require_public_item_id(
                 payload.get("public_item_id"),
                 derive_operation_public_item_id(
@@ -622,6 +726,33 @@ def _tool_completion_status(
     if status == "unknown":
         return ItemStatus.OUTCOME_UNKNOWN, error_code or "tool outcome is unknown"
     return ItemStatus.FAILED, error_code or "tool execution failed"
+
+
+def _legacy_model_public_item_id(
+    record: RolloutRecord,
+    *,
+    kind: str,
+    model_attempts_by_item: Mapping[str, str],
+) -> str | None:
+    if record.payload_schema_version != 1:
+        return None
+    channel_by_kind = {
+        "model_response": "agent_message",
+        "model_reasoning": "reasoning",
+        "model_plan": "plan",
+    }
+    channel = channel_by_kind.get(kind)
+    item_id = record.payload.get("item_id")
+    if channel is None or not isinstance(item_id, str) or record.turn_id is None:
+        return None
+    attempt_id = model_attempts_by_item.get(item_id)
+    if attempt_id is None:
+        return None
+    return derive_model_public_item_id(
+        turn_id=record.turn_id,
+        model_attempt_id=attempt_id,
+        channel=channel,
+    )
 
 
 def _public_item_kind(kind: str) -> TurnItemKind:

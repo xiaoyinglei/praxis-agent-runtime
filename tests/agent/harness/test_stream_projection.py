@@ -475,3 +475,131 @@ def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
             record.record_type != "item_delta"
             for record in store.list_records(thread_id)
         )
+
+
+def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+        _complete_model_response(store, turn_id=turn_id, text="legacy model answer")
+        store.record_tool_call(
+            turn_id=turn_id,
+            tool_call_id="legacy-call",
+            tool_name="read_file",
+            arguments={"path": "README.md"},
+            origin={"request_id": "legacy-request"},
+        )
+        values = {
+            "turn_id": turn_id,
+            "operation_id": "legacy-operation",
+            "tool_call_id": "legacy-call",
+            "tool_name": "read_file",
+            "arguments_digest": "legacy-arguments",
+            "execution_revision": "builtin-read-file-v1",
+            "idempotent": True,
+            "attempt_count": 0,
+            "error_code": None,
+            "requires_reconciliation": False,
+        }
+        store.record_tool_execution_state(status="prepared", **values)
+        store.record_tool_execution_state(status="ready", **values)
+        claim = store.claim_tool_operation(
+            operation_id="legacy-operation",
+            worker_id="legacy-worker",
+            lease_seconds=30.0,
+        )
+        assert store.commit_tool_operation_outcome(
+            operation_id="legacy-operation",
+            claim_generation=claim.claim_generation,
+            fencing_token=str(claim.fencing_token),
+            status="succeeded",
+            attempt_count=1,
+            error_code=None,
+            requires_reconciliation=False,
+        )
+        store.record_tool_result(
+            turn_id=turn_id,
+            operation_id="legacy-operation",
+            result={
+                "tool_call_id": "legacy-call",
+                "tool_name": "read_file",
+                "structured_content": {"text": "legacy file"},
+                "is_error": False,
+                "content": [],
+                "attachments": [],
+            },
+        )
+
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                "SELECT record_id, record_type, payload_json FROM rollout_records"
+            ).fetchall()
+            for row in rows:
+                payload = json.loads(row["payload_json"])
+                if row["record_type"] in {
+                    "model_operation_prepared",
+                    "model_retry_prepared",
+                }:
+                    payload.pop("public_item_ids", None)
+                if row["record_type"] in {
+                    "model_attempt_completed",
+                    "tool_operation_claimed",
+                    "tool_operation_outcome_committed",
+                }:
+                    payload.pop("public_item_id", None)
+                if row["record_type"] in {"item_started", "item_completed"}:
+                    payload.pop("attempt_id", None)
+                    payload.pop("channel", None)
+                    payload.pop("operation_id", None)
+                    payload.pop("attempt_generation", None)
+                    payload.pop("public_item_id", None)
+                payload_json = json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                connection.execute(
+                    """
+                    UPDATE rollout_records
+                    SET payload_schema_version = 1,
+                        payload_json = ?, payload_hash = ?
+                    WHERE record_id = ?
+                    """,
+                    (
+                        payload_json,
+                        hashlib.sha256(payload_json.encode()).hexdigest(),
+                        row["record_id"],
+                    ),
+                )
+        store.rebuild_projections()
+        assert store.verify().valid is True
+
+        first_replay = RolloutEventReader(store).read(thread_id)
+
+    with RolloutStore(database) as reopened:
+        assert reopened.verify().valid is True
+        second_replay = RolloutEventReader(reopened).read(thread_id)
+
+    first_items = [
+        result.event
+        for result in first_replay
+        if result.event.item_kind is not None
+    ]
+    second_items = [
+        result.event
+        for result in second_replay
+        if result.event.item_kind is not None
+    ]
+    assert [(event.type, event.item_kind, event.item_id) for event in first_items] == [
+        (event.type, event.item_kind, event.item_id) for event in second_items
+    ]
+    assert {event.item_kind.value for event in first_items} == {
+        "agent_message",
+        "tool",
+    }
