@@ -3,10 +3,13 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import queue as thread_queue
+import threading
 from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
@@ -45,6 +48,29 @@ class StreamChunk:
     tool_id: str = ""
     stop_reason: str = ""  # "end_turn" | "tool_use" | "max_tokens"
     usage: LLMUsage | None = None
+
+
+class ProviderDeltaChannel(StrEnum):
+    """Provider-visible model output channels."""
+
+    TEXT = "text"
+    REASONING = "reasoning"
+    PLAN = "plan"
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderDelta:
+    """One honest provider delta, before it becomes a Turn Item delta."""
+
+    channel: ProviderDeltaChannel
+    content: str
+
+
+ProviderDeltaSink = Callable[[ProviderDelta], None | Awaitable[None]]
+
+_PROVIDER_BRIDGE_MAXSIZE = 64
+_PROVIDER_BRIDGE_POLL_SECONDS = 0.005
+_PROVIDER_BRIDGE_PUT_TIMEOUT_SECONDS = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +234,7 @@ class LLMGateway:
         provider: str,
         supports_native_tools: bool,
         stream: bool = False,
-        text_delta_sink: Callable[[str], None | Awaitable[None]] | None = None,
+        delta_sink: ProviderDeltaSink | None = None,
         ledger: AsyncBudgetLedger | None = None,
         lease_id: str | None = None,
     ) -> AgentModelResponse:
@@ -255,8 +281,11 @@ class LLMGateway:
             )
             if effective_ledger is not None:
                 await effective_ledger.commit(effective_lease_id, usage.total_tokens)
-            if stream and turn.text and text_delta_sink is not None:
-                await _emit_text_delta(text_delta_sink, turn.text)
+            if stream and turn.text and delta_sink is not None:
+                await _emit_provider_delta(
+                    delta_sink,
+                    ProviderDelta(ProviderDeltaChannel.TEXT, turn.text),
+                )
             return AgentModelResponse(
                 turn=turn,
                 usage=usage,
@@ -301,10 +330,33 @@ class LLMGateway:
             async for chunk in chunks:
                 if chunk.type == "text_delta":
                     text += chunk.content
-                    if text_delta_sink is not None:
-                        await _emit_text_delta(text_delta_sink, chunk.content)
+                    if delta_sink is not None:
+                        await _emit_provider_delta(
+                            delta_sink,
+                            ProviderDelta(
+                                ProviderDeltaChannel.TEXT,
+                                chunk.content,
+                            ),
+                        )
                 elif chunk.type == "thinking_delta":
                     reasoning_content += chunk.content
+                    if delta_sink is not None:
+                        await _emit_provider_delta(
+                            delta_sink,
+                            ProviderDelta(
+                                ProviderDeltaChannel.REASONING,
+                                chunk.content,
+                            ),
+                        )
+                elif chunk.type == "plan_delta":
+                    if delta_sink is not None:
+                        await _emit_provider_delta(
+                            delta_sink,
+                            ProviderDelta(
+                                ProviderDeltaChannel.PLAN,
+                                chunk.content,
+                            ),
+                        )
                 elif chunk.type == "tool_use_start":
                     current_id = chunk.tool_id
                     current_name = chunk.tool_name
@@ -576,10 +628,10 @@ class LLMGateway:
 
         自动检测 generator 是否支持 stream_with_tools：
         - 支持：真流式，逐 chunk yield
-        - 不支持：模拟流式，先拿完整结果再分块
+        - 不支持：先拿完整结果，再诚实地发一个整体 delta
 
-        producer 线程和 consumer async 并发运行，用
-        loop.call_soon_threadsafe 桥接。
+        producer 在独立 daemon 线程中运行，通过有界线程队列与
+        async consumer 桥接。
 
         Yields:
             StreamChunk: text_delta / tool_use_start / tool_input_delta /
@@ -602,23 +654,46 @@ class LLMGateway:
                     required_tokens=reservation,
                 )
 
-        # 线程安全的 queue，producer 线程写入，consumer async 读取
-        loop = asyncio.get_running_loop()
-        queue: asyncio.Queue[StreamChunk | None] = asyncio.Queue()
+        bridge: thread_queue.Queue[StreamChunk] = thread_queue.Queue(
+            maxsize=_PROVIDER_BRIDGE_MAXSIZE
+        )
+        stop_producer = threading.Event()
+        producer_done = threading.Event()
         producer_error: list[BaseException] = []
 
+        def _put(chunk: StreamChunk) -> bool:
+            while not stop_producer.is_set():
+                try:
+                    bridge.put(
+                        chunk,
+                        timeout=_PROVIDER_BRIDGE_PUT_TIMEOUT_SECONDS,
+                    )
+                    return True
+                except thread_queue.Full:
+                    continue
+            return False
+
         def _producer() -> None:
-            """在工作线程中运行，通过 loop.call_soon_threadsafe 写入 queue。"""
             try:
-                self._invoke_streaming_with_tools(messages, tools, call_kwargs, queue, loop)
+                self._invoke_streaming_with_tools(
+                    messages,
+                    tools,
+                    call_kwargs,
+                    put=_put,
+                    stop_event=stop_producer,
+                )
             except BaseException as exc:
                 normalized = _tool_call_validation_error(exc) if isinstance(exc, Exception) else None
                 producer_error.append(normalized or exc)
-                # 确保 consumer 能退出
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+            finally:
+                producer_done.set()
 
-        # 在线程池中启动 producer
-        producer_task = loop.run_in_executor(None, _producer)
+        producer_thread = threading.Thread(
+            target=_producer,
+            name=f"llm-stream-{id(messages)}",
+            daemon=True,
+        )
+        producer_thread.start()
 
         # 并发 yield chunks
         total_output_tokens = 0
@@ -626,27 +701,34 @@ class LLMGateway:
         reported_usage: LLMUsage | None = None
         try:
             while True:
-                chunk = await queue.get()
-                if chunk is None:
-                    break
+                try:
+                    chunk = bridge.get_nowait()
+                except thread_queue.Empty:
+                    if producer_done.is_set():
+                        break
+                    await asyncio.sleep(_PROVIDER_BRIDGE_POLL_SECONDS)
+                    continue
                 if chunk.type in {"text_delta", "thinking_delta"}:
-                    total_output_tokens += self._token_accounting.count(chunk.content)
+                    total_output_tokens += self._token_accounting.count(
+                        chunk.content
+                    )
                 if chunk.type == "message_stop":
                     final_stop = chunk
                     reported_usage = chunk.usage
                     continue
                 yield chunk
         except asyncio.CancelledError:
+            stop_producer.set()
+            _request_provider_stream_cancel(self._generator)
             if effective_ledger is not None:
                 await effective_ledger.refund(effective_lease_id)
             raise
         except GeneratorExit:
+            stop_producer.set()
+            _request_provider_stream_cancel(self._generator)
             if effective_ledger is not None:
                 await effective_ledger.refund(effective_lease_id)
             raise
-        finally:
-            # 确保 producer 线程完成
-            await producer_task
 
         # 检查 producer 是否有异常
         if producer_error:
@@ -839,28 +921,29 @@ class LLMGateway:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
         kwargs: dict[str, Any],
-        queue: asyncio.Queue[StreamChunk | None],
-        loop: asyncio.AbstractEventLoop,
+        *,
+        put: Callable[[StreamChunk], bool],
+        stop_event: threading.Event,
     ) -> None:
-        """在同步线程中调用 generator 的流式接口。
-
-        通过 loop.call_soon_threadsafe 把 chunk 安全地写入 async queue。
-        """
-
-        def _put(chunk: StreamChunk | None) -> None:
-            loop.call_soon_threadsafe(queue.put_nowait, chunk)
+        """在 daemon 线程中调用同步 generator 的流式接口。"""
 
         stream_with_tools = getattr(self._generator, "stream_with_tools", None)
 
         if callable(stream_with_tools):
             # 真流式路径
-            for chunk in stream_with_tools(messages=messages, tools=tools, **kwargs):
+            for chunk in stream_with_tools(
+                messages=messages, tools=tools, **kwargs
+            ):
+                if stop_event.is_set():
+                    return
                 if isinstance(chunk, StreamChunk):
-                    _put(chunk)
+                    if not put(chunk):
+                        return
                 elif isinstance(chunk, dict):
-                    _put(StreamChunk(**chunk))
+                    if not put(StreamChunk(**chunk)):
+                        return
         else:
-            # 模拟流式：先拿完整结果再分块
+            # 非流式 provider：先拿完整结果，不伪造 token 时序。
             result = self._invoke_with_tools(messages, tools, kwargs)
             raw = result.value
             text = ""
@@ -901,22 +984,20 @@ class LLMGateway:
                 text = str(raw) if raw else ""
 
             if reasoning_content:
-                _put(
+                if not put(
                     StreamChunk(
                         type="thinking_delta",
                         content=reasoning_content,
                     )
-                )
+                ):
+                    return
 
-            # 分块 yield 文本
-            chunk_size = 20
-            for i in range(0, len(text), chunk_size):
-                _put(
-                    StreamChunk(
-                        type="text_delta",
-                        content=text[i : i + chunk_size],
-                    )
-                )
+            if text:
+                if not put(StreamChunk(
+                    type="text_delta",
+                    content=text,
+                )):
+                    return
 
             # yield 工具调用
             for tc in tool_calls_list:
@@ -926,28 +1007,24 @@ class LLMGateway:
                 if isinstance(tc_args, dict):
                     tc_args = json.dumps(tc_args)
 
-                _put(
-                    StreamChunk(
-                        type="tool_use_start",
-                        tool_name=tc_name,
-                        tool_id=tc_id,
-                    )
-                )
-                _put(StreamChunk(type="tool_input_delta", content=tc_args))
-                _put(StreamChunk(type="content_block_stop"))
+                if not put(StreamChunk(
+                    type="tool_use_start",
+                    tool_name=tc_name,
+                    tool_id=tc_id,
+                )):
+                    return
+                if not put(StreamChunk(type="tool_input_delta", content=tc_args)):
+                    return
+                if not put(StreamChunk(type="content_block_stop")):
+                    return
 
             if tool_calls_list:
                 stop_reason = "tool_use"
-            _put(
-                StreamChunk(
-                    type="message_stop",
-                    stop_reason=stop_reason,
-                    usage=result.usage,
-                )
-            )
-
-        # 结束标记
-        _put(None)
+            put(StreamChunk(
+                type="message_stop",
+                stop_reason=stop_reason,
+                usage=result.usage,
+            ))
 
 
 def _render_messages_as_prompt(messages: list[dict[str, Any]]) -> str:
@@ -967,13 +1044,31 @@ def _render_messages_as_prompt(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-async def _emit_text_delta(
-    sink: Callable[[str], None | Awaitable[None]],
-    value: str,
+async def _emit_provider_delta(
+    sink: ProviderDeltaSink,
+    delta: ProviderDelta,
 ) -> None:
-    emitted = sink(value)
+    emitted = sink(delta)
     if inspect.isawaitable(emitted):
         await emitted
+
+
+def _request_provider_stream_cancel(generator: object) -> None:
+    cancel_stream = getattr(generator, "cancel_stream", None)
+    if not callable(cancel_stream):
+        return
+
+    def _cancel() -> None:
+        try:
+            cancel_stream()
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_cancel,
+        name=f"llm-stream-cancel-{id(generator)}",
+        daemon=True,
+    ).start()
 
 
 def _plain_wire_mapping(value: Mapping[str, object]) -> dict[str, Any]:
@@ -1084,6 +1179,9 @@ __all__ = [
     "LLMGateway",
     "LLMGatewayError",
     "LLMToolCallValidationError",
+    "ProviderDelta",
+    "ProviderDeltaChannel",
+    "ProviderDeltaSink",
     "StreamChunk",
     "current_llm_budget_ledger",
     "llm_budget_scope",

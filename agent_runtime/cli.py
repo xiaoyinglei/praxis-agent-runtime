@@ -26,7 +26,13 @@ from agent_runtime.models import (
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_control_plane
-from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+)
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -64,6 +70,15 @@ class _CLIToolEventDisplay:
         self.answer_streamed = False
 
     async def emit(self, event: StreamEvent) -> None:
+        if event.type is EventType.ITEM_STARTED:
+            self._render_canonical_item_start(event)
+            return
+        if event.type is EventType.ITEM_DELTA:
+            self._render_canonical_item_delta(event)
+            return
+        if event.type is EventType.ITEM_COMPLETED:
+            self._render_canonical_item_completed(event)
+            return
         if event.type is EventType.TEXT_DELTA:
             text = event.data.get("text")
             if not isinstance(text, str) or not text:
@@ -95,6 +110,80 @@ class _CLIToolEventDisplay:
             detail = event.data.get("detail")
             suffix = f" — {detail}" if isinstance(detail, str) and detail else ""
             self._write_line(f"↻ 恢复: {strategy}{suffix}")
+
+    def _render_canonical_item_start(self, event: StreamEvent) -> None:
+        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
+            return
+        item_id = event.item_id
+        tool_name = event.data.get("tool_name")
+        if not isinstance(item_id, str) or not isinstance(tool_name, str):
+            return
+        if item_id in self._displayed_tool_ids:
+            return
+        self._displayed_tool_ids.add(item_id)
+        self._tool_names[item_id] = tool_name
+        preview = event.data.get("input_preview")
+        suffix = f": {preview}" if isinstance(preview, str) and preview else ""
+        self._write_line(f"→ {tool_name}{suffix}")
+
+    def _render_canonical_item_delta(self, event: StreamEvent) -> None:
+        delta = event.data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        if event.delta_kind is ItemDeltaKind.TEXT:
+            print(delta, end="", flush=True)
+            self.answer_streamed = True
+            self._line_open = not delta.endswith("\n")
+            return
+        if event.delta_kind in {
+            ItemDeltaKind.COMMAND_STDOUT,
+            ItemDeltaKind.COMMAND_STDERR,
+        }:
+            print(delta, end="", flush=True)
+            self._line_open = not delta.endswith("\n")
+            return
+        if event.delta_kind is ItemDeltaKind.TOOL_PROGRESS:
+            name = self._tool_names.get(event.item_id or "", "tool")
+            self._write_line(f"… {name}: {delta}")
+
+    def _render_canonical_item_completed(self, event: StreamEvent) -> None:
+        if event.item_kind is TurnItemKind.PLAN:
+            self._render_plan(event)
+            return
+        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
+            return
+        item_id = event.item_id
+        if not isinstance(item_id, str):
+            return
+        marker = (EventType.ITEM_COMPLETED, item_id)
+        if marker in self._displayed_tool_events:
+            return
+        self._displayed_tool_events.add(marker)
+        result = event.data.get("result")
+        result_map = result if isinstance(result, Mapping) else {}
+        event_name = result_map.get("tool_name")
+        tool_name = (
+            event_name
+            if isinstance(event_name, str) and event_name
+            else self._tool_names.get(item_id, event.item_kind.value)
+        )
+        if event.status is ItemStatus.SUCCESS:
+            structured = result_map.get("structured_content")
+            suffix = (
+                f": {_bounded_cli_text(str(structured))}"
+                if structured is not None
+                else ""
+            )
+            self._write_line(f"✓ {tool_name}{suffix}")
+            metadata = result_map.get("metadata")
+            if isinstance(metadata, Mapping):
+                diff = metadata.get("diff")
+                if isinstance(diff, str) and diff:
+                    self._write_block(diff)
+            return
+        error = event.error or result_map.get("error_message")
+        suffix = f": {_bounded_cli_text(error)}" if isinstance(error, str) else ""
+        self._write_line(f"✗ {tool_name}{suffix}")
 
     def _render_tool_start(self, event: StreamEvent) -> None:
         tool_id = event.data.get("tool_id")

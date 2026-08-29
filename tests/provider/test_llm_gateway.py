@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from types import SimpleNamespace
@@ -27,6 +28,8 @@ from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
     LLMGateway,
     LLMToolCallValidationError,
+    ProviderDelta,
+    ProviderDeltaChannel,
     StreamChunk,
 )
 from agent_runtime.tools.tool import (
@@ -114,6 +117,28 @@ class _StreamingGenerator:
             StreamChunk(type="text_delta", content="one two"),
             StreamChunk(type="message_stop", stop_reason="end_turn"),
         ]
+
+
+class _BlockingStreamingGenerator:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.release = threading.Event()
+
+    def stream_with_tools(self, **_kwargs: object) -> list[StreamChunk]:
+        self.started.set()
+        self.release.wait()
+        return []
+
+
+class _FastStreamingGenerator:
+    def __init__(self) -> None:
+        self.produced = 0
+
+    def stream_with_tools(self, **_kwargs: object):
+        for _index in range(1_000):
+            self.produced += 1
+            yield StreamChunk(type="text_delta", content="x")
+        yield StreamChunk(type="message_stop", stop_reason="end_turn")
 
 
 class _CanonicalNativeGenerator:
@@ -263,6 +288,8 @@ class _CanonicalStreamingGenerator:
     ) -> list[StreamChunk]:
         del messages, tools, kwargs
         return [
+            StreamChunk(type="thinking_delta", content="inspect evidence"),
+            StreamChunk(type="plan_delta", content="read then answer"),
             StreamChunk(type="text_delta", content="stream answer"),
             StreamChunk(
                 type="message_stop",
@@ -560,10 +587,51 @@ async def test_streaming_gateway_refunds_when_consumer_closes_early() -> None:
 
 
 @pytest.mark.anyio
+async def test_sync_provider_bridge_is_bounded_by_consumer_backpressure() -> None:
+    generator = _FastStreamingGenerator()
+    stream = _gateway(generator).astream_with_tools(
+        stage=LLMCallStage.TOOL_DECISION,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+    )
+
+    assert (await stream.__anext__()).content == "x"
+    await asyncio.sleep(0.05)
+
+    assert generator.produced < 100
+    await stream.aclose()
+
+
+@pytest.mark.anyio
+async def test_cancelling_permanently_blocked_sync_provider_returns_promptly() -> None:
+    generator = _BlockingStreamingGenerator()
+    stream = _gateway(generator).astream_with_tools(
+        stage=LLMCallStage.TOOL_DECISION,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+    )
+    task = asyncio.create_task(stream.__anext__())
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(generator.started.wait),
+            timeout=0.5,
+        )
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+    finally:
+        generator.release.set()
+        await stream.aclose()
+
+
+@pytest.mark.anyio
 async def test_streaming_fallback_parses_sdk_text_completion(
     chat_completion_factory: Callable[..., ChatCompletion],
 ) -> None:
-    response = chat_completion_factory(content="provider answer", tool_calls=None)
+    response = chat_completion_factory(
+        content="provider answer that is deliberately longer than twenty bytes",
+        tool_calls=None,
+    )
 
     chunks = [
         chunk
@@ -575,7 +643,9 @@ async def test_streaming_fallback_parses_sdk_text_completion(
     ]
 
     assert [chunk.type for chunk in chunks] == ["text_delta", "message_stop"]
-    assert chunks[0].content == "provider answer"
+    assert chunks[0].content == (
+        "provider answer that is deliberately longer than twenty bytes"
+    )
     assert chunks[-1].stop_reason == "end_turn"
     assert chunks[-1].usage is not None
     assert chunks[-1].usage.usage_source == "provider"
@@ -823,7 +893,7 @@ async def test_gateway_adapts_one_canonical_request_to_local_envelope(provider: 
 @pytest.mark.anyio
 async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
     request = _canonical_request()
-    deltas: list[str] = []
+    deltas: list[ProviderDelta] = []
 
     result = await _gateway(
         _CanonicalStreamingGenerator(),
@@ -835,13 +905,17 @@ async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
         provider="openai-compatible",
         supports_native_tools=True,
         stream=True,
-        text_delta_sink=deltas.append,
+        delta_sink=deltas.append,
     )
 
     assert result.turn.text == "stream answer"
     assert result.usage.cache_read_input_tokens == 9
     assert result.usage.usage_source == "provider"
-    assert deltas == ["stream answer"]
+    assert deltas == [
+        ProviderDelta(ProviderDeltaChannel.REASONING, "inspect evidence"),
+        ProviderDelta(ProviderDeltaChannel.PLAN, "read then answer"),
+        ProviderDelta(ProviderDeltaChannel.TEXT, "stream answer"),
+    ]
 
 
 @pytest.mark.anyio

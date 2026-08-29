@@ -19,6 +19,16 @@ from agent_runtime.harness import (
     HarnessToolCall,
     PreparedModelCall,
 )
+from agent_runtime.result import AgentResult
+from agent_runtime.streaming.events import (
+    EventType,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+    item_completed,
+    item_started,
+    turn_completed,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,16 +165,7 @@ async def _run_case(case: SmokeCase) -> SmokeResult:
             and result.answer == expected_answer
             and tools == case.expected_tools
         )
-        event_lines = tuple(
-            _tool_event_line(call.tool_name, index)
-            for index, call in enumerate(result.tool_calls)
-        )
-        if case.name == "praxis_demo":
-            event_lines = (
-                "[inspect] tool:start read_file fixture.py",
-                *event_lines,
-                "[complete] status=done answer=praxis demo complete",
-            )
+        event_lines = _v2_event_lines(result)
         diff = (
             "--- a/fixture.py\n+++ b/fixture.py\n@@ -1 +1 @@\n-before\n+after\n"
             if case.name == "praxis_demo"
@@ -188,9 +189,86 @@ def _phase(tool_name: str, index: int) -> str:
     return "inspect" if index == 0 else "verify"
 
 
-def _tool_event_line(tool_name: str, index: int) -> str:
-    suffix = "" if tool_name == "apply_patch" else " fixture.py"
-    return f"[{_phase(tool_name, index)}] tool:ok {tool_name}{suffix}"
+def _v2_event_lines(result: AgentResult) -> tuple[str, ...]:
+    canonical: list[tuple[int | None, StreamEvent]] = []
+    for index, call in enumerate(result.tool_calls):
+        item_id = f"tool:{result.turn_id}:{call.tool_call_id}:1"
+        preview = ""
+        if call.arguments is not None:
+            preview = ", ".join(
+                f"{key}={value!r}" for key, value in call.arguments.items()
+            )
+        canonical.append(
+            (
+                index,
+                item_started(
+                    turn_id=result.turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.TOOL,
+                    data={
+                        "tool_name": call.tool_name,
+                        "tool_call_id": call.tool_call_id,
+                        "input_preview": preview,
+                    },
+                ),
+            )
+        )
+        canonical.append(
+            (
+                index,
+                item_completed(
+                    turn_id=result.turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.TOOL,
+                    status=(ItemStatus.FAILED if call.is_error else ItemStatus.SUCCESS),
+                    data={"result": {"tool_name": call.tool_name}},
+                    error=call.error_message if call.is_error else None,
+                ),
+            )
+        )
+    canonical.append((None, turn_completed(result.turn_id)))
+    return tuple(
+        _v2_event_line(
+            event,
+            index=index,
+            public_status=result.status,
+            answer=result.answer,
+        )
+        for index, event in canonical
+    )
+
+
+def _v2_event_line(
+    event: StreamEvent,
+    *,
+    index: int | None,
+    public_status: str,
+    answer: str | None,
+) -> str:
+    if event.type is EventType.TURN_COMPLETED:
+        line = f"[complete] status={public_status}"
+        return f"{line} answer={answer}" if answer is not None else line
+    if index is None:
+        raise RuntimeError("canonical tool event is missing its display index")
+    tool_name = str(event.data.get("tool_name", "tool"))
+    if event.type is EventType.ITEM_COMPLETED:
+        result = event.data.get("result")
+        if isinstance(result, dict):
+            tool_name = str(result.get("tool_name", tool_name))
+        outcome = "error" if event.status is ItemStatus.FAILED else "ok"
+        return f"[{_phase(tool_name, index)}] tool:{outcome} {tool_name}"
+    if event.type is not EventType.ITEM_STARTED:
+        raise RuntimeError(f"unexpected canonical smoke event: {event.type.value}")
+    preview = str(event.data.get("input_preview", ""))
+    subject = _event_subject(tool_name, preview)
+    suffix = f" {subject}" if subject else ""
+    return f"[{_phase(tool_name, index)}] tool:start {tool_name}{suffix}"
+
+
+def _event_subject(tool_name: str, preview: str) -> str:
+    key = "file_path" if tool_name == "apply_patch" else "path"
+    match = re.search(rf"(?:^|, ){re.escape(key)}='([^']*)'", preview)
+    return "" if match is None else match.group(1)
 
 
 async def run_matrix(
