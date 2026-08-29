@@ -10,9 +10,14 @@ from typing import Any
 
 from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
 from agent_runtime.streaming.events import (
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
     derive_model_public_item_id,
     derive_operation_public_item_id,
     derive_plan_public_item_id,
+    item_completed,
+    item_started,
 )
 
 
@@ -52,6 +57,7 @@ class RolloutEvent:
     event_type: str
     producer: str
     data: Mapping[str, Any]
+    event: StreamEvent | None = None
 
 
 class RolloutEventReader:
@@ -82,7 +88,14 @@ class RolloutEventReader:
             if record.record_type == "item_started":
                 self._validate_internal_item_kind(record)
             self._validate_public_item_ids(record)
-        return tuple(self._event(record) for record in records)
+        item_kinds = {
+            str(record.payload["item_id"]): str(record.payload["kind"])
+            for record in all_records
+            if record.record_type == "item_started"
+            and isinstance(record.payload.get("item_id"), str)
+            and isinstance(record.payload.get("kind"), str)
+        }
+        return tuple(self._event(record, item_kinds=item_kinds) for record in records)
 
     def read_global(
         self,
@@ -90,13 +103,44 @@ class RolloutEventReader:
         after_record_id: int = 0,
     ) -> tuple[RolloutEvent, ...]:
         return tuple(
-            self._event(record)
+            self._event(record, item_kinds={})
             for record in self._store.list_global_records(
                 after_record_id=after_record_id
             )
         )
 
-    def _event(self, record: RolloutRecord) -> RolloutEvent:
+    def _event(
+        self,
+        record: RolloutRecord,
+        *,
+        item_kinds: Mapping[str, str],
+    ) -> RolloutEvent:
+        event_type = record.record_type
+        public_event: StreamEvent | None = None
+        item_id = record.payload.get("item_id")
+        kind = item_kinds.get(str(item_id))
+        if record.producer == "migration" and kind in _SUPPRESSED_ITEM_KINDS:
+            event_type = "internal_suppressed"
+        elif record.producer == "migration" and kind == "agent_message":
+            if record.turn_id is None or not isinstance(item_id, str):
+                raise RuntimeError("migrated agent message is missing durable identity")
+            if record.record_type == "item_started":
+                public_event = item_started(
+                    turn_id=record.turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.LEGACY_MESSAGE,
+                )
+            elif record.record_type == "item_completed":
+                text = record.payload.get("payload", {}).get("text")
+                if not isinstance(text, str):
+                    raise RuntimeError("migrated agent message content is malformed")
+                public_event = item_completed(
+                    turn_id=record.turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.LEGACY_MESSAGE,
+                    status=ItemStatus.SUCCESS,
+                    data={"content": text},
+                )
         return RolloutEvent(
             cursor=self._encode(
                 thread_id=record.thread_id,
@@ -106,9 +150,10 @@ class RolloutEventReader:
             thread_id=record.thread_id,
             turn_id=record.turn_id,
             thread_sequence=record.thread_sequence,
-            event_type=record.record_type,
+            event_type=event_type,
             producer=record.producer,
             data=record.payload,
+            event=public_event,
         )
 
     @staticmethod

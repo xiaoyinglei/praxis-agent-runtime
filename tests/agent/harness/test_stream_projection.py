@@ -283,3 +283,40 @@ def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> No
         projected = RolloutEventReader(store).read(thread_id)
 
     assert _completed_answer_count(projected, "one answer") == 1
+
+
+def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            turn_id="legacy-turn",
+            turn_producer="migration",
+            user_message="legacy question",
+            binding_manifest={"model_alias": "legacy"},
+        )
+        store.complete_turn(
+            turn_id=turn.turn_id,
+            answer="legacy answer",
+            producer="migration",
+        )
+
+        projected = RolloutEventReader(store).read(thread.thread_id)
+
+    completed = [
+        replayed
+        for replayed in projected
+        if (
+            (
+                replayed.event is not None
+                and replayed.event.type.value == "item_completed"
+            )
+            if hasattr(replayed, "event")
+            else getattr(replayed, "event_type", None) == "item_completed"
+        )
+    ]
+    assert len(completed) == 1
+    assert completed[0].event.item_kind.value == "legacy_message"
+    assert completed[0].event.data == {"content": "legacy answer"}
