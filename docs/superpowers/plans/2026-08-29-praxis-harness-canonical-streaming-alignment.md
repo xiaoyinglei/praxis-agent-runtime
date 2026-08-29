@@ -126,6 +126,7 @@ Run:
 uv run pytest -q tests/agent/harness/test_architecture_contract.py tests/agent/harness/test_public_agent_cutover.py
 uv run lint-imports
 uv run pytest --collect-only -q tests/agent/test_canonical_streaming_protocol.py tests/agent/test_update_plan_surfaces.py
+uv run pytest -q tests/provider/test_llm_gateway.py tests/agent/test_single_tool_executor.py tests/agent/test_builtin_coding_tools.py tests/agent/test_canonical_streaming_protocol.py -k 'sync_provider_bridge or streaming_runner or run_command or legacy_projection'
 ```
 
 Expected: public path reaches Harness only; deleted runtime imports remain forbidden. Streaming tests may still fail until later tasks.
@@ -322,6 +323,11 @@ with expected differing event types/order/IDs. GREEN: route CLI,
 `Agent.arun(event_sink=...)`, and `Agent.astream()` through the same Session
 dispatcher and projection.
 
+Then run a separate RED/GREEN/commit sub-microcycle for
+`tests/agent/harness/test_public_agent_cutover.py::test_public_runtime_emits_v2_only_without_implicit_legacy_duplicates`;
+the expected RED is at least one v1 wire event from the WIP runtime, and GREEN
+removes only implicit legacy emission.
+
 - [ ] **Task 3 regression**
 
 ```bash
@@ -356,18 +362,20 @@ Expected missing callback/delta events. GREEN: pass `ProviderDeltaSink` through
 Harness prepare/dispatch and `modeling/gateway.py`; allocate and persist channel
 IDs before dispatch, await each callback, and accumulate content without slicing.
 
-- [ ] **Microcycle 4.2: Bounded synchronous provider bridge**
+- [ ] **Microcycle 4.2: Harness integration with the retained synchronous bridge**
 
-RED nodes, separately:
+Main's bounded standard-library queue, timed puts, stop flag, daemon producer,
+and no-join cancellation are merge-time green regression coverage, not RED.
+Add independent Harness-integration RED/GREEN/commit nodes:
 
 ```text
-tests/provider/test_llm_gateway.py::test_sync_provider_bridge_backpressures_with_bounded_standard_queue
-tests/provider/test_llm_gateway.py::test_cancelled_sync_bridge_sets_stop_flag_and_never_joins_blocked_daemon
+tests/agent/harness/test_model_adapter.py::test_harness_backpressure_reaches_sync_provider_bridge
+tests/agent/harness/test_session.py::test_harness_cancel_of_blocked_sync_provider_closes_item_without_join
 ```
 
-Expected unbounded production or event-loop hang. GREEN: use a bounded
-`queue.Queue`, timed producer puts that poll a stop flag, a daemon producer
-thread, and no cancellation join.
+Expected failures are that the WIP Harness never supplies the awaited delta sink
+or durable cancellation path. GREEN wires the existing gateway bridge through
+the Session dispatcher without changing its already-green unit contract.
 
 - [ ] **Microcycle 4.3: Zero-delta and non-streaming honesty**
 
@@ -445,21 +453,23 @@ RED node:
 with expected premature start. GREEN: allocate the attempt ID early but publish
 start only after permission, approval, and durable claim.
 
-- [ ] **Microcycle 5.2: Awaited tool progress**
+- [ ] **Microcycle 5.2: Harness propagation of retained tool progress**
 
-RED node:
-`tests/agent/test_single_tool_executor.py::test_streaming_runner_progress_is_awaited_during_execution`
-with expected no progress or runner finishing before sink release. GREEN: port
-main's optional `ToolProgressSink` through the existing Harness executor and
-orchestrator without bypassing ACI checks.
+Main's awaited `ToolProgressSink` executor unit test is merge-time green
+coverage. RED node:
+`tests/agent/harness/test_tool_orchestrator.py::test_harness_tool_progress_backpressures_runner_through_dispatcher`
+with expected no public delta or runner finishing before Session capacity is
+released. GREEN: pass the existing sink through the Harness orchestrator after
+ACI checks and durable claim.
 
 - [ ] **Microcycle 5.3: One command Item with live pipes**
 
-RED nodes, separately:
+Main's raw shell stdout/stderr streaming and bound tests remain merge-time green.
+Run independent Harness-integration sub-microcycles:
 
 ```text
-tests/agent/test_builtin_coding_tools.py::test_run_command_streams_stdout_before_exit_and_keeps_stderr_distinct
-tests/agent/test_builtin_coding_tools.py::test_run_command_live_and_final_output_are_independently_bounded
+tests/agent/harness/test_tool_orchestrator.py::test_harness_command_item_receives_stdout_before_completion_and_distinct_stderr
+tests/agent/harness/test_tool_orchestrator.py::test_harness_command_item_preserves_live_and_final_output_bounds
 tests/agent/harness/test_stream_projection.py::test_command_execution_does_not_duplicate_command_outcome
 ```
 
@@ -661,12 +671,12 @@ test_legacy_migration.py::test_union_migration_rerun_is_idempotent
 GREEN: use explicit transaction/backup boundaries and compare the manifest's
 record-chain/projection hashes after reopen.
 
-- [ ] **Microcycle 7.5: Explicit legacy wire adapter**
+- [ ] **Task 7.5: Legacy adapter regression**
 
-RED node:
-`tests/agent/test_canonical_streaming_protocol.py::test_runtime_emits_only_v2_and_legacy_sink_is_opt_in`
-with expected duplicate v1 events or missing adapter. GREEN: retain enum imports
-but project v1 only through `LegacyStreamProjectionSink`.
+`LegacyStreamProjectionSink` is retained and characterized during Task 1; do
+not invent a RED for it here. Rerun
+`tests/agent/test_canonical_streaming_protocol.py::test_legacy_projection_emits_only_legacy_wire_events`.
+Runtime v2-only behavior is proven by Task 3's public entry-point parity cycle.
 
 - [ ] **Microcycle 7.6: Public imports and signatures**
 
