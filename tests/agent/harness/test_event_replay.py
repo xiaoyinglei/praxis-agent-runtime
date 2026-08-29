@@ -94,6 +94,16 @@ def test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch(
             reader.read(first_thread, after=wrong_store)
 
 
+def test_malformed_cursor_returns_actionable_full_resync_error(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, _turn_id = _start_turn(store, workspace, "malformed cursor")
+
+        with pytest.raises(ValueError, match="full resync"):
+            _reader(store).read(thread_id, after="not-a-valid-cursor")
+
+
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(
     tmp_path: Path,
 ) -> None:

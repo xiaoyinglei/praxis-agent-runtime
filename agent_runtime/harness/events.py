@@ -551,28 +551,28 @@ class RolloutEventReader:
 
     def _decode(self, cursor: str, *, thread_id: str) -> int:
         if not isinstance(cursor, str) or not cursor:
-            raise ValueError("event cursor must be non-empty")
+            raise _full_resync_error("event cursor must be non-empty")
         try:
             padding = "=" * (-len(cursor) % 4)
             payload = json.loads(
                 base64.urlsafe_b64decode(cursor + padding).decode()
             )
         except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
-            raise ValueError("event cursor is malformed") from exc
+            raise _full_resync_error("event cursor is malformed") from exc
         if not isinstance(payload, dict) or payload.get("version") != _CURSOR_VERSION:
-            raise ValueError("event cursor version is unsupported")
+            raise _full_resync_error("event cursor version is unsupported")
         if payload.get("schema_epoch") != _SCHEMA_EPOCH:
-            raise ValueError("event cursor schema epoch mismatch")
+            raise _full_resync_error("event cursor schema epoch mismatch")
         if payload.get("store_epoch") != self._store.epoch:
-            raise ValueError("event cursor belongs to a different store epoch")
+            raise _full_resync_error("event cursor belongs to a different store epoch")
         if payload.get("thread_id") != thread_id:
-            raise ValueError("event cursor belongs to a different thread")
+            raise _full_resync_error("event cursor belongs to a different thread")
         sequence = payload.get("thread_sequence")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
-            raise ValueError("event cursor sequence is invalid")
+            raise _full_resync_error("event cursor sequence is invalid")
         latest = self._store.list_records(thread_id)
         if latest and sequence > latest[-1].thread_sequence:
-            raise ValueError("event cursor is ahead of the Thread tail")
+            raise _full_resync_error("event cursor is ahead of the Thread tail")
         return sequence
 
 
@@ -598,6 +598,10 @@ def _accepted_answer_item_ids(records: tuple[RolloutRecord, ...]) -> frozenset[s
         and starts[item_id] == ("agent_message", "runtime")
         and record.payload.get("payload", {}).get("text") in model_texts
     )
+
+
+def _full_resync_error(reason: str) -> ValueError:
+    return ValueError(f"{reason}; discard the cursor and perform a full resync")
 
 
 def _tool_completion_status(
