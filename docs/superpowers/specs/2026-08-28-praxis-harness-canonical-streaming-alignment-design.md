@@ -49,8 +49,12 @@ Agent public API
 - CLI and SDK consume the same public protocol and do not infer lifecycle.
 
 The merge must not reintroduce `AgentService -> AgentLoop -> TurnStore` as a
-parallel path. Main's canonical protocol behavior is retained, while its old
-runtime-specific persistence wiring is adapted to `RolloutStore`.
+parallel path. Main's canonical envelope, Item lifecycle, durability-before-
+delivery, backpressure, and ordinary cancellation behavior are retained, while
+its old runtime-specific persistence wiring is adapted to `RolloutStore`.
+Unknown-outcome cancellation is one approved behavioral refinement: the Harness
+must keep the original Turn resumable for reconciliation rather than falsely
+claiming a terminal abort.
 
 ## Public protocol
 
@@ -91,7 +95,7 @@ Turn records project as follows:
 | `turn_failed` | `TURN_COMPLETED` with failed status |
 | `turn_cancelled` | `TURN_ABORTED` with cancelled reason |
 | `turn_abandoned` | `TURN_ABORTED` with abandoned reason |
-| `turn_interrupted` | nonterminal `TURN_PAUSED` with `data.status=interrupted` and `data.reason=outcome_unknown` |
+| `turn_interrupted` | nonterminal `TURN_PAUSED` with `data.status=paused` and `data.reason=outcome_unknown` |
 
 Internal Item/operation facts project as follows:
 
@@ -258,9 +262,11 @@ On stream close or task cancellation:
 6. after reconciliation, resume the same Turn with `TURN_RESUMED`, or explicitly
    abandon/cancel it and then project terminal `TURN_ABORTED`.
 
-`turn_interrupted` is represented by the existing nonterminal
-`TURN_PAUSED` wire event rather than being misprojected as `TURN_ABORTED` or a
-new Turn. No replay sequence may contain an Item after the final Turn event. Provider I/O
+`turn_interrupted` remains the durable Harness status but is represented by the
+existing nonterminal `TURN_PAUSED(status=paused, reason=outcome_unknown)` wire
+event rather than being misprojected as `TURN_ABORTED` or a new Turn. Approval
+pause uses the same wire type with a distinct reason. No replay sequence may
+contain an Item after the final Turn event. Provider I/O
 that cannot be interrupted may outlive the Turn only in an isolated daemon
 producer; it cannot block event-loop or Session shutdown.
 
@@ -354,7 +360,11 @@ Tests must prove the real public path, not only isolated dataclasses:
     rollback, and idempotent rerun;
 14. crash tests cover commit-before-publish, post-commit/pre-delivery restart,
     orphaned Item start recovery, independent subscribers, all cursor failures,
-    and public import/signature compatibility.
+    and public import/signature compatibility;
+15. compatibility tests distinguish ordinary approval
+    `TURN_PAUSED(status=paused)` from interruption
+    `TURN_PAUSED(status=paused, reason=outcome_unknown)` and verify only the
+    latter retains reconciliation claims.
 
 ## Intentional non-goals
 
