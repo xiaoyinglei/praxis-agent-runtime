@@ -119,7 +119,51 @@ class RolloutEventReader:
         public_event: StreamEvent | None = None
         item_id = record.payload.get("item_id")
         kind = item_kinds.get(str(item_id))
-        if record.producer == "migration" and kind in _SUPPRESSED_ITEM_KINDS:
+        if record.record_type == "tool_operation_claimed":
+            operation_id = record.payload.get("operation_id")
+            public_item_id = record.payload.get("public_item_id")
+            if (
+                record.turn_id is None
+                or not isinstance(operation_id, str)
+                or not isinstance(public_item_id, str)
+            ):
+                raise RuntimeError("claimed tool operation is missing public identity")
+            operation = self._store.read_tool_operation(operation_id)
+            public_event = item_started(
+                turn_id=record.turn_id,
+                item_id=public_item_id,
+                item_kind=(
+                    TurnItemKind.COMMAND
+                    if operation.tool_name == "run_command"
+                    else TurnItemKind.TOOL
+                ),
+                data={
+                    "operation_id": operation_id,
+                    "tool_call_id": operation.tool_call_id,
+                    "tool_name": operation.tool_name,
+                },
+            )
+        elif kind == "tool_result" and record.record_type == "item_completed":
+            operation_id = record.payload.get("operation_id")
+            public_item_id = record.payload.get("public_item_id")
+            if isinstance(operation_id, str) and isinstance(public_item_id, str):
+                if record.turn_id is None:
+                    raise RuntimeError("tool result is missing turn identity")
+                operation = self._store.read_tool_operation(operation_id)
+                status, error = _tool_completion_status(operation.status, operation.error_code)
+                public_event = item_completed(
+                    turn_id=record.turn_id,
+                    item_id=public_item_id,
+                    item_kind=(
+                        TurnItemKind.COMMAND
+                        if operation.tool_name == "run_command"
+                        else TurnItemKind.TOOL
+                    ),
+                    status=status,
+                    data={"result": record.payload.get("payload", {})},
+                    error=error,
+                )
+        elif record.producer == "migration" and kind in _SUPPRESSED_ITEM_KINDS:
             event_type = "internal_suppressed"
         elif record.producer == "migration" and kind == "agent_message":
             if record.turn_id is None or not isinstance(item_id, str):
@@ -300,3 +344,16 @@ def _accepted_answer_item_ids(records: tuple[RolloutRecord, ...]) -> frozenset[s
         and starts[item_id] == ("agent_message", "runtime")
         and record.payload.get("payload", {}).get("text") in model_texts
     )
+
+
+def _tool_completion_status(
+    status: str,
+    error_code: str | None,
+) -> tuple[ItemStatus, str | None]:
+    if status == "succeeded":
+        return ItemStatus.SUCCESS, None
+    if status == "cancelled":
+        return ItemStatus.CANCELLED, None
+    if status == "unknown":
+        return ItemStatus.OUTCOME_UNKNOWN, error_code or "tool outcome is unknown"
+    return ItemStatus.FAILED, error_code or "tool execution failed"

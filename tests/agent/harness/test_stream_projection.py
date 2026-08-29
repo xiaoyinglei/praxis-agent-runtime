@@ -320,3 +320,104 @@ def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> 
     assert len(completed) == 1
     assert completed[0].event.item_kind.value == "legacy_message"
     assert completed[0].event.data == {"content": "legacy answer"}
+
+
+def test_command_execution_does_not_create_a_second_command_outcome(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+        store.record_tool_call(
+            turn_id=turn_id,
+            tool_call_id="call-command",
+            tool_name="run_command",
+            arguments={"command": ["pwd"]},
+            origin={"request_id": "request-command"},
+        )
+        values = {
+            "turn_id": turn_id,
+            "operation_id": "operation-command",
+            "tool_call_id": "call-command",
+            "tool_name": "run_command",
+            "arguments_digest": "command-arguments",
+            "execution_revision": "builtin-run-command-v2-restricted-sandbox",
+            "idempotent": False,
+            "attempt_count": 0,
+            "error_code": None,
+            "requires_reconciliation": False,
+        }
+        store.record_tool_execution_state(status="prepared", **values)
+        store.record_tool_execution_state(status="ready", **values)
+        claim = store.claim_tool_operation(
+            operation_id="operation-command",
+            worker_id="command-worker",
+            lease_seconds=30.0,
+        )
+        assert store.commit_tool_operation_outcome(
+            operation_id="operation-command",
+            claim_generation=claim.claim_generation,
+            fencing_token=str(claim.fencing_token),
+            status="succeeded",
+            attempt_count=1,
+            error_code=None,
+            requires_reconciliation=False,
+        )
+        result = {
+            "tool_call_id": "call-command",
+            "tool_name": "run_command",
+            "structured_content": {"exit_code": 0, "stdout": "workspace\n"},
+            "is_error": False,
+            "content": [],
+            "attachments": [],
+        }
+        store.record_tool_result(
+            turn_id=turn_id,
+            operation_id="operation-command",
+            result=result,
+        )
+        duplicate_id = "legacy-command-activity"
+        with store._transaction():
+            store._append_and_reduce(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                record_type="item_started",
+                producer="tool",
+                payload={"item_id": duplicate_id, "kind": "command_execution"},
+            )
+            store._append_and_reduce(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                record_type="item_completed",
+                producer="tool",
+                payload={"item_id": duplicate_id, "payload": result},
+            )
+
+        projected = RolloutEventReader(store).read(thread_id)
+
+    if any(getattr(replayed, "event", None) is not None for replayed in projected):
+        outcomes = [
+            replayed.event
+            for replayed in projected
+            if replayed.event is not None
+            and replayed.event.type.value == "item_completed"
+            and replayed.event.item_kind is not None
+            and replayed.event.item_kind.value == "command"
+        ]
+    else:
+        starts = {
+            replayed.data["item_id"]: replayed.data["kind"]
+            for replayed in projected
+            if replayed.event_type == "item_started"
+        }
+        outcomes = [
+            replayed
+            for replayed in projected
+            if replayed.event_type == "item_completed"
+            and starts.get(replayed.data.get("item_id"))
+            in {"tool_result", "command_execution"}
+            and replayed.data.get("payload", {}).get("tool_call_id")
+            == "call-command"
+        ]
+    assert len(outcomes) == 1
