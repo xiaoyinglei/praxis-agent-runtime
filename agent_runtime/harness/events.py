@@ -26,7 +26,6 @@ from agent_runtime.streaming.events import (
     turn_started,
 )
 
-
 _PUBLIC_ITEM_KINDS = frozenset(
     {
         "agent_message",
@@ -480,13 +479,13 @@ class RolloutEventReader:
                 return
             if not isinstance(persisted, Mapping):
                 raise RuntimeError("persisted public Item ID mapping is missing")
-            for channel in ("agent_message", "reasoning", "plan"):
+            for persisted_channel in ("agent_message", "reasoning", "plan"):
                 cls._require_public_item_id(
-                    persisted.get(channel),
+                    persisted.get(persisted_channel),
                     derive_model_public_item_id(
                         turn_id=record.turn_id,
                         model_attempt_id=attempt_id,
-                        channel=channel,
+                        channel=persisted_channel,
                     ),
                 )
         attempt_id = payload.get("attempt_id")
