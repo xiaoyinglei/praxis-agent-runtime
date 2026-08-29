@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,24 @@ def test_replay_returns_event_and_separate_thread_cursor(tmp_path: Path) -> None
     assert all(isinstance(result.event, StreamEvent) for result in replayed)
     assert all(not hasattr(result.event, "cursor") for result in replayed)
     assert all(result.cursor for result in replayed)
+
+
+def test_thread_cursor_rejects_schema_epoch_mismatch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, _turn_id = _start_turn(store, workspace, "schema cursor")
+        reader = _reader(store)
+        cursor = reader.read(thread_id)[-1].cursor
+        padding = "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
+        payload["schema_epoch"] = "future-schema"
+        mismatched = base64.urlsafe_b64encode(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+
+        with pytest.raises(ValueError, match="schema epoch"):
+            reader.read(thread_id, after=mismatched)
 
 
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(

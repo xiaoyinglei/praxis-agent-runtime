@@ -81,6 +81,8 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
         "approval_invalidated",
     }
 )
+_CURSOR_VERSION = 1
+_SCHEMA_EPOCH = "harness-canonical-stream-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -536,8 +538,9 @@ class RolloutEventReader:
     def _encode(self, *, thread_id: str, sequence: int) -> str:
         encoded = json.dumps(
             {
-                "version": 1,
-                "epoch": self._store.epoch,
+                "version": _CURSOR_VERSION,
+                "store_epoch": self._store.epoch,
+                "schema_epoch": _SCHEMA_EPOCH,
                 "thread_id": thread_id,
                 "thread_sequence": sequence,
             },
@@ -556,9 +559,11 @@ class RolloutEventReader:
             )
         except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
             raise ValueError("event cursor is malformed") from exc
-        if not isinstance(payload, dict) or payload.get("version") != 1:
+        if not isinstance(payload, dict) or payload.get("version") != _CURSOR_VERSION:
             raise ValueError("event cursor version is unsupported")
-        if payload.get("epoch") != self._store.epoch:
+        if payload.get("schema_epoch") != _SCHEMA_EPOCH:
+            raise ValueError("event cursor schema epoch mismatch")
+        if payload.get("store_epoch") != self._store.epoch:
             raise ValueError("event cursor belongs to a different store epoch")
         if payload.get("thread_id") != thread_id:
             raise ValueError("event cursor belongs to a different thread")
