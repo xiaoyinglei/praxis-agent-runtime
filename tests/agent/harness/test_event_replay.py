@@ -104,6 +104,21 @@ def test_malformed_cursor_returns_actionable_full_resync_error(tmp_path: Path) -
             _reader(store).read(thread_id, after="not-a-valid-cursor")
 
 
+def test_global_tailer_accepts_only_after_record_id(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        first_thread, _ = _start_turn(store, workspace, "first global record")
+        after_record_id = store.list_records(first_thread)[-1].record_id
+        second_thread, _ = _start_turn(store, workspace, "second global record")
+        reader = _reader(store)
+
+        tail = reader.read_global(after_record_id=after_record_id)
+        assert {result.thread_id for result in tail} == {second_thread}
+        with pytest.raises(TypeError):
+            reader.read_global(after=tail[-1].cursor)
+
+
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(
     tmp_path: Path,
 ) -> None:
