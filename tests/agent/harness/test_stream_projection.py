@@ -449,3 +449,29 @@ def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
         [replayed] = RolloutEventReader(store).read(thread_id)
 
     assert replayed.event.timestamp_ms == getattr(committed, "committed_at_ms", -1)
+
+
+def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+
+        with pytest.raises(ValueError, match="unsupported record type"):
+            with store._transaction():
+                store._append_and_reduce(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    record_type="item_delta",
+                    producer="model",
+                    payload={
+                        "item_id": "transient-item",
+                        "delta_kind": "text",
+                        "delta": "never durable",
+                    },
+                )
+
+        assert all(
+            record.record_type != "item_delta"
+            for record in store.list_records(thread_id)
+        )
