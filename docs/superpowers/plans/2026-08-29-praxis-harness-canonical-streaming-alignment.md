@@ -19,7 +19,14 @@ Tasks 2–7 are executed as the microcycles listed in each task. For each row:
    (collection/import errors do not count as RED);
 3. implement only enough production behavior to pass that node;
 4. rerun the node and the named focused regression file;
-5. commit that microcycle before moving to the next row.
+5. stage only the test and production files used by that node and commit that
+   microcycle before moving to the next node.
+
+A list of nodes inside one numbered microcycle is an ordered list of independent
+sub-microcycles, not a batch: complete RED -> GREEN -> focused regression ->
+commit for the first node before writing the second node. Task-level regression
+steps run after those commits and must leave the worktree clean; they do not
+create an extra empty task commit.
 
 If a named node unexpectedly passes before implementation, strengthen the test
 to exercise the missing public path; do not change production code until a
@@ -51,8 +58,9 @@ valid RED is observed.
   `tests/agent/test_agent_runtime_facade.py`,
   `tests/agent/test_agent_service_loop_boundary.py`,
   `tests/agent/test_llm_providers.py`,
-  `tests/agent/test_public_turn_api.py`,
-  `tests/agent/test_turn_store.py`, and
+  `tests/agent/test_public_turn_api.py`, and
+  `tests/agent/test_turn_store.py`
+- Retain and rewrite against Harness fixtures:
   `tests/agent/test_update_plan_surfaces.py`
 
 - [ ] **Step 1: Record the integration boundary**
@@ -99,8 +107,9 @@ Resolve every merge-tree conflict explicitly:
   `service.py`, `turns.py`, and the seven old-runtime test files listed above;
 - keep main's v2 `streaming/events.py`, gateway delta ACI, Tool progress ACI,
   and shell command streaming behavior;
-- rewrite `streaming/sink.py` against the Harness dispatcher, without importing
-  `TurnStore`;
+- retain only main's `StreamEventSink` and `LegacyStreamProjectionSink` portions
+  of `streaming/sink.py`, without importing `TurnStore`; the new bounded
+  dispatcher is deliberately deferred to Task 3's RED/GREEN cycles;
 - combine Harness ACI/fencing behavior with main progress callbacks in
   `tools/executor.py` and its focused test;
 - retain Harness public wiring while porting v2 rendering in `cli.py` and
@@ -126,10 +135,11 @@ Expected: public path reaches Harness only; deleted runtime imports remain forbi
 Run and require success:
 
 ```bash
+git merge-base --is-ancestor 58e41c28 HEAD
+git add agent_runtime/cli.py agent_runtime/streaming/events.py agent_runtime/streaming/sink.py agent_runtime/tools/builtins/shell.py agent_runtime/tools/executor.py scripts/agent_delivery_smoke.py tests/agent/test_canonical_streaming_protocol.py tests/agent/test_cli_wiring.py tests/agent/test_single_tool_executor.py tests/agent/test_update_plan_surfaces.py tests/provider/test_llm_gateway.py
+git rm agent_runtime/core/llm_providers.py agent_runtime/loop/runtime.py agent_runtime/service.py agent_runtime/turns.py tests/agent/test_agent_loop_runtime.py tests/agent/test_agent_runtime_facade.py tests/agent/test_agent_service_loop_boundary.py tests/agent/test_llm_providers.py tests/agent/test_public_turn_api.py tests/agent/test_turn_store.py
 test -z "$(git diff --name-only --diff-filter=U)"
 git diff --cached --check
-git merge-base --is-ancestor 58e41c28 HEAD
-git add agent_runtime scripts tests docs
 git commit
 git merge-base --is-ancestor "$(cat /tmp/praxis-canonical-main-tip)" HEAD
 ```
@@ -142,10 +152,6 @@ message; it must not squash or amend `58e41c28`.
 **Files:**
 - Modify: `agent_runtime/streaming/events.py`
 - Modify: `agent_runtime/streaming/sink.py`
-- Create: `tests/agent/fixtures/build_legacy_rollout_fixtures.py`
-- Create: `tests/agent/fixtures/legacy/pre_v2_harness.sqlite3`
-- Create: `tests/agent/fixtures/legacy/legacy_turnstore_checkpoint.sqlite3`
-- Create: `tests/agent/fixtures/legacy/manifest.json`
 - Modify: `agent_runtime/harness/events.py`
 - Modify: `agent_runtime/harness/rollout.py`
 - Modify: `agent_runtime/harness/reducer.py`
@@ -195,6 +201,7 @@ RED nodes, executed separately:
 test_event_replay.py::test_replay_returns_event_and_separate_thread_cursor
 test_event_replay.py::test_thread_cursor_rejects_schema_epoch_mismatch
 test_event_replay.py::test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch
+test_event_replay.py::test_malformed_cursor_returns_actionable_full_resync_error
 test_event_replay.py::test_global_tailer_accepts_only_after_record_id
 ```
 
@@ -214,14 +221,13 @@ test_stream_projection.py::test_transient_deltas_never_enter_rollout_records
 Expected failures show monotonic timestamps or durable delta rows. GREEN: add a
 committed Unix-millisecond timestamp to `RolloutRecord`; do not append deltas.
 
-- [ ] **Task 2 regression and commit**
+- [ ] **Task 2 regression**
 
 Run:
 
 ```bash
 uv run pytest -q tests/agent/test_canonical_streaming_protocol.py tests/agent/harness/test_stream_projection.py tests/agent/harness/test_event_replay.py tests/agent/harness/test_rollout_store.py
-git add agent_runtime/streaming agent_runtime/harness tests/agent/test_canonical_streaming_protocol.py tests/agent/harness
-git commit -m "feat(agent): project canonical stream events from rollout history"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 3: Bounded Session event dispatcher and public API wiring
@@ -261,10 +267,16 @@ sentinel.
 
 - [ ] **Microcycle 3.3: Passive observer isolation**
 
-RED node:
-`tests/agent/harness/test_event_replay.py::test_lagging_passive_observer_detaches_without_blocking_control`
-with expected controlling producer timeout. GREEN: close only that observer with
-`ObserverLagged(last_cursor)` and preserve independent cursor state.
+Independent sub-microcycles:
+
+```text
+tests/agent/harness/test_event_replay.py::test_lagging_passive_observer_detaches_without_blocking_control
+tests/agent/harness/test_event_replay.py::test_lagging_observer_does_not_change_another_observers_cursor
+```
+
+Expected controlling producer timeout or mutated peer cursor. GREEN: close only
+the lagging observer with `ObserverLagged(last_cursor)` and preserve every other
+subscriber's independent cursor state.
 
 - [ ] **Microcycle 3.4: Sink failure and bounded shutdown**
 
@@ -273,29 +285,48 @@ RED nodes, separately:
 ```text
 test_canonical_streaming_protocol.py::test_raising_sink_cannot_rollback_committed_event
 test_canonical_streaming_protocol.py::test_never_returning_sink_is_cancelled_within_grace
+test_canonical_streaming_protocol.py::test_delta_sink_failure_cancels_producer_and_durably_closes_item
 ```
 
-Expected rollback or timeout. GREEN: committed facts stay upstream of delivery;
-cancel a stuck controlling sink after the configured grace period.
+Expected rollback, timeout, or open Item. GREEN: committed facts stay upstream
+of delivery; cancel a stuck controlling sink after the configured grace period
+and route delta-sink failure through the producer cancellation/durable closure
+path.
 
 - [ ] **Microcycle 3.5: Replace the synchronous listener bridge**
 
 RED node:
 `tests/agent/harness/test_public_agent_cutover.py::test_public_stream_awaits_post_commit_batch_without_record_listener_queue`
 with expected `_record_listener`/`put_nowait` path observed. GREEN: each outer
-`RolloutStore` transaction appends committed records to a synchronous internal
-post-commit batch. `Session`, `ThreadManager`, and `ToolOrchestrator` explicitly
-call `store.drain_committed_records()` after a mutation and `await
-dispatcher.publish_committed_batch(...)`. `RuntimeComposition` owns the
-dispatcher for the Session lifetime. Remove production `_record_listener` and
-all unbounded Agent queues; no database callback awaits or touches an event loop.
+`RolloutStore` transaction returns an immutable
+`CommittedMutation[T](value, records)` containing only that transaction's
+records. The active `Session` owns its dispatcher and awaits
+`publish_committed_batch(mutation.records)` after receiving the return value;
+`ThreadManager` routes mutations to the Session for that Thread, and
+`ToolOrchestrator` returns its transaction-local batch to that same Session.
+Remove production `_record_listener`, shared drain buffers, and all unbounded
+Agent queues; no database callback awaits or touches an event loop.
 
-- [ ] **Task 3 regression and commit**
+- [ ] **Microcycle 3.6: Interleaved Session ownership**
+
+RED node:
+`tests/agent/harness/test_public_agent_cutover.py::test_interleaved_threads_publish_only_their_transaction_batches`
+with expected cross-Thread event delivery. GREEN: keep dispatchers Session-owned
+and transaction batches immutable/thread-scoped, including subagent Sessions.
+
+- [ ] **Microcycle 3.7: Public entry-point parity**
+
+RED node:
+`tests/agent/harness/test_public_agent_cutover.py::test_cli_arun_sink_and_astream_share_identical_v2_lifecycle`
+with expected differing event types/order/IDs. GREEN: route CLI,
+`Agent.arun(event_sink=...)`, and `Agent.astream()` through the same Session
+dispatcher and projection.
+
+- [ ] **Task 3 regression**
 
 ```bash
 uv run pytest -q tests/agent/test_canonical_streaming_protocol.py tests/agent/harness/test_public_agent_cutover.py tests/agent/harness/test_event_replay.py tests/agent/test_cli_wiring.py
-git add agent_runtime/streaming agent_runtime/harness agent_runtime/agent.py agent_runtime/cli.py tests/agent
-git commit -m "feat(agent): add bounded harness event dispatcher"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 4: Native model text, reasoning, and plan Item lifecycles
@@ -385,12 +416,11 @@ RED node:
 with expected missing plan completion. GREEN: derive ID from Turn and revision,
 persist the complete PlanState, and reject a mismatched persisted ID.
 
-- [ ] **Task 4 regression and commit**
+- [ ] **Task 4 regression**
 
 ```bash
 uv run pytest -q tests/agent/test_canonical_streaming_protocol.py tests/agent/harness/test_model_adapter.py tests/agent/harness/test_session.py tests/agent/harness/test_event_replay.py tests/agent/test_update_plan_surfaces.py tests/provider/test_llm_gateway.py
-git add agent_runtime/harness agent_runtime/modeling agent_runtime/tools/builtins tests/agent tests/provider
-git commit -m "feat(agent): stream canonical model and plan items"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 5: Tool progress, command output, and reconciliation Items
@@ -470,12 +500,11 @@ RED node:
 with expected surviving child or duplicate/missing completion. GREEN: terminate
 and reap the entire group, then classify confirmed cancellation.
 
-- [ ] **Task 5 regression and commit**
+- [ ] **Task 5 regression**
 
 ```bash
 uv run pytest -q tests/agent/test_single_tool_executor.py tests/agent/test_builtin_coding_tools.py tests/agent/harness/test_tool_orchestrator.py tests/agent/harness/test_tool_claim_fencing.py tests/agent/harness/test_turn_recovery.py tests/agent/harness/test_stream_projection.py tests/agent/test_canonical_streaming_protocol.py
-git add agent_runtime/tools agent_runtime/harness tests/agent
-git commit -m "feat(agent): stream canonical tool and command items"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 6: Turn cancellation, orphan recovery, and replay ordering
@@ -516,6 +545,11 @@ RED node:
 with expected `TURN_ABORTED`, wrong paused status/reason, or released claim.
 GREEN: keep durable Turn status `interrupted`, project
 `TURN_PAUSED(status=paused, reason=outcome_unknown)`, and prohibit redispatch.
+
+Then run a separate RED/GREEN/commit sub-microcycle for
+`tests/agent/harness/test_turn_recovery.py::test_approval_pause_has_no_reconciliation_claim_but_interruption_retains_one`;
+the initial failure must show the two pause reasons sharing the wrong claim
+state, and GREEN must change only the reason-specific ownership transition.
 
 - [ ] **Microcycle 6.4: Same-Turn reconciliation/resume**
 
@@ -560,12 +594,11 @@ RED node:
 with expected lost event or different payload after reopen. GREEN: notify only
 after commit and reconstruct from Rollout order.
 
-- [ ] **Task 6 regression and commit**
+- [ ] **Task 6 regression**
 
 ```bash
 uv run pytest -q tests/agent/harness/test_turn_recovery.py tests/agent/harness/test_model_claim_recovery.py tests/agent/harness/test_committed_response_recovery.py tests/agent/harness/test_event_replay.py tests/agent/test_canonical_streaming_protocol.py
-git add agent_runtime/harness agent_runtime/agent.py tests/agent
-git commit -m "feat(agent): make stream cancellation and recovery durable"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 7: Legacy union migration and compatibility boundary
@@ -575,6 +608,10 @@ git commit -m "feat(agent): make stream cancellation and recovery durable"
 - Modify: `scripts/migrate_agent_rollout.py`
 - Modify: `scripts/verify_agent_rollout.py`
 - Modify: `agent_runtime/streaming/sink.py`
+- Create: `tests/agent/fixtures/build_legacy_rollout_fixtures.py`
+- Create: `tests/agent/fixtures/legacy/pre_v2_harness.sqlite3`
+- Create: `tests/agent/fixtures/legacy/legacy_turnstore_checkpoint.sqlite3`
+- Create: `tests/agent/fixtures/legacy/manifest.json`
 - Test: `tests/agent/harness/test_legacy_migration.py`
 - Test: `tests/agent/harness/test_architecture_contract.py`
 - Test: `tests/agent/test_public_exports.py`
@@ -631,6 +668,18 @@ RED node:
 with expected duplicate v1 events or missing adapter. GREEN: retain enum imports
 but project v1 only through `LegacyStreamProjectionSink`.
 
+- [ ] **Microcycle 7.6: Public imports and signatures**
+
+Independent RED/GREEN/commit nodes:
+
+```text
+tests/agent/test_public_exports.py::test_canonical_streaming_types_remain_public
+tests/agent/test_public_exports.py::test_agent_arun_event_sink_and_astream_signatures_are_compatible
+```
+
+Expected missing exports or changed parameter kinds/defaults. GREEN: restore
+only the documented public imports/signatures; do not expose Harness internals.
+
 - [ ] **Run exact migration and verification commands**
 
 ```bash
@@ -649,13 +698,12 @@ first migration is valid and matches manifest hashes; rerun lists all Turn IDs
 as skipped and preserves hashes; restore returns the copied database to the
 fixture SHA-256.
 
-- [ ] **Task 7 regression and commit**
+- [ ] **Task 7 regression**
 
 ```bash
 uv run pytest -q tests/agent/harness/test_legacy_migration.py tests/agent/harness/test_architecture_contract.py tests/agent/test_public_exports.py tests/repo/test_distribution_contract.py tests/agent/test_canonical_streaming_protocol.py
 uv run lint-imports
-git add agent_runtime/harness agent_runtime/streaming scripts tests/agent/fixtures tests/agent/harness tests/agent/test_public_exports.py tests/repo
-git commit -m "feat(agent): migrate legacy history into canonical rollout stream"
+test -z "$(git status --porcelain)"
 ```
 
 ### Task 8: Full repository verification and final alignment commit
@@ -711,6 +759,11 @@ If verification repairs remain, stage them by exact path and run:
 git diff --cached --check
 git commit -m "fix(agent): close canonical harness verification gaps"
 ```
+
+After any repair commit, rerun Steps 1–4 in full—focused tests, Ruff, mypy,
+import contracts, full pytest, build, both smokes, Harness acceptance, and
+benchmark validation. A repair commit is not considered verified by the command
+that motivated it.
 
 Then require:
 
