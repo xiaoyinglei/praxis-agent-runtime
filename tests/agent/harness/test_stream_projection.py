@@ -215,13 +215,14 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
                 "attachments": [],
             },
         )
-        result_completion = next(
+        plan_completion = next(
             record
             for record in store.list_records(thread_id)
             if record.record_type == "item_completed"
-            and record.payload.get("public_item_id") == operation_public_id
+            and isinstance(record.payload.get("payload"), dict)
+            and "plan" in record.payload["payload"]
         )
-        plan_public_id = result_completion.payload["plan_public_item_id"]
+        plan_public_id = plan_completion.payload["public_item_id"]
         assert plan_public_id
 
     with RolloutStore(database) as reopened:
@@ -232,10 +233,11 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             if record.record_type == "model_retry_prepared"
         ) == retry_ids
         assert next(
-            record.payload["plan_public_item_id"]
+            record.payload["public_item_id"]
             for record in persisted
             if record.record_type == "item_completed"
-            and record.payload.get("public_item_id") == operation_public_id
+            and isinstance(record.payload.get("payload"), dict)
+            and "plan" in record.payload["payload"]
         ) == plan_public_id
 
     with sqlite3.connect(database) as connection:

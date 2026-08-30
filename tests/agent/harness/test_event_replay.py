@@ -283,6 +283,76 @@ def test_thread_cursor_replays_the_same_committed_tail_after_restart(
         assert replayed[-1].event_type == "turn_completed"
 
 
+def test_reasoning_and_plan_completed_content_replays_after_reopen(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread_id, turn_id = _start_turn(store, workspace, "persist model channels")
+        operation = store.prepare_model_operation(
+            turn_id=turn_id,
+            request_hash="r" * 64,
+            context_hash="c" * 64,
+            tool_hash="t" * 64,
+            wire_hash="w" * 64,
+            request_ref={"request_id": f"{turn_id}:step:1"},
+        )
+        attempt = store.dispatch_model_attempt(operation.operation_id)
+        store.start_model_output_channel(
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            channel="reasoning",
+        )
+        store.start_model_output_channel(
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            channel="plan",
+        )
+        assert store.complete_model_attempt(
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            text="final answer",
+            provider_response_id="response-1",
+            usage={"input_tokens": 4, "output_tokens": 3},
+            reasoning_content="durable reasoning",
+            plan_content="durable plan",
+        )
+        expected = [
+            replay.event
+            for replay in _reader(store).read(thread_id)
+            if replay.event.type is events.EventType.ITEM_COMPLETED
+            and replay.event.item_kind
+            in {events.TurnItemKind.REASONING, events.TurnItemKind.PLAN}
+        ]
+
+    with RolloutStore(database) as reopened:
+        replayed = [
+            replay.event
+            for replay in _reader(reopened).read(thread_id)
+            if replay.event.type is events.EventType.ITEM_COMPLETED
+            and replay.event.item_kind
+            in {events.TurnItemKind.REASONING, events.TurnItemKind.PLAN}
+        ]
+
+        assert [
+            (event.item_id, event.item_kind, event.status, event.data)
+            for event in replayed
+        ] == [
+            (event.item_id, event.item_kind, event.status, event.data)
+            for event in expected
+        ]
+        assert {event.item_kind: event.data["content"] for event in replayed} == {
+            events.TurnItemKind.REASONING: "durable reasoning",
+            events.TurnItemKind.PLAN: "durable plan",
+        }
+        assert reopened.verify().valid is True
+
+
 def test_thread_cursors_are_independent_and_reject_the_wrong_thread(
     tmp_path: Path,
 ) -> None:

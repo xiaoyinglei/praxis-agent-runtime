@@ -141,17 +141,15 @@ async def test_harness_update_plan_projects_public_result_and_rollout_truth(
 
 
 @pytest.mark.anyio
-@pytest.mark.xfail(
-    strict=True,
-    reason="Task 4 persists the canonical plan revision Item",
-)
 async def test_harness_update_plan_emits_one_persisted_plan_revision_item(
     tmp_path: Path,
 ) -> None:
     result, items = await _run_plan_turn(tmp_path)
-    plan_items = [item for item in items if item.kind == "plan"]
+    plan_items = [item for item in items if item.kind == "plan_state"]
 
     assert result.plan is not None
     assert len(plan_items) == 1
-    assert plan_items[0].payload["plan"]["revision"] == result.plan.revision
+    assert plan_items[0].payload["plan"]["revision"] == 1
+    assert plan_items[0].payload["plan"]["objective"] == result.plan.objective
+    assert plan_items[0].payload["plan"]["status"] == "active"
     assert plan_items[0].payload["plan"]["summary"] == _PLAN_ARGUMENTS["explanation"]

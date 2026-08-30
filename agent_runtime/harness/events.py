@@ -411,20 +411,7 @@ class RolloutEventReader:
                     data={"result": record.payload.get("payload", {})},
                     error=error,
                 )
-                events = [completed]
-                plan_snapshot = record.payload.get("plan_snapshot")
-                plan_item_id = record.payload.get("plan_public_item_id")
-                if isinstance(plan_snapshot, Mapping) and isinstance(plan_item_id, str):
-                    events.append(
-                        item_completed(
-                            turn_id=record.turn_id,
-                            item_id=plan_item_id,
-                            item_kind=TurnItemKind.PLAN,
-                            status=ItemStatus.SUCCESS,
-                            data={"plan": dict(plan_snapshot)},
-                        )
-                    )
-                return tuple(events)
+                return (completed,)
             return ()
         if record.record_type == "item_completed":
             if not isinstance(item_id, str) or start is None:
@@ -569,6 +556,11 @@ class RolloutEventReader:
                 "content": payload.get("text", payload.get("content", "")),
                 "tool_calls": payload.get("tool_calls", ()),
             }
+        elif kind == "plan_state" and item_kind is TurnItemKind.PLAN:
+            plan = payload.get("plan", {})
+            if not isinstance(plan, Mapping):
+                raise RuntimeError("canonical plan snapshot payload is malformed")
+            data = {"plan": dict(plan)}
         elif item_kind in {TurnItemKind.REASONING, TurnItemKind.PLAN}:
             data = {"content": payload.get("content", payload.get("text", ""))}
         else:
@@ -665,6 +657,20 @@ class RolloutEventReader:
                         revision=revision,
                     ),
                 )
+        revision = payload.get("revision")
+        if (
+            record.record_type in {"item_started", "item_completed"}
+            and isinstance(revision, int)
+            and not isinstance(revision, bool)
+            and payload.get("public_item_id") is not None
+        ):
+            cls._require_public_item_id(
+                payload.get("public_item_id"),
+                derive_plan_public_item_id(
+                    turn_id=record.turn_id,
+                    revision=revision,
+                ),
+            )
 
     @staticmethod
     def _require_public_item_id(persisted: object, expected: str) -> None:

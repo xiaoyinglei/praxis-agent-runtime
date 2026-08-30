@@ -77,6 +77,6 @@ def test_provider_wire_and_model_dispatch_ownership_is_explicit() -> None:
         source = (RUNTIME / "harness" / component).read_text(encoding="utf-8")
         assert "serialize_openai_request" not in source
         assert "render_local_agent_request" not in source
-    assert _sources_containing("response = await self._model.dispatch(prepared)") == {
+    assert _sources_containing("dispatch = self._model.dispatch") == {
         Path("agent_runtime/harness/session.py")
     }

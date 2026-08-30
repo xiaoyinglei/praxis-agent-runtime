@@ -1937,19 +1937,6 @@ class RolloutStore:
                 and lease_current
             )
             if not is_current:
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="model_attempt_late_response",
-                    producer="runtime",
-                    payload={
-                        "operation_id": operation_id,
-                        "attempt_id": attempt_id,
-                        "generation": generation,
-                        "provider_response_id": provider_response_id,
-                        "usage": frozen_usage,
-                    },
-                )
                 return False
             started_channels = self._connection.execute(
                 """
@@ -2997,6 +2984,7 @@ class RolloutStore:
             public_item_id: str | None = None
             plan_public_item_id: str | None = None
             plan_snapshot: Mapping[str, Any] | None = None
+            plan_item_id: str | None = None
             if operation_id is not None:
                 attempt_generation = int(operation["claim_generation"])
                 if attempt_generation > 0:
@@ -3007,8 +2995,12 @@ class RolloutStore:
                     )
                 if operation["tool_name"] == "update_plan" and frozen_result.get("is_error") is not True:
                     structured = frozen_result.get("structured_content")
-                    revision = structured.get("revision") if isinstance(structured, Mapping) else None
-                    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+                    provider_revision = structured.get("revision") if isinstance(structured, Mapping) else None
+                    if (
+                        isinstance(provider_revision, bool)
+                        or not isinstance(provider_revision, int)
+                        or provider_revision < 0
+                    ):
                         raise RuntimeError("successful update_plan result requires a canonical revision")
                     call = self._connection.execute(
                         """
@@ -3028,14 +3020,68 @@ class RolloutStore:
                     arguments = matching_calls[0].get("arguments")
                     if not isinstance(arguments, Mapping):
                         raise RuntimeError("successful update_plan ToolCall arguments are malformed")
+                    prior_revisions = self._connection.execute(
+                        "SELECT COUNT(*) FROM items WHERE turn_id = ? AND kind = 'plan_state'",
+                        (turn_id,),
+                    ).fetchone()[0]
+                    revision = int(prior_revisions) + 1
                     plan_public_item_id = derive_plan_public_item_id(
                         turn_id=turn_id,
                         revision=revision,
                     )
+                    plan_item_id = f"item_{uuid4().hex}"
+                    raw_steps = arguments.get("plan", [])
+                    steps: list[dict[str, Any]] = []
+                    if isinstance(raw_steps, (list, tuple)):
+                        for index, raw_step in enumerate(raw_steps, start=1):
+                            if not isinstance(raw_step, Mapping):
+                                continue
+                            status = raw_step.get("status")
+                            normalized_status = (
+                                "pending" if status == "completed" else status
+                            )
+                            steps.append(
+                                {
+                                    "step_id": raw_step.get("step_id")
+                                    or f"step_{index}",
+                                    "title": raw_step.get("step", ""),
+                                    "status": normalized_status,
+                                }
+                            )
+                    objective_row = self._connection.execute(
+                        """
+                        SELECT payload_json FROM items
+                        WHERE turn_id = ? AND kind = 'user_message'
+                        ORDER BY sequence LIMIT 1
+                        """,
+                        (turn_id,),
+                    ).fetchone()
+                    objective_payload = (
+                        json.loads(objective_row["payload_json"])
+                        if objective_row is not None
+                        else {}
+                    )
                     plan_snapshot = {
                         "revision": revision,
-                        "plan": arguments.get("plan", []),
-                        "explanation": arguments.get("explanation"),
+                        "objective": objective_payload.get("text", "Current task"),
+                        "status": "active",
+                        "active_step_id": next(
+                            (
+                                step["step_id"]
+                                for step in steps
+                                if step["status"] == "in_progress"
+                            ),
+                            next(
+                                (
+                                    step["step_id"]
+                                    for step in steps
+                                    if step["status"] == "pending"
+                                ),
+                                None,
+                            ),
+                        ),
+                        "steps": steps,
+                        "summary": arguments.get("explanation"),
                     }
             started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
             if public_item_id is not None:
@@ -3065,13 +3111,6 @@ class RolloutStore:
                         "public_item_id": public_item_id,
                     }
                 )
-            if plan_public_item_id is not None:
-                completed_payload.update(
-                    {
-                        "plan_public_item_id": plan_public_item_id,
-                        "plan_snapshot": plan_snapshot,
-                    }
-                )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -3079,6 +3118,35 @@ class RolloutStore:
                 producer="tool",
                 payload=completed_payload,
             )
+            if (
+                plan_item_id is not None
+                and plan_public_item_id is not None
+                and plan_snapshot is not None
+            ):
+                self._append_and_reduce(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    record_type="item_started",
+                    producer="runtime",
+                    payload={
+                        "item_id": plan_item_id,
+                        "kind": "plan_state",
+                        "public_item_id": plan_public_item_id,
+                        "revision": plan_snapshot["revision"],
+                    },
+                )
+                self._append_and_reduce(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    record_type="item_completed",
+                    producer="runtime",
+                    payload={
+                        "item_id": plan_item_id,
+                        "public_item_id": plan_public_item_id,
+                        "revision": plan_snapshot["revision"],
+                        "payload": {"plan": plan_snapshot},
+                    },
+                )
             if operation_id is not None:
                 self._append_and_reduce(
                     thread_id=thread_id,

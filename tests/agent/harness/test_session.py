@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -311,6 +312,38 @@ class BlockingAfterFirstDeltaProvider:
         yield StreamChunk(type="text_delta", content="partial")
         self.blocked.set()
         self.release.wait()
+
+
+class FaultingModelCompletionStore(RolloutStore):
+    def __init__(self, database: Path) -> None:
+        self._completion_fault_at: int | None = None
+        self._completion_append_count = 0
+        super().__init__(database)
+
+    def arm_completion_fault(self, append_number: int) -> None:
+        self._completion_fault_at = append_number
+        self._completion_append_count = 0
+
+    def _append_and_reduce(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        record_type: str,
+        producer: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self._completion_fault_at is not None:
+            self._completion_append_count += 1
+            if self._completion_append_count == self._completion_fault_at:
+                raise RuntimeError("injected model completion fault")
+        super()._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type=record_type,
+            producer=producer,
+            payload=payload,
+        )
 
 
 class ZeroDeltaToolThenAnswerModel:
@@ -756,6 +789,106 @@ def test_late_model_attempt_cannot_commit_a_second_response(tmp_path: Path) -> N
             (1, "abandoned"),
             (2, "completed"),
         ]
+        assert store.verify().valid is True
+
+
+@pytest.mark.parametrize("fault_at", range(1, 6))
+def test_model_completion_faults_are_atomic_at_every_substep(
+    tmp_path: Path,
+    fault_at: int,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with FaultingModelCompletionStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="commit all model channels atomically",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        operation = store.prepare_model_operation(
+            turn_id=turn.turn_id,
+            request_hash="request-hash",
+            context_hash="context-hash",
+            tool_hash="tool-hash",
+            wire_hash="wire-hash",
+            request_ref={"request_id": f"{turn.turn_id}:step:1"},
+        )
+        attempt = store.dispatch_model_attempt(operation.operation_id)
+        for channel in ("reasoning", "plan"):
+            store.start_model_output_channel(
+                operation_id=operation.operation_id,
+                attempt_id=attempt.attempt_id,
+                generation=attempt.generation,
+                channel=channel,
+            )
+        records_before = store.list_records(thread.thread_id)
+        items_before = store.list_items(turn.turn_id)
+        store.arm_completion_fault(fault_at)
+
+        with pytest.raises(RuntimeError, match="injected model completion fault"):
+            store.complete_model_attempt(
+                operation_id=operation.operation_id,
+                attempt_id=attempt.attempt_id,
+                generation=attempt.generation,
+                text="final answer",
+                provider_response_id="response-1",
+                usage={"input_tokens": 4, "output_tokens": 3},
+                reasoning_content="complete reasoning",
+                plan_content="complete plan",
+            )
+
+        assert store.list_records(thread.thread_id) == records_before
+        assert store.list_items(turn.turn_id) == items_before
+        assert store.list_model_operations(turn.turn_id)[0].status == "dispatched"
+        assert store.list_model_attempts(operation.operation_id)[0].status == (
+            "dispatched"
+        )
+        assert store.verify().valid is True
+
+
+def test_stale_model_generation_appends_nothing(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="fence stale generation",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        operation = store.prepare_model_operation(
+            turn_id=turn.turn_id,
+            request_hash="request-hash",
+            context_hash="context-hash",
+            tool_hash="tool-hash",
+            wire_hash="wire-hash",
+            request_ref={"request_id": f"{turn.turn_id}:step:1"},
+        )
+        stale = store.dispatch_model_attempt(operation.operation_id)
+        store.mark_model_attempt_unknown(
+            operation_id=operation.operation_id,
+            attempt_id=stale.attempt_id,
+            generation=stale.generation,
+        )
+        current = store.prepare_model_retry(operation.operation_id)
+        store.dispatch_model_attempt(operation.operation_id)
+        before = store.list_records(thread.thread_id)
+
+        accepted = store.complete_model_attempt(
+            operation_id=operation.operation_id,
+            attempt_id=stale.attempt_id,
+            generation=stale.generation,
+            text="stale answer",
+            provider_response_id="response-stale",
+            usage={"input_tokens": 2, "output_tokens": 2},
+        )
+
+        assert accepted is False
+        assert store.list_records(thread.thread_id) == before
+        assert store.list_model_attempts(operation.operation_id)[-1].attempt_id == (
+            current.attempt_id
+        )
         assert store.verify().valid is True
 
 
