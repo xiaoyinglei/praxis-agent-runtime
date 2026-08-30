@@ -125,6 +125,7 @@ class TurnEventDispatcher:
             raise ValueError("capacity must be positive")
         self._capacity = capacity
         self._controlling: list[_EventChannel] = []
+        self._controlling_sinks: list[StreamEventSink] = []
         self._passive: list[_EventChannel] = []
 
     def subscribe_controlling(self) -> TurnEventStream:
@@ -137,11 +138,21 @@ class TurnEventDispatcher:
         self._passive.append(channel)
         return TurnEventStream(channel)
 
+    def subscribe_controlling_sink(self, sink: StreamEventSink) -> None:
+        self._controlling_sinks.append(sink)
+
     async def emit(self, event: StreamEvent, *, cursor: str | None = None) -> None:
         for channel in tuple(self._controlling):
             await channel.put(event)
         for channel in tuple(self._passive):
             channel.put_passive(event, cursor=cursor)
+        for sink in tuple(self._controlling_sinks):
+            try:
+                await sink.emit(event)
+            except Exception as exc:
+                raise EventChannelClosed(
+                    f"controlling event sink failed: {exc}"
+                ) from exc
 
 
 class LegacyStreamProjectionSink:

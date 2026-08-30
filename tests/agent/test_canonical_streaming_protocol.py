@@ -167,6 +167,12 @@ class _LiveSink:
         self.events.append(event)
 
 
+class _RaisingSink:
+    async def emit(self, event: events.StreamEvent) -> None:
+        del event
+        raise RuntimeError("sink failed")
+
+
 @pytest.mark.anyio
 async def test_legacy_projection_emits_only_legacy_wire_events() -> None:
     target = _LiveSink()
@@ -326,6 +332,32 @@ async def test_emit_after_close_raises_event_channel_closed() -> None:
 
     with pytest.raises(stream_sinks.EventChannelClosed):
         await dispatcher.emit(events.turn_started("turn-already-closed"))
+
+
+@pytest.mark.anyio
+async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        store.start_turn(
+            thread_id=thread.thread_id,
+            turn_id="turn-committed-before-sink",
+            user_message="commit before delivery",
+            binding_manifest={},
+        )
+        committed = RolloutEventReader(store).read(thread.thread_id)[0].event
+
+        dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+        dispatcher.subscribe_controlling_sink(_RaisingSink())
+        with pytest.raises(stream_sinks.EventChannelClosed, match="sink failed"):
+            await dispatcher.emit(committed)
+
+    with RolloutStore(database) as reopened:
+        replayed = RolloutEventReader(reopened).read(thread.thread_id)
+        assert replayed[0].event == committed
+        assert reopened.verify().valid is True
 
 
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
