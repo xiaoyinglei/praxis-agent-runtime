@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -69,10 +69,27 @@ class HarnessModelResponse:
             raise ValueError("incomplete model response requires a reason")
 
 
+@dataclass(frozen=True, slots=True)
+class HarnessModelDelta:
+    channel: Literal["text", "reasoning", "plan"]
+    content: str
+
+
+HarnessModelDeltaSink = Callable[
+    [HarnessModelDelta],
+    None | Awaitable[None],
+]
+
+
 class HarnessModel(Protocol):
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall: ...
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse: ...
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse: ...
 
 
 @dataclass(frozen=True, slots=True)

@@ -1476,6 +1476,77 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    def start_model_output_channel(
+        self,
+        *,
+        operation_id: str,
+        attempt_id: str,
+        generation: int,
+        channel: str,
+    ) -> ItemSnapshot:
+        kind_by_channel = {
+            "agent_message": "model_response",
+            "reasoning": "model_reasoning",
+            "plan": "model_plan",
+        }
+        kind = kind_by_channel.get(channel)
+        if kind is None:
+            raise ValueError(f"unsupported model output channel: {channel}")
+        selected_item_id: str | None = None
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT * FROM model_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise KeyError(f"unknown model operation: {operation_id}")
+            if not (
+                operation["status"] == "dispatched"
+                and operation["active_attempt_id"] == attempt_id
+                and operation["generation"] == generation
+            ):
+                raise RuntimeError("model output channel requires the active dispatched attempt")
+            existing = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM rollout_records
+                WHERE turn_id = ?
+                  AND record_type = 'item_started'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.channel') = ?
+                ORDER BY record_id
+                """,
+                (operation["turn_id"], attempt_id, channel),
+            ).fetchall()
+            if len(existing) > 1:
+                raise RuntimeError("model output channel has duplicate durable starts")
+            if existing:
+                payload = json.loads(existing[0]["payload_json"])
+                selected_item_id = str(payload["item_id"])
+            else:
+                selected_item_id = f"item_{uuid4().hex}"
+                public_item_id = derive_model_public_item_id(
+                    turn_id=str(operation["turn_id"]),
+                    model_attempt_id=attempt_id,
+                    channel=channel,
+                )
+                self._append_and_reduce(
+                    thread_id=str(operation["thread_id"]),
+                    turn_id=str(operation["turn_id"]),
+                    record_type="item_started",
+                    producer="model",
+                    payload={
+                        "item_id": selected_item_id,
+                        "kind": kind,
+                        "attempt_id": attempt_id,
+                        "channel": channel,
+                        "public_item_id": public_item_id,
+                    },
+                )
+        if selected_item_id is None:
+            raise RuntimeError("model output channel start lost its Item identity")
+        return self.read_item(selected_item_id)
+
     def mark_model_attempt_unknown(
         self,
         *,
@@ -1658,7 +1729,7 @@ class RolloutStore:
         if response_status == "completed" and not text.strip() and not frozen_tool_calls:
             raise ValueError("model response must contain text or tool calls")
         frozen_usage = _json_object(usage, field="usage")
-        response_item_id = f"item_{uuid4().hex}"
+        response_item_id: str | None = None
         observed_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -1698,6 +1769,24 @@ class RolloutStore:
                     },
                 )
                 return False
+            started_response = self._connection.execute(
+                """
+                SELECT payload_json
+                FROM rollout_records
+                WHERE turn_id = ?
+                  AND record_type = 'item_started'
+                  AND json_extract(payload_json, '$.attempt_id') = ?
+                  AND json_extract(payload_json, '$.channel') = 'agent_message'
+                ORDER BY record_id
+                """,
+                (operation["turn_id"], attempt_id),
+            ).fetchall()
+            if len(started_response) > 1:
+                raise RuntimeError("model response has duplicate durable starts")
+            if started_response:
+                response_item_id = str(json.loads(started_response[0]["payload_json"])["item_id"])
+            else:
+                response_item_id = f"item_{uuid4().hex}"
             public_item_id = derive_model_public_item_id(
                 turn_id=str(operation["turn_id"]),
                 model_attempt_id=attempt_id,
@@ -1718,19 +1807,20 @@ class RolloutStore:
                     "public_item_id": public_item_id,
                 },
             )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="item_started",
-                producer="model",
-                payload={
-                    "item_id": response_item_id,
-                    "kind": "model_response",
-                    "attempt_id": attempt_id,
-                    "channel": "agent_message",
-                    "public_item_id": public_item_id,
-                },
-            )
+            if not started_response:
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="item_started",
+                    producer="model",
+                    payload={
+                        "item_id": response_item_id,
+                        "kind": "model_response",
+                        "attempt_id": attempt_id,
+                        "channel": "agent_message",
+                        "public_item_id": public_item_id,
+                    },
+                )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],

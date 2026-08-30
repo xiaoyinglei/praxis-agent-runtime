@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -18,6 +19,7 @@ from agent_runtime.harness.protocol import (
     ContextManager,
     HarnessMessage,
     HarnessModel,
+    HarnessModelDelta,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
@@ -32,6 +34,12 @@ from agent_runtime.harness.tool_orchestrator import (
     ToolApprovalInvalidatedError,
     ToolApprovalRequiredError,
     ToolOrchestrator,
+)
+from agent_runtime.streaming.events import (
+    ItemDeltaKind,
+    TurnItemKind,
+    derive_model_public_item_id,
+    item_delta,
 )
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
@@ -559,8 +567,53 @@ class Session:
                 lease_seconds=self._model_lease_seconds,
             )
         )
+
+        async def publish_delta(delta: HarnessModelDelta) -> None:
+            channel = {
+                "text": "agent_message",
+                "reasoning": "reasoning",
+                "plan": "plan",
+            }[delta.channel]
+            item_kind = {
+                "text": TurnItemKind.AGENT_MESSAGE,
+                "reasoning": TurnItemKind.REASONING,
+                "plan": TurnItemKind.PLAN,
+            }[delta.channel]
+            delta_kind = {
+                "text": ItemDeltaKind.TEXT,
+                "reasoning": ItemDeltaKind.REASONING,
+                "plan": ItemDeltaKind.PLAN,
+            }[delta.channel]
+            await self._commit(
+                partial(
+                    self._store.start_model_output_channel,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    channel=channel,
+                )
+            )
+            if self._event_dispatcher is not None:
+                await self._event_dispatcher.emit(
+                    item_delta(
+                        turn_id=turn_id,
+                        item_id=derive_model_public_item_id(
+                            turn_id=turn_id,
+                            model_attempt_id=attempt.attempt_id,
+                            channel=channel,
+                        ),
+                        item_kind=item_kind,
+                        delta_kind=delta_kind,
+                        delta=delta.content,
+                    )
+                )
+
         try:
-            response = await self._model.dispatch(prepared)
+            dispatch = self._model.dispatch
+            if "delta_sink" in inspect.signature(dispatch).parameters:
+                response = await dispatch(prepared, delta_sink=publish_delta)
+            else:
+                response = await dispatch(prepared)
         except ModelDispatchPreflightError as exc:
             await self._commit(
                 partial(

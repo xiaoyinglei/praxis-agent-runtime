@@ -28,6 +28,8 @@ from agent_runtime.modeling.contracts import (
 from agent_runtime.modeling.gateway import (
     AgentModelResponse,
     LLMBudgetExceededError,
+    ProviderDelta,
+    ProviderDeltaChannel,
     model_request_input_text,
 )
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -37,6 +39,8 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSpec,
 )
+from agent_runtime.streaming.events import EventType, ItemDeltaKind
+from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
 class CapturingGateway:
@@ -64,6 +68,47 @@ class CapturingGateway:
             serializer_revision="openai-wire-v1",
             wire_kind="openai-compatible",
         )
+
+
+class NativeTextDeltaGateway(CapturingGateway):
+    def __init__(self) -> None:
+        super().__init__()
+        self.callback_returns = 0
+
+    async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
+        request = kwargs["request"]
+        delta_sink = kwargs.get("delta_sink")
+        assert kwargs.get("stream") is True
+        assert callable(delta_sink)
+        for fragment in ("real ", "gateway answer"):
+            emitted = delta_sink(ProviderDelta(ProviderDeltaChannel.TEXT, fragment))
+            if emitted is not None:
+                await emitted
+            self.callback_returns += 1
+        return AgentModelResponse(
+            turn=ToolUseResult(
+                text="real gateway answer",
+                stop_reason=StopReason.END_TURN,
+                raw_stop_reason="stop",
+            ),
+            usage=normalize_llm_usage(
+                input_tokens=3,
+                output_tokens=2,
+                input_tokens_include_cache=True,
+                usage_source="provider",
+            ),
+            provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
+            serializer_revision="openai-wire-v1",
+            wire_kind="openai-compatible",
+        )
+
+
+class BoundGatewayHarnessModel(GatewayHarnessModel):
+    def snapshot(self) -> dict[str, str]:
+        return {
+            "model_alias": "test-model",
+            "model_revision": "native-delta-v1",
+        }
 
 
 class MaxTokensGateway(CapturingGateway):
@@ -145,13 +190,16 @@ class BudgetAwareCapturingGateway(CapturingGateway):
         request = kwargs["request"]
         provider = kwargs["provider"]
         supports_native_tools = kwargs["supports_native_tools"]
-        assert self.token_accounting.count(
-            model_request_input_text(
-                request,
-                provider=provider,
-                supports_native_tools=supports_native_tools,
+        assert (
+            self.token_accounting.count(
+                model_request_input_text(
+                    request,
+                    provider=provider,
+                    supports_native_tools=supports_native_tools,
+                )
             )
-        ) <= self.max_input_tokens
+            <= self.max_input_tokens
+        )
         return await super().agenerate_model_request(**kwargs)
 
 
@@ -229,6 +277,67 @@ def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> No
     assert response.incomplete_reason == "max_output_tokens"
     assert response.text == "partial answer"
     assert response.usage["output_tokens"] == 256
+
+
+@pytest.mark.anyio
+async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    gateway = NativeTextDeltaGateway()
+    model = BoundGatewayHarnessModel(
+        model_alias="test-model",
+        resolved=ResolvedModel(
+            generator=object(),
+            kwargs={"max_tokens": 256},
+            gateway=gateway,
+            provider="openai-compatible",
+            model="provider-model",
+        ),
+        instructions=("Answer the user directly.",),
+    )
+    dispatcher = TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    with RuntimeComposition.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=model,
+        completion_gate=AcceptAnswer(),
+    ) as runtime:
+        running = asyncio.create_task(
+            runtime.thread_manager.run(
+                user_message="stream native fragments",
+                event_dispatcher=dispatcher,
+            )
+        )
+
+        turn_started = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        item_started_event = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        first_delta = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        second_delta = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        item_completed_event = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        turn_completed = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        result = await asyncio.wait_for(running, timeout=0.5)
+
+    assert gateway.callback_returns == 2
+    assert turn_started.type is EventType.TURN_STARTED
+    assert item_started_event.type is EventType.ITEM_STARTED
+    assert [first_delta.data["delta"], second_delta.data["delta"]] == [
+        "real ",
+        "gateway answer",
+    ]
+    assert first_delta.delta_kind is ItemDeltaKind.TEXT
+    assert second_delta.delta_kind is ItemDeltaKind.TEXT
+    assert {
+        item_started_event.item_id,
+        first_delta.item_id,
+        second_delta.item_id,
+        item_completed_event.item_id,
+    } == {item_started_event.item_id}
+    assert item_completed_event.data["content"] == "real gateway answer"
+    assert turn_completed.type is EventType.TURN_COMPLETED
+    assert result.answer == "real gateway answer"
 
 
 def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:

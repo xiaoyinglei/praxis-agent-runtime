@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
@@ -22,6 +23,8 @@ from agent_runtime.core.model_request import (
 )
 from agent_runtime.harness.protocol import (
     HarnessMessage,
+    HarnessModelDelta,
+    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
@@ -34,6 +37,7 @@ from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import (
     LLMBudgetExceededError,
     LLMContextOverflowError,
+    ProviderDelta,
     model_request_input_text,
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
@@ -129,11 +133,7 @@ class GatewayHarnessModel:
                 "message_count": len(canonical_request.messages),
                 "exposed_tool_names": canonical_request.exposed_tool_names,
                 "model_token_budget_remaining": remaining,
-                **(
-                    {"context_projection": context_projection}
-                    if context_projection is not None
-                    else {}
-                ),
+                **({"context_projection": context_projection} if context_projection is not None else {}),
             },
             dispatch_payload=_GatewayDispatch(
                 request=canonical_request,
@@ -143,7 +143,12 @@ class GatewayHarnessModel:
             ),
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
         payload = prepared.dispatch_payload
         if not isinstance(payload, _GatewayDispatch):
             raise TypeError("prepared call does not belong to GatewayHarnessModel")
@@ -156,12 +161,27 @@ class GatewayHarnessModel:
             if payload.model_token_budget_remaining is None
             else LLMBudgetLedger(total=payload.model_token_budget_remaining)
         )
+
+        async def forward_delta(delta: ProviderDelta) -> None:
+            if delta_sink is None:
+                return
+            emitted = delta_sink(
+                HarnessModelDelta(
+                    channel=delta.channel.value,
+                    content=delta.content,
+                )
+            )
+            if inspect.isawaitable(emitted):
+                await emitted
+
         try:
             response = await gateway.agenerate_model_request(
                 stage=LLMCallStage.AGENT_STEP,
                 request=payload.request,
                 provider=resolved.provider,
                 supports_native_tools=resolved.supports_native_tools,
+                stream=delta_sink is not None,
+                delta_sink=forward_delta if delta_sink is not None else None,
                 ledger=ledger,
                 lease_id=f"{payload.request.request_id}:provider",
             )
@@ -169,14 +189,11 @@ class GatewayHarnessModel:
             raise ModelDispatchPreflightError("Provider call exceeds the Turn's remaining model token budget.") from exc
         except LLMContextOverflowError as exc:
             raise ModelDispatchPreflightError(
-                "Model context exceeds the effective stage input budget: "
-                f"{exc.input_tokens} > {exc.max_input_tokens}."
+                f"Model context exceeds the effective stage input budget: {exc.input_tokens} > {exc.max_input_tokens}."
             ) from exc
         except BaseException as exc:
             if _is_uncertain_transport_failure(exc):
-                raise ModelDispatchOutcomeUnknownError(
-                    str(exc).strip() or type(exc).__name__
-                ) from exc
+                raise ModelDispatchOutcomeUnknownError(str(exc).strip() or type(exc).__name__) from exc
             raise
         if response.provider_wire_hash != payload.wire_hash:
             raise RuntimeError("provider wire changed between prepare and dispatch")
@@ -276,7 +293,12 @@ class ControlPlaneHarnessModel:
             raise RuntimeError("resolved provider identity differs from frozen binding")
         return resolved
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
         payload = prepared.dispatch_payload
         if not isinstance(payload, _GatewayDispatch):
             raise TypeError("prepared call does not belong to ControlPlaneHarnessModel")
@@ -284,7 +306,7 @@ class ControlPlaneHarnessModel:
             model_alias=str(prepared.request_ref["model_alias"]),
             resolved=payload.resolved,
             instructions=self._instructions,
-        ).dispatch(prepared)
+        ).dispatch(prepared, delta_sink=delta_sink)
 
 
 def _catalog_revision(control_plane: ModelControlPlane) -> str:
@@ -412,11 +434,15 @@ def _budgeted_request(
 
     input_tokens = measured(canonical)
     if input_tokens <= max_input_tokens:
-        return context, canonical, {
-            "compacted": False,
-            "input_tokens": input_tokens,
-            "max_input_tokens": max_input_tokens,
-        }
+        return (
+            context,
+            canonical,
+            {
+                "compacted": False,
+                "input_tokens": input_tokens,
+                "max_input_tokens": max_input_tokens,
+            },
+        )
 
     transcript_count = len(context.transcript)
     candidates: list[tuple[int, int]] = []
@@ -439,21 +465,29 @@ def _budgeted_request(
         candidate_tokens = measured(candidate)
         most_compact = (projected, candidate, candidate_tokens)
         if candidate_tokens <= max_input_tokens:
-            return projected, candidate, {
-                "compacted": True,
-                "input_tokens": candidate_tokens,
-                "max_input_tokens": max_input_tokens,
-                "parent_context_revision": context.context_revision,
-                "projected_context_revision": projected.context_revision,
-                "retained_tail_count": len(projected.transcript) - 1,
-                "summary_max_chars": summary_chars,
-            }
+            return (
+                projected,
+                candidate,
+                {
+                    "compacted": True,
+                    "input_tokens": candidate_tokens,
+                    "max_input_tokens": max_input_tokens,
+                    "parent_context_revision": context.context_revision,
+                    "projected_context_revision": projected.context_revision,
+                    "retained_tail_count": len(projected.transcript) - 1,
+                    "summary_max_chars": summary_chars,
+                },
+            )
     projected, candidate, candidate_tokens = most_compact
-    return projected, candidate, {
-        "compacted": projected is not context,
-        "input_tokens": candidate_tokens,
-        "max_input_tokens": max_input_tokens,
-        "parent_context_revision": context.context_revision,
-        "projected_context_revision": projected.context_revision,
-        "retained_tail_count": max(0, len(projected.transcript) - 1),
-    }
+    return (
+        projected,
+        candidate,
+        {
+            "compacted": projected is not context,
+            "input_tokens": candidate_tokens,
+            "max_input_tokens": max_input_tokens,
+            "parent_context_revision": context.context_revision,
+            "projected_context_revision": projected.context_revision,
+            "retained_tail_count": max(0, len(projected.transcript) - 1),
+        },
+    )
