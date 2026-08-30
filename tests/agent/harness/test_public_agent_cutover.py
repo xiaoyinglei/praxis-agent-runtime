@@ -7,17 +7,19 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
+from agent_runtime.cli import _run_facade_command
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
+    RolloutEventReader,
     RolloutStore,
     RuntimeComposition,
 )
 from agent_runtime.harness import composition as harness_composition
-from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.streaming.events import EventType, StreamEvent, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
@@ -399,8 +401,10 @@ async def test_public_agent_uses_rollout_harness_not_legacy_service(
         assert store.read_turn(result.turn_id).thread_id == result.thread_id
         assert store.verify().valid is True
     assert [event.type for event in events] == [
-        EventType.TURN_START,
-        EventType.TURN_END,
+        EventType.TURN_STARTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
     ]
     assert {event.turn_id for event in events} == {result.turn_id}
 
@@ -612,8 +616,10 @@ async def test_public_astream_replays_events_from_canonical_rollout(
     ]
 
     assert [event.type for event in events] == [
-        EventType.TURN_START,
-        EventType.TURN_END,
+        EventType.TURN_STARTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
     ]
     assert len({event.turn_id for event in events}) == 1
 
@@ -638,12 +644,12 @@ async def test_public_astream_emits_committed_turn_start_before_model_finishes(
 
     first = await asyncio.wait_for(anext(stream), timeout=1.0)
 
-    assert first.type is EventType.TURN_START
+    assert first.type is EventType.TURN_STARTED
     assert model.dispatch_started.is_set()
     assert not model.release_dispatch.is_set()
     model.release_dispatch.set()
     remaining = [event async for event in stream]
-    assert remaining[-1].type is EventType.TURN_END
+    assert remaining[-1].type is EventType.TURN_COMPLETED
 
 
 @pytest.mark.anyio
@@ -664,7 +670,7 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
     class Sink:
         async def emit(self, event: StreamEvent) -> None:
             events.append(event)
-            if event.type is EventType.TURN_START:
+            if event.type is EventType.TURN_STARTED:
                 turn_started.set()
 
     monkeypatch.setattr(agent, "_harness_model", lambda: model)
@@ -677,6 +683,7 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
     )
 
     await asyncio.wait_for(turn_started.wait(), timeout=1.0)
+    await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
 
     assert model.dispatch_started.is_set()
     assert not run.done()
@@ -684,8 +691,10 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
     result = await run
     assert result.answer == "live stream answer"
     assert [event.type for event in events] == [
-        EventType.TURN_START,
-        EventType.TURN_END,
+        EventType.TURN_STARTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.TURN_COMPLETED,
     ]
 
 
@@ -781,6 +790,128 @@ async def test_interleaved_threads_publish_only_their_transaction_batches(
 
 
 @pytest.mark.anyio
+async def test_cli_arun_sink_and_astream_share_identical_v2_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    class Capture:
+        def __init__(self) -> None:
+            self.events: list[StreamEvent] = []
+
+        def begin_turn(self) -> None:
+            return None
+
+        def finish(self) -> None:
+            return None
+
+        async def emit(self, event: StreamEvent) -> None:
+            self.events.append(event)
+
+    def configured_agent(name: str) -> Agent:
+        agent = Agent(
+            checkpoint_db=tmp_path / f"{name}.sqlite3",
+            workspace_path=workspace,
+        )
+        monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+        return agent
+
+    cli_agent = configured_agent("cli")
+    cli_capture = Capture()
+    cli_result = await _run_facade_command(
+        cli_agent,
+        task="CLI canonical lifecycle",
+        files=(),
+        max_tokens_total=None,
+        interactive_approval=False,
+        require_workspace_change=False,
+        event_display=cli_capture,  # type: ignore[arg-type]
+    )
+    sink_agent = configured_agent("sink")
+    sink_capture = Capture()
+    sink_result = await sink_agent.arun(
+        "sink canonical lifecycle",
+        require_workspace_change=False,
+        event_sink=sink_capture,
+    )
+    stream_agent = configured_agent("stream")
+    stream_events = [
+        event
+        async for event in stream_agent.astream(
+            "astream canonical lifecycle",
+            require_workspace_change=False,
+        )
+    ]
+
+    all_live = (cli_capture.events, sink_capture.events, stream_events)
+    assert (
+        [event.type for event in all_live[0]]
+        == [event.type for event in all_live[1]]
+        == [event.type for event in all_live[2]]
+    )
+    assert (
+        [event.item_kind for event in all_live[0]]
+        == [event.item_kind for event in all_live[1]]
+        == [event.item_kind for event in all_live[2]]
+    )
+    for database, result, live in (
+        (tmp_path / "cli.sqlite3", cli_result, cli_capture.events),
+        (tmp_path / "sink.sqlite3", sink_result, sink_capture.events),
+    ):
+        with RolloutStore(database) as store:
+            replayed = RolloutEventReader(store).read(result.thread_id)
+        assert [(event.type, event.item_id) for event in live] == [
+            (entry.event.type, entry.event.item_id) for entry in replayed
+        ]
+
+
+@pytest.mark.anyio
+async def test_public_runtime_emits_v2_only_without_implicit_legacy_duplicates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = Agent(
+        checkpoint_db=tmp_path / "praxis.sqlite3",
+        workspace_path=workspace,
+    )
+    monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+
+    class Capture:
+        def __init__(self) -> None:
+            self.events: list[StreamEvent] = []
+
+        async def emit(self, event: StreamEvent) -> None:
+            self.events.append(event)
+
+    capture = Capture()
+    await agent.arun(
+        "canonical events only",
+        require_workspace_change=False,
+        event_sink=capture,
+    )
+
+    v2_types = {
+        EventType.TURN_STARTED,
+        EventType.TURN_PAUSED,
+        EventType.TURN_RESUMED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_COMPLETED,
+        EventType.TURN_ABORTED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_DELTA,
+        EventType.ITEM_COMPLETED,
+    }
+    assert capture.events
+    assert all(event.protocol_version == 2 for event in capture.events)
+    assert all(event.type in v2_types for event in capture.events)
+    assert len([event for event in capture.events if event.type is EventType.ITEM_COMPLETED]) == 1
+
+
+@pytest.mark.anyio
 async def test_public_resume_event_sink_is_live_and_does_not_replay_old_events(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -805,7 +936,7 @@ async def test_public_resume_event_sink_is_live_and_does_not_replay_old_events(
     class Sink:
         async def emit(self, event: StreamEvent) -> None:
             events.append(event)
-            if event.type is EventType.TOOL_USE_START:
+            if event.type is EventType.ITEM_STARTED and event.item_kind is TurnItemKind.TOOL:
                 tool_started.set()
 
     resume = asyncio.create_task(agent.aresume(paused.turn_id, "allow_once", event_sink=Sink()))
@@ -815,12 +946,12 @@ async def test_public_resume_event_sink_is_live_and_does_not_replay_old_events(
 
     assert model.resume_dispatch_started.is_set()
     assert not resume.done()
-    assert EventType.TURN_START not in [event.type for event in events]
+    assert EventType.TURN_STARTED not in [event.type for event in events]
     assert EventType.HUMAN_INPUT_REQUIRED not in [event.type for event in events]
     model.release_resume_dispatch.set()
     result = await resume
     assert result.answer == "resumed live"
-    assert events[-1].type is EventType.TURN_END
+    assert events[-1].type is EventType.TURN_COMPLETED
 
 
 @pytest.mark.anyio

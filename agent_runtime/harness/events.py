@@ -202,6 +202,7 @@ class RolloutEventReader:
             for record, event in self._project_records(
                 self._store.list_records(thread_id),
                 after_thread_sequence=0,
+                include_open_starts=True,
             )
             if record.record_id in batch_record_ids
         )
@@ -227,6 +228,7 @@ class RolloutEventReader:
         records: tuple[RolloutRecord, ...],
         *,
         after_thread_sequence: int,
+        include_open_starts: bool = False,
     ) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         for record in records:
             if record.record_type == "item_started":
@@ -293,6 +295,7 @@ class RolloutEventReader:
                 model_attempts_by_item=model_attempts_by_item,
                 tool_operations_by_item=tool_operations_by_item,
                 tool_generations_by_operation=tool_generations_by_operation,
+                include_open_starts=include_open_starts,
             )
             if record.thread_sequence > after_thread_sequence:
                 projected.extend((record, event) for event in events)
@@ -309,6 +312,7 @@ class RolloutEventReader:
         model_attempts_by_item: Mapping[str, str],
         tool_operations_by_item: Mapping[str, str],
         tool_generations_by_operation: Mapping[str, int],
+        include_open_starts: bool,
     ) -> tuple[StreamEvent, ...]:
         lifecycle = self._project_lifecycle(record)
         if lifecycle is not None:
@@ -334,9 +338,9 @@ class RolloutEventReader:
                 )
             if record.turn_id is None or not isinstance(operation_id, str) or not isinstance(public_item_id, str):
                 raise RuntimeError("claimed tool operation is missing public identity")
-            if (
-                not isinstance(generation, int)
-                or (
+            if not isinstance(generation, int) or (
+                not include_open_starts
+                and (
                     operation_id,
                     generation,
                 )
@@ -357,7 +361,7 @@ class RolloutEventReader:
                 ),
             )
         if record.record_type == "item_started":
-            if not isinstance(item_id, str) or item_id not in completed_item_ids:
+            if not isinstance(item_id, str) or (not include_open_starts and item_id not in completed_item_ids):
                 return ()
             if item_id in duplicate_answer_ids or kind in _SUPPRESSED_ITEM_KINDS:
                 return ()

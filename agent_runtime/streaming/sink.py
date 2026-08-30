@@ -45,6 +45,7 @@ class ObserverLagged(RuntimeError):  # noqa: N818 - protocol name
 class _EventChannel:
     def __init__(self, *, capacity: int, last_cursor: str | None = None) -> None:
         self.queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=capacity)
+        self.available = asyncio.Event()
         self.closed = asyncio.Event()
         self.error: Exception = EventChannelClosed("event channel is closed")
         self.last_cursor = last_cursor
@@ -63,6 +64,7 @@ class _EventChannel:
         closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
         await put
+        self.available.set()
 
     async def receive(self) -> StreamEvent:
         if self.closed.is_set():
@@ -77,7 +79,18 @@ class _EventChannel:
             raise self.error
         closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
-        return await receive
+        event = await receive
+        if self.queue.empty():
+            self.available.clear()
+        return event
+
+    def receive_nowait(self) -> StreamEvent:
+        if self.closed.is_set():
+            raise self.error
+        event = self.queue.get_nowait()
+        if self.queue.empty():
+            self.available.clear()
+        return event
 
     def put_passive(self, event: StreamEvent, *, cursor: str | None) -> None:
         if self.closed.is_set():
@@ -87,6 +100,7 @@ class _EventChannel:
         except asyncio.QueueFull:
             self.close(error=ObserverLagged(last_cursor=self.last_cursor))
             return
+        self.available.set()
         if cursor is not None:
             self.last_cursor = cursor
 
@@ -101,6 +115,7 @@ class _EventChannel:
     def _discard_queued(self) -> None:
         while not self.queue.empty():
             self.queue.get_nowait()
+        self.available.clear()
 
 
 class TurnEventStream:
@@ -111,6 +126,12 @@ class TurnEventStream:
 
     async def receive(self) -> StreamEvent:
         return await self._channel.receive()
+
+    def receive_nowait(self) -> StreamEvent:
+        return self._channel.receive_nowait()
+
+    async def wait_available(self) -> None:
+        await self._channel.available.wait()
 
     def close(self) -> None:
         self._channel.close()

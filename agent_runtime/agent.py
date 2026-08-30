@@ -381,14 +381,19 @@ class Agent:
             )
         )
         try:
-            while not run_task.done() or not stream.empty:
-                next_event = asyncio.create_task(stream.receive())
+            while True:
+                if not stream.empty:
+                    yield stream.receive_nowait()
+                    continue
+                if run_task.done():
+                    break
+                next_event = asyncio.create_task(stream.wait_available())
                 done, _pending = await asyncio.wait(
                     {run_task, next_event},
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 if next_event in done:
-                    yield next_event.result()
+                    continue
                 else:
                     next_event.cancel()
                     await asyncio.gather(next_event, return_exceptions=True)
