@@ -8,7 +8,14 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from agent_runtime.cli import agent_app
+from agent_runtime.core.llm_registry import (
+    ModelNotAvailableError,
+    ModelRegistry,
+    UnknownModelAliasError,
+)
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
+from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from agent_runtime.models import (
     ModelCatalog,
     ModelControlPlane,
@@ -18,10 +25,7 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSpec,
 )
-from rag.agent.cli import agent_app
-from rag.agent.core.llm_registry import ModelNotAvailableError, ModelRegistry
-from rag.schema.llm import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
-from rag.utils.text import load_env_file
+from agent_runtime.text import load_env_file
 
 
 def _write_models_config(path: Path) -> None:
@@ -99,16 +103,28 @@ def test_model_catalog_loads_runtime_specs_without_embedding_models(tmp_path: Pa
     assert local.runtime.expected_model_contains == "Qwen3-14B"
 
 
-def test_bundled_default_chat_model_is_deepseek_chat() -> None:
+def test_bundled_default_chat_model_is_groq_control() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
     spec = catalog.get(catalog.default_model_id)
 
-    assert catalog.default_model_id == "deepseek_chat"
-    assert spec.provider == "deepseek"
-    assert spec.provider_model == "deepseek-chat"
+    assert catalog.default_model_id == "groq_gpt_oss_120b"
+    assert spec.provider == "groq"
+    assert spec.provider_model == "openai/gpt-oss-120b"
     assert spec.location == "cloud"
-    assert spec.api_key_env == "DEEPSEEK_API_KEY"
+    assert spec.api_key_env == "GROQ_API_KEY"
+
+
+def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
+    catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
+
+    spec = catalog.get("kimi_cloud")
+
+    assert spec.provider == "kimi"
+    assert spec.provider_model == "kimi-k2.6"
+    assert spec.location == "cloud"
+    assert spec.api_key_env == "MOONSHOT_API_KEY"
+    assert spec.context_window == 262_144
 
 
 def test_bundled_local_qwen8_runtime_is_available_for_local_testing() -> None:
@@ -292,6 +308,35 @@ def test_model_session_state_persists_without_rewriting_yaml(tmp_path: Path) -> 
     assert config_path.read_text(encoding="utf-8") == before
 
 
+def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(config_path))
+    resolved_aliases: list[str] = []
+
+    def resolve_model(self: ModelRegistry, alias: str) -> object:
+        del self
+        resolved_aliases.append(alias)
+        return object()
+
+    monkeypatch.setattr(ModelRegistry, "resolve", resolve_model)
+    control = ModelControlPlane.from_env(
+        initial_model_id="local_qwen",
+        session_path=session_path,
+    )
+
+    with pytest.raises(UnknownModelAliasError, match="missing"):
+        control.switch_model("missing", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+    assert resolved_aliases == []
+    assert not session_path.exists()
+
+
 def test_agent_model_cli_uses_session_state_not_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -380,6 +425,52 @@ def test_local_runtime_manager_launches_and_polls_until_expected_model() -> None
     )
 
     assert launched == [["uv", "run", "python", "-m", "mlx_lm.server"]]
+
+
+def test_local_runtime_manager_closes_only_the_process_it_launched() -> None:
+    requests = [
+        OSError("not listening"),
+        {"data": [{"id": "models--mlx-community--Qwen3-14B-4bit"}]},
+    ]
+    process = SimpleNamespace(pid=123)
+    stopped: list[object] = []
+
+    def request_json(url: str, timeout: float) -> object:
+        del url, timeout
+        item = requests.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    manager = LocalRuntimeManager(
+        request_json=request_json,
+        launch_process=lambda _command: process,
+        stop_process=stopped.append,
+        sleep=lambda _: None,
+        monotonic=_counter(),
+    )
+    manager.ensure_ready(
+        ModelSpec(
+            id="local_qwen",
+            provider="qwen",
+            provider_model="models--mlx-community--Qwen3-14B-4bit",
+            context_window=32768,
+            supports_tools=True,
+            supports_structured_output=True,
+            location="local",
+            runtime=ModelRuntimeSpec(
+                health_url="http://127.0.0.1:8080/v1/models",
+                launch_command=("uv", "run", "python", "-m", "mlx_lm.server"),
+                expected_model_contains="Qwen3-14B",
+                startup_timeout_seconds=5,
+            ),
+        )
+    )
+
+    manager.close()
+    manager.close()
+
+    assert stopped == [process]
 
 
 def test_local_runtime_manager_rejects_endpoint_conflict() -> None:

@@ -5,14 +5,14 @@ from dataclasses import dataclass, field
 from types import TracebackType
 from typing import TYPE_CHECKING, Self
 
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 from agent_runtime.knowledge import RAGKnowledgeConfig
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.integrations.knowledge import (
+from agent_runtime.tools.integrations.knowledge import (
     KnowledgeResult,
     KnowledgeSearchInput,
     KnowledgeSearchOutput,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.permissions import ToolExecutionContext
 from rag.retrieval import QueryOptions
 
 if TYPE_CHECKING:
@@ -94,9 +94,7 @@ class LazyRAGKnowledgeProvider:
         if self._runtime is not None:
             return self._runtime
 
-        from agent_runtime.runtime.builder import build_optional_rag_runtime
-
-        runtime, diagnostics = build_optional_rag_runtime(
+        runtime, diagnostics = _build_optional_rag_runtime(
             config=self.config,
             model_alias=self.model_alias,
             vector_dsn=self.vector_dsn,
@@ -116,3 +114,57 @@ class LazyRAGKnowledgeProvider:
             self._runtime_context_entered = True
         self._runtime = runtime
         return runtime
+
+
+def _build_optional_rag_runtime(
+    *,
+    config: RAGKnowledgeConfig,
+    model_alias: str | None,
+    vector_dsn: str | None,
+) -> tuple[RAGRuntime | None, tuple[RuntimeDiagnostic, ...]]:
+    try:
+        if not config.storage_root.exists():
+            raise FileNotFoundError(f"RAG storage root does not exist: {config.storage_root}")
+        from rag import AssemblyRequest, CapabilityRequirements, RAGRuntime
+        from rag.models.assembly_adapter import to_assembly_overrides
+        from rag.models.runtime import RuntimeOverrides, resolve_runtime_config
+        from rag.storage.runtime_config import runtime_storage_config
+
+        runtime_config = resolve_runtime_config(
+            RuntimeOverrides(
+                model_alias=model_alias,
+                embedding_model_alias=config.embedding_model,
+                reranker_model_alias=config.reranker_model or "none",
+            )
+        )
+        storage = runtime_storage_config(
+            config.storage_root,
+            vector_backend=config.vector_backend,
+            vector_dsn=vector_dsn,
+            vector_namespace=config.vector_namespace,
+            vector_collection_prefix=config.vector_collection_prefix,
+        )
+        runtime = RAGRuntime.from_request(
+            storage=storage,
+            request=AssemblyRequest(
+                requirements=CapabilityRequirements(
+                    require_chat=True,
+                    default_context_tokens=QueryOptions().max_context_tokens,
+                ),
+                overrides=to_assembly_overrides(runtime_config),
+            ),
+            generation_config=runtime_config.generation,
+            chat_context_window_tokens=runtime_config.primary_model.context_window_tokens or 32_768,
+            llm_stage_budgets=runtime_config.llm_stage_budgets,
+        )
+        return runtime, ()
+    except Exception as exc:
+        return None, (
+            RuntimeDiagnostic(
+                code="rag_knowledge_init_failed",
+                component="rag_runtime",
+                message="Configured knowledge runtime could not be initialized.",
+                severity="error",
+                error_type=type(exc).__name__[:120],
+            ),
+        )

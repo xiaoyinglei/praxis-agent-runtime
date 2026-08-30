@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from agent_runtime.text import keyword_overlap, search_terms
 from rag.assembly import EmbeddingCapabilityBinding
 from rag.retrieval.evidence import CandidateLike, EvidenceBundle
 from rag.schema.core import AssetRecord, Document, SectionRecord, Source
@@ -17,7 +18,6 @@ from rag.schema.runtime import (
     VectorSearchResult,
 )
 from rag.storage.search_backends.web_search_repo import DeterministicWebSearchRepo
-from rag.utils.text import keyword_overlap, search_terms
 
 
 @dataclass(frozen=True)
@@ -315,12 +315,16 @@ class MilvusSummaryHybridRetriever:
                 continue
             sparse_query_vector = self._sparse_query_vector(binding, sparse_query)
             for stage in stage_plan:
-                if getattr(stage, "trigger", "always") != "always" and len(results) >= int(getattr(stage, "min_hits", 0) or 0):
+                if getattr(stage, "trigger", "always") != "always" and len(results) >= int(
+                    getattr(stage, "min_hits", 0) or 0
+                ):
                     continue
                 item_kind = str(getattr(stage, "collection", "") or "")
                 if self._vector_repo.count_vectors(embedding_space=target_space, item_kind=item_kind) <= 0:
                     continue
-                remaining = max(min(int(getattr(stage, "limit", branch_limit) or branch_limit), branch_limit) - len(results), 1)
+                remaining = max(
+                    min(int(getattr(stage, "limit", branch_limit) or branch_limit), branch_limit) - len(results), 1
+                )
                 hits = await self._hybrid_search(
                     query_vector=query_vectors[0],
                     sparse_query=sparse_query,
@@ -517,10 +521,7 @@ class SearchBackedRetrievalFactory:
     ) -> list[RetrievedCandidate]:
         query_terms = search_terms(query)
         lowered = query.lower()
-        target_aliases = {
-            target: set(special_target_aliases(target))
-            for target in retrieval_signals.special_targets
-        }
+        target_aliases = {target: set(special_target_aliases(target)) for target in retrieval_signals.special_targets}
         if not target_aliases:
             return []
         candidates: list[RetrievedCandidate] = []
@@ -560,7 +561,15 @@ class SearchBackedRetrievalFactory:
         document_titles = set(retrieval_signals.metadata_filters.document_titles)
         file_names = set(retrieval_signals.metadata_filters.file_names)
         special_targets = set(retrieval_signals.special_targets)
-        if not (page_numbers or page_ranges or source_types or focus_terms or document_titles or file_names or special_targets):
+        if not (
+            page_numbers
+            or page_ranges
+            or source_types
+            or focus_terms
+            or document_titles
+            or file_names
+            or special_targets
+        ):
             return []
 
         candidates: list[RetrievedCandidate] = []
@@ -900,7 +909,9 @@ class SearchBackedRetrievalFactory:
         return GroundingTarget(
             kind=target_kind,
             doc_id=int(str(result.doc_id)),
-            source_id=None if (result.source_id or metadata.get("source_id")) in {None, ""} else int(str(result.source_id or metadata.get("source_id"))),
+            source_id=None
+            if (result.source_id or metadata.get("source_id")) in {None, ""}
+            else int(str(result.source_id or metadata.get("source_id"))),
             section_id=None if section_id in {None, ""} else int(str(section_id)),
             asset_id=None if asset_id in {None, ""} else int(str(asset_id)),
             page_start=page_start,
@@ -966,10 +977,7 @@ class SearchBackedRetrievalFactory:
         if page_numbers and pages & page_numbers:
             return True
         return any(
-            any(
-                getattr(page_range, "start", 0) <= page <= getattr(page_range, "end", 0)
-                for page in pages
-            )
+            any(getattr(page_range, "start", 0) <= page <= getattr(page_range, "end", 0) for page in pages)
             for page_range in page_ranges
         )
 
@@ -978,11 +986,7 @@ class SearchBackedRetrievalFactory:
         if not source_scope:
             return documents
         allowed = {str(item) for item in source_scope}
-        return [
-            document
-            for document in documents
-            if {str(document.doc_id), str(document.source_id)} & allowed
-        ]
+        return [document for document in documents if {str(document.doc_id), str(document.source_id)} & allowed]
 
     def _get_document(self, doc_id: int | str) -> Document | None:
         get_document = getattr(self._metadata_repo, "get_document", None)

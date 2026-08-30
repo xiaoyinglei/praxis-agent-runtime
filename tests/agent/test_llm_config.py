@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from rag.agent.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
 
 
 class TestModelSpec:

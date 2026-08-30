@@ -11,16 +11,26 @@ from typing import Any
 
 import pytest
 
-from rag.agent.tools.builtins import (
+from agent_runtime.tools.builtins import (
     RESIDENT_CODING_TOOL_NAMES,
     create_resident_coding_tools,
 )
-from rag.agent.tools.builtins import search as search_module
-from rag.agent.tools.builtins import shell as shell_module
-from rag.agent.tools.executor import ToolExecution, ToolExecutor
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import Tool, ToolCall, ToolCallOrigin, ToolEffect
-from rag.agent.workspace import WorkspaceRuntime, open_workspace
+from agent_runtime.tools.builtins import search as search_module
+from agent_runtime.tools.builtins import shell as shell_module
+from agent_runtime.tools.evidence import (
+    runtime_workspace_change,
+    runtime_workspace_file_changes,
+)
+from agent_runtime.tools.executor import ToolExecution, ToolExecutor
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
+    Tool,
+    ToolCall,
+    ToolCallOrigin,
+    ToolEffect,
+    ToolValidationError,
+)
+from agent_runtime.workspace import WorkspaceRuntime, open_workspace
 
 
 def _origin(tool_name: str) -> ToolCallOrigin:
@@ -88,12 +98,19 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         },
     )
 
+    assert all(
+        " finish" not in tool.definition.description.lower()
+        for tool in tools
+    )
+
     assert RESIDENT_CODING_TOOL_NAMES == (
-        "list_files",
         "search_text",
+        "list_files",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
     )
     assert tuple(tool.definition.name for tool in tools) == RESIDENT_CODING_TOOL_NAMES
@@ -108,6 +125,73 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         assert all(
             isinstance(schema, Mapping) and schema.get("description")
             for schema in properties.values()
+        )
+
+
+def test_resident_tool_docs_distinguish_content_from_behavior(
+    tmp_path: Path,
+) -> None:
+    tools = _tools_by_name(open_workspace(tmp_path, create=True))
+
+    assert "Reuse a sufficient result" in tools["read_file"].definition.description
+    assert "past end-of-file do not verify text content" in (
+        tools["read_file"].definition.description
+    )
+    assert "never reapply the patch" in (
+        tools["apply_patch"].definition.description.casefold()
+    )
+    assert "instead of pre-reading" in tools["apply_patch"].definition.description
+    assert "never both" in tools["apply_patch"].definition.description
+    assert "non-truncated" in tools["search_text"].definition.description
+    assert "never batch paired confirmations" in (
+        tools["search_text"].definition.description
+    )
+    assert "verify code behavior" in tools["run_command"].definition.description
+    assert "solely to reconfirm" in tools["run_command"].definition.description
+    assert "without returning raw binary bytes" in (
+        tools["inspect_data_file"].definition.description
+    )
+    assert "does not use shell heredocs" in (
+        tools["execute_python"].definition.description
+    )
+
+
+def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:
+    summary = b"short test summary: FAILED tests/test_api.py::test_contract\n"
+    payload = b"collection started\n" + (b"x" * 60_000) + summary
+
+    bounded, truncated = shell_module._bounded_stream(payload)
+
+    assert truncated is True
+    assert bounded.startswith("collection started\n")
+    assert bounded.endswith(summary.decode())
+    assert "output truncated; preserved head and tail" in bounded
+    assert len(bounded.encode("utf-8")) <= shell_module._MAX_STREAM_BYTES
+
+
+def test_run_command_normalizes_unambiguous_millisecond_timeout(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    command = _tools_by_name(workspace)["run_command"]
+
+    validated = command.validate_input(
+        {
+            "command": "uv run pytest -q tests/agent/test_agent_loop_runtime.py",
+            "timeout_seconds": 120_000,
+        }
+    )
+
+    assert validated["timeout_seconds"] == 120.0
+    timeout_schema = command.definition.input_schema["properties"]["timeout_seconds"]
+    assert isinstance(timeout_schema, Mapping)
+    assert timeout_schema["maximum"] == 600_000.0
+    with pytest.raises(ToolValidationError, match="timeout_seconds"):
+        command.validate_input(
+            {
+                "command": "uv run pytest -q",
+                "timeout_seconds": 601,
+            }
         )
 
 
@@ -195,6 +279,26 @@ async def test_filesystem_tools_list_read_patch_and_expose_changes_immediately(
     assert "-needle_one()" in patch_diff
     assert "+fresh_symbol()" in patch_diff
     assert patched.result.metadata["diff_truncated"] is False
+    assert "workspace_changed" not in patched.result.metadata
+    assert "before_sha256" not in patched.result.metadata
+    assert "after_sha256" not in patched.result.metadata
+    assert patched.result.metadata["runtime_workspace_write"] is True
+    assert patched.result.metadata["workspace_tree_changed"] is True
+    assert len(
+        str(patched.result.metadata["workspace_tree_before_sha256"])
+    ) == 64
+    assert len(
+        str(patched.result.metadata["workspace_tree_after_sha256"])
+    ) == 64
+    assert (
+        patched.result.metadata["workspace_tree_before_sha256"]
+        != patched.result.metadata["workspace_tree_after_sha256"]
+    )
+    [(changed_path, before_sha256, after_sha256)] = (
+        runtime_workspace_file_changes(patched.result)
+    )
+    assert changed_path == "src/example.py"
+    assert before_sha256 != after_sha256
     assert old_search.result.structured_content is not None
     assert old_search.result.structured_content["matches"] == ()
     assert new_search.result.structured_content is not None
@@ -258,6 +362,30 @@ async def test_read_file_supports_source_line_windows_and_continuation(
 
 
 @pytest.mark.anyio
+async def test_read_file_accepts_common_offset_plus_max_lines_aci(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    (workspace.root / "lines.py").write_text(
+        "line_1\nline_2\nline_3\nline_4\nline_5\n",
+        encoding="utf-8",
+    )
+
+    execution = await _execute(
+        _tools_by_name(workspace)["read_file"],
+        {"path": "lines.py", "offset": 3, "max_lines": 2},
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is False
+    assert execution.result.structured_content is not None
+    output = execution.result.structured_content
+    assert output["content"] == "line_3\nline_4\n"
+    assert output["start_line"] == 3
+    assert output["end_line"] == 4
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("arguments", "error_code"),
     [
@@ -306,6 +434,101 @@ async def test_apply_patch_non_effect_is_a_canonical_tool_error(
     assert execution.result.error_message
     assert execution.result.structured_content is not None
     assert execution.result.structured_content["replaced"] is False
+
+
+@pytest.mark.anyio
+async def test_apply_patch_rejects_replacement_with_identical_content(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    target = workspace.root / "notes.txt"
+    target.write_text("same", encoding="utf-8")
+
+    execution = await _execute(
+        _tools_by_name(workspace)["apply_patch"],
+        {
+            "file_path": "notes.txt",
+            "old_string": "same",
+            "new_string": "same",
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert execution.result.error_code == "patch_no_change"
+    assert execution.result.metadata.get("workspace_changed") is not True
+    assert target.read_text(encoding="utf-8") == "same"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "file_path",
+    [".venv/bin/pytest", "node_modules/.bin/eslint"],
+)
+async def test_apply_patch_cannot_replace_verification_toolchain(
+    tmp_path: Path,
+    file_path: str,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    target = workspace.root / file_path
+    target.parent.mkdir(parents=True)
+    target.write_text("trusted\n", encoding="utf-8")
+    tool = _tools_by_name(workspace)["apply_patch"]
+
+    execution = await _execute(
+        tool,
+        {
+            "file_path": file_path,
+            "old_string": "trusted",
+            "new_string": "exit 0",
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert target.read_text(encoding="utf-8") == "trusted\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "alias_kind",
+    ["toolchain-directory", "verifier-file"],
+)
+async def test_apply_patch_rejects_protected_symlink_path(
+    tmp_path: Path,
+    alias_kind: str,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    if alias_kind == "toolchain-directory":
+        writable_toolchain = workspace.root / "writable-toolchain"
+        target = writable_toolchain / "bin" / "pytest"
+        target.parent.mkdir(parents=True)
+        target.write_text("trusted\n", encoding="utf-8")
+        (workspace.root / ".venv").symlink_to(
+            writable_toolchain,
+            target_is_directory=True,
+        )
+    else:
+        target = workspace.root / "scripts" / "pytest"
+        target.parent.mkdir(parents=True)
+        target.write_text("trusted\n", encoding="utf-8")
+        alias = workspace.root / ".venv" / "bin" / "pytest"
+        alias.parent.mkdir(parents=True)
+        alias.symlink_to(target)
+    tool = _tools_by_name(workspace)["apply_patch"]
+
+    execution = await _execute(
+        tool,
+        {
+            "file_path": ".venv/bin/pytest",
+            "old_string": "trusted",
+            "new_string": "exit 0",
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert target.read_text(encoding="utf-8") == "trusted\n"
 
 
 @pytest.mark.anyio
@@ -372,6 +595,9 @@ async def test_search_text_supports_literal_regex_path_glob_context_and_limits(
     )
 
     assert literal.result.structured_content is not None
+    assert literal.result.structured_content["searched_file_path"] == (
+        "src/one.py"
+    )
     literal_matches = literal.result.structured_content["matches"]
     assert len(literal_matches) == 1
     assert literal_matches[0]["file_path"] == "src/one.py"
@@ -393,6 +619,70 @@ async def test_search_text_supports_literal_regex_path_glob_context_and_limits(
     assert limited.result.structured_content["total_matches"] == 1
     assert limited.result.structured_content["truncated"] is True
     assert invalid_regex.result.error_code == "invalid_arguments"
+
+
+@pytest.mark.anyio
+async def test_search_text_reports_only_exact_text_file_provenance(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    source = workspace.root / "src"
+    source.mkdir()
+    (source / "only.txt").write_text("alpha\n", encoding="utf-8")
+    (source / "binary.bin").write_bytes(b"alpha\x00omega")
+    (source / "large.txt").write_text(
+        "x" * (search_module._MAX_SEARCH_FILE_BYTES + 1),
+        encoding="utf-8",
+    )
+    search = _tools_by_name(workspace)["search_text"]
+
+    exact = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/only.txt"},
+        workspace=workspace,
+    )
+    excluded = await _execute(
+        search,
+        {
+            "pattern": "missing",
+            "path": "src/only.txt",
+            "glob": "*.py",
+        },
+        workspace=workspace,
+    )
+    binary = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/binary.bin"},
+        workspace=workspace,
+    )
+    directory = await _execute(
+        search,
+        {
+            "pattern": "missing",
+            "path": "src",
+            "glob": "only.txt",
+        },
+        workspace=workspace,
+    )
+    truncated = await _execute(
+        search,
+        {"pattern": "missing", "path": "src/large.txt"},
+        workspace=workspace,
+    )
+
+    assert exact.result.structured_content is not None
+    assert exact.result.structured_content["searched_file_path"] == (
+        "src/only.txt"
+    )
+    assert exact.result.structured_content["truncated"] is False
+    for execution in (excluded, binary, directory):
+        assert execution.result.structured_content is not None
+        assert execution.result.structured_content["searched_file_path"] is None
+    assert truncated.result.structured_content is not None
+    assert truncated.result.structured_content["searched_file_path"] == (
+        "src/large.txt"
+    )
+    assert truncated.result.structured_content["truncated"] is True
 
 
 @pytest.mark.anyio
@@ -428,6 +718,71 @@ async def test_search_text_prioritizes_source_and_returns_local_context(
         "",
     )
     assert match["context_after"] == ("    revision: int = 0",)
+    assert execution.result.structured_content["truncated"] is True
+
+
+@pytest.mark.anyio
+async def test_search_text_deprioritizes_agent_support_sources_at_workspace_root(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    product_source = workspace.root / "src"
+    support_source = workspace.root / ".agents" / "skills" / "helper"
+    product_source.mkdir()
+    support_source.mkdir(parents=True)
+    (product_source / "runtime.py").write_text(
+        "class RuntimeSystem:\n    pass\n",
+        encoding="utf-8",
+    )
+    (support_source / "scripts.py").write_text(
+        "class SupportSystem:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    execution = await _execute(
+        _tools_by_name(workspace)["search_text"],
+        {"pattern": "System", "path": ".", "max_results": 1},
+        workspace=workspace,
+    )
+
+    assert execution.result.structured_content is not None
+    [match] = execution.result.structured_content["matches"]
+    assert match["file_path"] == "src/runtime.py"
+
+
+@pytest.mark.anyio
+async def test_search_text_directory_results_are_diverse_across_matching_files(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    source = workspace.root / "src"
+    source.mkdir()
+    (source / "noisy.py").write_text(
+        "\n".join(f"OpenAI noisy reference {index}" for index in range(20)),
+        encoding="utf-8",
+    )
+    (source / "relevant.py").write_text(
+        "class OpenAIWireRequest:\n    pass\n",
+        encoding="utf-8",
+    )
+
+    execution = await _execute(
+        _tools_by_name(workspace)["search_text"],
+        {
+            "pattern": "OpenAI",
+            "path": "src",
+            "max_results": 5,
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.structured_content is not None
+    matches = execution.result.structured_content["matches"]
+    assert len(matches) == 5
+    assert {match["file_path"] for match in matches} == {
+        "src/noisy.py",
+        "src/relevant.py",
+    }
     assert execution.result.structured_content["truncated"] is True
 
 
@@ -502,8 +857,15 @@ async def test_update_plan_uses_the_injected_state_callback(tmp_path: Path) -> N
         {
             "explanation": "Show the next implementation checkpoint.",
             "plan": [
-                {"step": "Implement the resident tools", "status": "in_progress"},
-                {"step": "Run focused tests", "status": "pending"},
+                {
+                    "step_id": "step_implement",
+                    "step": "Implement the resident tools",
+                    "status": "in_progress",
+                },
+                {
+                    "step": "Run focused tests",
+                    "status": "pending",
+                },
             ],
         },
         workspace=workspace,
@@ -514,9 +876,89 @@ async def test_update_plan_uses_the_injected_state_callback(tmp_path: Path) -> N
         "accepted": True,
         "revision": 1,
         "message": "plan updated",
+        "authority": "advisory",
     }
     assert len(updates) == 1
+    assert updates[0]["plan"][0]["step_id"] == "step_implement"
     assert updates[0]["plan"][0]["step"] == "Implement the resident tools"
+    assert updates[0]["explanation"] == (
+        "Show the next implementation checkpoint."
+    )
+
+
+@pytest.mark.anyio
+async def test_update_plan_accepts_strategy_without_task_choreography(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    updates: list[Mapping[str, Any]] = []
+    update_plan = _tools_by_name(workspace, updates=updates)["update_plan"]
+
+    execution = await _execute(
+        update_plan,
+        {
+            "plan": [
+                {
+                    "step": "Try the next viable strategy",
+                    "status": "in_progress",
+                }
+            ],
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is False
+    assert set(updates[0]) == {"plan", "explanation"}
+    assert set(updates[0]["plan"][0]) == {
+        "step_id",
+        "step",
+        "status",
+    }
+
+
+@pytest.mark.anyio
+async def test_update_plan_requires_only_a_visible_plan(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    update_plan = _tools_by_name(workspace)["update_plan"]
+
+    missing_plan = await _execute(
+        update_plan,
+        {},
+        workspace=workspace,
+    )
+
+    assert missing_plan.result.error_code == "invalid_arguments"
+    assert "plan" in (missing_plan.result.error_message or "")
+    assert set(update_plan.definition.input_schema["required"]) == {"plan"}
+    assert "goal_id" not in update_plan.definition.input_schema["properties"]
+
+
+@pytest.mark.anyio
+async def test_update_plan_rejects_removed_plan_authority_fields(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    update_plan = _tools_by_name(workspace)["update_plan"]
+
+    execution = await _execute(
+        update_plan,
+        {
+            "target_files": ["../outside.py"],
+            "plan": [
+                {
+                    "step": "Read the target",
+                    "status": "in_progress",
+                }
+            ],
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert execution.result.error_code == "invalid_arguments"
+    assert "target_files" in (execution.result.error_message or "")
 
 
 @pytest.mark.anyio
@@ -545,6 +987,74 @@ async def test_run_command_returns_bounded_structured_process_output(
     assert execution.result.structured_content["timed_out"] is False
     assert execution.result.structured_content["execution_mode"] == "restricted_sandbox"
     assert execution.result.structured_content["network_enabled"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_run_command_workspace_write_emits_runtime_change_evidence(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    target = workspace.root / "source.py"
+    target.write_text("before\n", encoding="utf-8")
+    tool = _tools_by_name(workspace)["run_command"]
+    call = ToolCall(
+        tool_call_id="write-command",
+        tool_name="run_command",
+        arguments={
+            "command": "printf 'after\\n' > source.py",
+            "working_dir": ".",
+            "timeout_seconds": 1,
+            "workspace_write": True,
+        },
+        origin=_origin("run_command"),
+    )
+
+    execution = await ToolExecutor({"run_command": tool}).execute(
+        call,
+        context=ToolExecutionContext(
+            workspace_root=workspace.root,
+            cwd=workspace.root,
+            allow_write_tools=True,
+            allow_execute_tools=True,
+            approved_tool_call_ids=frozenset({call.tool_call_id}),
+        ),
+    )
+
+    assert target.read_text(encoding="utf-8") == "after\n"
+    assert execution.result.metadata["runtime_workspace_write"] is True
+    assert execution.result.metadata["workspace_tree_changed"] is True
+    assert runtime_workspace_change(execution.result) is not None
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_run_command_nonzero_exit_is_a_canonical_tool_failure(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    tools = _tools_by_name(workspace)
+
+    execution = await _execute(
+        tools["run_command"],
+        {
+            "command": "printf 'failure evidence' >&2; exit 7",
+            "working_dir": ".",
+            "timeout_seconds": 1,
+        },
+        workspace=workspace,
+    )
+
+    assert execution.result.is_error is True
+    assert execution.result.error_code == "command_failed"
+    assert execution.result.error_message == (
+        "command exited with status 7; changing timeout alone cannot fix a "
+        "completed command, so inspect stdout/stderr or change the command or code"
+    )
+    assert execution.result.retryable is False
+    assert execution.result.structured_content is not None
+    assert execution.result.structured_content["stderr"] == "failure evidence"
+    assert execution.result.structured_content["exit_code"] == 7
 
 
 @pytest.mark.anyio

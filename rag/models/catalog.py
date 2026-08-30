@@ -5,14 +5,14 @@ from typing import Any
 
 import yaml
 
-from rag.models.config import (
+from agent_runtime.modeling.config import (
     GenerationConfig,
     GenerationTaskConfig,
     ModelCapability,
     ModelSpec,
     TokenizerModelConfig,
 )
-from rag.schema.llm import LLMCallStage, LLMStageBudget, parse_llm_stage_budgets
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget, parse_llm_stage_budgets
 
 _DEFAULT_CATALOG_PATH = "configs/models.yaml"
 
@@ -69,19 +69,13 @@ class ModelCatalog:
             models[alias] = ModelSpec(
                 alias=alias,
                 capability=ModelCapability(entry["capability"]),
-                provider=str(
-                    merged.get("protocol")
-                    or merged.get("provider")
-                    or entry["provider"]
-                ),
+                provider=str(merged.get("protocol") or merged.get("provider") or entry["provider"]),
                 model=entry["model"],
                 base_url=_optional_str(merged.get("base_url")),
                 api_key_env=_optional_str(merged.get("api_key_env")),
                 embedding_space=entry.get("embedding_space"),
                 context_window_tokens=(
-                    int(entry["context_window_tokens"])
-                    if "context_window_tokens" in entry
-                    else None
+                    int(entry["context_window_tokens"]) if "context_window_tokens" in entry else None
                 ),
             )
 
@@ -122,9 +116,6 @@ class ModelCatalog:
             planner=_parse_task("planner"),
             synthesize=_parse_task("synthesize"),
             factcheck=_parse_task("factcheck"),
-            memory_select=_parse_task("memory_select"),
-            memory_extract=_parse_task("memory_extract"),
-            memory_consolidate=_parse_task("memory_consolidate"),
         )
 
     @property
@@ -137,10 +128,7 @@ class ModelCatalog:
 
     @property
     def llm_stage_budgets(self) -> dict[LLMCallStage, LLMStageBudget]:
-        return {
-            stage: budget.model_copy()
-            for stage, budget in self._llm_stage_budgets.items()
-        }
+        return {stage: budget.model_copy() for stage, budget in self._llm_stage_budgets.items()}
 
     def get_model(self, alias: str) -> ModelSpec:
         spec = self._models.get(alias)

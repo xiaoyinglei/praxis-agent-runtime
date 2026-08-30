@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from rag.agent.workspace import (
+from agent_runtime.workspace import (
     WorkspacePathError,
     WorkspaceRuntime,
     create_temp_workspace,
     import_files,
     open_workspace,
+    workspace_tree_sha256,
 )
 
 # ---------------------------------------------------------------------------
@@ -54,25 +57,29 @@ class TestWorkspaceInitialize:
 
 
 class TestWorkspaceProperties:
+    def test_runtime_root_uses_praxis_namespace(self, tmp_path: Path) -> None:
+        ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
+        assert ws.runtime_root == tmp_path / ".praxis" / "runtime"
+
     def test_input_files(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.input_files == tmp_path / ".rag" / "agent_runtime" / "input_files"
+        assert ws.input_files == tmp_path / ".praxis" / "runtime" / "input_files"
 
     def test_scratch(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.scratch == tmp_path / ".rag" / "agent_runtime" / "scratch"
+        assert ws.scratch == tmp_path / ".praxis" / "runtime" / "scratch"
 
     def test_artifacts(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.artifacts == tmp_path / ".rag" / "agent_runtime" / "artifacts"
+        assert ws.artifacts == tmp_path / ".praxis" / "runtime" / "artifacts"
 
     def test_reports(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.reports == tmp_path / ".rag" / "agent_runtime" / "reports"
+        assert ws.reports == tmp_path / ".praxis" / "runtime" / "reports"
 
     def test_logs(self, tmp_path: Path) -> None:
         ws = WorkspaceRuntime(root=tmp_path, is_temporary=False)
-        assert ws.logs == tmp_path / ".rag" / "agent_runtime" / "logs"
+        assert ws.logs == tmp_path / ".praxis" / "runtime" / "logs"
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +238,154 @@ class TestOpenWorkspace:
 
 
 # ---------------------------------------------------------------------------
+# workspace_tree_sha256
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceTreeSha256:
+    def test_temporary_runtime_writes_do_not_count_as_user_changes(self) -> None:
+        workspace = create_temp_workspace()
+        try:
+            baseline = workspace_tree_sha256(workspace.root)
+
+            (workspace.scratch / "skill.py").write_text(
+                "runtime helper\n",
+                encoding="utf-8",
+            )
+            (workspace.logs / "runtime.log").write_text(
+                "runtime\n",
+                encoding="utf-8",
+            )
+
+            assert workspace_tree_sha256(workspace.root) == baseline
+        finally:
+            shutil.rmtree(workspace.root, ignore_errors=True)
+
+    def test_non_git_snapshot_counts_source_but_not_runtime_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        workspace = open_workspace(tmp_path)
+        baseline = workspace_tree_sha256(workspace.root)
+
+        (workspace.logs / "runtime.log").write_text("runtime\n", encoding="utf-8")
+        assert workspace_tree_sha256(workspace.root) == baseline
+
+        (workspace.root / "source.py").write_text("value = 1\n", encoding="utf-8")
+        assert workspace_tree_sha256(workspace.root) != baseline
+
+    def test_git_snapshot_tracks_dirty_and_untracked_source_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git is unavailable")
+        repository = tmp_path / "repository"
+        repository.mkdir()
+        subprocess.run(
+            (git, "init", "--quiet"),
+            cwd=repository,
+            check=True,
+        )
+        (repository / ".gitignore").write_text(".cache/\n", encoding="utf-8")
+        source = repository / "source.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run(
+            (git, "add", ".gitignore", "source.py"),
+            cwd=repository,
+            check=True,
+        )
+        subprocess.run(
+            (
+                git,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ),
+            cwd=repository,
+            check=True,
+        )
+        baseline = workspace_tree_sha256(repository)
+
+        source.write_text("value = 2\n", encoding="utf-8")
+        assert workspace_tree_sha256(repository) != baseline
+        source.write_text("value = 1\n", encoding="utf-8")
+        assert workspace_tree_sha256(repository) == baseline
+
+        untracked = repository / "new_source.py"
+        untracked.write_text("new = True\n", encoding="utf-8")
+        assert workspace_tree_sha256(repository) != baseline
+        untracked.unlink()
+
+        ignored = repository / ".cache" / "runtime.bin"
+        ignored.parent.mkdir()
+        ignored.write_bytes(b"runtime")
+        assert workspace_tree_sha256(repository) == baseline
+
+        runtime_log = repository / ".praxis" / "runtime" / "logs" / "run.log"
+        runtime_log.parent.mkdir(parents=True)
+        runtime_log.write_text("runtime\n", encoding="utf-8")
+        assert workspace_tree_sha256(repository) == baseline
+
+    def test_snapshot_ignores_git_index_and_head_only_changes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        git = shutil.which("git")
+        if git is None:
+            pytest.skip("git is unavailable")
+        repository = tmp_path / "repository"
+        repository.mkdir()
+        subprocess.run((git, "init", "--quiet"), cwd=repository, check=True)
+        source = repository / "source.py"
+        source.write_text("value = 1\n", encoding="utf-8")
+        subprocess.run((git, "add", "source.py"), cwd=repository, check=True)
+        subprocess.run(
+            (
+                git,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ),
+            cwd=repository,
+            check=True,
+        )
+
+        source.write_text("value = 2\n", encoding="utf-8")
+        changed_filesystem = workspace_tree_sha256(repository)
+        subprocess.run((git, "add", "source.py"), cwd=repository, check=True)
+        assert workspace_tree_sha256(repository) == changed_filesystem
+
+        subprocess.run(
+            (
+                git,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "metadata only",
+            ),
+            cwd=repository,
+            check=True,
+        )
+        assert workspace_tree_sha256(repository) == changed_filesystem
+
+
+# ---------------------------------------------------------------------------
 # import_files
 # ---------------------------------------------------------------------------
 
@@ -297,20 +452,20 @@ class TestImportFiles:
 
 class TestUniqueDest:
     def test_no_collision(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest == tmp_path / "file.txt"
 
     def test_collision_appends_counter(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("existing")
         dest = _unique_dest(tmp_path, "file.txt")
         assert dest.name == "file__1.txt"
 
     def test_multiple_collisions(self, tmp_path: Path) -> None:
-        from rag.agent.workspace import _unique_dest
+        from agent_runtime.workspace import _unique_dest
 
         (tmp_path / "file.txt").write_text("1")
         (tmp_path / "file__1.txt").write_text("2")

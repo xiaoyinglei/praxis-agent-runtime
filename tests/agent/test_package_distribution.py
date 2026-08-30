@@ -34,7 +34,7 @@ def test_built_wheel_loads_bundled_qwen35_model_outside_repo(
         import json
 
         import agent_runtime
-        import rag.agent.core.llm_registry as registry_module
+        import agent_runtime.core.llm_registry as registry_module
         from agent_runtime import Agent
 
         spec = Agent(model="qwen3_5_9b_mlx_4bit").current_model()

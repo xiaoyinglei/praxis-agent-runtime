@@ -2,8 +2,7 @@
   "schema_version": 1,
   "suite_id": "agent-model-tool-quality-v1",
   "models": [
-    "qwen3_5_9b_mlx_4bit",
-    "groq_gpt_oss_120b"
+    "deepseek_v4_flash"
   ],
   "cases": [
     {

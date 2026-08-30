@@ -11,11 +11,11 @@ from pathlib import Path
 from threading import BoundedSemaphore
 from typing import Any, Protocol, cast
 
+from agent_runtime.text import DEFAULT_TOKENIZER_FALLBACK_MODEL, keyword_overlap, search_terms
 from rag.ingest.asset_anchors import asset_anchor
 from rag.schema.core import AssetRecord, LayoutMetaCacheRecord, SectionRecord
 from rag.schema.query import EvidenceItem, GroundingTarget
 from rag.utils.guard import CircuitBreaker
-from rag.utils.text import DEFAULT_TOKENIZER_FALLBACK_MODEL, keyword_overlap, search_terms
 
 MAX_COMPUTE_BLOCK_TOKENS = 1_500
 MAX_SCHEMA_COLUMNS = 30
@@ -246,9 +246,7 @@ class GroundingService:
         ranked = self._rank_local_items(local_items, query=query, query_terms=query_terms)
         return ranked[
             : max(
-                self.budgets.local_window_top_k
-                + self.budgets.max_neighbor_assets
-                + self.budgets.max_neighbor_sections,
+                self.budgets.local_window_top_k + self.budgets.max_neighbor_assets + self.budgets.max_neighbor_sections,
                 1,
             )
         ]
@@ -339,16 +337,16 @@ class GroundingService:
                 "citation_anchor": item.citation_anchor or f"{asset.asset_type}@p{asset.page_no}",
                 "page_start": asset.page_no,
                 "page_end": asset.page_no,
-                    "grounding_target": GroundingTarget(
-                        kind="asset",
-                        doc_id=asset.doc_id,
-                        source_id=asset.source_id,
-                        section_id=asset.section_id,
-                        asset_id=asset.asset_id,
-                        page_start=asset.page_no,
-                        page_end=asset.page_no,
-                        raw_locator=self._raw_locator_dict(asset.raw_locator),
-                    ),
+                "grounding_target": GroundingTarget(
+                    kind="asset",
+                    doc_id=asset.doc_id,
+                    source_id=asset.source_id,
+                    section_id=asset.section_id,
+                    asset_id=asset.asset_id,
+                    page_start=asset.page_no,
+                    page_end=asset.page_no,
+                    raw_locator=self._raw_locator_dict(asset.raw_locator),
+                ),
                 "retrieval_channels": [*item.retrieval_channels, "grounding"],
             }
         )
@@ -505,9 +503,7 @@ class GroundingService:
                 continue
             distance = abs(candidate_window_index - current_window_index)
             if distance <= radius:
-                selected_with_distance.append(
-                    (distance, candidate_window_index, candidate.order_index, candidate)
-                )
+                selected_with_distance.append((distance, candidate_window_index, candidate.order_index, candidate))
         selected_with_distance.sort(key=lambda item: (item[0], item[1], item[2], item[3].section_id))
         return [candidate for *_prefix, candidate in selected_with_distance[:max_sections]]
 
@@ -612,7 +608,7 @@ class GroundingService:
         parts.append("")
         parts.append("For ANY question involving actual data values — filtering by a value")
         parts.append('("Northern region"), aggregating ("total sales"), sorting ("top 5"),')
-        parts.append('or comparing rows — you MUST output a computation request in this')
+        parts.append("or comparing rows — you MUST output a computation request in this")
         parts.append("EXACT format:")
         parts.append("")
         parts.append("<compute_request>")
@@ -780,11 +776,7 @@ class GroundingService:
 
     def _raw_locator_dict(self, raw_locator: object) -> dict[str, str]:
         payload = self._raw_locator_payload(raw_locator)
-        return {
-            str(key): str(value)
-            for key, value in payload.items()
-            if value is not None and str(value).strip()
-        }
+        return {str(key): str(value) for key, value in payload.items() if value is not None and str(value).strip()}
 
     def _locator_key(self, raw_locator: object) -> str | None:
         payload = self._raw_locator_payload(raw_locator)
@@ -963,8 +955,7 @@ class GroundingService:
         if not items:
             return []
         lexical_scores = {
-            item.evidence_id: float(item.score) + 0.05 * keyword_overlap(query_terms, item.text)
-            for item in items
+            item.evidence_id: float(item.score) + 0.05 * keyword_overlap(query_terms, item.text) for item in items
         }
         rerank_bonus = self._rerank_bonus(query, items)
         return sorted(

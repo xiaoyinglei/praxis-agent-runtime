@@ -6,15 +6,13 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
-from agent_runtime.planning import AgentPlan, PlanEvent
-from rag.agent.core.human_input import HumanInputRequest, ToolCallSummary
-from rag.agent.core.runtime_diagnostics import RuntimeDiagnostic
-from rag.agent.tools.tool import JsonValue, ToolResult
-from rag.schema.llm import LLMUsage
-from rag.schema.query import AnswerCitation, EvidenceItem, GroundingTarget
+from agent_runtime.knowledge import AgentCitation, AgentEvidence, agent_evidence_from_value
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
+from agent_runtime.tools.tool import JsonValue
 
 if TYPE_CHECKING:
-    from rag.agent.service import AgentRunResult
+    from agent_runtime.harness.protocol import TurnResult
+    from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
 type AgentPauseKind = Literal[
@@ -56,51 +54,6 @@ class AgentToolCall:
                 "structured_output",
                 _freeze_json_value(self.structured_output),
             )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentEvidence:
-    evidence_id: str
-    doc_id: int
-    citation_anchor: str
-    text: str
-    score: float
-    benchmark_doc_id: str | None = None
-    source_id: int | None = None
-    evidence_kind: str = "internal"
-    record_type: str | None = None
-    file_name: str | None = None
-    section_path: tuple[str, ...] = ()
-    page_start: int | None = None
-    page_end: int | None = None
-    source_type: str | None = None
-    retrieval_channels: tuple[str, ...] = ()
-    retrieval_family: str | None = None
-    grounding_target: Mapping[str, JsonValue] | None = None
-
-    def __post_init__(self) -> None:
-        if self.grounding_target is not None:
-            object.__setattr__(
-                self,
-                "grounding_target",
-                _freeze_json_mapping(self.grounding_target),
-            )
-
-
-@dataclass(frozen=True, slots=True)
-class AgentCitation:
-    citation_id: str
-    evidence_id: str
-    record_type: str
-    file_name: str | None = None
-    section_path: tuple[str, ...] = ()
-    page_start: int | None = None
-    page_end: int | None = None
-    citation_anchor: str | None = None
-    doc_id: int | None = None
-    benchmark_doc_id: str | None = None
-    source_id: int | None = None
-    source_type: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,210 +138,408 @@ class AgentResult:
     insufficient_evidence: bool
     plan: AgentPlan | None
     plan_events: tuple[PlanEvent, ...]
+    needs_user_input: str | None = None
+    thread_id: str = ""
 
     @classmethod
-    def _from_internal(
+    def _from_harness(
         cls,
-        result: AgentRunResult,
+        result: TurnResult,
         *,
+        store: RolloutStore,
         files: tuple[str, ...] = (),
     ) -> AgentResult:
-        status = _project_status(result.status)
-        arguments_by_id = _tool_call_arguments(result)
-        projected_files = files or tuple(result.input_files)
+        turn = store.read_turn(result.turn_id)
+        thread = store.read_thread(result.thread_id)
+        attempts = tuple(
+            attempt
+            for operation in store.list_model_operations(result.turn_id)
+            for attempt in store.list_model_attempts(operation.operation_id)
+            if attempt.status == "completed"
+        )
+        usage_values = tuple(attempt.usage for attempt in attempts)
+        sources = tuple(
+            value
+            for usage in usage_values
+            if isinstance((value := usage.get("usage_source")), str)
+        )
+        items = store.list_items(result.turn_id)
+        arguments_by_id = {
+            str(item.payload["tool_call_id"]): item.payload.get("arguments")
+            for item in items
+            if item.kind == "tool_call"
+            and isinstance(item.payload.get("tool_call_id"), str)
+            and isinstance(item.payload.get("arguments"), Mapping)
+        }
+        projected_calls: list[AgentToolCall] = []
+        evidence: list[AgentEvidence] = []
+        citations: list[AgentCitation] = []
+        groundedness = False
+        insufficient_evidence = False
+        for item in items:
+            if item.kind != "tool_result":
+                continue
+            payload = item.payload
+            tool_call_id = payload.get("tool_call_id")
+            tool_name = payload.get("tool_name")
+            if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                continue
+            raw_structured = payload.get("structured_content")
+            structured = (
+                None
+                if raw_structured is None
+                else _freeze_json_value(raw_structured)
+            )
+            projected_calls.append(
+                AgentToolCall(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    arguments=cast(
+                        Mapping[str, JsonValue] | None,
+                        arguments_by_id.get(tool_call_id),
+                    ),
+                    structured_output=structured,
+                    is_error=payload.get("is_error") is True,
+                    error_code=(
+                        value
+                        if isinstance((value := payload.get("error_code")), str)
+                        else None
+                    ),
+                    error_message=(
+                        value
+                        if isinstance((value := payload.get("error_message")), str)
+                        else None
+                    ),
+                    retryable=payload.get("retryable") is True,
+                    truncated=payload.get("truncated") is True,
+                )
+            )
+            if tool_name != "search_knowledge" or not isinstance(
+                raw_structured, Mapping
+            ):
+                continue
+            groundedness = raw_structured.get("groundedness_flag") is True
+            insufficient_evidence = (
+                raw_structured.get("insufficient_evidence") is True
+            )
+            raw_evidence = raw_structured.get("results")
+            if isinstance(raw_evidence, Sequence) and not isinstance(
+                raw_evidence, (str, bytes)
+            ):
+                for value in raw_evidence:
+                    if isinstance(value, Mapping):
+                        evidence.append(agent_evidence_from_value(value))
+            evidence_by_anchor = {
+                item.citation_anchor: item for item in evidence
+            }
+            raw_citations = raw_structured.get("citations")
+            if isinstance(raw_citations, Sequence) and not isinstance(
+                raw_citations, (str, bytes)
+            ):
+                for value in raw_citations:
+                    if not isinstance(value, str):
+                        continue
+                    source = evidence_by_anchor.get(value)
+                    citations.append(
+                        AgentCitation(
+                            citation_id=value,
+                            evidence_id=("" if source is None else source.evidence_id),
+                            record_type=(
+                                "knowledge"
+                                if source is None or source.source_type is None
+                                else source.source_type
+                            ),
+                            file_name=(None if source is None else source.file_name),
+                            citation_anchor=value,
+                            doc_id=(None if source is None else source.doc_id),
+                            source_type=(None if source is None else source.source_type),
+                        )
+                    )
+        pause: AgentPause | None = None
+        pending = tuple(
+            interaction
+            for interaction in store.list_interactions(result.turn_id)
+            if interaction.status == "pending"
+        )
+        if len(pending) == 1 and pending[0].kind in {
+            "tool_approval",
+            "tool_reconciliation",
+            "choice",
+            "clarification",
+        }:
+            interaction = pending[0]
+            reason = interaction.request.get("reason")
+            requested_question = interaction.request.get("question")
+            question = (
+                reason
+                if isinstance(reason, str) and reason
+                else requested_question
+                if isinstance(requested_question, str) and requested_question
+                else f"Input required for {interaction.kind}"
+            )
+            summaries: tuple[AgentToolSummary, ...] = ()
+            if interaction.operation_id is not None:
+                operation = store.read_tool_operation(interaction.operation_id)
+                arguments = arguments_by_id.get(operation.tool_call_id)
+                effects = interaction.request.get("effects")
+                summaries = (
+                    AgentToolSummary(
+                        tool_call_id=operation.tool_call_id,
+                        tool_name=operation.tool_name,
+                        args_preview=(
+                            "" if arguments is None else str(dict(arguments))[:1000]
+                        ),
+                        approval_id=interaction.request_id,
+                        risk_level=("high" if effects else "low"),
+                        reason=question,
+                    ),
+                )
+            pause = AgentPause(
+                request_id=interaction.request_id,
+                kind=cast(AgentPauseKind, interaction.kind),
+                question=question,
+                tool_calls=summaries,
+                options=_interaction_options(interaction.kind, interaction.request),
+                context=cast(Mapping[str, JsonValue], interaction.request),
+            )
+        plan, plan_events = _project_harness_plan(items, turn_status=turn.status)
+        unknown_model_diagnostics = tuple(
+            record
+            for record in store.list_records(thread.thread_id)
+            if record.turn_id == turn.turn_id
+            and record.record_type == "model_attempt_unknown"
+            and isinstance(record.payload.get("error_type"), str)
+            and isinstance(record.payload.get("error_message"), str)
+        )
+        incomplete_model_responses = tuple(
+            item
+            for item in items
+            if item.kind == "model_response"
+            and item.payload.get("response_status") == "incomplete"
+            and isinstance(item.payload.get("incomplete_reason"), str)
+        )
+        rejected_model_diagnostics = tuple(
+            record
+            for record in store.list_records(thread.thread_id)
+            if record.turn_id == turn.turn_id
+            and record.record_type == "model_attempt_rejected"
+            and isinstance(record.payload.get("error_type"), str)
+            and isinstance(record.payload.get("error_message"), str)
+        )
+        projected_diagnostics: list[AgentDiagnostic] = []
+        if unknown_model_diagnostics:
+            projected_diagnostics.append(
+                AgentDiagnostic(
+                    code="model_dispatch_outcome_unknown",
+                    component="model",
+                    message=str(
+                        unknown_model_diagnostics[-1].payload["error_message"]
+                    ),
+                    severity="warning",
+                    degraded=True,
+                    error_type=str(
+                        unknown_model_diagnostics[-1].payload["error_type"]
+                    ),
+                ),
+            )
+        if rejected_model_diagnostics:
+            rejected = rejected_model_diagnostics[-1]
+            projected_diagnostics.append(
+                AgentDiagnostic(
+                    code="model_dispatch_rejected",
+                    component="model",
+                    message=str(rejected.payload["error_message"]),
+                    severity="error",
+                    degraded=True,
+                    error_type=str(rejected.payload["error_type"]),
+                )
+            )
+        if incomplete_model_responses:
+            reason = str(incomplete_model_responses[-1].payload["incomplete_reason"])
+            projected_diagnostics.append(
+                AgentDiagnostic(
+                    code="model_response_incomplete",
+                    component="model",
+                    message=f"Model response was incomplete: {reason}.",
+                    severity="error",
+                    degraded=True,
+                    error_type="IncompleteModelResponse",
+                )
+            )
+        diagnostics = tuple(projected_diagnostics)
         return cls(
-            answer=result.final_answer,
-            status=status,
-            files=projected_files,
-            tool_calls=tuple(_project_tool_call(tool, arguments_by_id=arguments_by_id) for tool in result.tool_results),
-            evidence=tuple(_project_evidence(item) for item in result.evidence),
-            citations=tuple(_project_citation(item) for item in result.citations),
-            usage=_project_usage(result),
-            diagnostics=tuple(_project_diagnostic(item) for item in result.runtime_diagnostics),
-            turn_id=result.turn_id,
-            stop_reason=result.stop_reason,
-            pause=_project_pause(result.human_input_request),
-            workspace_path=result.workspace_path,
-            groundedness=result.groundedness_flag,
-            insufficient_evidence=result.insufficient_evidence_flag,
-            plan=(None if result.plan is None else result.plan.model_copy(deep=True)),
-            plan_events=tuple(event.model_copy(deep=True) for event in result.plan_events),
+            answer=result.answer,
+            status={
+                "completed": "done",
+                "paused": "paused",
+            }.get(result.status, "failed"),  # type: ignore[arg-type]
+            files=files,
+            tool_calls=tuple(projected_calls),
+            evidence=tuple(evidence),
+            citations=tuple(citations),
+            usage=AgentUsage(
+                input_tokens=sum(_usage_integer(usage, "input_tokens") for usage in usage_values),
+                output_tokens=sum(_usage_integer(usage, "output_tokens") for usage in usage_values),
+                total_tokens=sum(_usage_integer(usage, "total_tokens") for usage in usage_values),
+                tool_calls=len(projected_calls),
+                model_calls=len(attempts),
+                usage_source=(
+                    None
+                    if not sources
+                    else sources[0] if len(set(sources)) == 1 else "mixed"
+                ),
+            ),
+            diagnostics=diagnostics,
+            turn_id=turn.turn_id,
+            stop_reason=turn.status,
+            pause=pause,
+            workspace_path=thread.workspace,
+            groundedness=groundedness,
+            insufficient_evidence=insufficient_evidence,
+            plan=plan,
+            plan_events=plan_events,
+            needs_user_input=None if pause is None else pause.question,
+            thread_id=thread.thread_id,
         )
 
 
-def _project_status(value: str) -> AgentResultStatus:
-    if value not in {"done", "paused", "failed"}:
-        raise ValueError(f"unsupported internal Agent result status: {value!r}")
-    return cast(AgentResultStatus, value)
-
-
-def _tool_call_arguments(
-    result: AgentRunResult,
-) -> Mapping[str, Mapping[str, JsonValue]]:
-    arguments = result.tool_call_arguments
-    return MappingProxyType({} if arguments is None else arguments)
-
-
-def _project_tool_call(
-    result: ToolResult,
+def _project_harness_plan(
+    items: Sequence[ItemSnapshot],
     *,
-    arguments_by_id: Mapping[str, Mapping[str, JsonValue]],
-) -> AgentToolCall:
-    arguments = arguments_by_id.get(result.tool_call_id)
-    return AgentToolCall(
-        tool_call_id=result.tool_call_id,
-        tool_name=result.tool_name,
-        arguments=arguments,
-        structured_output=result.structured_content,
-        is_error=result.is_error,
-        error_code=result.error_code,
-        error_message=result.error_message,
-        retryable=result.retryable,
-        truncated=result.truncated,
-        latency_ms=None,
+    turn_status: str,
+) -> tuple[AgentPlan | None, tuple[PlanEvent, ...]]:
+    objective = next(
+        (
+            item.payload.get("text")
+            for item in items
+            if item.kind == "user_message"
+            and isinstance(item.payload.get("text"), str)
+        ),
+        "Current task",
     )
-
-
-def _project_evidence(item: EvidenceItem) -> AgentEvidence:
-    return AgentEvidence(
-        evidence_id=item.evidence_id,
-        doc_id=item.doc_id,
-        benchmark_doc_id=item.benchmark_doc_id,
-        source_id=item.source_id,
-        citation_anchor=item.citation_anchor,
-        text=item.text,
-        score=item.score,
-        evidence_kind=item.evidence_kind,
-        record_type=item.record_type,
-        file_name=item.file_name,
-        section_path=tuple(item.section_path),
-        page_start=item.page_start,
-        page_end=item.page_end,
-        source_type=item.source_type,
-        retrieval_channels=tuple(item.retrieval_channels),
-        retrieval_family=item.retrieval_family,
-        grounding_target=_project_grounding_target(item.grounding_target),
+    successful_plan_calls = {
+        item.payload.get("tool_call_id")
+        for item in items
+        if item.kind == "tool_result"
+        and item.payload.get("tool_name") == "update_plan"
+        and item.payload.get("is_error") is not True
+    }
+    updates = [
+        item
+        for item in items
+        if item.kind == "tool_call"
+        and item.payload.get("tool_name") == "update_plan"
+        and item.payload.get("tool_call_id") in successful_plan_calls
+    ]
+    if not updates:
+        return None, ()
+    events: list[PlanEvent] = []
+    projected_steps: list[PlanStep] = []
+    summary: str | None = None
+    for revision, item in enumerate(updates, start=1):
+        arguments = item.payload.get("arguments")
+        if not isinstance(arguments, Mapping):
+            continue
+        raw_plan = arguments.get("plan")
+        if not isinstance(raw_plan, Sequence) or isinstance(raw_plan, (str, bytes)):
+            continue
+        candidate_steps: list[PlanStep] = []
+        for index, raw_step in enumerate(raw_plan, start=1):
+            if not isinstance(raw_step, Mapping):
+                continue
+            title = raw_step.get("step")
+            status = raw_step.get("status")
+            if not isinstance(title, str) or status not in {
+                "pending",
+                "in_progress",
+                "completed",
+            }:
+                continue
+            step_id = raw_step.get("step_id")
+            candidate_steps.append(
+                PlanStep(
+                    step_id=(
+                        step_id
+                        if isinstance(step_id, str) and step_id
+                        else f"step_{index}"
+                    ),
+                    title=title,
+                    status=status,
+                )
+            )
+        projected_steps = candidate_steps
+        explanation = arguments.get("explanation")
+        summary = explanation if isinstance(explanation, str) else None
+        call_id = str(item.payload.get("tool_call_id"))
+        events.append(
+            PlanEvent(
+                event_id=f"plan_event_{call_id}",
+                event_type="llm_update",
+                plan_revision=revision,
+                message=summary or "Applied update_plan tool update.",
+                related_step_id=next(
+                    (
+                        step.step_id
+                        for step in projected_steps
+                        if step.status == "in_progress"
+                    ),
+                    None,
+                ),
+                tool_call_ids=[call_id],
+            )
+        )
+    if not projected_steps:
+        return None, tuple(events)
+    revision = len(events)
+    if turn_status == "completed":
+        revision += 1
+        projected_steps = [
+            step.model_copy(update={"status": "completed"})
+            for step in projected_steps
+        ]
+        events.append(
+            PlanEvent(
+                event_id=f"plan_event_completed_{revision}",
+                event_type="completed",
+                plan_revision=revision,
+                message="Plan completed with the accepted Turn.",
+            )
+        )
+    plan = AgentPlan(
+        objective=str(objective),
+        status="complete" if turn_status == "completed" else "active",
+        revision=revision,
+        active_step_id=next(
+            (
+                step.step_id
+                for step in projected_steps
+                if step.status == "in_progress"
+            ),
+            None,
+        ),
+        steps=projected_steps,
+        summary=summary,
     )
+    return plan, tuple(events)
 
 
-def _project_grounding_target(
-    target: GroundingTarget | None,
-) -> Mapping[str, JsonValue] | None:
-    if target is None:
-        return None
-    return MappingProxyType(
-        {
-            "kind": target.kind,
-            "doc_id": target.doc_id,
-            "source_id": target.source_id,
-            "section_id": target.section_id,
-            "asset_id": target.asset_id,
-            "page_start": target.page_start,
-            "page_end": target.page_end,
-            "section_path": tuple(target.section_path),
-            "raw_locator": MappingProxyType(dict(target.raw_locator)),
-        }
-    )
+def _usage_integer(usage: Mapping[str, object], key: str) -> int:
+    value = usage.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _project_citation(item: AnswerCitation) -> AgentCitation:
-    return AgentCitation(
-        citation_id=item.citation_id,
-        file_name=item.file_name,
-        section_path=tuple(item.section_path),
-        page_start=item.page_start,
-        page_end=item.page_end,
-        evidence_id=item.evidence_id,
-        record_type=item.record_type,
-        citation_anchor=item.citation_anchor,
-        doc_id=item.doc_id,
-        benchmark_doc_id=item.benchmark_doc_id,
-        source_id=item.source_id,
-        source_type=item.source_type,
-    )
-
-
-def _project_diagnostic(item: RuntimeDiagnostic) -> AgentDiagnostic:
-    return AgentDiagnostic(
-        code=item.code,
-        component=item.component,
-        message=item.message,
-        severity=item.severity,
-        degraded=item.degraded,
-        error_type=item.error_type,
-    )
-
-
-def _project_pause(value: HumanInputRequest | None) -> AgentPause | None:
-    if value is None:
-        return None
-    return AgentPause(
-        request_id=value.request_id,
-        kind=value.kind,
-        question=value.question,
-        tool_calls=tuple(_project_tool_summary(item) for item in value.tool_calls),
-        options=tuple(value.options),
-        context=_freeze_json_mapping(value.context),
-    )
-
-
-def _project_tool_summary(item: ToolCallSummary) -> AgentToolSummary:
-    return AgentToolSummary(
-        tool_call_id=item.tool_call_id,
-        approval_id=item.approval_id,
-        tool_name=item.tool_name,
-        args_preview=item.args_preview,
-        risk_level=item.risk_level,
-        reason=item.reason,
-    )
-
-
-def _project_usage(result: AgentRunResult) -> AgentUsage:
-    usages = tuple(record.usage for record in result.model_call_records)
-    latency = result.latency_profile
-    metrics = result.tool_call_metrics
-    return AgentUsage(
-        input_tokens=sum(usage.input_tokens for usage in usages),
-        output_tokens=sum(usage.output_tokens for usage in usages),
-        total_tokens=sum(usage.total_tokens for usage in usages),
-        tool_calls=len(result.tool_results),
-        model_calls=len(result.model_call_records),
-        latency_ms=0.0 if latency is None else latency.total_ms,
-        logical_input_tokens=_sum_optional(tuple(usage.logical_input_tokens for usage in usages)),
-        uncached_input_tokens=_sum_optional(tuple(usage.uncached_input_tokens for usage in usages)),
-        cache_read_input_tokens=_sum_optional(tuple(usage.cache_read_input_tokens for usage in usages)),
-        cache_write_input_tokens=_sum_optional(tuple(usage.cache_write_input_tokens for usage in usages)),
-        usage_source=_usage_source(usages),
-        startup_ms=0.0 if latency is None else latency.startup_ms,
-        build_service_ms=(0.0 if latency is None else latency.build_service_ms),
-        model_ready_ms=0.0 if latency is None else latency.model_ready_ms,
-        prepare_latency_ms=(0.0 if latency is None else latency.prepare_latency_ms),
-        model_latency_ms=0.0 if latency is None else latency.model_latency_ms,
-        tool_latency_ms=0.0 if latency is None else latency.tool_latency_ms,
-        finalize_latency_ms=(0.0 if latency is None else latency.finalize_latency_ms),
-        prompt_bytes=0 if latency is None else latency.prompt_bytes,
-        tool_schema_bytes=(0 if latency is None else latency.tool_schema_bytes),
-        native_calls=0 if metrics is None else metrics.native_calls,
-        native_errors=0 if metrics is None else metrics.native_errors,
-        native_latency_ms_total=(0.0 if metrics is None else metrics.native_latency_ms_total),
-        deferred_calls=0 if metrics is None else metrics.deferred_calls,
-        mcp_calls=0 if metrics is None else metrics.mcp_calls,
-        mcp_errors=0 if metrics is None else metrics.mcp_errors,
-        mcp_latency_ms_total=(0.0 if metrics is None else metrics.mcp_latency_ms_total),
-    )
-
-
-def _sum_optional(values: tuple[int | None, ...]) -> int | None:
-    if not values or any(value is None for value in values):
-        return None
-    return sum(value for value in values if value is not None)
-
-
-def _usage_source(usages: tuple[LLMUsage, ...]) -> str | None:
-    values = tuple(usage.usage_source for usage in usages if usage.usage_source is not None)
-    if not values:
-        return None
-    return values[0] if len(set(values)) == 1 else "mixed"
+def _interaction_options(
+    kind: str,
+    request: Mapping[str, object],
+) -> tuple[str, ...]:
+    if kind == "tool_approval":
+        return ("approve", "deny")
+    if kind != "choice":
+        return ()
+    options = request.get("options")
+    if not isinstance(options, Sequence) or isinstance(options, (str, bytes)):
+        return ()
+    return tuple(option for option in options if isinstance(option, str))
 
 
 def _freeze_json_mapping(

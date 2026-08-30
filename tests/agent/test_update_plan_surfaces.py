@@ -1,159 +1,155 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
-from langgraph.checkpoint.memory import MemorySaver
 
-from agent_runtime.result import AgentResult
-from agent_runtime.runtime.builder import build_agent_service
-from rag.agent.core.checkpointing import (
-    LangGraphCheckpointStore,
-    agent_checkpoint_serde,
+from agent_runtime.agent import Agent
+from agent_runtime.core.model_request import toolset_revision_for_tools
+from agent_runtime.harness import (
+    HarnessModelRequest,
+    HarnessModelResponse,
+    HarnessToolCall,
+    ItemSnapshot,
+    PreparedModelCall,
+    RolloutStore,
 )
-from rag.agent.core.definition import AgentRuntimePolicy
-from rag.agent.core.turn_contracts import ToolCallPlan
-from rag.agent.loop.state import LoopState, ModelTurnDraft
-from rag.agent.service import AgentRunRequest, AgentService
-from rag.agent.streaming.events import EventType, ItemDeltaKind, TurnItemKind
-from rag.agent.workspace import open_workspace
+from agent_runtime.result import AgentResult
 
 _PLAN_ARGUMENTS = {
     "explanation": "Implementation is ready; verification is next.",
     "plan": [
-        {"step": "Implement durable plan state", "status": "completed"},
-        {"step": "Run integration verification", "status": "in_progress"},
+        {
+            "step_id": "implement",
+            "step": "Implement durable plan state",
+            "status": "completed",
+        },
+        {
+            "step_id": "verify",
+            "step": "Run integration verification",
+            "status": "in_progress",
+        },
     ],
 }
 
 
-class _UpdatePlanThenPauseProvider:
-    async def next_turn(
-        self,
-        state: LoopState,
-        *,
-        definition: AgentRuntimePolicy,
-        budget_remaining: int,
-    ) -> ModelTurnDraft:
-        del definition, budget_remaining
-        if not state["tool_results"]:
-            return ModelTurnDraft(
-                action="execute",
+class _UpdatePlanThenAnswerModel:
+    def snapshot(self) -> dict[str, str]:
+        return {"model_alias": "plan-test", "model_revision": "v1"}
+
+    def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
+        digest = hashlib.sha256(
+            f"{request.turn_id}:{request.step}".encode()
+        ).hexdigest()
+        return PreparedModelCall(
+            request_hash=digest,
+            context_hash=digest,
+            tool_hash=toolset_revision_for_tools(request.tools),
+            wire_hash=digest,
+            request_ref={
+                "request_id": f"{request.turn_id}:step:{request.step}",
+                "toolset_revision": toolset_revision_for_tools(request.tools),
+                "exposed_tool_names": [
+                    tool.definition.name for tool in request.tools
+                ],
+                "step": request.step,
+            },
+        )
+
+    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+        step = int(prepared.request_ref["step"])
+        if step == 1:
+            return HarnessModelResponse(
+                text="",
+                provider_response_id="plan-call",
+                usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
                 tool_calls=(
-                    ToolCallPlan(
-                        tool_call_id="call_update_plan",
-                        tool_name="update_plan",
+                    HarnessToolCall(
+                        id="call-update-plan",
+                        name="update_plan",
                         arguments=_PLAN_ARGUMENTS,
                     ),
                 ),
             )
-        return ModelTurnDraft(
-            action="pause",
-            pause_reason="Inspect the persisted plan.",
+        return HarnessModelResponse(
+            text="plan verified",
+            provider_response_id="plan-answer",
+            usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
         )
 
 
-class _UnusedModelRegistry:
-    default_model = "unused"
-
-    def resolve_for_node(self, **_kwargs: object) -> object:
-        raise AssertionError("the injected model-turn provider must be used")
-
-
-def _plan_service(
+async def _run_plan_turn(
     tmp_path: Path,
-) -> tuple[AgentService, AgentRuntimePolicy, MemorySaver]:
-    checkpointer = MemorySaver(serde=agent_checkpoint_serde())
-    service = build_agent_service(
-        open_workspace(tmp_path / "workspace", create=True),
-        checkpointer=checkpointer,
-        model_control_plane=_UnusedModelRegistry(),  # type: ignore[arg-type]
+) -> tuple[AgentResult, tuple[ItemSnapshot, ...]]:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    agent = Agent(checkpoint_db=database, workspace_path=workspace)
+    model = _UpdatePlanThenAnswerModel()
+    agent._harness_model = lambda: model
+
+    result = await agent.arun(
+        "Make update_plan durable.",
+        require_workspace_change=False,
     )
-    service._model_turn_provider = _UpdatePlanThenPauseProvider()
-    definition = service._policy
-    return service, definition, checkpointer
+    with RolloutStore(database) as store:
+        items = tuple(store.list_items(result.turn_id))
+    return result, items
 
 
 @pytest.mark.anyio
-async def test_update_plan_is_canonical_result_and_checkpoint_state(
+async def test_harness_update_plan_projects_public_result_and_rollout_truth(
     tmp_path: Path,
 ) -> None:
-    service, definition, checkpointer = _plan_service(tmp_path)
-    request = AgentRunRequest(
-        message="Make update_plan durable.",
-        turn_id="turn-plan-result",
-    )
+    result, items = await _run_plan_turn(tmp_path)
 
-    result = await service.run(request)
-
-    assert result.status == "paused"
+    assert result.status == "done"
+    assert result.answer == "plan verified"
     assert result.plan is not None
+    assert result.plan.objective == "Make update_plan durable."
     assert result.plan.summary == _PLAN_ARGUMENTS["explanation"]
+    assert result.plan.revision == 2
+    assert result.plan.status == "complete"
     assert [step.title for step in result.plan.steps] == [
         "Implement durable plan state",
         "Run integration verification",
     ]
     assert [step.status for step in result.plan.steps] == [
         "completed",
-        "in_progress",
+        "completed",
     ]
-    assert result.plan.revision == 1
-    assert result.plan.active_step_id == "step_002"
-    assert any(event.event_type == "llm_update" for event in result.plan_events)
-    update_result = next(item for item in result.tool_results if item.tool_name == "update_plan")
-    assert update_result.structured_content == {
-        "accepted": True,
-        "revision": result.plan.revision,
-        "message": "Plan updated and persisted.",
-    }
+    assert [event.event_type for event in result.plan_events] == [
+        "llm_update",
+        "completed",
+    ]
 
-    restored = await LangGraphCheckpointStore(
-        checkpointer,
-        run_config=request.to_run_config(definition),
-    ).load_latest()
-    assert restored is not None
-    assert restored["plan_state"].agent_plan == result.plan
-    assert restored["plan_state"].plan_events == result.plan_events
-
-    public = AgentResult._from_internal(result)
-    assert public.plan == result.plan
-    assert public.plan_events == tuple(result.plan_events)
+    update_call = next(
+        item
+        for item in items
+        if item.kind == "tool_call"
+        and item.payload.get("tool_name") == "update_plan"
+    )
+    update_result = next(
+        item
+        for item in items
+        if item.kind == "tool_result"
+        and item.payload.get("tool_name") == "update_plan"
+    )
+    assert update_call.payload["arguments"] == _PLAN_ARGUMENTS
+    assert update_result.payload["is_error"] is False
 
 
 @pytest.mark.anyio
-async def test_update_plan_emits_complete_plan_snapshot_on_stream(
+async def test_harness_update_plan_emits_one_persisted_plan_revision_item(
     tmp_path: Path,
 ) -> None:
-    service, _definition, _checkpointer = _plan_service(tmp_path)
+    result, items = await _run_plan_turn(tmp_path)
+    plan_items = [item for item in items if item.kind == "plan_state"]
 
-    events = [
-        event
-        async for event in service.run_streaming(
-            AgentRunRequest(
-                message="Stream the durable plan.",
-                turn_id="turn-plan-stream",
-            )
-        )
-    ]
-
-    plan_events = [
-        event for event in events if event.item_kind is TurnItemKind.PLAN
-    ]
-    assert [event.type for event in plan_events] == [
-        EventType.ITEM_STARTED,
-        EventType.ITEM_DELTA,
-        EventType.ITEM_COMPLETED,
-    ]
-    assert plan_events[1].delta_kind is ItemDeltaKind.PLAN
-    plan_event = plan_events[-1]
-    assert plan_event.turn_id == "turn-plan-stream"
-    assert not hasattr(plan_event, "session_id")
-    assert plan_event.iteration == 1
-    assert plan_event.sequence > 0
-    assert plan_event.data["plan"]["summary"] == _PLAN_ARGUMENTS["explanation"]
-    assert plan_event.data["plan"]["active_step_id"] == "step_002"
-    assert [step["status"] for step in plan_event.data["plan"]["steps"]] == [
-        "completed",
-        "in_progress",
-    ]
-    assert plan_event.data["event"]["event_type"] == "llm_update"
+    assert result.plan is not None
+    assert len(plan_items) == 1
+    assert plan_items[0].payload["plan"]["revision"] == 1
+    assert plan_items[0].payload["plan"]["objective"] == result.plan.objective
+    assert plan_items[0].payload["plan"]["status"] == "active"
+    assert plan_items[0].payload["plan"]["summary"] == _PLAN_ARGUMENTS["explanation"]

@@ -11,13 +11,13 @@ import click
 import typer
 from pydantic import BaseModel
 
+from agent_runtime.text import load_env_file
 from rag import AssemblyRequest, CapabilityRequirements, RAGRuntime, StorageConfig
 from rag.models.assembly_adapter import to_assembly_overrides
 from rag.models.runtime import RuntimeOverrides, resolve_runtime_config
 from rag.retrieval import QueryOptions, RetrievalProfile
 from rag.schema.core import SourceType
 from rag.storage.runtime_config import DEFAULT_VECTOR_BACKEND, runtime_storage_config
-from rag.utils.text import load_env_file
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 DEFAULT_STORAGE_ROOT = Path(".rag")
@@ -139,9 +139,7 @@ def _runtime(
             overrides=overrides,
         ),
         generation_config=runtime_config.generation,
-        chat_context_window_tokens=(
-            runtime_config.primary_model.context_window_tokens or 32_768
-        ),
+        chat_context_window_tokens=(runtime_config.primary_model.context_window_tokens or 32_768),
         llm_stage_budgets=runtime_config.llm_stage_budgets,
     )
 

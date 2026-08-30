@@ -45,7 +45,11 @@ class StorageLifecycleService:
             if document.storage_tier is target_tier:
                 continue
             existing = get_processing_state(document.doc_id) if callable(get_processing_state) else None
-            if existing is not None and existing.stage != "storage_lifecycle" and existing.status in {"pending", "processing"}:
+            if (
+                existing is not None
+                and existing.stage != "storage_lifecycle"
+                and existing.status in {"pending", "processing"}
+            ):
                 continue
             state = self.lifecycle_queue.enqueue(
                 doc_id=document.doc_id,
@@ -64,7 +68,11 @@ class StorageLifecycleService:
         get_document = getattr(self.metadata_repo, "get_document", None)
         set_document_storage_tier = getattr(self.metadata_repo, "set_document_storage_tier", None)
         sync_document_summaries = getattr(self.data_contract_service, "sync_document_summaries", None)
-        if not callable(get_document) or not callable(set_document_storage_tier) or not callable(sync_document_summaries):
+        if (
+            not callable(get_document)
+            or not callable(set_document_storage_tier)
+            or not callable(sync_document_summaries)
+        ):
             raise RuntimeError("storage lifecycle requires document lookup, storage tier update, and summary sync")
         document = get_document(state.doc_id)
         if document is None:

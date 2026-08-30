@@ -18,7 +18,9 @@ class _MetadataRepo:
     def get_processing_state(self, doc_id: int) -> ProcessingStateRecord | None:
         return self.states.get(doc_id)
 
-    def list_processing_states(self, *, source_id: int | None = None, status: str | None = None, stage: str | None = None):
+    def list_processing_states(
+        self, *, source_id: int | None = None, status: str | None = None, stage: str | None = None
+    ):
         states = list(self.states.values())
         if source_id is not None:
             states = [state for state in states if state.source_id == source_id]

@@ -1,4 +1,4 @@
-# Agent Naming Guide
+# Praxis Agent Naming Guide
 
 This guide keeps agent names short, stable, and composable. Names should make
 the local code readable; architecture docs explain the full pipeline.

@@ -5,9 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
-import pytest
 
-from rag.ingest.table_executor import MAX_RESULT_ROWS, MAX_SQL_TIMEOUT_SECONDS, ComputeResult, TableExecutor
+from rag.ingest.table_executor import MAX_RESULT_ROWS, ComputeResult, TableExecutor
 
 
 class _FakeObjectStore:
@@ -211,7 +210,16 @@ def test_execute_trims_trailing_sparse_footer_rows_before_ranking() -> None:
                 "月",
             ],
             "日_日提货": ["131.074462", "19.22484", "6.307968", "29.137104", "", "0", "131.074462", "1868.351764"],
-            "月累计_月累计提货": ["1868.351764", "281.059297", "66.189168", "435.377389", "", "0", "6.33998", "6.35034"],
+            "月累计_月累计提货": [
+                "1868.351764",
+                "281.059297",
+                "66.189168",
+                "435.377389",
+                "",
+                "0",
+                "6.33998",
+                "6.35034",
+            ],
             "月提货同比": ["-0.024129", "0.029459", "0.006566", "0.064241", "", "", "", ""],
             "年累计_年累计提货": ["12354.342395", "1661.394877", "511.311048", "3040.898458", "", "", "", ""],
             "年提货同比": ["-0.024033", "-0.073234", "0.05879", "0.120539", "", "", "", ""],
@@ -248,7 +256,7 @@ def test_execute_preserves_wide_sparse_report_rows() -> None:
     inspected = executor.inspect(asset_id=88, head_rows=3, tail_rows=0)
     result = executor.execute(
         asset_id=88,
-        sql='SELECT SUM("当日 提货") AS total FROM sheet WHERE "区域" IN (\'北方\', \'东北\')',
+        sql="SELECT SUM(\"当日 提货\") AS total FROM sheet WHERE \"区域\" IN ('北方', '东北')",
     )
 
     assert inspected is not None

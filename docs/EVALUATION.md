@@ -1,6 +1,7 @@
-# 评测与历史基线
+# Praxis 历史检索评测
 
-> 从 [README.md](../README.md) 拆分出来。保留历史基线结果，用于和当前默认链路做横向对比。
+> 从 [README.md](../README.md) 拆分出来。这是 RAG 子系统的历史基线快照，
+> 不是当前 Praxis 模型质量门禁；当前证据见 [benchmark](benchmark.md)。
 
 ## 历史基线结果与实验配置
 

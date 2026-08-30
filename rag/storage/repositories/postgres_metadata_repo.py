@@ -13,8 +13,8 @@ from rag.schema.core import (
     LayoutMetaCacheRecord,
     ProcessingStateRecord,
     SectionRecord,
-    StorageTier,
     Source,
+    StorageTier,
 )
 from rag.schema.runtime import AccessPolicy
 
@@ -334,7 +334,7 @@ class PostgresMetadataRepo:
             f"""
             SELECT *
             FROM {self._schema}.documents
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY updated_at DESC, doc_id DESC
             LIMIT 1
             """,
@@ -402,7 +402,7 @@ class PostgresMetadataRepo:
         row = self._fetchone(
             f"""
             UPDATE {self._schema}.documents
-            SET {', '.join(clauses)}
+            SET {", ".join(clauses)}
             WHERE doc_id = %s
             RETURNING *
             """,
@@ -632,7 +632,7 @@ class PostgresMetadataRepo:
             f"""
             SELECT *
             FROM {self._schema}.layout_meta_cache
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY updated_at DESC, cache_id DESC
             LIMIT 1
             """,
@@ -956,7 +956,8 @@ class PostgresMetadataRepo:
             """
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sources_content_hash ON {self._schema}.sources(content_hash)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sources_content_hash "
+            f"ON {self._schema}.sources(content_hash)"
         )
         self._conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sources_location ON {self._schema}.sources(location)"
@@ -997,16 +998,19 @@ class PostgresMetadataRepo:
             """
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_version ON {self._schema}.documents(version_group_id, version_no DESC)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_version "
+            f"ON {self._schema}.documents(version_group_id, version_no DESC)"
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_active ON {self._schema}.documents(is_active, storage_tier, updated_at DESC)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_active "
+            f"ON {self._schema}.documents(is_active, storage_tier, updated_at DESC)"
         )
         self._conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_hash ON {self._schema}.documents(file_hash)"
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_scope ON {self._schema}.documents(tenant_id, department_id, auth_tag)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_documents_scope "
+            f"ON {self._schema}.documents(tenant_id, department_id, auth_tag)"
         )
 
     def _create_sections_table(self) -> None:
@@ -1043,37 +1047,30 @@ class PostgresMetadataRepo:
             """
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_doc_order ON {self._schema}.sections(doc_id, order_index)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_doc_order "
+            f"ON {self._schema}.sections(doc_id, order_index)"
+        )
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS content_storage_key TEXT")
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS char_range_start BIGINT")
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS char_range_end BIGINT")
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS byte_range_start BIGINT")
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS byte_range_end BIGINT")
+        self._conn.execute(f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS visible_text_key TEXT")
+        self._conn.execute(
+            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS raw_locator "
+            "JSONB NOT NULL DEFAULT '{}'::jsonb"
         )
         self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS content_storage_key TEXT"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_source_doc "
+            f"ON {self._schema}.sections(source_id, doc_id)"
         )
         self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS char_range_start BIGINT"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_page_range "
+            f"ON {self._schema}.sections(doc_id, page_start, page_end)"
         )
         self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS char_range_end BIGINT"
-        )
-        self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS byte_range_start BIGINT"
-        )
-        self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS byte_range_end BIGINT"
-        )
-        self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS visible_text_key TEXT"
-        )
-        self._conn.execute(
-            f"ALTER TABLE {self._schema}.sections ADD COLUMN IF NOT EXISTS raw_locator JSONB NOT NULL DEFAULT '{{}}'::jsonb"
-        )
-        self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_source_doc ON {self._schema}.sections(source_id, doc_id)"
-        )
-        self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_page_range ON {self._schema}.sections(doc_id, page_start, page_end)"
-        )
-        self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_toc_path ON {self._schema}.sections USING GIN(toc_path)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_sections_toc_path "
+            f"ON {self._schema}.sections USING GIN(toc_path)"
         )
 
     def _create_assets_table(self) -> None:
@@ -1100,11 +1097,10 @@ class PostgresMetadataRepo:
             )
             """
         )
+        self._conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_assets_doc ON {self._schema}.assets(doc_id)")
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_assets_doc ON {self._schema}.assets(doc_id)"
-        )
-        self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_assets_source_doc ON {self._schema}.assets(source_id, doc_id)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_assets_source_doc "
+            f"ON {self._schema}.assets(source_id, doc_id)"
         )
         self._conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_assets_section ON {self._schema}.assets(section_id)"
@@ -1132,7 +1128,8 @@ class PostgresMetadataRepo:
             """
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_layout_cache_doc ON {self._schema}.layout_meta_cache(doc_id)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_layout_cache_doc "
+            f"ON {self._schema}.layout_meta_cache(doc_id)"
         )
 
     def _create_processing_state_table(self) -> None:
@@ -1155,10 +1152,12 @@ class PostgresMetadataRepo:
             """
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_processing_state_status ON {self._schema}.processing_state(status, stage, priority)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_processing_state_status "
+            f"ON {self._schema}.processing_state(status, stage, priority)"
         )
         self._conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_processing_state_source ON {self._schema}.processing_state(source_id, updated_at DESC)"
+            f"CREATE INDEX IF NOT EXISTS idx_{self._schema}_processing_state_source "
+            f"ON {self._schema}.processing_state(source_id, updated_at DESC)"
         )
 
     def _source_from_row(self, row: dict[str, Any]) -> Source:
@@ -1191,8 +1190,7 @@ class PostgresMetadataRepo:
 
     def _with_access_policy(self, row: dict[str, Any]) -> dict[str, Any]:
         data = dict(row)
-        data["effective_access_policy"] = AccessPolicy(
-        )
+        data["effective_access_policy"] = AccessPolicy()
         return data
 
     def _json_columns(self, row: dict[str, Any], *columns: str) -> dict[str, Any]:
@@ -1207,7 +1205,7 @@ class PostgresMetadataRepo:
 
     @staticmethod
     def _json_dumps(value: object) -> str:
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        if hasattr(value, "model_dump") and callable(value.model_dump):
             value = value.model_dump(mode="python")
         return json.dumps(value, ensure_ascii=True, sort_keys=True)
 

@@ -4,7 +4,6 @@ import ast
 import re
 from pathlib import Path
 
-
 REPOSITORY_ROOT = Path(__file__).parents[2]
 PRODUCTION_ROOTS = (
     REPOSITORY_ROOT / "rag",
@@ -36,12 +35,12 @@ LEGACY_REFERENCE = re.compile(
     r"format_tool_result_fallback"
 )
 FINAL_DEFINITIONS = {
-    "Tool": ("class", "rag/agent/tools/tool.py"),
-    "ToolRegistry": ("class", "rag/agent/tools/registry.py"),
-    "select_tools": ("function", "rag/agent/tools/selection.py"),
-    "can_use_tool": ("function", "rag/agent/tools/permissions.py"),
-    "ToolExecutor": ("class", "rag/agent/tools/executor.py"),
-    "ToolResult": ("class", "rag/agent/tools/tool.py"),
+    "Tool": ("class", "agent_runtime/tools/tool.py"),
+    "ToolRegistry": ("class", "agent_runtime/tools/registry.py"),
+    "select_tools": ("function", "agent_runtime/tools/selection.py"),
+    "can_use_tool": ("function", "agent_runtime/tools/permissions.py"),
+    "ToolExecutor": ("class", "agent_runtime/tools/executor.py"),
+    "ToolResult": ("class", "agent_runtime/tools/tool.py"),
 }
 
 

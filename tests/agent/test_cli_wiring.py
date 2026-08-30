@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import click
@@ -9,17 +10,18 @@ from typer.main import get_command
 from typer.testing import CliRunner
 
 from agent_runtime import RAGKnowledgeConfig
-from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
-from agent_runtime.result import AgentResult, AgentToolCall, AgentUsage
-from agent_runtime.runtime.builder import build_agent_service
-from rag.agent.cli import (
+from agent_runtime import cli as cli_module
+from agent_runtime.agent import Agent
+from agent_runtime.cli import (
     _CLIToolEventDisplay,
     _display_agent_result,
     _load_knowledge_config,
     agent_app,
 )
-from rag.agent.service import AgentRunRequest
-from rag.agent.streaming.events import (
+from agent_runtime.harness import RolloutStore
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
+from agent_runtime.result import AgentPause, AgentResult, AgentToolCall, AgentUsage
+from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
     ItemStatus,
@@ -35,22 +37,43 @@ from rag.agent.streaming.events import (
     tool_use_result,
     tool_use_start,
 )
-from rag.agent.tools.builtins import RESIDENT_CODING_TOOL_NAMES
-from rag.agent.tools.integrations.knowledge import KnowledgeSearchOutput
-from rag.agent.tools.integrations.mcp import (
-    MCPToolDescriptor,
-    create_mcp_tools,
-)
-from rag.agent.tools.integrations.skills import create_skill_tools
-from rag.agent.workspace import open_workspace
 
 
-class _ModelRegistry:
-    default_model = "fake"
+def test_cli_defaults_use_praxis_runtime_paths() -> None:
+    assert cli_module.DEFAULT_MODEL_SESSION_PATH == Path(".praxis/model_session.json")
+    assert cli_module.DEFAULT_CHECKPOINT_PATH == Path(".praxis/checkpoints.sqlite")
 
-    def resolve_for_node(self, **kwargs: object) -> object:
-        del kwargs
-        raise AssertionError("model resolution is not needed for assembly")
+
+def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    legacy_root = tmp_path / ".rag"
+    legacy_checkpoint = legacy_root / "agent_checkpoints.sqlite"
+    legacy_session = legacy_root / "agent_model_session.json"
+    legacy_session_text = '{"current_model_id":"legacy-sentinel"}'
+    legacy_root.mkdir()
+    legacy_checkpoint.write_bytes(b"legacy checkpoint sentinel")
+    legacy_session.write_text(legacy_session_text, encoding="utf-8")
+
+    agent = Agent()
+    assert agent.checkpoint_db == Path(".praxis/checkpoints.sqlite")
+    assert agent.model_session_path == Path(".praxis/model_session.json")
+    try:
+        current = agent.current_model()
+        switched = agent.switch_model(current.id)
+
+        assert switched.id == current.id
+        assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
+        assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
+            "current_model_id": current.id
+        }
+        assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
+        assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
+    finally:
+        if agent._model_control_plane is not None:
+            agent._model_control_plane.close()
 
 
 @pytest.mark.anyio
@@ -114,6 +137,9 @@ async def test_cli_renders_canonical_text_tool_and_plan_items(
                 "--max-tokens-total",
                 "--allow-write-tools",
                 "--allow-execute-tools",
+                "--require-workspace-change",
+                "--no-require-workspace-change",
+                "--model-session-path",
             ),
             (
                 "--agent",
@@ -175,6 +201,18 @@ def test_agent_command_options_match_the_clean_public_contract(
         assert option not in option_names
 
 
+def test_workspace_change_help_discloses_post_change_verification_gate() -> None:
+    result = CliRunner().invoke(
+        agent_app,
+        ["run", "--help"],
+        env={"COLUMNS": "240"},
+    )
+
+    assert result.exit_code == 0
+    assert "最后一次真实变更后" in result.output
+    assert "测试、lint、类型检查或构建" in result.output
+
+
 def test_agent_run_rejects_missing_input_without_internal_traceback(
     tmp_path: Path,
 ) -> None:
@@ -197,6 +235,155 @@ def test_agent_run_rejects_missing_input_without_internal_traceback(
     assert "Traceback" not in result.output
 
 
+def test_agent_run_can_store_model_session_outside_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+            return _result()
+
+    def create_facade(**kwargs: object) -> _Facade:
+        facade_options.append(kwargs)
+        return _Facade()
+
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+    model_session_path = tmp_path / "artifacts" / "model-session.json"
+
+    cli_module.agent_run(
+        task="Inspect the repository.",
+        checkpoint_db=tmp_path / "artifacts" / "checkpoints.sqlite",
+        model_session_path=model_session_path,
+        non_interactive=True,
+    )
+
+    assert facade_options[0]["model_session_path"] == model_session_path
+
+
+def test_agent_run_can_disable_workspace_mcp_discovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+            return _result()
+
+    def create_facade(**kwargs: object) -> _Facade:
+        facade_options.append(kwargs)
+        return _Facade()
+
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+
+    cli_module.agent_run(
+        task="Evaluate built-in tools only.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        disable_workspace_mcp=True,
+        non_interactive=True,
+    )
+
+    assert facade_options[0]["enable_workspace_mcp"] is False
+
+
+def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller_workspace = tmp_path / "caller"
+    turn_workspace = tmp_path / "turn-workspace"
+    caller_workspace.mkdir()
+    turn_workspace.mkdir()
+    database = tmp_path / "agent.sqlite"
+    knowledge = RAGKnowledgeConfig(
+        storage_root=tmp_path / "knowledge",
+        vector_backend="sqlite",
+    )
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=turn_workspace)
+        previous = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="remember cobalt",
+            binding_manifest={
+                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "knowledge_config": knowledge.model_dump(mode="json"),
+            },
+        )
+        previous = store.complete_turn(
+            turn_id=previous.turn_id,
+            answer="remembered cobalt",
+        )
+    facade_options: list[dict[str, object]] = []
+    loop_options: list[dict[str, object]] = []
+
+    def create_facade(**kwargs: object) -> object:
+        facade_options.append(kwargs)
+        return object()
+
+    async def chat_loop(_facade: object, **kwargs: object) -> None:
+        loop_options.append(kwargs)
+
+    monkeypatch.chdir(caller_workspace)
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)
+    monkeypatch.setattr(cli_module, "_chat_facade_loop", chat_loop)
+
+    cli_module.agent_chat(
+        previous_turn_id=previous.turn_id,
+        checkpoint_db=database,
+    )
+
+    assert facade_options == [
+        {
+            "model": "qwen3_5_9b_mlx_4bit",
+            "checkpoint_db": database,
+            "workspace_path": str(turn_workspace.resolve()),
+            "model_session_path": cli_module.DEFAULT_MODEL_SESSION_PATH,
+            "knowledge": knowledge,
+        }
+    ]
+    assert loop_options[0]["previous_turn_id"] == previous.turn_id
+
+
+def test_agent_run_forwards_workspace_change_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def arun(self, _task: str, **kwargs: object) -> AgentResult:
+            run_options.append(kwargs)
+            return _result()
+
+    monkeypatch.setattr(
+        cli_module,
+        "_create_agent_facade",
+        lambda **_kwargs: _Facade(),
+    )
+
+    cli_module.agent_run(
+        task="Fix the implementation.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        non_interactive=True,
+    )
+
+    assert run_options[0]["require_workspace_change"] is True
+
+    cli_module.agent_run(
+        task="Explain the implementation.",
+        checkpoint_db=tmp_path / "checkpoints.sqlite",
+        model_session_path=tmp_path / "model-session.json",
+        require_workspace_change=False,
+        non_interactive=True,
+    )
+
+    assert run_options[1]["require_workspace_change"] is False
+
+
 def _result(
     *,
     status: str = "done",
@@ -204,6 +391,8 @@ def _result(
     tool_calls: tuple[AgentToolCall, ...] = (),
     plan: AgentPlan | None = None,
     plan_events: tuple[PlanEvent, ...] = (),
+    pause: AgentPause | None = None,
+    needs_user_input: str | None = None,
 ) -> AgentResult:
     return AgentResult(
         answer=answer,
@@ -216,67 +405,14 @@ def _result(
         diagnostics=(),
         turn_id="turn-test",
         stop_reason=None,
-        pause=None,
+        pause=pause,
         workspace_path=None,
         groundedness=False,
         insufficient_evidence=False,
         plan=plan,
         plan_events=plan_events,
+        needs_user_input=needs_user_input,
     )
-
-
-def test_builder_assembles_default_six_tools_in_product_order() -> None:
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-    )
-
-    assert tuple(service._tool_snapshot) == RESIDENT_CODING_TOOL_NAMES
-    assert service._tool_executor._tools is service._tool_snapshot
-    state = service.initial_state(AgentRunRequest(message="Inspect repository."))
-    assert tuple(state["resident_tool_names"]) == RESIDENT_CODING_TOOL_NAMES
-
-
-def test_builder_binds_coding_tools_to_the_supplied_workspace(
-    tmp_path: Path,
-) -> None:
-    workspace = open_workspace(tmp_path / "workspace", create=True)
-    (workspace.root / "visible.txt").write_text("visible", encoding="utf-8")
-
-    service = build_agent_service(
-        workspace,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-    )
-    tool = service._tool_snapshot["list_files"]
-    output = tool.run(tool.validate_input({}))
-
-    assert service._workspace is workspace
-    assert any(entry.name == "visible.txt" for entry in output.entries)
-
-
-@pytest.mark.anyio
-async def test_configured_knowledge_is_a_resident_extension() -> None:
-    async def search(_payload: object, **_kwargs: object) -> object:
-        return KnowledgeSearchOutput(
-            answer_text="configured knowledge",
-            total_found=0,
-        )
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        knowledge_runner=search,  # type: ignore[arg-type]
-    )
-    state = service.initial_state(AgentRunRequest(message="Search docs."))
-
-    assert tuple(service._tool_snapshot) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "search_knowledge",
-    )
-    assert state["resident_tool_names"] == [
-        *RESIDENT_CODING_TOOL_NAMES,
-        "search_knowledge",
-    ]
 
 
 def test_cli_shows_called_tool_names_without_verbose(
@@ -307,6 +443,45 @@ def test_cli_does_not_repeat_an_answer_that_was_already_streamed(
     )
 
     assert "already visible" not in capsys.readouterr().out
+
+
+def test_cli_shows_untyped_pause_reason_exactly_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    reason = "Choose a target branch before continuing."
+
+    _display_agent_result(
+        _result(
+            status="paused",
+            needs_user_input=reason,
+        ),
+        verbose=False,
+    )
+
+    output = capsys.readouterr().out
+    assert f"暂停原因: {reason}" in output
+    assert output.count(reason) == 1
+
+
+def test_cli_leaves_typed_pause_question_to_pause_handler(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    question = "Allow apply_patch?"
+
+    _display_agent_result(
+        _result(
+            status="paused",
+            pause=AgentPause(
+                request_id="request-approval",
+                kind="tool_approval",
+                question=question,
+            ),
+            needs_user_input=question,
+        ),
+        verbose=False,
+    )
+
+    assert question not in capsys.readouterr().out
 
 
 def test_cli_shows_the_persisted_update_plan_without_verbose(
@@ -501,90 +676,6 @@ async def test_cli_displays_plan_and_recovery_events(
     assert "✓ Inspect source" in output
     assert "→ Wire CLI" in output
     assert "↻ 恢复: model_retry — attempt 2 of 3" in output
-
-
-def test_builder_passes_canonical_events_to_cli_display() -> None:
-    display = _CLIToolEventDisplay()
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        stream_sink=display,
-    )
-
-    assert service._stream_sink is display
-
-
-def test_builder_installs_hidden_factory_outputs_with_find_tools() -> None:
-    mcp_tools = create_mcp_tools(
-        (
-            MCPToolDescriptor(
-                server_name="docs",
-                tool_name="search",
-                description="Search external documentation.",
-                input_schema={
-                    "type": "object",
-                    "properties": {"query": {"type": "string"}},
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-                read_only_hint=True,
-            ),
-        ),
-        lambda _server, _tool, _arguments: {"text": "found"},
-    )
-
-    service = build_agent_service(
-        None,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        mcp_tools=mcp_tools,
-    )
-
-    assert tuple(service._tool_snapshot) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "mcp__docs__search",
-        "find_tools",
-    )
-    automatic_state = service.initial_state(AgentRunRequest(message="Inspect docs."))
-    disabled_state = service.initial_state(
-        AgentRunRequest(
-            message="Inspect docs.",
-            allow_discovery_tools=False,
-        )
-    )
-    assert tuple(automatic_state["resident_tool_names"]) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "find_tools",
-    )
-    assert automatic_state["allow_discovery_tools"] is True
-    assert tuple(disabled_state["resident_tool_names"]) == (RESIDENT_CODING_TOOL_NAMES)
-    assert disabled_state["allow_discovery_tools"] is False
-    assert automatic_state["active_tool_names"] == []
-
-
-def test_builder_makes_skill_gateways_resident_when_skills_are_available(
-    tmp_path: Path,
-) -> None:
-    workspace = open_workspace(tmp_path / "workspace", create=True)
-    skill_tools = create_skill_tools(
-        workspace,
-        invoke_skill=lambda _arguments: {"success": False, "name": "missing"},
-        active_skill_root=lambda _skill_id: None,
-    )
-
-    service = build_agent_service(
-        workspace,
-        model_control_plane=_ModelRegistry(),  # type: ignore[arg-type]
-        skill_tools=skill_tools,
-    )
-    state = service.initial_state(AgentRunRequest(message="Use an installed skill."))
-
-    assert tuple(state["resident_tool_names"]) == (
-        *RESIDENT_CODING_TOOL_NAMES,
-        "invoke_skill",
-        "materialize_skill_asset",
-    )
-    assert "find_tools" not in state["resident_tool_names"]
 
 
 def test_knowledge_config_is_serializable_and_forbids_unknown_fields(

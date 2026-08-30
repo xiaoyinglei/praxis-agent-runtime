@@ -140,7 +140,9 @@ models:
     capability: chat
     provider: groq
     model: openai/gpt-oss-120b
+    tokenizer_model: gpt-oss-120b
     context_window_tokens: 131072
+    request_context_tokens: 8000
 
   groq_llama_3_3_70b:
     capability: chat
@@ -161,7 +163,14 @@ models:
     capability: chat
     provider: kimi
     model: kimi-k2.6
+    max_tokens: 32768
     context_window_tokens: 262144
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      provider_options:
+        thinking:
+          type: enabled
 
   # -------------------------------------------------------------------------
   # Embedding models.
@@ -196,10 +205,9 @@ models:
 # Defaults: what to use when no explicit model is requested.
 # ---------------------------------------------------------------------------
 defaults:
-  # For local-only testing, change this to qwen3_8b_mlx_4bit.
-  # The bundled default must be usable for real coding turns without Groq's
-  # free-tier 8k TPM ceiling; Groq models remain explicit opt-in choices.
-  primary_model: deepseek_chat
+  # Product runs default to Groq so an omitted --model never starts a local
+  # MLX server. Benchmark release lanes remain explicit in their manifest.
+  primary_model: groq_gpt_oss_120b
 
   embedding_model: qwen3_embedding_8b_4bit_dwq
   reranker_model: qwen3_reranker_4b
@@ -230,18 +238,6 @@ generation:
     max_tokens: 2048
     temperature: 0.1
 
-  memory_select:
-    max_tokens: 256
-    temperature: 0.1
-
-  memory_extract:
-    max_tokens: 2048
-    temperature: 0.3
-
-  memory_consolidate:
-    max_tokens: 4096
-    temperature: 0.3
-
   tool_decision:
     max_tokens: 4096
     temperature: 0.2
@@ -255,6 +251,14 @@ generation:
 # LLM stage budgets: input/output budget by internal LLM stage.
 # ---------------------------------------------------------------------------
 llm_budgets:
+  # One Harness sampling round may produce tool calls or a final answer.
+  # The model declaration supplies the requested output limit; this policy is
+  # only the model-independent ceiling for an agent step.
+  agent_step:
+    max_input_tokens: 64000
+    max_output_tokens: 32768
+    safety_margin_tokens: 512
+
   goal_contract:
     max_input_tokens: 3000
     max_output_tokens: 512

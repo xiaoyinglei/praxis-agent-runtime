@@ -14,7 +14,6 @@ from rag.assembly.models import (
 from rag.assembly.support import _CompositeProvider
 from rag.models.assembly_adapter import to_assembly_overrides
 
-
 # ── Stub provider for testing (simulates EmbeddingHttpClient / RerankHttpClient) ──
 
 
@@ -55,11 +54,15 @@ def _stub_rerank_provider() -> _CompositeProvider:
 
 def test_embedding_service_url_env_sets_embedding_provider() -> None:
     """When RAG_EMBEDDING_SERVICE_URL is set, embedding_provider should be set."""
-    from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
+    from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"),
-        embedding_model=ModelSpec(alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"),
+        primary_model=ModelSpec(
+            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
+        ),
+        embedding_model=ModelSpec(
+            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
+        ),
     )
     overrides = to_assembly_overrides(runtime_config)
     assert overrides.embedding_provider is None  # YAML doesn't set runtime providers
@@ -73,12 +76,21 @@ def test_embedding_service_url_env_sets_embedding_provider() -> None:
 
 def test_rerank_service_url_env_sets_rerank_provider() -> None:
     """When RAG_RERANK_SERVICE_URL is set, rerank_provider should be set."""
-    from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
+    from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"),
-        embedding_model=ModelSpec(alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"),
-        reranker_model=ModelSpec(alias="test_rerank", capability=ModelCapability.RERANKER, provider="sentence_transformers", model="bge-reranker"),
+        primary_model=ModelSpec(
+            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
+        ),
+        embedding_model=ModelSpec(
+            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
+        ),
+        reranker_model=ModelSpec(
+            alias="test_rerank",
+            capability=ModelCapability.RERANKER,
+            provider="sentence_transformers",
+            model="bge-reranker",
+        ),
     )
     overrides = to_assembly_overrides(runtime_config)
     assert overrides.rerank_provider is None
@@ -94,12 +106,21 @@ def test_rerank_service_url_env_sets_rerank_provider() -> None:
 
 def test_require_rerank_false_strips_reranker_and_runtime_provider() -> None:
     """require_rerank=False strips both rerank config and rerank_provider."""
-    from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
+    from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"),
-        embedding_model=ModelSpec(alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"),
-        reranker_model=ModelSpec(alias="test_rerank", capability=ModelCapability.RERANKER, provider="sentence_transformers", model="bge-reranker"),
+        primary_model=ModelSpec(
+            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
+        ),
+        embedding_model=ModelSpec(
+            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
+        ),
+        reranker_model=ModelSpec(
+            alias="test_rerank",
+            capability=ModelCapability.RERANKER,
+            provider="sentence_transformers",
+            model="bge-reranker",
+        ),
     )
     overrides = to_assembly_overrides(runtime_config)
     assert overrides.rerank is not None  # YAML default provides reranker
@@ -119,12 +140,21 @@ def test_require_rerank_false_strips_reranker_and_runtime_provider() -> None:
 
 def test_require_rerank_true_preserves_reranker() -> None:
     """When require_rerank=True and YAML has reranker, it should be preserved."""
-    from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
+    from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"),
-        embedding_model=ModelSpec(alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"),
-        reranker_model=ModelSpec(alias="test_rerank", capability=ModelCapability.RERANKER, provider="sentence_transformers", model="bge-reranker"),
+        primary_model=ModelSpec(
+            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
+        ),
+        embedding_model=ModelSpec(
+            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
+        ),
+        reranker_model=ModelSpec(
+            alias="test_rerank",
+            capability=ModelCapability.RERANKER,
+            provider="sentence_transformers",
+            model="bge-reranker",
+        ),
     )
     overrides = to_assembly_overrides(runtime_config)
     assert overrides.rerank is not None
@@ -140,10 +170,8 @@ def test_cli_embedding_model_plus_env_conflict() -> None:
     embedding_model = "mlx_embedding"  # explicitly set via CLI
 
     if embedding_service_url and embedding_model is not None:
-        with pytest.raises(Exception):
-            raise typer.BadParameter(
-                "RAG_EMBEDDING_SERVICE_URL is set but --embedding-model was also specified."
-            )
+        with pytest.raises(typer.BadParameter):
+            raise typer.BadParameter("RAG_EMBEDDING_SERVICE_URL is set but --embedding-model was also specified.")
 
 
 def test_cli_reranker_model_plus_env_conflict() -> None:
@@ -152,10 +180,8 @@ def test_cli_reranker_model_plus_env_conflict() -> None:
     reranker_model = "bge_reranker"  # explicitly set via CLI
 
     if rerank_service_url and reranker_model is not None:
-        with pytest.raises(Exception):
-            raise typer.BadParameter(
-                "RAG_RERANK_SERVICE_URL is set but --reranker-model was also specified."
-            )
+        with pytest.raises(typer.BadParameter):
+            raise typer.BadParameter("RAG_RERANK_SERVICE_URL is set but --reranker-model was also specified.")
 
 
 # ── env absent → YAML default ──
@@ -163,11 +189,15 @@ def test_cli_reranker_model_plus_env_conflict() -> None:
 
 def test_no_service_url_env_uses_yaml_default() -> None:
     """Without service URL env, YAML default provider should be used (no runtime provider)."""
-    from rag.models.config import ModelCapability, ModelRuntimeConfig, ModelSpec
+    from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"),
-        embedding_model=ModelSpec(alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"),
+        primary_model=ModelSpec(
+            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
+        ),
+        embedding_model=ModelSpec(
+            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
+        ),
     )
     overrides = to_assembly_overrides(runtime_config)
 

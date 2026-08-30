@@ -4,6 +4,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
+from agent_runtime.modeling.tokenization import (
+    DEFAULT_TOKENIZER_FALLBACK_MODEL,
+    TokenAccountingService,
+    TokenizerContract,
+)
+from agent_runtime.text import load_env_file
 from rag.assembly.bindings import (
     CapabilityBinding,
     ChatCapabilityBinding,
@@ -38,8 +44,6 @@ from rag.assembly.support import (
     first_non_negative_int,
     first_positive_int,
 )
-from rag.assembly.tokenizer import DEFAULT_TOKENIZER_FALLBACK_MODEL, TokenAccountingService, TokenizerContract
-from rag.utils.text import load_env_file
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,8 +204,7 @@ class CapabilityAssemblyService:
         if not mismatches:
             return RuntimeContractGovernance(status="valid", should_persist=False)
         details = ", ".join(
-            f"{field}: current={current!r} stored={stored!r}"
-            for field, (current, stored) in mismatches.items()
+            f"{field}: current={current!r} stored={stored!r}" for field, (current, stored) in mismatches.items()
         )
         issue = AssemblyIssue(
             severity="error",
@@ -593,10 +596,7 @@ class CapabilityAssemblyService:
     def _profile_from_provider_config(self, provider_config: ProviderConfig) -> CapabilityProfile:
         profile_id = provider_config.profile_id or provider_config.provider_kind
         model_label = (
-            provider_config.chat_model
-            or provider_config.embedding_model
-            or provider_config.rerank_model
-            or "default"
+            provider_config.chat_model or provider_config.embedding_model or provider_config.rerank_model or "default"
         )
         label = provider_config.label or f"{provider_config.provider_kind} / {model_label}"
 

@@ -5,12 +5,13 @@ from pathlib import Path
 import pytest
 import yaml
 
-from rag.agent.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
-from rag.agent.core.llm_registry import (
+from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.core.llm_registry import (
     ModelRegistry,
     UnknownModelAliasError,
+    _chat_provider_config,
 )
-from rag.schema.llm import LLMCallStage
+from agent_runtime.modeling.contracts import LLMCallStage
 
 
 def _ollama_spec(model: str = "test-model") -> ModelSpec:
@@ -48,8 +49,16 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
                         "provider": "qwen",
                         "protocol": "openai_compatible",
                         "model": "Qwen/Qwen3-8B-MLX-4bit",
+                        "max_tokens": 16384,
                         "base_url": "http://127.0.0.1:8080/v1",
                         "context_window_tokens": 32768,
+                        "defaults": {
+                            "temperature": 1.0,
+                            "top_p": 0.95,
+                            "provider_options": {
+                                "thinking": {"type": "enabled"},
+                            },
+                        },
                     }
                 },
                 "defaults": {"primary_model": "qwen3_8b_mlx_4bit"},
@@ -71,6 +80,12 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
     assert config.models["qwen3_8b_mlx_4bit"].provider is ModelProvider.OPENAI_COMPATIBLE
     assert config.models["qwen3_8b_mlx_4bit"].base_url == "http://127.0.0.1:8080/v1"
     assert config.models["qwen3_8b_mlx_4bit"].context_window_tokens == 32768
+    assert config.models["qwen3_8b_mlx_4bit"].max_tokens == 16384
+    assert config.models["qwen3_8b_mlx_4bit"].defaults == {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "provider_options": {"thinking": {"type": "enabled"}},
+    }
     assert config.llm_stage_budgets[LLMCallStage.TOOL_DECISION].max_input_tokens == 12000
 
 
@@ -100,7 +115,7 @@ def test_load_configs_models_preserves_api_key_env_for_cloud_models(
     monkeypatch.setenv("MIMO_API_KEY", "sk-test")
 
     config = ModelRegistry._load_yaml_file(config_path)
-    provider_config = ModelRegistry(config)._spec_to_provider_config(config.models["mimo_cloud"])
+    provider_config = _chat_provider_config(config.models["mimo_cloud"])
 
     assert config.models["mimo_cloud"].api_key_env == "MIMO_API_KEY"
     assert provider_config.api_key == "sk-test"
@@ -153,7 +168,9 @@ def test_load_configs_models_supports_provider_section_schema(
                         "capability": "chat",
                         "provider": "groq",
                         "model": "openai/gpt-oss-120b",
+                        "tokenizer_model": "gpt-oss-120b",
                         "context_window_tokens": 131072,
+                        "request_context_tokens": 8000,
                     },
                 },
                 "defaults": {"primary_model": "groq_gpt_oss_120b"},
@@ -166,7 +183,7 @@ def test_load_configs_models_supports_provider_section_schema(
     config = ModelRegistry._load_yaml_file(config_path)
     groq = config.models["groq_gpt_oss_120b"]
     local = config.models["qwen3_8b_mlx_4bit"]
-    provider_config = ModelRegistry(config)._spec_to_provider_config(groq)
+    provider_config = _chat_provider_config(groq)
 
     assert config.default_model == "groq_gpt_oss_120b"
     assert groq.provider is ModelProvider.OPENAI_COMPATIBLE
@@ -174,6 +191,9 @@ def test_load_configs_models_supports_provider_section_schema(
     assert groq.base_url == "https://api.groq.com/openai/v1"
     assert groq.api_key_env == "GROQ_API_KEY"
     assert groq.location == "cloud"
+    assert groq.context_window_tokens == 131072
+    assert groq.request_context_tokens == 8000
+    assert groq.tokenizer_model == "gpt-oss-120b"
     assert provider_config.api_key == "sk-test"
     assert provider_config.base_url == "https://api.groq.com/openai/v1"
     assert local.provider is ModelProvider.OPENAI_COMPATIBLE
@@ -208,7 +228,7 @@ def test_repository_catalog_declares_local_qwen35_9b() -> None:
     assert spec.runtime.expected_model_contains == "Qwen3.5-9B-4bit"
 
 
-def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) -> None:
+def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None:
     config_path = tmp_path / "models.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -231,7 +251,7 @@ def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) 
                 },
                 "defaults": {"primary_model": "main"},
                 "generation": {
-                    "memory_extract": {
+                    "factcheck": {
                         "model": "mimo_cloud",
                         "max_tokens": 2048,
                         "temperature": 0.3,
@@ -244,9 +264,9 @@ def test_load_configs_models_preserves_memory_generation_config(tmp_path: Path) 
 
     config = ModelRegistry._load_yaml_file(config_path)
 
-    assert config.generation.memory_extract.model == "mimo_cloud"
-    assert config.generation.memory_extract.max_tokens == 2048
-    assert config.generation.memory_extract.temperature == 0.3
+    assert config.generation.factcheck.model == "mimo_cloud"
+    assert config.generation.factcheck.max_tokens == 2048
+    assert config.generation.factcheck.temperature == 0.3
 
 
 def test_from_env_loads_dotenv_before_resolving_model_config(
@@ -274,8 +294,7 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
     )
     env_path = tmp_path / ".env"
     env_path.write_text(
-        f"RAG_AGENT_MODELS_PATH={config_path}\n"
-        "MIMO_API_KEY=sk-dotenv\n",
+        f"RAG_AGENT_MODELS_PATH={config_path}\nMIMO_API_KEY=sk-dotenv\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
@@ -283,7 +302,7 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
 
     registry = ModelRegistry.from_env(env_path=str(env_path))
     spec = registry._config.models["mimo_cloud"]
-    provider_config = registry._spec_to_provider_config(spec)
+    provider_config = _chat_provider_config(spec)
 
     assert registry.default_model == "mimo_cloud"
     assert provider_config.api_key == "sk-dotenv"
@@ -347,6 +366,84 @@ class TestModelRegistryResolve:
         assert resolved.kwargs["max_tokens"] == 512
         assert resolved.kwargs["temperature"] == 0.3
         assert resolved.kwargs["top_p"] == 0.8
+
+    def test_request_context_limit_caps_runtime_without_rewriting_model_window(
+        self,
+    ) -> None:
+        spec = ModelSpec(
+            provider=ModelProvider.OLLAMA,
+            model="request-capped",
+            context_window_tokens=131_072,
+            request_context_tokens=8_000,
+        )
+        registry = ModelRegistry(
+            AgentModelsConfig(
+                models={"capped": spec},
+                default_model="capped",
+            )
+        )
+
+        resolved = registry.resolve("capped")
+
+        assert registry.get_model_spec("capped").context_window_tokens == 131_072
+        assert resolved.context_window_tokens == 8_000
+        assert (
+            resolved.gateway.effective_stage_budget(
+                LLMCallStage.TOOL_DECISION,
+                kwargs={"max_tokens": 2_048},
+            ).max_input_tokens
+            == 5_440
+        )
+
+    def test_explicit_tokenizer_model_avoids_provider_id_fallback_counting(
+        self,
+    ) -> None:
+        spec = ModelSpec(
+            provider=ModelProvider.OLLAMA,
+            model="provider/gpt-oss-120b",
+            tokenizer_model="gpt-oss-120b",
+        )
+        registry = ModelRegistry(
+            AgentModelsConfig(
+                models={"tokenized": spec},
+                default_model="tokenized",
+            )
+        )
+
+        resolved = registry.resolve("tokenized")
+
+        assert resolved.token_accounting is not None
+        assert resolved.token_accounting.backend_descriptor() == (
+            "tiktoken",
+            "gpt-oss-120b",
+        )
+        assert resolved.token_accounting.count('{"tools":[{"name":"read_file"}]}') > 4
+
+    def test_explicit_model_output_limit_expands_tool_decision_stage_budget(
+        self,
+    ) -> None:
+        spec = ModelSpec(
+            provider=ModelProvider.OLLAMA,
+            model="long-thinking",
+            max_tokens=32_768,
+            context_window_tokens=131_072,
+            request_context_tokens=65_536,
+        )
+        registry = ModelRegistry(
+            AgentModelsConfig(
+                models={"long": spec},
+                default_model="long",
+            )
+        )
+
+        resolved = registry.resolve("long")
+        budget = resolved.gateway.effective_stage_budget(
+            LLMCallStage.TOOL_DECISION,
+            kwargs={"max_tokens": resolved.kwargs["max_tokens"]},
+        )
+
+        assert budget.max_output_tokens == 32_768
+        assert budget.max_input_tokens > 30_000
 
 
 class TestModelRegistryResolveOrFallback:

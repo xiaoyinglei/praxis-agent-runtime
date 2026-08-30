@@ -11,8 +11,10 @@
         "list_files",
         "search_text",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan"
       ],
       "expected_tool": null,
@@ -122,8 +124,10 @@
         "list_files",
         "search_text",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
         "find_tools"
       ],
@@ -163,8 +167,10 @@
         "list_files",
         "search_text",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan"
       ],
       "expected_tool": null,
@@ -205,8 +211,10 @@
         "list_files",
         "search_text",
         "read_file",
+        "inspect_data_file",
         "apply_patch",
         "run_command",
+        "execute_python",
         "update_plan",
         "find_tools"
       ],

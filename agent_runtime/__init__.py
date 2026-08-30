@@ -2,17 +2,19 @@
 
 from typing import TYPE_CHECKING
 
+from agent_runtime.harness.events import ReplayEvent
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
+from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentResult, AgentUsage
-from rag.agent.streaming.events import (
+from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
     ItemStatus,
     StreamEvent,
     TurnItemKind,
 )
-from rag.agent.streaming.sink import LegacyStreamProjectionSink
+from agent_runtime.streaming.sink import LegacyStreamProjectionSink
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -29,6 +31,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "Agent",
     "AgentEventSink",
+    "AgentPlan",
     "AgentResult",
     "AgentUsage",
     "EventType",
@@ -37,7 +40,10 @@ __all__ = [
     "LegacyStreamProjectionSink",
     "ModelNotAvailableError",
     "ModelSpec",
+    "PlanEvent",
+    "PlanStep",
     "RAGKnowledgeConfig",
+    "ReplayEvent",
     "StreamEvent",
     "TurnItemKind",
 ]

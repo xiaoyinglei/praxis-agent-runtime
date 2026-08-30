@@ -38,7 +38,7 @@ def test_agent_model_current_uses_light_cli_path() -> None:
         """
 import sys
 from typer.testing import CliRunner
-from rag.agent.cli import agent_app
+from agent_runtime.cli import agent_app
 
 result = CliRunner().invoke(agent_app, ["model", "current"], env={"COLUMNS": "240"})
 print(result.output)
@@ -48,8 +48,8 @@ if result.exit_code != 0:
 forbidden = [
     "agent_runtime.agent",
     "agent_runtime.knowledge_providers.rag",
-    "rag.agent.service",
-    "rag.agent.builtin_registry",
+    "agent_runtime.service",
+    "agent_runtime.builtin_registry",
     "sentence_transformers",
 ]
 loaded = [name for name in forbidden if name in sys.modules]

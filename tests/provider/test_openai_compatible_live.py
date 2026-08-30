@@ -5,14 +5,14 @@ import os
 
 import pytest
 
-from rag.agent.core.model_request import (
+from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.modeling.gateway import LLMGateway
 from rag.assembly.support import _OpenAICompatibleChatGenerator
-from rag.providers.llm_gateway import LLMGateway
-from rag.schema.llm import LLMCallStage
 
 _BASE_URL = os.environ.get("RAG_TEST_OPENAI_BASE_URL")
 _MODEL = os.environ.get("RAG_TEST_OPENAI_MODEL")
@@ -20,10 +20,7 @@ _API_KEY = os.environ.get("RAG_TEST_OPENAI_API_KEY")
 
 pytestmark = pytest.mark.skipif(
     not (_BASE_URL and _MODEL),
-    reason=(
-        "set RAG_TEST_OPENAI_BASE_URL and RAG_TEST_OPENAI_MODEL "
-        "to run live OpenAI-compatible tests"
-    ),
+    reason=("set RAG_TEST_OPENAI_BASE_URL and RAG_TEST_OPENAI_MODEL to run live OpenAI-compatible tests"),
 )
 
 

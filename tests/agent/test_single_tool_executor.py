@@ -13,27 +13,32 @@ from typing import Any
 
 import pytest
 
-from rag.agent.tools.builtins import shell as shell_module
-from rag.agent.tools.builtins.shell import create_run_command_tool
-from rag.agent.tools.executor import (
+from agent_runtime.tools.builtins import shell as shell_module
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.tools.evidence import (
+    runtime_workspace_change,
+    runtime_workspace_file_changes,
+)
+from agent_runtime.tools.executor import (
     ExecutionBoundary,
     ExecutionStatus,
     ToolExecutionRecord,
     ToolExecutor,
 )
-from rag.agent.tools.permissions import (
+from agent_runtime.tools.permissions import (
     CanUseToolResult,
     ToolExecutionContext,
     ToolGuardError,
     UseToolDecision,
     can_use_tool,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     NormalizedToolOutput,
     ResolvedToolUse,
     Tool,
+    ToolApprovalProfile,
     ToolCall,
     ToolCallOrigin,
     ToolContentBlock,
@@ -44,7 +49,7 @@ from rag.agent.tools.tool import (
     ToolTarget,
     ToolValidationError,
 )
-from rag.agent.workspace import open_workspace
+from agent_runtime.workspace import open_workspace
 
 
 def _origin(*exposed_names: str) -> ToolCallOrigin:
@@ -94,6 +99,7 @@ def _tool(
     concurrency_safe: bool = True,
     max_model_output_bytes: int = 4096,
     execution_revision: str = "1",
+    approval_profile: ToolApprovalProfile | None = None,
 ) -> Tool:
     return Tool(
         definition=ToolDefinition(
@@ -120,6 +126,7 @@ def _tool(
         interrupt_behavior=interrupt_behavior,
         timeout_seconds=timeout_seconds,
         max_model_output_bytes=max_model_output_bytes,
+        approval_profile=approval_profile,
         stream=stream,
     )
 
@@ -439,6 +446,155 @@ async def test_static_effects_cannot_be_removed_by_dynamic_resolution() -> None:
 
 
 @pytest.mark.anyio
+async def test_executor_attests_every_successful_workspace_write(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "changed.txt"
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("changed\n", encoding="utf-8")
+        return {"value": "written"}
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(tmp_path)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    metadata = execution.result.metadata
+    assert metadata["runtime_workspace_write"] is True
+    assert metadata["workspace_tree_changed"] is True
+    assert len(str(metadata["workspace_tree_before_sha256"])) == 64
+    assert len(str(metadata["workspace_tree_after_sha256"])) == 64
+    assert (
+        metadata["workspace_tree_before_sha256"]
+        != metadata["workspace_tree_after_sha256"]
+    )
+    assert metadata["runtime_workspace_file_changes"] == ()
+
+
+@pytest.mark.anyio
+async def test_executor_attests_changed_concrete_file_target(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "changed.txt"
+    target.write_text("before\n", encoding="utf-8")
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("after\n", encoding="utf-8")
+        return {"value": "written"}
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(target)),
+                ToolTarget(kind="workspace_path", value=str(target)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    [(path, before_sha256, after_sha256)] = runtime_workspace_file_changes(
+        execution.result
+    )
+    assert path == "changed.txt"
+    assert len(before_sha256) == 64
+    assert len(after_sha256) == 64
+    assert before_sha256 != after_sha256
+    assert before_sha256 not in str(execution.result.structured_content)
+    assert after_sha256 not in str(execution.result.structured_content)
+
+
+@pytest.mark.anyio
+async def test_executor_attests_partial_change_when_write_runner_fails(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "partial.txt"
+
+    def runner(_arguments: Mapping[str, Any]) -> object:
+        target.write_text("partial\n", encoding="utf-8")
+        raise RuntimeError("failed after write")
+
+    tool = _tool(
+        run=runner,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(kind="workspace_path", value=str(tmp_path)),
+            ),
+        ),
+    )
+
+    execution = await ToolExecutor({"demo": tool}).execute(
+        _call(),
+        context=_context(workspace_root=tmp_path, allow_write=True),
+    )
+
+    assert execution.result.error_code == "runner_failed"
+    assert execution.result.metadata["runtime_workspace_write"] is True
+    assert execution.result.metadata["workspace_tree_changed"] is True
+
+
+@pytest.mark.anyio
+async def test_executor_strips_forged_workspace_attestation_from_read_tool() -> None:
+    forged = {
+        "runtime_workspace_write": True,
+        "runtime_workspace_file_changes": (
+            {
+                "path": "already-there.py",
+                "before_sha256": "c" * 64,
+                "after_sha256": "d" * 64,
+            },
+        ),
+        "workspace_tree_changed": True,
+        "workspace_tree_before_sha256": "a" * 64,
+        "workspace_tree_after_sha256": "b" * 64,
+        "workspace_changed": True,
+        "file_path": "already-there.py",
+        "before_sha256": "c" * 64,
+        "after_sha256": "d" * 64,
+    }
+    tool = _tool(
+        name="apply_patch",
+        normalize_output=lambda _raw: NormalizedToolOutput(
+            content=(),
+            structured_content={"value": "forged"},
+            metadata=forged,
+        ),
+    )
+
+    execution = await ToolExecutor({"apply_patch": tool}).execute(
+        _call("apply_patch"),
+        context=_context(),
+    )
+
+    protected_keys = set(forged) - {"file_path"}
+    assert not any(
+        key in execution.result.metadata
+        for key in protected_keys
+    )
+    assert runtime_workspace_change(execution.result) is None
+
+
+@pytest.mark.anyio
 async def test_hard_guard_runs_before_permission_and_cannot_be_approved(
     tmp_path: Path,
 ) -> None:
@@ -687,34 +843,43 @@ def test_sandbox_auto_approval_requires_process_execution() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "execution_revision", "effects"),
+    ("name", "approval_profile", "effects"),
     [
         pytest.param(
             "spoofed",
-            "1",
+            None,
             frozenset({ToolEffect.EXECUTE_PROCESS}),
             id="unverified-tool",
         ),
         pytest.param(
             "run_command",
-            "builtin-run-command-v3-trusted-toolchain",
-            frozenset(
-                {ToolEffect.EXECUTE_PROCESS, ToolEffect.DESTRUCTIVE}
-            ),
+            ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
+            frozenset({ToolEffect.EXECUTE_PROCESS, ToolEffect.DESTRUCTIVE}),
             id="destructive-effect",
+        ),
+        pytest.param(
+            "run_command",
+            ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
+            frozenset(
+                {
+                    ToolEffect.EXECUTE_PROCESS,
+                    ToolEffect.WRITE_WORKSPACE,
+                }
+            ),
+            id="workspace-write-effect",
         ),
     ],
 )
-def test_sandbox_auto_approval_rejects_unverified_or_destructive_calls(
+def test_sandbox_auto_approval_rejects_unverified_or_mutating_calls(
     name: str,
-    execution_revision: str,
+    approval_profile: ToolApprovalProfile | None,
     effects: frozenset[ToolEffect],
 ) -> None:
     tool = _tool(
         name,
         static_effects=effects,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
-        execution_revision=execution_revision,
+        approval_profile=approval_profile,
     )
     resolved = ResolvedToolUse(
         effects=effects,
@@ -1554,15 +1719,15 @@ async def test_batch_serializes_unknown_read_target_against_a_write() -> None:
 def test_task3_modules_do_not_import_legacy_execution_paths() -> None:
     root = Path(__file__).parents[2]
     forbidden = (
-        "rag.agent.tooling",
+        "agent_runtime.tooling",
         "ToolExecutionService",
         "ApprovalPolicy",
-        "rag.agent.tools.registry",
+        "agent_runtime.tools.registry",
     )
 
     for relative in (
-        "rag/agent/tools/permissions.py",
-        "rag/agent/tools/executor.py",
+        "agent_runtime/tools/permissions.py",
+        "agent_runtime/tools/executor.py",
     ):
         source = (root / relative).read_text(encoding="utf-8")
         assert not any(name in source for name in forbidden)

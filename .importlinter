@@ -1,30 +1,69 @@
 [importlinter]
-root_package = rag
+root_packages =
+    agent_runtime
+    rag
+
+[importlinter:contract:runtime_rag_boundary]
+name = Runtime depends on RAG only through the knowledge adapter
+type = forbidden
+source_modules =
+    agent_runtime
+forbidden_modules =
+    rag
+ignore_imports =
+    agent_runtime.knowledge_providers.rag -> rag
+    agent_runtime.knowledge_providers.rag -> rag.models.assembly_adapter
+    agent_runtime.knowledge_providers.rag -> rag.models.runtime
+    agent_runtime.knowledge_providers.rag -> rag.retrieval
+    agent_runtime.knowledge_providers.rag -> rag.runtime
+    agent_runtime.knowledge_providers.rag -> rag.storage.runtime_config
+allow_indirect_imports = true
 
 [importlinter:contract:schema_foundation]
-name = Schema remains independent from agent orchestration
+name = RAG schema remains independent from runtime orchestration
 type = forbidden
 source_modules =
     rag.schema
 forbidden_modules =
-    rag.agent
+    agent_runtime.runtime
+    agent_runtime.tools
 
 [importlinter:contract:tools_boundary]
-name = Tools do not depend on agent orchestration
+name = Runtime tools do not depend on Harness orchestration
 type = forbidden
 source_modules =
-    rag.agent.tools
+    agent_runtime.tools
 forbidden_modules =
-    rag.agent.graphs
-    rag.agent.service
-    rag.cli
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager
 
-[importlinter:contract:memory_boundary]
-name = Memory does not depend on agent orchestration
+[importlinter:contract:harness_components_do_not_depend_on_session]
+name = Harness components do not depend on Session internals
 type = forbidden
 source_modules =
-    rag.agent.memory
+    agent_runtime.harness.context
+    agent_runtime.harness.events
+    agent_runtime.harness.model_adapter
+    agent_runtime.harness.protocol
+    agent_runtime.harness.reducer
+    agent_runtime.harness.rollout
+    agent_runtime.harness.tool_orchestrator
+    agent_runtime.harness.tool_router
 forbidden_modules =
-    rag.agent.graphs
-    rag.agent.service
-    rag.cli
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager
+
+[importlinter:contract:core_does_not_depend_on_harness_orchestration]
+name = Core does not depend on Harness orchestration
+type = forbidden
+source_modules =
+    agent_runtime.core
+forbidden_modules =
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager

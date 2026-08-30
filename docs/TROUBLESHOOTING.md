@@ -1,4 +1,4 @@
-# 故障排查
+# Praxis 故障排查
 
 > 从 [README.md](../README.md) 拆分出来。常见问题和处理顺序。
 

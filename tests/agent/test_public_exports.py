@@ -12,103 +12,140 @@ _LEGACY_CLOSURE_EXPORTS = {
 }
 
 _LEGACY_CLOSURE_MODULES = (
-    "rag.agent.core.agent_as_tool",
-    "rag.agent.core.agent_service_factory",
-    "rag.agent.core.agent_tool_contract",
-    "rag.agent.core.compiler",
-    "rag.agent.core.delegation",
-    "rag.agent.core.runtime_ports",
-    "rag.agent.core.registry",
-    "rag.agent.core.subagent_runner",
-    "rag.agent.graphs.base",
+    "agent_runtime.service",
+    "agent_runtime.turns",
+    "agent_runtime.loop",
+    "agent_runtime.memory",
+    "agent_runtime.core.checkpointing",
+    "agent_runtime.core.context",
+    "agent_runtime.core.human_input",
+    "agent_runtime.core.llm_context",
+    "agent_runtime.core.llm_providers",
+    "agent_runtime.core.model_provider_runtime",
+    "agent_runtime.core.agent_as_tool",
+    "agent_runtime.core.agent_service_factory",
+    "agent_runtime.core.agent_tool_contract",
+    "agent_runtime.core.compiler",
+    "agent_runtime.core.delegation",
+    "agent_runtime.core.runtime_ports",
+    "agent_runtime.core.registry",
+    "agent_runtime.core.subagent_runner",
+    "agent_runtime.graphs.base",
 )
 
 _LEGACY_CLOSURE_PATHS = (
-    "rag/agent/core/agent_service_factory.py",
-    "rag/agent/core/compiler.py",
-    "rag/agent/core/subagent_runner.py",
-    "rag/agent/core/agent_as_tool.py",
-    "rag/agent/core/agent_tool_contract.py",
-    "rag/agent/core/delegation.py",
-    "rag/agent/core/runtime_ports.py",
-    "rag/agent/core/registry.py",
-    "rag/agent/graphs/base.py",
-    "rag/agent/graphs/__init__.py",
-    "rag/agent/graphs/nodes/__init__.py",
+    "agent_runtime/service.py",
+    "agent_runtime/turns.py",
+    "agent_runtime/loop",
+    "agent_runtime/memory",
+    "agent_runtime/core/checkpointing.py",
+    "agent_runtime/core/context.py",
+    "agent_runtime/core/human_input.py",
+    "agent_runtime/core/llm_context.py",
+    "agent_runtime/core/llm_providers.py",
+    "agent_runtime/core/model_provider_runtime.py",
+    "agent_runtime/core/agent_service_factory.py",
+    "agent_runtime/core/compiler.py",
+    "agent_runtime/core/subagent_runner.py",
+    "agent_runtime/core/agent_as_tool.py",
+    "agent_runtime/core/agent_tool_contract.py",
+    "agent_runtime/core/delegation.py",
+    "agent_runtime/core/runtime_ports.py",
+    "agent_runtime/core/registry.py",
+    "agent_runtime/graphs/base.py",
+    "agent_runtime/graphs/__init__.py",
+    "agent_runtime/graphs/nodes/__init__.py",
+)
+
+_ORPHANED_AGENT_PATHS = (
+    "agent_runtime/binding_providers.py",
+    "agent_runtime/capabilities/__init__.py",
 )
 
 
-def test_agent_package_exports_new_contract_surface_only() -> None:
-    import rag.agent as agent
-    import rag.agent.core as core
-
-    assert hasattr(agent, "AgentRuntimePolicy")
-    assert not hasattr(agent, "AgentRegistry")
-    assert hasattr(agent, "AgentRunConfig")
-    assert hasattr(agent, "AgentRunRequest")
-    assert hasattr(agent, "AgentRunResult")
-    assert hasattr(agent, "AgentService")
-    assert hasattr(agent, "AgentState")
-    assert hasattr(agent, "Tool")
-    assert hasattr(agent, "ToolRegistry")
-    assert hasattr(agent, "ToolResult")
-    assert hasattr(agent, "TurnRegistry")
-    assert not hasattr(agent, "derive_child_config")
-    assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(agent.__all__)
-    assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(core.__all__)
-    assert not hasattr(agent, "AgentGraphCompiler")
-    assert not hasattr(agent, "PlanController")
-    assert not hasattr(agent, "RuntimeRegistry")
-    assert not hasattr(agent, "TaskDAG")
-    assert not hasattr(agent, "AnalysisAgentService")
-    assert not hasattr(agent, "AgentRunState")
-    assert not hasattr(agent, "AgentToolSpec")
-    assert not hasattr(agent, "ToolSpec")
-    assert not hasattr(agent, "AgentPlan")
-    assert not hasattr(agent, "PlanEvent")
-    assert not hasattr(agent, "PlanTracker")
-
-
-def test_root_package_exports_new_agent_contract_surface() -> None:
-    from rag import (
-        AgentRunConfig,
-        AgentRunRequest,
-        AgentRuntimePolicy,
-        AgentService,
-        AgentState,
-        Tool,
-        ToolRegistry,
-        ToolResult,
+def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
+    import agent_runtime as public_api
+    import agent_runtime.core as core
+    from agent_runtime.harness import (
+        RolloutStore,
+        Session,
+        StepContext,
+        ThreadManager,
+        TurnContext,
     )
+    from agent_runtime.tools import Tool, ToolRegistry, ToolResult
 
-    assert AgentRuntimePolicy is not None
-    assert AgentRunConfig is not None
-    assert AgentRunRequest is not None
-    assert AgentService is not None
-    assert AgentState is not None
+    assert RolloutStore is not None
+    assert ThreadManager is not None
+    assert Session is not None
+    assert TurnContext is not None
+    assert StepContext is not None
     assert Tool is not None
     assert ToolRegistry is not None
     assert ToolResult is not None
+    for internal_name in (
+        "AgentRuntimePolicy",
+        "AgentRunConfig",
+        "AgentRunRequest",
+        "AgentRunResult",
+        "AgentService",
+        "AgentState",
+        "Tool",
+        "ToolRegistry",
+        "ToolResult",
+        "TurnRegistry",
+    ):
+        assert not hasattr(public_api, internal_name)
+    assert core.__all__ == []
+    assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(public_api.__all__)
+    assert _LEGACY_CLOSURE_EXPORTS.isdisjoint(core.__all__)
+    for removed_name in (
+        "AgentGraphCompiler",
+        "PlanController",
+        "RuntimeRegistry",
+        "TaskDAG",
+        "AnalysisAgentService",
+        "AgentRunState",
+        "AgentToolSpec",
+        "ToolSpec",
+        "PlanTracker",
+    ):
+        assert not hasattr(public_api, removed_name)
+
+
+def test_rag_root_does_not_export_agent_contract_surface() -> None:
+    import rag
+
+    for name in (
+        "AgentRunConfig",
+        "AgentRunRequest",
+        "AgentRuntimePolicy",
+        "AgentService",
+        "AgentState",
+        "Tool",
+        "ToolRegistry",
+        "ToolResult",
+    ):
+        assert not hasattr(rag, name)
 
 
 def test_legacy_agent_service_module_no_longer_exports_old_service() -> None:
-    import importlib
+    import importlib.util
 
-    service = importlib.import_module("rag.agent.service")
-    assert not hasattr(service, "AnalysisAgentService")
+    assert importlib.util.find_spec("agent_runtime.service") is None
 
 
 def test_legacy_agent_modules_are_removed() -> None:
     import importlib.util
 
     legacy_modules = (
-        "rag.agent.planner",
-        "rag.agent.executor",
-        "rag.agent.critic",
-        "rag.agent.synthesizer",
-        "rag.agent.understanding",
-        "rag.agent.report",
-        "rag.agent.schema",
+        "agent_runtime.planner",
+        "agent_runtime.executor",
+        "agent_runtime.critic",
+        "agent_runtime.synthesizer",
+        "agent_runtime.understanding",
+        "agent_runtime.report",
+        "agent_runtime.schema",
         *_LEGACY_CLOSURE_MODULES,
     )
 
@@ -126,9 +163,15 @@ def test_legacy_agent_closure_files_are_removed() -> None:
     assert [relative for relative in _LEGACY_CLOSURE_PATHS if (root / relative).exists()] == []
 
 
+def test_orphaned_agent_paths_are_removed() -> None:
+    root = Path(__file__).resolve().parents[2]
+
+    assert [relative for relative in _ORPHANED_AGENT_PATHS if (root / relative).exists()] == []
+
+
 def test_production_tree_has_no_legacy_agent_closure_imports() -> None:
     root = Path(__file__).resolve().parents[2]
-    forbidden = (*_LEGACY_CLOSURE_MODULES, "rag.agent.graphs")
+    forbidden = (*_LEGACY_CLOSURE_MODULES, "agent_runtime.graphs")
     offenders: dict[str, tuple[str, ...]] = {}
 
     for production_root in (root / "rag", root / "agent_runtime"):

@@ -6,20 +6,20 @@ from typing import Any
 
 import pytest
 
-from rag.agent.core.context import LLMBudgetLedger
+from agent_runtime.modeling.budget import LLMBudgetLedger
+from agent_runtime.modeling.contracts import (
+    LLMCallStage,
+    LLMProviderResult,
+    LLMStageBudget,
+    LLMUsage,
+)
+from agent_runtime.modeling.gateway import LLMGateway, llm_budget_scope
 from rag.providers.generation import (
     AnswerGenerationService,
     AnswerGenerator,
     AnswerSectionPayload,
     GeneratorBinding,
     StructuredAnswerPayload,
-)
-from rag.providers.llm_gateway import LLMGateway, llm_budget_scope
-from rag.schema.llm import (
-    LLMCallStage,
-    LLMProviderResult,
-    LLMStageBudget,
-    LLMUsage,
 )
 from rag.schema.query import EvidenceItem, GroundingTarget
 from rag.schema.runtime import AccessPolicy, RuntimeMode

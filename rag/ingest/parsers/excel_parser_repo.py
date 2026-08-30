@@ -322,7 +322,11 @@ class ExcelParserRepo:
         column_indices: list[int] | None = None,
     ) -> bool:
         for row in worksheet.iter_rows(min_row=1, max_row=max_row, max_col=max_column, values_only=True):
-            values = row if column_indices is None else [row[index] if index < len(row) else None for index in column_indices]
+            values = (
+                row
+                if column_indices is None
+                else [row[index] if index < len(row) else None for index in column_indices]
+            )
             if any(isinstance(value, str) and value.startswith("=") for value in values):
                 return True
         return False

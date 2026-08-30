@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
 import subprocess
 import time
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 from urllib.request import urlopen
 
-from agent_runtime.models import ModelSpec
-from rag.agent.core.llm_registry import ModelNotAvailableError
+from agent_runtime.core.llm_registry import ModelNotAvailableError
+
+if TYPE_CHECKING:
+    from agent_runtime.models import ModelSpec
 
 
 class LocalRuntimeError(ModelNotAvailableError):
@@ -28,13 +33,16 @@ class LocalRuntimeManager:
         *,
         request_json: Callable[[str, float], object] | None = None,
         launch_process: Callable[[list[str]], object] | None = None,
+        stop_process: Callable[[object], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._request_json = request_json or _request_json
         self._launch_process = launch_process or _launch_process
+        self._stop_process = stop_process or _stop_process
         self._sleep = sleep
         self._monotonic = monotonic
+        self._launched_process: object | None = None
 
     def ensure_ready(self, spec: ModelSpec) -> None:
         if getattr(spec, "location", None) != "local":
@@ -58,6 +66,7 @@ class LocalRuntimeManager:
             )
             return
         except EndpointConflictError:
+            self.close()
             raise
         except Exception as initial_error:
             launch_command = getattr(runtime, "launch_command", ()) if runtime is not None else ()
@@ -66,7 +75,10 @@ class LocalRuntimeManager:
                     f"Local model {spec.id!r} is not running and has no runtime.launch_command"
                 ) from initial_error
 
-        self._launch_process([str(part) for part in launch_command])
+        self.close()
+        self._launched_process = self._launch_process(
+            [str(part) for part in launch_command]
+        )
         timeout = float(getattr(runtime, "startup_timeout_seconds", 60.0))
         interval = float(getattr(runtime, "poll_interval_seconds", 1.0))
         deadline = self._monotonic() + timeout
@@ -83,12 +95,20 @@ class LocalRuntimeManager:
                 )
                 return
             except EndpointConflictError:
+                self.close()
                 raise
             except Exception as exc:
                 last_error = exc
                 self._sleep(interval)
 
+        self.close()
         raise LocalRuntimeTimeoutError(f"Timed out waiting for local model {spec.id!r} at {health_url}") from last_error
+
+    def close(self) -> None:
+        process = self._launched_process
+        self._launched_process = None
+        if process is not None:
+            self._stop_process(process)
 
 
 def _request_json(url: str, timeout: float) -> object:
@@ -103,6 +123,45 @@ def _launch_process(command: list[str]) -> object:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+
+
+def _stop_process(process: object) -> None:
+    poll = getattr(process, "poll", None)
+    if callable(poll) and poll() is not None:
+        return
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            terminate = getattr(process, "terminate", None)
+            if callable(terminate):
+                terminate()
+    else:
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            terminate()
+
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        if isinstance(pid, int) and pid > 0:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+        else:
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                kill()
+        wait(timeout=5.0)
 
 
 def _raise_if_unexpected_model(

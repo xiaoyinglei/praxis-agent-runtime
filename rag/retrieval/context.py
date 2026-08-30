@@ -4,12 +4,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
-from rag.assembly import TokenAccountingService, TokenizerContract
+from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+from agent_runtime.text import DEFAULT_TOKENIZER_FALLBACK_MODEL
 from rag.providers.generation import AnswerGenerationService
 from rag.retrieval.evidence import classify_retrieval_family
 from rag.schema.query import EvidenceItem
 from rag.schema.runtime import RuntimeMode
-from rag.utils.text import DEFAULT_TOKENIZER_FALLBACK_MODEL
 
 MAX_TOKENS_PER_EVIDENCE = 2500
 
@@ -174,10 +174,7 @@ class EvidenceTruncator:
         selected_indices: list[int] = []
         selected_docs: set[int] = set()
         selected_groups: set[str] = set()
-        family_priority = {
-            family: len(family_order) - position
-            for position, family in enumerate(family_order)
-        }
+        family_priority = {family: len(family_order) - position for position, family in enumerate(family_order)}
 
         def select(index: int, item: EvidenceItem) -> None:
             selected_indices.append(index)
@@ -208,11 +205,7 @@ class EvidenceTruncator:
             select(best_index, best_item)
 
         remaining = sorted(
-            [
-                (index, item)
-                for index, item in indexed_items
-                if index not in selected_indices
-            ],
+            [(index, item) for index, item in indexed_items if index not in selected_indices],
             key=lambda pair: self._selection_key(
                 pair[1],
                 original_index=pair[0],

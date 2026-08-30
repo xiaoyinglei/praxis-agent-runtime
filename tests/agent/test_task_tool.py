@@ -7,11 +7,11 @@ from typing import Any
 
 import pytest
 
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations import subagent as subagent_module
-from rag.agent.tools.integrations.subagent import create_subagent_tool
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import Tool, ToolCall, ToolCallOrigin
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations import subagent as subagent_module
+from agent_runtime.tools.integrations.subagent import create_subagent_tool
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
 
 
 def _call(arguments: Mapping[str, Any]) -> ToolCall:
@@ -120,7 +120,7 @@ def test_subagent_adapter_does_not_own_the_child_loop() -> None:
         if isinstance(node, ast.ImportFrom) and node.module is not None
     }
 
-    assert not any(module.startswith("rag.agent.loop") for module in imports)
+    assert not any(module.startswith("agent_runtime.loop") for module in imports)
     assert "AgentLoop" not in source
     assert "AgentService" not in source
     assert "DelegatedAgentRunner" not in source

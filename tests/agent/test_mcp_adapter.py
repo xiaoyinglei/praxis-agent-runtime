@@ -7,16 +7,16 @@ from typing import Any
 
 import pytest
 
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations import mcp as mcp_module
-from rag.agent.tools.integrations.mcp import (
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations import mcp as mcp_module
+from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
     canonical_mcp_name,
     create_mcp_tools,
     normalize_mcp_name,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import (
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import (
     Tool,
     ToolCall,
     ToolCallOrigin,

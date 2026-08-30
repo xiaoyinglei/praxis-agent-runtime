@@ -5,7 +5,7 @@ from types import MappingProxyType
 
 import pytest
 
-from rag.agent.tools.selection import (
+from agent_runtime.tools.selection import (
     ToolActivationError,
     ToolConfigurationError,
     ToolSchemaBudgetError,
@@ -13,7 +13,7 @@ from rag.agent.tools.selection import (
     resolve_tool_options,
     select_tools,
 )
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
     JsonValue,

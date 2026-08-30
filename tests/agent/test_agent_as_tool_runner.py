@@ -4,13 +4,13 @@ from collections.abc import Mapping
 
 import pytest
 
-from rag.agent.tools.executor import ToolExecutor
-from rag.agent.tools.integrations.subagent import (
+from agent_runtime.tools.executor import ToolExecutor
+from agent_runtime.tools.integrations.subagent import (
     SubagentOutput,
     create_subagent_tool,
 )
-from rag.agent.tools.permissions import ToolExecutionContext
-from rag.agent.tools.tool import JsonValue, ToolCall, ToolCallOrigin
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import JsonValue, ToolCall, ToolCallOrigin
 
 
 def _call(arguments: Mapping[str, JsonValue]) -> ToolCall:

@@ -15,32 +15,40 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
-      - run: uv sync
-      - run: uv run pytest -q
-      - run: uv run lint-imports
-      - name: Ruff changed Python files
+      - name: Sync locked environment
+        run: uv sync --locked
+      - name: Ruff
+        run: uv run ruff check .
+      - name: Mypy
+        run: uv run mypy
+      - name: Pytest
+        run: uv run pytest -q
+      - name: Import contracts
+        run: uv run lint-imports
+      - name: Build distribution
+        run: uv build
+      - name: CLI projection smoke
+        run: uv run python scripts/agent_cli_smoke.py
+      - name: Delivery smoke
+        run: uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
+      - name: Harness acceptance contract
+        run: uv run python scripts/agent_harness_acceptance.py validate --schema evals/harness/acceptance_v1.json --contract docs/design/praxis_harness_architecture.md
+      - name: Benchmark manifest
+        run: uv run python scripts/agent_code_benchmark.py validate evals/code_agent/benchmark_v1.json --repository .
+      - name: Installed wheel smoke
+        shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
-          else
-            base_sha="HEAD~1"
+          smoke_root="$(mktemp -d "$RUNNER_TEMP/praxis-wheel-smoke.XXXXXX")"
+          smoke_venv="$smoke_root/venv"
+          mapfile -d '' -t wheels < <(find dist -maxdepth 1 -type f -name '*.whl' -print0)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            printf 'Expected exactly one wheel in dist, found %s\n' "${#wheels[@]}" >&2
+            exit 1
           fi
-          mapfile -t changed_py < <(git diff --name-only --diff-filter=ACMRT "$base_sha...HEAD" -- '*.py')
-          if [ "${#changed_py[@]}" -eq 0 ]; then
-            echo "No changed Python files to lint."
-          else
-            uv run ruff check "${changed_py[@]}"
-          fi
-      - name: Mypy changed source files
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base_sha="${{ github.event.pull_request.base.sha }}"
-          else
-            base_sha="HEAD~1"
-          fi
-          mapfile -t changed_py < <(git diff --name-only --diff-filter=ACMRT "$base_sha...HEAD" -- 'rag/*.py' 'rag/**/*.py')
-          if [ "${#changed_py[@]}" -eq 0 ]; then
-            echo "No changed source files to type-check."
-          else
-            uv run mypy "${changed_py[@]}"
-          fi
+          wheel="${wheels[0]}"
+
+          uv venv --no-project --python 3.12 "$smoke_venv"
+          uv pip install --python "$smoke_venv/bin/python" "$wheel"
+          cd "$smoke_root"
+          "$smoke_venv/bin/agent" --help
+          "$smoke_venv/bin/rag" --help

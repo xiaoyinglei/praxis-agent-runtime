@@ -2,14 +2,15 @@ import json
 import re
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 from pytest import MonkeyPatch
 from typer.testing import CliRunner
 
-import rag.agent.cli as agent_cli
+import agent_runtime.cli as agent_cli
 import rag.cli as cli
+from agent_runtime.cli import agent_app
 from rag import StorageConfig
-from rag.agent.cli import agent_app
 from rag.cli import app
 from rag.retrieval.models import BuiltContext, PublicQueryResult
 from rag.schema.query import GroundedAnswer
@@ -179,8 +180,8 @@ def test_cli_main_delegates_to_typer_app(monkeypatch: MonkeyPatch) -> None:
 def test_project_metadata_exposes_agent_as_primary_console_script() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
 
-    assert pyproject["project"]["name"] == "agent-runtime"
-    assert pyproject["project"]["scripts"]["agent"] == "rag.agent.cli:agent_app"
+    assert pyproject["project"]["name"] == "praxis-agent-runtime"
+    assert pyproject["project"]["scripts"]["agent"] == "agent_runtime.cli:agent_app"
     assert pyproject["project"]["scripts"]["rag"] == "rag.cli:app"
 
 
@@ -245,18 +246,21 @@ def test_agent_cli_is_the_top_level_agent_entrypoint() -> None:
     assert "--agent" not in _plain_help(run_help.output)
 
 
-def test_chat_model_switch_fails_after_turn_lineage_has_started(capsys) -> None:
-    class UnexpectedAgent:
+def test_chat_model_switch_is_not_blocked_by_turn_lineage(capsys) -> None:
+    switched: list[str] = []
+
+    class Agent:
         def switch_model(self, model_id: str):
-            raise AssertionError(f"must not switch {model_id!r}")
+            switched.append(model_id)
+            return SimpleNamespace(id=model_id)
 
     agent_cli._handle_model_slash_command(
         "/model switch qwen3_5_9b_mlx_4bit",
-        agent=UnexpectedAgent(),  # type: ignore[arg-type]
-        allow_switch=False,
+        agent=Agent(),  # type: ignore[arg-type]
     )
 
-    assert "当前上下文的模型绑定已冻结" in capsys.readouterr().out
+    assert switched == ["qwen3_5_9b_mlx_4bit"]
+    assert "已切换模型: qwen3_5_9b_mlx_4bit" in capsys.readouterr().out
 
 
 def test_rag_cli_no_longer_exposes_agent_or_analyze_task() -> None:

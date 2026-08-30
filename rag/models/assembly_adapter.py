@@ -3,8 +3,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING
 
+from agent_runtime.modeling.config import GenerationTaskConfig, ModelRuntimeConfig, ModelSpec
 from rag.assembly.models import AssemblyOverrides, ProviderConfig, TokenizerConfig
-from rag.models.config import GenerationTaskConfig, ModelRuntimeConfig, ModelSpec
 
 if TYPE_CHECKING:
     from rag.models.catalog import ModelCatalog
@@ -48,14 +48,16 @@ def to_assembly_overrides(config: ModelRuntimeConfig) -> AssemblyOverrides:
             max_context_tokens=tokenizer_config.max_context_tokens,
             prompt_reserved_tokens=tokenizer_config.prompt_reserved_tokens,
             local_files_only=tokenizer_config.local_files_only,
-        ) if (
+        )
+        if (
             tokenizer_config.tokenizer_backend is not None
             or tokenizer_config.chunk_token_size is not None
             or tokenizer_config.chunk_overlap_tokens is not None
             or tokenizer_config.max_context_tokens is not None
             or tokenizer_config.prompt_reserved_tokens is not None
             or tokenizer_config.local_files_only is not None
-        ) else None,
+        )
+        else None,
     )
 
 

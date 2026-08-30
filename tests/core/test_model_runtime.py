@@ -6,19 +6,20 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import BaseModel
 
+from agent_runtime.modeling.config import GenerationTaskConfig, ModelCapability, ModelRuntimeConfig
+from agent_runtime.modeling.contracts import LLMCallStage
 from rag.assembly.models import ProviderConfig
 from rag.assembly.support import _OpenAICompatibleChatGenerator, build_provider
 from rag.models.assembly_adapter import resolve_task_model, to_assembly_overrides
 from rag.models.catalog import ModelCatalog
-from rag.models.config import GenerationTaskConfig, ModelCapability, ModelRuntimeConfig
 from rag.models.guard import EmbeddingSpaceMismatchError, assert_embedding_space_compatible
 from rag.models.runtime import RuntimeOverrides, resolve_runtime_config
 from rag.runtime import _generator_bindings_from_chat_bindings
-from rag.schema.llm import LLMCallStage
 
 
 class _StructuredPayload(BaseModel):
     answer: str
+
 
 CATALOG_YAML = """
 models:
@@ -597,9 +598,7 @@ def test_e2e_model_runtime_driven_ingest_and_query(
         assert "报销" in evidence_texts_2, f"Expected '报销' in evidence, got: {evidence_texts_2[:200]}"
 
         r3 = runtime.query_public("绩效考核怎么评")
-        assert any(
-            "考核" in e.text for e in r3.context.evidence if e.text
-        ), "Expected '考核' in evidence"
+        assert any("考核" in e.text for e in r3.context.evidence if e.text), "Expected '考核' in evidence"
 
         # 验证 generation provider 来自我们的模型
         assert r1.generation_model is not None
@@ -637,6 +636,7 @@ class _FakeEmbedder:
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         import hashlib
+
         result: list[list[float]] = []
         for text in texts:
             seed = int(hashlib.md5(text.encode()).hexdigest()[:8], 16)
@@ -693,7 +693,9 @@ def test_override_priority_model_beats_compat_env(monkeypatch: pytest.MonkeyPatc
 
 # ── generation config ──────────────────────────────────────────
 
-_GENERATION_CATALOG_YAML = CATALOG_YAML + """
+_GENERATION_CATALOG_YAML = (
+    CATALOG_YAML
+    + """
 generation:
   summary:
     model: qwen_local
@@ -718,6 +720,7 @@ generation:
     max_tokens: 2048
     temperature: 0.1
 """
+)
 
 
 @pytest.fixture

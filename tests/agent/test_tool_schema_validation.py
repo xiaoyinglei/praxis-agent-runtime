@@ -34,7 +34,7 @@ from pydantic.dataclasses import dataclass as pydantic_dataclass
 from pydantic_core import core_schema
 from typing_extensions import TypedDict
 
-from rag.agent.tools.tool import (
+from agent_runtime.tools.tool import (
     JsonValue,
     ToolValidationError,
     _reject_ignored_extras_in_value,

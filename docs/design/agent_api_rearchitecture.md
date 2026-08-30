@@ -480,7 +480,7 @@ the recommended API.
 - Add `agent_runtime.AgentResult`.
 - Add `agent_runtime.config` and `agent_runtime.models`.
 - Change `agent` CLI to call the facade.
-- Keep existing `rag.agent.service.AgentService` internally.
+- Keep existing `agent_runtime.service.AgentService` internally.
 - Do not move files yet unless necessary.
 - Add the first Model Control Plane slice: `ModelSpec`, `ModelCatalog`,
   `ModelSessionState`, `ModelPolicy`, `ModelControlPlane`, and
@@ -500,8 +500,10 @@ Agent(model="qwen14b").run("hi")
 
 ### Phase 2: Move Package Boundaries
 
-- Move or wrap `rag.agent.*` under `agent_runtime.runtime.*`.
-- Keep compatibility imports with deprecation warnings.
+This superseded phase proposed an intermediate wrapper layer. The Praxis hard
+cutover replaces it: Agent implementation is owned directly by `agent_runtime`,
+with no compatibility imports.
+
 - Update docs and tests to prefer `agent_runtime`.
 - Make `rag` clearly a knowledge/RAG lower-level subsystem.
 
