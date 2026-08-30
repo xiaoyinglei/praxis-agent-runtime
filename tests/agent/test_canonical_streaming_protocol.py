@@ -318,6 +318,16 @@ async def test_full_controlling_queue_close_wakes_blocked_emitter() -> None:
         await asyncio.wait_for(blocked_emit, timeout=0.2)
 
 
+@pytest.mark.anyio
+async def test_emit_after_close_raises_event_channel_closed() -> None:
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    stream.close()
+
+    with pytest.raises(stream_sinks.EventChannelClosed):
+        await dispatcher.emit(events.turn_started("turn-already-closed"))
+
+
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
