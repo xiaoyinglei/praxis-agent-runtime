@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import fields
 from pathlib import Path
@@ -16,6 +17,7 @@ from agent_runtime.harness import (
     RolloutStore,
 )
 from agent_runtime.streaming import events
+from agent_runtime.streaming import sink as stream_sinks
 from agent_runtime.streaming.sink import LegacyStreamProjectionSink
 
 
@@ -276,6 +278,25 @@ async def test_legacy_projection_preserves_tool_id_result_details_and_plan_event
         "diff_truncated": False,
     }
     assert target.events[2].data["event"] == {"event_type": "llm_update"}
+
+
+@pytest.mark.anyio
+async def test_controlling_stream_blocks_producer_when_queue_is_full() -> None:
+    dispatcher_type = getattr(stream_sinks, "TurnEventDispatcher", None)
+    assert dispatcher_type is not None, "canonical dispatcher must be public"
+    dispatcher = dispatcher_type(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    first = events.turn_started("turn-backpressure")
+    second = events.turn_completed("turn-backpressure")
+
+    await dispatcher.emit(first)
+    blocked_emit = asyncio.create_task(dispatcher.emit(second))
+    await asyncio.sleep(0)
+
+    assert blocked_emit.done() is False
+    assert await stream.receive() == first
+    await asyncio.wait_for(blocked_emit, timeout=0.2)
+    assert await stream.receive() == second
 
 
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:

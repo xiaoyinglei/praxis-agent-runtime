@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
@@ -26,6 +27,37 @@ class StreamEventSink(Protocol):
     """Streaming event sink protocol."""
 
     async def emit(self, event: StreamEvent) -> None: ...
+
+
+class TurnEventStream:
+    """One controlling consumer of a Turn's canonical event stream."""
+
+    def __init__(self, queue: asyncio.Queue[StreamEvent]) -> None:
+        self._queue = queue
+
+    async def receive(self) -> StreamEvent:
+        return await self._queue.get()
+
+
+class TurnEventDispatcher:
+    """Fan out one Turn's events with controlling-consumer backpressure."""
+
+    def __init__(self, *, capacity: int = 64) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise TypeError("capacity must be an integer")
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self._capacity = capacity
+        self._controlling: list[asyncio.Queue[StreamEvent]] = []
+
+    def subscribe_controlling(self) -> TurnEventStream:
+        queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=self._capacity)
+        self._controlling.append(queue)
+        return TurnEventStream(queue)
+
+    async def emit(self, event: StreamEvent) -> None:
+        for queue in tuple(self._controlling):
+            await queue.put(event)
 
 
 class LegacyStreamProjectionSink:
