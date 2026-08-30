@@ -173,6 +173,19 @@ class _RaisingSink:
         raise RuntimeError("sink failed")
 
 
+class _NeverReturningSink:
+    def __init__(self) -> None:
+        self.cancelled = asyncio.Event()
+
+    async def emit(self, event: events.StreamEvent) -> None:
+        del event
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
 @pytest.mark.anyio
 async def test_legacy_projection_emits_only_legacy_wire_events() -> None:
     target = _LiveSink()
@@ -358,6 +371,23 @@ async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> N
         replayed = RolloutEventReader(reopened).read(thread.thread_id)
         assert replayed[0].event == committed
         assert reopened.verify().valid is True
+
+
+@pytest.mark.anyio
+async def test_never_returning_sink_is_cancelled_within_grace() -> None:
+    sink = _NeverReturningSink()
+    dispatcher = stream_sinks.TurnEventDispatcher(
+        capacity=1,
+        sink_cancel_grace_seconds=0.01,
+    )
+    dispatcher.subscribe_controlling_sink(sink)
+
+    with pytest.raises(stream_sinks.EventChannelClosed, match="grace"):
+        await asyncio.wait_for(
+            dispatcher.emit(events.turn_started("turn-stuck-sink")),
+            timeout=0.2,
+        )
+    assert sink.cancelled.is_set()
 
 
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:

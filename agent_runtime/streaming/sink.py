@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Mapping, Sequence
 from typing import Protocol, cast
 
@@ -118,12 +119,25 @@ class TurnEventStream:
 class TurnEventDispatcher:
     """Fan out one Turn's events with controlling-consumer backpressure."""
 
-    def __init__(self, *, capacity: int = 64) -> None:
+    def __init__(
+        self,
+        *,
+        capacity: int = 64,
+        sink_cancel_grace_seconds: float = 1.0,
+    ) -> None:
         if isinstance(capacity, bool) or not isinstance(capacity, int):
             raise TypeError("capacity must be an integer")
         if capacity <= 0:
             raise ValueError("capacity must be positive")
+        if (
+            isinstance(sink_cancel_grace_seconds, bool)
+            or not isinstance(sink_cancel_grace_seconds, (int, float))
+            or not math.isfinite(sink_cancel_grace_seconds)
+            or sink_cancel_grace_seconds <= 0
+        ):
+            raise ValueError("sink cancellation grace must be finite and positive")
         self._capacity = capacity
+        self._sink_cancel_grace_seconds = float(sink_cancel_grace_seconds)
         self._controlling: list[_EventChannel] = []
         self._controlling_sinks: list[StreamEventSink] = []
         self._passive: list[_EventChannel] = []
@@ -147,12 +161,30 @@ class TurnEventDispatcher:
         for channel in tuple(self._passive):
             channel.put_passive(event, cursor=cursor)
         for sink in tuple(self._controlling_sinks):
+            delivery = asyncio.create_task(sink.emit(event))
+            done, _pending = await asyncio.wait(
+                {delivery},
+                timeout=self._sink_cancel_grace_seconds,
+            )
+            if not done:
+                delivery.cancel()
+                await asyncio.sleep(0)
+                delivery.add_done_callback(_consume_task_result)
+                raise EventChannelClosed(
+                    "controlling event sink exceeded cancellation grace"
+                )
             try:
-                await sink.emit(event)
+                delivery.result()
             except Exception as exc:
                 raise EventChannelClosed(
                     f"controlling event sink failed: {exc}"
                 ) from exc
+
+
+def _consume_task_result(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    task.exception()
 
 
 class LegacyStreamProjectionSink:
