@@ -42,7 +42,7 @@ from agent_runtime.streaming.events import (
     derive_model_public_item_id,
     item_delta,
 )
-from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.streaming.sink import EventChannelClosed, TurnEventDispatcher
 from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
 
 
@@ -256,8 +256,8 @@ class Session:
     async def retry_unknown_model(self, *, turn_id: str) -> TurnResult:
         turn = self._store.read_turn(turn_id)
         turn_context = self.restore_turn_context(turn_id)
-        if turn.status != "paused":
-            raise RuntimeError("model retry requires a paused Turn")
+        if turn.status not in {"paused", "interrupted"}:
+            raise RuntimeError("model retry requires a paused or interrupted Turn")
         unknown = [
             operation for operation in self._store.list_model_operations(turn_id) if operation.status == "unknown"
         ]
@@ -636,8 +636,15 @@ class Session:
                 turn_id=turn_id,
                 reason=str(exc),
             )
-        except ModelDispatchCancelledError as exc:
+        except (ModelDispatchCancelledError, EventChannelClosed) as exc:
             reason = str(exc).strip() or "provider acknowledged model cancellation"
+            await self._commit(
+                partial(
+                    self._store.request_turn_cancellation,
+                    turn_id=turn_id,
+                    reason=reason,
+                )
+            )
             await self._commit(
                 partial(
                     self._store.cancel_model_attempt,
@@ -681,6 +688,15 @@ class Session:
                 status="paused",
             )
         except asyncio.CancelledError as exc:
+            await asyncio.shield(
+                self._commit(
+                    partial(
+                        self._store.request_turn_cancellation,
+                        turn_id=turn_id,
+                        reason="Turn task cancelled while provider outcome was unknown",
+                    )
+                )
+            )
             await self._commit(
                 partial(
                     self._store.mark_model_attempt_unknown,

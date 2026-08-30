@@ -13,6 +13,7 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
+    ModelDispatchCancelledError,
     PreparedModelCall,
     RolloutEventReader,
     RolloutStore,
@@ -316,6 +317,21 @@ class BlockingPublicModel(PublicHarnessModel):
             provider_response_id="live-stream-response",
             usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
         )
+
+
+class AcknowledgedStreamCancelModel(PublicHarnessModel):
+    def __init__(self) -> None:
+        self.dispatch_started = asyncio.Event()
+
+    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+        del prepared
+        self.dispatch_started.set()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError as exc:
+            raise ModelDispatchCancelledError(
+                "provider acknowledged stream cancellation"
+            ) from exc
 
 
 class BlockingResumeModel(PatchThenAnswerModel):
@@ -650,6 +666,83 @@ async def test_public_astream_emits_committed_turn_start_before_model_finishes(
     model.release_dispatch.set()
     remaining = [event async for event in stream]
     assert remaining[-1].type is EventType.TURN_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_confirmed_stream_cancel_commits_request_then_turn_aborted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "praxis.sqlite3"
+    agent = Agent(checkpoint_db=database, workspace_path=workspace)
+    model = AcknowledgedStreamCancelModel()
+    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    stream = agent.astream(
+        "cancel the controlling stream",
+        require_workspace_change=False,
+    )
+
+    started = await asyncio.wait_for(anext(stream), timeout=1.0)
+    await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
+    await stream.aclose()
+
+    with RolloutStore(database) as store:
+        replayed = [
+            entry.event
+            for entry in RolloutEventReader(store).read_global()
+            if entry.event.turn_id == started.turn_id
+        ]
+        turn = store.read_turn(started.turn_id)
+        thread = store.read_thread(turn.thread_id)
+
+    assert [event.type for event in replayed] == [
+        EventType.TURN_STARTED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_ABORTED,
+    ]
+    assert turn.status == "cancelled"
+    assert thread.active_turn_id is None
+
+
+@pytest.mark.anyio
+async def test_unconfirmed_stream_cancel_retains_interrupted_turn_for_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "praxis.sqlite3"
+    agent = Agent(checkpoint_db=database, workspace_path=workspace)
+    model = BlockingPublicModel()
+    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    stream = agent.astream(
+        "cancel with an unknown provider outcome",
+        require_workspace_change=False,
+    )
+
+    started = await asyncio.wait_for(anext(stream), timeout=1.0)
+    await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
+    await stream.aclose()
+
+    with RolloutStore(database) as store:
+        replayed = [
+            entry.event
+            for entry in RolloutEventReader(store).read_global()
+            if entry.event.turn_id == started.turn_id
+        ]
+        turn = store.read_turn(started.turn_id)
+        thread = store.read_thread(turn.thread_id)
+
+    assert [event.type for event in replayed] == [
+        EventType.TURN_STARTED,
+        EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.TURN_PAUSED,
+    ]
+    assert replayed[-1].data["reason"] == "outcome_unknown"
+    assert turn.status == "interrupted"
+    assert thread.active_turn_id == turn.turn_id
 
 
 @pytest.mark.anyio

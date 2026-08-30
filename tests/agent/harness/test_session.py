@@ -920,7 +920,7 @@ def test_provider_failure_leaves_durable_unknown_attempt_for_reconciliation(
         assert attempt.status == "unknown"
         assert result.turn_id == operation.turn_id
         assert result.status == "paused"
-        assert store.read_turn(operation.turn_id).status == "paused"
+        assert store.read_turn(operation.turn_id).status == "interrupted"
         unknown = [
             record for record in store.list_records(thread.thread_id) if record.record_type == "model_attempt_unknown"
         ]
@@ -1062,6 +1062,13 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
         assert attempt.status == "cancelled"
         assert completed.status is ItemStatus.CANCELLED
         assert completed.data["content"] == "partial before cancel"
+        cancellation_index = next(
+            index
+            for index, event in enumerate(events)
+            if event.type is EventType.TURN_CANCELLATION_REQUESTED
+        )
+        completion_index = events.index(completed)
+        assert cancellation_index < completion_index < len(events) - 1
         assert events[-1].type is EventType.TURN_ABORTED
         assert store.verify().valid is True
 

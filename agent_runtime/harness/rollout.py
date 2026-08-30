@@ -1103,6 +1103,58 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    def request_turn_cancellation(
+        self,
+        *,
+        turn_id: str,
+        producer: str = "runtime",
+        reason: str = "controlling stream closed",
+    ) -> TurnSnapshot:
+        """Append the durable request before live work receives cancellation."""
+
+        if not isinstance(producer, str) or not producer.strip():
+            raise ValueError("cancellation producer must be non-empty")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("cancellation reason must be non-empty")
+        with self._transaction():
+            turn = self._connection.execute(
+                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+            if turn is None:
+                raise KeyError(f"unknown turn: {turn_id}")
+            if turn["status"] not in {"running", "paused", "interrupted"}:
+                return self.read_turn(turn_id)
+            thread_id = str(turn["thread_id"])
+            active = self._connection.execute(
+                "SELECT active_turn_id FROM threads WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+            if active is None or active["active_turn_id"] != turn_id:
+                raise RuntimeError(
+                    "cancellation request cannot target a foreign active slot"
+                )
+            existing = self._connection.execute(
+                """
+                SELECT 1 FROM rollout_records
+                WHERE turn_id = ? AND record_type = 'turn_cancellation_requested'
+                LIMIT 1
+                """,
+                (turn_id,),
+            ).fetchone()
+            if existing is None:
+                self._append_and_reduce(
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    record_type="turn_cancellation_requested",
+                    producer=producer.strip(),
+                    payload={
+                        "turn_id": turn_id,
+                        "reason": reason.strip()[:2_000],
+                    },
+                )
+        return self.read_turn(turn_id)
+
     def request_clarification(
         self,
         *,
@@ -1483,7 +1535,7 @@ class RolloutStore:
                 self._append_and_reduce(
                     thread_id=operation["thread_id"],
                     turn_id=operation["turn_id"],
-                    record_type="turn_paused",
+                    record_type="turn_interrupted",
                     producer="recovery",
                     payload={
                         "turn_id": operation["turn_id"],
@@ -1626,12 +1678,12 @@ class RolloutStore:
                 self._append_and_reduce(
                     thread_id=operation["thread_id"],
                     turn_id=operation["turn_id"],
-                    record_type="turn_paused",
+                    record_type="turn_interrupted",
                     producer="runtime",
                     payload={
                         "turn_id": operation["turn_id"],
                         "operation_id": operation_id,
-                        "reason": "model outcome unknown",
+                        "reason": "outcome_unknown",
                     },
                 )
         return self.list_model_attempts(operation_id)[-1]
@@ -1862,8 +1914,8 @@ class RolloutStore:
                 "SELECT status FROM turns WHERE turn_id = ?",
                 (operation["turn_id"],),
             ).fetchone()
-            if turn is None or turn["status"] != "paused":
-                raise RuntimeError("model retry requires a paused Turn")
+            if turn is None or turn["status"] not in {"paused", "interrupted"}:
+                raise RuntimeError("model retry requires a paused or interrupted Turn")
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],

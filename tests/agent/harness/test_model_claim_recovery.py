@@ -109,7 +109,7 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
         assert recovered.status == "unknown"
         assert recovered.claim_owner == "model-worker-a"
         assert late is False
-        assert restarted.read_turn(turn.turn_id).status == "paused"
+        assert restarted.read_turn(turn.turn_id).status == "interrupted"
         assert restarted.read_thread(thread.thread_id).active_turn_id == turn.turn_id
         assert not any(
             item.kind == "model_response"

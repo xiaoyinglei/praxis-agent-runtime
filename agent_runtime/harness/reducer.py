@@ -397,6 +397,11 @@ def apply_record(
             turn["status"] = "running"
             turn["applied_thread_sequence"] = sequence
             state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "turn_cancellation_requested":
+            turn_id = payload["turn_id"]
+            turn = state.turns[turn_id]
+            turn["applied_thread_sequence"] = sequence
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
         case "item_started":
             item_id = payload["item_id"]
             turn_id = _turn_id(record)
