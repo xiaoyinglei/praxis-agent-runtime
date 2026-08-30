@@ -9,6 +9,7 @@ from typing import Any
 from agent_runtime.harness.protocol import BindingProvider, TurnResult
 from agent_runtime.harness.rollout import RolloutStore, TurnSnapshot
 from agent_runtime.harness.session import Session
+from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
 class ThreadManager:
@@ -20,6 +21,7 @@ class ThreadManager:
         workspace: Path,
         binding_provider: BindingProvider,
         binding_validator: Callable[[Mapping[str, Any]], None] | None = None,
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> None:
         resolved_workspace = Path(workspace).resolve()
         if not resolved_workspace.is_dir():
@@ -30,6 +32,7 @@ class ThreadManager:
         self._workspace = resolved_workspace
         self._binding_provider = binding_provider
         self._binding_validator = binding_validator
+        self._event_dispatcher = event_dispatcher
 
     async def run(
         self,
@@ -38,6 +41,7 @@ class ThreadManager:
         thread_id: str | None = None,
         previous_turn_id: str | None = None,
         input_files: tuple[Mapping[str, Any], ...] = (),
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> TurnResult:
         if thread_id is not None and previous_turn_id is not None:
             raise ValueError("thread_id and previous_turn_id are mutually exclusive")
@@ -59,7 +63,10 @@ class ThreadManager:
             thread = self._store.read_thread(thread_id)
             if Path(thread.workspace) != self._workspace:
                 raise RuntimeError("thread belongs to a different workspace security domain")
-        return await self._session_for_thread(thread_id).run(
+        return await self._session_for_thread(
+            thread_id,
+            event_dispatcher=event_dispatcher or self._event_dispatcher,
+        ).run(
             user_message=user_message,
             binding_manifest=self._binding_provider.snapshot(),
             input_files=input_files,
@@ -162,15 +169,25 @@ class ThreadManager:
 
     def _session_for_turn(self, turn_id: str) -> Session:
         turn = self._store.read_turn(turn_id)
-        return self._session_for_thread(turn.thread_id)
+        return self._session_for_thread(
+            turn.thread_id,
+            event_dispatcher=self._event_dispatcher,
+        )
 
-    def _session_for_thread(self, thread_id: str) -> Session:
+    def _session_for_thread(
+        self,
+        thread_id: str,
+        *,
+        event_dispatcher: TurnEventDispatcher | None = None,
+    ) -> Session:
         session = self._sessions.get(thread_id)
         if session is None:
             session = self._session_factory(thread_id)
             if session.thread_id != thread_id:
                 raise RuntimeError("Session factory returned the wrong thread")
             self._sessions[thread_id] = session
+        if event_dispatcher is not None:
+            session.attach_event_dispatcher(event_dispatcher)
         return session
 
     def _validate_turn_workspace(self, turn_id: str) -> TurnSnapshot:

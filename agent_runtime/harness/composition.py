@@ -280,17 +280,6 @@ class RuntimeComposition:
             raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(integrity.errors))
         context_manager = RolloutContextManager(store)
         worker_id = f"worker_{uuid4().hex}"
-        tool_orchestrator = (
-            None
-            if not tool_snapshot
-            else ToolOrchestrator(
-                store=store,
-                tools=tool_snapshot,
-                execution_context=execution_context,
-                worker_id=worker_id,
-                event_dispatcher=event_dispatcher,
-            )
-        )
         tool_router = (
             None
             if not tool_snapshot
@@ -307,6 +296,16 @@ class RuntimeComposition:
         resolved_completion_gate = completion_gate or DeliveryCompletionGate(store)
 
         def open_session(thread_id: str) -> Session:
+            tool_orchestrator = (
+                None
+                if not tool_snapshot
+                else ToolOrchestrator(
+                    store=store,
+                    tools=tool_snapshot,
+                    execution_context=execution_context,
+                    worker_id=worker_id,
+                )
+            )
             return Session(
                 thread_id=thread_id,
                 store=store,
@@ -317,7 +316,6 @@ class RuntimeComposition:
                 tool_orchestrator=tool_orchestrator,
                 worker_id=worker_id,
                 max_steps=max_steps,
-                event_dispatcher=event_dispatcher,
             )
 
         binding_provider = _CompositionBindingProvider(
@@ -337,6 +335,7 @@ class RuntimeComposition:
             workspace=workspace,
             binding_provider=binding_provider,
             binding_validator=binding_provider.ensure_available,
+            event_dispatcher=event_dispatcher,
         )
         thread_manager_ref["manager"] = thread_manager
         return cls(store=store, thread_manager=thread_manager)

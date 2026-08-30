@@ -140,6 +140,12 @@ class ToolOrchestrator:
             tuple[tuple[str, ...], tuple[Mapping[str, Any], ...]],
         ] = {}
 
+    def attach_event_dispatcher(
+        self,
+        event_dispatcher: TurnEventDispatcher,
+    ) -> None:
+        self._event_dispatcher = event_dispatcher
+
     async def _commit[T](self, operation: Callable[[], T]) -> T:
         mutation = self._store.capture_mutation(operation)
         if self._event_dispatcher is not None:

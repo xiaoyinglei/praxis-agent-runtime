@@ -106,6 +106,14 @@ class Session:
         self._model_lease_seconds = model_lease_seconds
         self._event_dispatcher = event_dispatcher
 
+    def attach_event_dispatcher(
+        self,
+        event_dispatcher: TurnEventDispatcher,
+    ) -> None:
+        self._event_dispatcher = event_dispatcher
+        if self._tool_orchestrator is not None:
+            self._tool_orchestrator.attach_event_dispatcher(event_dispatcher)
+
     async def run(
         self,
         *,

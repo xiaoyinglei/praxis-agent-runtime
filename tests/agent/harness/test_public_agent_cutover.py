@@ -14,9 +14,11 @@ from agent_runtime.harness import (
     HarnessToolCall,
     PreparedModelCall,
     RolloutStore,
+    RuntimeComposition,
 )
 from agent_runtime.harness import composition as harness_composition
 from agent_runtime.streaming.events import EventType, StreamEvent
+from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
 class PublicHarnessModel:
@@ -736,6 +738,46 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
     model.release_dispatch.set()
     result = await asyncio.wait_for(running, timeout=1.0)
     assert result.answer == "live stream answer"
+
+
+@pytest.mark.anyio
+async def test_interleaved_threads_publish_only_their_transaction_batches(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first_dispatcher = TurnEventDispatcher()
+    second_dispatcher = TurnEventDispatcher()
+    first_stream = first_dispatcher.subscribe_controlling()
+    second_stream = second_dispatcher.subscribe_controlling()
+    with RuntimeComposition.open(
+        database=tmp_path / "praxis.sqlite3",
+        workspace=workspace,
+        model=PublicHarnessModel(),
+        require_workspace_change=False,
+    ) as runtime:
+        first, second = await asyncio.gather(
+            runtime.thread_manager.run(
+                user_message="first interleaved thread",
+                event_dispatcher=first_dispatcher,
+            ),
+            runtime.thread_manager.run(
+                user_message="second interleaved thread",
+                event_dispatcher=second_dispatcher,
+            ),
+        )
+
+        first_events = []
+        while not first_stream.empty:
+            first_events.append(await first_stream.receive())
+        second_events = []
+        while not second_stream.empty:
+            second_events.append(await second_stream.receive())
+
+    assert first_events
+    assert second_events
+    assert {event.turn_id for event in first_events} == {first.turn_id}
+    assert {event.turn_id for event in second_events} == {second.turn_id}
 
 
 @pytest.mark.anyio
