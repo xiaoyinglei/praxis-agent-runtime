@@ -299,6 +299,25 @@ async def test_controlling_stream_blocks_producer_when_queue_is_full() -> None:
     assert await stream.receive() == second
 
 
+@pytest.mark.anyio
+async def test_full_controlling_queue_close_wakes_blocked_emitter() -> None:
+    closed_error = getattr(stream_sinks, "EventChannelClosed", None)
+    assert closed_error is not None, "closed event channels need a public error"
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    await dispatcher.emit(events.turn_started("turn-close"))
+    blocked_emit = asyncio.create_task(
+        dispatcher.emit(events.turn_completed("turn-close"))
+    )
+    await asyncio.sleep(0)
+    assert blocked_emit.done() is False
+
+    stream.close()
+
+    with pytest.raises(closed_error):
+        await asyncio.wait_for(blocked_emit, timeout=0.2)
+
+
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

@@ -29,14 +29,67 @@ class StreamEventSink(Protocol):
     async def emit(self, event: StreamEvent) -> None: ...
 
 
+class EventChannelClosed(RuntimeError):  # noqa: N818 - protocol name
+    """A controlling event consumer closed its channel."""
+
+
+class _EventChannel:
+    def __init__(self, *, capacity: int) -> None:
+        self.queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=capacity)
+        self.closed = asyncio.Event()
+
+    async def put(self, event: StreamEvent) -> None:
+        if self.closed.is_set():
+            raise EventChannelClosed("event channel is closed")
+        put = asyncio.create_task(self.queue.put(event))
+        closing = asyncio.create_task(self.closed.wait())
+        await asyncio.wait((put, closing), return_when=asyncio.FIRST_COMPLETED)
+        if self.closed.is_set():
+            put.cancel()
+            await asyncio.gather(put, return_exceptions=True)
+            self._discard_queued()
+            raise EventChannelClosed("event channel is closed")
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await put
+
+    async def receive(self) -> StreamEvent:
+        if self.closed.is_set():
+            raise EventChannelClosed("event channel is closed")
+        receive = asyncio.create_task(self.queue.get())
+        closing = asyncio.create_task(self.closed.wait())
+        await asyncio.wait((receive, closing), return_when=asyncio.FIRST_COMPLETED)
+        if self.closed.is_set():
+            receive.cancel()
+            await asyncio.gather(receive, return_exceptions=True)
+            self._discard_queued()
+            raise EventChannelClosed("event channel is closed")
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        return await receive
+
+    def close(self) -> None:
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        self._discard_queued()
+
+    def _discard_queued(self) -> None:
+        while not self.queue.empty():
+            self.queue.get_nowait()
+
+
 class TurnEventStream:
     """One controlling consumer of a Turn's canonical event stream."""
 
-    def __init__(self, queue: asyncio.Queue[StreamEvent]) -> None:
-        self._queue = queue
+    def __init__(self, channel: _EventChannel) -> None:
+        self._channel = channel
 
     async def receive(self) -> StreamEvent:
-        return await self._queue.get()
+        return await self._channel.receive()
+
+    def close(self) -> None:
+        self._channel.close()
 
 
 class TurnEventDispatcher:
@@ -48,16 +101,16 @@ class TurnEventDispatcher:
         if capacity <= 0:
             raise ValueError("capacity must be positive")
         self._capacity = capacity
-        self._controlling: list[asyncio.Queue[StreamEvent]] = []
+        self._controlling: list[_EventChannel] = []
 
     def subscribe_controlling(self) -> TurnEventStream:
-        queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=self._capacity)
-        self._controlling.append(queue)
-        return TurnEventStream(queue)
+        channel = _EventChannel(capacity=self._capacity)
+        self._controlling.append(channel)
+        return TurnEventStream(channel)
 
     async def emit(self, event: StreamEvent) -> None:
-        for queue in tuple(self._controlling):
-            await queue.put(event)
+        for channel in tuple(self._controlling):
+            await channel.put(event)
 
 
 class LegacyStreamProjectionSink:
