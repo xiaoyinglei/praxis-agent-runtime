@@ -2,28 +2,45 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
 from agent_runtime.core.llm_registry import ResolvedModel
+from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
     GatewayHarnessModel,
     HarnessMessage,
+    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
+    HarnessToolCall,
     ModelDispatchPreflightError,
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
+    RuntimeComposition,
     Session,
 )
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway, StreamChunk
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.tool import (
+    CancellationMode,
+    InterruptBehavior,
+    JsonValue,
+    NormalizedToolOutput,
+    ResolvedToolUse,
+    Tool,
+    ToolContentBlock,
+    ToolDefinition,
+    ToolEffect,
+    json_schema_input,
+)
 
 
 class InspectingModel:
@@ -224,10 +241,100 @@ class BlockingAfterFirstDeltaProvider:
         self.blocked = threading.Event()
         self.release = threading.Event()
 
-    def stream_with_tools(self, **_kwargs: object):
+    def stream_with_tools(self, **_kwargs: object) -> Iterator[StreamChunk]:
         yield StreamChunk(type="text_delta", content="partial")
         self.blocked.set()
         self.release.wait()
+
+
+class ZeroDeltaToolThenAnswerModel:
+    def __init__(self) -> None:
+        self.dispatch_count = 0
+
+    def snapshot(self) -> dict[str, str]:
+        return {"model_alias": "test-model"}
+
+    def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
+        toolset_revision = toolset_revision_for_tools(request.tools)
+        digest = str(request.step) * 64
+        return PreparedModelCall(
+            request_hash=digest,
+            context_hash=digest,
+            tool_hash=toolset_revision,
+            wire_hash=digest,
+            request_ref={
+                "request_id": f"{request.turn_id}:step:{request.step}",
+                "toolset_revision": toolset_revision,
+                "exposed_tool_names": [tool.definition.name for tool in request.tools],
+            },
+        )
+
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
+        del prepared, delta_sink
+        self.dispatch_count += 1
+        if self.dispatch_count == 1:
+            return HarnessModelResponse(
+                text="",
+                provider_response_id="response-tool-only",
+                usage={"input_tokens": 2, "output_tokens": 1},
+                tool_calls=(
+                    HarnessToolCall(
+                        id="call-1",
+                        name="read_file",
+                        arguments={"path": "README.md"},
+                    ),
+                ),
+            )
+        return HarnessModelResponse(
+            text="tool completed",
+            provider_response_id="response-final",
+            usage={"input_tokens": 4, "output_tokens": 2},
+        )
+
+
+class AcceptToolCompleted:
+    def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
+        assert proposal.answer == "tool completed"
+        return CompletionDecision(action="accept", reason="tool loop completed")
+
+
+def _read_file_tool() -> Tool:
+    schema: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ("path",),
+        "additionalProperties": False,
+    }
+    return Tool(
+        definition=ToolDefinition(
+            name="read_file",
+            description="Read a test file.",
+            input_schema=schema,
+        ),
+        validate_input=json_schema_input(schema),
+        run=lambda arguments: {"text": f"contents of {arguments['path']}"},
+        normalize_output=lambda raw: NormalizedToolOutput(
+            content=(ToolContentBlock(type="text", data={"value": str(raw)}),),
+        ),
+        output_schema=None,
+        static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
+        resolve_use=lambda _arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.READ_WORKSPACE}),
+            targets=(),
+        ),
+        execution_revision="read-file-v1",
+        idempotent=True,
+        concurrency_safe=True,
+        cancellation_mode=CancellationMode.COOPERATIVE,
+        interrupt_behavior=InterruptBehavior.CANCEL,
+        timeout_seconds=1.0,
+        max_model_output_bytes=4_096,
+    )
 
 
 @pytest.mark.anyio
@@ -323,6 +430,54 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
             assert completed[0].data["content"] == "partial"
     finally:
         provider.release.set()
+
+
+@pytest.mark.anyio
+async def test_zero_text_tool_only_response_starts_then_completes_without_delta(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = ZeroDeltaToolThenAnswerModel()
+    dispatcher = TurnEventDispatcher(capacity=64)
+    stream = dispatcher.subscribe_controlling()
+    tool = _read_file_tool()
+    with RuntimeComposition.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=model,
+        completion_gate=AcceptToolCompleted(),
+        tools={tool.definition.name: tool},
+    ) as runtime:
+        result = await runtime.thread_manager.run(
+            user_message="use one tool",
+            event_dispatcher=dispatcher,
+        )
+        events = []
+        while not stream.empty:
+            events.append(stream.receive_nowait())
+
+    tool_only_completion = next(
+        event
+        for event in events
+        if event.type is EventType.ITEM_COMPLETED
+        and event.item_kind is TurnItemKind.AGENT_MESSAGE
+        and event.data["tool_calls"]
+    )
+    tool_only_lifecycle = [
+        event for event in events if event.item_id == tool_only_completion.item_id
+    ]
+
+    assert result.answer == "tool completed"
+    assert model.dispatch_count == 2
+    assert [event.type for event in tool_only_lifecycle] == [
+        EventType.ITEM_STARTED,
+        EventType.ITEM_COMPLETED,
+    ]
+    assert tool_only_completion.data["content"] == ""
+    tool_calls = tool_only_completion.data["tool_calls"]
+    assert isinstance(tool_calls, (list, tuple))
+    assert len(tool_calls) == 1
 
 
 def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -> None:

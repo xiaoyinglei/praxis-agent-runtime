@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from agent_runtime.harness import (
     GatewayHarnessModel,
     HarnessAgent,
     HarnessMessage,
+    HarnessModelDelta,
     HarnessModelRequest,
     ModelDispatchPreflightError,
     RolloutContextManager,
@@ -22,6 +24,7 @@ from agent_runtime.harness import (
 )
 from agent_runtime.modeling.contracts import (
     LLMCallStage,
+    LLMProviderResult,
     LLMStageBudget,
     normalize_llm_usage,
 )
@@ -145,11 +148,31 @@ class FastSyncStreamingProvider:
     def __init__(self) -> None:
         self.produced = 0
 
-    def stream_with_tools(self, **_kwargs: object):
+    def stream_with_tools(self, **_kwargs: object) -> Iterator[StreamChunk]:
         for _index in range(1_000):
             self.produced += 1
             yield StreamChunk(type="text_delta", content="x")
         yield StreamChunk(type="message_stop", stop_reason="end_turn")
+
+
+class NonStreamingProvider:
+    def generate_with_tools(self, **_kwargs: object) -> LLMProviderResult[dict[str, object]]:
+        return LLMProviderResult(
+            value={
+                "choices": [
+                    {
+                        "message": {"content": "one complete response"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            },
+            usage=normalize_llm_usage(
+                input_tokens=3,
+                output_tokens=3,
+                input_tokens_include_cache=True,
+                usage_source="provider",
+            ),
+        )
 
 
 class BoundGatewayHarnessModel(GatewayHarnessModel):
@@ -514,6 +537,53 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
     assert result.answer == "x" * 1_000
     assert events[0].type is EventType.TURN_STARTED
     assert events[-1].type is EventType.TURN_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> None:
+    provider = NonStreamingProvider()
+    gateway = LLMGateway(
+        generator=provider,
+        token_accounting=CharacterAccounting(),
+        model_context_tokens=8_192,
+        stage_budgets={
+            LLMCallStage.AGENT_STEP: LLMStageBudget(
+                max_input_tokens=4_096,
+                max_output_tokens=256,
+                safety_margin_tokens=0,
+            )
+        },
+    )
+    model = GatewayHarnessModel(
+        model_alias="test-model",
+        resolved=ResolvedModel(
+            generator=provider,
+            kwargs={"max_tokens": 256},
+            gateway=gateway,
+            provider="openai-compatible",
+            model="provider-model",
+        ),
+        instructions=("Answer the user directly.",),
+    )
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            messages=(HarnessMessage(role="user", content="answer once"),),
+            binding_manifest={"model_alias": "test-model"},
+        )
+    )
+    deltas: list[HarnessModelDelta] = []
+
+    async def capture(delta: HarnessModelDelta) -> None:
+        deltas.append(delta)
+
+    response = await model.dispatch(prepared, delta_sink=capture)
+
+    assert response.text == "one complete response"
+    assert [(delta.channel, delta.content) for delta in deltas] == [
+        ("text", "one complete response")
+    ]
 
 
 def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:
