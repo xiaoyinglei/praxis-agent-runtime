@@ -11,8 +11,8 @@ import fitz
 import pytest
 from openpyxl import Workbook
 
-from agent_runtime.core.observations import runtime_workspace_file_changes
 from agent_runtime.tools.builtins import create_resident_coding_tools
+from agent_runtime.tools.evidence import runtime_workspace_file_changes
 from agent_runtime.tools.executor import ToolExecution, ToolExecutor
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin

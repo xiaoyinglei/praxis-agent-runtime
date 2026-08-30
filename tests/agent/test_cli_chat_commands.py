@@ -9,9 +9,9 @@ from pytest import MonkeyPatch
 
 from agent_runtime import cli
 from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.harness import RolloutStore
 from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
-from agent_runtime.turns import RuntimeBinding, TurnStatus, TurnStore
 
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
@@ -56,16 +56,17 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "agent.sqlite"
-    store = TurnStore(database)
-    previous = store.begin_turn(
-        "first",
-        RuntimeBinding(
-            model_alias="fake-model",
-            workspace_path=str(workspace.resolve()),
-        ),
-    )
-    store.mark_terminal(previous.turn_id, TurnStatus.COMPLETED)
-    store.close()
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        previous = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="first",
+            binding_manifest={"model_alias": "fake-model"},
+        )
+        previous = store.complete_turn(
+            turn_id=previous.turn_id,
+            answer="first answer",
+        )
     turn_calls: list[object] = []
 
     class _Facade:

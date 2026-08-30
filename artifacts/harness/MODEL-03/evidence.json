@@ -1,0 +1,20 @@
+{
+  "schema_version": "praxis-harness-case-evidence-v1",
+  "requirement_id": "MODEL-03",
+  "command": [
+    "uv",
+    "run",
+    "pytest",
+    "-q",
+    "tests/agent/harness/test_turn_runner.py::test_single_final_response_over_frozen_token_budget_fails_the_turn",
+    "tests/agent/harness/test_turn_runner.py::test_model_preflight_rejection_fails_without_an_unknown_outcome",
+    "tests/agent/harness/test_turn_runner.py::test_incomplete_model_response_is_durable_failure_not_unknown",
+    "tests/agent/harness/test_turn_runner.py::test_known_model_rejection_fails_without_unknown_or_retry_state",
+    "tests/agent/harness/test_public_agent_cutover.py::test_public_agent_freezes_and_durably_enforces_model_budget",
+    "tests/agent/harness/test_public_agent_cutover.py::test_public_result_exposes_durable_incomplete_model_diagnostic"
+  ],
+  "command_sha256": "fbe42211711963790c589c1a76821cb6285c6e972f4c52630b80b02f5cbd890c",
+  "exit_code": 0,
+  "stdout_sha256": "4b4745ab015b850ce8a676a147e4f8195e772f647bded79bba21d982a287ba42",
+  "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}

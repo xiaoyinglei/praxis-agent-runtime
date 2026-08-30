@@ -104,7 +104,10 @@ class ReadFileInput(BaseModel):
         default=0,
         ge=0,
         description=(
-            "Byte offset to start reading; this is not a source line number. "
+            "Byte offset to start reading when max_lines is omitted. For "
+            "compatibility with common coding-agent ACIs, offset is treated "
+            "as a one-based source line when max_lines is supplied without "
+            "start_line. "
             "For the next non-overlapping chunk, pass the previous output's "
             "next_offset value."
         ),
@@ -139,12 +142,13 @@ class ReadFileInput(BaseModel):
 
     @model_validator(mode="after")
     def validate_read_mode(self) -> ReadFileInput:
-        if self.offset and (
-            self.start_line is not None or self.max_lines is not None
-        ):
+        if self.offset and self.start_line is not None:
             raise ValueError(
-                "offset cannot be combined with start_line or max_lines"
+                "offset cannot be combined with start_line"
             )
+        if self.offset and self.max_lines is not None:
+            self.start_line = self.offset
+            self.offset = 0
         return self
 
 
@@ -304,7 +308,7 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
             str(arguments["path"]),
             effects=frozenset({ToolEffect.READ_WORKSPACE}),
         ),
-        execution_revision="builtin-read-file-v2-binary-routing",
+        execution_revision="builtin-read-file-v3-line-window-compat",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -324,7 +328,7 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 "is atomically installed and does not create new files. Verification "
                 "toolchains under .venv and node_modules are read-only. After a "
                 "successful literal edit, use at most one targeted read_file or "
-                "search_text call, never both, then finish when it proves the requested "
+                "search_text call, never both, then return a final answer when it proves the requested "
                 "state. If the task already supplies the exact file, old text, and new "
                 "text, call apply_patch directly instead of pre-reading merely to "
                 "reconfirm them; the replacement checks fail closed. Never reapply the "

@@ -1,7 +1,13 @@
 # Praxis 产品契约
 
 日期：2026-07-22
-状态：当前实施依据
+状态：已被 `docs/design/praxis_harness_architecture.md` 取代
+
+> 本文记录 2026-07-22 时的产品收敛阶段。它保留作历史依据，但其中
+> “公开身份只使用 `turn_id`”“不需要 Thread”以及继续使用
+> `AgentService -> AgentLoop -> ToolExecutor` 的结论，不再约束新的
+> Harness 内核。当前目标、对象所有权、迁移和验收门禁以
+> `docs/design/praxis_harness_architecture.md` 为准。
 
 `docs/superpowers/specs/2026-07-18-agent-public-api-lifecycle-cleanup-design.md`
 只是历史记录，不再决定当前实现。

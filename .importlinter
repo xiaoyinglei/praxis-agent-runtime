@@ -25,24 +25,45 @@ type = forbidden
 source_modules =
     rag.schema
 forbidden_modules =
-    agent_runtime.service
     agent_runtime.runtime
     agent_runtime.tools
 
 [importlinter:contract:tools_boundary]
-name = Runtime tools do not depend on service or loop orchestration
+name = Runtime tools do not depend on Harness orchestration
 type = forbidden
 source_modules =
     agent_runtime.tools
 forbidden_modules =
-    agent_runtime.service
-    agent_runtime.runtime
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager
 
-[importlinter:contract:memory_boundary]
-name = Runtime memory does not depend on service orchestration or assembly
+[importlinter:contract:harness_components_do_not_depend_on_session]
+name = Harness components do not depend on Session internals
 type = forbidden
 source_modules =
-    agent_runtime.memory
+    agent_runtime.harness.context
+    agent_runtime.harness.events
+    agent_runtime.harness.model_adapter
+    agent_runtime.harness.protocol
+    agent_runtime.harness.reducer
+    agent_runtime.harness.rollout
+    agent_runtime.harness.tool_orchestrator
+    agent_runtime.harness.tool_router
 forbidden_modules =
-    agent_runtime.service
-    agent_runtime.runtime
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager
+
+[importlinter:contract:core_does_not_depend_on_harness_orchestration]
+name = Core does not depend on Harness orchestration
+type = forbidden
+source_modules =
+    agent_runtime.core
+forbidden_modules =
+    agent_runtime.harness.composition
+    agent_runtime.harness.facade
+    agent_runtime.harness.session
+    agent_runtime.harness.thread_manager

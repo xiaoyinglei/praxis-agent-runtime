@@ -7,6 +7,7 @@ import os
 import shlex
 import sys
 from collections.abc import Coroutine, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -15,6 +16,7 @@ import typer
 import yaml
 
 from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelNotAvailableError,
@@ -31,12 +33,6 @@ from agent_runtime.streaming.events import (
     StreamEvent,
     TurnItemKind,
 )
-from agent_runtime.turns import (
-    TurnNotFoundError,
-    TurnRecord,
-    TurnStateError,
-    TurnStore,
-)
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -47,6 +43,20 @@ agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class _CLIRuntimeBinding:
+    model_alias: str | None
+    workspace_path: str
+    knowledge: RAGKnowledgeConfig | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CLITurn:
+    turn_id: str
+    status: str
+    runtime: _CLIRuntimeBinding
 
 class _CLIToolEventDisplay:
     """Project canonical stream events into bounded terminal output."""
@@ -546,6 +556,7 @@ def _create_agent_facade(
     workspace_path: Path | str | None = None,
     model_session_path: Path | None = None,
     knowledge: RAGKnowledgeConfig | None = None,
+    enable_workspace_mcp: bool = True,
 ) -> Agent:
     from agent_runtime.agent import Agent
 
@@ -555,6 +566,7 @@ def _create_agent_facade(
         workspace_path=workspace_path,
         model_session_path=model_session_path,
         knowledge=knowledge,
+        enable_workspace_mcp=enable_workspace_mcp,
     )
 
 
@@ -589,8 +601,6 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
         KeyError,
         ModelNotAvailableError,
         ModelPolicyError,
-        TurnNotFoundError,
-        TurnStateError,
         UnknownModelAliasError,
         ValueError,
     ) as exc:
@@ -912,32 +922,77 @@ def _latest_cli_turn(
     checkpoint_db: Path,
     *,
     workspace_path: Path | None,
-) -> TurnRecord | None:
-    store = TurnStore(checkpoint_db)
-    try:
-        return store.latest_resumable_turn(workspace_path=workspace_path)
-    finally:
-        store.close()
+) -> _CLITurn | None:
+    with RolloutStore(checkpoint_db) as store:
+        return _latest_harness_turn(
+            store,
+            statuses={"paused"},
+            workspace_path=workspace_path,
+        )
 
 
 def _latest_completed_cli_turn(
     checkpoint_db: Path,
     *,
     workspace_path: Path | None,
-) -> TurnRecord | None:
-    store = TurnStore(checkpoint_db)
-    try:
-        return store.latest_turn(workspace_path=workspace_path)
-    finally:
-        store.close()
+) -> _CLITurn | None:
+    with RolloutStore(checkpoint_db) as store:
+        return _latest_harness_turn(
+            store,
+            statuses={"completed", "failed", "cancelled"},
+            workspace_path=workspace_path,
+        )
 
 
-def _cli_turn(checkpoint_db: Path, turn_id: str) -> TurnRecord:
-    store = TurnStore(checkpoint_db)
-    try:
-        return store.get_turn(turn_id)
-    finally:
-        store.close()
+def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
+    with RolloutStore(checkpoint_db) as store:
+        try:
+            turn = store.read_turn(turn_id)
+        except KeyError as exc:
+            raise KeyError(f"Turn not found: {turn_id}") from exc
+        return _project_cli_turn(store, turn)
+
+
+def _latest_harness_turn(
+    store: RolloutStore,
+    *,
+    statuses: set[str],
+    workspace_path: Path | None,
+) -> _CLITurn | None:
+    expected_workspace = (
+        None if workspace_path is None else workspace_path.expanduser().resolve()
+    )
+    for turn in reversed(store.list_turns()):
+        if turn.status not in statuses:
+            continue
+        thread = store.read_thread(turn.thread_id)
+        if (
+            expected_workspace is not None
+            and Path(thread.workspace).resolve() != expected_workspace
+        ):
+            continue
+        return _project_cli_turn(store, turn)
+    return None
+
+
+def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
+    thread = store.read_thread(turn.thread_id)
+    alias = turn.binding_manifest.get("model_alias")
+    knowledge_value = turn.binding_manifest.get("knowledge_config")
+    knowledge = (
+        RAGKnowledgeConfig.model_validate(knowledge_value)
+        if isinstance(knowledge_value, Mapping)
+        else None
+    )
+    return _CLITurn(
+        turn_id=turn.turn_id,
+        status=turn.status,
+        runtime=_CLIRuntimeBinding(
+            model_alias=alias if isinstance(alias, str) else None,
+            workspace_path=thread.workspace,
+            knowledge=knowledge,
+        ),
+    )
 
 
 @agent_app.command(name="chat")
@@ -993,7 +1048,7 @@ def agent_chat(
     if previous_turn_id is not None and last:
         raise typer.BadParameter("--previous-turn-id 与 --last 不能同时使用")
     effective_previous_turn_id = previous_turn_id
-    continued_turn: TurnRecord | None = None
+    continued_turn: _CLITurn | None = None
     if last:
         latest = _latest_completed_cli_turn(
             checkpoint_db,
@@ -1115,6 +1170,13 @@ def agent_run(
         bool,
         typer.Option("--allow-execute-tools", help="预授权本次进程执行类调用"),
     ] = False,
+    disable_workspace_mcp: Annotated[
+        bool,
+        typer.Option(
+            "--disable-workspace-mcp",
+            help="隔离运行：不发现或启动工作区中的 MCP 服务。",
+        ),
+    ] = False,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
     if previous_turn_id is not None and last:
@@ -1140,6 +1202,7 @@ def agent_run(
         workspace_path=Path.cwd(),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
+        enable_workspace_mcp=not disable_workspace_mcp,
     )
     interactive_approval = not non_interactive and _is_interactive_terminal()
     event_display = _CLIToolEventDisplay()
@@ -1236,8 +1299,12 @@ def agent_resume(
         raise typer.Exit(code=2)
     if action is None and user_input is not None:
         raise typer.BadParameter("--input 需要同时指定 --action")
+    turn_metadata = _cli_turn(checkpoint_db, effective_turn_id)
     facade = _create_agent_facade(
+        model=turn_metadata.runtime.model_alias,
         checkpoint_db=checkpoint_db,
+        workspace_path=turn_metadata.runtime.workspace_path,
+        knowledge=turn_metadata.runtime.knowledge,
     )
     event_display = _CLIToolEventDisplay()
     if action is None:

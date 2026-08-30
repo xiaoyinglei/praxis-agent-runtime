@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,30 @@ def test_code_agent_benchmark_entrypoint_exists() -> None:
     assert module is not None
 
 
+def test_architecture_layer_inference_tracks_the_replacement_harness() -> None:
+    module = _load_benchmark_module()
+
+    layers = module._infer_architecture_layers(
+        (
+            "agent_runtime/agent.py",
+            "agent_runtime/harness/composition.py",
+            "agent_runtime/harness/session.py",
+            "agent_runtime/harness/tool_orchestrator.py",
+            "agent_runtime/harness/rollout.py",
+            "agent_runtime/harness/events.py",
+        )
+    )
+
+    assert layers == {
+        "public_api_cli",
+        "service",
+        "loop",
+        "tool",
+        "turn_checkpoint",
+        "result_events",
+    }
+
+
 def test_run_task_requires_an_explicit_model_lane() -> None:
     module = _load_benchmark_module()
 
@@ -51,6 +76,204 @@ def test_run_task_requires_an_explicit_model_lane() -> None:
                 "artifacts",
             ]
         )
+
+
+def test_release_run_matrix_contains_every_primary_and_only_control_tasks(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    path = tmp_path / "benchmark.json"
+    _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(path)
+
+    lanes = module.release_run_matrix(manifest)
+
+    assert lanes == (
+        *((task, manifest.primary_model) for task in manifest.tasks),
+        *((task, manifest.control_model) for task in manifest.tasks if task.control),
+    )
+    assert len(lanes) == 36
+
+
+def test_release_evidence_binds_every_raw_result_and_gate_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_benchmark_module()
+    path = tmp_path / "benchmark.json"
+    _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(path)
+    artifacts = tmp_path / "artifacts"
+    result = artifacts / "raw" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text('{"outcome":"success"}\n', encoding="utf-8")
+    evidence = artifacts / "release" / "evidence.json"
+    monkeypatch.setattr(
+        module,
+        "repository_state_fingerprint",
+        lambda _repository: "a" * 64,
+    )
+
+    module._write_release_evidence(
+        path=Path("release/evidence.json"),
+        artifacts_root=artifacts,
+        manifest=manifest,
+        repository=tmp_path,
+        summary={"release_ready": True},
+        result_paths=(result,),
+    )
+
+    payload = json.loads(evidence.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "praxis-code-agent-release-evidence-v1"
+    assert payload["runtime_fingerprint"] == "a" * 64
+    assert payload["gate"] == {"release_ready": True}
+    assert payload["results"] == [
+        {
+            "path": "raw/result.json",
+            "sha256": module.hashlib.sha256(result.read_bytes()).hexdigest(),
+        }
+    ]
+
+
+def test_release_evidence_loader_rejects_tampered_raw_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_benchmark_module()
+    path = tmp_path / "benchmark.json"
+    _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(path)
+    artifacts = tmp_path / "artifacts"
+    result = artifacts / "raw" / "result.json"
+    result.parent.mkdir(parents=True)
+    result.write_text("original\n", encoding="utf-8")
+    evidence = artifacts / "release" / "evidence.json"
+    monkeypatch.setattr(
+        module,
+        "repository_state_fingerprint",
+        lambda _repository: "a" * 64,
+    )
+    module._write_release_evidence(
+        path=Path("release/evidence.json"),
+        artifacts_root=artifacts,
+        manifest=manifest,
+        repository=tmp_path,
+        summary={"release_ready": True},
+        result_paths=(result,),
+    )
+    result.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sha256"):
+        module.load_release_evidence(
+            evidence,
+            artifacts_root=artifacts,
+            manifest=manifest,
+        )
+
+
+def test_run_release_cli_requires_external_artifact_and_explicit_agent_command() -> None:
+    module = _load_benchmark_module()
+
+    args = module._build_parser().parse_args(
+        [
+            "run-release",
+            "benchmark.json",
+            "--evidence-artifact",
+            "artifacts/harness/PROD-02/evidence.json",
+            "--agent-command",
+            "uv run agent",
+        ]
+    )
+
+    assert args.command == "run-release"
+    assert args.agent_command == "uv run agent"
+    assert args.artifacts_root is None
+
+
+def test_current_runtime_agent_command_is_absolute_and_not_task_workspace_relative(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    entrypoint = interpreter.with_name("agent")
+    entrypoint.parent.mkdir(parents=True)
+    entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(module.sys, "executable", str(interpreter))
+
+    command = module._resolve_agent_command("current-runtime")
+
+    assert command == (str(entrypoint.resolve()),)
+
+
+def test_run_task_cli_resolves_current_runtime_like_run_release(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest = SimpleNamespace(tasks=(SimpleNamespace(task_id="task-1"),))
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(module, "load_manifest", lambda _path: manifest)
+    monkeypatch.setattr(
+        module,
+        "validate_repository_bindings",
+        lambda _manifest, repository: None,
+    )
+    monkeypatch.setattr(
+        module,
+        "_resolve_agent_command",
+        lambda value: ("/trusted/current/agent", value),
+    )
+
+    def fake_run_task(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            task_id="task-1",
+            model_alias="model-1",
+            outcome=SimpleNamespace(value="passed"),
+            turn_id="turn-1",
+            artifact_dir=tmp_path / "artifact",
+        )
+
+    monkeypatch.setattr(module, "run_task", fake_run_task)
+
+    exit_code = module.main(
+        [
+            "run-task",
+            "benchmark.json",
+            "task-1",
+            "--artifacts-root",
+            str(tmp_path),
+            "--model",
+            "model-1",
+            "--agent-command",
+            "current-runtime",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["agent_command"] == (
+        "/trusted/current/agent",
+        "current-runtime",
+    )
+
+
+def test_compare_kernels_cli_freezes_the_old_kernel_commit() -> None:
+    module = _load_benchmark_module()
+
+    args = module._build_parser().parse_args(
+        [
+            "compare-kernels",
+            "benchmark.json",
+            "--baseline-commit",
+            "a" * 40,
+            "--evidence-artifact",
+            "artifacts/harness/PROD-03/evidence.json",
+        ]
+    )
+
+    assert args.command == "compare-kernels"
+    assert args.baseline_commit == "a" * 40
 
 
 def _task_payload(
@@ -428,6 +651,21 @@ def test_release_gate_blocks_false_completion_from_control_run(
     assert "false_completion_blocker" in summary["reasons"]
 
 
+def test_release_gate_blocks_any_safety_violation(tmp_path: Path) -> None:
+    module = _load_benchmark_module()
+    path = tmp_path / "benchmark.json"
+    _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(path)
+    results = _complete_release_results(manifest)
+    results[0]["safety_violations"] = ["workspace_escape"]
+
+    summary = module.evaluate_release_results(manifest, results)
+
+    assert summary["release_ready"] is False
+    assert summary["safety_violation_count"] == 1
+    assert "safety_violation_blocker" in summary["reasons"]
+
+
 def test_release_gate_requires_complete_unique_runs_and_failure_diagnoses(
     tmp_path: Path,
 ) -> None:
@@ -486,6 +724,52 @@ def test_release_gate_rejects_results_from_a_stale_runtime_state(
 
     assert summary["release_ready"] is False
     assert "runtime_fingerprint_mismatch" in summary["reasons"]
+
+
+def test_kernel_comparison_requires_new_harness_to_match_old_pass_count(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    path = tmp_path / "benchmark.json"
+    _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(path)
+    baseline = _complete_release_results(manifest)
+    candidate = _complete_release_results(manifest)
+    for result in baseline:
+        result["runtime_fingerprint"] = "b" * 64
+    candidate[0]["outcome"] = "bounded_failure"
+    candidate[0]["diagnosis"] = {
+        "primary": "model_decision",
+        "evidence": ["agent_result:failed"],
+    }
+
+    comparison = module.evaluate_kernel_comparison(
+        manifest,
+        candidate,
+        baseline,
+        candidate_runtime_fingerprint="a" * 64,
+        baseline_runtime_fingerprint="b" * 64,
+    )
+
+    assert comparison["candidate_primary_passed"] == 29
+    assert comparison["baseline_primary_passed"] == 30
+    assert comparison["comparison_ready"] is False
+    assert comparison["reasons"] == ["candidate_below_baseline"]
+
+    baseline[0]["outcome"] = "bounded_failure"
+    baseline[0]["diagnosis"] = {
+        "primary": "model_decision",
+        "evidence": ["agent_result:failed"],
+    }
+    matched = module.evaluate_kernel_comparison(
+        manifest,
+        candidate,
+        baseline,
+        candidate_runtime_fingerprint="a" * 64,
+        baseline_runtime_fingerprint="b" * 64,
+    )
+    assert matched["comparison_ready"] is True
+    assert matched["reasons"] == []
 
 
 def test_gate_command_verifies_evidence_hashes_and_emits_release_decision(
@@ -685,6 +969,35 @@ def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
     assert "inspection_calls:20" in diagnosis.evidence
 
 
+def test_incomplete_model_response_is_diagnosed_from_public_harness_evidence() -> None:
+    module = _load_benchmark_module()
+    facts = module.RunFacts(
+        model_alias="deepseek_v4_flash",
+        turn_status="failed",
+        valid_diff=False,
+        hidden_acceptance_passed=False,
+    )
+    outcome = module.classify_outcome(facts)
+
+    diagnosis = module.diagnose_run(
+        facts,
+        outcome,
+        agent_stdout=(
+            "[model] model_response_incomplete: "
+            "Model response was incomplete: max_output_tokens.\n"
+            "inspection_budget_exhausted\n"
+        ),
+        acceptance_stdout="1 failed",
+        acceptance_stderr="",
+    )
+
+    assert outcome is module.RunOutcome.BOUNDED_FAILURE
+    assert diagnosis.primary is module.DiagnosisCause.MODEL_CAPABILITY_GAP
+    assert diagnosis.secondary == ()
+    assert diagnosis.confidence >= 0.9
+    assert "model_response:incomplete:max_output_tokens" in diagnosis.evidence
+
+
 def test_false_completion_diagnosis_names_execution_closure() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
@@ -848,6 +1161,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
         "import sys\n"
         "required = {'--model-session-path', '--checkpoint-db', '--non-interactive'}\n"
         "required.add('--require-workspace-change')\n"
+        "required.add('--disable-workspace-mcp')\n"
         "assert required <= set(sys.argv)\n"
         "assert sys.argv[sys.argv.index('--model') + 1] == 'kimi_cloud'\n"
         "assert '--max-tokens-total' not in sys.argv\n"
@@ -898,6 +1212,84 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
     assert payload["max_tokens_total"] is None
     assert payload["runtime_fingerprint"] == record.runtime_fingerprint
     assert len(record.runtime_fingerprint) == 64
+
+
+def test_run_task_retries_only_a_durable_unknown_model_operation(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    repo = tmp_path / "history"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "benchmark@example.invalid")
+    _git(repo, "config", "user.name", "Benchmark Fixture")
+    (repo / "app.py").write_text("VALUE = 'broken'\n", encoding="utf-8")
+    _git(repo, "add", "app.py")
+    _git(repo, "commit", "-qm", "fixture source")
+    source_commit = _git(repo, "rev-parse", "HEAD")
+    (repo / "hidden_test.py").write_text(
+        "from pathlib import Path\n"
+        "assert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", "hidden_test.py")
+    _git(repo, "commit", "-qm", "fixture target")
+    target_commit = _git(repo, "rev-parse", "HEAD")
+
+    fake_agent = tmp_path / "retrying_agent.py"
+    fake_agent.write_text(
+        "from pathlib import Path\n"
+        "import sqlite3\n"
+        "import sys\n"
+        "checkpoint = Path(sys.argv[sys.argv.index('--checkpoint-db') + 1])\n"
+        "if sys.argv[1] == 'run':\n"
+        "    with sqlite3.connect(checkpoint) as connection:\n"
+        "        connection.execute('CREATE TABLE model_operations (operation_id TEXT, turn_id TEXT, status TEXT)')\n"
+        "        connection.execute(\"INSERT INTO model_operations VALUES ('modelop-1', 'turn-retry', 'unknown')\")\n"
+        "    print('Turn: turn-retry')\n"
+        "    print('状态: paused')\n"
+        "    raise SystemExit(2)\n"
+        "assert sys.argv[1:4] == ['resume', 'turn-retry', '--action']\n"
+        "assert sys.argv[4] == 'retry'\n"
+        "with sqlite3.connect(checkpoint) as connection:\n"
+        "    connection.execute(\"UPDATE model_operations SET status='completed'\")\n"
+        "Path('app.py').write_text(\"VALUE = 'fixed'\\n\", encoding='utf-8')\n"
+        "print('Turn: turn-retry')\n"
+        "print('状态: done')\n",
+        encoding="utf-8",
+    )
+    task = _task_payload("retry-task")
+    task.update(
+        {
+            "source_commit": source_commit,
+            "target_commit": target_commit,
+            "acceptance_command": [sys.executable, "hidden_test.py"],
+            "acceptance_files": ["hidden_test.py"],
+            "setup_command": [],
+            "allowed_paths": ["app.py"],
+            "budget": {"max_turns": 12, "timeout_seconds": 30},
+        }
+    )
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=[task]))
+    manifest = module.load_manifest(manifest_path)
+
+    record = module.run_task(
+        repository=repo,
+        manifest=manifest,
+        task=manifest.tasks[0],
+        model_alias="kimi_cloud",
+        agent_command=(sys.executable, str(fake_agent)),
+        artifacts_root=tmp_path / "artifacts",
+    )
+
+    assert record.outcome is module.RunOutcome.PASSED
+    assert record.turn_id == "turn-retry"
+    assert record.turn_status == "done"
+    assert "VALUE = 'fixed'" in record.diff
+    stdout = (record.artifact_dir / "agent.stdout").read_text(encoding="utf-8")
+    assert "状态: paused" in stdout
+    assert "状态: done" in stdout
 
 
 def test_command_cleanup_waits_for_background_process_group(tmp_path: Path) -> None:

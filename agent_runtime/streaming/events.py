@@ -9,6 +9,8 @@ StreamEvent 定义 — 流式输出的基础类型。
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import InitVar, dataclass, field
@@ -84,6 +86,70 @@ class ItemStatus(StrEnum):
     FAILED = "failed"
     CANCELLED = "cancelled"
     OUTCOME_UNKNOWN = "outcome_unknown"
+
+
+def derive_model_public_item_id(
+    *,
+    turn_id: str,
+    model_attempt_id: str,
+    channel: str,
+) -> str:
+    if channel not in {"agent_message", "reasoning", "plan"}:
+        raise ValueError(f"unsupported model Item channel: {channel}")
+    return _derived_public_item_id(
+        "model",
+        turn_id,
+        model_attempt_id,
+        channel,
+    )
+
+
+def derive_operation_public_item_id(
+    *,
+    turn_id: str,
+    operation_id: str,
+    attempt_generation: int,
+) -> str:
+    if isinstance(attempt_generation, bool) or attempt_generation <= 0:
+        raise ValueError("operation attempt_generation must be a positive integer")
+    return _derived_public_item_id(
+        "operation",
+        turn_id,
+        operation_id,
+        str(attempt_generation),
+    )
+
+
+def derive_plan_public_item_id(*, turn_id: str, revision: int) -> str:
+    if isinstance(revision, bool) or revision < 0:
+        raise ValueError("plan revision must be a non-negative integer")
+    return _derived_public_item_id("plan", turn_id, str(revision))
+
+
+def derive_reconciliation_public_item_id(
+    *,
+    turn_id: str,
+    operation_id: str,
+    reconciler_revision: str,
+) -> str:
+    return _derived_public_item_id(
+        "reconciliation",
+        turn_id,
+        operation_id,
+        reconciler_revision,
+    )
+
+
+def _derived_public_item_id(namespace: str, *parts: str) -> str:
+    if any(not isinstance(part, str) or not part for part in parts):
+        raise ValueError("public Item ID components must be non-empty strings")
+    canonical = json.dumps(
+        [namespace, *parts],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:32]
+    return f"{namespace}:{digest}"
 
 
 _TURN_EVENTS = frozenset(

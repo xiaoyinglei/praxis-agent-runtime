@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from agent_runtime.core.context import LLMBudgetLedger
+from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.modeling.contracts import (
     LLMCallStage,
     LLMProviderResult,

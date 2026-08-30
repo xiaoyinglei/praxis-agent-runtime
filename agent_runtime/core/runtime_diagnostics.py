@@ -88,70 +88,6 @@ class RuntimeDiagnostic(BaseModel):
         )
 
 
-# Tool call metrics.
-
-
-class ToolCallMetrics(BaseModel):
-    """Lightweight counters for canonical tool execution.
-
-    Populated by AgentLoop during tool execution and attached to the loop
-    state. A compact RuntimeDiagnostic summary is emitted for inline display.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    # Resident/native direct calls
-    native_calls: int = 0
-    native_errors: int = 0
-    native_latency_ms_total: float = 0.0
-
-    # Discoverable extension calls
-    find_tools_calls: int = 0
-    find_tools_hits: int = 0
-    deferred_activations: int = 0
-    deferred_calls: int = 0
-
-    # MCP
-    mcp_calls: int = 0
-    mcp_errors: int = 0
-    mcp_latency_ms_total: float = 0.0
-
-    # Approval
-    approval_allow: int = 0
-    approval_deny: int = 0
-    approval_ask: int = 0
-
-    # Context budget
-    context_tokens_start: int = 0
-    context_tokens_end: int = 0
-
-    @property
-    def token_savings_pct(self) -> float:
-        """Estimated tool-context token savings during the run."""
-        if self.context_tokens_start == 0:
-            return 0.0
-        return (1.0 - self.context_tokens_end / self.context_tokens_start) * 100
-
-    @property
-    def find_tools_hit_rate(self) -> float:
-        if self.find_tools_calls == 0:
-            return 0.0
-        return self.find_tools_hits / self.find_tools_calls * 100
-
-    @property
-    def mcp_avg_latency_ms(self) -> float:
-        if self.mcp_calls == 0:
-            return 0.0
-        return self.mcp_latency_ms_total / self.mcp_calls
-
-    @property
-    def approval_ask_rate(self) -> float:
-        total = self.approval_allow + self.approval_deny + self.approval_ask
-        if total == 0:
-            return 0.0
-        return self.approval_ask / total * 100
-
-
 class AgentLatencyProfile(BaseModel):
     """Per-run latency profile for product Agent execution."""
 
@@ -185,7 +121,6 @@ __all__ = [
     "MAX_RUNTIME_DIAGNOSTICS",
     "AgentLatencyProfile",
     "RuntimeDiagnostic",
-    "ToolCallMetrics",
     "merge_runtime_diagnostics",
     "redact_sensitive_text",
 ]

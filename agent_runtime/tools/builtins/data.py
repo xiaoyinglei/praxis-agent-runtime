@@ -134,8 +134,9 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "PDF text, delimited-table rows, or a JSON preview. Use this before "
                 "analysis and once after execute_python creates a data artifact. A "
                 "successful inspection of the exact generated path verifies that "
-                "artifact's file structure and content; then finish instead of "
-                "reading the original binary again or repeating the inspection."
+                "artifact's file structure and content; then return a non-empty "
+                "final answer with zero tool calls instead of reading the original "
+                "binary again or repeating the inspection."
             ),
             input_schema=_INSPECT_INPUT_SCHEMA,
         ),

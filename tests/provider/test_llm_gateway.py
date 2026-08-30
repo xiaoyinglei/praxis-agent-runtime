@@ -12,12 +12,12 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
-from agent_runtime.core.context import LLMBudgetLedger
 from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.modeling.contracts import (
     LLMCallStage,
     LLMProviderResult,

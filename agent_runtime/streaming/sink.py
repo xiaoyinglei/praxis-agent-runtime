@@ -1,28 +1,18 @@
-"""
-StreamEventSink — 流式事件的出口。
+"""Streaming event sink contracts and explicit legacy projection."""
 
-QueueStreamEventSink 把事件放进 asyncio.Queue，供外部 async generator 消费。
-
-使用方式：
-    sink = QueueStreamEventSink()
-    task = asyncio.create_task(agent_loop.run(..., stream_sink=sink))
-    async for event in sink.stream():
-        render(event)
-"""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, cast
+import math
+from collections.abc import Mapping, Sequence
+from typing import Protocol, cast
 
-from agent_runtime.core.messages import ModelMessage, ToolCall, canonical_json_text
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
     ItemStatus,
     StreamEvent,
     TurnItemKind,
-    item_completed,
     loop_end,
     text_delta,
     thinking_delta,
@@ -33,14 +23,193 @@ from agent_runtime.streaming.events import (
 )
 from agent_runtime.tools.tool import JsonValue
 
-if TYPE_CHECKING:
-    from agent_runtime.turns import TurnStore
-
 
 class StreamEventSink(Protocol):
-    """流式事件 sink 协议。"""
+    """Streaming event sink protocol."""
 
     async def emit(self, event: StreamEvent) -> None: ...
+
+
+class EventChannelClosed(RuntimeError):  # noqa: N818 - protocol name
+    """A controlling event consumer closed its channel."""
+
+
+class ObserverLagged(RuntimeError):  # noqa: N818 - protocol name
+    """A passive observer fell behind its bounded event channel."""
+
+    def __init__(self, *, last_cursor: str | None) -> None:
+        super().__init__("passive observer lagged; reconnect from durable history")
+        self.last_cursor = last_cursor
+
+
+class _EventChannel:
+    def __init__(self, *, capacity: int, last_cursor: str | None = None) -> None:
+        self.queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=capacity)
+        self.available = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.error: Exception = EventChannelClosed("event channel is closed")
+        self.last_cursor = last_cursor
+
+    async def put(self, event: StreamEvent) -> None:
+        if self.closed.is_set():
+            raise self.error
+        put = asyncio.create_task(self.queue.put(event))
+        closing = asyncio.create_task(self.closed.wait())
+        await asyncio.wait((put, closing), return_when=asyncio.FIRST_COMPLETED)
+        if self.closed.is_set():
+            put.cancel()
+            await asyncio.gather(put, return_exceptions=True)
+            self._discard_queued()
+            raise self.error
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        await put
+        self.available.set()
+
+    async def receive(self) -> StreamEvent:
+        if self.closed.is_set():
+            raise self.error
+        receive = asyncio.create_task(self.queue.get())
+        closing = asyncio.create_task(self.closed.wait())
+        await asyncio.wait((receive, closing), return_when=asyncio.FIRST_COMPLETED)
+        if self.closed.is_set():
+            receive.cancel()
+            await asyncio.gather(receive, return_exceptions=True)
+            self._discard_queued()
+            raise self.error
+        closing.cancel()
+        await asyncio.gather(closing, return_exceptions=True)
+        event = await receive
+        if self.queue.empty():
+            self.available.clear()
+        return event
+
+    def receive_nowait(self) -> StreamEvent:
+        if self.closed.is_set():
+            raise self.error
+        event = self.queue.get_nowait()
+        if self.queue.empty():
+            self.available.clear()
+        return event
+
+    def put_passive(self, event: StreamEvent, *, cursor: str | None) -> None:
+        if self.closed.is_set():
+            return
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.close(error=ObserverLagged(last_cursor=self.last_cursor))
+            return
+        self.available.set()
+        if cursor is not None:
+            self.last_cursor = cursor
+
+    def close(self, *, error: Exception | None = None) -> None:
+        if self.closed.is_set():
+            return
+        if error is not None:
+            self.error = error
+        self.closed.set()
+        self._discard_queued()
+
+    def _discard_queued(self) -> None:
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.available.clear()
+
+
+class TurnEventStream:
+    """One controlling consumer of a Turn's canonical event stream."""
+
+    def __init__(self, channel: _EventChannel) -> None:
+        self._channel = channel
+
+    async def receive(self) -> StreamEvent:
+        return await self._channel.receive()
+
+    def receive_nowait(self) -> StreamEvent:
+        return self._channel.receive_nowait()
+
+    async def wait_available(self) -> None:
+        await self._channel.available.wait()
+
+    def close(self) -> None:
+        self._channel.close()
+
+    @property
+    def empty(self) -> bool:
+        return self._channel.queue.empty()
+
+
+class TurnEventDispatcher:
+    """Fan out one Turn's events with controlling-consumer backpressure."""
+
+    def __init__(
+        self,
+        *,
+        capacity: int = 64,
+        sink_cancel_grace_seconds: float = 1.0,
+    ) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int):
+            raise TypeError("capacity must be an integer")
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        if (
+            isinstance(sink_cancel_grace_seconds, bool)
+            or not isinstance(sink_cancel_grace_seconds, (int, float))
+            or not math.isfinite(sink_cancel_grace_seconds)
+            or sink_cancel_grace_seconds <= 0
+        ):
+            raise ValueError("sink cancellation grace must be finite and positive")
+        self._capacity = capacity
+        self._sink_cancel_grace_seconds = float(sink_cancel_grace_seconds)
+        self._controlling: list[_EventChannel] = []
+        self._controlling_sinks: list[StreamEventSink] = []
+        self._passive: list[_EventChannel] = []
+
+    def subscribe_controlling(self) -> TurnEventStream:
+        channel = _EventChannel(capacity=self._capacity)
+        self._controlling.append(channel)
+        return TurnEventStream(channel)
+
+    def subscribe_passive(self, *, last_cursor: str | None = None) -> TurnEventStream:
+        channel = _EventChannel(capacity=self._capacity, last_cursor=last_cursor)
+        self._passive.append(channel)
+        return TurnEventStream(channel)
+
+    def subscribe_controlling_sink(self, sink: StreamEventSink) -> None:
+        self._controlling_sinks.append(sink)
+
+    async def emit(self, event: StreamEvent, *, cursor: str | None = None) -> None:
+        for channel in tuple(self._controlling):
+            await channel.put(event)
+        for channel in tuple(self._passive):
+            channel.put_passive(event, cursor=cursor)
+        for sink in tuple(self._controlling_sinks):
+            delivery = asyncio.create_task(sink.emit(event))
+            done, _pending = await asyncio.wait(
+                {delivery},
+                timeout=self._sink_cancel_grace_seconds,
+            )
+            if not done:
+                delivery.cancel()
+                await asyncio.sleep(0)
+                delivery.add_done_callback(_consume_task_result)
+                raise EventChannelClosed(
+                    "controlling event sink exceeded cancellation grace"
+                )
+            try:
+                delivery.result()
+            except Exception as exc:
+                raise EventChannelClosed(
+                    f"controlling event sink failed: {exc}"
+                ) from exc
+
+
+def _consume_task_result(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    task.exception()
 
 
 class LegacyStreamProjectionSink:
@@ -62,10 +231,7 @@ class LegacyStreamProjectionSink:
 
     def _project(self, event: StreamEvent) -> StreamEvent | None:
         if event.type in {EventType.TURN_STARTED, EventType.TURN_RESUMED}:
-            return turn_start(
-                turn_id=event.turn_id,
-                iteration=event.iteration,
-            )
+            return turn_start(turn_id=event.turn_id, iteration=event.iteration)
         if event.type in {
             EventType.TURN_PAUSED,
             EventType.TURN_COMPLETED,
@@ -112,11 +278,7 @@ class LegacyStreamProjectionSink:
         if not isinstance(delta, str):
             return None
         if event.delta_kind is ItemDeltaKind.TEXT:
-            return text_delta(
-                delta,
-                turn_id=event.turn_id,
-                iteration=event.iteration,
-            )
+            return text_delta(delta, turn_id=event.turn_id, iteration=event.iteration)
         if event.delta_kind is ItemDeltaKind.REASONING:
             return thinking_delta(
                 delta,
@@ -160,8 +322,7 @@ class LegacyStreamProjectionSink:
         tool_name = self._tool_names.get(event.item_id, event.item_kind.value)
         legacy_tool_id = self._tool_ids.get(event.item_id, event.item_id)
         if event.status is ItemStatus.SUCCESS:
-            result = event.data.get("result")
-            result_text, details = _legacy_tool_result(result)
+            result_text, details = _legacy_tool_result(event.data.get("result"))
             return StreamEvent(
                 type=EventType.TOOL_USE_RESULT,
                 turn_id=event.turn_id,
@@ -178,10 +339,8 @@ class LegacyStreamProjectionSink:
             )
         return tool_use_error(
             legacy_tool_id,
-            (
-                event.error
-                or (event.status.value if event.status is not None else "tool failed")
-            ),
+            event.error
+            or (event.status.value if event.status is not None else "tool failed"),
             recoverable=event.status is not ItemStatus.OUTCOME_UNKNOWN,
             turn_id=event.turn_id,
             iteration=event.iteration,
@@ -225,205 +384,3 @@ def _legacy_tool_result(result: JsonValue | None) -> tuple[str, JsonValue]:
                 "diff_truncated": diff_truncated,
             }
     return text[:500], details
-
-
-class DurableStreamEventSink:
-    """Persist authoritative Item completion before delivering it live."""
-
-    def __init__(
-        self,
-        *,
-        turn_store: TurnStore,
-        live_sink: StreamEventSink,
-    ) -> None:
-        self._turn_store = turn_store
-        self._live_sink: StreamEventSink | None = live_sink
-        self._started_at_ms: dict[tuple[str, str], int] = {}
-        self._started_items: dict[tuple[str, str], StreamEvent] = {}
-        self._item_deltas: dict[tuple[str, str], list[str]] = {}
-
-    async def emit(self, event: StreamEvent) -> None:
-        key = (event.turn_id, event.item_id or "")
-        if event.type is EventType.ITEM_STARTED and event.item_id is not None:
-            self._started_at_ms[key] = event.timestamp_ms
-            self._started_items[key] = event
-            self._item_deltas[key] = []
-        elif event.type is EventType.ITEM_DELTA:
-            self._item_deltas.setdefault(key, []).append(
-                cast(str, event.data["delta"])
-            )
-        elif event.type is EventType.ITEM_COMPLETED:
-            message = _completed_item_message(event)
-            self._turn_store.commit_completed_item(
-                event,
-                message=message,
-                started_at_ms=self._started_at_ms.pop(key, None),
-            )
-            self._started_items.pop(key, None)
-            self._item_deltas.pop(key, None)
-        if self._live_sink is not None:
-            await self._live_sink.emit(event)
-
-    async def close_open_items(self) -> None:
-        """Durably cancel every started Item before its Turn is aborted."""
-
-        for key, started in tuple(self._started_items.items()):
-            if started.item_id is None or started.item_kind is None:
-                continue
-            content = "".join(self._item_deltas.get(key, ()))
-            data: dict[str, JsonValue] = (
-                {"content": content}
-                if started.item_kind
-                in {
-                    TurnItemKind.AGENT_MESSAGE,
-                    TurnItemKind.REASONING,
-                    TurnItemKind.PLAN,
-                }
-                else {}
-            )
-            completed = item_completed(
-                turn_id=started.turn_id,
-                item_id=started.item_id,
-                item_kind=started.item_kind,
-                status=ItemStatus.CANCELLED,
-                data=data,
-                iteration=started.iteration,
-                parent_item_id=started.parent_item_id,
-            )
-            self._turn_store.commit_completed_item(
-                completed,
-                started_at_ms=self._started_at_ms.get(key),
-            )
-
-    def disconnect_live(self) -> None:
-        """Stop delivery without changing durable completion semantics."""
-
-        self._live_sink = None
-
-class QueueStreamEventSink:
-    """基于 asyncio.Queue 的流式事件 sink。
-
-    外部通过 stream() 消费事件。
-    """
-
-    def __init__(self, maxsize: int = 1000) -> None:
-        self._queue: asyncio.Queue[StreamEvent | None] = asyncio.Queue(
-            maxsize=maxsize
-        )
-        self._closed = asyncio.Event()
-
-    async def emit(self, event: StreamEvent) -> None:
-        """往 queue 里放一个事件。"""
-        if self._closed.is_set():
-            raise RuntimeError("stream sink is closed")
-        put_task = asyncio.create_task(self._queue.put(event))
-        close_task = asyncio.create_task(self._closed.wait())
-        done, _pending = await asyncio.wait(
-            {put_task, close_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if put_task in done:
-            close_task.cancel()
-            await asyncio.gather(close_task, return_exceptions=True)
-            return
-        put_task.cancel()
-        await asyncio.gather(put_task, return_exceptions=True)
-        raise RuntimeError("stream sink closed during emit")
-
-    async def stream(self) -> AsyncGenerator[StreamEvent, None]:
-        """消费事件流，直到收到 LOOP_END 或 ABORT。"""
-        while not self._closed.is_set() or not self._queue.empty():
-            get_task = asyncio.create_task(self._queue.get())
-            close_task = asyncio.create_task(self._closed.wait())
-            done, _pending = await asyncio.wait(
-                {get_task, close_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if get_task in done:
-                close_task.cancel()
-                await asyncio.gather(close_task, return_exceptions=True)
-                event = get_task.result()
-                if event is not None:
-                    yield event
-                continue
-            get_task.cancel()
-            await asyncio.gather(get_task, return_exceptions=True)
-
-    async def close(self) -> None:
-        """通知消费者结束。"""
-        self._closed.set()
-
-    @property
-    def queue(self) -> asyncio.Queue[StreamEvent | None]:
-        return self._queue
-
-
-def _completed_item_message(event: StreamEvent) -> ModelMessage | None:
-    if event.item_kind in {
-        TurnItemKind.TOOL,
-        TurnItemKind.COMMAND,
-        TurnItemKind.PLAN,
-    } and isinstance(event.data.get("result"), Mapping):
-        return _completed_tool_message(event)
-    if (
-        event.item_kind is not TurnItemKind.AGENT_MESSAGE
-        or event.status is not ItemStatus.SUCCESS
-    ):
-        return None
-    content = event.data.get("content")
-    raw_calls = event.data.get("tool_calls")
-    if not isinstance(content, str):
-        raise ValueError("completed agent_message requires string content")
-    if not isinstance(raw_calls, (list, tuple)):
-        raise ValueError("completed agent_message requires tool_calls sequence")
-    calls: list[ToolCall] = []
-    for raw_call in raw_calls:
-        if not isinstance(raw_call, Mapping):
-            raise ValueError("completed agent_message tool_calls must be objects")
-        call_id = raw_call.get("id")
-        name = raw_call.get("name")
-        arguments = raw_call.get("arguments")
-        if not isinstance(call_id, str) or not call_id:
-            raise ValueError("completed agent_message tool call requires id")
-        if not isinstance(name, str) or not name:
-            raise ValueError("completed agent_message tool call requires name")
-        if not isinstance(arguments, Mapping):
-            raise ValueError("completed agent_message tool call requires arguments")
-        calls.append(
-            ToolCall(
-                id=call_id,
-                name=name,
-                input=cast(dict[str, object], dict(arguments)),
-            )
-        )
-    return ModelMessage(
-        role="assistant",
-        content=content,
-        tool_calls=tuple(calls),
-    )
-
-
-def _completed_tool_message(event: StreamEvent) -> ModelMessage | None:
-    result = event.data.get("result")
-    if not isinstance(result, Mapping):
-        return None
-    tool_call_id = result.get("tool_call_id")
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        raise ValueError("completed tool item result requires tool_call_id")
-    content = result.get("content")
-    if not isinstance(content, (list, tuple)):
-        raise ValueError("completed tool item result requires content sequence")
-    payload = {
-        "content": content,
-        "structured_content": result.get("structured_content"),
-        "is_error": result.get("is_error"),
-        "error_code": result.get("error_code"),
-        "error_message": result.get("error_message"),
-        "retryable": result.get("retryable"),
-        "truncated": result.get("truncated"),
-    }
-    return ModelMessage(
-        role="tool",
-        content=canonical_json_text(cast(JsonValue, payload)),
-        tool_call_id=tool_call_id,
-    )
