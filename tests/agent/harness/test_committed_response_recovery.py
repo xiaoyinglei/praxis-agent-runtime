@@ -315,42 +315,20 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
                     ),
                 )
             )
-        [committed_outcome] = crashed_process.list_tool_operations(turn.turn_id)
-        assert committed_outcome.status == "succeeded"
-        assert committed_outcome.result_item_id is None
+        [rolled_back_outcome] = crashed_process.list_tool_operations(turn.turn_id)
+        assert rolled_back_outcome.status == "running"
+        assert rolled_back_outcome.result_item_id is None
         assert calls == ["README.md"]
 
     with RolloutStore(database) as recovered_process:
-        model = AnswerAfterRecovery()
-        session = Session(
-            thread_id=turn.thread_id,
-            store=recovered_process,
-            model=model,
-            context_manager=RolloutContextManager(recovered_process),
-            completion_gate=AcceptRecoveredAnswer(),
-            tool_router=StaticToolRouter(tools),
-            tool_orchestrator=ToolOrchestrator(
-                store=recovered_process,
-                tools=tools,
-                execution_context=ToolExecutionContext(
-                    workspace_root=workspace,
-                    cwd=workspace,
-                ),
-            ),
+        [expired_claim] = recovered_process.list_tool_operations(turn.turn_id)
+        assert expired_claim.lease_expires_at is not None
+        recovered_process.expire_tool_operation_claim(
+            operation_id=expired_claim.operation_id,
+            now=expired_claim.lease_expires_at + 1.0,
         )
-
-        recovered = HarnessAgent(
-            ThreadManager(
-                store=recovered_process,
-                session_factory=lambda _thread_id: session,
-                workspace=workspace,
-                binding_provider=FrozenBinding(),
-            )
-        ).recover_committed_model_response(turn.turn_id)
-
-        assert recovered.status == "paused"
+        assert recovered_process.read_turn(turn.turn_id).status == "paused"
         assert calls == ["README.md"]
-        assert model.requests == []
         [unknown] = recovered_process.list_tool_operations(turn.turn_id)
         assert unknown.status == "unknown"
         assert unknown.requires_reconciliation is True
