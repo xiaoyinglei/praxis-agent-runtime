@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from pathlib import Path
 
+import pytest
+
+from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
+    GatewayHarnessModel,
     HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
@@ -15,6 +20,10 @@ from agent_runtime.harness import (
     RolloutStore,
     Session,
 )
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.gateway import LLMGateway, StreamChunk
+from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
+from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
 class InspectingModel:
@@ -193,6 +202,127 @@ class AnswerAfterClarificationModel(InspectingModel):
             provider_response_id="response-target-a",
             usage={"input_tokens": 6, "output_tokens": 3},
         )
+
+
+class CharacterAccounting:
+    def count(self, text: str) -> int:
+        return len(text)
+
+    def clip(
+        self,
+        text: str,
+        token_budget: int,
+        *,
+        add_ellipsis: bool = False,
+    ) -> str:
+        suffix = "..." if add_ellipsis and len(text) > token_budget else ""
+        return text[: max(0, token_budget - len(suffix))] + suffix
+
+
+class BlockingAfterFirstDeltaProvider:
+    def __init__(self) -> None:
+        self.blocked = threading.Event()
+        self.release = threading.Event()
+
+    def stream_with_tools(self, **_kwargs: object):
+        yield StreamChunk(type="text_delta", content="partial")
+        self.blocked.set()
+        self.release.wait()
+
+
+@pytest.mark.anyio
+async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = BlockingAfterFirstDeltaProvider()
+    gateway = LLMGateway(
+        generator=provider,
+        token_accounting=CharacterAccounting(),
+        model_context_tokens=8_192,
+        stage_budgets={
+            LLMCallStage.AGENT_STEP: LLMStageBudget(
+                max_input_tokens=4_096,
+                max_output_tokens=256,
+                safety_margin_tokens=0,
+            )
+        },
+    )
+    model = GatewayHarnessModel(
+        model_alias="test-model",
+        resolved=ResolvedModel(
+            generator=provider,
+            kwargs={"max_tokens": 256},
+            gateway=gateway,
+            provider="openai-compatible",
+            model="provider-model",
+        ),
+        instructions=("Answer the user directly.",),
+    )
+    dispatcher = TurnEventDispatcher(capacity=8)
+    stream = dispatcher.subscribe_controlling()
+    try:
+        with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+            thread = store.create_thread(workspace=workspace)
+            runner = Session(
+                thread_id=thread.thread_id,
+                store=store,
+                model=model,
+                context_manager=RolloutContextManager(store),
+                completion_gate=FixedDecisionGate("accept", "unused"),
+                event_dispatcher=dispatcher,
+            )
+            running = asyncio.create_task(
+                runner.run(
+                    user_message="cancel a blocked sync provider",
+                    binding_manifest={"model_alias": "test-model"},
+                )
+            )
+            initial_events = [
+                await asyncio.wait_for(stream.receive(), timeout=0.5)
+                for _index in range(3)
+            ]
+            await asyncio.wait_for(
+                asyncio.to_thread(provider.blocked.wait),
+                timeout=0.5,
+            )
+
+            running.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(running, timeout=0.2)
+
+            terminal_events = []
+            while not stream.empty:
+                terminal_events.append(stream.receive_nowait())
+
+            [operation] = store.list_model_operations()
+            [attempt] = store.list_model_attempts(operation.operation_id)
+            [response_item] = [
+                item
+                for item in store.list_items(operation.turn_id)
+                if item.kind == "model_response"
+            ]
+
+            assert [event.type for event in initial_events] == [
+                EventType.TURN_STARTED,
+                EventType.ITEM_STARTED,
+                EventType.ITEM_DELTA,
+            ]
+            assert attempt.status == "unknown"
+            assert response_item.status == "completed"
+            assert response_item.payload["text"] == "partial"
+            completed = [
+                event
+                for event in terminal_events
+                if event.type is EventType.ITEM_COMPLETED
+                and event.item_kind is TurnItemKind.AGENT_MESSAGE
+            ]
+            assert len(completed) == 1
+            assert completed[0].status is ItemStatus.OUTCOME_UNKNOWN
+            assert completed[0].data["content"] == "partial"
+    finally:
+        provider.release.set()
 
 
 def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -> None:

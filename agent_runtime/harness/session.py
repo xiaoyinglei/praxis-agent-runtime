@@ -644,6 +644,11 @@ class Session:
                     generation=attempt.generation,
                     error_type=type(exc).__name__,
                     error_message=(str(exc).strip() or "model dispatch raised without a message"),
+                    channel_content={
+                        "agent_message": "".join(streamed_content["text"]),
+                        "reasoning": "".join(streamed_content["reasoning"]),
+                        "plan": "".join(streamed_content["plan"]),
+                    },
                 )
             )
             return TurnResult(
@@ -661,6 +666,11 @@ class Session:
                     generation=attempt.generation,
                     error_type=type(exc).__name__,
                     error_message=("model dispatch was cancelled after provider I/O began"),
+                    channel_content={
+                        "agent_message": "".join(streamed_content["text"]),
+                        "reasoning": "".join(streamed_content["reasoning"]),
+                        "plan": "".join(streamed_content["plan"]),
+                    },
                 )
             )
             raise
@@ -675,6 +685,11 @@ class Session:
                     reason=message,
                     error_type=type(exc).__name__,
                     error_message=message,
+                    channel_content={
+                        "agent_message": "".join(streamed_content["text"]),
+                        "reasoning": "".join(streamed_content["reasoning"]),
+                        "plan": "".join(streamed_content["plan"]),
+                    },
                 )
             )
             return await self._fail_turn(

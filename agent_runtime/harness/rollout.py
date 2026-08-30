@@ -37,6 +37,22 @@ def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
     }
 
 
+def _model_channel_content(
+    content: Mapping[str, str] | None,
+) -> dict[str, str]:
+    if content is None:
+        return {}
+    allowed = {"agent_message", "reasoning", "plan"}
+    frozen: dict[str, str] = {}
+    for channel, value in content.items():
+        if channel not in allowed:
+            raise ValueError(f"unsupported model output channel: {channel}")
+        if not isinstance(value, str):
+            raise TypeError(f"model {channel} content must be a string")
+        frozen[channel] = value
+    return frozen
+
+
 class ResourceClaimConflictError(RuntimeError):
     """Another running or unknown operation owns an incompatible resource."""
 
@@ -1555,11 +1571,13 @@ class RolloutStore:
         generation: int,
         error_type: str | None = None,
         error_message: str | None = None,
+        channel_content: Mapping[str, str] | None = None,
     ) -> ModelAttemptSnapshot:
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model dispatch error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model dispatch error_message must be non-empty")
+        frozen_channel_content = _model_channel_content(channel_content)
         with self._transaction():
             operation = self._connection.execute(
                 "SELECT * FROM model_operations WHERE operation_id = ?",
@@ -1589,6 +1607,17 @@ class RolloutStore:
                 producer="runtime",
                 payload=payload,
             )
+            self._close_started_model_output_channels(
+                operation=operation,
+                attempt_id=attempt_id,
+                status="outcome_unknown",
+                error=(
+                    error_message.strip()[:2_000]
+                    if error_message is not None
+                    else "model outcome is unknown"
+                ),
+                channel_content=frozen_channel_content,
+            )
             turn = self._connection.execute(
                 "SELECT status FROM turns WHERE turn_id = ?", (operation["turn_id"],)
             ).fetchone()
@@ -1615,6 +1644,7 @@ class RolloutStore:
         reason: str,
         error_type: str | None = None,
         error_message: str | None = None,
+        channel_content: Mapping[str, str] | None = None,
     ) -> ModelAttemptSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("model rejection reason must be non-empty")
@@ -1622,6 +1652,7 @@ class RolloutStore:
             raise ValueError("model rejection error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model rejection error_message must be non-empty")
+        frozen_channel_content = _model_channel_content(channel_content)
         with self._transaction():
             operation = self._connection.execute(
                 "SELECT * FROM model_operations WHERE operation_id = ?",
@@ -1652,7 +1683,92 @@ class RolloutStore:
                 producer="runtime",
                 payload=payload,
             )
+            self._close_started_model_output_channels(
+                operation=operation,
+                attempt_id=attempt_id,
+                status="failed",
+                error=(
+                    error_message.strip()[:2_000]
+                    if error_message is not None
+                    else reason.strip()[:2_000]
+                ),
+                channel_content=frozen_channel_content,
+            )
         return self.list_model_attempts(operation_id)[-1]
+
+    def _close_started_model_output_channels(
+        self,
+        *,
+        operation: sqlite3.Row,
+        attempt_id: str,
+        status: str,
+        error: str,
+        channel_content: Mapping[str, str],
+    ) -> None:
+        if status not in {"failed", "cancelled", "outcome_unknown"}:
+            raise ValueError("model Item terminal status is unsupported")
+        started = self._connection.execute(
+            """
+            SELECT payload_json
+            FROM rollout_records
+            WHERE turn_id = ?
+              AND record_type = 'item_started'
+              AND json_extract(payload_json, '$.attempt_id') = ?
+              AND json_extract(payload_json, '$.channel') IN (
+                  'agent_message', 'reasoning', 'plan'
+              )
+            ORDER BY record_id
+            """,
+            (operation["turn_id"], attempt_id),
+        ).fetchall()
+        seen_channels: set[str] = set()
+        for row in started:
+            start_payload = json.loads(row["payload_json"])
+            channel = str(start_payload["channel"])
+            if channel in seen_channels:
+                raise RuntimeError(
+                    f"model {channel} channel has duplicate durable starts"
+                )
+            seen_channels.add(channel)
+            item_id = str(start_payload["item_id"])
+            completed = self._connection.execute(
+                """
+                SELECT 1
+                FROM rollout_records
+                WHERE turn_id = ?
+                  AND record_type = 'item_completed'
+                  AND json_extract(payload_json, '$.item_id') = ?
+                LIMIT 1
+                """,
+                (operation["turn_id"], item_id),
+            ).fetchone()
+            if completed is not None:
+                continue
+            content = channel_content.get(channel, "")
+            item_payload: dict[str, Any]
+            if channel == "agent_message":
+                item_payload = {"text": content, "tool_calls": ()}
+            else:
+                item_payload = {"content": content}
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="item_completed",
+                producer="model",
+                payload={
+                    "item_id": item_id,
+                    "attempt_id": attempt_id,
+                    "channel": channel,
+                    "public_item_id": derive_model_public_item_id(
+                        turn_id=str(operation["turn_id"]),
+                        model_attempt_id=attempt_id,
+                        channel=channel,
+                    ),
+                    "status": status,
+                    "error": error,
+                    "payload": item_payload,
+                },
+            )
 
     def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
         self._assert_artifact_integrity()

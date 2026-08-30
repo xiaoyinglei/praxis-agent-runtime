@@ -28,8 +28,10 @@ from agent_runtime.modeling.contracts import (
 from agent_runtime.modeling.gateway import (
     AgentModelResponse,
     LLMBudgetExceededError,
+    LLMGateway,
     ProviderDelta,
     ProviderDeltaChannel,
+    StreamChunk,
     model_request_input_text,
 )
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -137,6 +139,17 @@ class NativeReasoningPlanGateway(CapturingGateway):
             serializer_revision="openai-wire-v1",
             wire_kind="openai-compatible",
         )
+
+
+class FastSyncStreamingProvider:
+    def __init__(self) -> None:
+        self.produced = 0
+
+    def stream_with_tools(self, **_kwargs: object):
+        for _index in range(1_000):
+            self.produced += 1
+            yield StreamChunk(type="text_delta", content="x")
+        yield StreamChunk(type="message_stop", stop_reason="end_turn")
 
 
 class BoundGatewayHarnessModel(GatewayHarnessModel):
@@ -443,6 +456,66 @@ async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
     assert len(item_ids) == 2
 
 
+@pytest.mark.anyio
+async def test_harness_backpressure_reaches_sync_provider_bridge(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    provider = FastSyncStreamingProvider()
+    gateway = LLMGateway(
+        generator=provider,
+        token_accounting=CharacterAccounting(),
+        model_context_tokens=8_192,
+        stage_budgets={
+            LLMCallStage.AGENT_STEP: LLMStageBudget(
+                max_input_tokens=4_096,
+                max_output_tokens=2_048,
+                safety_margin_tokens=0,
+            )
+        },
+    )
+    model = BoundGatewayHarnessModel(
+        model_alias="test-model",
+        resolved=ResolvedModel(
+            generator=provider,
+            kwargs={"max_tokens": 2_048},
+            gateway=gateway,
+            provider="openai-compatible",
+            model="provider-model",
+        ),
+        instructions=("Answer the user directly.",),
+    )
+    dispatcher = TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    with RuntimeComposition.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=model,
+        completion_gate=AcceptAnyAnswer(),
+    ) as runtime:
+        running = asyncio.create_task(
+            runtime.thread_manager.run(
+                user_message="exercise sync provider backpressure",
+                event_dispatcher=dispatcher,
+            )
+        )
+        events = [await asyncio.wait_for(stream.receive(), timeout=0.5)]
+        await asyncio.sleep(0.1)
+
+        assert provider.produced < 100
+
+        while not running.done() or not stream.empty:
+            if stream.empty:
+                await asyncio.wait_for(stream.wait_available(), timeout=1.0)
+            events.append(stream.receive_nowait())
+        result = await asyncio.wait_for(running, timeout=1.0)
+
+    assert result.answer == "x" * 1_000
+    assert events[0].type is EventType.TURN_STARTED
+    assert events[-1].type is EventType.TURN_COMPLETED
+
+
 def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:
     gateway = BudgetAwareCapturingGateway(max_input_tokens=9_000)
     resolved = ResolvedModel(
@@ -735,6 +808,12 @@ class AcceptAnswer:
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
         assert proposal.answer == "real gateway answer"
         return CompletionDecision(action="accept", reason="integration answer accepted")
+
+
+class AcceptAnyAnswer:
+    def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
+        assert proposal.answer
+        return CompletionDecision(action="accept", reason="answer accepted")
 
 
 def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
