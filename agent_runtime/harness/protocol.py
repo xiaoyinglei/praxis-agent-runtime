@@ -43,6 +43,10 @@ class ModelDispatchOutcomeUnknownError(RuntimeError):
     """Provider transport ended after dispatch without a terminal response."""
 
 
+class ModelDispatchCancelledError(RuntimeError):
+    """The provider acknowledged a definitive cancellation before completion."""
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedModelCall:
     request_hash: str

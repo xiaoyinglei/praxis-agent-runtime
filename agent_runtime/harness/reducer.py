@@ -156,6 +156,14 @@ def apply_record(
             attempt["status"] = "failed"
             attempt["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
+        case "model_attempt_cancelled":
+            operation = state.model_operations[payload["operation_id"]]
+            attempt = state.model_attempts[payload["attempt_id"]]
+            operation["status"] = "cancelled"
+            operation["applied_thread_sequence"] = sequence
+            attempt["status"] = "cancelled"
+            attempt["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
         case "model_retry_prepared":
             operation = state.model_operations[payload["operation_id"]]
             previous = state.model_attempts[payload["previous_attempt_id"]]

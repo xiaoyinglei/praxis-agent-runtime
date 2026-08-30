@@ -1770,6 +1770,64 @@ class RolloutStore:
                 },
             )
 
+    def cancel_model_attempt(
+        self,
+        *,
+        operation_id: str,
+        attempt_id: str,
+        generation: int,
+        reason: str,
+        channel_content: Mapping[str, str] | None = None,
+    ) -> ModelAttemptSnapshot:
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("model cancellation reason must be non-empty")
+        frozen_channel_content = _model_channel_content(channel_content)
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT * FROM model_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if operation is None:
+                raise KeyError(f"unknown model operation: {operation_id}")
+            if not (
+                operation["status"] == "dispatched"
+                and operation["active_attempt_id"] == attempt_id
+                and operation["generation"] == generation
+            ):
+                raise RuntimeError(
+                    "only the active dispatched model attempt can be cancelled"
+                )
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="model_attempt_cancelled",
+                producer="runtime",
+                payload={
+                    "operation_id": operation_id,
+                    "attempt_id": attempt_id,
+                    "generation": generation,
+                    "reason": reason.strip()[:2_000],
+                },
+            )
+            self._close_started_model_output_channels(
+                operation=operation,
+                attempt_id=attempt_id,
+                status="cancelled",
+                error=reason.strip()[:2_000],
+                channel_content=frozen_channel_content,
+            )
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="turn_cancelled",
+                producer="runtime",
+                payload={
+                    "turn_id": str(operation["turn_id"]),
+                    "reason": reason.strip()[:2_000],
+                },
+            )
+        return self.list_model_attempts(operation_id)[-1]
+
     def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
         self._assert_artifact_integrity()
         with self._transaction():

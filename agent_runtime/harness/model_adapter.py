@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -28,6 +29,7 @@ from agent_runtime.harness.protocol import (
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
+    ModelDispatchCancelledError,
     ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
     PreparedModelCall,
@@ -196,6 +198,13 @@ class GatewayHarnessModel:
         except LLMContextOverflowError as exc:
             raise ModelDispatchPreflightError(
                 f"Model context exceeds the effective stage input budget: {exc.input_tokens} > {exc.max_input_tokens}."
+            ) from exc
+        except asyncio.CancelledError as exc:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+            raise ModelDispatchCancelledError(
+                "provider acknowledged model cancellation"
             ) from exc
         except BaseException as exc:
             if _is_uncertain_transport_failure(exc):

@@ -23,6 +23,7 @@ from agent_runtime.harness.protocol import (
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
+    ModelDispatchCancelledError,
     ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
     PreparedModelCall,
@@ -634,6 +635,28 @@ class Session:
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reason=str(exc),
+            )
+        except ModelDispatchCancelledError as exc:
+            reason = str(exc).strip() or "provider acknowledged model cancellation"
+            await self._commit(
+                partial(
+                    self._store.cancel_model_attempt,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    reason=reason,
+                    channel_content={
+                        "agent_message": "".join(streamed_content["text"]),
+                        "reasoning": "".join(streamed_content["reasoning"]),
+                        "plan": "".join(streamed_content["plan"]),
+                    },
+                )
+            )
+            return TurnResult(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                answer=None,
+                status="cancelled",
             )
         except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError) as exc:
             await self._commit(

@@ -61,6 +61,7 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
         "model_attempt_completed",
         "model_attempt_late_response",
         "model_attempt_rejected",
+        "model_attempt_cancelled",
         "model_attempt_unknown",
         "tool_operation_prepared",
         "tool_operation_migrated",

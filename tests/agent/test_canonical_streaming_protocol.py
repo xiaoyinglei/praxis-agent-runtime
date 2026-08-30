@@ -10,6 +10,8 @@ import pytest
 import agent_runtime
 from agent_runtime.agent import Agent
 from agent_runtime.harness import (
+    HarnessModelDelta,
+    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
@@ -423,8 +425,19 @@ class _StaticHarnessModel:
             request_ref={"request_id": f"{request.turn_id}:step:{request.step}"},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
         del prepared
+        if delta_sink is not None:
+            emitted = delta_sink(
+                HarnessModelDelta(channel="text", content="canonical answer")
+            )
+            if emitted is not None:
+                await emitted
         return HarnessModelResponse(
             text="canonical answer",
             provider_response_id="response-v2",
@@ -433,10 +446,6 @@ class _StaticHarnessModel:
 
 
 @pytest.mark.anyio
-@pytest.mark.xfail(
-    strict=True,
-    reason="Tasks 3 and 4 wire the Harness dispatcher and live model deltas",
-)
 async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

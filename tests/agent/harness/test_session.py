@@ -14,10 +14,12 @@ from agent_runtime.harness import (
     CompletionProposal,
     GatewayHarnessModel,
     HarnessMessage,
+    HarnessModelDelta,
     HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
+    ModelDispatchCancelledError,
     ModelDispatchPreflightError,
     PreparedModelCall,
     RolloutContextManager,
@@ -124,6 +126,43 @@ class RejectedDispatchModel(InspectingModel):
         raise RuntimeError("provider rejected a validly delivered request")
 
 
+class PartialFailureModel(InspectingModel):
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
+        del prepared
+        assert delta_sink is not None
+        for delta in (
+            HarnessModelDelta(channel="reasoning", content="partial reasoning"),
+            HarnessModelDelta(channel="plan", content="partial plan"),
+            HarnessModelDelta(channel="text", content="partial answer"),
+        ):
+            emitted = delta_sink(delta)
+            if emitted is not None:
+                await emitted
+        raise RuntimeError("provider rejected the stream")
+
+
+class AcknowledgedCancellationModel(InspectingModel):
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
+        del prepared
+        assert delta_sink is not None
+        emitted = delta_sink(
+            HarnessModelDelta(channel="text", content="partial before cancel")
+        )
+        if emitted is not None:
+            await emitted
+        raise ModelDispatchCancelledError("provider acknowledged cancellation")
+
+
 class RetryThenAnswerModel(InspectingModel):
     def __init__(self, store: RolloutStore) -> None:
         super().__init__(store)
@@ -136,6 +175,33 @@ class RetryThenAnswerModel(InspectingModel):
             raise ConnectionError("first dispatch outcome is unknown")
         return HarnessModelResponse(
             text="recovered model answer",
+            provider_response_id="response-recovered",
+            usage={"input_tokens": 4, "output_tokens": 2},
+        )
+
+
+class StreamingRetryThenAnswerModel(InspectingModel):
+    def __init__(self, store: RolloutStore) -> None:
+        super().__init__(store)
+        self.dispatch_count = 0
+
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
+        del prepared
+        assert delta_sink is not None
+        self.dispatch_count += 1
+        content = "uncertain partial" if self.dispatch_count == 1 else "recovered answer"
+        emitted = delta_sink(HarnessModelDelta(channel="text", content=content))
+        if emitted is not None:
+            await emitted
+        if self.dispatch_count == 1:
+            raise ConnectionError("first streamed attempt became uncertain")
+        return HarnessModelResponse(
+            text=content,
             provider_response_id="response-recovered",
             usage={"input_tokens": 4, "output_tokens": 2},
         )
@@ -766,6 +832,107 @@ def test_known_model_rejection_fails_without_unknown_or_retry_state(
         assert store.verify().valid is True
 
 
+@pytest.mark.anyio
+async def test_partial_provider_failure_closes_started_channels_failed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dispatcher = TurnEventDispatcher(capacity=32)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        runner = Session(
+            thread_id=thread.thread_id,
+            store=store,
+            model=PartialFailureModel(store),
+            context_manager=RolloutContextManager(store),
+            completion_gate=InspectingCompletionGate(store),
+            event_dispatcher=dispatcher,
+        )
+
+        result = await runner.run(
+            user_message="fail after partial channels",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        events = []
+        while not stream.empty:
+            events.append(stream.receive_nowait())
+
+        assert result.status == "failed"
+        completed = [
+            event
+            for event in events
+            if event.type is EventType.ITEM_COMPLETED
+            and event.item_kind
+            in {
+                TurnItemKind.AGENT_MESSAGE,
+                TurnItemKind.REASONING,
+                TurnItemKind.PLAN,
+            }
+        ]
+        assert {event.item_kind for event in completed} == {
+            TurnItemKind.AGENT_MESSAGE,
+            TurnItemKind.REASONING,
+            TurnItemKind.PLAN,
+        }
+        assert all(event.status is ItemStatus.FAILED for event in completed)
+        assert {
+            event.item_kind: event.data["content"] for event in completed
+        } == {
+            TurnItemKind.AGENT_MESSAGE: "partial answer",
+            TurnItemKind.REASONING: "partial reasoning",
+            TurnItemKind.PLAN: "partial plan",
+        }
+        assert all(item.status == "completed" for item in store.list_items(result.turn_id))
+        assert store.verify().valid is True
+
+
+@pytest.mark.anyio
+async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dispatcher = TurnEventDispatcher(capacity=16)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        runner = Session(
+            thread_id=thread.thread_id,
+            store=store,
+            model=AcknowledgedCancellationModel(store),
+            context_manager=RolloutContextManager(store),
+            completion_gate=InspectingCompletionGate(store),
+            event_dispatcher=dispatcher,
+        )
+
+        result = await runner.run(
+            user_message="cancel definitively",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        events = []
+        while not stream.empty:
+            events.append(stream.receive_nowait())
+
+        [operation] = store.list_model_operations(result.turn_id)
+        [attempt] = store.list_model_attempts(operation.operation_id)
+        [completed] = [
+            event
+            for event in events
+            if event.type is EventType.ITEM_COMPLETED
+            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+        ]
+        assert result.status == "cancelled"
+        assert store.read_turn(result.turn_id).status == "cancelled"
+        assert operation.status == "cancelled"
+        assert attempt.status == "cancelled"
+        assert completed.status is ItemStatus.CANCELLED
+        assert completed.data["content"] == "partial before cancel"
+        assert events[-1].type is EventType.TURN_ABORTED
+        assert store.verify().valid is True
+
+
 def test_model_retry_uses_a_new_attempt_on_the_same_logical_operation(
     tmp_path: Path,
 ) -> None:
@@ -802,6 +969,70 @@ def test_model_retry_uses_a_new_attempt_on_the_same_logical_operation(
         ]
         assert model.dispatch_count == 2
         assert store.read_turn(paused.turn_id).status == "completed"
+        assert store.verify().valid is True
+
+
+@pytest.mark.anyio
+async def test_model_retry_uses_new_attempt_and_public_item_ids(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    dispatcher = TurnEventDispatcher(capacity=32)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        model = StreamingRetryThenAnswerModel(store)
+        runner = Session(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=RolloutContextManager(store),
+            completion_gate=FixedDecisionGate("accept", "retry completed"),
+            event_dispatcher=dispatcher,
+        )
+
+        paused = await runner.run(
+            user_message="retry uncertain streaming output",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        resumed = await runner.retry_unknown_model(turn_id=paused.turn_id)
+        events = []
+        while not stream.empty:
+            events.append(stream.receive_nowait())
+
+        starts = [
+            event
+            for event in events
+            if event.type is EventType.ITEM_STARTED
+            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+        ]
+        completed = [
+            event
+            for event in events
+            if event.type is EventType.ITEM_COMPLETED
+            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+        ]
+        [operation] = store.list_model_operations(paused.turn_id)
+        attempts = store.list_model_attempts(operation.operation_id)
+
+        assert paused.status == "paused"
+        assert resumed.status == "completed"
+        assert resumed.answer == "recovered answer"
+        assert len(starts) == 2
+        assert starts[0].item_id != starts[1].item_id
+        assert [event.item_id for event in completed] == [
+            starts[0].item_id,
+            starts[1].item_id,
+        ]
+        assert [event.status for event in completed] == [
+            ItemStatus.OUTCOME_UNKNOWN,
+            ItemStatus.SUCCESS,
+        ]
+        assert [(attempt.generation, attempt.status) for attempt in attempts] == [
+            (1, "abandoned"),
+            (2, "completed"),
+        ]
         assert store.verify().valid is True
 
 
