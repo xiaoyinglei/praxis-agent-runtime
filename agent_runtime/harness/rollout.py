@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import os
 import sqlite3
 import time
@@ -25,7 +24,6 @@ from agent_runtime.streaming.events import (
 )
 
 _REDUCER_VERSION = 1
-logger = logging.getLogger(__name__)
 
 
 def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
@@ -92,6 +90,14 @@ class RolloutRecord:
     payload: Mapping[str, Any]
     payload_hash: str
     committed_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class CommittedMutation[T]:
+    """A mutation result paired with exactly its committed Rollout records."""
+
+    value: T
+    records: tuple[RolloutRecord, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,13 +204,11 @@ class RolloutStore:
     def __init__(
         self,
         path: Path,
-        *,
-        record_listener: Callable[[RolloutRecord], None] | None = None,
     ) -> None:
         self._path = Path(path)
         self._artifact_root = self._path.with_name(f"{self._path.name}.artifacts")
-        self._record_listener = record_listener
-        self._pending_record_notifications: list[RolloutRecord] | None = None
+        self._pending_transaction_records: list[RolloutRecord] | None = None
+        self._captured_commits: list[tuple[RolloutRecord, ...]] | None = None
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(self._path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
@@ -231,6 +235,21 @@ class RolloutStore:
     @property
     def artifact_root(self) -> Path:
         return self._artifact_root
+
+    def capture_mutation[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
+        """Run one Store mutation and return only that transaction's records."""
+
+        if self._captured_commits is not None:
+            raise RuntimeError("committed mutation capture cannot be nested")
+        captured: list[tuple[RolloutRecord, ...]] = []
+        self._captured_commits = captured
+        try:
+            value = operation()
+        finally:
+            self._captured_commits = None
+        if len(captured) != 1:
+            raise RuntimeError("committed mutation must contain exactly one outer transaction")
+        return CommittedMutation(value=value, records=captured[0])
 
     def commit_artifact(
         self,
@@ -338,8 +357,7 @@ class RolloutStore:
         removed: list[str] = []
         with self._transaction():
             referenced = {
-                str(row["blob_sha256"])
-                for row in self._connection.execute("SELECT blob_sha256 FROM artifacts")
+                str(row["blob_sha256"]) for row in self._connection.execute("SELECT blob_sha256 FROM artifacts")
             }
             cutoff = time.time() - min_age_seconds
             for directory, keep_referenced in (
@@ -806,10 +824,13 @@ class RolloutStore:
             raise ValueError("migrated unknown operation must require reconciliation")
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
-            if self._connection.execute(
-                "SELECT 1 FROM tool_operations WHERE operation_id = ? OR (turn_id = ? AND tool_call_id = ?)",
-                (operation_id, turn_id, tool_call_id),
-            ).fetchone() is not None:
+            if (
+                self._connection.execute(
+                    "SELECT 1 FROM tool_operations WHERE operation_id = ? OR (turn_id = ? AND tool_call_id = ?)",
+                    (operation_id, turn_id, tool_call_id),
+                ).fetchone()
+                is not None
+            ):
                 raise RuntimeError("migrated tool operation identity already exists")
             if result_item_id is not None:
                 item = self._connection.execute(
@@ -1316,9 +1337,7 @@ class RolloutStore:
                 existing_hashes = {name: existing[name] for name in hashes}
                 existing_ref = json.loads(existing["request_ref_json"])
                 if existing_hashes != hashes or existing_ref != frozen_ref:
-                    raise RuntimeError(
-                        f"model request identity reused with conflicting payload: {request_id}"
-                    )
+                    raise RuntimeError(f"model request identity reused with conflicting payload: {request_id}")
                 selected_operation_id = str(existing["operation_id"])
             else:
                 self._append_and_reduce(
@@ -1468,9 +1487,7 @@ class RolloutStore:
     ) -> ModelAttemptSnapshot:
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model dispatch error_type must be non-empty")
-        if error_message is not None and (
-            not isinstance(error_message, str) or not error_message.strip()
-        ):
+        if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model dispatch error_message must be non-empty")
         with self._transaction():
             operation = self._connection.execute(
@@ -1532,9 +1549,7 @@ class RolloutStore:
             raise ValueError("model rejection reason must be non-empty")
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model rejection error_type must be non-empty")
-        if error_message is not None and (
-            not isinstance(error_message, str) or not error_message.strip()
-        ):
+        if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model rejection error_message must be non-empty")
         with self._transaction():
             operation = self._connection.execute(
@@ -2667,9 +2682,7 @@ class RolloutStore:
                         (turn_id, operation_id),
                     ).fetchall()
                     if len(reconciliation) != 1:
-                        raise RuntimeError(
-                            "paused unknown tool result requires one reconciliation interaction"
-                        )
+                        raise RuntimeError("paused unknown tool result requires one reconciliation interaction")
                 elif turn["status"] != "running":
                     raise RuntimeError(f"turn is not running: {turn_id}")
             elif turn["status"] != "running":
@@ -2701,8 +2714,7 @@ class RolloutStore:
                     matching_calls = [
                         json.loads(row["payload_json"])
                         for row in call
-                        if json.loads(row["payload_json"]).get("tool_call_id")
-                        == operation["tool_call_id"]
+                        if json.loads(row["payload_json"]).get("tool_call_id") == operation["tool_call_id"]
                     ]
                     if len(matching_calls) != 1:
                         raise RuntimeError("successful update_plan result requires one canonical ToolCall")
@@ -3166,18 +3178,14 @@ class RolloutStore:
                         continue
                     artifact_id = attachment.get("artifact_id")
                     if not isinstance(artifact_id, str) or artifact_id not in artifacts:
-                        errors.append(
-                            f"artifact attachment in Item {item['item_id']} references unknown artifact"
-                        )
+                        errors.append(f"artifact attachment in Item {item['item_id']} references unknown artifact")
                         continue
                     durable = artifacts[artifact_id]
                     if (
                         attachment.get("media_type") != durable["media_type"]
                         or attachment.get("name") != durable["name"]
                     ):
-                        errors.append(
-                            f"artifact attachment metadata mismatch in Item {item['item_id']}"
-                        )
+                        errors.append(f"artifact attachment metadata mismatch in Item {item['item_id']}")
         return errors
 
     def _validate_artifact_references(self, payload: Mapping[str, Any]) -> None:
@@ -3229,11 +3237,11 @@ class RolloutStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
-        if self._pending_record_notifications is not None:
+        if self._pending_transaction_records is not None:
             yield
             return
         pending: list[RolloutRecord] = []
-        self._pending_record_notifications = pending
+        self._pending_transaction_records = pending
         began = False
         try:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -3246,17 +3254,10 @@ class RolloutStore:
         else:
             self._connection.execute("COMMIT")
         finally:
-            self._pending_record_notifications = None
-        listener = self._record_listener
-        if listener is not None:
-            for record in pending:
-                try:
-                    listener(record)
-                except Exception:
-                    logger.exception(
-                        "post-commit RolloutRecord listener failed for record %s",
-                        record.record_id,
-                    )
+            self._pending_transaction_records = None
+        captured = self._captured_commits
+        if captured is not None:
+            captured.append(tuple(pending))
 
     def _append_and_reduce(
         self,
@@ -3306,7 +3307,7 @@ class RolloutStore:
             reducer_version=_REDUCER_VERSION,
         )
         self._persist_projection_state(state)
-        pending = self._pending_record_notifications
+        pending = self._pending_transaction_records
         if pending is None:
             raise RuntimeError("RolloutRecord appended outside a transaction")
         pending.append(_record_snapshot(row))
@@ -3815,13 +3816,10 @@ class RolloutStore:
             (f"epoch_{uuid4().hex}",),
         )
         rollout_record_columns = {
-            str(row["name"])
-            for row in self._connection.execute("PRAGMA table_info(rollout_records)")
+            str(row["name"]) for row in self._connection.execute("PRAGMA table_info(rollout_records)")
         }
         if "committed_at_ms" not in rollout_record_columns:
-            self._connection.execute(
-                "ALTER TABLE rollout_records ADD COLUMN committed_at_ms INTEGER"
-            )
+            self._connection.execute("ALTER TABLE rollout_records ADD COLUMN committed_at_ms INTEGER")
         thread_columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(threads)")}
         if "parent_thread_id" not in thread_columns:
             self._connection.execute("ALTER TABLE threads ADD COLUMN parent_thread_id TEXT")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from stat import S_ISLNK
@@ -12,7 +12,9 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from agent_runtime.core.messages import tool_result_message
+from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.executor import (
     ExecutionStartRejectedError,
     ExecutionStatus,
@@ -33,9 +35,7 @@ from agent_runtime.tools.tool import (
 )
 
 _TOOL_LEASE_GRACE_SECONDS = 30.0
-_INSPECTION_TOOL_NAMES = frozenset(
-    {"find_tools", "inspect_data_file", "list_files", "read_file", "search_text"}
-)
+_INSPECTION_TOOL_NAMES = frozenset({"find_tools", "inspect_data_file", "list_files", "read_file", "search_text"})
 _INITIAL_INSPECTION_BUDGET = 12
 _PLANNED_INSPECTION_BUDGET = 20
 
@@ -44,8 +44,7 @@ def tool_consumes_inspection_budget(tool: Tool) -> bool:
     """Return whether a model-visible tool is inspection-first before an edit."""
 
     return tool.definition.name in _INSPECTION_TOOL_NAMES or (
-        ToolEffect.READ_WORKSPACE in tool.static_effects
-        and ToolEffect.WRITE_WORKSPACE not in tool.static_effects
+        ToolEffect.READ_WORKSPACE in tool.static_effects and ToolEffect.WRITE_WORKSPACE not in tool.static_effects
     )
 
 
@@ -53,8 +52,7 @@ def _operation_consumes_inspection_budget(operation: object) -> bool:
     tool_name = getattr(operation, "tool_name", None)
     effects = getattr(operation, "effects", ())
     return tool_name in _INSPECTION_TOOL_NAMES or (
-        ToolEffect.READ_WORKSPACE.value in effects
-        and ToolEffect.WRITE_WORKSPACE.value not in effects
+        ToolEffect.READ_WORKSPACE.value in effects and ToolEffect.WRITE_WORKSPACE.value not in effects
     )
 
 
@@ -67,9 +65,7 @@ def _has_committed_workspace_change(store: RolloutStore, turn_id: str) -> bool:
     result_items = {
         item.item_id: item
         for item in store.list_items(turn_id)
-        if item.kind == "tool_result"
-        and item.status == "completed"
-        and item.producer == "tool"
+        if item.kind == "tool_result" and item.status == "completed" and item.producer == "tool"
     }
     for operation in store.list_tool_operations(turn_id):
         if operation.status != "succeeded" or operation.result_item_id is None:
@@ -91,21 +87,13 @@ def inspection_tools_available(store: RolloutStore, turn_id: str) -> bool:
     if not _requires_workspace_change(store, turn_id):
         return True
     operations = tuple(
-        operation
-        for operation in store.list_tool_operations(turn_id)
-        if operation.status == "succeeded"
+        operation for operation in store.list_tool_operations(turn_id) if operation.status == "succeeded"
     )
     if _has_committed_workspace_change(store, turn_id):
         return True
-    planned = any(
-        operation.tool_name == "update_plan" for operation in operations
-    )
-    budget = (
-        _PLANNED_INSPECTION_BUDGET if planned else _INITIAL_INSPECTION_BUDGET
-    )
-    return sum(
-        _operation_consumes_inspection_budget(operation) for operation in operations
-    ) < budget
+    planned = any(operation.tool_name == "update_plan" for operation in operations)
+    budget = _PLANNED_INSPECTION_BUDGET if planned else _INITIAL_INSPECTION_BUDGET
+    return sum(_operation_consumes_inspection_budget(operation) for operation in operations) < budget
 
 
 class ToolApprovalRequiredError(RuntimeError):
@@ -137,6 +125,7 @@ class ToolOrchestrator:
         execution_context: ToolExecutionContext,
         worker_id: str | None = None,
         lease_seconds: float = 300.0,
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> None:
         self._store = store
         self._tools = tools
@@ -144,34 +133,49 @@ class ToolOrchestrator:
         self._executor = ToolExecutor(tools)
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._lease_seconds = lease_seconds
+        self._event_dispatcher = event_dispatcher
         self._claims: dict[str, tuple[int, str]] = {}
         self._resolved_scopes: dict[
             str,
             tuple[tuple[str, ...], tuple[Mapping[str, Any], ...]],
         ] = {}
 
+    async def _commit[T](self, operation: Callable[[], T]) -> T:
+        mutation = self._store.capture_mutation(operation)
+        if self._event_dispatcher is not None:
+            for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
+                await self._event_dispatcher.emit(
+                    replayed.event,
+                    cursor=replayed.cursor,
+                )
+        return mutation.value
+
     async def execute(self, *, turn_id: str, call: ToolCall) -> ToolResult:
         execution_context = self._context_for_turn(turn_id)
-        self._store.record_tool_call(
-            turn_id=turn_id,
-            tool_call_id=call.tool_call_id,
-            tool_name=call.tool_name,
-            arguments=_json_mapping(call.arguments),
-            origin={
-                "request_id": call.origin.request_id,
-                "toolset_revision": call.origin.toolset_revision,
-                "exposed_tool_names": list(call.origin.exposed_tool_names),
-            },
+        await self._commit(
+            lambda: self._store.record_tool_call(
+                turn_id=turn_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments=_json_mapping(call.arguments),
+                origin={
+                    "request_id": call.origin.request_id,
+                    "toolset_revision": call.origin.toolset_revision,
+                    "exposed_tool_names": list(call.origin.exposed_tool_names),
+                },
+            )
         )
         inspection_block = self._inspection_budget_result(
             turn_id=turn_id,
             call=call,
         )
         if inspection_block is not None:
-            self._store.record_tool_result(
-                turn_id=turn_id,
-                operation_id=None,
-                result=_tool_result_payload(inspection_block),
+            await self._commit(
+                lambda: self._store.record_tool_result(
+                    turn_id=turn_id,
+                    operation_id=None,
+                    result=_tool_result_payload(inspection_block),
+                )
             )
             return inspection_block
         tool = self._tools.get(call.tool_name)
@@ -179,7 +183,7 @@ class ToolOrchestrator:
         async def persist(record: ToolExecutionRecord) -> None:
             if tool is None:
                 raise RuntimeError("unknown tools must not create execution records")
-            self._persist_execution_record(
+            await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=record,
@@ -208,29 +212,33 @@ class ToolOrchestrator:
                 execution.trace.effects,
                 execution.trace.targets,
             )
-            interaction = self._store.request_tool_approval(
-                turn_id=turn_id,
-                operation_id=record.operation_id,
-                tool_call_id=record.tool_call_id,
-                tool_name=record.tool_name,
-                arguments_digest=record.arguments_digest,
-                execution_revision=tool.execution_revision,
-                idempotent=record.idempotent,
-                effects=effects,
-                resources=resources,
-                request=_approval_request(
-                    execution,
-                    record=record,
-                    tool=tool,
-                    context=execution_context,
-                ),
+            interaction = await self._commit(
+                lambda: self._store.request_tool_approval(
+                    turn_id=turn_id,
+                    operation_id=record.operation_id,
+                    tool_call_id=record.tool_call_id,
+                    tool_name=record.tool_name,
+                    arguments_digest=record.arguments_digest,
+                    execution_revision=tool.execution_revision,
+                    idempotent=record.idempotent,
+                    effects=effects,
+                    resources=resources,
+                    request=_approval_request(
+                        execution,
+                        record=record,
+                        tool=tool,
+                        context=execution_context,
+                    ),
+                )
             )
             raise ToolApprovalRequiredError(interaction.request_id)
         operation_id = None if execution.record is None else execution.record.operation_id
-        self._store.record_tool_result(
-            turn_id=turn_id,
-            operation_id=operation_id,
-            result=_tool_result_payload(execution.result),
+        await self._commit(
+            lambda: self._store.record_tool_result(
+                turn_id=turn_id,
+                operation_id=operation_id,
+                result=_tool_result_payload(execution.result),
+            )
         )
         return execution.result
 
@@ -247,8 +255,7 @@ class ToolOrchestrator:
             return None
         operations = self._store.list_tool_operations(turn_id)
         inspection_count = sum(
-            operation.status == "succeeded"
-            and _operation_consumes_inspection_budget(operation)
+            operation.status == "succeeded" and _operation_consumes_inspection_budget(operation)
             for operation in operations
         )
         return ToolResult(
@@ -307,14 +314,18 @@ class ToolOrchestrator:
             if preflight.result.error_code != "approval_required" or _approval_scope(
                 interaction.request
             ) != _approval_scope(current_request):
-                invalidated = self._store.invalidate_tool_approval(
-                    turn_id=turn_id,
-                    reason="approval scope changed before execution",
+                invalidated = await self._commit(
+                    lambda: self._store.invalidate_tool_approval(
+                        turn_id=turn_id,
+                        reason="approval scope changed before execution",
+                    )
                 )
                 raise ToolApprovalInvalidatedError(invalidated.request_id)
-        interaction = self._store.resolve_tool_approval(
-            turn_id=turn_id,
-            decision=decision,
+        interaction = await self._commit(
+            lambda: self._store.resolve_tool_approval(
+                turn_id=turn_id,
+                decision=decision,
+            )
         )
         record = ToolExecutionRecord(
             tool_call_id=operation.tool_call_id,
@@ -337,7 +348,7 @@ class ToolOrchestrator:
         )
 
         async def persist(updated: ToolExecutionRecord) -> None:
-            self._persist_execution_record(
+            await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=updated,
@@ -349,10 +360,12 @@ class ToolOrchestrator:
             record=record,
             record_sink=persist,
         )
-        self._store.record_tool_result(
-            turn_id=turn_id,
-            operation_id=operation.operation_id,
-            result=_tool_result_payload(execution.result),
+        await self._commit(
+            lambda: self._store.record_tool_result(
+                turn_id=turn_id,
+                operation_id=operation.operation_id,
+                result=_tool_result_payload(execution.result),
+            )
         )
         return execution.result
 
@@ -400,9 +413,11 @@ class ToolOrchestrator:
         if preflight.result.error_code != "approval_required" or _approval_scope(
             interaction.request
         ) != _approval_scope(current_request):
-            invalidated = self._store.invalidate_resolved_tool_approval(
-                turn_id=turn_id,
-                reason="approval scope changed before recovered execution",
+            invalidated = await self._commit(
+                lambda: self._store.invalidate_resolved_tool_approval(
+                    turn_id=turn_id,
+                    reason="approval scope changed before recovered execution",
+                )
             )
             raise ToolApprovalInvalidatedError(invalidated.request_id)
 
@@ -422,7 +437,7 @@ class ToolOrchestrator:
         )
 
         async def persist(updated: ToolExecutionRecord) -> None:
-            self._persist_execution_record(
+            await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=updated,
@@ -434,10 +449,12 @@ class ToolOrchestrator:
             record=record,
             record_sink=persist,
         )
-        self._store.record_tool_result(
-            turn_id=turn_id,
-            operation_id=operation.operation_id,
-            result=_tool_result_payload(execution.result),
+        await self._commit(
+            lambda: self._store.record_tool_result(
+                turn_id=turn_id,
+                operation_id=operation.operation_id,
+                result=_tool_result_payload(execution.result),
+            )
         )
         return execution.result
 
@@ -495,7 +512,7 @@ class ToolOrchestrator:
             active_skill_ids=frozenset(active_skill_ids),
         )
 
-    def _persist_execution_record(
+    async def _persist_execution_record(
         self,
         *,
         turn_id: str,
@@ -510,13 +527,13 @@ class ToolOrchestrator:
                 if existing.status != "ready":
                     raise RuntimeError("prepared execution record requires a ready operation")
                 return
-            self._write_operation_state(
+            await self._write_operation_state(
                 turn_id=turn_id,
                 tool=tool,
                 record=record,
                 status="prepared",
             )
-            self._write_operation_state(
+            await self._write_operation_state(
                 turn_id=turn_id,
                 tool=tool,
                 record=record,
@@ -529,15 +546,19 @@ class ToolOrchestrator:
                 tool.timeout_seconds + _TOOL_LEASE_GRACE_SECONDS,
             )
             try:
-                claim = self._store.claim_tool_operation(
-                    operation_id=record.operation_id,
-                    worker_id=self._worker_id,
-                    lease_seconds=lease_seconds,
+                claim = await self._commit(
+                    lambda: self._store.claim_tool_operation(
+                        operation_id=record.operation_id,
+                        worker_id=self._worker_id,
+                        lease_seconds=lease_seconds,
+                    )
                 )
             except ResourceClaimConflictError as conflict:
-                self._store.reject_ready_tool_operation(
-                    operation_id=record.operation_id,
-                    error_code="resource_busy",
+                await self._commit(
+                    lambda: self._store.reject_ready_tool_operation(
+                        operation_id=record.operation_id,
+                        error_code="resource_busy",
+                    )
                 )
                 raise ExecutionStartRejectedError(
                     "resource_busy",
@@ -568,19 +589,21 @@ class ToolOrchestrator:
             ):
                 return
             raise RuntimeError("tool outcome has no active durable claim")
-        accepted = self._store.commit_tool_operation_outcome(
-            operation_id=record.operation_id,
-            claim_generation=active_claim[0],
-            fencing_token=active_claim[1],
-            status=status,
-            attempt_count=record.attempt_count,
-            error_code=record.error_code,
-            requires_reconciliation=record.requires_reconciliation,
+        accepted = await self._commit(
+            lambda: self._store.commit_tool_operation_outcome(
+                operation_id=record.operation_id,
+                claim_generation=active_claim[0],
+                fencing_token=active_claim[1],
+                status=status,
+                attempt_count=record.attempt_count,
+                error_code=record.error_code,
+                requires_reconciliation=record.requires_reconciliation,
+            )
         )
         if not accepted:
             raise RuntimeError("stale worker cannot commit tool operation outcome")
 
-    def _write_operation_state(
+    async def _write_operation_state(
         self,
         *,
         turn_id: str,
@@ -592,20 +615,22 @@ class ToolOrchestrator:
             record.operation_id,
             ((), ()),
         )
-        self._store.record_tool_execution_state(
-            turn_id=turn_id,
-            operation_id=record.operation_id,
-            tool_call_id=record.tool_call_id,
-            tool_name=record.tool_name,
-            arguments_digest=record.arguments_digest,
-            execution_revision=tool.execution_revision,
-            idempotent=record.idempotent,
-            status=status,
-            attempt_count=record.attempt_count,
-            error_code=record.error_code,
-            requires_reconciliation=record.requires_reconciliation,
-            effects=effects,
-            resources=resources,
+        await self._commit(
+            lambda: self._store.record_tool_execution_state(
+                turn_id=turn_id,
+                operation_id=record.operation_id,
+                tool_call_id=record.tool_call_id,
+                tool_name=record.tool_name,
+                arguments_digest=record.arguments_digest,
+                execution_revision=tool.execution_revision,
+                idempotent=record.idempotent,
+                status=status,
+                attempt_count=record.attempt_count,
+                error_code=record.error_code,
+                requires_reconciliation=record.requires_reconciliation,
+                effects=effects,
+                resources=resources,
+            )
         )
 
     def _committed_tool_call(self, *, turn_id: str, tool_call_id: str) -> ToolCall:

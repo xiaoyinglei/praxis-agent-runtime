@@ -6,21 +6,21 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelControlPlane, ModelSpec
 from agent_runtime.result import AgentPause, AgentResult
 from agent_runtime.streaming.events import StreamEvent
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
     from agent_runtime.harness import BoundHarnessModel, RuntimeComposition
-    from agent_runtime.harness.rollout import RolloutRecord
     from agent_runtime.tools.tool import Tool
 
 logger = logging.getLogger(__name__)
@@ -112,57 +112,33 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
-        _record_listener: Callable[[RolloutRecord], None] | None = None,
+        _event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AgentResult:
         runtime_agent = (
             self if previous_turn_id is None else self._harness_agent_for_turn(previous_turn_id, followup=True)
         )
         input_file_items = runtime_agent._stage_harness_files(files or ())
-        event_queue: asyncio.Queue[StreamEvent | None] | None = None if event_sink is None else asyncio.Queue()
-
-        async def consume_events() -> None:
-            if event_queue is None or event_sink is None:
-                return
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    return
-                await event_sink.emit(event)
-
-        consumer = None if event_queue is None else asyncio.create_task(consume_events())
-
-        def publish(record: RolloutRecord) -> None:
-            if event_queue is not None:
-                event = _stream_event_from_record(record)
-                if event is not None:
-                    event_queue.put_nowait(event)
-            if _record_listener is not None:
-                _record_listener(record)
-
-        listener = publish if event_queue is not None or _record_listener is not None else None
-        try:
-            async with runtime_agent._open_harness_runtime(
-                require_workspace_change=require_workspace_change,
-                allow_write_tools=allow_write_tools,
-                allow_execute_tools=allow_execute_tools,
-                max_steps=max_turns,
-                max_tokens_total=max_tokens_total,
-                record_listener=listener,
-            ) as runtime:
-                internal = await runtime.thread_manager.run(
-                    user_message=task,
-                    previous_turn_id=previous_turn_id,
-                    input_files=input_file_items,
-                )
-                return AgentResult._from_harness(
-                    internal,
-                    store=runtime.store,
-                    files=tuple(files or ()),
-                )
-        finally:
-            if event_queue is not None and consumer is not None:
-                event_queue.put_nowait(None)
-                await consumer
+        dispatcher = _event_dispatcher or TurnEventDispatcher()
+        if event_sink is not None:
+            dispatcher.subscribe_controlling_sink(event_sink)
+        async with runtime_agent._open_harness_runtime(
+            require_workspace_change=require_workspace_change,
+            allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools,
+            max_steps=max_turns,
+            max_tokens_total=max_tokens_total,
+            event_dispatcher=dispatcher,
+        ) as runtime:
+            internal = await runtime.thread_manager.run(
+                user_message=task,
+                previous_turn_id=previous_turn_id,
+                input_files=input_file_items,
+            )
+            return AgentResult._from_harness(
+                internal,
+                store=runtime.store,
+                files=tuple(files or ()),
+            )
 
     def resume(
         self,
@@ -199,16 +175,12 @@ class Agent:
             require_change = (
                 isinstance(completion_policy, Mapping) and completion_policy.get("require_workspace_change") is True
             )
-            tool_execution_policy = turn.binding_manifest.get(
-                "tool_execution_policy"
-            )
+            tool_execution_policy = turn.binding_manifest.get("tool_execution_policy")
             allow_write_tools = (
-                isinstance(tool_execution_policy, Mapping)
-                and tool_execution_policy.get("allow_write_tools") is True
+                isinstance(tool_execution_policy, Mapping) and tool_execution_policy.get("allow_write_tools") is True
             )
             allow_execute_tools = (
-                isinstance(tool_execution_policy, Mapping)
-                and tool_execution_policy.get("allow_execute_tools") is True
+                isinstance(tool_execution_policy, Mapping) and tool_execution_policy.get("allow_execute_tools") is True
             )
             step_budget = _positive_integer(turn.binding_manifest.get("model_step_budget"))
             token_budget = _positive_integer(turn.binding_manifest.get("model_token_budget_total"))
@@ -240,22 +212,15 @@ class Agent:
                 "invalidated during migration, so abort the Turn explicitly"
             )
         if action == "abort":
-            committed_events: list[StreamEvent] = []
+            from agent_runtime.harness import RolloutEventReader
 
-            def collect(record: RolloutRecord) -> None:
-                event = _stream_event_from_record(record)
-                if event is not None:
-                    committed_events.append(event)
-
-            with RolloutStore(
-                self._harness_database(),
-                record_listener=collect,
-            ) as store:
+            with RolloutStore(self._harness_database()) as store:
                 turn = store.read_turn(turn_id)
                 thread = store.read_thread(turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
-                cancelled = store.cancel_turn(turn_id=turn_id)
+                mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
+                cancelled = mutation.value
                 result = AgentResult._from_harness(
                     TurnResult(
                         thread_id=cancelled.thread_id,
@@ -265,90 +230,84 @@ class Agent:
                     ),
                     store=store,
                 )
-            if event_sink is not None:
-                for event in committed_events:
-                    await event_sink.emit(event)
+                if event_sink is not None:
+                    dispatcher = TurnEventDispatcher()
+                    dispatcher.subscribe_controlling_sink(event_sink)
+                    for replayed in RolloutEventReader(store).project_committed_batch(mutation.records):
+                        await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
-        event_queue: asyncio.Queue[StreamEvent | None] | None = None if event_sink is None else asyncio.Queue()
-
-        async def consume_events() -> None:
-            if event_queue is None or event_sink is None:
-                return
-            while True:
-                event = await event_queue.get()
-                if event is None:
-                    return
-                await event_sink.emit(event)
-
-        consumer = None if event_queue is None else asyncio.create_task(consume_events())
-
-        def publish(record: RolloutRecord) -> None:
-            if event_queue is None:
-                return
-            event = _stream_event_from_record(record)
-            if event is not None:
-                event_queue.put_nowait(event)
-
-        try:
-            async with runtime_agent._open_harness_runtime(
-                require_workspace_change=require_change,
-                allow_write_tools=allow_write_tools,
-                allow_execute_tools=allow_execute_tools,
-                max_steps=step_budget,
-                max_tokens_total=token_budget,
-                record_listener=(publish if event_queue is not None else None),
-            ) as runtime:
-                if len(pending) == 1 and pending[0].kind == "tool_approval":
-                    decision = {
-                        "allow_once": "approve",
-                        "approve": "approve",
-                        "deny": "deny",
-                    }.get(action)
-                    if decision is None:
-                        raise ValueError("tool approval action must be allow_once, approve, or deny")
-                    internal = await runtime.thread_manager.resume(
-                        turn_id=turn_id,
-                        decision=decision,
-                    )
-                elif len(pending) == 1 and pending[0].kind in {
-                    "clarification",
-                    "choice",
-                }:
-                    if action != "continue" or user_input is None:
-                        raise ValueError(
-                            f"{pending[0].kind} resume requires action=continue and user_input"
-                        )
-                    internal = await runtime.thread_manager.respond_interaction(
-                        turn_id=turn_id,
-                        request_id=pending[0].request_id,
-                        response=user_input,
-                    )
-                elif (
-                    not pending
-                    and len(unknown_model) == 1
-                    and action
-                    in {
-                        "continue",
-                        "retry",
-                    }
-                ):
-                    internal = await runtime.thread_manager.retry_unknown_model(turn_id=turn_id)
-                elif (
-                    not pending and resolved_approved_ready and action in {"allow_once", "approve", "continue", "retry"}
-                ):
-                    internal = await runtime.thread_manager.resume(
-                        turn_id=turn_id,
-                        decision="approve",
-                    )
-                elif not pending and recoverable_committed_response and action in {"continue", "retry"}:
-                    internal = await runtime.thread_manager.recover_committed_model_response(turn_id=turn_id)
-                else:
-                    raise RuntimeError("resume action does not match the Turn's durable pending state")
-                return AgentResult._from_harness(internal, store=runtime.store)
-        finally:
-            if event_queue is not None and consumer is not None:
-                event_queue.put_nowait(None)
-                await consumer
+        dispatcher = TurnEventDispatcher()
+        if event_sink is not None:
+            dispatcher.subscribe_controlling_sink(event_sink)
+        async with runtime_agent._open_harness_runtime(
+            require_workspace_change=require_change,
+            allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools,
+            max_steps=step_budget,
+            max_tokens_total=token_budget,
+            event_dispatcher=dispatcher,
+        ) as runtime:
+            if len(pending) == 1 and pending[0].kind == "tool_approval":
+                decision = {
+                    "allow_once": "approve",
+                    "approve": "approve",
+                    "deny": "deny",
+                }.get(action)
+                if decision is None:
+                    raise ValueError("tool approval action must be allow_once, approve, or deny")
+                internal = await runtime.thread_manager.resume(
+                    turn_id=turn_id,
+                    decision=decision,
+                )
+            elif len(pending) == 1 and pending[0].kind in {
+                "clarification",
+                "choice",
+            }:
+                if action != "continue" or user_input is None:
+                    raise ValueError(f"{pending[0].kind} resume requires action=continue and user_input")
+                internal = await runtime.thread_manager.respond_interaction(
+                    turn_id=turn_id,
+                    request_id=pending[0].request_id,
+                    response=user_input,
+                )
+            elif (
+                not pending
+                and len(unknown_model) == 1
+                and action
+                in {
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await runtime.thread_manager.retry_unknown_model(turn_id=turn_id)
+            elif (
+                not pending
+                and resolved_approved_ready
+                and action
+                in {
+                    "allow_once",
+                    "approve",
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await runtime.thread_manager.resume(
+                    turn_id=turn_id,
+                    decision="approve",
+                )
+            elif (
+                not pending
+                and recoverable_committed_response
+                and action
+                in {
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await runtime.thread_manager.recover_committed_model_response(turn_id=turn_id)
+            else:
+                raise RuntimeError("resume action does not match the Turn's durable pending state")
+            return AgentResult._from_harness(internal, store=runtime.store)
 
     def read_result(self, turn_id: str) -> AgentResult:
         return asyncio.run(self.aread_result(turn_id))
@@ -406,13 +365,8 @@ class Agent:
     ) -> AsyncIterator[StreamEvent]:
         """Yield committed durable events while the Turn is still running."""
 
-        queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
-
-        def publish(record: RolloutRecord) -> None:
-            event = _stream_event_from_record(record)
-            if event is not None:
-                queue.put_nowait(event)
-
+        dispatcher = TurnEventDispatcher()
+        stream = dispatcher.subscribe_controlling()
         run_task = asyncio.create_task(
             self.arun(
                 task,
@@ -423,15 +377,12 @@ class Agent:
                 require_workspace_change=require_workspace_change,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
-                _record_listener=publish,
+                _event_dispatcher=dispatcher,
             )
         )
         try:
-            while not run_task.done() or not queue.empty():
-                if not queue.empty():
-                    yield queue.get_nowait()
-                    continue
-                next_event = asyncio.create_task(queue.get())
+            while not run_task.done() or not stream.empty:
+                next_event = asyncio.create_task(stream.receive())
                 done, _pending = await asyncio.wait(
                     {run_task, next_event},
                     return_when=asyncio.FIRST_COMPLETED,
@@ -507,10 +458,7 @@ class Agent:
             knowledge=frozen_knowledge,
             enable_workspace_mcp=(
                 bool(mcp_policy.get("workspace_discovery_enabled"))
-                if isinstance(mcp_policy, Mapping)
-                and isinstance(
-                    mcp_policy.get("workspace_discovery_enabled"), bool
-                )
+                if isinstance(mcp_policy, Mapping) and isinstance(mcp_policy.get("workspace_discovery_enabled"), bool)
                 else self.enable_workspace_mcp
             ),
         )
@@ -566,7 +514,7 @@ class Agent:
         allow_execute_tools: bool,
         max_steps: int | None,
         max_tokens_total: int | None,
-        record_listener: Callable[[RolloutRecord], None] | None = None,
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AsyncIterator[RuntimeComposition]:
         from agent_runtime.harness import RuntimeComposition
         from agent_runtime.runtime.mcp import (
@@ -626,11 +574,7 @@ class Agent:
             knowledge_revision = "rag_" + hashlib.sha256(self.knowledge.model_dump_json().encode()).hexdigest()[:16]
 
         async with AsyncExitStack() as stack:
-            config_path = (
-                resolve_product_mcp_config(workspace.root)
-                if self.enable_workspace_mcp
-                else None
-            )
+            config_path = resolve_product_mcp_config(workspace.root) if self.enable_workspace_mcp else None
             mcp_tools: tuple[Tool, ...] = ()
             if config_path is not None:
                 trust = decide_mcp_config_trust(
@@ -661,7 +605,7 @@ class Agent:
                 skill_runtime=skill_runtime,
                 max_steps=16 if max_steps is None else max_steps,
                 max_tokens_total=max_tokens_total,
-                record_listener=record_listener,
+                event_dispatcher=event_dispatcher,
             )
             try:
                 yield runtime
@@ -690,31 +634,6 @@ class Agent:
                 control_plane,
                 label="model control plane",
             )
-
-
-def _stream_event_from_record(record: RolloutRecord) -> StreamEvent | None:
-    from agent_runtime.streaming.events import EventType
-    from agent_runtime.tools.tool import JsonValue
-
-    event_types = {
-        "turn_started": EventType.TURN_START,
-        "turn_completed": EventType.TURN_END,
-        "turn_failed": EventType.TURN_END,
-        "turn_cancelled": EventType.ABORT,
-        "interaction_requested": EventType.HUMAN_INPUT_REQUIRED,
-        "tool_operation_claimed": EventType.TOOL_USE_START,
-        "tool_operation_result_linked": EventType.TOOL_USE_RESULT,
-        "tool_operation_start_rejected": EventType.TOOL_USE_ERROR,
-    }
-    event_type = event_types.get(record.record_type)
-    if record.turn_id is None or event_type is None:
-        return None
-    return StreamEvent(
-        type=event_type,
-        turn_id=record.turn_id,
-        sequence=record.thread_sequence,
-        data=cast(dict[str, JsonValue], dict(record.payload)),
-    )
 
 
 def _positive_integer(value: object) -> int | None:

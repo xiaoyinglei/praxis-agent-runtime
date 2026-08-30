@@ -15,6 +15,7 @@ from agent_runtime.harness import (
     PreparedModelCall,
     RolloutStore,
 )
+from agent_runtime.harness import composition as harness_composition
 from agent_runtime.streaming.events import EventType, StreamEvent
 
 
@@ -106,9 +107,7 @@ async def test_public_result_exposes_durable_unknown_model_diagnostic(
     result = await agent.arun("dispatch failure", require_workspace_change=False)
 
     assert result.status == "paused"
-    assert result.diagnostics == (
-        result.diagnostics[0],
-    )
+    assert result.diagnostics == (result.diagnostics[0],)
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "model_dispatch_outcome_unknown"
     assert diagnostic.component == "model"
@@ -170,9 +169,7 @@ async def test_public_agent_can_explicitly_disable_workspace_mcp_discovery_and_f
 
     assert result.status == "done"
     with RolloutStore(database) as store:
-        assert store.read_turn(result.turn_id).binding_manifest["mcp_policy"] == {
-            "workspace_discovery_enabled": False
-        }
+        assert store.read_turn(result.turn_id).binding_manifest["mcp_policy"] == {"workspace_discovery_enabled": False}
 
 
 @pytest.mark.anyio
@@ -471,9 +468,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
 
     assert paused.status == "paused"
     with RolloutStore(database) as store:
-        policy = store.read_turn(paused.turn_id).binding_manifest[
-            "tool_execution_policy"
-        ]
+        policy = store.read_turn(paused.turn_id).binding_manifest["tool_execution_policy"]
         assert policy["allow_write_tools"] is True
         assert policy["allow_execute_tools"] is True
 
@@ -690,6 +685,57 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
         EventType.TURN_START,
         EventType.TURN_END,
     ]
+
+
+@pytest.mark.anyio
+async def test_public_stream_awaits_post_commit_batch_without_record_listener_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "praxis.sqlite3"
+    model = BlockingPublicModel()
+    agent = Agent(checkpoint_db=database, workspace_path=workspace)
+    sink_started = asyncio.Event()
+    release_sink = asyncio.Event()
+
+    class BlockingSink:
+        async def emit(self, event: StreamEvent) -> None:
+            if event.type is EventType.TURN_STARTED:
+                sink_started.set()
+                await release_sink.wait()
+
+    original_init = RolloutStore.__init__
+
+    def reject_record_listener(self: RolloutStore, *args: object, **kwargs: object) -> None:
+        assert kwargs.get("record_listener") is None
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(RolloutStore, "__init__", reject_record_listener)
+    monkeypatch.setattr(harness_composition, "RolloutStore", RolloutStore)
+    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    running = asyncio.create_task(
+        agent.arun(
+            "await committed batch delivery",
+            require_workspace_change=False,
+            event_sink=BlockingSink(),
+        )
+    )
+
+    await asyncio.wait_for(sink_started.wait(), timeout=0.5)
+    assert model.dispatch_started.is_set() is False
+    with RolloutStore(database) as committed_store:
+        turns = committed_store.list_turns()
+        assert len(turns) == 1
+        assert turns[0].status == "running"
+        assert committed_store.verify().valid is True
+
+    release_sink.set()
+    await asyncio.wait_for(model.dispatch_started.wait(), timeout=0.5)
+    model.release_dispatch.set()
+    result = await asyncio.wait_for(running, timeout=1.0)
+    assert result.answer == "live stream answer"
 
 
 @pytest.mark.anyio

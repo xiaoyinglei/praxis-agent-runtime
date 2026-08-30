@@ -115,6 +115,10 @@ class TurnEventStream:
     def close(self) -> None:
         self._channel.close()
 
+    @property
+    def empty(self) -> bool:
+        return self._channel.queue.empty()
+
 
 class TurnEventDispatcher:
     """Fan out one Turn's events with controlling-consumer backpressure."""

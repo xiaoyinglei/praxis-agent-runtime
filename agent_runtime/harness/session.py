@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.protocol import (
     CompletionGate,
     CompletionProposal,
@@ -31,6 +33,7 @@ from agent_runtime.harness.tool_orchestrator import (
     ToolApprovalRequiredError,
     ToolOrchestrator,
 )
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
 
 
@@ -88,6 +91,7 @@ class Session:
         max_steps: int = 16,
         worker_id: str | None = None,
         model_lease_seconds: float = 300.0,
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> None:
         store.read_thread(thread_id)
         self.thread_id = thread_id
@@ -100,6 +104,7 @@ class Session:
         self._max_steps = max_steps
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._model_lease_seconds = model_lease_seconds
+        self._event_dispatcher = event_dispatcher
 
     async def run(
         self,
@@ -108,16 +113,28 @@ class Session:
         binding_manifest: Mapping[str, Any],
         input_files: tuple[Mapping[str, Any], ...] = (),
     ) -> TurnResult:
-        turn = self._store.start_turn(
-            thread_id=self.thread_id,
-            user_message=user_message,
-            binding_manifest=binding_manifest,
-            input_files=input_files,
+        turn = await self._commit(
+            lambda: self._store.start_turn(
+                thread_id=self.thread_id,
+                user_message=user_message,
+                binding_manifest=binding_manifest,
+                input_files=input_files,
+            )
         )
         return await self.run_turn(
             self.restore_turn_context(turn.turn_id),
             start_step=1,
         )
+
+    async def _commit[T](self, operation: Callable[[], T]) -> T:
+        mutation = self._store.capture_mutation(operation)
+        if self._event_dispatcher is not None:
+            for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
+                await self._event_dispatcher.emit(
+                    replayed.event,
+                    cursor=replayed.cursor,
+                )
+        return mutation.value
 
     def restore_turn_context(self, turn_id: str) -> TurnContext:
         turn = self._store.read_turn(turn_id)
@@ -240,7 +257,7 @@ class Session:
             or prepared.wire_hash != operation.wire_hash
         ):
             raise RuntimeError("unknown model request cannot be reproduced exactly")
-        self._store.prepare_model_retry(operation.operation_id)
+        await self._commit(lambda: self._store.prepare_model_retry(operation.operation_id))
         dispatched = await self._dispatch_prepared(
             thread_id=turn.thread_id,
             turn_id=turn_id,
@@ -251,7 +268,7 @@ class Session:
             return dispatched
         token_budget = turn.binding_manifest.get("model_token_budget_total")
         if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-            return self._fail_turn(
+            return await self._fail_turn(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,
                 reason="Turn exceeded its frozen model token budget.",
@@ -297,7 +314,12 @@ class Session:
                 continue
             if tool_operation.result_item_id is None:
                 if tool_operation.status in {"succeeded", "failed"}:
-                    interaction = self._store.mark_tool_result_missing(operation_id=tool_operation.operation_id)
+                    interaction = await self._commit(
+                        partial(
+                            self._store.mark_tool_result_missing,
+                            operation_id=tool_operation.operation_id,
+                        )
+                    )
                     return TurnResult(
                         thread_id=turn.thread_id,
                         turn_id=turn_id,
@@ -315,7 +337,7 @@ class Session:
                 raise RuntimeError("committed tool result linkage is malformed")
         token_budget = turn.binding_manifest.get("model_token_budget_total")
         if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-            return self._fail_turn(
+            return await self._fail_turn(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,
                 reason="Turn exceeded its frozen model token budget.",
@@ -384,16 +406,20 @@ class Session:
                 )
             raise RuntimeError(f"resolved {interaction.kind} is already being processed")
         if interaction.kind == "clarification":
-            self._store.resolve_clarification(
-                turn_id=turn_id,
-                request_id=request_id,
-                response=response,
+            await self._commit(
+                lambda: self._store.resolve_clarification(
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    response=response,
+                )
             )
         else:
-            self._store.resolve_choice(
-                turn_id=turn_id,
-                request_id=request_id,
-                selection=response,
+            await self._commit(
+                lambda: self._store.resolve_choice(
+                    turn_id=turn_id,
+                    request_id=request_id,
+                    selection=response,
+                )
             )
         return await self.run_turn(
             turn_context,
@@ -420,7 +446,7 @@ class Session:
         effective_step_budget = min(self._max_steps, step_budget)
         for step in range(start_step, effective_step_budget + 1):
             if token_budget is not None and self._consumed_model_tokens(turn_id) >= token_budget:
-                return self._fail_turn(
+                return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     reason="Turn exhausted its frozen model token budget.",
@@ -429,7 +455,7 @@ class Session:
                 step_context = self.capture_step_context(turn_context, step=step)
                 request = step_context.model_request()
             except ContextBudgetExceededError as exc:
-                return self._fail_turn(
+                return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     reason=str(exc),
@@ -439,13 +465,16 @@ class Session:
                 **prepared.request_ref,
                 "request_id": prepared.request_ref.get("request_id") or f"{turn_id}:step:{step}",
             }
-            operation = self._store.prepare_model_operation(
-                turn_id=turn_id,
-                request_hash=prepared.request_hash,
-                context_hash=prepared.context_hash,
-                tool_hash=prepared.tool_hash,
-                wire_hash=prepared.wire_hash,
-                request_ref=durable_request_ref,
+            operation = await self._commit(
+                partial(
+                    self._store.prepare_model_operation,
+                    turn_id=turn_id,
+                    request_hash=prepared.request_hash,
+                    context_hash=prepared.context_hash,
+                    tool_hash=prepared.tool_hash,
+                    wire_hash=prepared.wire_hash,
+                    request_ref=durable_request_ref,
+                )
             )
             dispatched = await self._dispatch_prepared(
                 thread_id=thread_id,
@@ -456,7 +485,7 @@ class Session:
             if isinstance(dispatched, TurnResult):
                 return dispatched
             if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-                return self._fail_turn(
+                return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     reason="Turn exceeded its frozen model token budget.",
@@ -470,7 +499,7 @@ class Session:
             if handled is None:
                 continue
             return handled
-        return self._fail_turn(
+        return await self._fail_turn(
             thread_id=thread_id,
             turn_id=turn_id,
             reason="Turn exhausted its frozen model step budget.",
@@ -492,14 +521,14 @@ class Session:
                         consumed += value
         return consumed
 
-    def _fail_turn(
+    async def _fail_turn(
         self,
         *,
         thread_id: str,
         turn_id: str,
         reason: str,
     ) -> TurnResult:
-        self._store.fail_turn(turn_id=turn_id, reason=reason)
+        await self._commit(lambda: self._store.fail_turn(turn_id=turn_id, reason=reason))
         return TurnResult(
             thread_id=thread_id,
             turn_id=turn_id,
@@ -515,32 +544,40 @@ class Session:
         operation: ModelOperationSnapshot,
         prepared: PreparedModelCall,
     ) -> HarnessModelResponse | TurnResult:
-        attempt = self._store.dispatch_model_attempt(
-            operation.operation_id,
-            worker_id=self._worker_id,
-            lease_seconds=self._model_lease_seconds,
+        attempt = await self._commit(
+            lambda: self._store.dispatch_model_attempt(
+                operation.operation_id,
+                worker_id=self._worker_id,
+                lease_seconds=self._model_lease_seconds,
+            )
         )
         try:
             response = await self._model.dispatch(prepared)
         except ModelDispatchPreflightError as exc:
-            self._store.reject_model_attempt(
-                operation_id=operation.operation_id,
-                attempt_id=attempt.attempt_id,
-                generation=attempt.generation,
-                reason=str(exc),
+            await self._commit(
+                partial(
+                    self._store.reject_model_attempt,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    reason=str(exc),
+                )
             )
-            return self._fail_turn(
+            return await self._fail_turn(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reason=str(exc),
             )
         except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError) as exc:
-            self._store.mark_model_attempt_unknown(
-                operation_id=operation.operation_id,
-                attempt_id=attempt.attempt_id,
-                generation=attempt.generation,
-                error_type=type(exc).__name__,
-                error_message=(str(exc).strip() or "model dispatch raised without a message"),
+            await self._commit(
+                partial(
+                    self._store.mark_model_attempt_unknown,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    error_type=type(exc).__name__,
+                    error_message=(str(exc).strip() or "model dispatch raised without a message"),
+                )
             )
             return TurnResult(
                 thread_id=thread_id,
@@ -549,51 +586,59 @@ class Session:
                 status="paused",
             )
         except asyncio.CancelledError as exc:
-            self._store.mark_model_attempt_unknown(
-                operation_id=operation.operation_id,
-                attempt_id=attempt.attempt_id,
-                generation=attempt.generation,
-                error_type=type(exc).__name__,
-                error_message="model dispatch was cancelled after provider I/O began",
+            await self._commit(
+                partial(
+                    self._store.mark_model_attempt_unknown,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    error_type=type(exc).__name__,
+                    error_message=("model dispatch was cancelled after provider I/O began"),
+                )
             )
             raise
         except Exception as exc:
             message = str(exc).strip() or "model dispatch failed with a known error"
-            self._store.reject_model_attempt(
-                operation_id=operation.operation_id,
-                attempt_id=attempt.attempt_id,
-                generation=attempt.generation,
-                reason=message,
-                error_type=type(exc).__name__,
-                error_message=message,
+            await self._commit(
+                partial(
+                    self._store.reject_model_attempt,
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    reason=message,
+                    error_type=type(exc).__name__,
+                    error_message=message,
+                )
             )
-            return self._fail_turn(
+            return await self._fail_turn(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reason=message,
             )
-        accepted = self._store.complete_model_attempt(
-            operation_id=operation.operation_id,
-            attempt_id=attempt.attempt_id,
-            generation=attempt.generation,
-            text=response.text,
-            provider_response_id=response.provider_response_id,
-            usage=response.usage,
-            tool_calls=tuple(
-                {
-                    "id": call.id,
-                    "name": call.name,
-                    "arguments": dict(call.arguments),
-                }
-                for call in response.tool_calls
-            ),
-            response_status=response.status,
-            incomplete_reason=response.incomplete_reason,
+        accepted = await self._commit(
+            lambda: self._store.complete_model_attempt(
+                operation_id=operation.operation_id,
+                attempt_id=attempt.attempt_id,
+                generation=attempt.generation,
+                text=response.text,
+                provider_response_id=response.provider_response_id,
+                usage=response.usage,
+                tool_calls=tuple(
+                    {
+                        "id": call.id,
+                        "name": call.name,
+                        "arguments": dict(call.arguments),
+                    }
+                    for call in response.tool_calls
+                ),
+                response_status=response.status,
+                incomplete_reason=response.incomplete_reason,
+            )
         )
         if not accepted:
             raise RuntimeError("current model attempt lost its commit generation")
         if response.status == "incomplete":
-            return self._fail_turn(
+            return await self._fail_turn(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 reason=(f"Model returned an incomplete agent step: {response.incomplete_reason}."),
@@ -642,22 +687,24 @@ class Session:
                         interaction_id=pending[0].request_id,
                     )
             return None
-        return self._finish_answer(
+        return await self._finish_answer(
             thread_id=thread_id,
             turn_id=turn_id,
             answer=response.text,
         )
 
-    def _finish_answer(
+    async def _finish_answer(
         self,
         *,
         thread_id: str,
         turn_id: str,
         answer: str,
     ) -> TurnResult | None:
-        proposal_item = self._store.record_final_proposal(
-            turn_id=turn_id,
-            answer=answer,
+        proposal_item = await self._commit(
+            lambda: self._store.record_final_proposal(
+                turn_id=turn_id,
+                answer=answer,
+            )
         )
         proposal = CompletionProposal(
             thread_id=thread_id,
@@ -666,22 +713,28 @@ class Session:
             answer=answer,
         )
         decision = self._completion_gate.evaluate(proposal)
-        self._store.record_completion_decision(
-            turn_id=turn_id,
-            proposal_item_id=proposal.item_id,
-            action=decision.action,
-            reason=decision.reason,
+        await self._commit(
+            lambda: self._store.record_completion_decision(
+                turn_id=turn_id,
+                proposal_item_id=proposal.item_id,
+                action=decision.action,
+                reason=decision.reason,
+            )
         )
         if decision.action == "continue":
-            self._store.record_completion_feedback(
-                turn_id=turn_id,
-                reason=decision.reason,
+            await self._commit(
+                lambda: self._store.record_completion_feedback(
+                    turn_id=turn_id,
+                    reason=decision.reason,
+                )
             )
             return None
         if decision.action == "pause":
-            interaction = self._store.request_clarification(
-                turn_id=turn_id,
-                question=decision.reason,
+            interaction = await self._commit(
+                lambda: self._store.request_clarification(
+                    turn_id=turn_id,
+                    question=decision.reason,
+                )
             )
             return TurnResult(
                 thread_id=thread_id,
@@ -691,16 +744,23 @@ class Session:
                 interaction_id=interaction.request_id,
             )
         if decision.action == "fail":
-            self._store.fail_turn(turn_id=turn_id, reason=decision.reason)
+            await self._commit(
+                lambda: self._store.fail_turn(
+                    turn_id=turn_id,
+                    reason=decision.reason,
+                )
+            )
             return TurnResult(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 answer=None,
                 status="failed",
             )
-        completed = self._store.complete_turn(
-            turn_id=turn_id,
-            answer=answer,
+        completed = await self._commit(
+            lambda: self._store.complete_turn(
+                turn_id=turn_id,
+                answer=answer,
+            )
         )
         return TurnResult(
             thread_id=thread_id,

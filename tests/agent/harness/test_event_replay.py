@@ -11,7 +11,6 @@ import pytest
 
 import agent_runtime.harness as harness
 from agent_runtime.harness import RolloutStore
-from agent_runtime.harness.rollout import RolloutRecord
 from agent_runtime.streaming import events
 from agent_runtime.streaming import sink as stream_sinks
 from agent_runtime.streaming.events import StreamEvent
@@ -59,9 +58,11 @@ def test_thread_cursor_rejects_schema_epoch_mismatch(tmp_path: Path) -> None:
         padding = "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
         payload["schema_epoch"] = "future-schema"
-        mismatched = base64.urlsafe_b64encode(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).decode().rstrip("=")
+        mismatched = (
+            base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+            .decode()
+            .rstrip("=")
+        )
 
         with pytest.raises(ValueError, match="schema epoch"):
             reader.read(thread_id, after=mismatched)
@@ -84,17 +85,21 @@ def test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch(
         padding = "=" * (-len(cursor) % 4)
         payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
         payload["thread_sequence"] = 10_000
-        ahead = base64.urlsafe_b64encode(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).decode().rstrip("=")
+        ahead = (
+            base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+            .decode()
+            .rstrip("=")
+        )
         with pytest.raises(ValueError, match="ahead"):
             reader.read(first_thread, after=ahead)
 
         payload["thread_sequence"] = 0
         payload["store_epoch"] = "different-store"
-        wrong_store = base64.urlsafe_b64encode(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-        ).decode().rstrip("=")
+        wrong_store = (
+            base64.urlsafe_b64encode(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode())
+            .decode()
+            .rstrip("=")
+        )
         with pytest.raises(ValueError, match="store epoch"):
             reader.read(first_thread, after=wrong_store)
 
@@ -142,11 +147,7 @@ def test_global_tailer_fails_closed_on_incomplete_unknown_item_kind(
     database = tmp_path / "rollout.sqlite3"
     with RolloutStore(database) as store:
         thread_id, _turn_id = _start_turn(store, workspace, "unknown global item")
-        start = next(
-            record
-            for record in store.list_records(thread_id)
-            if record.record_type == "item_started"
-        )
+        start = next(record for record in store.list_records(thread_id) if record.record_type == "item_started")
         payload = {"item_id": start.payload["item_id"], "kind": "future_internal_kind"}
         payload_json = json.dumps(
             payload,
@@ -330,16 +331,8 @@ def test_item_lifecycle_events_are_derived_from_one_committed_record_sequence(
 
         assert [event.thread_sequence for event in events] == [2, 5, 6, 7]
         assert events[-1].event_type == "turn_completed"
-        started = {
-            event.event.item_id
-            for event in events
-            if event.event_type == "item_started"
-        }
-        completed = {
-            event.event.item_id
-            for event in events
-            if event.event_type == "item_completed"
-        }
+        started = {event.event.item_id for event in events if event.event_type == "item_started"}
+        completed = {event.event.item_id for event in events if event.event_type == "item_completed"}
         assert started == completed
         assert len(started) == 1
         assert all(event.turn_id == turn_id for event in events[1:])
@@ -353,15 +346,19 @@ def test_post_commit_delivery_crash_does_not_lose_replayable_events(
     database = tmp_path / "rollout.sqlite3"
     attempted: list[int] = []
 
-    def crash_after_commit(record: RolloutRecord) -> None:
-        attempted.append(record.record_id)
-        raise RuntimeError("injected delivery crash")
-
-    with RolloutStore(database, record_listener=crash_after_commit) as store:
+    with RolloutStore(database) as store:
         thread_id, turn_id = _start_turn(store, workspace, "survive delivery crash")
-        store.complete_turn(turn_id=turn_id, answer="committed despite listener crash")
+        with pytest.raises(RuntimeError, match="injected delivery crash"):
+            mutation = store.capture_mutation(
+                lambda: store.complete_turn(
+                    turn_id=turn_id,
+                    answer="committed despite listener crash",
+                )
+            )
+            attempted.extend(record.record_id for record in mutation.records)
+            raise RuntimeError("injected delivery crash")
         committed_count = len(store.list_records(thread_id))
-        assert attempted == list(range(1, committed_count + 1))
+        assert attempted == [committed_count - 2, committed_count - 1, committed_count]
         assert store.verify().valid is True
 
     with RolloutStore(database) as restarted:

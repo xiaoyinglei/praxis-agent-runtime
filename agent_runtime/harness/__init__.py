@@ -35,6 +35,7 @@ from agent_runtime.harness.protocol import (
 )
 from agent_runtime.harness.rollout import (
     ArtifactSnapshot,
+    CommittedMutation,
     ItemSnapshot,
     ModelAttemptSnapshot,
     ModelOperationSnapshot,
@@ -60,6 +61,7 @@ __all__ = [
     "CompletionDecision",
     "CompletionGate",
     "CompletionProposal",
+    "CommittedMutation",
     "ControlPlaneHarnessModel",
     "ContextManager",
     "ContextBudgetExceededError",

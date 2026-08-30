@@ -184,6 +184,44 @@ class RolloutEventReader:
             for index, (record, event) in enumerate(projected, start=1)
         )
 
+    def project_committed_batch(
+        self,
+        records: tuple[RolloutRecord, ...],
+    ) -> tuple[ReplayEvent, ...]:
+        """Project only one already-committed, single-Thread mutation batch."""
+
+        if not records:
+            return ()
+        thread_ids = {record.thread_id for record in records}
+        if len(thread_ids) != 1:
+            raise RuntimeError("committed mutation batch must belong to one Thread")
+        thread_id = next(iter(thread_ids))
+        batch_record_ids = {record.record_id for record in records}
+        projected = tuple(
+            (record, event)
+            for record, event in self._project_records(
+                self._store.list_records(thread_id),
+                after_thread_sequence=0,
+            )
+            if record.record_id in batch_record_ids
+        )
+        return tuple(
+            ReplayEvent(
+                event=replace(
+                    event,
+                    sequence=index,
+                    timestamp_ms=record.committed_at_ms,
+                ),
+                cursor=self._encode(
+                    thread_id=record.thread_id,
+                    sequence=record.thread_sequence,
+                ),
+                record_id=record.record_id,
+                thread_sequence=record.thread_sequence,
+            )
+            for index, (record, event) in enumerate(projected, start=1)
+        )
+
     def _project_records(
         self,
         records: tuple[RolloutRecord, ...],
@@ -197,14 +235,12 @@ class RolloutEventReader:
         starts = {
             str(record.payload["item_id"]): record
             for record in records
-            if record.record_type == "item_started"
-            and isinstance(record.payload.get("item_id"), str)
+            if record.record_type == "item_started" and isinstance(record.payload.get("item_id"), str)
         }
         completed_item_ids = {
             str(record.payload["item_id"])
             for record in records
-            if record.record_type == "item_completed"
-            and isinstance(record.payload.get("item_id"), str)
+            if record.record_type == "item_completed" and isinstance(record.payload.get("item_id"), str)
         }
         duplicate_answer_ids = _accepted_answer_item_ids(records)
         model_attempts_by_item = {
@@ -296,32 +332,28 @@ class RolloutEventReader:
                     operation_id=operation_id,
                     attempt_generation=generation,
                 )
-            if (
-                record.turn_id is None
-                or not isinstance(operation_id, str)
-                or not isinstance(public_item_id, str)
-            ):
+            if record.turn_id is None or not isinstance(operation_id, str) or not isinstance(public_item_id, str):
                 raise RuntimeError("claimed tool operation is missing public identity")
-            if not isinstance(generation, int) or (
-                operation_id,
-                generation,
-            ) not in completed_operations:
+            if (
+                not isinstance(generation, int)
+                or (
+                    operation_id,
+                    generation,
+                )
+                not in completed_operations
+            ):
                 return ()
             operation = self._store.read_tool_operation(operation_id)
             return (
                 item_started(
-                turn_id=record.turn_id,
-                item_id=public_item_id,
-                item_kind=(
-                    TurnItemKind.COMMAND
-                    if operation.tool_name == "run_command"
-                    else TurnItemKind.TOOL
-                ),
-                data={
-                    "operation_id": operation_id,
-                    "tool_call_id": operation.tool_call_id,
-                    "tool_name": operation.tool_name,
-                },
+                    turn_id=record.turn_id,
+                    item_id=public_item_id,
+                    item_kind=(TurnItemKind.COMMAND if operation.tool_name == "run_command" else TurnItemKind.TOOL),
+                    data={
+                        "operation_id": operation_id,
+                        "tool_call_id": operation.tool_call_id,
+                        "tool_name": operation.tool_name,
+                    },
                 ),
             )
         if record.record_type == "item_started":
@@ -346,11 +378,7 @@ class RolloutEventReader:
         elif kind == "tool_result" and record.record_type == "item_completed":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
-            if (
-                record.payload_schema_version == 1
-                and isinstance(item_id, str)
-                and not isinstance(operation_id, str)
-            ):
+            if record.payload_schema_version == 1 and isinstance(item_id, str) and not isinstance(operation_id, str):
                 operation_id = tool_operations_by_item.get(item_id)
             if (
                 record.payload_schema_version == 1
@@ -373,11 +401,7 @@ class RolloutEventReader:
                 completed = item_completed(
                     turn_id=record.turn_id,
                     item_id=public_item_id,
-                    item_kind=(
-                        TurnItemKind.COMMAND
-                        if operation.tool_name == "run_command"
-                        else TurnItemKind.TOOL
-                    ),
+                    item_kind=(TurnItemKind.COMMAND if operation.tool_name == "run_command" else TurnItemKind.TOOL),
                     status=status,
                     data={"result": record.payload.get("payload", {})},
                     error=error,
@@ -554,9 +578,7 @@ class RolloutEventReader:
             data=data,
             error=error,
             parent_item_id=(
-                str(record.payload["parent_item_id"])
-                if isinstance(record.payload.get("parent_item_id"), str)
-                else None
+                str(record.payload["parent_item_id"]) if isinstance(record.payload.get("parent_item_id"), str) else None
             ),
         )
 
@@ -642,9 +664,7 @@ class RolloutEventReader:
     @staticmethod
     def _require_public_item_id(persisted: object, expected: str) -> None:
         if persisted != expected:
-            raise RuntimeError(
-                "persisted public Item ID mismatch; durable history requires repair"
-            )
+            raise RuntimeError("persisted public Item ID mismatch; durable history requires repair")
 
     def _encode(self, *, thread_id: str, sequence: int) -> str:
         encoded = json.dumps(
@@ -665,9 +685,7 @@ class RolloutEventReader:
             raise _full_resync_error("event cursor must be non-empty")
         try:
             padding = "=" * (-len(cursor) % 4)
-            payload = json.loads(
-                base64.urlsafe_b64decode(cursor + padding).decode()
-            )
+            payload = json.loads(base64.urlsafe_b64decode(cursor + padding).decode())
         except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
             raise _full_resync_error("event cursor is malformed") from exc
         if not isinstance(payload, dict) or payload.get("version") != _CURSOR_VERSION:
@@ -691,15 +709,13 @@ def _accepted_answer_item_ids(records: tuple[RolloutRecord, ...]) -> frozenset[s
     starts = {
         str(record.payload["item_id"]): (record.payload.get("kind"), record.producer)
         for record in records
-        if record.record_type == "item_started"
-        and isinstance(record.payload.get("item_id"), str)
+        if record.record_type == "item_started" and isinstance(record.payload.get("item_id"), str)
     }
     model_texts = {
         record.payload.get("payload", {}).get("text")
         for record in records
         if record.record_type == "item_completed"
-        and starts.get(str(record.payload.get("item_id")), (None, None))[0]
-        == "model_response"
+        and starts.get(str(record.payload.get("item_id")), (None, None))[0] == "model_response"
     }
     return frozenset(
         item_id
@@ -761,9 +777,7 @@ def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:
         try:
             return TurnItemKind(str(persisted))
         except ValueError:
-            raise RuntimeError(
-                f"persisted public Item kind is unsupported: {persisted!r}"
-            ) from None
+            raise RuntimeError(f"persisted public Item kind is unsupported: {persisted!r}") from None
     if record.producer == "migration" and kind == "model_response":
         return TurnItemKind.LEGACY_MESSAGE
     mapping = {

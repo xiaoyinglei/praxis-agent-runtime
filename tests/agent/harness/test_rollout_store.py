@@ -11,31 +11,27 @@ from threading import Barrier
 
 import pytest
 
-from agent_runtime.harness import RolloutRecord, RolloutStore
+from agent_runtime.harness import RolloutStore
 
 ROOT = Path(__file__).parents[3]
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_agent_rollout.py"
 
 
-def test_record_listener_runs_only_after_the_record_is_committed(tmp_path: Path) -> None:
+def test_committed_mutation_returns_only_records_after_commit(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    observed: list[tuple[int, int]] = []
-
-    def observe(record: RolloutRecord) -> None:
-        record_id = record.record_id
+    with RolloutStore(database) as store:
+        mutation = store.capture_mutation(lambda: store.create_thread(workspace=workspace))
+        [record] = mutation.records
+        assert mutation.value.thread_id == record.thread_id
         with sqlite3.connect(database) as independent_reader:
             committed = independent_reader.execute(
                 "SELECT COUNT(*) FROM rollout_records WHERE record_id = ?",
-                (record_id,),
+                (record.record_id,),
             ).fetchone()[0]
-        observed.append((record_id, committed))
 
-    with RolloutStore(database, record_listener=observe) as store:
-        store.create_thread(workspace=workspace)
-
-    assert observed == [(1, 1)]
+    assert committed == 1
 
 
 def test_start_turn_persists_records_and_rebuildable_projections(tmp_path: Path) -> None:

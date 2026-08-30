@@ -12,11 +12,12 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
-from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
+from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.session import Session
 from agent_runtime.harness.thread_manager import ThreadManager
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchInput,
     create_knowledge_tools,
@@ -155,7 +156,7 @@ class RuntimeComposition:
         skill_runtime: HarnessSkillRuntime | None = None,
         max_steps: int = 16,
         max_tokens_total: int | None = None,
-        record_listener: Callable[[RolloutRecord], None] | None = None,
+        event_dispatcher: TurnEventDispatcher | None = None,
     ) -> RuntimeComposition:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
@@ -272,7 +273,7 @@ class RuntimeComposition:
         tool_snapshot = registry.freeze()
         if discoverable_names:
             snapshot_ref["tools"] = tool_snapshot
-        store = RolloutStore(database, record_listener=record_listener)
+        store = RolloutStore(database)
         integrity = store.verify()
         if not integrity.valid:
             store.close()
@@ -287,6 +288,7 @@ class RuntimeComposition:
                 tools=tool_snapshot,
                 execution_context=execution_context,
                 worker_id=worker_id,
+                event_dispatcher=event_dispatcher,
             )
         )
         tool_router = (
@@ -315,6 +317,7 @@ class RuntimeComposition:
                 tool_orchestrator=tool_orchestrator,
                 worker_id=worker_id,
                 max_steps=max_steps,
+                event_dispatcher=event_dispatcher,
             )
 
         binding_provider = _CompositionBindingProvider(
