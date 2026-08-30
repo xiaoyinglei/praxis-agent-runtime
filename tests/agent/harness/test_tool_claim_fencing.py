@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
+from typing import Any
 
 import pytest
 
@@ -49,7 +50,93 @@ def _ready_operation(store: RolloutStore, turn_id: str) -> str:
     return "toolop-1"
 
 
-def test_expired_claim_fences_late_worker_result(tmp_path: Path) -> None:
+class FaultingToolResultStore(RolloutStore):
+    def __init__(self, database: Path) -> None:
+        self._fault_at: int | None = None
+        self._append_count = 0
+        super().__init__(database)
+
+    def arm_fault(self, append_number: int) -> None:
+        self._fault_at = append_number
+        self._append_count = 0
+
+    def _append_and_reduce(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str | None,
+        record_type: str,
+        producer: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        if self._fault_at is not None:
+            self._append_count += 1
+            if self._append_count == self._fault_at:
+                raise RuntimeError("injected tool success fault")
+        super()._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type=record_type,
+            producer=producer,
+            payload=payload,
+        )
+
+
+@pytest.mark.parametrize("fault_at", range(1, 5))
+def test_tool_success_faults_are_atomic_at_every_substep(
+    tmp_path: Path,
+    fault_at: int,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with FaultingToolResultStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="commit tool success atomically",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        operation_id = _ready_operation(store, turn.turn_id)
+        claim = store.claim_tool_operation(
+            operation_id=operation_id,
+            worker_id="worker-a",
+            lease_seconds=30.0,
+        )
+        records_before = store.list_records(thread.thread_id)
+        items_before = store.list_items(turn.turn_id)
+        store.arm_fault(fault_at)
+
+        with pytest.raises(RuntimeError, match="injected tool success fault"):
+            store.commit_tool_operation_result(
+                turn_id=turn.turn_id,
+                operation_id=operation_id,
+                claim_generation=claim.claim_generation,
+                fencing_token=str(claim.fencing_token),
+                status="succeeded",
+                attempt_count=1,
+                error_code=None,
+                requires_reconciliation=False,
+                result={
+                    "tool_call_id": "call-1",
+                    "tool_name": "write_file",
+                    "is_error": False,
+                    "content": [],
+                    "attachments": [],
+                },
+            )
+
+        assert store.list_records(thread.thread_id) == records_before
+        assert store.list_items(turn.turn_id) == items_before
+        operation = store.read_tool_operation(operation_id)
+        assert operation.status == "running"
+        assert operation.fencing_token == claim.fencing_token
+        assert operation.result_item_id is None
+        assert store.verify().valid is True
+
+
+def test_stale_fencing_token_appends_nothing_and_releases_no_foreign_claim(
+    tmp_path: Path,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
@@ -68,6 +155,7 @@ def test_expired_claim_fences_late_worker_result(tmp_path: Path) -> None:
         )
 
         store.expire_tool_operation_claim(operation_id=operation_id, now=106.0)
+        records_before = store.list_records(thread.thread_id)
         accepted = store.commit_tool_operation_outcome(
             operation_id=operation_id,
             claim_generation=claim.claim_generation,
@@ -83,10 +171,7 @@ def test_expired_claim_fences_late_worker_result(tmp_path: Path) -> None:
         assert operation.status == "unknown"
         assert operation.claim_generation == 1
         assert operation.claim_owner == "worker-a"
-        assert any(
-            record.record_type == "tool_operation_stale_result"
-            for record in store.list_records(thread.thread_id)
-        )
+        assert store.list_records(thread.thread_id) == records_before
         assert store.verify().valid is True
 
 
@@ -541,7 +626,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
         assert not any(
             item.kind == "tool_result" for item in verifier.list_items(turn.turn_id)
         )
-        assert any(
+        assert not any(
             record.record_type == "tool_operation_stale_result"
             for record in verifier.list_records(thread.thread_id)
         )

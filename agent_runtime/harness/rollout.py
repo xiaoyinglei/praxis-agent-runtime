@@ -2474,7 +2474,8 @@ class RolloutStore:
                 and operation["lease_expires_at"] is not None
                 and observed_at <= float(operation["lease_expires_at"])
             )
-            record_type = "tool_operation_outcome_committed" if is_current else "tool_operation_stale_result"
+            if not is_current:
+                return False
             public_item_id = derive_operation_public_item_id(
                 turn_id=str(operation["turn_id"]),
                 operation_id=operation_id,
@@ -2483,7 +2484,7 @@ class RolloutStore:
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
-                record_type=record_type,
+                record_type="tool_operation_outcome_committed",
                 producer="runtime",
                 payload={
                     "operation_id": operation_id,
@@ -2530,6 +2531,40 @@ class RolloutStore:
                     },
                 )
         return is_current
+
+    def commit_tool_operation_result(
+        self,
+        *,
+        turn_id: str,
+        operation_id: str,
+        claim_generation: int,
+        fencing_token: str,
+        status: str,
+        attempt_count: int,
+        error_code: str | None,
+        requires_reconciliation: bool,
+        result: Mapping[str, Any],
+        now: float | None = None,
+    ) -> bool:
+        with self._transaction():
+            accepted = self.commit_tool_operation_outcome(
+                operation_id=operation_id,
+                claim_generation=claim_generation,
+                fencing_token=fencing_token,
+                status=status,
+                attempt_count=attempt_count,
+                error_code=error_code,
+                requires_reconciliation=requires_reconciliation,
+                now=now,
+            )
+            if not accepted:
+                return False
+            self.record_tool_result(
+                turn_id=turn_id,
+                operation_id=operation_id,
+                result=result,
+            )
+        return True
 
     def resolve_tool_reconciliation(
         self,

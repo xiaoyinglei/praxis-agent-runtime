@@ -260,13 +260,9 @@ class ToolOrchestrator:
                 )
             )
             raise ToolApprovalRequiredError(interaction.request_id)
-        operation_id = None if execution.record is None else execution.record.operation_id
-        await self._commit(
-            lambda: self._store.record_tool_result(
-                turn_id=turn_id,
-                operation_id=operation_id,
-                result=_tool_result_payload(execution.result),
-            )
+        await self._commit_execution_result(
+            turn_id=turn_id,
+            execution=execution,
         )
         return execution.result
 
@@ -305,6 +301,62 @@ class ToolOrchestrator:
                 delta=progress.content,
             )
         )
+
+    async def _commit_execution_result(
+        self,
+        *,
+        turn_id: str,
+        execution: ToolExecution,
+    ) -> None:
+        record = execution.record
+        operation_id = None if record is None else record.operation_id
+        if record is None:
+            await self._commit(
+                lambda: self._store.record_tool_result(
+                    turn_id=turn_id,
+                    operation_id=None,
+                    result=_tool_result_payload(execution.result),
+                )
+            )
+            return
+        claim = self._claims.pop(record.operation_id, None)
+        if claim is None:
+            operation = self._store.read_tool_operation(record.operation_id)
+            if (
+                operation.status == "failed"
+                and operation.error_code == record.error_code == "resource_busy"
+            ):
+                await self._commit(
+                    lambda: self._store.record_tool_result(
+                        turn_id=turn_id,
+                        operation_id=operation_id,
+                        result=_tool_result_payload(execution.result),
+                    )
+                )
+                return
+            raise RuntimeError("tool outcome has no active durable claim")
+        status = {
+            ExecutionStatus.COMPLETED: "succeeded",
+            ExecutionStatus.FAILED: "failed",
+            ExecutionStatus.OUTCOME_UNKNOWN: "unknown",
+        }.get(record.status)
+        if status is None:
+            raise RuntimeError(f"unsupported ToolExecutionRecord status: {record.status}")
+        accepted = await self._commit(
+            lambda: self._store.commit_tool_operation_result(
+                turn_id=turn_id,
+                operation_id=record.operation_id,
+                claim_generation=claim[0],
+                fencing_token=claim[1],
+                status=status,
+                attempt_count=record.attempt_count,
+                error_code=record.error_code,
+                requires_reconciliation=record.requires_reconciliation,
+                result=_tool_result_payload(execution.result),
+            )
+        )
+        if not accepted:
+            raise RuntimeError("stale worker cannot commit tool operation outcome")
 
     def _inspection_budget_result(
         self,
@@ -438,12 +490,9 @@ class ToolOrchestrator:
             record_sink=persist,
             progress_sink=publish_progress,
         )
-        await self._commit(
-            lambda: self._store.record_tool_result(
-                turn_id=turn_id,
-                operation_id=operation.operation_id,
-                result=_tool_result_payload(execution.result),
-            )
+        await self._commit_execution_result(
+            turn_id=turn_id,
+            execution=execution,
         )
         return execution.result
 
@@ -541,12 +590,9 @@ class ToolOrchestrator:
             record_sink=persist,
             progress_sink=publish_progress,
         )
-        await self._commit(
-            lambda: self._store.record_tool_result(
-                turn_id=turn_id,
-                operation_id=operation.operation_id,
-                result=_tool_result_payload(execution.result),
-            )
+        await self._commit_execution_result(
+            turn_id=turn_id,
+            execution=execution,
         )
         return execution.result
 
@@ -665,35 +711,13 @@ class ToolOrchestrator:
                 claim.fencing_token,
             )
             return
-        status = {
-            ExecutionStatus.COMPLETED: "succeeded",
-            ExecutionStatus.FAILED: "failed",
-            ExecutionStatus.OUTCOME_UNKNOWN: "unknown",
-        }.get(record.status)
-        if status is None:
-            raise RuntimeError(f"unsupported ToolExecutionRecord status: {record.status}")
-        active_claim = self._claims.pop(record.operation_id, None)
-        if active_claim is None:
-            if (
-                existing is not None
-                and existing.status == "failed"
-                and existing.error_code == record.error_code == "resource_busy"
-            ):
-                return
-            raise RuntimeError("tool outcome has no active durable claim")
-        accepted = await self._commit(
-            lambda: self._store.commit_tool_operation_outcome(
-                operation_id=record.operation_id,
-                claim_generation=active_claim[0],
-                fencing_token=active_claim[1],
-                status=status,
-                attempt_count=record.attempt_count,
-                error_code=record.error_code,
-                requires_reconciliation=record.requires_reconciliation,
-            )
-        )
-        if not accepted:
-            raise RuntimeError("stale worker cannot commit tool operation outcome")
+        if record.status in {
+            ExecutionStatus.COMPLETED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.OUTCOME_UNKNOWN,
+        }:
+            return
+        raise RuntimeError(f"unsupported ToolExecutionRecord status: {record.status}")
 
     async def _write_operation_state(
         self,
