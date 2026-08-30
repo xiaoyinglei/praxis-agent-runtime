@@ -61,12 +61,20 @@ class HarnessModelResponse:
     tool_calls: tuple[HarnessToolCall, ...] = ()
     status: Literal["completed", "incomplete"] = "completed"
     incomplete_reason: str | None = None
+    reasoning_content: str | None = None
+    plan_content: str | None = None
 
     def __post_init__(self) -> None:
         if self.status == "completed" and self.incomplete_reason is not None:
             raise ValueError("completed model response cannot have an incomplete reason")
         if self.status == "incomplete" and not self.incomplete_reason:
             raise ValueError("incomplete model response requires a reason")
+        if self.reasoning_content is not None and not isinstance(
+            self.reasoning_content, str
+        ):
+            raise TypeError("model reasoning content must be a string or None")
+        if self.plan_content is not None and not isinstance(self.plan_content, str):
+            raise TypeError("model plan content must be a string or None")
 
 
 @dataclass(frozen=True, slots=True)

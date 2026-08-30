@@ -567,8 +567,14 @@ class Session:
                 lease_seconds=self._model_lease_seconds,
             )
         )
+        streamed_content: dict[str, list[str]] = {
+            "text": [],
+            "reasoning": [],
+            "plan": [],
+        }
 
         async def publish_delta(delta: HarnessModelDelta) -> None:
+            streamed_content[delta.channel].append(delta.content)
             channel = {
                 "text": "agent_message",
                 "reasoning": "reasoning",
@@ -694,6 +700,16 @@ class Session:
                 ),
                 response_status=response.status,
                 incomplete_reason=response.incomplete_reason,
+                reasoning_content=(
+                    response.reasoning_content
+                    if response.reasoning_content is not None
+                    else "".join(streamed_content["reasoning"])
+                ),
+                plan_content=(
+                    response.plan_content
+                    if response.plan_content is not None
+                    else "".join(streamed_content["plan"])
+                ),
             )
         )
         if not accepted:

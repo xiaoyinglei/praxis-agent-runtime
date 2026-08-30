@@ -39,7 +39,7 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSpec,
 )
-from agent_runtime.streaming.events import EventType, ItemDeltaKind
+from agent_runtime.streaming.events import EventType, ItemDeltaKind, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
@@ -94,6 +94,42 @@ class NativeTextDeltaGateway(CapturingGateway):
             usage=normalize_llm_usage(
                 input_tokens=3,
                 output_tokens=2,
+                input_tokens_include_cache=True,
+                usage_source="provider",
+            ),
+            provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
+            serializer_revision="openai-wire-v1",
+            wire_kind="openai-compatible",
+        )
+
+
+class NativeReasoningPlanGateway(CapturingGateway):
+    async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
+        request = kwargs["request"]
+        delta_sink = kwargs.get("delta_sink")
+        assert kwargs.get("stream") is True
+        assert callable(delta_sink)
+        fragments = (
+            (ProviderDeltaChannel.REASONING, "inspect "),
+            (ProviderDeltaChannel.REASONING, "evidence"),
+            (ProviderDeltaChannel.PLAN, "patch "),
+            (ProviderDeltaChannel.PLAN, "and verify"),
+            (ProviderDeltaChannel.TEXT, "real gateway answer"),
+        )
+        for channel, fragment in fragments:
+            emitted = delta_sink(ProviderDelta(channel, fragment))
+            if emitted is not None:
+                await emitted
+        return AgentModelResponse(
+            turn=ToolUseResult(
+                text="real gateway answer",
+                reasoning_content="inspect evidence",
+                stop_reason=StopReason.END_TURN,
+                raw_stop_reason="stop",
+            ),
+            usage=normalize_llm_usage(
+                input_tokens=3,
+                output_tokens=7,
                 input_tokens_include_cache=True,
                 usage_source="provider",
             ),
@@ -338,6 +374,73 @@ async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
     assert item_completed_event.data["content"] == "real gateway answer"
     assert turn_completed.type is EventType.TURN_COMPLETED
     assert result.answer == "real gateway answer"
+
+
+@pytest.mark.anyio
+async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    gateway = NativeReasoningPlanGateway()
+    model = BoundGatewayHarnessModel(
+        model_alias="test-model",
+        resolved=ResolvedModel(
+            generator=object(),
+            kwargs={"max_tokens": 256},
+            gateway=gateway,
+            provider="openai-compatible",
+            model="provider-model",
+        ),
+        instructions=("Answer the user directly.",),
+    )
+    dispatcher = TurnEventDispatcher(capacity=32)
+    stream = dispatcher.subscribe_controlling()
+    with RuntimeComposition.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=model,
+        completion_gate=AcceptAnswer(),
+    ) as runtime:
+        result = await runtime.thread_manager.run(
+            user_message="stream all native channels",
+            event_dispatcher=dispatcher,
+        )
+        events = []
+        while not stream.empty:
+            events.append(stream.receive_nowait())
+
+    assert result.answer == "real gateway answer"
+    expected = {
+        TurnItemKind.REASONING: ("inspect evidence", ItemDeltaKind.REASONING),
+        TurnItemKind.PLAN: ("patch and verify", ItemDeltaKind.PLAN),
+    }
+    item_ids: set[str] = set()
+    for item_kind, (content, delta_kind) in expected.items():
+        channel_events = [event for event in events if event.item_kind is item_kind]
+        assert [event.type for event in channel_events] == [
+            EventType.ITEM_STARTED,
+            EventType.ITEM_DELTA,
+            EventType.ITEM_DELTA,
+            EventType.ITEM_COMPLETED,
+        ]
+        assert {event.item_id for event in channel_events} == {
+            channel_events[0].item_id
+        }
+        assert "".join(
+            str(event.data["delta"])
+            for event in channel_events
+            if event.type is EventType.ITEM_DELTA
+        ) == content
+        assert all(
+            event.delta_kind is delta_kind
+            for event in channel_events
+            if event.type is EventType.ITEM_DELTA
+        )
+        assert channel_events[-1].data["content"] == content
+        assert channel_events[0].item_id is not None
+        item_ids.add(channel_events[0].item_id)
+    assert len(item_ids) == 2
 
 
 def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:

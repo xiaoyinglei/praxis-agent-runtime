@@ -161,8 +161,14 @@ class GatewayHarnessModel:
             if payload.model_token_budget_remaining is None
             else LLMBudgetLedger(total=payload.model_token_budget_remaining)
         )
+        streamed_content: dict[str, list[str]] = {
+            "text": [],
+            "reasoning": [],
+            "plan": [],
+        }
 
         async def forward_delta(delta: ProviderDelta) -> None:
+            streamed_content[delta.channel.value].append(delta.content)
             if delta_sink is None:
                 return
             emitted = delta_sink(
@@ -212,6 +218,12 @@ class GatewayHarnessModel:
                 ),
                 status="incomplete",
                 incomplete_reason="max_output_tokens",
+                reasoning_content=(
+                    response.turn.reasoning_content
+                    or "".join(streamed_content["reasoning"])
+                    or None
+                ),
+                plan_content="".join(streamed_content["plan"]) or None,
             )
         if response.turn.stop_reason is StopReason.TOOL_USE and not response.turn.tool_calls:
             raise RuntimeError("tool-use stop reason did not include tool calls")
@@ -231,6 +243,12 @@ class GatewayHarnessModel:
                 )
                 for call in response.turn.tool_calls
             ),
+            reasoning_content=(
+                response.turn.reasoning_content
+                or "".join(streamed_content["reasoning"])
+                or None
+            ),
+            plan_content="".join(streamed_content["plan"]) or None,
         )
 
 

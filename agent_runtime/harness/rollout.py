@@ -1713,6 +1713,8 @@ class RolloutStore:
         tool_calls: tuple[Mapping[str, Any], ...] = (),
         response_status: str = "completed",
         incomplete_reason: str | None = None,
+        reasoning_content: str | None = None,
+        plan_content: str | None = None,
         now: float | None = None,
     ) -> bool:
         if not isinstance(text, str):
@@ -1728,6 +1730,12 @@ class RolloutStore:
             raise ValueError("incomplete model response requires a reason")
         if response_status == "completed" and not text.strip() and not frozen_tool_calls:
             raise ValueError("model response must contain text or tool calls")
+        for channel, content in (
+            ("reasoning", reasoning_content),
+            ("plan", plan_content),
+        ):
+            if content is not None and not isinstance(content, str):
+                raise TypeError(f"model {channel} content must be a string or None")
         frozen_usage = _json_object(usage, field="usage")
         response_item_id: str | None = None
         observed_at = time.time() if now is None else float(now)
@@ -1769,22 +1777,32 @@ class RolloutStore:
                     },
                 )
                 return False
-            started_response = self._connection.execute(
+            started_channels = self._connection.execute(
                 """
                 SELECT payload_json
                 FROM rollout_records
                 WHERE turn_id = ?
                   AND record_type = 'item_started'
                   AND json_extract(payload_json, '$.attempt_id') = ?
-                  AND json_extract(payload_json, '$.channel') = 'agent_message'
+                  AND json_extract(payload_json, '$.channel') IN (
+                      'agent_message', 'reasoning', 'plan'
+                  )
                 ORDER BY record_id
                 """,
                 (operation["turn_id"], attempt_id),
             ).fetchall()
-            if len(started_response) > 1:
-                raise RuntimeError("model response has duplicate durable starts")
-            if started_response:
-                response_item_id = str(json.loads(started_response[0]["payload_json"])["item_id"])
+            started_by_channel: dict[str, Mapping[str, Any]] = {}
+            for row in started_channels:
+                payload = json.loads(row["payload_json"])
+                channel = str(payload["channel"])
+                if channel in started_by_channel:
+                    raise RuntimeError(
+                        f"model {channel} channel has duplicate durable starts"
+                    )
+                started_by_channel[channel] = payload
+            started_response = started_by_channel.get("agent_message")
+            if started_response is not None:
+                response_item_id = str(started_response["item_id"])
             else:
                 response_item_id = f"item_{uuid4().hex}"
             public_item_id = derive_model_public_item_id(
@@ -1807,7 +1825,7 @@ class RolloutStore:
                     "public_item_id": public_item_id,
                 },
             )
-            if not started_response:
+            if started_response is None:
                 self._append_and_reduce(
                     thread_id=operation["thread_id"],
                     turn_id=operation["turn_id"],
@@ -1841,6 +1859,31 @@ class RolloutStore:
                     },
                 },
             )
+            for channel, content in (
+                ("reasoning", reasoning_content),
+                ("plan", plan_content),
+            ):
+                started = started_by_channel.get(channel)
+                if started is None:
+                    continue
+                public_channel_item_id = derive_model_public_item_id(
+                    turn_id=str(operation["turn_id"]),
+                    model_attempt_id=attempt_id,
+                    channel=channel,
+                )
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="item_completed",
+                    producer="model",
+                    payload={
+                        "item_id": str(started["item_id"]),
+                        "attempt_id": attempt_id,
+                        "channel": channel,
+                        "public_item_id": public_channel_item_id,
+                        "payload": {"content": content or ""},
+                    },
+                )
         return True
 
     def list_model_operations(self, turn_id: str | None = None) -> tuple[ModelOperationSnapshot, ...]:
