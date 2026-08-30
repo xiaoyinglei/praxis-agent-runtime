@@ -203,6 +203,34 @@ async def test_lagging_passive_observer_detaches_without_blocking_control() -> N
     assert raised.value.last_cursor == "cursor-before"
 
 
+@pytest.mark.anyio
+async def test_lagging_observer_does_not_change_another_observers_cursor() -> None:
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    first = dispatcher.subscribe_passive(last_cursor="cursor-zero-first")
+    second = dispatcher.subscribe_passive(last_cursor="cursor-zero-second")
+
+    await dispatcher.emit(
+        events.turn_started("turn-cursor-isolation"),
+        cursor="cursor-one",
+    )
+    assert (await first.receive()).type is events.EventType.TURN_STARTED
+    await dispatcher.emit(
+        events.turn_completed("turn-cursor-isolation"),
+        cursor="cursor-two",
+    )
+    await dispatcher.emit(
+        events.turn_aborted("turn-cursor-isolation", reason="late observer"),
+        cursor="cursor-three",
+    )
+
+    with pytest.raises(stream_sinks.ObserverLagged) as first_lag:
+        await first.receive()
+    with pytest.raises(stream_sinks.ObserverLagged) as second_lag:
+        await second.receive()
+    assert first_lag.value.last_cursor == "cursor-two"
+    assert second_lag.value.last_cursor == "cursor-one"
+
+
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(
     tmp_path: Path,
 ) -> None:
