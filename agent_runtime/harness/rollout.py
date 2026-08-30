@@ -725,6 +725,14 @@ class RolloutStore:
         if kind == "tool_result":
             self._validate_artifact_references(frozen_payload)
         item_id = f"item_{uuid4().hex}"
+        public_projection = (
+            {
+                "public_item_id": item_id,
+                "public_item_kind": "legacy_message",
+            }
+            if kind == "model_response"
+            else {}
+        )
         with self._transaction():
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?",
@@ -739,14 +747,18 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="item_started",
                 producer="migration",
-                payload={"item_id": item_id, "kind": kind},
+                payload={"item_id": item_id, "kind": kind, **public_projection},
             )
             self._append_and_reduce(
                 thread_id=str(turn["thread_id"]),
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="migration",
-                payload={"item_id": item_id, "payload": frozen_payload},
+                payload={
+                    "item_id": item_id,
+                    "payload": frozen_payload,
+                    **public_projection,
+                },
             )
         return self.list_items(turn_id)[-1]
 

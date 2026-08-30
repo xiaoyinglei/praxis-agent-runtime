@@ -603,3 +603,110 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
         "agent_message",
         "tool",
     }
+
+
+def test_migrated_model_response_projects_one_legacy_message(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+        migrated = store.record_migrated_context_item(
+            turn_id=turn_id,
+            kind="model_response",
+            payload={"text": "migrated model answer", "tool_calls": []},
+        )
+
+        migrated_records = [
+            record
+            for record in store.list_records(thread_id)
+            if record.payload.get("item_id") == migrated.item_id
+        ]
+        assert [record.payload.get("public_item_id") for record in migrated_records] == [
+            migrated.item_id,
+            migrated.item_id,
+        ]
+        assert [record.payload.get("public_item_kind") for record in migrated_records] == [
+            "legacy_message",
+            "legacy_message",
+        ]
+
+        replayed = RolloutEventReader(store).read(thread_id)
+
+    legacy = [
+        result.event
+        for result in replayed
+        if result.event.item_kind is not None
+        and result.event.item_kind.value == "legacy_message"
+        and result.event.item_id == migrated.item_id
+    ]
+    assert [event.type.value for event in legacy] == [
+        "item_started",
+        "item_completed",
+    ]
+    assert legacy[-1].data == {"content": "migrated model answer"}
+
+
+def test_pre_identity_migrated_model_response_upcasts_to_legacy_message(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread_id, turn_id = _start_turn(store, workspace)
+        migrated = store.record_migrated_context_item(
+            turn_id=turn_id,
+            kind="model_response",
+            payload={"text": "pre-identity migrated answer", "tool_calls": []},
+        )
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT record_id, payload_json
+            FROM rollout_records
+            WHERE producer = 'migration'
+            """
+        ).fetchall()
+        for record_id, payload_json in rows:
+            payload = json.loads(payload_json)
+            if payload.get("item_id") != migrated.item_id:
+                continue
+            payload.pop("public_item_id")
+            payload.pop("public_item_kind")
+            rewritten = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            connection.execute(
+                """
+                UPDATE rollout_records
+                SET payload_json = ?, payload_hash = ?
+                WHERE record_id = ?
+                """,
+                (
+                    rewritten,
+                    hashlib.sha256(rewritten.encode()).hexdigest(),
+                    record_id,
+                ),
+            )
+
+    with RolloutStore(database) as reopened:
+        reopened.rebuild_projections()
+        assert reopened.verify().valid is True
+        replayed = RolloutEventReader(reopened).read(thread_id)
+
+    legacy = [
+        result.event
+        for result in replayed
+        if result.event.item_kind is not None
+        and result.event.item_kind.value == "legacy_message"
+        and result.event.item_id == migrated.item_id
+    ]
+    assert [event.type.value for event in legacy] == [
+        "item_started",
+        "item_completed",
+    ]
+    assert legacy[-1].data == {"content": "pre-identity migrated answer"}

@@ -476,7 +476,7 @@ class RolloutEventReader:
         internal_item_id = record.payload.get("item_id")
         if not isinstance(internal_item_id, str):
             raise RuntimeError("public Item start is missing item_id")
-        item_kind = _public_item_kind(kind)
+        item_kind = _public_item_kind(record, kind=kind)
         public_item_id = record.payload.get("public_item_id")
         if not isinstance(public_item_id, str):
             public_item_id = derived_public_item_id
@@ -513,7 +513,7 @@ class RolloutEventReader:
         internal_item_id = record.payload.get("item_id")
         if not isinstance(internal_item_id, str):
             raise RuntimeError("public Item completion is missing item_id")
-        item_kind = _public_item_kind(kind)
+        item_kind = _public_item_kind(record, kind=kind)
         public_item_id = record.payload.get("public_item_id")
         if not isinstance(public_item_id, str):
             public_item_id = derived_public_item_id
@@ -755,7 +755,17 @@ def _legacy_model_public_item_id(
     )
 
 
-def _public_item_kind(kind: str) -> TurnItemKind:
+def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:
+    persisted = record.payload.get("public_item_kind")
+    if persisted is not None:
+        try:
+            return TurnItemKind(str(persisted))
+        except ValueError:
+            raise RuntimeError(
+                f"persisted public Item kind is unsupported: {persisted!r}"
+            ) from None
+    if record.producer == "migration" and kind == "model_response":
+        return TurnItemKind.LEGACY_MESSAGE
     mapping = {
         "agent_message": TurnItemKind.LEGACY_MESSAGE,
         "model_response": TurnItemKind.AGENT_MESSAGE,
