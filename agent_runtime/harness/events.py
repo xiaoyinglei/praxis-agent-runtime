@@ -16,6 +16,7 @@ from agent_runtime.streaming.events import (
     derive_model_public_item_id,
     derive_operation_public_item_id,
     derive_plan_public_item_id,
+    derive_reconciliation_public_item_id,
     item_completed,
     item_started,
     turn_aborted,
@@ -33,6 +34,7 @@ _PUBLIC_ITEM_KINDS = frozenset(
         "model_reasoning",
         "model_plan",
         "tool_result",
+        "tool_reconciliation",
         "command_execution",
         "plan_state",
     }
@@ -402,7 +404,15 @@ class RolloutEventReader:
                 if record.turn_id is None:
                     raise RuntimeError("tool result is missing turn identity")
                 operation = self._store.read_tool_operation(operation_id)
-                status, error = _tool_completion_status(operation.status, operation.error_code)
+                status, error = (
+                    _record_item_status(record.payload)
+                    if record.payload_schema_version >= 2
+                    and record.payload.get("status") is not None
+                    else _tool_completion_status(
+                        operation.status,
+                        operation.error_code,
+                    )
+                )
                 completed = item_completed(
                     turn_id=record.turn_id,
                     item_id=public_item_id,
@@ -515,6 +525,11 @@ class RolloutEventReader:
             item_id=public_item_id,
             item_kind=item_kind,
             iteration=_iteration(record.payload),
+            parent_item_id=(
+                str(record.payload["parent_item_id"])
+                if isinstance(record.payload.get("parent_item_id"), str)
+                else None
+            ),
         )
 
     @staticmethod
@@ -561,6 +576,14 @@ class RolloutEventReader:
             if not isinstance(plan, Mapping):
                 raise RuntimeError("canonical plan snapshot payload is malformed")
             data = {"plan": dict(plan)}
+        elif item_kind is TurnItemKind.RECONCILIATION:
+            result = payload.get("result", {})
+            if not isinstance(result, Mapping):
+                raise RuntimeError("canonical reconciliation payload is malformed")
+            data = {
+                "result": dict(result),
+                "reconciler_revision": payload.get("reconciler_revision"),
+            }
         elif item_kind in {TurnItemKind.REASONING, TurnItemKind.PLAN}:
             data = {"content": payload.get("content", payload.get("text", ""))}
         else:
@@ -669,6 +692,20 @@ class RolloutEventReader:
                 derive_plan_public_item_id(
                     turn_id=record.turn_id,
                     revision=revision,
+                ),
+            )
+        reconciler_revision = payload.get("reconciler_revision")
+        if (
+            record.record_type in {"item_started", "item_completed"}
+            and isinstance(operation_id, str)
+            and isinstance(reconciler_revision, str)
+        ):
+            cls._require_public_item_id(
+                payload.get("public_item_id"),
+                derive_reconciliation_public_item_id(
+                    turn_id=record.turn_id,
+                    operation_id=operation_id,
+                    reconciler_revision=reconciler_revision,
                 ),
             )
 
@@ -797,6 +834,7 @@ def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:
         "model_reasoning": TurnItemKind.REASONING,
         "model_plan": TurnItemKind.PLAN,
         "plan_state": TurnItemKind.PLAN,
+        "tool_reconciliation": TurnItemKind.RECONCILIATION,
     }
     try:
         return mapping[kind]

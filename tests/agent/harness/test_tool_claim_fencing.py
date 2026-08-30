@@ -514,7 +514,9 @@ def test_trusted_reconciler_commits_unknown_success_without_replaying_runner(
         }
         assert store.read_turn(turn.turn_id).status == "running"
         [tool_result] = [
-            item for item in store.list_items(turn.turn_id) if item.kind == "tool_result"
+            item
+            for item in store.list_items(turn.turn_id)
+            if item.kind == "tool_reconciliation"
         ]
         assert operation.result_item_id == tool_result.item_id
         assert store.verify().valid is True

@@ -1019,6 +1019,9 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
         [operation] = store.list_tool_operations(turn.turn_id)
         assert operation.status == "unknown"
         assert operation.requires_reconciliation is True
+        assert operation.claim_owner is not None
+        assert operation.fencing_token is not None
+        assert operation.lease_expires_at is not None
         assert operation.result_item_id is not None
         [interaction] = store.list_interactions(turn.turn_id)
         assert interaction.kind == "tool_reconciliation"

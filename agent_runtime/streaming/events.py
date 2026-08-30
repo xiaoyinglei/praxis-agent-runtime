@@ -126,6 +126,20 @@ def derive_plan_public_item_id(*, turn_id: str, revision: int) -> str:
     return _derived_public_item_id("plan", turn_id, str(revision))
 
 
+def derive_reconciliation_public_item_id(
+    *,
+    turn_id: str,
+    operation_id: str,
+    reconciler_revision: str,
+) -> str:
+    return _derived_public_item_id(
+        "reconciliation",
+        turn_id,
+        operation_id,
+        reconciler_revision,
+    )
+
+
 def _derived_public_item_id(namespace: str, *parts: str) -> str:
     if any(not isinstance(part, str) or not part for part in parts):
         raise ValueError("public Item ID components must be non-empty strings")

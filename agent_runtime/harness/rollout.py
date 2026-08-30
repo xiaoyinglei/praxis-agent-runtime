@@ -21,6 +21,7 @@ from agent_runtime.streaming.events import (
     derive_model_public_item_id,
     derive_operation_public_item_id,
     derive_plan_public_item_id,
+    derive_reconciliation_public_item_id,
 )
 
 _REDUCER_VERSION = 1
@@ -2608,6 +2609,16 @@ class RolloutStore:
             if operation is None or operation["status"] != "unknown":
                 raise RuntimeError("reconciliation interaction is not bound to an unknown operation")
             thread_id = str(turn["thread_id"])
+            parent_item_id = derive_operation_public_item_id(
+                turn_id=turn_id,
+                operation_id=str(operation["operation_id"]),
+                attempt_generation=int(operation["claim_generation"]),
+            )
+            public_item_id = derive_reconciliation_public_item_id(
+                turn_id=turn_id,
+                operation_id=str(operation["operation_id"]),
+                reconciler_revision=reconciler_revision,
+            )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -2639,14 +2650,32 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="item_started",
                 producer="reconciler",
-                payload={"item_id": item_id, "kind": "tool_result"},
+                payload={
+                    "item_id": item_id,
+                    "kind": "tool_reconciliation",
+                    "operation_id": str(operation["operation_id"]),
+                    "public_item_id": public_item_id,
+                    "parent_item_id": parent_item_id,
+                    "reconciler_revision": reconciler_revision,
+                },
             )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="reconciler",
-                payload={"item_id": item_id, "payload": frozen_result},
+                payload={
+                    "item_id": item_id,
+                    "operation_id": str(operation["operation_id"]),
+                    "public_item_id": public_item_id,
+                    "parent_item_id": parent_item_id,
+                    "reconciler_revision": reconciler_revision,
+                    "payload": {
+                        "status": status,
+                        "result": frozen_result,
+                        "reconciler_revision": reconciler_revision,
+                    },
+                },
             )
             self._append_and_reduce(
                 thread_id=thread_id,
@@ -3146,6 +3175,16 @@ class RolloutStore:
                         "public_item_id": public_item_id,
                     }
                 )
+                public_status = {
+                    "succeeded": "success",
+                    "cancelled": "cancelled",
+                    "unknown": "outcome_unknown",
+                }.get(str(operation["status"]), "failed")
+                completed_payload["status"] = public_status
+                if public_status in {"failed", "outcome_unknown"}:
+                    completed_payload["error"] = str(
+                        operation["error_code"] or "tool execution failed"
+                    )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
