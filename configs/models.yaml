@@ -50,6 +50,12 @@ providers:
     base_url: https://api.groq.com/openai/v1
     api_key_env: GROQ_API_KEY
 
+  kimi:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+
   mimo:
     protocol: openai_compatible
     location: cloud
@@ -150,6 +156,12 @@ models:
     provider: mimo
     model: mimo-v2.5-pro
     context_window_tokens: 256000
+
+  kimi_cloud:
+    capability: chat
+    provider: kimi
+    model: kimi-k2.6
+    context_window_tokens: 262144
 
   # -------------------------------------------------------------------------
   # Embedding models.
