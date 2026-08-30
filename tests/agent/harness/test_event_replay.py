@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -11,6 +12,8 @@ import pytest
 import agent_runtime.harness as harness
 from agent_runtime.harness import RolloutStore
 from agent_runtime.harness.rollout import RolloutRecord
+from agent_runtime.streaming import events
+from agent_runtime.streaming import sink as stream_sinks
 from agent_runtime.streaming.events import StreamEvent
 
 
@@ -178,6 +181,26 @@ def test_global_tailer_fails_closed_on_incomplete_unknown_item_kind(
             reader.read(thread_id)
         with pytest.raises(RuntimeError, match="unknown internal Item kind"):
             reader.read_global()
+
+
+@pytest.mark.anyio
+async def test_lagging_passive_observer_detaches_without_blocking_control() -> None:
+    observer_error = getattr(stream_sinks, "ObserverLagged", None)
+    assert observer_error is not None, "lagging observers need a public error"
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    controlling = dispatcher.subscribe_controlling()
+    observer = dispatcher.subscribe_passive(last_cursor="cursor-before")
+    first = events.turn_started("turn-observer")
+    second = events.turn_completed("turn-observer")
+
+    await dispatcher.emit(first)
+    assert await controlling.receive() == first
+    await asyncio.wait_for(dispatcher.emit(second), timeout=0.2)
+
+    assert await controlling.receive() == second
+    with pytest.raises(observer_error) as raised:
+        await observer.receive()
+    assert raised.value.last_cursor == "cursor-before"
 
 
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(

@@ -33,14 +33,24 @@ class EventChannelClosed(RuntimeError):  # noqa: N818 - protocol name
     """A controlling event consumer closed its channel."""
 
 
+class ObserverLagged(RuntimeError):  # noqa: N818 - protocol name
+    """A passive observer fell behind its bounded event channel."""
+
+    def __init__(self, *, last_cursor: str | None) -> None:
+        super().__init__("passive observer lagged; reconnect from durable history")
+        self.last_cursor = last_cursor
+
+
 class _EventChannel:
-    def __init__(self, *, capacity: int) -> None:
+    def __init__(self, *, capacity: int, last_cursor: str | None = None) -> None:
         self.queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=capacity)
         self.closed = asyncio.Event()
+        self.error: Exception = EventChannelClosed("event channel is closed")
+        self.last_cursor = last_cursor
 
     async def put(self, event: StreamEvent) -> None:
         if self.closed.is_set():
-            raise EventChannelClosed("event channel is closed")
+            raise self.error
         put = asyncio.create_task(self.queue.put(event))
         closing = asyncio.create_task(self.closed.wait())
         await asyncio.wait((put, closing), return_when=asyncio.FIRST_COMPLETED)
@@ -48,14 +58,14 @@ class _EventChannel:
             put.cancel()
             await asyncio.gather(put, return_exceptions=True)
             self._discard_queued()
-            raise EventChannelClosed("event channel is closed")
+            raise self.error
         closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
         await put
 
     async def receive(self) -> StreamEvent:
         if self.closed.is_set():
-            raise EventChannelClosed("event channel is closed")
+            raise self.error
         receive = asyncio.create_task(self.queue.get())
         closing = asyncio.create_task(self.closed.wait())
         await asyncio.wait((receive, closing), return_when=asyncio.FIRST_COMPLETED)
@@ -63,14 +73,27 @@ class _EventChannel:
             receive.cancel()
             await asyncio.gather(receive, return_exceptions=True)
             self._discard_queued()
-            raise EventChannelClosed("event channel is closed")
+            raise self.error
         closing.cancel()
         await asyncio.gather(closing, return_exceptions=True)
         return await receive
 
-    def close(self) -> None:
+    def put_passive(self, event: StreamEvent, *, cursor: str | None) -> None:
         if self.closed.is_set():
             return
+        try:
+            self.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.close(error=ObserverLagged(last_cursor=self.last_cursor))
+            return
+        if cursor is not None:
+            self.last_cursor = cursor
+
+    def close(self, *, error: Exception | None = None) -> None:
+        if self.closed.is_set():
+            return
+        if error is not None:
+            self.error = error
         self.closed.set()
         self._discard_queued()
 
@@ -102,15 +125,23 @@ class TurnEventDispatcher:
             raise ValueError("capacity must be positive")
         self._capacity = capacity
         self._controlling: list[_EventChannel] = []
+        self._passive: list[_EventChannel] = []
 
     def subscribe_controlling(self) -> TurnEventStream:
         channel = _EventChannel(capacity=self._capacity)
         self._controlling.append(channel)
         return TurnEventStream(channel)
 
-    async def emit(self, event: StreamEvent) -> None:
+    def subscribe_passive(self, *, last_cursor: str | None = None) -> TurnEventStream:
+        channel = _EventChannel(capacity=self._capacity, last_cursor=last_cursor)
+        self._passive.append(channel)
+        return TurnEventStream(channel)
+
+    async def emit(self, event: StreamEvent, *, cursor: str | None = None) -> None:
         for channel in tuple(self._controlling):
             await channel.put(event)
+        for channel in tuple(self._passive):
+            channel.put_passive(event, cursor=cursor)
 
 
 class LegacyStreamProjectionSink:
