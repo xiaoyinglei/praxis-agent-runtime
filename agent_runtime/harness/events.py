@@ -130,10 +130,6 @@ class RolloutEventReader:
         self._store.read_thread(thread_id)
         sequence = 0 if after is None else self._decode(after, thread_id=thread_id)
         all_records = self._store.list_records(thread_id)
-        for record in all_records:
-            if record.record_type == "item_started":
-                self._validate_internal_item_kind(record)
-            self._validate_public_item_ids(record)
         projected = self._project_records(all_records, after_thread_sequence=sequence)
         return tuple(
             ReplayEvent(
@@ -157,8 +153,8 @@ class RolloutEventReader:
         *,
         after_record_id: int = 0,
     ) -> tuple[ReplayEvent, ...]:
-        records = self._store.list_global_records(after_record_id=0)
-        thread_ids = tuple(dict.fromkeys(record.thread_id for record in records))
+        tail_records = self._store.list_global_records(after_record_id=after_record_id)
+        thread_ids = tuple(dict.fromkeys(record.thread_id for record in tail_records))
         projected = sorted(
             (
                 pair
@@ -194,6 +190,10 @@ class RolloutEventReader:
         *,
         after_thread_sequence: int,
     ) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
+        for record in records:
+            if record.record_type == "item_started":
+                self._validate_internal_item_kind(record)
+            self._validate_public_item_ids(record)
         starts = {
             str(record.payload["item_id"]): record
             for record in records

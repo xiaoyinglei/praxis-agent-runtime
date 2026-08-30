@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -117,6 +119,65 @@ def test_global_tailer_accepts_only_after_record_id(tmp_path: Path) -> None:
         assert {result.thread_id for result in tail} == {second_thread}
         with pytest.raises(TypeError):
             reader.read_global(after=tail[-1].cursor)
+
+
+def test_global_tailer_rejects_negative_record_id(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        _start_turn(store, workspace, "negative global record")
+
+        with pytest.raises(ValueError, match="non-negative"):
+            _reader(store).read_global(after_record_id=-1)
+
+
+def test_global_tailer_fails_closed_on_incomplete_unknown_item_kind(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread_id, _turn_id = _start_turn(store, workspace, "unknown global item")
+        start = next(
+            record
+            for record in store.list_records(thread_id)
+            if record.record_type == "item_started"
+        )
+        payload = {"item_id": start.payload["item_id"], "kind": "future_internal_kind"}
+        payload_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                """
+                UPDATE rollout_records
+                SET payload_json = ?, payload_hash = ?
+                WHERE record_id = ?
+                """,
+                (
+                    payload_json,
+                    hashlib.sha256(payload_json.encode()).hexdigest(),
+                    start.record_id,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM rollout_records
+                WHERE record_type = 'item_completed'
+                  AND json_extract(payload_json, '$.item_id') = ?
+                """,
+                (start.payload["item_id"],),
+            )
+
+        reader = _reader(store)
+        with pytest.raises(RuntimeError, match="unknown internal Item kind"):
+            reader.read(thread_id)
+        with pytest.raises(RuntimeError, match="unknown internal Item kind"):
+            reader.read_global()
 
 
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(
