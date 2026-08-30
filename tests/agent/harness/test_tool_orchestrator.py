@@ -26,7 +26,7 @@ from agent_runtime.harness import (
 )
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.harness.tool_router import DurableToolRouter
-from agent_runtime.streaming.events import EventType, TurnItemKind
+from agent_runtime.streaming.events import EventType, ItemDeltaKind, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
@@ -345,6 +345,90 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
             started.item_id
         }
         assert completed.type is EventType.ITEM_COMPLETED
+
+
+@pytest.mark.anyio
+async def test_harness_command_item_receives_stdout_before_completion_and_distinct_stderr(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async def stream_command(
+        _arguments: Mapping[str, JsonValue],
+        sink,
+    ) -> dict[str, object]:
+        await sink(ToolProgress(ToolProgressKind.STDOUT, "stdout-line\n"))
+        await sink(ToolProgress(ToolProgressKind.STDERR, "stderr-line\n"))
+        return {
+            "stdout": "stdout-line\n",
+            "stderr": "stderr-line\n",
+            "exit_code": 0,
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": 1.0,
+        }
+
+    base = _read_tool(workspace=workspace)
+    command = replace(
+        base,
+        definition=replace(base.definition, name="run_command"),
+        stream=stream_command,
+    )
+    dispatcher = TurnEventDispatcher(capacity=16)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="run one command",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        orchestrator = ToolOrchestrator(
+            store=store,
+            tools={"run_command": command},
+            execution_context=ToolExecutionContext(
+                workspace_root=workspace,
+                cwd=workspace,
+            ),
+            event_dispatcher=dispatcher,
+        )
+        result = await orchestrator.execute(
+            turn_id=turn.turn_id,
+            call=ToolCall(
+                tool_call_id="call-command-1",
+                tool_name="run_command",
+                arguments={"path": "ignored"},
+                origin=ToolCallOrigin(
+                    request_id="request-command-1",
+                    toolset_revision="toolset-v1",
+                    exposed_tool_names=("run_command",),
+                ),
+            ),
+        )
+        public_events = []
+        while not stream.empty:
+            public_events.append(stream.receive_nowait())
+
+        assert result.is_error is False
+        assert [event.type for event in public_events] == [
+            EventType.ITEM_STARTED,
+            EventType.ITEM_DELTA,
+            EventType.ITEM_DELTA,
+            EventType.ITEM_COMPLETED,
+        ]
+        assert [event.delta_kind for event in public_events[1:3]] == [
+            ItemDeltaKind.COMMAND_STDOUT,
+            ItemDeltaKind.COMMAND_STDERR,
+        ]
+        assert [event.data["delta"] for event in public_events[1:3]] == [
+            "stdout-line\n",
+            "stderr-line\n",
+        ]
+        assert all(
+            event.item_kind is TurnItemKind.COMMAND for event in public_events
+        )
+        assert len({event.item_id for event in public_events}) == 1
 
 
 @pytest.mark.anyio
