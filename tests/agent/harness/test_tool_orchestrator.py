@@ -24,7 +24,10 @@ from agent_runtime.harness import (
     RuntimeComposition,
     ToolOrchestrator,
 )
+from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.streaming.events import EventType, TurnItemKind
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
 from agent_runtime.tools.tool import (
@@ -39,6 +42,8 @@ from agent_runtime.tools.tool import (
     ToolContentBlock,
     ToolDefinition,
     ToolEffect,
+    ToolProgress,
+    ToolProgressKind,
     ToolTarget,
     json_schema_input,
 )
@@ -169,6 +174,177 @@ def test_read_only_tool_operation_is_durable_before_runner_io(tmp_path: Path) ->
                 error_code=None,
                 requires_reconciliation=False,
             )
+
+
+@pytest.mark.anyio
+async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    base = _read_tool(workspace=workspace)
+    tool = replace(
+        base,
+        static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+        resolve_use=lambda arguments: ResolvedToolUse(
+            effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            targets=(
+                ToolTarget(
+                    kind="workspace_path",
+                    value=str(workspace / str(arguments["path"])),
+                ),
+            ),
+        ),
+    )
+    dispatcher = TurnEventDispatcher(capacity=16)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="approve one write",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        orchestrator = ToolOrchestrator(
+            store=store,
+            tools={"read_file": tool},
+            execution_context=ToolExecutionContext(
+                workspace_root=workspace,
+                cwd=workspace,
+                require_confirmation_for=frozenset({"read_file"}),
+            ),
+            event_dispatcher=dispatcher,
+        )
+        call = ToolCall(
+            tool_call_id="call-approval-1",
+            tool_name="read_file",
+            arguments={"path": "approved.txt"},
+            origin=ToolCallOrigin(
+                request_id="request-approval-1",
+                toolset_revision="toolset-v1",
+                exposed_tool_names=("read_file",),
+            ),
+        )
+
+        with pytest.raises(ToolApprovalRequiredError):
+            await orchestrator.execute(turn_id=turn.turn_id, call=call)
+
+        before_events = []
+        while not stream.empty:
+            before_events.append(stream.receive_nowait())
+        assert not any(
+            event.type is EventType.ITEM_STARTED for event in before_events
+        )
+        [before_approval] = store.list_tool_operations(turn.turn_id)
+        assert before_approval.status == "awaiting_approval"
+        assert before_approval.claim_generation == 0
+
+        result = await orchestrator.resume_approval(
+            turn_id=turn.turn_id,
+            decision="approve",
+        )
+        public_events = []
+        while not stream.empty:
+            public_events.append(stream.receive_nowait())
+
+        assert result.is_error is False
+        tool_events = [
+            event
+            for event in public_events
+            if event.item_kind is TurnItemKind.TOOL
+        ]
+        assert [event.type for event in tool_events] == [
+            EventType.ITEM_STARTED,
+            EventType.ITEM_COMPLETED,
+        ]
+        assert all(
+            event.item_kind is TurnItemKind.TOOL for event in tool_events
+        )
+        assert tool_events[0].item_id == tool_events[1].item_id
+        [claimed] = store.list_tool_operations(turn.turn_id)
+        assert claimed.claim_generation == 1
+        assert claimed.fencing_token is not None
+
+
+@pytest.mark.anyio
+async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    callback_returns = 0
+
+    async def stream_runner(
+        arguments: Mapping[str, JsonValue],
+        sink,
+    ) -> dict[str, str]:
+        nonlocal callback_returns
+        for content in ("first", "second"):
+            await sink(
+                ToolProgress(
+                    kind=ToolProgressKind.PROGRESS,
+                    content=f"{content}:{arguments['path']}",
+                )
+            )
+            callback_returns += 1
+        return {"text": "stream complete"}
+
+    tool = replace(
+        _read_tool(workspace=workspace),
+        stream=stream_runner,
+    )
+    dispatcher = TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="stream tool progress",
+            binding_manifest={"model_alias": "test-model"},
+        )
+        orchestrator = ToolOrchestrator(
+            store=store,
+            tools={"read_file": tool},
+            execution_context=ToolExecutionContext(
+                workspace_root=workspace,
+                cwd=workspace,
+            ),
+            event_dispatcher=dispatcher,
+        )
+        call = ToolCall(
+            tool_call_id="call-progress-1",
+            tool_name="read_file",
+            arguments={"path": "README.md"},
+            origin=ToolCallOrigin(
+                request_id="request-progress-1",
+                toolset_revision="toolset-v1",
+                exposed_tool_names=("read_file",),
+            ),
+        )
+        running = asyncio.create_task(
+            orchestrator.execute(turn_id=turn.turn_id, call=call)
+        )
+
+        started = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        await asyncio.sleep(0.05)
+
+        assert callback_returns == 1
+        assert running.done() is False
+
+        first = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        second = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        completed = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        result = await asyncio.wait_for(running, timeout=0.5)
+
+        assert result.is_error is False
+        assert [first.data["delta"], second.data["delta"]] == [
+            "first:README.md",
+            "second:README.md",
+        ]
+        assert {started.item_id, first.item_id, second.item_id, completed.item_id} == {
+            started.item_id
+        }
+        assert completed.type is EventType.ITEM_COMPLETED
 
 
 @pytest.mark.anyio

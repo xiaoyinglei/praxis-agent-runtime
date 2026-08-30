@@ -14,6 +14,12 @@ from uuid import uuid4
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
+from agent_runtime.streaming.events import (
+    ItemDeltaKind,
+    TurnItemKind,
+    derive_operation_public_item_id,
+    item_delta,
+)
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.executor import (
     ExecutionStartRejectedError,
@@ -30,6 +36,8 @@ from agent_runtime.tools.tool import (
     ToolCall,
     ToolCallOrigin,
     ToolEffect,
+    ToolProgress,
+    ToolProgressKind,
     ToolResult,
     ToolTarget,
 )
@@ -185,14 +193,27 @@ class ToolOrchestrator:
             )
             return inspection_block
         tool = self._tools.get(call.tool_name)
+        active_record: ToolExecutionRecord | None = None
 
         async def persist(record: ToolExecutionRecord) -> None:
+            nonlocal active_record
             if tool is None:
                 raise RuntimeError("unknown tools must not create execution records")
             await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=record,
+            )
+            if record.status is ExecutionStatus.STARTED:
+                active_record = record
+
+        async def publish_progress(progress: ToolProgress) -> None:
+            if active_record is None:
+                raise RuntimeError("tool progress arrived before the durable claim")
+            await self._publish_tool_progress(
+                turn_id=turn_id,
+                record=active_record,
+                progress=progress,
             )
 
         def capture_preflight(
@@ -209,6 +230,7 @@ class ToolOrchestrator:
             context=execution_context,
             record_sink=persist,
             preflight_sink=capture_preflight,
+            progress_sink=publish_progress,
         )
         if execution.result.error_code == "approval_required":
             if tool is None:
@@ -247,6 +269,42 @@ class ToolOrchestrator:
             )
         )
         return execution.result
+
+    async def _publish_tool_progress(
+        self,
+        *,
+        turn_id: str,
+        record: ToolExecutionRecord,
+        progress: ToolProgress,
+    ) -> None:
+        if self._event_dispatcher is None:
+            return
+        claim = self._claims.get(record.operation_id)
+        if claim is None:
+            raise RuntimeError("tool progress has no active fenced claim")
+        is_command = record.tool_name == "run_command"
+        delta_kind = (
+            ItemDeltaKind.COMMAND_STDOUT
+            if is_command and progress.kind is ToolProgressKind.STDOUT
+            else ItemDeltaKind.COMMAND_STDERR
+            if is_command and progress.kind is ToolProgressKind.STDERR
+            else ItemDeltaKind.TOOL_PROGRESS
+        )
+        await self._event_dispatcher.emit(
+            item_delta(
+                turn_id=turn_id,
+                item_id=derive_operation_public_item_id(
+                    turn_id=turn_id,
+                    operation_id=record.operation_id,
+                    attempt_generation=claim[0],
+                ),
+                item_kind=(
+                    TurnItemKind.COMMAND if is_command else TurnItemKind.TOOL
+                ),
+                delta_kind=delta_kind,
+                delta=progress.content,
+            )
+        )
 
     def _inspection_budget_result(
         self,
@@ -352,12 +410,25 @@ class ToolOrchestrator:
                 execution_context.denied_tool_call_ids | (set() if approved else {call.tool_call_id})
             ),
         )
+        active_record: ToolExecutionRecord | None = None
 
         async def persist(updated: ToolExecutionRecord) -> None:
+            nonlocal active_record
             await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=updated,
+            )
+            if updated.status is ExecutionStatus.STARTED:
+                active_record = updated
+
+        async def publish_progress(progress: ToolProgress) -> None:
+            if active_record is None:
+                raise RuntimeError("tool progress arrived before the durable claim")
+            await self._publish_tool_progress(
+                turn_id=turn_id,
+                record=active_record,
+                progress=progress,
             )
 
         execution = await self._executor.execute(
@@ -365,6 +436,7 @@ class ToolOrchestrator:
             context=context,
             record=record,
             record_sink=persist,
+            progress_sink=publish_progress,
         )
         await self._commit(
             lambda: self._store.record_tool_result(
@@ -441,12 +513,25 @@ class ToolOrchestrator:
             approved_tool_call_ids=(execution_context.approved_tool_call_ids | {call.tool_call_id}),
             denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
         )
+        active_record: ToolExecutionRecord | None = None
 
         async def persist(updated: ToolExecutionRecord) -> None:
+            nonlocal active_record
             await self._persist_execution_record(
                 turn_id=turn_id,
                 tool=tool,
                 record=updated,
+            )
+            if updated.status is ExecutionStatus.STARTED:
+                active_record = updated
+
+        async def publish_progress(progress: ToolProgress) -> None:
+            if active_record is None:
+                raise RuntimeError("tool progress arrived before the durable claim")
+            await self._publish_tool_progress(
+                turn_id=turn_id,
+                record=active_record,
+                progress=progress,
             )
 
         execution = await self._executor.execute(
@@ -454,6 +539,7 @@ class ToolOrchestrator:
             context=context,
             record=record,
             record_sink=persist,
+            progress_sink=publish_progress,
         )
         await self._commit(
             lambda: self._store.record_tool_result(
