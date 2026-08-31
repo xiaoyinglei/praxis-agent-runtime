@@ -229,11 +229,11 @@ def test_model_catalog_deep_copies_supplied_definitions() -> None:
     )
     original_revision = catalog.definition("kimi_cloud").definition_revision
 
-    provider_options = definition.defaults["provider_options"]
-    assert isinstance(provider_options, dict)
-    thinking = provider_options["thinking"]
-    assert isinstance(thinking, dict)
-    thinking["type"] = "disabled"
+    provider_options = definition.defaults.provider_options
+    assert provider_options is not None
+    thinking = provider_options.thinking
+    assert thinking is not None
+    object.__setattr__(thinking, "type", "disabled")
 
     assert catalog.definition("kimi_cloud").definition_revision == original_revision
 

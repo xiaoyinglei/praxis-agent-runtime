@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -50,7 +51,7 @@ def test_model_execution_definition_has_fixed_canonical_digest() -> None:
     assert b'"api_key_env":null' in payload
     assert b'"request_context_tokens":null' in payload
     assert definition.definition_revision == (
-        "sha256:18ede8321e6eb5d9865d4de06c718b59a93ba9032a90781041896a70101fa0f5"
+        "sha256:e3b798580476bc1f3f5ac7dfac8f95bb20708a02dbd8f617fb887d91c93117e4"
     )
 
 
@@ -111,7 +112,6 @@ def test_model_definition_snapshot_is_not_mutated_by_callers() -> None:
     first = registry.get_model_definition("main")
     revision = first.definition_revision
 
-    first.defaults["temperature"] = 0.75
     first.llm_stage_budgets["agent_step"] = first.llm_stage_budgets[
         "agent_step"
     ].model_copy(update={"max_input_tokens": 1})
@@ -131,8 +131,43 @@ def test_model_definition_rejects_non_json_request_values() -> None:
     config = _make_config()
     config.models["main"].defaults = {"provider_options": {"modes": {"a", "b"}}}
 
-    with pytest.raises(ValueError, match="JSON|json"):
+    with pytest.raises(ValueError, match="JSON|json|provider_options|extra"):
         ModelRegistry(config)
+
+
+@pytest.mark.parametrize(
+    "unsafe_defaults",
+    [
+        {"api_key": "plaintext-secret"},
+        {"headers": {"Authorization": "Bearer plaintext-secret"}},
+        {"provider_options": {"thinking": {"type": "enabled"}, "token": "secret"}},
+    ],
+)
+def test_whole_catalog_override_rejects_transport_or_secret_defaults(
+    unsafe_defaults: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.setenv(
+        "RAG_AGENT_MODELS",
+        json.dumps(
+            {
+                "version": 1,
+                "models": {
+                    "main": {
+                        "provider": "ollama",
+                        "model": "main-model",
+                        "defaults": unsafe_defaults,
+                    }
+                },
+                "default_model": "main",
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="extra|forbidden|provider_options"):
+        ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
 
 
 def test_resolved_kwargs_cannot_mutate_cached_definition(

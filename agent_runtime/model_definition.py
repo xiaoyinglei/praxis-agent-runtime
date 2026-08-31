@@ -7,8 +7,9 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelSpec
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
@@ -51,6 +52,30 @@ class RuntimeDefinition(BaseModel):
     poll_interval_seconds: float
 
 
+class ThinkingOptionsDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    type: Literal["enabled", "disabled"]
+
+
+class ProviderOptionsDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    thinking: ThinkingOptionsDefinition | None = None
+
+
+class RequestDefaultsDefinition(BaseModel):
+    """Safe request defaults; transport and authentication fields are absent."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0, allow_inf_nan=False)
+    parallel_tool_calls: bool | None = Field(default=None, strict=True)
+    seed: int | None = Field(default=None, ge=-(2**63), le=2**63 - 1, strict=True)
+    provider_options: ProviderOptionsDefinition | None = None
+
+
 class ModelExecutionDefinition(BaseModel):
     """Every request-affecting value needed to execute one selected model.
 
@@ -70,7 +95,7 @@ class ModelExecutionDefinition(BaseModel):
     timeout_seconds: float
     base_url: str | None
     api_key_env: str | None
-    defaults: dict[str, JsonValue]
+    defaults: RequestDefaultsDefinition
     context_window_tokens: int
     request_context_tokens: int | None
     supports_tools: bool
@@ -107,7 +132,7 @@ def build_model_execution_definition(
         timeout_seconds=spec.timeout_seconds,
         base_url=spec.base_url,
         api_key_env=spec.api_key_env,
-        defaults=deepcopy(spec.defaults),
+        defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),
         context_window_tokens=spec.context_window_tokens,
         request_context_tokens=spec.request_context_tokens,
         supports_tools=spec.supports_tools,
