@@ -272,6 +272,49 @@ def test_whole_catalog_yaml_override_rejects_unknown_chat_fields(tmp_path: Path)
         ModelRegistry._load_yaml_file(config_path)
 
 
+@pytest.mark.parametrize("source", ["json", "yaml"])
+def test_whole_catalog_override_rejects_explicit_null_defaults(
+    source: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "version": 1,
+        "models": {
+            "main": {
+                "provider": "ollama",
+                "model": "main-model",
+                "defaults": {"temperature": None},
+            }
+        },
+        "default_model": "main",
+    }
+    if source == "json":
+        monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+        monkeypatch.setenv("RAG_AGENT_MODELS", json.dumps(payload))
+        with pytest.raises(ValueError, match="defaults do not accept null"):
+            ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
+    else:
+        config_path = tmp_path / "models.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "version": 1,
+                    "models": {
+                        "main": {
+                            "capability": "chat",
+                            **payload["models"]["main"],
+                        }
+                    },
+                    "defaults": {"primary_model": "main"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="defaults do not accept null"):
+            ModelRegistry._load_yaml_file(config_path)
+
+
 def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -> None:
     config = AgentModelsConfig(
         models={

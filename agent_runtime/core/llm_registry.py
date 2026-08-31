@@ -310,9 +310,15 @@ class ModelRegistry:
         except Exception as exc:
             raise ModelNotAvailableError(f"Failed to build provider for {alias!r}: {exc}") from exc
 
+        definition = self._definitions[alias]
         kwargs: dict[str, Any] = {
-            "max_tokens": spec.max_tokens,
-            **deepcopy(spec.defaults),
+            "max_tokens": definition.max_tokens,
+            **deepcopy(
+                definition.defaults.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
+            ),
         }
         runtime_context_tokens = min(
             spec.context_window_tokens,

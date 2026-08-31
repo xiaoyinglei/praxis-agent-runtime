@@ -195,6 +195,15 @@ class ModelSpec(BaseModel):
     def validate_api_key_environment_name(cls, value: str | None) -> str | None:
         return validate_api_key_env_name(value)
 
+    @field_validator("defaults", mode="before")
+    @classmethod
+    def reject_null_request_defaults(cls, value: object) -> object:
+        if isinstance(value, dict):
+            null_path = _first_null_path(value)
+            if null_path is not None:
+                raise ValueError(f"model defaults do not accept null: {null_path}")
+        return value
+
     @model_validator(mode="after")
     def validate_request_context_limit(self) -> ModelSpec:
         if self.request_context_tokens is not None and self.request_context_tokens > self.context_window_tokens:
@@ -208,6 +217,18 @@ class ModelSpec(BaseModel):
             location=self.location,
         )
         return self
+
+
+def _first_null_path(value: dict[object, object], *, prefix: str = "") -> str | None:
+    for key, item in value.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        if item is None:
+            return path
+        if isinstance(item, dict):
+            nested = _first_null_path(item, prefix=path)
+            if nested is not None:
+                return nested
+    return None
 
 
 class AgentModelsConfig(BaseModel):
