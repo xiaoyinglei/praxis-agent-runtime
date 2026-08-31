@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import (
@@ -19,6 +19,27 @@ class ModelProvider(StrEnum):
     MLX = "mlx"
     OLLAMA = "ollama"
     OPENAI_COMPATIBLE = "openai_compatible"
+
+
+class ModelGenerationDefaults(BaseModel):
+    """Typed user-facing generation overrides supported by the runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0, allow_inf_nan=False)
+    parallel_tool_calls: bool | None = Field(default=None, strict=True)
+    seed: int | None = Field(default=None, ge=-(2**63), le=2**63 - 1, strict=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_nulls(cls, value: object) -> object:
+        if isinstance(value, dict):
+            null_keys = sorted(key for key, item in value.items() if item is None)
+            if null_keys:
+                joined = ", ".join(str(key) for key in null_keys)
+                raise ValueError(f"generation defaults do not accept null: {joined}")
+        return value
 
 
 class ModelRuntimeConfig(BaseModel):
