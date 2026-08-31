@@ -315,10 +315,11 @@ class UserModelRegistryStore:
         _validate_alias(alias)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
+            validated_mutation = _revalidate_patch(mutation)
             current = models.get(alias)
             if current is None:
                 raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
-            models[alias] = _apply_patch(current, mutation)
+            models[alias] = _apply_patch(current, validated_mutation)
             return models
 
         return self._mutate(expected=expected, apply=apply)
@@ -522,6 +523,17 @@ def _revalidate_document(
             "models": plain_models,
         }
     )
+
+
+def _revalidate_patch(mutation: ModelDefinitionPatch) -> ModelDefinitionPatch:
+    """Rebuild a caller-supplied patch from its explicitly set plain fields."""
+
+    plain_patch = mutation.model_dump(
+        mode="json",
+        exclude_unset=True,
+        warnings=False,
+    )
+    return ModelDefinitionPatch.model_validate(plain_patch)
 
 
 def _reject_none_changes(value: object, *, path: str = "changes") -> None:

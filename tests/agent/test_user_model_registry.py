@@ -316,6 +316,34 @@ def test_store_rejects_constructed_patch_with_none_deletion(tmp_path: Path) -> N
     assert store.path.read_bytes() == before
 
 
+@pytest.mark.parametrize(
+    ("changes", "unset_paths"),
+    [
+        ({"protocol": None}, ("tokenizer_model",)),
+        ({}, ("runtime.launch_command",)),
+        ({"max_tokens": 1024}, ("tokenizer_model",)),
+    ],
+)
+def test_store_revalidates_constructed_replacement_patch_shape_under_lock(
+    tmp_path: Path,
+    changes: dict[str, object],
+    unset_paths: tuple[str, ...],
+) -> None:
+    store = _store(tmp_path)
+    added = store.add("mine", _definition(), expected=store.read().version)
+    before = store.path.read_bytes()
+    bypass = ModelDefinitionPatch.model_construct(
+        replacement=_definition(model="replacement"),
+        changes=changes,
+        unset_paths=unset_paths,
+    )
+
+    with pytest.raises(ValidationError):
+        store.update("mine", bypass, expected=added.snapshot.version)
+
+    assert store.path.read_bytes() == before
+
+
 _UNSET_CASES: tuple[tuple[str, Callable[[UserModelDefinition], object]], ...] = (
     ("tokenizer_model", lambda value: value.tokenizer_model),
     ("provider_name", lambda value: value.provider_name),
