@@ -170,6 +170,40 @@ def test_whole_catalog_override_rejects_transport_or_secret_defaults(
         ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
 
 
+@pytest.mark.parametrize(
+    "unsafe_fields",
+    [
+        {"base_url": "https://example.com/v1?api_key=plaintext-secret"},
+        {"api_key_env": "sk-plaintext-secret"},
+        {
+            "runtime": {
+                "health_url": "http://127.0.0.1/health?token=plaintext-secret"
+            }
+        },
+    ],
+)
+def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
+    unsafe_fields: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = {"provider": "ollama", "model": "main-model", **unsafe_fields}
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.setenv(
+        "RAG_AGENT_MODELS",
+        json.dumps(
+            {
+                "version": 1,
+                "models": {"main": model},
+                "default_model": "main",
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="api_key_env|credentials|query|fragment"):
+        ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
+
+
 def test_resolved_kwargs_cannot_mutate_cached_definition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

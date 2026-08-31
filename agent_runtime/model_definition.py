@@ -9,9 +9,15 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from agent_runtime.core.llm_config import AgentModelsConfig, ModelSpec
+from agent_runtime.core.llm_config import (
+    AgentModelsConfig,
+    ModelProvider,
+    ModelSpec,
+    validate_api_key_env_name,
+    validate_http_url,
+)
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 
@@ -51,6 +57,11 @@ class RuntimeDefinition(BaseModel):
     startup_timeout_seconds: float
     poll_interval_seconds: float
 
+    @field_validator("health_url")
+    @classmethod
+    def validate_health_url(cls, value: str | None) -> str | None:
+        return validate_http_url(value, field_name="runtime.health_url")
+
 
 class ThinkingOptionsDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -86,7 +97,7 @@ class ModelExecutionDefinition(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    provider: str
+    provider: ModelProvider
     provider_name: str | None
     protocol: str | None
     model: str
@@ -100,7 +111,7 @@ class ModelExecutionDefinition(BaseModel):
     request_context_tokens: int | None
     supports_tools: bool
     supports_structured_output: bool
-    location: str | None
+    location: Literal["local", "cloud"] | None
     input_cost_per_1m: float | None
     output_cost_per_1m: float | None
     cache_read_cost_per_1m: float | None
@@ -108,6 +119,16 @@ class ModelExecutionDefinition(BaseModel):
     runtime: RuntimeDefinition | None
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str | None) -> str | None:
+        return validate_http_url(value, field_name="base_url")
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_environment_name(cls, value: str | None) -> str | None:
+        return validate_api_key_env_name(value)
 
     @property
     def definition_revision(self) -> str:
@@ -123,7 +144,7 @@ def build_model_execution_definition(
 
     runtime = spec.runtime
     return ModelExecutionDefinition(
-        provider=spec.provider.value,
+        provider=spec.provider,
         provider_name=spec.provider_name,
         protocol=spec.protocol,
         model=spec.model,

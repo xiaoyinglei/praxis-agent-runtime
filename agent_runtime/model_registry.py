@@ -14,7 +14,12 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from agent_runtime.core.llm_config import ModelGenerationDefaults, ModelProvider
+from agent_runtime.core.llm_config import (
+    ModelGenerationDefaults,
+    ModelProvider,
+    validate_api_key_env_name,
+    validate_http_url,
+)
 from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
     ConfigVersionConflict,
@@ -26,7 +31,6 @@ from agent_runtime.model_config_io import (
 )
 
 _ALIAS_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
-_ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_ALIASES = frozenset(
     {
         "list",
@@ -122,7 +126,7 @@ class ModelRuntimeDeclaration(BaseModel):
     @field_validator("health_url")
     @classmethod
     def validate_health_url(cls, value: str | None) -> str | None:
-        return _validate_http_url(value, field_name="runtime.health_url")
+        return validate_http_url(value, field_name="runtime.health_url")
 
     @field_validator("launch_command", mode="before")
     @classmethod
@@ -178,14 +182,12 @@ class UserModelDefinition(BaseModel):
     @field_validator("base_url")
     @classmethod
     def validate_base_url(cls, value: str | None) -> str | None:
-        return _validate_http_url(value, field_name="base_url")
+        return validate_http_url(value, field_name="base_url")
 
     @field_validator("api_key_env")
     @classmethod
     def validate_api_key_environment_name(cls, value: str | None) -> str | None:
-        if value is not None and _ENVIRONMENT_NAME_PATTERN.fullmatch(value) is None:
-            raise ValueError("api_key_env must be an environment-variable name")
-        return value
+        return validate_api_key_env_name(value)
 
     @model_validator(mode="after")
     def validate_budget_and_endpoint_consistency(self) -> Self:
@@ -464,25 +466,6 @@ def _validate_alias(alias: str) -> None:
 def _reject_blank_or_padded_text(value: str | None) -> str | None:
     if value is not None and (not value.strip() or value != value.strip()):
         raise ValueError("text values must be non-blank and have no surrounding whitespace")
-    return value
-
-
-def _validate_http_url(value: str | None, *, field_name: str) -> str | None:
-    if value is None:
-        return None
-    if any(character.isspace() for character in value):
-        raise ValueError(f"{field_name} must not contain whitespace")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
-        raise ValueError(f"{field_name} must not contain ASCII control characters")
-    parts = urlsplit(value)
-    if parts.scheme not in {"http", "https"} or not parts.netloc or parts.hostname is None:
-        raise ValueError(f"{field_name} must be an absolute HTTP(S) URL")
-    try:
-        _ = parts.port
-    except ValueError as error:
-        raise ValueError(f"{field_name} contains an invalid port") from error
-    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
-        raise ValueError(f"{field_name} must not contain credentials, query parameters, or fragments")
     return value
 
 

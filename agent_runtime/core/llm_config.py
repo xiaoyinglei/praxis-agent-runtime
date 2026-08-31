@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -11,6 +13,37 @@ from agent_runtime.modeling.contracts import (
     LLMCallStage,
     LLMStageBudget,
 )
+
+_ENVIRONMENT_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_http_url(value: str | None, *, field_name: str) -> str | None:
+    """Validate a secret-free absolute endpoint suitable for persistence."""
+
+    if value is None:
+        return None
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{field_name} must not contain whitespace")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError(f"{field_name} must not contain ASCII control characters")
+    parts = urlsplit(value)
+    if parts.scheme not in {"http", "https"} or not parts.netloc or parts.hostname is None:
+        raise ValueError(f"{field_name} must be an absolute HTTP(S) URL")
+    try:
+        _ = parts.port
+    except ValueError as error:
+        raise ValueError(f"{field_name} contains an invalid port") from error
+    if parts.username is not None or parts.password is not None or parts.query or parts.fragment:
+        raise ValueError(
+            f"{field_name} must not contain credentials, query parameters, or fragments"
+        )
+    return value
+
+
+def validate_api_key_env_name(value: str | None) -> str | None:
+    if value is not None and _ENVIRONMENT_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError("api_key_env must be an environment-variable name")
+    return value
 
 
 class ModelProvider(StrEnum):
