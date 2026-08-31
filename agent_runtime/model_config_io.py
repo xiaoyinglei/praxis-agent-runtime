@@ -140,6 +140,12 @@ def atomic_install_bytes(path: Path, payload: bytes) -> Literal["created", "exis
         _remove_temp_if_present(temp_path)
 
 
+def confirm_parent_directory_durability(path: Path) -> None:
+    """Confirm that the directory entry containing *path* is durable."""
+
+    _fsync_directory(path.parent)
+
+
 def _is_within(candidate: Path, root: Path) -> bool:
     try:
         candidate.relative_to(root)

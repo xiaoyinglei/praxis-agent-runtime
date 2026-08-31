@@ -23,6 +23,7 @@ from agent_runtime.model_config_io import (
     ConfigVersionConflict,
     FileVersion,
     atomic_replace_bytes,
+    confirm_parent_directory_durability,
     exclusive_config_lock,
     file_fingerprint,
 )
@@ -274,7 +275,13 @@ class ModelSessionStore:
                 raise ConfigVersionConflict(
                     "model session does not match the exact intended post-state"
                 )
-            observed.selection_requester = receipt.selection_requester
+            try:
+                confirm_parent_directory_durability(self.path)
+            except OSError as error:
+                raise SessionCommitOutcomeUnknown(
+                    "Model session still cannot confirm durable intended bytes",
+                    receipt=receipt,
+                ) from error
             return observed
 
 
@@ -387,6 +394,7 @@ class ModelControlPlane:
         self._registry = registry
         self._session_path = session_path
         self._session_store = ModelSessionStore(session_path) if session_path is not None else None
+        self._pending_session_receipt: SessionMutationReceipt | None = None
         self._local_runtime_manager = local_runtime_manager
         self.session_diagnostics = session_diagnostics
 
@@ -499,11 +507,15 @@ class ModelControlPlane:
         )
         persisted = None
         if persist and self._session_store is not None:
-            persisted = self._session_store.select(
-                spec.id,
-                expected=self.state.file_version,
-                selection_requester=requested_by,
-            )
+            try:
+                persisted = self._session_store.select(
+                    spec.id,
+                    expected=self.state.file_version,
+                    selection_requester=requested_by,
+                )
+            except SessionCommitOutcomeUnknown as error:
+                self._pending_session_receipt = error.receipt
+                raise
         self.state.current_model_id = spec.id
         self.state.selection_requester = requested_by
         if persisted is not None:
@@ -514,16 +526,23 @@ class ModelControlPlane:
     def reconcile_model_switch(self, receipt: SessionMutationReceipt) -> ModelSpec:
         if self._session_store is None:
             raise RuntimeError("model session storage is not configured")
+        if receipt is not self._pending_session_receipt:
+            raise ValueError("model session receipt was not issued by this control plane")
         spec = self.policy.review_switch(
             catalog=self.catalog,
             target_model_id=receipt.intended_model_id,
             requested_by=receipt.selection_requester,
         )
-        persisted = self._session_store.reconcile(receipt)
+        try:
+            persisted = self._session_store.reconcile(receipt)
+        except ConfigVersionConflict:
+            self._pending_session_receipt = None
+            raise
         self.state.current_model_id = persisted.current_model_id
-        self.state.selection_requester = persisted.selection_requester
+        self.state.selection_requester = receipt.selection_requester
         self.state.file_revision = persisted.file_revision
         self.state.fingerprint = persisted.fingerprint
+        self._pending_session_receipt = None
         return spec
 
     def request_model_switch(self, model_id: str) -> ModelSpec:
