@@ -18,12 +18,20 @@ from agent_runtime.core.llm_registry import (
     ResolvedModel,
     UnknownModelAliasError,
 )
+from agent_runtime.model_config_io import (
+    ConfigVersionConflict,
+    FileVersion,
+    atomic_replace_bytes,
+    exclusive_config_lock,
+    file_fingerprint,
+)
 from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.modeling.config import GenerationConfig
 
 ModelLocation = Literal["local", "cloud"]
 ModelSwitchRequester = Literal["user", "agent", "system"]
 ModelOrigin = Literal["builtin", "user", "override"]
+_MISSING_SESSION_FINGERPRINT = "missing"
 
 
 class LocalRuntimeReadyManager(Protocol):
@@ -140,31 +148,131 @@ class ModelSessionState:
     """Mutable model choice for one runtime session."""
 
     current_model_id: str
+    selection_requester: ModelSwitchRequester = "system"
+    file_revision: int = 0
+    fingerprint: str = _MISSING_SESSION_FINGERPRINT
+
+    @property
+    def file_version(self) -> FileVersion:
+        return FileVersion(
+            revision=self.file_revision,
+            fingerprint=self.fingerprint,
+        )
 
     @classmethod
     def load(cls, path: Path, *, default_model_id: str) -> ModelSessionState:
-        if not path.is_file():
-            return cls(current_model_id=default_model_id)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return cls(current_model_id=default_model_id)
-        current = payload.get("current_model_id")
-        if isinstance(current, str) and current.strip():
-            return cls(current_model_id=current.strip())
-        return cls(current_model_id=default_model_id)
+        return ModelSessionStore(path).read(default_model_id=default_model_id)
 
     def save(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            json.dumps(
-                {"current_model_id": self.current_model_id},
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
+        stored = ModelSessionStore(path).select(
+            self.current_model_id,
+            expected=self.file_version,
         )
+        self.file_revision = stored.file_revision
+        self.fingerprint = stored.fingerprint
+
+
+class ModelSessionStore:
+    """Crash-safe, compare-and-swap storage for one selected model alias."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def read(self, *, default_model_id: str) -> ModelSessionState:
+        try:
+            payload = self.path.read_bytes()
+        except FileNotFoundError:
+            return ModelSessionState(current_model_id=default_model_id)
+        document, legacy = _parse_session_document(payload)
+        return ModelSessionState(
+            current_model_id=cast(str, document["current_model_id"]),
+            selection_requester="user",
+            file_revision=0 if legacy else cast(int, document["revision"]),
+            fingerprint=file_fingerprint(payload),
+        )
+
+    def select(
+        self,
+        model_id: str,
+        *,
+        expected: FileVersion,
+    ) -> ModelSessionState:
+        if not isinstance(model_id, str) or not model_id.strip() or model_id != model_id.strip():
+            raise ValueError("model session current_model_id must be a non-empty trimmed string")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with exclusive_config_lock(self.path):
+            observed = self.read(default_model_id=model_id)
+            if observed.file_version != expected:
+                raise ConfigVersionConflict(
+                    "model session changed since it was read "
+                    f"(expected revision {expected.revision}, observed {observed.file_revision})"
+                )
+            revision = observed.file_revision + 1
+            encoded = _encode_session_document(
+                revision=revision,
+                current_model_id=model_id,
+            )
+            fingerprint = file_fingerprint(encoded)
+            atomic_replace_bytes(
+                self.path,
+                encoded,
+                intended_fingerprint=fingerprint,
+            )
+        return ModelSessionState(
+            current_model_id=model_id,
+            selection_requester="user",
+            file_revision=revision,
+            fingerprint=fingerprint,
+        )
+
+
+def _parse_session_document(payload: bytes) -> tuple[dict[str, object], bool]:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        document: dict[str, object] = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError(f"model session contains duplicate key {key!r}")
+            document[key] = value
+        return document
+
+    try:
+        value = json.loads(payload, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("model session is not valid UTF-8 JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError("model session must be a JSON object")
+    keys = set(value)
+    if keys == {"current_model_id"}:
+        legacy = True
+    elif keys == {"version", "revision", "current_model_id"}:
+        legacy = False
+        version = value["version"]
+        revision = value["revision"]
+        if type(version) is not int or version != 1:
+            raise ValueError("model session version must be 1")
+        if type(revision) is not int or revision < 0:
+            raise ValueError("model session revision must be a non-negative integer")
+    else:
+        raise ValueError("model session has unexpected or missing fields")
+    current = value["current_model_id"]
+    if not isinstance(current, str) or not current.strip() or current != current.strip():
+        raise ValueError("model session current_model_id must be a non-empty trimmed string")
+    return cast(dict[str, object], value), legacy
+
+
+def _encode_session_document(*, revision: int, current_model_id: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "version": 1,
+                "revision": revision,
+                "current_model_id": current_model_id,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,6 +319,7 @@ class ModelControlPlane:
         registry: ModelResolver | None = None,
         session_path: Path | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        session_diagnostics: tuple[str, ...] = (),
     ) -> None:
         if not catalog.has(state.current_model_id):
             raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
@@ -219,7 +328,9 @@ class ModelControlPlane:
         self.policy = policy or ModelPolicy()
         self._registry = registry
         self._session_path = session_path
+        self._session_store = ModelSessionStore(session_path) if session_path is not None else None
         self._local_runtime_manager = local_runtime_manager
+        self.session_diagnostics = session_diagnostics
 
     @classmethod
     def from_config_file(
@@ -227,6 +338,7 @@ class ModelControlPlane:
         path: Path,
         *,
         initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
@@ -235,6 +347,7 @@ class ModelControlPlane:
         return cls.from_registry(
             registry,
             initial_model_id=initial_model_id,
+            initial_selection_requester=initial_selection_requester,
             session_path=session_path,
             policy=policy,
             local_runtime_manager=local_runtime_manager,
@@ -246,6 +359,7 @@ class ModelControlPlane:
         env_path: str = ".env",
         *,
         initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
@@ -254,6 +368,7 @@ class ModelControlPlane:
         return cls.from_registry(
             registry,
             initial_model_id=initial_model_id,
+            initial_selection_requester=initial_selection_requester,
             session_path=session_path,
             policy=policy,
             local_runtime_manager=local_runtime_manager,
@@ -265,14 +380,16 @@ class ModelControlPlane:
         registry: ModelRegistry,
         *,
         initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
     ) -> ModelControlPlane:
         catalog = ModelCatalog.from_registry(registry)
-        state = _load_session_state(
+        state, diagnostics = _load_session_state(
             catalog=catalog,
             initial_model_id=initial_model_id,
+            initial_selection_requester=initial_selection_requester,
             session_path=session_path,
         )
         return cls(
@@ -282,6 +399,7 @@ class ModelControlPlane:
             registry=registry,
             session_path=session_path,
             local_runtime_manager=local_runtime_manager,
+            session_diagnostics=diagnostics,
         )
 
     @property
@@ -318,9 +436,17 @@ class ModelControlPlane:
             target_model_id=model_id,
             requested_by=requested_by,
         )
+        persisted = None
+        if persist and self._session_store is not None:
+            persisted = self._session_store.select(
+                spec.id,
+                expected=self.state.file_version,
+            )
         self.state.current_model_id = spec.id
-        if persist and self._session_path is not None:
-            self.state.save(self._session_path)
+        self.state.selection_requester = requested_by
+        if persisted is not None:
+            self.state.file_revision = persisted.file_revision
+            self.state.fingerprint = persisted.fingerprint
         return spec
 
     def request_model_switch(self, model_id: str) -> ModelSpec:
@@ -376,20 +502,46 @@ def _load_session_state(
     *,
     catalog: ModelCatalog,
     initial_model_id: str | None,
+    initial_selection_requester: ModelSwitchRequester,
     session_path: Path | None,
-) -> ModelSessionState:
+) -> tuple[ModelSessionState, tuple[str, ...]]:
+    store = ModelSessionStore(session_path) if session_path is not None else None
     if initial_model_id is not None:
-        state = ModelSessionState(current_model_id=initial_model_id)
-    elif session_path is not None:
-        state = ModelSessionState.load(
-            session_path,
-            default_model_id=catalog.default_model_id,
+        persisted = (
+            store.read(default_model_id=catalog.default_model_id)
+            if store is not None
+            else ModelSessionState(current_model_id=catalog.default_model_id)
         )
+        state = ModelSessionState(
+            current_model_id=initial_model_id,
+            selection_requester=initial_selection_requester,
+            file_revision=persisted.file_revision,
+            fingerprint=persisted.fingerprint,
+        )
+    elif store is not None:
+        state = store.read(default_model_id=catalog.default_model_id)
     else:
         state = ModelSessionState(current_model_id=catalog.default_model_id)
-    if not catalog.has(state.current_model_id):
+    if catalog.has(state.current_model_id):
+        return state, ()
+    if initial_model_id is not None or store is None:
         raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
-    return state
+    stale_model_id = state.current_model_id
+    try:
+        repaired = store.select(catalog.default_model_id, expected=state.file_version)
+    except ConfigVersionConflict:
+        newer = store.read(default_model_id=catalog.default_model_id)
+        if catalog.has(newer.current_model_id):
+            return newer, (
+                f"Persisted model {stale_model_id!r} became stale; preserved newer selection "
+                f"{newer.current_model_id!r}.",
+            )
+        repaired = store.select(catalog.default_model_id, expected=newer.file_version)
+    repaired.selection_requester = "user"
+    return repaired, (
+        f"Persisted model {stale_model_id!r} is unavailable; repaired selection to "
+        f"effective default {catalog.default_model_id!r}.",
+    )
 
 
 def _to_public_spec(
@@ -469,6 +621,7 @@ __all__ = [
     "ModelPolicyError",
     "ModelRuntimeSpec",
     "ModelSessionState",
+    "ModelSessionStore",
     "ModelSpec",
     "ModelSwitchRequester",
     "format_model_rows",

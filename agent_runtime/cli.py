@@ -22,6 +22,7 @@ from agent_runtime.models import (
     ModelNotAvailableError,
     ModelPolicyError,
     ModelSpec,
+    ModelSwitchRequester,
     format_model_rows,
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
@@ -557,6 +558,7 @@ def _create_agent_facade(
     model_session_path: Path | None = None,
     knowledge: RAGKnowledgeConfig | None = None,
     enable_workspace_mcp: bool = True,
+    _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
 
@@ -567,6 +569,7 @@ def _create_agent_facade(
         model_session_path=model_session_path,
         knowledge=knowledge,
         enable_workspace_mcp=enable_workspace_mcp,
+        _selection_requester=_selection_requester,
     )
 
 
@@ -1081,6 +1084,7 @@ def agent_chat(
         workspace_path=facade_workspace,
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
         knowledge=facade_knowledge,
+        _selection_requester="user",
     )
     _run_cli_async(
         _chat_facade_loop(
@@ -1203,6 +1207,7 @@ def agent_run(
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
         enable_workspace_mcp=not disable_workspace_mcp,
+        _selection_requester="user",
     )
     interactive_approval = not non_interactive and _is_interactive_terminal()
     event_display = _CLIToolEventDisplay()
@@ -1305,6 +1310,7 @@ def agent_resume(
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
+        _selection_requester="user",
     )
     event_display = _CLIToolEventDisplay()
     if action is None:

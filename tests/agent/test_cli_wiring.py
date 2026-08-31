@@ -67,10 +67,31 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
         assert switched.id == current.id
         assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
         assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
-            "current_model_id": current.id
+            "version": 1,
+            "revision": 1,
+            "current_model_id": current.id,
         }
         assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
         assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
+    finally:
+        if agent._model_control_plane is not None:
+            agent._model_control_plane.close()
+
+
+def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
+    agent = Agent(
+        model="qwen3_5_9b_mlx_4bit",
+        model_session_path=None,
+    )
+    try:
+        current = agent.current_model()
+        assert agent._get_model_control_plane().state.selection_requester == "system"
+
+        agent.switch_model(current.id)
+        assert agent._get_model_control_plane().state.selection_requester == "user"
+
+        agent._request_model_switch(current.id)
+        assert agent._get_model_control_plane().state.selection_requester == "agent"
     finally:
         if agent._model_control_plane is not None:
             agent._model_control_plane.close()
@@ -254,12 +275,14 @@ def test_agent_run_can_store_model_session_outside_workspace(
 
     cli_module.agent_run(
         task="Inspect the repository.",
+        model="qwen3_5_9b_mlx_4bit",
         checkpoint_db=tmp_path / "artifacts" / "checkpoints.sqlite",
         model_session_path=model_session_path,
         non_interactive=True,
     )
 
     assert facade_options[0]["model_session_path"] == model_session_path
+    assert facade_options[0]["_selection_requester"] == "user"
 
 
 def test_agent_run_can_disable_workspace_mcp_discovery(
@@ -342,6 +365,7 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
             "workspace_path": str(turn_workspace.resolve()),
             "model_session_path": cli_module.DEFAULT_MODEL_SESSION_PATH,
             "knowledge": knowledge,
+            "_selection_requester": "user",
         }
     ]
     assert loop_options[0]["previous_turn_id"] == previous.turn_id

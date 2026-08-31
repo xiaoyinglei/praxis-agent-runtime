@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
-from agent_runtime.models import ModelControlPlane, ModelSpec
+from agent_runtime.models import ModelControlPlane, ModelSpec, ModelSwitchRequester
 from agent_runtime.result import AgentPause, AgentResult
 from agent_runtime.streaming.events import StreamEvent
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -43,17 +43,21 @@ class Agent:
         model_session_path: Path | None = DEFAULT_MODEL_SESSION_PATH,
         knowledge: RAGKnowledgeConfig | None = None,
         enable_workspace_mcp: bool = True,
+        _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
+        if _selection_requester not in {"user", "agent", "system"}:
+            raise ValueError("_selection_requester must be user, agent, or system")
         self.model = model
         self.checkpoint_db = checkpoint_db
         self.workspace_path = None if workspace_path is None else Path(workspace_path).expanduser().resolve()
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self.enable_workspace_mcp = enable_workspace_mcp
+        self._selection_requester = _selection_requester
         self._model_control_plane: ModelControlPlane | None = None
         self._followup_model_id: str | None = None
 
@@ -69,6 +73,12 @@ class Agent:
             requested_by="user",
             persist=self.model_session_path is not None,
         )
+        self.model = spec.id
+        self._followup_model_id = spec.id
+        return spec
+
+    def _request_model_switch(self, model_id: str) -> ModelSpec:
+        spec = self._get_model_control_plane().request_model_switch(model_id)
         self.model = spec.id
         self._followup_model_id = spec.id
         return spec
@@ -466,6 +476,7 @@ class Agent:
                 if isinstance(mcp_policy, Mapping) and isinstance(mcp_policy.get("workspace_discovery_enabled"), bool)
                 else self.enable_workspace_mcp
             ),
+            _selection_requester=self._selection_requester,
         )
         override = self.__dict__.get("_harness_model")
         if callable(override):
@@ -627,6 +638,7 @@ class Agent:
         if self._model_control_plane is None:
             self._model_control_plane = ModelControlPlane.from_env(
                 initial_model_id=self.model,
+                initial_selection_requester=self._selection_requester,
                 session_path=self.model_session_path,
             )
         return self._model_control_plane

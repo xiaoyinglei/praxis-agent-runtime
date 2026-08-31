@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,11 @@ from agent_runtime.core.llm_registry import (
     UnknownModelAliasError,
 )
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
+from agent_runtime.model_config_io import (
+    CommitOutcomeUnknown,
+    ConfigVersionConflict,
+    file_fingerprint,
+)
 from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from agent_runtime.models import (
     ModelCatalog,
@@ -23,6 +29,7 @@ from agent_runtime.models import (
     ModelPolicyError,
     ModelRuntimeSpec,
     ModelSessionState,
+    ModelSessionStore,
     ModelSpec,
 )
 from agent_runtime.text import load_env_file
@@ -328,6 +335,26 @@ def test_model_policy_reviews_agent_model_switch_requests(tmp_path: Path) -> Non
     assert state.current_model_id == "local_qwen"
     control.switch_model("mimo_cloud", requested_by="user")
     assert state.current_model_id == "mimo_cloud"
+    assert state.selection_requester == "user"
+
+
+def test_agent_selection_requester_paths_are_explicit(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="system",
+        session_path=None,
+    )
+
+    assert control.state.selection_requester == "system"
+
+    control.switch_model("mimo_cloud", requested_by="user", persist=False)
+    assert control.state.selection_requester == "user"
+
+    control.request_model_switch("local_qwen")
+    assert control.state.selection_requester == "agent"
 
 
 def test_control_plane_resolves_provider_from_session_current_model(
@@ -441,6 +468,242 @@ def test_model_session_state_persists_without_rewriting_yaml(tmp_path: Path) -> 
     )
     assert restored.current_model().id == "mimo_cloud"
     assert config_path.read_text(encoding="utf-8") == before
+
+
+def test_model_session_legacy_record_loads_as_user_and_upgrades_on_switch(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    legacy_bytes = b'{"current_model_id":"local_qwen"}\n'
+    session_path.write_bytes(legacy_bytes)
+
+    control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+
+    assert control.state.selection_requester == "user"
+    assert control.state.file_revision == 0
+    assert control.state.fingerprint == file_fingerprint(legacy_bytes)
+    assert session_path.read_bytes() == legacy_bytes
+
+    control.switch_model("mimo_cloud", requested_by="user")
+
+    assert json.loads(session_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "revision": 1,
+        "current_model_id": "mimo_cloud",
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"version": 1, "revision": 0},
+        {"version": 1, "revision": True, "current_model_id": "local_qwen"},
+        {"version": 2, "revision": 0, "current_model_id": "local_qwen"},
+        {
+            "version": 1,
+            "revision": 0,
+            "current_model_id": "local_qwen",
+            "selection_requester": "system",
+        },
+    ],
+)
+def test_model_session_store_rejects_malformed_or_privileged_records(
+    tmp_path: Path,
+    payload: dict[str, object],
+) -> None:
+    session_path = tmp_path / "model-session.json"
+    session_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="session"):
+        ModelSessionStore(session_path).read(default_model_id="local_qwen")
+
+
+def test_model_session_switch_uses_revision_and_exact_fingerprint_cas(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    first = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+    second = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+
+    first.switch_model("mimo_cloud", requested_by="user")
+
+    with pytest.raises(ConfigVersionConflict, match="session"):
+        second.switch_model("mimo_cloud", requested_by="user")
+
+    assert second.current_model().id == "local_qwen"
+    assert json.loads(session_path.read_text(encoding="utf-8"))["current_model_id"] == "mimo_cloud"
+
+
+def test_model_session_fingerprint_detects_same_revision_rewrite(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    session_path.write_text(
+        json.dumps({"version": 1, "revision": 7, "current_model_id": "local_qwen"}),
+        encoding="utf-8",
+    )
+    control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+    session_path.write_text(
+        json.dumps({"version": 1, "revision": 7, "current_model_id": "mimo_cloud"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigVersionConflict, match="session"):
+        control.switch_model("mimo_cloud", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+
+
+def test_model_switch_write_failure_retains_selection_and_requester(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="system",
+        session_path=session_path,
+    )
+
+    def fail_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr("agent_runtime.models.atomic_replace_bytes", fail_write)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        control.switch_model("mimo_cloud", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+    assert control.state.selection_requester == "system"
+
+
+def test_model_switch_unknown_commit_outcome_retains_in_memory_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="system",
+        session_path=session_path,
+    )
+
+    def unknown_outcome(*_args: object, **_kwargs: object) -> None:
+        raise CommitOutcomeUnknown("cannot confirm session durability")
+
+    monkeypatch.setattr("agent_runtime.models.atomic_replace_bytes", unknown_outcome)
+
+    with pytest.raises(CommitOutcomeUnknown, match="cannot confirm"):
+        control.switch_model("mimo_cloud", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+    assert control.state.selection_requester == "system"
+
+
+def test_stale_persisted_alias_is_atomically_repaired_to_catalog_default(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    session_path.write_text(
+        json.dumps({"version": 1, "revision": 4, "current_model_id": "removed-model"}),
+        encoding="utf-8",
+    )
+
+    control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+
+    assert control.current_model().id == "local_qwen"
+    assert control.state.selection_requester == "user"
+    assert control.state.file_revision == 5
+    assert any("removed-model" in diagnostic for diagnostic in control.session_diagnostics)
+    assert json.loads(session_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "revision": 5,
+        "current_model_id": "local_qwen",
+    }
+
+
+def test_stale_repair_conflict_preserves_newer_valid_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    session_path.write_text(
+        json.dumps({"version": 1, "revision": 2, "current_model_id": "removed-model"}),
+        encoding="utf-8",
+    )
+    original_select = ModelSessionStore.select
+    calls = 0
+
+    def race_once(
+        self: ModelSessionStore,
+        model_id: str,
+        *,
+        expected: object,
+    ) -> ModelSessionState:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            current = self.read(default_model_id="local_qwen")
+            original_select(self, "mimo_cloud", expected=current.file_version)
+            raise ConfigVersionConflict("simulated session race")
+        return original_select(self, model_id, expected=expected)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ModelSessionStore, "select", race_once)
+
+    control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
+
+    assert calls == 1
+    assert control.current_model().id == "mimo_cloud"
+    assert control.state.file_revision == 3
+
+
+def test_stale_repair_retries_newer_invalid_selection_only_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    session_path.write_text(
+        json.dumps({"version": 1, "revision": 2, "current_model_id": "removed-model"}),
+        encoding="utf-8",
+    )
+    original_select = ModelSessionStore.select
+    calls = 0
+
+    def always_race(
+        self: ModelSessionStore,
+        model_id: str,
+        *,
+        expected: object,
+    ) -> ModelSessionState:
+        nonlocal calls
+        calls += 1
+        current = self.read(default_model_id="local_qwen")
+        original_select(self, f"still-invalid-{calls}", expected=current.file_version)
+        raise ConfigVersionConflict("simulated session race")
+
+    monkeypatch.setattr(ModelSessionStore, "select", always_race)
+
+    with pytest.raises(ConfigVersionConflict, match="simulated session race"):
+        ModelControlPlane.from_config_file(config_path, session_path=session_path)
+
+    assert calls == 2
 
 
 def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
