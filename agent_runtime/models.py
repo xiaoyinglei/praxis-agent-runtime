@@ -152,6 +152,13 @@ class ModelSessionState:
     file_revision: int = 0
     fingerprint: str = _MISSING_SESSION_FINGERPRINT
 
+    def __post_init__(self) -> None:
+        _validate_selection_requester(self.selection_requester)
+        if type(self.file_revision) is not int or self.file_revision < 0:
+            raise ValueError("model session file_revision must be a non-negative integer")
+        if not isinstance(self.fingerprint, str) or not self.fingerprint:
+            raise ValueError("model session fingerprint must be a non-empty string")
+
     @property
     def file_version(self) -> FileVersion:
         return FileVersion(
@@ -431,6 +438,7 @@ class ModelControlPlane:
         requested_by: ModelSwitchRequester,
         persist: bool = True,
     ) -> ModelSpec:
+        _validate_selection_requester(requested_by)
         spec = self.policy.review_switch(
             catalog=self.catalog,
             target_model_id=model_id,
@@ -542,6 +550,11 @@ def _load_session_state(
         f"Persisted model {stale_model_id!r} is unavailable; repaired selection to "
         f"effective default {catalog.default_model_id!r}.",
     )
+
+
+def _validate_selection_requester(value: object) -> None:
+    if value not in {"user", "agent", "system"}:
+        raise ValueError("selection requester must be user, agent, or system")
 
 
 def _to_public_spec(

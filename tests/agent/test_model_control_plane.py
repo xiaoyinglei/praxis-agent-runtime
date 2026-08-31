@@ -357,6 +357,23 @@ def test_agent_selection_requester_paths_are_explicit(tmp_path: Path) -> None:
     assert control.state.selection_requester == "agent"
 
 
+def test_selection_requester_rejects_unknown_policy_domains(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+
+    with pytest.raises(ValueError, match="requester"):
+        ModelSessionState(
+            current_model_id="local_qwen",
+            selection_requester="root",  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="requester"):
+        ModelControlPlane.from_config_file(
+            config_path,
+            initial_model_id="local_qwen",
+            initial_selection_requester="root",  # type: ignore[arg-type]
+        )
+
+
 def test_control_plane_resolves_provider_from_session_current_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
