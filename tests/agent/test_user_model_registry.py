@@ -16,6 +16,7 @@ from agent_runtime.model_registry import (
     ModelRuntimeDeclaration,
     RegistryCollisionError,
     RegistryCommitOutcomeUnknown,
+    RegistryConfigValidationError,
     RegistryEntryNotFound,
     RegistryOverrideActiveError,
     UserModelDefinition,
@@ -101,6 +102,10 @@ def test_schema_rejects_unsupported_provider(provider: str) -> None:
         "http://host:invalid/v1",
         "http://key@host/v1",
         "https://host/v1?api_key=x",
+        " http://host/v1",
+        "http://host/v1 ",
+        "http://host/v1\nmodels",
+        "http://host\t.example/v1",
     ],
 )
 def test_schema_rejects_non_absolute_or_secret_bearing_url(base_url: str) -> None:
@@ -117,6 +122,20 @@ def test_schema_requires_cloud_endpoint_and_matching_location() -> None:
         _definition(location="local", base_url="https://api.example.com/v1")
     with pytest.raises(ValidationError, match="local"):
         _definition(provider="ollama", location=None, base_url="https://api.example.com/v1")
+
+
+@pytest.mark.parametrize(
+    "health_url",
+    [
+        " http://127.0.0.1/health",
+        "http://127.0.0.1/health\nnext",
+        "http://local\thost/health",
+        "http://127.0.0.1/health\x7f",
+    ],
+)
+def test_schema_rejects_whitespace_or_control_characters_in_health_url(health_url: str) -> None:
+    with pytest.raises(ValidationError, match="whitespace|control"):
+        ModelRuntimeDeclaration(health_url=health_url)
 
 
 @pytest.mark.parametrize("api_key_env", ["sk-secret", "API KEY", "1TOKEN", "${TOKEN}", "TOKEN=value"])
@@ -210,6 +229,40 @@ def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ValidationError, match="null"):
+        store.read()
+
+
+@pytest.mark.parametrize(
+    ("yaml_text", "duplicate"),
+    [
+        (
+            "version: 1\nrevision: 0\nmodels:\n"
+            "  mine: {provider: mlx, model: first}\n"
+            "  mine: {provider: mlx, model: second}\n",
+            "mine",
+        ),
+        (
+            "version: 1\nrevision: 0\nmodels:\n  mine:\n"
+            "    provider: mlx\n    provider: ollama\n    model: m\n",
+            "provider",
+        ),
+        (
+            "version: 1\nrevision: 0\nmodels:\n  mine:\n"
+            "    provider: mlx\n    model: m\n    defaults:\n"
+            "      temperature: 0.1\n      temperature: 0.2\n",
+            "temperature",
+        ),
+    ],
+)
+def test_read_rejects_duplicate_yaml_mapping_keys(
+    tmp_path: Path,
+    yaml_text: str,
+    duplicate: str,
+) -> None:
+    store = _store(tmp_path)
+    store.path.write_text(yaml_text, encoding="utf-8")
+
+    with pytest.raises(RegistryConfigValidationError, match=f"duplicate.*{duplicate}"):
         store.read()
 
 

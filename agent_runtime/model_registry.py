@@ -8,7 +8,7 @@ import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal, Self, cast
 from urllib.parse import urlsplit
 
 import yaml
@@ -77,6 +77,35 @@ class InvalidUnsetPath(ValueError):  # noqa: N818
 
 class RegistryOverrideActiveError(RuntimeError):
     """The runtime is using a whole-catalog override that ignores this registry."""
+
+
+class RegistryConfigValidationError(ValueError):
+    """The registry YAML is syntactically invalid or structurally ambiguous."""
+
+
+class _StrictSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects duplicate keys at every mapping depth."""
+
+    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
+        if not isinstance(node, yaml.MappingNode):
+            return cast(dict[Any, Any], super().construct_mapping(node, deep=deep))
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as error:
+                raise RegistryConfigValidationError(
+                    f"Registry YAML mapping key at line {key_node.start_mark.line + 1} is not scalar"
+                ) from error
+            if duplicate:
+                raise RegistryConfigValidationError(
+                    f"Registry YAML contains duplicate mapping key {key!r} "
+                    f"at line {key_node.start_mark.line + 1}"
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
 
 
 class ModelRuntimeDeclaration(BaseModel):
@@ -403,7 +432,7 @@ class UserModelRegistryStore:
                 document=UserModelRegistryDocument(revision=0),
                 fingerprint=file_fingerprint(b""),
             )
-        parsed = yaml.safe_load(payload)
+        parsed = _load_registry_yaml(payload)
         document = UserModelRegistryDocument.model_validate(parsed)
         return RegistrySnapshot(document=document, fingerprint=file_fingerprint(payload))
 
@@ -441,6 +470,10 @@ def _reject_blank_or_padded_text(value: str | None) -> str | None:
 def _validate_http_url(value: str | None, *, field_name: str) -> str | None:
     if value is None:
         return None
+    if value != value.strip():
+        raise ValueError(f"{field_name} must not contain leading or trailing whitespace")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError(f"{field_name} must not contain ASCII control characters")
     parts = urlsplit(value)
     if parts.scheme not in {"http", "https"} or not parts.netloc or parts.hostname is None:
         raise ValueError(f"{field_name} must be an absolute HTTP(S) URL")
@@ -558,6 +591,16 @@ def _serialize_document(document: UserModelRegistryDocument) -> bytes:
     return text.encode("utf-8")
 
 
+def _load_registry_yaml(payload: bytes) -> object:
+    try:
+        parsed: object = yaml.load(payload, Loader=_StrictSafeLoader)
+    except RegistryConfigValidationError:
+        raise
+    except yaml.YAMLError as error:
+        raise RegistryConfigValidationError(f"Invalid registry YAML: {error}") from error
+    return parsed
+
+
 __all__ = [
     "InvalidUnsetPath",
     "ModelDefinitionPatch",
@@ -566,6 +609,7 @@ __all__ = [
     "MutationReceipt",
     "RegistryCollisionError",
     "RegistryCommitOutcomeUnknown",
+    "RegistryConfigValidationError",
     "RegistryEntryNotFound",
     "RegistryMutationResult",
     "RegistryOverrideActiveError",
