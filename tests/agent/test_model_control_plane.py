@@ -374,6 +374,55 @@ def test_selection_requester_rejects_unknown_policy_domains(tmp_path: Path) -> N
         )
 
 
+def test_selection_requester_rejects_objects_that_compare_equal_to_system() -> None:
+    class ForgedRequester:
+        def __hash__(self) -> int:
+            return hash("system")
+
+        def __eq__(self, other: object) -> bool:
+            return other == "system"
+
+    with pytest.raises(ValueError, match="requester"):
+        ModelSessionState(
+            current_model_id="local_qwen",
+            selection_requester=ForgedRequester(),  # type: ignore[arg-type]
+        )
+
+
+def test_initial_and_restored_selections_are_reviewed_in_requester_domain(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    user_policy = ModelPolicy(allowed_user_model_ids=frozenset({"local_qwen"}))
+
+    with pytest.raises(ModelPolicyError, match="not allowed"):
+        ModelControlPlane.from_config_file(
+            config_path,
+            initial_model_id="mimo_cloud",
+            initial_selection_requester="user",
+            policy=user_policy,
+        )
+
+    session_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "revision": 3,
+                "current_model_id": "mimo_cloud",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ModelPolicyError, match="not allowed"):
+        ModelControlPlane.from_config_file(
+            config_path,
+            session_path=session_path,
+            policy=user_policy,
+        )
+
+
 def test_control_plane_resolves_provider_from_session_current_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

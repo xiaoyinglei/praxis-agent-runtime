@@ -13,7 +13,12 @@ from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
 
 from agent_runtime.knowledge import RAGKnowledgeConfig
-from agent_runtime.models import ModelControlPlane, ModelSpec, ModelSwitchRequester
+from agent_runtime.models import (
+    ModelControlPlane,
+    ModelSpec,
+    ModelSwitchRequester,
+    validate_model_switch_requester,
+)
 from agent_runtime.result import AgentPause, AgentResult
 from agent_runtime.streaming.events import StreamEvent
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -49,15 +54,14 @@ class Agent:
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
-        if _selection_requester not in {"user", "agent", "system"}:
-            raise ValueError("_selection_requester must be user, agent, or system")
+        selection_requester = validate_model_switch_requester(_selection_requester)
         self.model = model
         self.checkpoint_db = checkpoint_db
         self.workspace_path = None if workspace_path is None else Path(workspace_path).expanduser().resolve()
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self.enable_workspace_mcp = enable_workspace_mcp
-        self._selection_requester = _selection_requester
+        self._selection_requester = selection_requester
         self._model_control_plane: ModelControlPlane | None = None
         self._followup_model_id: str | None = None
 

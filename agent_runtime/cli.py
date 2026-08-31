@@ -1310,7 +1310,6 @@ def agent_resume(
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
-        _selection_requester="user",
     )
     event_display = _CLIToolEventDisplay()
     if action is None:

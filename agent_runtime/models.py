@@ -297,6 +297,7 @@ class ModelPolicy:
         target_model_id: str,
         requested_by: ModelSwitchRequester,
     ) -> ModelSpec:
+        requested_by = validate_model_switch_requester(requested_by)
         spec = catalog.get(target_model_id)
         allowed = self._allowed_ids_for(requested_by)
         if allowed is not None and target_model_id not in allowed:
@@ -333,6 +334,11 @@ class ModelControlPlane:
         self.catalog = catalog
         self.state = state
         self.policy = policy or ModelPolicy()
+        self.policy.review_switch(
+            catalog=self.catalog,
+            target_model_id=self.state.current_model_id,
+            requested_by=self.state.selection_requester,
+        )
         self._registry = registry
         self._session_path = session_path
         self._session_store = ModelSessionStore(session_path) if session_path is not None else None
@@ -553,8 +559,13 @@ def _load_session_state(
 
 
 def _validate_selection_requester(value: object) -> None:
-    if value not in {"user", "agent", "system"}:
+    validate_model_switch_requester(value)
+
+
+def validate_model_switch_requester(value: object) -> ModelSwitchRequester:
+    if type(value) is not str or value not in ("user", "agent", "system"):
         raise ValueError("selection requester must be user, agent, or system")
+    return cast(ModelSwitchRequester, value)
 
 
 def _to_public_spec(
@@ -638,4 +649,5 @@ __all__ = [
     "ModelSpec",
     "ModelSwitchRequester",
     "format_model_rows",
+    "validate_model_switch_requester",
 ]
