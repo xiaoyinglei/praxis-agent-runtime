@@ -28,6 +28,9 @@ def test_built_wheel_loads_bundled_qwen35_model_outside_repo(
     env = os.environ.copy()
     env.pop("RAG_AGENT_MODELS", None)
     env.pop("RAG_AGENT_MODELS_PATH", None)
+    env["PRAXIS_MODEL_REGISTRY_PATH"] = str(
+        (tmp_path / "isolated-user-config" / "models.yaml").resolve()
+    )
     env["PYTHONPATH"] = str(wheel)
     script = textwrap.dedent(
         """

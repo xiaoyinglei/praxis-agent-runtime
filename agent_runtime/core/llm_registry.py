@@ -2,14 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.model_config_io import discover_git_worktree
+from agent_runtime.model_definition import (
+    ModelExecutionDefinition,
+    build_model_execution_definition,
+    effective_stage_budgets,
+)
+from agent_runtime.model_registry import UserModelDefinition, UserModelRegistryStore
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
-from agent_runtime.modeling.contracts import LLMCallStage, parse_llm_stage_budgets
+from agent_runtime.modeling.contracts import parse_llm_stage_budgets
 
 
 class UnknownModelAliasError(KeyError):
@@ -70,8 +78,28 @@ class ModelRegistry:
     _BUNDLED_CONFIG_PACKAGE = "agent_runtime"
     _BUNDLED_CONFIG_RESOURCE = ("_data", "models.yaml")
 
-    def __init__(self, config: AgentModelsConfig) -> None:
-        self._config = config
+    def __init__(
+        self,
+        config: AgentModelsConfig,
+        *,
+        origins: Mapping[str, Literal["builtin", "user", "override"]] | None = None,
+    ) -> None:
+        self._config = config.model_copy(deep=True)
+        if origins is not None and set(origins) != set(self._config.models):
+            raise ValueError("model origins must cover exactly the configured models")
+        default_origin: Literal["builtin", "user", "override"] = "override"
+        self._origins = {
+            alias: origins[alias] if origins is not None else default_origin
+            for alias in self._config.models
+        }
+        self._definitions = {
+            alias: build_model_execution_definition(spec=spec, config=self._config)
+            for alias, spec in self._config.models.items()
+        }
+        for definition in self._definitions.values():
+            # Validate canonical JSON at the catalog boundary so unsupported
+            # values fail before a model can be selected or dispatched.
+            _ = definition.definition_revision
         self._cache: dict[str, ResolvedModel] = {}
 
     @property
@@ -94,12 +122,24 @@ class ModelRegistry:
         spec = self._config.models.get(alias)
         if spec is None:
             raise UnknownModelAliasError(f"Model alias {alias!r} not found in config")
-        return spec
+        return spec.model_copy(deep=True)
+
+    def origin(self, alias: str) -> Literal["builtin", "user", "override"]:
+        try:
+            return self._origins[alias]
+        except KeyError as exc:
+            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
+
+    def get_model_definition(self, alias: str) -> ModelExecutionDefinition:
+        try:
+            return self._definitions[alias].model_copy(deep=True)
+        except KeyError as exc:
+            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
 
     @classmethod
     def from_env(cls, env_path: str = ".env", *, default_model: str | None = None) -> ModelRegistry:
         _load_env_file(Path(env_path))
-        config = cls._load_config()
+        config, origins = cls._load_effective_config()
         if default_model is not None:
             if default_model not in config.models:
                 raise UnknownModelAliasError(f"Model alias {default_model!r} not found in config")
@@ -109,7 +149,45 @@ class ModelRegistry:
                     "fallback_model": default_model,
                 }
             )
-        return cls(config)
+        return cls(config, origins=origins)
+
+    @classmethod
+    def _load_effective_config(
+        cls,
+    ) -> tuple[AgentModelsConfig, dict[str, Literal["builtin", "user", "override"]]]:
+        if os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"):
+            override = cls._load_config()
+            return override, {alias: "override" for alias in override.models}
+
+        built_in = cls._load_config()
+        workspace = Path.cwd().resolve()
+        registry_path = _user_registry_path()
+        store = UserModelRegistryStore(
+            path=registry_path,
+            workspace=workspace,
+            worktree=discover_git_worktree(workspace),
+            built_in_aliases=built_in.models,
+            whole_catalog_override_active=False,
+        )
+        user_snapshot = store.read()
+        collisions = sorted(set(built_in.models).intersection(user_snapshot.document.models))
+        if collisions:
+            raise ValueError(
+                "User model registry collides with built-in aliases: " + ", ".join(collisions)
+            )
+        models = dict(built_in.models)
+        models.update(
+            {
+                alias: _user_definition_to_model_spec(definition)
+                for alias, definition in user_snapshot.document.models.items()
+            }
+        )
+        effective = built_in.model_copy(update={"models": models}, deep=True)
+        origins: dict[str, Literal["builtin", "user", "override"]] = {
+            alias: "builtin" for alias in built_in.models
+        }
+        origins.update({alias: "user" for alias in user_snapshot.document.models})
+        return effective, origins
 
     @classmethod
     def _load_config(cls) -> AgentModelsConfig:
@@ -187,6 +265,8 @@ class ModelRegistry:
                 "location": merged.get("location"),
                 "input_cost_per_1m": cost.get("input_per_1m"),
                 "output_cost_per_1m": cost.get("output_per_1m"),
+                "cache_read_cost_per_1m": cost.get("cache_read_per_1m"),
+                "cache_write_cost_per_1m": cost.get("cache_write_per_1m"),
                 "runtime": merged.get("runtime"),
             }
 
@@ -238,12 +318,7 @@ class ModelRegistry:
                 local_files_only=True,
             )
         )
-        stage_budgets = {stage: budget.model_copy() for stage, budget in self._config.llm_stage_budgets.items()}
-        tool_decision_budget = stage_budgets[LLMCallStage.TOOL_DECISION]
-        if spec.max_tokens > tool_decision_budget.max_output_tokens:
-            stage_budgets[LLMCallStage.TOOL_DECISION] = tool_decision_budget.model_copy(
-                update={"max_output_tokens": spec.max_tokens}
-            )
+        stage_budgets = effective_stage_budgets(config=self._config, spec=spec)
         resolved = ResolvedModel(
             generator=generator,
             kwargs=kwargs,
@@ -460,6 +535,47 @@ def _api_key_from_env(name: str | None) -> str | None:
         return None
     value = os.environ.get(name)
     return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _user_registry_path() -> Path:
+    configured = os.environ.get("PRAXIS_MODEL_REGISTRY_PATH")
+    if configured:
+        return Path(configured)
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(config_home) if config_home else Path.home() / ".config"
+    return root / "praxis" / "models.yaml"
+
+
+def _user_definition_to_model_spec(definition: UserModelDefinition) -> ModelSpec:
+    runtime = (
+        definition.runtime.model_dump(mode="json", exclude_none=True)
+        if definition.runtime is not None
+        else None
+    )
+    return ModelSpec.model_validate(
+        {
+            "provider": definition.provider,
+            "model": definition.model,
+            "tokenizer_model": definition.tokenizer_model,
+            "provider_name": definition.provider_name,
+            "protocol": definition.protocol,
+            "max_tokens": definition.max_tokens,
+            "timeout_seconds": definition.timeout_seconds,
+            "base_url": definition.base_url,
+            "api_key_env": definition.api_key_env,
+            "defaults": definition.defaults.model_dump(mode="json", exclude_none=True),
+            "context_window_tokens": definition.context_window_tokens,
+            "request_context_tokens": definition.request_context_tokens,
+            "supports_tools": definition.supports_tools,
+            "supports_structured_output": definition.supports_structured_output,
+            "location": definition.location,
+            "input_cost_per_1m": definition.input_cost_per_1m,
+            "output_cost_per_1m": definition.output_cost_per_1m,
+            "cache_read_cost_per_1m": definition.cache_read_cost_per_1m,
+            "cache_write_cost_per_1m": definition.cache_write_cost_per_1m,
+            "runtime": runtime,
+        }
+    )
 
 
 def _load_env_file(path: Path) -> None:

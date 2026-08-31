@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,20 @@ from agent_runtime.core.llm_registry import (
     UnknownModelAliasError,
     _chat_provider_config,
 )
-from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.model_definition import canonical_definition_json
+from agent_runtime.modeling.config import GenerationTaskConfig
+from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_model_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PRAXIS_MODEL_REGISTRY_PATH",
+        str((tmp_path / "user-config" / "models.yaml").resolve()),
+    )
 
 
 def _ollama_spec(model: str = "test-model") -> ModelSpec:
@@ -36,6 +50,92 @@ def _make_config(
         default_model=default_model,
         fallback_model=fallback_model,
     )
+
+
+def test_model_execution_definition_has_fixed_canonical_digest() -> None:
+    registry = ModelRegistry(_make_config())
+
+    definition = registry.get_model_definition("main")
+    payload = canonical_definition_json(definition)
+
+    assert b'"api_key_env":null' in payload
+    assert b'"request_context_tokens":null' in payload
+    assert definition.definition_revision == (
+        "sha256:18ede8321e6eb5d9865d4de06c718b59a93ba9032a90781041896a70101fa0f5"
+    )
+
+
+def test_model_definition_digest_changes_only_for_selected_request_definition() -> None:
+    baseline = _make_config()
+    changed = baseline.model_copy(deep=True)
+    changed.models["main"].max_tokens = baseline.models["main"].max_tokens + 1
+    unrelated = baseline.model_copy(
+        update={
+            "models": {
+                **baseline.models,
+                "unrelated": _ollama_spec("other-model"),
+            }
+        },
+        deep=True,
+    )
+
+    base_digest = ModelRegistry(baseline).get_model_definition("main").definition_revision
+
+    assert ModelRegistry(changed).get_model_definition("main").definition_revision != base_digest
+    assert ModelRegistry(unrelated).get_model_definition("main").definition_revision == base_digest
+
+
+def test_model_definition_digest_covers_generation_defaults_and_stage_budgets() -> None:
+    baseline = _make_config()
+    baseline_digest = ModelRegistry(baseline).get_model_definition("main").definition_revision
+
+    generation_changed = baseline.model_copy(deep=True)
+    generation_changed.generation = replace(
+        generation_changed.generation,
+        answer=GenerationTaskConfig(max_tokens=777, temperature=0.25),
+    )
+    budget_changed = baseline.model_copy(deep=True)
+    budget_changed.llm_stage_budgets[LLMCallStage.AGENT_STEP] = LLMStageBudget(
+        max_input_tokens=63_999,
+        max_output_tokens=32_768,
+        safety_margin_tokens=512,
+    )
+    defaults_changed = baseline.model_copy(deep=True)
+    defaults_changed.models["main"].defaults = {"temperature": 0.25}
+
+    assert (
+        ModelRegistry(generation_changed).get_model_definition("main").definition_revision
+        != baseline_digest
+    )
+    assert (
+        ModelRegistry(budget_changed).get_model_definition("main").definition_revision
+        != baseline_digest
+    )
+    assert (
+        ModelRegistry(defaults_changed).get_model_definition("main").definition_revision
+        != baseline_digest
+    )
+
+
+def test_model_definition_snapshot_is_not_mutated_by_callers() -> None:
+    registry = ModelRegistry(_make_config())
+    first = registry.get_model_definition("main")
+    revision = first.definition_revision
+
+    first.defaults["temperature"] = 0.75
+    first.llm_stage_budgets["agent_step"] = first.llm_stage_budgets[
+        "agent_step"
+    ].model_copy(update={"max_input_tokens": 1})
+
+    assert registry.get_model_definition("main").definition_revision == revision
+
+
+def test_model_definition_rejects_non_finite_request_values() -> None:
+    config = _make_config()
+    config.models["main"].defaults = {"temperature": float("nan")}
+
+    with pytest.raises(ValueError, match="finite|JSON"):
+        ModelRegistry(config)
 
 
 def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> None:

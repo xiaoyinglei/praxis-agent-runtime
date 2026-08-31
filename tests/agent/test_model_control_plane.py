@@ -28,6 +28,17 @@ from agent_runtime.models import (
 from agent_runtime.text import load_env_file
 
 
+@pytest.fixture(autouse=True)
+def _isolate_user_model_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "PRAXIS_MODEL_REGISTRY_PATH",
+        str((tmp_path / "user-config" / "models.yaml").resolve()),
+    )
+
+
 def _write_models_config(path: Path) -> None:
     path.write_text(
         yaml.safe_dump(
@@ -101,6 +112,121 @@ def test_model_catalog_loads_runtime_specs_without_embedding_models(tmp_path: Pa
     assert local.runtime is not None
     assert local.runtime.health_url == "http://127.0.0.1:8080/v1/models"
     assert local.runtime.expected_model_contains == "Qwen3-14B"
+
+
+def test_effective_catalog_layers_user_registry_with_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = (tmp_path / "user-config" / "models.yaml").resolve()
+    registry_path.parent.mkdir()
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "revision": 1,
+                "models": {
+                    "my_qwen": {
+                        "provider": "openai_compatible",
+                        "provider_name": "local-test",
+                        "model": "Qwen/Qwen3.5-9B",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "location": "local",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
+
+    first = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
+    assert first.origin("groq_gpt_oss_120b") == "builtin"
+    assert first.origin("my_qwen") == "user"
+    assert first.get("my_qwen").provider_model == "Qwen/Qwen3.5-9B"
+    assert first.default_model_id == "groq_gpt_oss_120b"
+    first_definition_revision = first.definition("my_qwen").definition_revision
+    assert first.definition("my_qwen").provider == "openai_compatible"
+    assert first.definition("my_qwen").generation.answer.max_tokens == 4096
+
+    registry_path.write_text(
+        registry_path.read_text(encoding="utf-8").replace("Qwen3.5-9B", "Qwen3.5-14B"),
+        encoding="utf-8",
+    )
+    assert first.get("my_qwen").provider_model == "Qwen/Qwen3.5-9B"
+    refreshed = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
+    assert refreshed.get("my_qwen").provider_model == "Qwen/Qwen3.5-14B"
+    assert refreshed.definition("my_qwen").definition_revision != first_definition_revision
+
+
+def test_effective_catalog_rejects_user_shadowing_builtin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = (tmp_path / "user-config" / "models.yaml").resolve()
+    registry_path.parent.mkdir()
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "revision": 1,
+                "models": {
+                    "groq_gpt_oss_120b": {
+                        "provider": "openai_compatible",
+                        "model": "attacker/model",
+                        "base_url": "https://example.com/v1",
+                        "location": "cloud",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
+
+    with pytest.raises(ValueError, match="collid|built-in"):
+        ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
+
+
+def test_effective_catalog_fails_loudly_for_malformed_user_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = (tmp_path / "user-config" / "models.yaml").resolve()
+    registry_path.parent.mkdir()
+    registry_path.write_text("version: 2\nrevision: 1\nmodels: {}\n", encoding="utf-8")
+    monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
+
+    with pytest.raises(ValueError, match="version"):
+        ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
+
+
+def test_whole_catalog_override_replaces_layers_and_marks_origin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    override_path = tmp_path / "override.yaml"
+    _write_models_config(override_path)
+    registry_path = (tmp_path / "user-config" / "models.yaml").resolve()
+    registry_path.parent.mkdir()
+    registry_path.write_text(
+        "version: 1\nrevision: 0\nmodels: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(override_path))
+    monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
+
+    catalog = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
+
+    assert [item.id for item in catalog.list_models()] == ["local_qwen", "mimo_cloud"]
+    assert catalog.origin("local_qwen") == "override"
+    assert not catalog.has("groq_gpt_oss_120b")
 
 
 def test_bundled_default_chat_model_is_groq_control() -> None:

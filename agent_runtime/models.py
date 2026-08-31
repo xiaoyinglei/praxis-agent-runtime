@@ -5,6 +5,7 @@ import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 
@@ -17,10 +18,12 @@ from agent_runtime.core.llm_registry import (
     ResolvedModel,
     UnknownModelAliasError,
 )
+from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.modeling.config import GenerationConfig
 
 ModelLocation = Literal["local", "cloud"]
 ModelSwitchRequester = Literal["user", "agent", "system"]
+ModelOrigin = Literal["builtin", "user", "override"]
 
 
 class LocalRuntimeReadyManager(Protocol):
@@ -66,12 +69,22 @@ class ModelCatalog:
         *,
         specs: Mapping[str, ModelSpec],
         default_model_id: str,
+        origins: Mapping[str, ModelOrigin] | None = None,
+        definitions: Mapping[str, ModelExecutionDefinition] | None = None,
     ) -> None:
         if not specs:
             raise ValueError("model catalog must not be empty")
         if default_model_id not in specs:
             raise UnknownModelAliasError(f"Default model {default_model_id!r} not found in catalog")
-        self._specs = dict(specs)
+        if origins is not None and set(origins) != set(specs):
+            raise ValueError("model catalog origins must cover exactly the model specs")
+        if definitions is not None and set(definitions) != set(specs):
+            raise ValueError("model catalog definitions must cover exactly the model specs")
+        self._specs = MappingProxyType(dict(specs))
+        self._origins = MappingProxyType(
+            dict(origins) if origins is not None else {model_id: "override" for model_id in specs}
+        )
+        self._definitions = MappingProxyType(dict(definitions or {}))
         self.default_model_id = default_model_id
 
     @classmethod
@@ -87,7 +100,14 @@ class ModelCatalog:
         specs = {
             model_id: _to_public_spec(model_id, registry.get_model_spec(model_id)) for model_id in registry.model_ids
         }
-        return cls(specs=specs, default_model_id=registry.default_model)
+        return cls(
+            specs=specs,
+            default_model_id=registry.default_model,
+            origins={model_id: registry.origin(model_id) for model_id in registry.model_ids},
+            definitions={
+                model_id: registry.get_model_definition(model_id) for model_id in registry.model_ids
+            },
+        )
 
     def list_models(self) -> list[ModelSpec]:
         return [self._specs[model_id] for model_id in self._specs]
@@ -100,6 +120,19 @@ class ModelCatalog:
 
     def has(self, model_id: str) -> bool:
         return model_id in self._specs
+
+    def origin(self, model_id: str) -> ModelOrigin:
+        self.get(model_id)
+        return cast(ModelOrigin, self._origins[model_id])
+
+    def definition(self, model_id: str) -> ModelExecutionDefinition:
+        self.get(model_id)
+        try:
+            return self._definitions[model_id].model_copy(deep=True)
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Model catalog entry {model_id!r} has no execution definition"
+            ) from exc
 
 
 @dataclass(slots=True)
@@ -445,6 +478,7 @@ __all__ = [
     "ModelControlPlane",
     "ModelLocation",
     "ModelNotAvailableError",
+    "ModelOrigin",
     "ModelPolicy",
     "ModelPolicyError",
     "ModelRuntimeSpec",
