@@ -104,12 +104,30 @@ def test_schema_rejects_unsupported_provider(provider: str) -> None:
         "https://host/v1?api_key=x",
         " http://host/v1",
         "http://host/v1 ",
+        "http://local host/v1",
+        "http://host/v 1",
+        "http://local\u00a0host/v1",
+        "http://host/v\u20031",
         "http://host/v1\nmodels",
         "http://host\t.example/v1",
     ],
 )
 def test_schema_rejects_non_absolute_or_secret_bearing_url(base_url: str) -> None:
     with pytest.raises(ValidationError):
+        _definition(base_url=base_url)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://local host/v1",
+        "http://host/v 1",
+        "http://local\u00a0host/v1",
+        "http://host/v\u20031",
+    ],
+)
+def test_schema_rejects_any_whitespace_in_base_url(base_url: str) -> None:
+    with pytest.raises(ValidationError, match="whitespace"):
         _definition(base_url=base_url)
 
 
@@ -128,6 +146,9 @@ def test_schema_requires_cloud_endpoint_and_matching_location() -> None:
     "health_url",
     [
         " http://127.0.0.1/health",
+        "http://local host/health",
+        "http://localhost/health\u00a0check",
+        "http://localhost/health\u2003check",
         "http://127.0.0.1/health\nnext",
         "http://local\thost/health",
         "http://127.0.0.1/health\x7f",

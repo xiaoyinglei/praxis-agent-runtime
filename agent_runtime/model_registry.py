@@ -470,8 +470,8 @@ def _reject_blank_or_padded_text(value: str | None) -> str | None:
 def _validate_http_url(value: str | None, *, field_name: str) -> str | None:
     if value is None:
         return None
-    if value != value.strip():
-        raise ValueError(f"{field_name} must not contain leading or trailing whitespace")
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{field_name} must not contain whitespace")
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
         raise ValueError(f"{field_name} must not contain ASCII control characters")
     parts = urlsplit(value)
