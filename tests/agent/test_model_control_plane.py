@@ -701,6 +701,30 @@ def test_stale_persisted_alias_is_atomically_repaired_to_catalog_default(
     }
 
 
+def test_stale_repair_reviews_default_before_writing_session(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    original = json.dumps(
+        {
+            "version": 1,
+            "revision": 7,
+            "current_model_id": "removed-model",
+        }
+    ).encode()
+    session_path.write_bytes(original)
+    policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo_cloud"}))
+
+    with pytest.raises(ModelPolicyError, match="local_qwen.*not allowed"):
+        ModelControlPlane.from_config_file(
+            config_path,
+            session_path=session_path,
+            policy=policy,
+        )
+
+    assert session_path.read_bytes() == original
+
+
 def test_stale_repair_conflict_preserves_newer_valid_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -399,16 +399,18 @@ class ModelControlPlane:
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
     ) -> ModelControlPlane:
         catalog = ModelCatalog.from_registry(registry)
+        effective_policy = policy or ModelPolicy()
         state, diagnostics = _load_session_state(
             catalog=catalog,
             initial_model_id=initial_model_id,
             initial_selection_requester=initial_selection_requester,
             session_path=session_path,
+            policy=effective_policy,
         )
         return cls(
             catalog=catalog,
             state=state,
-            policy=policy,
+            policy=effective_policy,
             registry=registry,
             session_path=session_path,
             local_runtime_manager=local_runtime_manager,
@@ -518,6 +520,7 @@ def _load_session_state(
     initial_model_id: str | None,
     initial_selection_requester: ModelSwitchRequester,
     session_path: Path | None,
+    policy: ModelPolicy,
 ) -> tuple[ModelSessionState, tuple[str, ...]]:
     store = ModelSessionStore(session_path) if session_path is not None else None
     if initial_model_id is not None:
@@ -541,6 +544,11 @@ def _load_session_state(
     if initial_model_id is not None or store is None:
         raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
     stale_model_id = state.current_model_id
+    policy.review_switch(
+        catalog=catalog,
+        target_model_id=catalog.default_model_id,
+        requested_by="user",
+    )
     try:
         repaired = store.select(catalog.default_model_id, expected=state.file_version)
     except ConfigVersionConflict:
