@@ -263,6 +263,12 @@ def _raise_if_not_reconciled(path: Path, payload: bytes, error: OSError) -> None
         raise CommitOutcomeUnknown(
             f"Config commit cannot confirm intended bytes for {path}"
         ) from error
+    try:
+        _fsync_directory(path.parent)
+    except OSError as retry_error:
+        raise CommitOutcomeUnknown(
+            f"Config commit cannot confirm durable intended bytes for {path}"
+        ) from retry_error
 
 
 def _remove_temp_if_present(path: Path) -> None:

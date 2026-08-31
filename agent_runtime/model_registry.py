@@ -228,6 +228,12 @@ class ModelDefinitionPatch(BaseModel):
     unset_paths: tuple[str, ...] = ()
     replacement: UserModelDefinition | None = None
 
+    @field_validator("changes")
+    @classmethod
+    def reject_none_deletions(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _reject_none_changes(value)
+        return value
+
     @model_validator(mode="after")
     def validate_mutation_shape(self) -> Self:
         if self.replacement is not None and (self.changes or self.unset_paths):
@@ -355,6 +361,11 @@ class UserModelRegistryStore:
                     f"Stale registry version: expected {expected}, observed {current.version}"
                 )
             models = apply(dict(current.document.models))
+            validated = _revalidate_document(
+                revision=current.document.revision,
+                models=models,
+            )
+            models = validated.models
             self._validate_effective_aliases(models)
             unchanged = _normalized_models(models) == _normalized_models(current.document.models)
             if unchanged:
@@ -459,6 +470,7 @@ def _endpoint_location(base_url: str | None) -> Literal["local", "cloud"] | None
 def _apply_patch(current: UserModelDefinition, mutation: ModelDefinitionPatch) -> UserModelDefinition:
     if mutation.replacement is not None:
         return mutation.replacement
+    _reject_none_changes(mutation.changes)
     payload: dict[str, Any] = current.to_persisted_mapping()
     _deep_merge(payload, mutation.changes)
     for path in mutation.unset_paths:
@@ -490,6 +502,37 @@ def _unset_path(payload: dict[str, Any], path: str) -> None:
 
 def _normalized_models(models: Mapping[str, UserModelDefinition]) -> dict[str, dict[str, object]]:
     return {alias: definition.to_persisted_mapping() for alias, definition in sorted(models.items())}
+
+
+def _revalidate_document(
+    *,
+    revision: int,
+    models: Mapping[str, UserModelDefinition],
+) -> UserModelRegistryDocument:
+    """Cross the mutation trust boundary using plain data, never model identity."""
+
+    plain_models = {
+        alias: definition.model_dump(mode="python", exclude_none=True, warnings=False)
+        for alias, definition in models.items()
+    }
+    return UserModelRegistryDocument.model_validate(
+        {
+            "version": 1,
+            "revision": revision,
+            "models": plain_models,
+        }
+    )
+
+
+def _reject_none_changes(value: object, *, path: str = "changes") -> None:
+    if value is None:
+        raise ValueError(f"{path} cannot be null; nullable deletions must use unset_paths")
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _reject_none_changes(child, path=f"{path}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _reject_none_changes(child, path=f"{path}[{index}]")
 
 
 def _serialize_document(document: UserModelRegistryDocument) -> bytes:

@@ -223,6 +223,21 @@ def test_add_rejects_user_and_builtin_collisions(tmp_path: Path) -> None:
         store.add("builtin", _definition(), expected=committed.snapshot.version)
 
 
+def test_add_revalidates_adversarial_constructed_definition_under_lock(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    bypass = UserModelDefinition.model_construct(
+        provider="anthropic",
+        model="",
+        max_tokens=0,
+        context_window_tokens=0,
+    )
+
+    with pytest.raises(ValidationError):
+        store.add("mine", bypass, expected=store.read().version)
+
+    assert not store.path.exists()
+
+
 def test_patch_update_and_complete_replacement(tmp_path: Path) -> None:
     store = _store(tmp_path)
     added = store.add("mine", _definition(tokenizer_model="old"), expected=store.read().version)
@@ -246,6 +261,59 @@ def test_patch_update_and_complete_replacement(tmp_path: Path) -> None:
         expected=patched.snapshot.version,
     )
     assert replaced.snapshot.document.models["mine"] == replacement
+
+
+def test_replacement_revalidates_adversarial_constructed_definition_under_lock(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    added = store.add("mine", _definition(), expected=store.read().version)
+    before = store.path.read_bytes()
+    bypass = UserModelDefinition.model_construct(
+        provider="anthropic",
+        model="",
+        max_tokens=0,
+        context_window_tokens=0,
+    )
+
+    with pytest.raises(ValidationError):
+        store.update(
+            "mine",
+            ModelDefinitionPatch(replacement=bypass),
+            expected=added.snapshot.version,
+        )
+
+    assert store.path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"protocol": None},
+        {"location": None},
+        {"runtime": None},
+        {"api_key_env": None},
+        {"runtime": {"health_url": None}},
+        {"defaults": {"temperature": None}},
+    ],
+)
+def test_patch_rejects_none_deletions_at_every_nesting_level(changes: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="unset_paths"):
+        ModelDefinitionPatch(changes=changes)
+
+
+def test_store_rejects_constructed_patch_with_none_deletion(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    added = store.add(
+        "mine",
+        _definition(protocol="openai_compatible"),
+        expected=store.read().version,
+    )
+    before = store.path.read_bytes()
+    bypass = ModelDefinitionPatch.model_construct(changes={"protocol": None})
+
+    with pytest.raises(ValueError, match="unset_paths"):
+        store.update("mine", bypass, expected=added.snapshot.version)
+
+    assert store.path.read_bytes() == before
 
 
 _UNSET_CASES: tuple[tuple[str, Callable[[UserModelDefinition], object]], ...] = (
@@ -433,13 +501,10 @@ def test_unknown_commit_outcome_carries_receipt_and_reconciles_exact_state(
     store = _store(tmp_path)
     expected = store.read().version
 
-    def replace_then_report_unknown(path: Path, payload: bytes, *, intended_fingerprint: str) -> None:
-        path.write_bytes(payload)
-        from agent_runtime.model_config_io import CommitOutcomeUnknown
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("directory fsync failed")
 
-        raise CommitOutcomeUnknown("directory fsync failed")
-
-    monkeypatch.setattr("agent_runtime.model_registry.atomic_replace_bytes", replace_then_report_unknown)
+    monkeypatch.setattr("agent_runtime.model_config_io._fsync_directory", fail_directory_fsync)
     with pytest.raises(RegistryCommitOutcomeUnknown) as captured:
         store.add("mine", _definition(), expected=expected)
     receipt = captured.value.receipt

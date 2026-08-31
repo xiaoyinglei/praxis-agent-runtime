@@ -383,7 +383,32 @@ class TestAtomicConfigWrites:
 
         assert target.read_bytes() == b"old"
 
-    def test_post_replace_directory_fsync_failure_reconciles_intended_bytes(
+    def test_post_replace_directory_fsync_failure_retries_and_then_succeeds(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "models.json"
+        target.write_bytes(b"old")
+        payload = b"new"
+        calls = 0
+
+        def fail_once_directory_fsync(path: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("directory fsync failed after replace")
+
+        monkeypatch.setattr(model_config_io, "_fsync_directory", fail_once_directory_fsync)
+
+        atomic_replace_bytes(
+            target,
+            payload,
+            intended_fingerprint=file_fingerprint(payload),
+        )
+
+        assert calls == 2
+        assert target.read_bytes() == payload
+
+    def test_post_replace_reconciled_bytes_still_raise_when_retry_fsync_fails(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         target = tmp_path / "models.json"
@@ -395,11 +420,28 @@ class TestAtomicConfigWrites:
 
         monkeypatch.setattr(model_config_io, "_fsync_directory", fail_directory_fsync)
 
-        atomic_replace_bytes(
-            target,
-            payload,
-            intended_fingerprint=file_fingerprint(payload),
-        )
+        with pytest.raises(CommitOutcomeUnknown, match="cannot confirm"):
+            atomic_replace_bytes(
+                target,
+                payload,
+                intended_fingerprint=file_fingerprint(payload),
+            )
+
+        assert target.read_bytes() == payload
+
+    def test_post_install_reconciled_bytes_still_raise_when_retry_fsync_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "models.json"
+        payload = b"new"
+
+        def fail_directory_fsync(path: Path) -> None:
+            raise OSError("directory fsync failed after install")
+
+        monkeypatch.setattr(model_config_io, "_fsync_directory", fail_directory_fsync)
+
+        with pytest.raises(CommitOutcomeUnknown, match="cannot confirm"):
+            atomic_install_bytes(target, payload)
 
         assert target.read_bytes() == payload
 
