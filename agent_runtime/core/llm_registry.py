@@ -9,7 +9,12 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.core.llm_config import (
+    AgentModelsConfig,
+    ModelProvider,
+    ModelSpec,
+    normalize_model_endpoint,
+)
 from agent_runtime.model_config_io import discover_git_worktree
 from agent_runtime.model_definition import (
     ModelExecutionDefinition,
@@ -225,6 +230,7 @@ class ModelRegistry:
 
         with open(path, encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
+        _validate_raw_catalog(data)
 
         # Support configs/models.yaml: models keyed by alias plus defaults.
         raw_models = data.get("models", {})
@@ -253,6 +259,7 @@ class ModelRegistry:
                 "model": entry["model"],
                 "tokenizer_model": entry.get("tokenizer_model"),
                 "max_tokens": entry.get("max_tokens", 2048),
+                "timeout_seconds": entry.get("timeout_seconds", 120.0),
                 "defaults": entry.get("defaults", {}),
                 "base_url": merged.get("base_url"),
                 "api_key_env": merged.get("api_key_env"),
@@ -395,11 +402,16 @@ def _build_chat_generator(spec: ModelSpec) -> object:
 
 
 def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
+    endpoint = normalize_model_endpoint(
+        provider=spec.provider,
+        base_url=spec.base_url,
+        location=spec.location,
+    )
     if spec.provider is ModelProvider.OLLAMA:
-        return ChatProviderConfig(base_url=spec.base_url or "http://localhost:11434", api_key=None)
+        return ChatProviderConfig(base_url=endpoint.base_url, api_key=None)
     if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
         return ChatProviderConfig(
-            base_url=spec.base_url or "http://127.0.0.1:8080/v1",
+            base_url=endpoint.base_url,
             api_key=_api_key_from_env(spec.api_key_env),
         )
     raise ValueError(f"Unsupported provider: {spec.provider}")
@@ -532,6 +544,120 @@ def _parse_generation_config(raw: object) -> GenerationConfig:
         synthesize=parse_task("synthesize"),
         factcheck=parse_task("factcheck"),
     )
+
+
+def _validate_raw_catalog(data: object) -> None:
+    if not isinstance(data, dict):
+        raise ValueError("model catalog YAML must contain a mapping")
+    _reject_unknown_keys(
+        data,
+        {
+            "version",
+            "providers",
+            "models",
+            "defaults",
+            "fallback_model",
+            "generation",
+            "llm_budgets",
+            "tokenizer",
+        },
+        where="model catalog",
+    )
+    raw_models = data.get("models", {})
+    raw_providers = data.get("providers", {})
+    if not isinstance(raw_models, dict) or not isinstance(raw_providers, dict):
+        raise ValueError("model catalog models/providers must be mappings")
+    for alias, raw_entry in raw_models.items():
+        if not isinstance(raw_entry, dict) or raw_entry.get("capability") != "chat":
+            continue
+        _reject_unknown_keys(
+            raw_entry,
+            {
+                "capability",
+                "provider",
+                "protocol",
+                "model",
+                "tokenizer_model",
+                "max_tokens",
+                "timeout_seconds",
+                "defaults",
+                "base_url",
+                "api_key_env",
+                "context_window_tokens",
+                "request_context_tokens",
+                "tools",
+                "supports_tools",
+                "structured_output",
+                "supports_structured_output",
+                "location",
+                "cost",
+                "runtime",
+                "experimental",
+            },
+            where=f"chat model {alias!r}",
+        )
+        cost = raw_entry.get("cost")
+        if cost is not None:
+            if not isinstance(cost, dict):
+                raise ValueError(f"chat model {alias!r} cost must be a mapping")
+            _reject_unknown_keys(
+                cost,
+                {
+                    "input_per_1m",
+                    "output_per_1m",
+                    "cache_read_per_1m",
+                    "cache_write_per_1m",
+                },
+                where=f"chat model {alias!r} cost",
+            )
+        _validate_raw_runtime(raw_entry.get("runtime"), where=f"chat model {alias!r}")
+        provider_ref = raw_entry.get("provider")
+        provider_entry = raw_providers.get(provider_ref)
+        if provider_entry is not None:
+            if not isinstance(provider_entry, dict):
+                raise ValueError(f"provider {provider_ref!r} must be a mapping")
+            _reject_unknown_keys(
+                provider_entry,
+                {"protocol", "location", "base_url", "api_key_env", "runtime"},
+                where=f"provider {provider_ref!r}",
+            )
+            _validate_raw_runtime(
+                provider_entry.get("runtime"),
+                where=f"provider {provider_ref!r}",
+            )
+
+
+def _validate_raw_runtime(value: object, *, where: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        raise ValueError(f"{where} runtime must be a mapping")
+    _reject_unknown_keys(
+        value,
+        {
+            "server",
+            "host",
+            "port",
+            "health_url",
+            "launch_command",
+            "launch_command_template",
+            "expected_model_contains",
+            "startup_timeout_seconds",
+            "poll_interval_seconds",
+        },
+        where=f"{where} runtime",
+    )
+
+
+def _reject_unknown_keys(
+    value: dict[object, object],
+    allowed: set[str],
+    *,
+    where: str,
+) -> None:
+    unknown = sorted(str(key) for key in value if key not in allowed)
+    if unknown:
+        raise ValueError(f"{where} contains unknown fields: {', '.join(unknown)}")
 
 
 def _api_key_from_env(name: str | None) -> str | None:

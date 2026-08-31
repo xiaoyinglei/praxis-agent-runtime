@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import ipaddress
 import os
 import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Self, cast
-from urllib.parse import urlsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from agent_runtime.core.llm_config import (
     ModelGenerationDefaults,
     ModelProvider,
+    normalize_model_endpoint,
     validate_api_key_env_name,
     validate_http_url,
 )
@@ -197,14 +196,13 @@ class UserModelDefinition(BaseModel):
         if self.max_tokens > request_limit:
             raise ValueError("max_tokens must not exceed the effective request context limit")
 
-        endpoint_location = _endpoint_location(self.base_url)
         if self.location == "cloud" and self.base_url is None:
             raise ValueError("cloud model requires base_url")
-        if self.location is not None and endpoint_location is not None and self.location != endpoint_location:
-            raise ValueError(f"location={self.location!r} conflicts with the base_url endpoint location")
-        effective_location = self.location or endpoint_location
-        if self.provider in {ModelProvider.MLX, ModelProvider.OLLAMA} and effective_location == "cloud":
-            raise ValueError(f"provider {self.provider.value!r} is local and cannot declare location='cloud'")
+        _ = normalize_model_endpoint(
+            provider=self.provider,
+            base_url=self.base_url,
+            location=self.location,
+        )
         return self
 
     def to_persisted_mapping(self) -> dict[str, object]:
@@ -467,21 +465,6 @@ def _reject_blank_or_padded_text(value: str | None) -> str | None:
     if value is not None and (not value.strip() or value != value.strip()):
         raise ValueError("text values must be non-blank and have no surrounding whitespace")
     return value
-
-
-def _endpoint_location(base_url: str | None) -> Literal["local", "cloud"] | None:
-    if base_url is None:
-        return None
-    hostname = urlsplit(base_url).hostname
-    if hostname == "localhost":
-        return "local"
-    if hostname is not None:
-        try:
-            if ipaddress.ip_address(hostname).is_loopback:
-                return "local"
-        except ValueError:
-            pass
-    return "cloud"
 
 
 def _apply_patch(current: UserModelDefinition, mutation: ModelDefinitionPatch) -> UserModelDefinition:

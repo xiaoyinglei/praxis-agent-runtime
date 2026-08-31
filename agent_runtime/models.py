@@ -8,10 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol, cast
-from urllib.parse import urlparse
 
-from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_config import ModelSpec as InternalModelSpec
+from agent_runtime.core.llm_config import normalize_model_endpoint
 from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
@@ -399,10 +398,10 @@ def _to_public_spec(
 ) -> ModelSpec:
     provider = str(spec.provider_name or spec.provider)
     provider_model = str(spec.model)
-    base_url = spec.base_url
-    location = spec.location or _infer_location(
-        base_url=base_url,
+    endpoint = normalize_model_endpoint(
         provider=spec.provider,
+        base_url=spec.base_url,
+        location=spec.location,
     )
     return ModelSpec(
         id=model_id,
@@ -411,9 +410,9 @@ def _to_public_spec(
         context_window=int(spec.context_window_tokens),
         supports_tools=bool(spec.supports_tools),
         supports_structured_output=bool(spec.supports_structured_output),
-        location=location,
+        location=endpoint.location,
         protocol=spec.protocol,
-        base_url=base_url,
+        base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
         max_output_tokens=int(spec.max_tokens),
         input_cost_per_1m=spec.input_cost_per_1m,
@@ -433,20 +432,6 @@ def _to_public_runtime_spec(runtime: object | None) -> ModelRuntimeSpec | None:
         startup_timeout_seconds=float(getattr(runtime, "startup_timeout_seconds", 60.0)),
         poll_interval_seconds=float(getattr(runtime, "poll_interval_seconds", 1.0)),
     )
-
-
-def _infer_location(
-    *,
-    base_url: str | None,
-    provider: object,
-) -> ModelLocation:
-    if provider in {ModelProvider.MLX, ModelProvider.OLLAMA}:
-        return "local"
-    if base_url:
-        host = urlparse(base_url).hostname or ""
-        if host in {"localhost", "127.0.0.1", "::1"}:
-            return "local"
-    return "cloud"
 
 
 def format_model_rows(

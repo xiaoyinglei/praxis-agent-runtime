@@ -51,7 +51,7 @@ def test_model_execution_definition_has_fixed_canonical_digest() -> None:
     assert b'"api_key_env":null' in payload
     assert b'"request_context_tokens":null' in payload
     assert definition.definition_revision == (
-        "sha256:e3b798580476bc1f3f5ac7dfac8f95bb20708a02dbd8f617fb887d91c93117e4"
+        "sha256:0d78906982c607629387196daf265f42dfc585b5da3b53fb780a86feef0fe786"
     )
 
 
@@ -202,6 +202,95 @@ def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
 
     with pytest.raises(ValueError, match="api_key_env|credentials|query|fragment"):
         ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
+
+
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"max_tokens": -7},
+        {"timeout_seconds": -1},
+        {"input_cost_per_1m": -3},
+        {"location": "local", "base_url": "https://api.example.com/v1"},
+        {
+            "provider": "ollama",
+            "location": "cloud",
+            "base_url": "https://api.example.com/v1",
+        },
+        {"api_key": "plaintext-secret"},
+        {"headers": {"Authorization": "Bearer plaintext-secret"}},
+        {"unknown_request_knob": True},
+    ],
+)
+def test_whole_catalog_json_override_rejects_invalid_or_unknown_model_fields(
+    invalid_fields: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model: dict[str, object] = {
+        "provider": "openai_compatible",
+        "model": "main-model",
+        "base_url": "https://api.example.com/v1",
+        "location": "cloud",
+    }
+    model.update(invalid_fields)
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.setenv(
+        "RAG_AGENT_MODELS",
+        json.dumps(
+            {
+                "version": 1,
+                "models": {"main": model},
+                "default_model": "main",
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError):
+        ModelRegistry.from_env(env_path=str(tmp_path / "missing.env"))
+
+
+def test_whole_catalog_yaml_override_rejects_unknown_chat_fields(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "main": {
+                        "capability": "chat",
+                        "provider": "ollama",
+                        "model": "main-model",
+                        "api_key": "plaintext-secret",
+                    }
+                },
+                "defaults": {"primary_model": "main"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown fields.*api_key"):
+        ModelRegistry._load_yaml_file(config_path)
+
+
+def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -> None:
+    config = AgentModelsConfig(
+        models={
+            "main": ModelSpec(
+                provider=ModelProvider.OLLAMA,
+                model="main-model",
+            )
+        },
+        default_model="main",
+    )
+    registry = ModelRegistry(config)
+
+    definition = registry.get_model_definition("main")
+    provider = _chat_provider_config(registry.get_model_spec("main"))
+
+    assert definition.base_url == "http://localhost:11434"
+    assert definition.location == "local"
+    assert definition.tokenizer_model == "main-model"
+    assert provider.base_url == definition.base_url
 
 
 def test_resolved_kwargs_cannot_mutate_cached_definition(

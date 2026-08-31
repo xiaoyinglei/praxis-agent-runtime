@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
+from agent_runtime.core.llm_config import (
+    AgentModelsConfig,
+    ModelProvider,
+    ModelSpec,
+    normalize_model_endpoint,
+)
 
 
 class TestModelSpec:
@@ -34,6 +39,33 @@ class TestModelSpec:
         )
         assert spec.defaults["temperature"] == 0.0
         assert spec.defaults["top_p"] == 0.9
+
+    @pytest.mark.parametrize(
+        "host",
+        ["127.0.0.2", "127.1", "2130706433", "0x7f000001"],
+    )
+    def test_legacy_loopback_spellings_have_one_location(self, host: str) -> None:
+        endpoint = normalize_model_endpoint(
+            provider=ModelProvider.OPENAI_COMPATIBLE,
+            base_url=f"http://{host}:8080/v1",
+            location=None,
+        )
+        assert endpoint.location == "local"
+
+        with pytest.raises(ValueError, match="location"):
+            normalize_model_endpoint(
+                provider=ModelProvider.OPENAI_COMPATIBLE,
+                base_url=f"http://{host}:8080/v1",
+                location="cloud",
+            )
+
+    def test_model_spec_rejects_unknown_fields_and_invalid_budgets(self) -> None:
+        with pytest.raises(ValueError, match="extra"):
+            ModelSpec.model_validate(
+                {"provider": "ollama", "model": "m", "headers": {"x": "secret"}}
+            )
+        with pytest.raises(ValueError, match="greater than 0"):
+            ModelSpec(provider=ModelProvider.OLLAMA, model="m", max_tokens=-1)
 
 
 class TestAgentModelsConfig:

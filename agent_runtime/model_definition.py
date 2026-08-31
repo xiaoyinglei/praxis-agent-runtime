@@ -9,12 +9,13 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_runtime.core.llm_config import (
     AgentModelsConfig,
     ModelProvider,
     ModelSpec,
+    normalize_model_endpoint,
     validate_api_key_env_name,
     validate_http_url,
 )
@@ -26,8 +27,8 @@ class GenerationTaskDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     model: str | None
-    max_tokens: int | None
-    temperature: float | None
+    max_tokens: int | None = Field(gt=0, strict=True)
+    temperature: float | None = Field(ge=0.0, le=2.0, allow_inf_nan=False)
 
 
 class GenerationDefinition(BaseModel):
@@ -43,9 +44,9 @@ class GenerationDefinition(BaseModel):
 class StageBudgetDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    max_input_tokens: int
-    max_output_tokens: int
-    safety_margin_tokens: int
+    max_input_tokens: int = Field(gt=0, strict=True)
+    max_output_tokens: int = Field(gt=0, strict=True)
+    safety_margin_tokens: int = Field(ge=0, strict=True)
 
 
 class RuntimeDefinition(BaseModel):
@@ -54,8 +55,8 @@ class RuntimeDefinition(BaseModel):
     health_url: str | None
     launch_command: tuple[str, ...]
     expected_model_contains: str | None
-    startup_timeout_seconds: float
-    poll_interval_seconds: float
+    startup_timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+    poll_interval_seconds: float = Field(gt=0, allow_inf_nan=False)
 
     @field_validator("health_url")
     @classmethod
@@ -100,22 +101,22 @@ class ModelExecutionDefinition(BaseModel):
     provider: ModelProvider
     provider_name: str | None
     protocol: str | None
-    model: str
+    model: str = Field(min_length=1)
     tokenizer_model: str | None
-    max_tokens: int
-    timeout_seconds: float
+    max_tokens: int = Field(gt=0, strict=True)
+    timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
     base_url: str | None
     api_key_env: str | None
     defaults: RequestDefaultsDefinition
-    context_window_tokens: int
-    request_context_tokens: int | None
+    context_window_tokens: int = Field(gt=0, strict=True)
+    request_context_tokens: int | None = Field(gt=0, strict=True)
     supports_tools: bool
     supports_structured_output: bool
     location: Literal["local", "cloud"] | None
-    input_cost_per_1m: float | None
-    output_cost_per_1m: float | None
-    cache_read_cost_per_1m: float | None
-    cache_write_cost_per_1m: float | None
+    input_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
+    output_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
+    cache_read_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
+    cache_write_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
     runtime: RuntimeDefinition | None
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
@@ -130,6 +131,22 @@ class ModelExecutionDefinition(BaseModel):
     def validate_api_key_environment_name(cls, value: str | None) -> str | None:
         return validate_api_key_env_name(value)
 
+    @model_validator(mode="after")
+    def validate_normalized_execution_values(self) -> ModelExecutionDefinition:
+        endpoint = normalize_model_endpoint(
+            provider=self.provider,
+            base_url=self.base_url,
+            location=self.location,
+        )
+        if self.base_url != endpoint.base_url or self.location != endpoint.location:
+            raise ValueError("model execution endpoint and location must be normalized")
+        request_limit = self.request_context_tokens or self.context_window_tokens
+        if request_limit > self.context_window_tokens:
+            raise ValueError("request_context_tokens must not exceed context_window_tokens")
+        if self.max_tokens > request_limit:
+            raise ValueError("max_tokens must not exceed the effective request context limit")
+        return self
+
     @property
     def definition_revision(self) -> str:
         return definition_revision(self)
@@ -143,22 +160,27 @@ def build_model_execution_definition(
     """Normalize one internal declaration and its catalog-wide runtime policy."""
 
     runtime = spec.runtime
+    endpoint = normalize_model_endpoint(
+        provider=spec.provider,
+        base_url=spec.base_url,
+        location=spec.location,
+    )
     return ModelExecutionDefinition(
         provider=spec.provider,
         provider_name=spec.provider_name,
         protocol=spec.protocol,
         model=spec.model,
-        tokenizer_model=spec.tokenizer_model,
+        tokenizer_model=spec.tokenizer_model or spec.model,
         max_tokens=spec.max_tokens,
         timeout_seconds=spec.timeout_seconds,
-        base_url=spec.base_url,
+        base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
         defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),
         context_window_tokens=spec.context_window_tokens,
         request_context_tokens=spec.request_context_tokens,
         supports_tools=spec.supports_tools,
         supports_structured_output=spec.supports_structured_output,
-        location=spec.location,
+        location=endpoint.location,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
         cache_read_cost_per_1m=spec.cache_read_cost_per_1m,
