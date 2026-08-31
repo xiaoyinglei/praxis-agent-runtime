@@ -19,11 +19,14 @@ from agent_runtime.model_config_io import discover_git_worktree
 from agent_runtime.model_definition import (
     ModelExecutionDefinition,
     build_model_execution_definition,
-    effective_stage_budgets,
 )
 from agent_runtime.model_registry import UserModelDefinition, UserModelRegistryStore
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
-from agent_runtime.modeling.contracts import parse_llm_stage_budgets
+from agent_runtime.modeling.contracts import (
+    LLMCallStage,
+    LLMStageBudget,
+    parse_llm_stage_budgets,
+)
 
 
 class UnknownModelAliasError(KeyError):
@@ -44,6 +47,8 @@ class ResolvedModel:
     provider: str = "openai-compatible"
     model: str = "agent-model"
     supports_native_tools: bool = True
+    definition_revision: str | None = None
+    generation_config: GenerationConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,9 +148,25 @@ class ModelRegistry:
             raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
 
     @classmethod
-    def from_env(cls, env_path: str = ".env", *, default_model: str | None = None) -> ModelRegistry:
+    def from_env(
+        cls,
+        env_path: str = ".env",
+        *,
+        default_model: str | None = None,
+        workspace: Path | None = None,
+        worktree: Path | None = None,
+    ) -> ModelRegistry:
         _load_env_file(Path(env_path))
-        config, origins = cls._load_effective_config()
+        resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
+        resolved_worktree = (
+            discover_git_worktree(resolved_workspace)
+            if worktree is None
+            else worktree.expanduser().resolve()
+        )
+        config, origins = cls._load_effective_config(
+            workspace=resolved_workspace,
+            worktree=resolved_worktree,
+        )
         if default_model is not None:
             if default_model not in config.models:
                 raise UnknownModelAliasError(f"Model alias {default_model!r} not found in config")
@@ -160,18 +181,20 @@ class ModelRegistry:
     @classmethod
     def _load_effective_config(
         cls,
+        *,
+        workspace: Path,
+        worktree: Path,
     ) -> tuple[AgentModelsConfig, dict[str, Literal["builtin", "user", "override"]]]:
         if os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"):
             override = cls._load_config()
             return override, {alias: "override" for alias in override.models}
 
         built_in = cls._load_config()
-        workspace = Path.cwd().resolve()
-        registry_path = _user_registry_path()
+        registry_path = user_model_registry_path()
         store = UserModelRegistryStore(
             path=registry_path,
             workspace=workspace,
-            worktree=discover_git_worktree(workspace),
+            worktree=worktree,
             built_in_aliases=built_in.models,
             whole_catalog_override_active=False,
         )
@@ -295,9 +318,6 @@ class ModelRegistry:
 
     def resolve(self, alias: str) -> ResolvedModel:
         """别名 → (Generator, kwargs)。按 alias 缓存，同 alias 多次调用返回同一 Generator。"""
-        from agent_runtime.modeling.gateway import LLMGateway
-        from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
-
         if alias in self._cache:
             return self._cache[alias]
 
@@ -305,12 +325,43 @@ class ModelRegistry:
         if spec is None:
             raise UnknownModelAliasError(f"Model alias {alias!r} not found in config")
 
+        definition = self._definitions[alias]
+        resolved = self._resolve_definition(
+            definition=definition,
+            spec=spec,
+            subject=f"alias {alias!r}",
+        )
+        self._cache[alias] = resolved
+        return resolved
+
+    def resolve_definition(self, definition: ModelExecutionDefinition) -> ResolvedModel:
+        """Resolve one complete frozen definition without a catalog alias lookup."""
+
+        normalized = ModelExecutionDefinition.model_validate(
+            definition.model_dump(mode="python", exclude_none=False)
+        )
+        revision = normalized.definition_revision
+        return self._resolve_definition(
+            definition=normalized,
+            spec=_model_spec_from_definition(normalized),
+            subject=f"definition {revision!r}",
+        )
+
+    def _resolve_definition(
+        self,
+        *,
+        definition: ModelExecutionDefinition,
+        spec: ModelSpec,
+        subject: str,
+    ) -> ResolvedModel:
+        from agent_runtime.modeling.gateway import LLMGateway
+        from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+
         try:
             generator = _build_chat_generator(spec)
         except Exception as exc:
-            raise ModelNotAvailableError(f"Failed to build provider for {alias!r}: {exc}") from exc
+            raise ModelNotAvailableError(f"Failed to build provider for {subject}") from exc
 
-        definition = self._definitions[alias]
         kwargs: dict[str, Any] = {
             "max_tokens": definition.max_tokens,
             **deepcopy(
@@ -321,21 +372,24 @@ class ModelRegistry:
             ),
         }
         runtime_context_tokens = min(
-            spec.context_window_tokens,
-            spec.request_context_tokens or spec.context_window_tokens,
+            definition.context_window_tokens,
+            definition.request_context_tokens or definition.context_window_tokens,
         )
         token_accounting = TokenAccountingService(
             TokenizerContract(
-                embedding_model_name=spec.model,
-                tokenizer_model_name=spec.tokenizer_model or spec.model,
-                chunking_tokenizer_model_name=(spec.tokenizer_model or spec.model),
+                embedding_model_name=definition.model,
+                tokenizer_model_name=definition.tokenizer_model or definition.model,
+                chunking_tokenizer_model_name=(definition.tokenizer_model or definition.model),
                 tokenizer_backend="auto",
                 max_context_tokens=runtime_context_tokens,
                 prompt_reserved_tokens=512,
                 local_files_only=True,
             )
         )
-        stage_budgets = effective_stage_budgets(config=self._config, spec=spec)
+        stage_budgets = {
+            LLMCallStage(stage): LLMStageBudget.model_validate(budget.model_dump())
+            for stage, budget in definition.llm_stage_budgets.items()
+        }
         resolved = ResolvedModel(
             generator=generator,
             kwargs=kwargs,
@@ -347,11 +401,12 @@ class ModelRegistry:
                 stage_budgets=stage_budgets,
             ),
             token_accounting=token_accounting,
-            provider=spec.provider_name or spec.provider.value,
-            model=spec.model,
-            supports_native_tools=spec.supports_tools,
+            provider=definition.provider_name or definition.provider.value,
+            model=definition.model,
+            supports_native_tools=definition.supports_tools,
+            definition_revision=definition.definition_revision,
+            generation_config=_generation_config_from_definition(definition),
         )
-        self._cache[alias] = resolved
         return resolved
 
     def resolve_or_fallback(self, alias: str) -> ResolvedModel:
@@ -376,6 +431,57 @@ class ModelRegistry:
         """
         alias = node_model or self._config.default_model
         return self.resolve_or_fallback(alias)
+
+
+def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSpec:
+    return ModelSpec.model_validate(
+        {
+            "provider": definition.provider,
+            "provider_name": definition.provider_name,
+            "protocol": definition.protocol,
+            "model": definition.model,
+            "tokenizer_model": definition.tokenizer_model,
+            "max_tokens": definition.max_tokens,
+            "timeout_seconds": definition.timeout_seconds,
+            "base_url": definition.base_url,
+            "api_key_env": definition.api_key_env,
+            "defaults": definition.defaults.model_dump(mode="python", exclude_none=True),
+            "context_window_tokens": definition.context_window_tokens,
+            "request_context_tokens": definition.request_context_tokens,
+            "supports_tools": definition.supports_tools,
+            "supports_structured_output": definition.supports_structured_output,
+            "location": definition.location,
+            "input_cost_per_1m": definition.input_cost_per_1m,
+            "output_cost_per_1m": definition.output_cost_per_1m,
+            "cache_read_cost_per_1m": definition.cache_read_cost_per_1m,
+            "cache_write_cost_per_1m": definition.cache_write_cost_per_1m,
+            "runtime": (
+                definition.runtime.model_dump(mode="python", exclude_none=True)
+                if definition.runtime is not None
+                else None
+            ),
+        }
+    )
+
+
+def _generation_config_from_definition(
+    definition: ModelExecutionDefinition,
+) -> GenerationConfig:
+    def task(name: str) -> GenerationTaskConfig:
+        value = getattr(definition.generation, name)
+        return GenerationTaskConfig(
+            model=value.model,
+            max_tokens=value.max_tokens,
+            temperature=value.temperature,
+        )
+
+    return GenerationConfig(
+        summary=task("summary"),
+        answer=task("answer"),
+        planner=task("planner"),
+        synthesize=task("synthesize"),
+        factcheck=task("factcheck"),
+    )
 
 
 def _build_chat_generator(spec: ModelSpec) -> object:
@@ -673,7 +779,7 @@ def _api_key_from_env(name: str | None) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-def _user_registry_path() -> Path:
+def user_model_registry_path() -> Path:
     configured = os.environ.get("PRAXIS_MODEL_REGISTRY_PATH")
     if configured:
         return Path(configured)

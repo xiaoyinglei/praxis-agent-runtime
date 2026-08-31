@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Iterable, Mapping
@@ -8,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 from agent_runtime.core.llm_config import ModelSpec as InternalModelSpec
 from agent_runtime.core.llm_config import normalize_model_endpoint
@@ -17,6 +19,7 @@ from agent_runtime.core.llm_registry import (
     ModelResolver,
     ResolvedModel,
     UnknownModelAliasError,
+    user_model_registry_path,
 )
 from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
@@ -24,11 +27,23 @@ from agent_runtime.model_config_io import (
     FileVersion,
     atomic_replace_bytes,
     confirm_parent_directory_durability,
+    discover_git_worktree,
     exclusive_config_lock,
     file_fingerprint,
 )
-from agent_runtime.model_definition import ModelExecutionDefinition
+from agent_runtime.model_definition import (
+    ModelExecutionDefinition,
+    canonical_definition_json,
+)
+from agent_runtime.model_trust import (
+    BindingAuthenticationError,
+    ModelBindingTrustDomain,
+    TrustedModelDefinitionArchive,
+    build_model_binding_association,
+    build_model_binding_envelope,
+)
 from agent_runtime.modeling.config import GenerationConfig
+from agent_runtime.tools.tool import JsonValue
 
 ModelLocation = Literal["local", "cloud"]
 ModelSwitchRequester = Literal["user", "agent", "system"]
@@ -341,6 +356,34 @@ class ModelPolicy:
     allowed_user_model_ids: frozenset[str] | None = None
     allowed_agent_model_ids: frozenset[str] | None = None
     allowed_system_model_ids: frozenset[str] | None = None
+    allowed_provider_kinds: frozenset[str] | None = None
+    allowed_remote_hosts: frozenset[str] | None = None
+    allow_local_launch: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.allow_local_launch) is not bool:
+            raise TypeError("allow_local_launch must be a bool")
+        if self.allowed_remote_hosts is not None and any(
+            type(host) is not str or not host or host != host.lower() or host != host.strip()
+            for host in self.allowed_remote_hosts
+        ):
+            raise ValueError("allowed remote hosts must be non-empty normalized hostnames")
+
+    @property
+    def revision(self) -> str:
+        payload = json.dumps(
+            {
+                "allowed_user_model_ids": _sorted_policy_values(self.allowed_user_model_ids),
+                "allowed_agent_model_ids": _sorted_policy_values(self.allowed_agent_model_ids),
+                "allowed_system_model_ids": _sorted_policy_values(self.allowed_system_model_ids),
+                "allowed_provider_kinds": _sorted_policy_values(self.allowed_provider_kinds),
+                "allowed_remote_hosts": _sorted_policy_values(self.allowed_remote_hosts),
+                "allow_local_launch": self.allow_local_launch,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return f"model-policy:sha256:{hashlib.sha256(payload).hexdigest()}"
 
     def review_switch(
         self,
@@ -355,6 +398,43 @@ class ModelPolicy:
         if allowed is not None and target_model_id not in allowed:
             raise ModelPolicyError(f"Model {target_model_id!r} is not allowed for {requested_by} requests")
         return spec
+
+    def review_binding(
+        self,
+        *,
+        alias: str,
+        definition: ModelExecutionDefinition,
+        requested_by: ModelSwitchRequester,
+    ) -> ModelExecutionDefinition:
+        requested_by = validate_model_switch_requester(requested_by)
+        if type(alias) is not str or not alias or alias != alias.strip():
+            raise ModelPolicyError("Frozen model alias is invalid")
+        allowed = self._allowed_ids_for(requested_by)
+        if allowed is not None and alias not in allowed:
+            raise ModelPolicyError(f"Model {alias!r} is not allowed for {requested_by} requests")
+        try:
+            normalized = ModelExecutionDefinition.model_validate(
+                definition.model_dump(mode="python", exclude_none=False)
+            )
+        except (TypeError, ValueError) as error:
+            raise ModelPolicyError("Frozen model definition is invalid") from error
+        provider_kind = normalized.provider.value
+        if (
+            self.allowed_provider_kinds is not None
+            and provider_kind not in self.allowed_provider_kinds
+        ):
+            raise ModelPolicyError(f"Frozen model provider {provider_kind!r} is not allowed")
+        if normalized.location == "cloud" and self.allowed_remote_hosts is not None:
+            host = urlsplit(normalized.base_url or "").hostname
+            if host is None or host.rstrip(".").lower() not in self.allowed_remote_hosts:
+                raise ModelPolicyError(f"Frozen model remote host {host!r} is not allowed")
+        if (
+            not self.allow_local_launch
+            and normalized.runtime is not None
+            and normalized.runtime.launch_command
+        ):
+            raise ModelPolicyError("Frozen model local launch command is not allowed")
+        return normalized
 
     def _allowed_ids_for(
         self,
@@ -380,6 +460,8 @@ class ModelControlPlane:
         session_path: Path | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
         session_diagnostics: tuple[str, ...] = (),
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> None:
         if not catalog.has(state.current_model_id):
             raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
@@ -396,6 +478,8 @@ class ModelControlPlane:
         self._session_store = ModelSessionStore(session_path) if session_path is not None else None
         self._pending_session_receipt: SessionMutationReceipt | None = None
         self._local_runtime_manager = local_runtime_manager
+        self._trust_domain = trust_domain
+        self._definition_archive = definition_archive
         self.session_diagnostics = session_diagnostics
 
     @classmethod
@@ -408,6 +492,8 @@ class ModelControlPlane:
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> ModelControlPlane:
         registry = ModelRegistry(ModelRegistry._load_yaml_file(path))
         return cls.from_registry(
@@ -417,6 +503,8 @@ class ModelControlPlane:
             session_path=session_path,
             policy=policy,
             local_runtime_manager=local_runtime_manager,
+            trust_domain=trust_domain,
+            definition_archive=definition_archive,
         )
 
     @classmethod
@@ -429,8 +517,33 @@ class ModelControlPlane:
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
+        workspace: Path | None = None,
+        worktree: Path | None = None,
     ) -> ModelControlPlane:
-        registry = ModelRegistry.from_env(env_path=env_path)
+        resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
+        resolved_worktree = (
+            discover_git_worktree(resolved_workspace)
+            if worktree is None
+            else worktree.expanduser().resolve()
+        )
+        registry = ModelRegistry.from_env(
+            env_path=env_path,
+            workspace=resolved_workspace,
+            worktree=resolved_worktree,
+        )
+        registry_path = user_model_registry_path()
+        effective_trust = trust_domain or ModelBindingTrustDomain(
+            registry_path.parent / "binding-trust.json",
+            workspace=resolved_workspace,
+            worktree=resolved_worktree,
+        )
+        effective_archive = definition_archive or TrustedModelDefinitionArchive(
+            registry_path.parent / "model-definitions",
+            workspace=resolved_workspace,
+            worktree=resolved_worktree,
+        )
         return cls.from_registry(
             registry,
             initial_model_id=initial_model_id,
@@ -438,6 +551,8 @@ class ModelControlPlane:
             session_path=session_path,
             policy=policy,
             local_runtime_manager=local_runtime_manager,
+            trust_domain=effective_trust,
+            definition_archive=effective_archive,
         )
 
     @classmethod
@@ -450,6 +565,8 @@ class ModelControlPlane:
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
         local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> ModelControlPlane:
         catalog = ModelCatalog.from_registry(registry)
         effective_policy = policy or ModelPolicy()
@@ -468,6 +585,8 @@ class ModelControlPlane:
             session_path=session_path,
             local_runtime_manager=local_runtime_manager,
             session_diagnostics=diagnostics,
+            trust_domain=trust_domain,
+            definition_archive=definition_archive,
         )
 
     @property
@@ -547,6 +666,92 @@ class ModelControlPlane:
 
     def request_model_switch(self, model_id: str) -> ModelSpec:
         return self.switch_model(model_id, requested_by="agent")
+
+    def freeze_model_binding(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> dict[str, JsonValue]:
+        _validate_binding_identity(thread_id, field_name="thread_id")
+        _validate_binding_identity(turn_id, field_name="turn_id")
+        trust = self._trust_domain
+        archive = self._definition_archive
+        if trust is None or archive is None:
+            raise RuntimeError("model binding trust services are not configured")
+        alias = self.state.current_model_id
+        requester = self.state.selection_requester
+        definition = self.policy.review_binding(
+            alias=alias,
+            definition=self.catalog.definition(alias),
+            requested_by=requester,
+        )
+        status = trust.status()
+        revision = archive.ensure(definition)
+        if revision != definition.definition_revision:
+            raise RuntimeError("trusted model definition archive returned a mismatched revision")
+        envelope = build_model_binding_envelope(
+            alias=alias,
+            origin=self.catalog.origin(alias),
+            definition=definition,
+            policy_revision=self.policy.revision,
+        )
+        association = build_model_binding_association(
+            status=status,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            selection_requester=requester,
+            binding=envelope,
+        )
+        association["signature"] = trust.sign(association)
+        return association
+
+    def resolve_frozen_binding(
+        self,
+        binding: Mapping[str, JsonValue],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> ResolvedModel:
+        trust = self._trust_domain
+        archive = self._definition_archive
+        if trust is None or archive is None:
+            raise RuntimeError("model binding trust services are not configured")
+        _validate_binding_identity(thread_id, field_name="thread_id")
+        _validate_binding_identity(turn_id, field_name="turn_id")
+        if not isinstance(binding, Mapping):
+            raise BindingAuthenticationError("frozen model binding must be a mapping")
+        association = dict(binding)
+        signature = association.pop("signature", None)
+        if type(signature) is not str:
+            raise BindingAuthenticationError("frozen model binding signature is missing")
+        trust.verify(cast(Mapping[str, JsonValue], association), signature)
+        if association["thread_id"] != thread_id or association["turn_id"] != turn_id:
+            raise BindingAuthenticationError("frozen model binding belongs to a different Turn")
+        envelope = cast(Mapping[str, JsonValue], association["binding"])
+        revision = cast(str, envelope["definition_revision"])
+        archived = archive.load(revision)
+        raw_definition = cast(Mapping[str, object], envelope["definition"])
+        try:
+            turn_definition = ModelExecutionDefinition.model_validate(dict(raw_definition))
+        except (TypeError, ValueError) as error:
+            raise BindingAuthenticationError("frozen model definition is invalid") from error
+        if canonical_definition_json(archived) != canonical_definition_json(turn_definition):
+            raise BindingAuthenticationError(
+                "frozen model definition does not match the trusted archive"
+            )
+        alias = cast(str, envelope["alias"])
+        requester = validate_model_switch_requester(association["selection_requester"])
+        reviewed = self.policy.review_binding(
+            alias=alias,
+            definition=archived,
+            requested_by=requester,
+        )
+        self._ensure_model_ready(_to_public_definition_spec(alias, reviewed))
+        resolver = getattr(self._registry, "resolve_definition", None)
+        if not callable(resolver):
+            raise RuntimeError("Model resolver cannot resolve frozen definitions")
+        return cast(ResolvedModel, resolver(reviewed))
 
     def resolve(self, alias: str) -> ResolvedModel:
         if self._registry is None:
@@ -650,10 +855,55 @@ def _validate_selection_requester(value: object) -> None:
     validate_model_switch_requester(value)
 
 
+def _sorted_policy_values(values: frozenset[str] | None) -> list[str] | None:
+    return None if values is None else sorted(values)
+
+
 def validate_model_switch_requester(value: object) -> ModelSwitchRequester:
     if type(value) is not str or value not in ("user", "agent", "system"):
         raise ValueError("selection requester must be user, agent, or system")
     return cast(ModelSwitchRequester, value)
+
+
+def _validate_binding_identity(value: object, *, field_name: str) -> None:
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-empty trimmed string")
+
+
+def _to_public_definition_spec(
+    alias: str,
+    definition: ModelExecutionDefinition,
+) -> ModelSpec:
+    runtime = definition.runtime
+    location = definition.location
+    if location is None:
+        raise ValueError("frozen model definition has no normalized location")
+    return ModelSpec(
+        id=alias,
+        provider=definition.provider_name or definition.provider.value,
+        provider_model=definition.model,
+        context_window=definition.context_window_tokens,
+        supports_tools=definition.supports_tools,
+        supports_structured_output=definition.supports_structured_output,
+        location=location,
+        protocol=definition.protocol,
+        base_url=definition.base_url,
+        api_key_env=definition.api_key_env,
+        max_output_tokens=definition.max_tokens,
+        input_cost_per_1m=definition.input_cost_per_1m,
+        output_cost_per_1m=definition.output_cost_per_1m,
+        runtime=(
+            ModelRuntimeSpec(
+                health_url=runtime.health_url,
+                launch_command=runtime.launch_command,
+                expected_model_contains=runtime.expected_model_contains,
+                startup_timeout_seconds=runtime.startup_timeout_seconds,
+                poll_interval_seconds=runtime.poll_interval_seconds,
+            )
+            if runtime is not None
+            else None
+        ),
+    )
 
 
 def _to_public_spec(

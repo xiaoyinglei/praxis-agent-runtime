@@ -23,6 +23,13 @@ from agent_runtime.model_config_io import (
     ConfigVersionConflict,
     file_fingerprint,
 )
+from agent_runtime.model_trust import (
+    BindingAuthenticationError,
+    ModelBindingTrustDomain,
+    TrustDomainNotInitializedError,
+    TrustedDefinitionNotFoundError,
+    TrustedModelDefinitionArchive,
+)
 from agent_runtime.modeling.contracts import DEFAULT_LLM_STAGE_BUDGETS, LLMCallStage
 from agent_runtime.models import (
     ModelCatalog,
@@ -33,6 +40,7 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSessionStore,
     ModelSpec,
+    ModelSwitchRequester,
     SessionCommitOutcomeUnknown,
 )
 from agent_runtime.text import load_env_file
@@ -339,6 +347,244 @@ def test_model_policy_reviews_agent_model_switch_requests(tmp_path: Path) -> Non
     control.switch_model("mimo_cloud", requested_by="user")
     assert state.current_model_id == "mimo_cloud"
     assert state.selection_requester == "user"
+
+
+@pytest.mark.parametrize("requested_by", ["user", "agent", "system"])
+def test_model_policy_reviews_frozen_definition_without_catalog(
+    tmp_path: Path,
+    requested_by: ModelSwitchRequester,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    catalog = ModelCatalog.from_config_file(config_path)
+    definition = catalog.definition("mimo_cloud")
+    policy = ModelPolicy(
+        allowed_user_model_ids=frozenset({"mimo_cloud"}),
+        allowed_agent_model_ids=frozenset({"mimo_cloud"}),
+        allowed_system_model_ids=frozenset({"mimo_cloud"}),
+        allowed_provider_kinds=frozenset({definition.provider.value}),
+        allowed_remote_hosts=frozenset({"token-plan-cn.xiaomimimo.com"}),
+    )
+
+    reviewed = policy.review_binding(
+        alias="mimo_cloud",
+        definition=definition,
+        requested_by=requested_by,
+    )
+
+    assert reviewed == definition
+
+
+def test_model_policy_rejects_frozen_provider_host_and_local_launch(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    catalog = ModelCatalog.from_config_file(config_path)
+    cloud = catalog.definition("mimo_cloud")
+    local = catalog.definition("local_qwen")
+
+    with pytest.raises(ModelPolicyError, match="provider"):
+        ModelPolicy(allowed_provider_kinds=frozenset({"ollama"})).review_binding(
+            alias="mimo_cloud",
+            definition=cloud,
+            requested_by="user",
+        )
+    with pytest.raises(ModelPolicyError, match="host"):
+        ModelPolicy(allowed_remote_hosts=frozenset({"api.example.com"})).review_binding(
+            alias="mimo_cloud",
+            definition=cloud,
+            requested_by="user",
+        )
+    with pytest.raises(ModelPolicyError, match="launch"):
+        ModelPolicy(allow_local_launch=False).review_binding(
+            alias="local_qwen",
+            definition=local,
+            requested_by="user",
+        )
+
+
+def test_model_policy_revalidates_frozen_endpoint_and_credential_reference(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    definition = ModelCatalog.from_config_file(config_path).definition("mimo_cloud")
+    wrong_location = definition.model_copy(update={"location": "local"})
+    unsafe_credential = definition.model_copy(update={"api_key_env": "TOKEN=value"})
+
+    with pytest.raises(ModelPolicyError, match="invalid"):
+        ModelPolicy().review_binding(
+            alias="mimo_cloud",
+            definition=wrong_location,
+            requested_by="user",
+        )
+    with pytest.raises(ModelPolicyError, match="invalid"):
+        ModelPolicy().review_binding(
+            alias="mimo_cloud",
+            definition=unsafe_credential,
+            requested_by="user",
+        )
+
+
+def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    archive = TrustedModelDefinitionArchive(
+        trusted_root / "model-definitions",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    ready: list[str] = []
+    manager = SimpleNamespace(ensure_ready=lambda spec: ready.append(spec.id))
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="user",
+        trust_domain=trust,
+        definition_archive=archive,
+        local_runtime_manager=manager,
+    )
+    frozen_definition = control.catalog.definition("local_qwen")
+    resolved_sentinel = SimpleNamespace(model="resolved-frozen")
+    resolved_definitions: list[object] = []
+
+    def resolve_definition(_registry: object, definition: object) -> object:
+        resolved_definitions.append(definition)
+        return resolved_sentinel
+
+    monkeypatch.setattr(ModelRegistry, "resolve_definition", resolve_definition)
+
+    binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+    resolved = control.resolve_frozen_binding(
+        binding,
+        thread_id="thread-1",
+        turn_id="turn-1",
+    )
+
+    assert resolved is resolved_sentinel
+    assert ready == ["local_qwen"]
+    assert resolved_definitions == [frozen_definition]
+    assert binding["selection_requester"] == "user"
+    assert binding["thread_id"] == "thread-1"
+    envelope = binding["binding"]
+    assert isinstance(envelope, dict)
+    assert envelope["alias"] == "local_qwen"
+    assert envelope["origin"] == "override"
+    assert archive.load(frozen_definition.definition_revision) == frozen_definition
+
+    tampered = {**binding, "turn_id": "turn-2"}
+    with pytest.raises(BindingAuthenticationError):
+        control.resolve_frozen_binding(
+            tampered,
+            thread_id="thread-1",
+            turn_id="turn-2",
+        )
+    assert ready == ["local_qwen"]
+    assert resolved_definitions == [frozen_definition]
+
+    archived_path = archive.path / f"{frozen_definition.definition_revision}.json"
+    archived_path.unlink()
+    with pytest.raises(TrustedDefinitionNotFoundError):
+        control.resolve_frozen_binding(
+            binding,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+    assert ready == ["local_qwen"]
+    assert resolved_definitions == [frozen_definition]
+
+
+def test_freeze_requires_explicit_trust_before_archive_mutation(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    trust_path = trusted_root / "binding-trust.json"
+    archive_path = trusted_root / "model-definitions"
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        trust_domain=ModelBindingTrustDomain(
+            trust_path,
+            workspace=workspace,
+            worktree=workspace,
+        ),
+        definition_archive=TrustedModelDefinitionArchive(
+            archive_path,
+            workspace=workspace,
+            worktree=workspace,
+        ),
+    )
+
+    with pytest.raises(TrustDomainNotInitializedError, match="agent model trust init"):
+        control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+
+    assert not trust_path.exists()
+    assert not archive_path.exists()
+
+
+def test_frozen_binding_checks_current_credential_before_provider_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    archive = TrustedModelDefinitionArchive(
+        trusted_root / "model-definitions",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="mimo_cloud",
+        initial_selection_requester="user",
+        trust_domain=trust,
+        definition_archive=archive,
+    )
+    binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+    provider_calls: list[object] = []
+
+    def resolve_definition(_registry: object, definition: object) -> object:
+        provider_calls.append(definition)
+        return object()
+
+    monkeypatch.setattr(ModelRegistry, "resolve_definition", resolve_definition)
+    monkeypatch.delenv("MIMO_API_KEY", raising=False)
+
+    with pytest.raises(ModelNotAvailableError, match="MIMO_API_KEY"):
+        control.resolve_frozen_binding(
+            binding,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+
+    assert provider_calls == []
 
 
 def test_agent_selection_requester_paths_are_explicit(tmp_path: Path) -> None:

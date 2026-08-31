@@ -7,8 +7,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+from agent_runtime.core import llm_registry as llm_registry_module
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
 from agent_runtime.core.llm_registry import (
+    ModelNotAvailableError,
     ModelRegistry,
     UnknownModelAliasError,
     _chat_provider_config,
@@ -656,6 +658,144 @@ class TestModelRegistryResolve:
         reg = ModelRegistry(_make_config())
         with pytest.raises(UnknownModelAliasError):
             reg.resolve("nonexistent")
+
+    def test_resolve_definition_uses_complete_frozen_values_without_alias_lookup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        source_config = _make_config()
+        source_config.models["main"] = ModelSpec(
+            provider=ModelProvider.OPENAI_COMPATIBLE,
+            provider_name="frozen-provider",
+            protocol="openai_compatible",
+            model="provider/frozen-v1",
+            tokenizer_model="frozen-tokenizer",
+            max_tokens=777,
+            timeout_seconds=45.5,
+            base_url="http://127.0.0.1:9090/v1",
+            defaults={
+                "temperature": 0.25,
+                "top_p": 0.8,
+                "parallel_tool_calls": False,
+                "seed": 9,
+            },
+            context_window_tokens=65_536,
+            request_context_tokens=12_345,
+            supports_tools=False,
+            supports_structured_output=False,
+            location="local",
+            runtime={
+                "health_url": "http://127.0.0.1:9090/health",
+                "launch_command": ["frozen-server", "--port", "9090"],
+                "expected_model_contains": "frozen-v1",
+                "startup_timeout_seconds": 17.0,
+                "poll_interval_seconds": 0.25,
+            },
+        )
+        source_config.generation = replace(
+            source_config.generation,
+            answer=GenerationTaskConfig(
+                model="main",
+                max_tokens=701,
+                temperature=0.15,
+            ),
+        )
+        source_config.llm_stage_budgets = {
+            stage: LLMStageBudget(
+                max_input_tokens=10_000 + index,
+                max_output_tokens=1_000 + index,
+                safety_margin_tokens=100 + index,
+            )
+            for index, stage in enumerate(LLMCallStage)
+        }
+        definition = ModelRegistry(source_config).get_model_definition("main")
+        target = ModelRegistry(_make_config())
+        observed: dict[str, ModelSpec] = {}
+        generator = object()
+
+        def build_frozen(spec: ModelSpec) -> object:
+            observed["spec"] = spec.model_copy(deep=True)
+            return generator
+
+        monkeypatch.setattr(llm_registry_module, "_build_chat_generator", build_frozen)
+
+        resolved = target.resolve_definition(definition)
+
+        frozen_spec = observed["spec"]
+        assert frozen_spec.model == "provider/frozen-v1"
+        assert frozen_spec.tokenizer_model == "frozen-tokenizer"
+        assert frozen_spec.timeout_seconds == 45.5
+        assert frozen_spec.runtime is not None
+        assert frozen_spec.runtime.launch_command == ("frozen-server", "--port", "9090")
+        assert resolved.generator is generator
+        assert resolved.kwargs == {
+            "max_tokens": 777,
+            "temperature": 0.25,
+            "top_p": 0.8,
+            "parallel_tool_calls": False,
+            "seed": 9,
+        }
+        assert resolved.context_window_tokens == 12_345
+        assert resolved.model == "provider/frozen-v1"
+        assert resolved.provider == "frozen-provider"
+        assert resolved.supports_native_tools is False
+        assert resolved.definition_revision == definition.definition_revision
+        assert resolved.generation_config is not None
+        assert resolved.generation_config.answer.max_tokens == 701
+        assert resolved.gateway is not None
+        for stage in LLMCallStage:
+            expected = definition.llm_stage_budgets[stage.value]
+            actual = resolved.gateway.stage_budget(stage)
+            assert actual.model_dump() == expected.model_dump()
+
+    def test_resolve_definition_reloads_current_credential_for_each_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config = AgentModelsConfig(
+            models={
+                "cloud": ModelSpec(
+                    provider=ModelProvider.OPENAI_COMPATIBLE,
+                    model="cloud-model",
+                    base_url="https://api.example.com/v1",
+                    api_key_env="FROZEN_TEST_API_KEY",
+                    location="cloud",
+                )
+            },
+            default_model="cloud",
+        )
+        registry = ModelRegistry(config)
+        definition = registry.get_model_definition("cloud")
+        observed_keys: list[str | None] = []
+
+        def capture_credential(spec: ModelSpec) -> object:
+            observed_keys.append(_chat_provider_config(spec).api_key)
+            return object()
+
+        monkeypatch.setattr(llm_registry_module, "_build_chat_generator", capture_credential)
+        monkeypatch.setenv("FROZEN_TEST_API_KEY", "first-secret")
+        first = registry.resolve_definition(definition)
+        monkeypatch.setenv("FROZEN_TEST_API_KEY", "rotated-secret")
+        second = registry.resolve_definition(definition)
+
+        assert first.generator is not second.generator
+        assert observed_keys == ["first-secret", "rotated-secret"]
+
+    def test_resolve_definition_does_not_echo_provider_secret_errors(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        registry = ModelRegistry(_make_config())
+        definition = registry.get_model_definition("main")
+
+        def fail_with_secret(_spec: ModelSpec) -> object:
+            raise RuntimeError("provider rejected secret-value")
+
+        monkeypatch.setattr(llm_registry_module, "_build_chat_generator", fail_with_secret)
+        with pytest.raises(ModelNotAvailableError) as captured:
+            registry.resolve_definition(definition)
+
+        assert "secret-value" not in str(captured.value)
 
     def test_resolve_returns_generator(self) -> None:
         reg = ModelRegistry(_make_config())

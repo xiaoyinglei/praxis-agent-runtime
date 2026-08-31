@@ -19,8 +19,10 @@ from agent_runtime.cli import (
     agent_app,
 )
 from agent_runtime.harness import RolloutStore
+from agent_runtime.models import ModelControlPlane
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentPause, AgentResult, AgentToolCall, AgentUsage
+from agent_runtime.runtime.builder import build_model_control_plane
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
@@ -95,6 +97,36 @@ def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
     finally:
         if agent._model_control_plane is not None:
             agent._model_control_plane.close()
+
+
+def test_agent_and_builder_pass_explicit_workspace_security_domain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "selected-workspace"
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    workspace.mkdir()
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+    captured: list[dict[str, object]] = []
+    sentinel = object()
+
+    def capture_from_env(cls: type[ModelControlPlane], **kwargs: object) -> object:
+        del cls
+        captured.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(ModelControlPlane, "from_env", classmethod(capture_from_env))
+
+    agent = Agent(workspace_path=workspace, model_session_path=Path(".praxis/session.json"))
+    assert agent._get_model_control_plane() is sentinel
+    assert build_model_control_plane(workspace=workspace) is sentinel
+
+    assert len(captured) == 2
+    assert captured[0]["session_path"] == workspace / ".praxis/session.json"
+    for call in captured:
+        assert call["workspace"] == workspace.resolve()
+        assert call["worktree"] == workspace.resolve()
 
 
 @pytest.mark.anyio
