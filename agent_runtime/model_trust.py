@@ -25,7 +25,9 @@ from agent_runtime.model_config_io import (
     UntrustedConfigPathError,
     atomic_install_bytes,
     confirm_parent_directory_durability,
+    ensure_durable_directory,
     exclusive_config_lock,
+    reconcile_atomic_install_link,
     validate_user_config_path,
 )
 from agent_runtime.model_definition import (
@@ -41,6 +43,8 @@ _TRUST_FILE_LIMIT = 4096
 _DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 _REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SIGNATURE_PATTERN = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
+_BINDING_SCHEMA_VERSION = 2
+_AUTHENTICATION_SCHEMA_VERSION = 1
 
 
 class TrustDomainNotInitializedError(RuntimeError):
@@ -93,6 +97,7 @@ class ModelBindingTrustDomain:
             error_type=TrustDomainValidationError,
         )
         with exclusive_config_lock(self.path):
+            _reconcile_install_if_present(self.path)
             try:
                 existing = self._load()
             except TrustDomainNotInitializedError:
@@ -116,7 +121,7 @@ class ModelBindingTrustDomain:
         material = self._load()
         digest = hmac.new(
             material.key,
-            _canonical_association(association),
+            _validated_association_bytes(association, status=material.status),
             hashlib.sha256,
         ).hexdigest()
         return f"hmac-sha256:{digest}"
@@ -125,7 +130,7 @@ class ModelBindingTrustDomain:
         material = self._load()
         expected = hmac.new(
             material.key,
-            _canonical_association(association),
+            _validated_association_bytes(association, status=material.status),
             hashlib.sha256,
         ).hexdigest()
         provided = signature.removeprefix("hmac-sha256:") if isinstance(signature, str) else ""
@@ -139,6 +144,7 @@ class ModelBindingTrustDomain:
 
     def _load(self) -> _TrustMaterial:
         try:
+            _reconcile_install_if_needed(self.path)
             _validate_private_directory(
                 self.path.parent,
                 subject="trust domain parent",
@@ -179,6 +185,7 @@ class TrustedModelDefinitionArchive:
         )
         target = self._target(revision)
         with exclusive_config_lock(target):
+            _reconcile_install_if_present(target)
             try:
                 existing = self._load_target(target, revision=revision)
             except TrustedDefinitionNotFoundError:
@@ -213,6 +220,7 @@ class TrustedModelDefinitionArchive:
             raise TrustedDefinitionNotFoundError(
                 f"trusted model definition {definition_revision!r} is not installed"
             ) from error
+        _reconcile_install_if_needed(target)
         return self._load_target(target, revision=definition_revision)
 
     def _target(self, revision: str) -> Path:
@@ -338,6 +346,55 @@ def _normalize_definition(definition: ModelExecutionDefinition) -> ModelExecutio
         raise TrustedDefinitionValidationError("model definition is invalid") from error
 
 
+def build_model_binding_envelope(
+    *,
+    alias: str,
+    origin: str,
+    definition: ModelExecutionDefinition,
+    policy_revision: str,
+) -> dict[str, JsonValue]:
+    """Build the exact digest-bearing envelope authenticated for one Turn."""
+
+    normalized = _normalize_definition(definition)
+    envelope: dict[str, JsonValue] = {
+        "schema_version": _BINDING_SCHEMA_VERSION,
+        "alias": alias,
+        "origin": origin,
+        "definition_revision": normalized.definition_revision,
+        "definition": cast(
+            JsonValue,
+            normalized.model_dump(mode="json", by_alias=True, exclude_none=False),
+        ),
+        "policy_revision": policy_revision,
+    }
+    envelope["binding_digest"] = _json_digest(envelope)
+    _validate_binding_envelope(envelope)
+    return envelope
+
+
+def build_model_binding_association(
+    *,
+    status: TrustDomainStatus,
+    thread_id: str,
+    turn_id: str,
+    selection_requester: str,
+    binding: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Build the exact identity association accepted by the trust domain."""
+
+    association: dict[str, JsonValue] = {
+        "authentication_schema_version": _AUTHENTICATION_SCHEMA_VERSION,
+        "trust_domain_id": status.trust_domain_id,
+        "signing_key_id": status.signing_key_id,
+        "thread_id": thread_id,
+        "turn_id": turn_id,
+        "selection_requester": selection_requester,
+        "binding": dict(binding),
+    }
+    _validated_association_bytes(association, status=status)
+    return association
+
+
 def _strict_json_object(
     payload: bytes,
     *,
@@ -361,13 +418,118 @@ def _strict_json_object(
     return cast(dict[str, object], value)
 
 
-def _canonical_association(association: Mapping[str, JsonValue]) -> bytes:
+def _validated_association_bytes(
+    association: Mapping[str, JsonValue],
+    *,
+    status: TrustDomainStatus,
+) -> bytes:
     if not isinstance(association, Mapping):
-        raise TypeError("model binding association must be a mapping")
+        raise BindingAuthenticationError("model binding association must be a mapping")
+    document = dict(association)
+    required = {
+        "authentication_schema_version",
+        "trust_domain_id",
+        "signing_key_id",
+        "thread_id",
+        "turn_id",
+        "selection_requester",
+        "binding",
+    }
+    if set(document) != required:
+        raise BindingAuthenticationError(
+            "model binding association has unexpected or missing fields"
+        )
+    if (
+        type(document["authentication_schema_version"]) is not int
+        or document["authentication_schema_version"] != _AUTHENTICATION_SCHEMA_VERSION
+    ):
+        raise BindingAuthenticationError("model binding authentication schema is unsupported")
+    trust_domain_id = document["trust_domain_id"]
+    signing_key_id = document["signing_key_id"]
+    if (
+        type(trust_domain_id) is not str
+        or type(signing_key_id) is not str
+        or trust_domain_id != status.trust_domain_id
+        or signing_key_id != status.signing_key_id
+    ):
+        raise BindingAuthenticationError("model binding trust identity does not match")
+    for field_name in ("thread_id", "turn_id"):
+        value = document[field_name]
+        if type(value) is not str or not value or value != value.strip():
+            raise BindingAuthenticationError(
+                f"model binding {field_name} must be a non-empty trimmed string"
+            )
+    requester = document["selection_requester"]
+    if type(requester) is not str or requester not in ("user", "agent", "system"):
+        raise BindingAuthenticationError("model binding selection requester is invalid")
+    binding = document["binding"]
+    if not isinstance(binding, Mapping):
+        raise BindingAuthenticationError("model binding envelope must be a mapping")
+    _validate_binding_envelope(binding)
     try:
-        return canonical_json_text(cast(JsonValue, dict(association))).encode("utf-8")
+        return canonical_json_text(cast(JsonValue, document)).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise ValueError("model binding association must contain canonical JSON values") from error
+        raise BindingAuthenticationError(
+            "model binding association must contain canonical JSON values"
+        ) from error
+
+
+def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
+    document = dict(binding)
+    required = {
+        "schema_version",
+        "alias",
+        "origin",
+        "definition_revision",
+        "definition",
+        "policy_revision",
+        "binding_digest",
+    }
+    if set(document) != required:
+        raise BindingAuthenticationError("model binding envelope has unexpected or missing fields")
+    if type(document["schema_version"]) is not int or document[
+        "schema_version"
+    ] != _BINDING_SCHEMA_VERSION:
+        raise BindingAuthenticationError("model binding schema is unsupported")
+    alias = document["alias"]
+    if type(alias) is not str or not alias or alias != alias.strip():
+        raise BindingAuthenticationError("model binding alias is invalid")
+    origin = document["origin"]
+    if type(origin) is not str or origin not in ("builtin", "user", "override"):
+        raise BindingAuthenticationError("model binding origin is invalid")
+    revision = document["definition_revision"]
+    if type(revision) is not str or _REVISION_PATTERN.fullmatch(revision) is None:
+        raise BindingAuthenticationError("model binding definition revision is malformed")
+    policy_revision = document["policy_revision"]
+    if (
+        type(policy_revision) is not str
+        or not policy_revision
+        or policy_revision != policy_revision.strip()
+    ):
+        raise BindingAuthenticationError("model binding policy revision is invalid")
+    raw_definition = document["definition"]
+    if not isinstance(raw_definition, Mapping):
+        raise BindingAuthenticationError("model binding definition must be a mapping")
+    try:
+        definition = ModelExecutionDefinition.model_validate(dict(raw_definition))
+    except ValidationError as error:
+        raise BindingAuthenticationError("model binding definition is invalid") from error
+    if definition.definition_revision != revision:
+        raise BindingAuthenticationError("model binding definition digest does not match")
+    binding_digest = document["binding_digest"]
+    if type(binding_digest) is not str or _REVISION_PATTERN.fullmatch(binding_digest) is None:
+        raise BindingAuthenticationError("model binding envelope digest is malformed")
+    unsigned = {key: value for key, value in document.items() if key != "binding_digest"}
+    if not hmac.compare_digest(binding_digest, _json_digest(unsigned)):
+        raise BindingAuthenticationError("model binding envelope digest does not match")
+
+
+def _json_digest(value: Mapping[str, object]) -> str:
+    try:
+        payload = canonical_json_text(cast(JsonValue, dict(value))).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise BindingAuthenticationError("model binding contains non-JSON values") from error
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
 def _key_id(key: bytes) -> str:
@@ -398,8 +560,10 @@ def _ensure_private_directory(
     error_type: type[ValueError],
 ) -> None:
     try:
-        path.mkdir(mode=_PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
-    except FileExistsError as error:
+        ensure_durable_directory(path, mode=_PRIVATE_DIRECTORY_MODE)
+    except CommitOutcomeUnknown:
+        raise
+    except OSError as error:
         raise error_type(f"{subject} is not a private directory") from error
     _validate_private_directory(path, subject=subject, error_type=error_type)
 
@@ -472,6 +636,24 @@ def _confirm_visible_install(path: Path, *, subject: str) -> None:
         raise CommitOutcomeUnknown(f"{subject} durability is still unconfirmed") from error
 
 
+def _reconcile_install_if_present(path: Path) -> None:
+    try:
+        reconcile_atomic_install_link(path)
+    except FileNotFoundError:
+        return
+
+
+def _reconcile_install_if_needed(path: Path) -> None:
+    try:
+        observed = path.lstat()
+    except FileNotFoundError:
+        return
+    if observed.st_nlink == 1:
+        return
+    with exclusive_config_lock(path):
+        reconcile_atomic_install_link(path)
+
+
 __all__ = [
     "BindingAuthenticationError",
     "ModelBindingTrustDomain",
@@ -481,4 +663,6 @@ __all__ = [
     "TrustedDefinitionNotFoundError",
     "TrustedDefinitionValidationError",
     "TrustedModelDefinitionArchive",
+    "build_model_binding_association",
+    "build_model_binding_envelope",
 ]

@@ -146,6 +146,96 @@ def confirm_parent_directory_durability(path: Path) -> None:
     _fsync_directory(path.parent)
 
 
+def ensure_durable_directory(path: Path, *, mode: int = 0o700) -> None:
+    """Create a directory chain and durably install every new directory entry."""
+
+    missing: list[Path] = []
+    ancestor = path
+    while True:
+        try:
+            ancestor_stat = ancestor.lstat()
+        except FileNotFoundError:
+            missing.append(ancestor)
+            parent = ancestor.parent
+            if parent == ancestor:
+                raise OSError(f"no existing ancestor for directory {path}") from None
+            ancestor = parent
+            continue
+        if stat.S_ISLNK(ancestor_stat.st_mode) or not stat.S_ISDIR(ancestor_stat.st_mode):
+            raise OSError(f"unsafe directory ancestor: {ancestor}")
+        break
+
+    if ancestor.parent != ancestor:
+        try:
+            _fsync_directory(ancestor.parent)
+        except OSError as error:
+            raise CommitOutcomeUnknown(
+                f"Directory durability cannot be confirmed for {ancestor}"
+            ) from error
+
+    for directory in reversed(missing):
+        try:
+            directory.mkdir(mode=mode)
+        except FileExistsError:
+            observed = directory.lstat()
+            if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+                raise OSError(
+                    f"unsafe directory created concurrently: {directory}"
+                ) from None
+        try:
+            _fsync_directory(directory.parent)
+        except OSError as error:
+            raise CommitOutcomeUnknown(
+                f"Directory durability cannot be confirmed for {directory}"
+            ) from error
+
+
+def reconcile_atomic_install_link(path: Path) -> None:
+    """Remove the one stale temp hard link left by an interrupted no-replace install."""
+
+    target = path.lstat()
+    if target.st_nlink == 1:
+        return
+    if (
+        target.st_nlink != 2
+        or not stat.S_ISREG(target.st_mode)
+        or target.st_uid != os.geteuid()
+    ):
+        raise OSError(f"unsafe hard-linked config file: {path}")
+
+    prefix = f".{path.name}."
+    candidates: list[Path] = []
+    for candidate in path.parent.iterdir():
+        if not candidate.name.startswith(prefix) or not candidate.name.endswith(".tmp"):
+            continue
+        try:
+            candidate_stat = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            stat.S_ISREG(candidate_stat.st_mode)
+            and candidate_stat.st_uid == os.geteuid()
+            and (candidate_stat.st_dev, candidate_stat.st_ino) == (target.st_dev, target.st_ino)
+        ):
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise OSError(f"cannot safely reconcile hard-linked config file: {path}")
+
+    candidates[0].unlink()
+    try:
+        _fsync_directory(path.parent)
+    except OSError as error:
+        raise CommitOutcomeUnknown(
+            f"Config install cleanup durability cannot be confirmed for {path}"
+        ) from error
+    observed = path.lstat()
+    if (
+        observed.st_nlink != 1
+        or (observed.st_dev, observed.st_ino) != (target.st_dev, target.st_ino)
+    ):
+        raise OSError(f"config install reconciliation changed target identity: {path}")
+
+
 def _is_within(candidate: Path, root: Path) -> bool:
     try:
         candidate.relative_to(root)

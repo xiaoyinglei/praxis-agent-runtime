@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime import model_config_io
+from agent_runtime import model_config_io, model_trust
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
 from agent_runtime.core.llm_registry import ModelRegistry
 from agent_runtime.model_config_io import CommitOutcomeUnknown, UntrustedConfigPathError
@@ -22,6 +22,8 @@ from agent_runtime.model_trust import (
     TrustedDefinitionNotFoundError,
     TrustedDefinitionValidationError,
     TrustedModelDefinitionArchive,
+    build_model_binding_association,
+    build_model_binding_envelope,
 )
 
 
@@ -79,6 +81,31 @@ def _archive_worker(
         worktree=Path(workspace),
     )
     outcomes.put(archive.ensure(_definition()))
+
+
+def _crash_after_install_link_worker(
+    kind: str,
+    path: str,
+    workspace: str,
+) -> None:
+    def crash_install(target: Path, payload: bytes) -> str:
+        temporary = model_config_io._write_adjacent_temp(target, payload)
+        os.link(temporary, target)
+        os._exit(0)
+
+    model_trust.atomic_install_bytes = crash_install
+    if kind == "trust":
+        ModelBindingTrustDomain(
+            Path(path),
+            workspace=Path(workspace),
+            worktree=Path(workspace),
+        ).initialize()
+    else:
+        TrustedModelDefinitionArchive(
+            Path(path),
+            workspace=Path(workspace),
+            worktree=Path(workspace),
+        ).ensure(_definition())
 
 
 def test_trust_status_and_sign_never_initialize_implicitly(tmp_path: Path) -> None:
@@ -159,8 +186,10 @@ def test_trust_post_install_unknown_requires_durability_before_success(
     domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
     real_directory_fsync = model_config_io._fsync_directory
 
-    def fail_directory_fsync(_path: Path) -> None:
-        raise OSError("directory fsync unavailable")
+    def fail_directory_fsync(path: Path) -> None:
+        if path == trust_path.parent:
+            raise OSError("directory fsync unavailable")
+        real_directory_fsync(path)
 
     monkeypatch.setattr(model_config_io, "_fsync_directory", fail_directory_fsync)
     with pytest.raises(CommitOutcomeUnknown):
@@ -243,15 +272,20 @@ def test_trust_rejects_duplicate_json_keys(tmp_path: Path) -> None:
 def test_binding_signature_covers_complete_association(tmp_path: Path) -> None:
     workspace, trust_path, _ = _paths(tmp_path)
     domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
-    domain.initialize()
-    association = {
-        "authentication_schema_version": 1,
-        "thread_id": "thread-1",
-        "turn_id": "turn-1",
-        "alias": "main",
-        "selection_requester": "user",
-        "binding": {"definition_revision": _definition().definition_revision},
-    }
+    status = domain.initialize()
+    binding = build_model_binding_envelope(
+        alias="main",
+        origin="override",
+        definition=_definition(),
+        policy_revision="model-policy:v1",
+    )
+    association = build_model_binding_association(
+        status=status,
+        thread_id="thread-1",
+        turn_id="turn-1",
+        selection_requester="user",
+        binding=binding,
+    )
 
     signature = domain.sign(association)
     domain.verify(association, signature)
@@ -260,10 +294,132 @@ def test_binding_signature_covers_complete_association(tmp_path: Path) -> None:
         {**association, "thread_id": "thread-2"},
         {**association, "turn_id": "turn-2"},
         {**association, "selection_requester": "system"},
-        {**association, "binding": {"definition_revision": _definition("other").definition_revision}},
+        {**association, "trust_domain_id": "d8ec2a14-31fd-4d7b-96e5-452296c361b0"},
+        {**association, "signing_key_id": "sha256:" + "0" * 64},
+        {**association, "binding": {**binding, "alias": "other"}},
     ):
         with pytest.raises(BindingAuthenticationError):
             domain.verify(changed, signature)
+
+
+def test_binding_trust_rejects_incomplete_or_extra_association(tmp_path: Path) -> None:
+    workspace, trust_path, _ = _paths(tmp_path)
+    domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
+    status = domain.initialize()
+    binding = build_model_binding_envelope(
+        alias="main",
+        origin="override",
+        definition=_definition(),
+        policy_revision="model-policy:v1",
+    )
+    complete = build_model_binding_association(
+        status=status,
+        thread_id="thread-1",
+        turn_id="turn-1",
+        selection_requester="user",
+        binding=binding,
+    )
+
+    with pytest.raises(BindingAuthenticationError, match="missing"):
+        domain.sign({"thread_id": "thread-1", "turn_id": "turn-1"})
+    with pytest.raises(BindingAuthenticationError, match="unexpected"):
+        domain.sign({**complete, "extra": True})
+
+
+@pytest.mark.parametrize("kind", ["trust", "archive"])
+def test_interrupted_post_link_install_recovers_exact_stale_temp(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    workspace, trust_path, archive_path = _paths(tmp_path)
+    target_path = trust_path if kind == "trust" else archive_path
+    if kind == "archive":
+        archive_path.mkdir(mode=0o700)
+    process = multiprocessing.Process(
+        target=_crash_after_install_link_worker,
+        args=(kind, str(target_path), str(workspace)),
+    )
+    process.start()
+    process.join(timeout=10)
+    assert process.exitcode == 0
+
+    installed = (
+        trust_path
+        if kind == "trust"
+        else archive_path / f"{_definition().definition_revision}.json"
+    )
+    assert installed.stat().st_nlink == 2
+    if kind == "trust":
+        ModelBindingTrustDomain(
+            trust_path,
+            workspace=workspace,
+            worktree=workspace,
+        ).initialize()
+    else:
+        TrustedModelDefinitionArchive(
+            archive_path,
+            workspace=workspace,
+            worktree=workspace,
+        ).ensure(_definition())
+    assert installed.stat().st_nlink == 1
+    assert not tuple(installed.parent.glob(f".{installed.name}.*.tmp"))
+
+
+def test_new_managed_directories_are_durably_installed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    trust_path = tmp_path / "new-config" / "binding-trust.json"
+    archive_path = tmp_path / "new-config" / "model-definitions"
+    observed: list[Path] = []
+    real_directory_fsync = model_config_io._fsync_directory
+
+    def record_directory_fsync(path: Path) -> None:
+        observed.append(path)
+        real_directory_fsync(path)
+
+    monkeypatch.setattr(model_config_io, "_fsync_directory", record_directory_fsync)
+    ModelBindingTrustDomain(
+        trust_path,
+        workspace=workspace,
+        worktree=workspace,
+    ).initialize()
+    TrustedModelDefinitionArchive(
+        archive_path,
+        workspace=workspace,
+        worktree=workspace,
+    ).ensure(_definition())
+
+    assert tmp_path in observed
+    assert trust_path.parent in observed
+    assert archive_path in observed
+
+
+def test_new_trust_directory_parent_fsync_failure_is_outcome_unknown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    trust_path = tmp_path / "new-config" / "binding-trust.json"
+    real_directory_fsync = model_config_io._fsync_directory
+
+    def fail_new_entry_parent(path: Path) -> None:
+        if path == tmp_path:
+            raise OSError("new directory entry durability unavailable")
+        real_directory_fsync(path)
+
+    monkeypatch.setattr(model_config_io, "_fsync_directory", fail_new_entry_parent)
+    domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
+    with pytest.raises(CommitOutcomeUnknown):
+        domain.initialize()
+    assert trust_path.parent.is_dir()
+    assert not trust_path.exists()
+
+    monkeypatch.setattr(model_config_io, "_fsync_directory", real_directory_fsync)
+    assert domain.initialize() == domain.status()
 
 
 def test_archive_ensure_and_load_use_canonical_digest_and_private_mode(tmp_path: Path) -> None:
@@ -400,8 +556,10 @@ def test_archive_post_install_unknown_requires_durability_before_success(
     definition = _definition()
     real_directory_fsync = model_config_io._fsync_directory
 
-    def fail_directory_fsync(_path: Path) -> None:
-        raise OSError("directory fsync unavailable")
+    def fail_directory_fsync(path: Path) -> None:
+        if path == archive_path:
+            raise OSError("directory fsync unavailable")
+        real_directory_fsync(path)
 
     monkeypatch.setattr(model_config_io, "_fsync_directory", fail_directory_fsync)
     with pytest.raises(CommitOutcomeUnknown):
