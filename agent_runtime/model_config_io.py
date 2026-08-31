@@ -1,0 +1,184 @@
+"""Crash-safe, trusted-path byte I/O for persisted model configuration."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import os
+import subprocess
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+
+@dataclass(frozen=True, slots=True)
+class FileVersion:
+    """The revision and content fingerprint observed for a config file."""
+
+    revision: int
+    fingerprint: str
+
+
+class ConfigVersionConflict(RuntimeError):  # noqa: N818
+    """A config write was based on a stale file version."""
+
+
+class CommitOutcomeUnknown(RuntimeError):  # noqa: N818
+    """Visibility occurred, but the final durable outcome cannot be confirmed."""
+
+
+class UntrustedConfigPathError(ValueError):
+    """A user-supplied config path escapes the workspace trust boundary."""
+
+
+def discover_git_worktree(workspace: Path) -> Path:
+    """Return the resolved Git top-level directory, or the workspace if absent."""
+
+    resolved_workspace = workspace.expanduser().resolve()
+    completed = subprocess.run(
+        ["git", "-C", os.fspath(resolved_workspace), "rev-parse", "--show-toplevel"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return resolved_workspace
+    top_level = completed.stdout.strip()
+    return Path(top_level).resolve() if top_level else resolved_workspace
+
+
+def validate_user_config_path(path: Path, *, workspace: Path, worktree: Path) -> Path:
+    """Resolve *path* and require it to stay in the workspace or worktree."""
+
+    resolved_workspace = workspace.expanduser().resolve()
+    resolved_worktree = worktree.expanduser().resolve()
+    candidate = (
+        path.expanduser()
+        if path.is_absolute()
+        else resolved_workspace / path.expanduser()
+    ).resolve()
+    if _is_within(candidate, resolved_workspace) or _is_within(
+        candidate, resolved_worktree
+    ):
+        return candidate
+    raise UntrustedConfigPathError(
+        f"Config path {path} resolves outside workspace/worktree trust boundary"
+    )
+
+
+def file_fingerprint(payload: bytes) -> str:
+    """Return the stable SHA-256 fingerprint for exact file bytes."""
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+@contextmanager
+def exclusive_config_lock(path: Path) -> Iterator[None]:
+    """Take an advisory inter-process lock stored beside the config path."""
+
+    lock_path = path.with_name(f".{path.name}.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def atomic_replace_bytes(path: Path, payload: bytes, *, intended_fingerprint: str) -> None:
+    """Durably replace *path* without rolling back once it becomes visible."""
+
+    if file_fingerprint(payload) != intended_fingerprint:
+        raise ValueError("intended_fingerprint does not match payload")
+
+    temp_path = _write_adjacent_temp(path, payload)
+    replaced = False
+    try:
+        os.replace(temp_path, path)
+        replaced = True
+        try:
+            _fsync_directory(path.parent)
+        except OSError as error:
+            _raise_if_not_reconciled(path, payload, error)
+    finally:
+        if not replaced:
+            _remove_temp_if_present(temp_path)
+
+
+def atomic_install_bytes(path: Path, payload: bytes) -> Literal["created", "exists"]:
+    """Atomically install bytes only when no target file exists yet."""
+
+    temp_path = _write_adjacent_temp(path, payload)
+    try:
+        try:
+            os.link(temp_path, path)
+        except FileExistsError:
+            return "exists"
+        try:
+            _fsync_directory(path.parent)
+        except OSError as error:
+            _raise_if_not_reconciled(path, payload, error)
+        return "created"
+    finally:
+        _remove_temp_if_present(temp_path)
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _write_adjacent_temp(path: Path, payload: bytes) -> Path:
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb", closefd=True) as temporary_file:
+            temporary_file.write(payload)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+    except BaseException:
+        _remove_temp_if_present(temporary_path)
+        raise
+    return temporary_path
+
+
+def _fsync_directory(directory: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(directory, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _raise_if_not_reconciled(path: Path, payload: bytes, error: OSError) -> None:
+    try:
+        reconciled = path.read_bytes() == payload
+    except OSError:
+        reconciled = False
+    if not reconciled:
+        raise CommitOutcomeUnknown(
+            f"Config commit cannot confirm intended bytes for {path}"
+        ) from error
+
+
+def _remove_temp_if_present(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
