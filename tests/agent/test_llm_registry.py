@@ -17,17 +17,6 @@ from agent_runtime.modeling.config import GenerationTaskConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 
 
-@pytest.fixture(autouse=True)
-def _isolate_user_model_registry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "PRAXIS_MODEL_REGISTRY_PATH",
-        str((tmp_path / "user-config" / "models.yaml").resolve()),
-    )
-
-
 def _ollama_spec(model: str = "test-model") -> ModelSpec:
     return ModelSpec(
         provider=ModelProvider.OLLAMA,
@@ -136,6 +125,38 @@ def test_model_definition_rejects_non_finite_request_values() -> None:
 
     with pytest.raises(ValueError, match="finite|JSON"):
         ModelRegistry(config)
+
+
+def test_model_definition_rejects_non_json_request_values() -> None:
+    config = _make_config()
+    config.models["main"].defaults = {"provider_options": {"modes": {"a", "b"}}}
+
+    with pytest.raises(ValueError, match="JSON|json"):
+        ModelRegistry(config)
+
+
+def test_resolved_kwargs_cannot_mutate_cached_definition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _make_config()
+    config.models["main"].defaults = {
+        "provider_options": {"thinking": {"type": "enabled"}}
+    }
+    registry = ModelRegistry(config)
+    original_revision = registry.get_model_definition("main").definition_revision
+    monkeypatch.setattr(
+        "agent_runtime.core.llm_registry._build_chat_generator",
+        lambda spec: object(),
+    )
+
+    resolved = registry.resolve("main")
+    provider_options = resolved.kwargs["provider_options"]
+    assert isinstance(provider_options, dict)
+    thinking = provider_options["thinking"]
+    assert isinstance(thinking, dict)
+    thinking["type"] = "disabled"
+
+    assert registry.get_model_definition("main").definition_revision == original_revision
 
 
 def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> None:

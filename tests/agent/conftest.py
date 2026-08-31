@@ -14,6 +14,25 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+@pytest.fixture(autouse=True)
+def isolate_user_model_registry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep every Agent test independent of the developer's real registry."""
+
+    monkeypatch.setenv(
+        "PRAXIS_MODEL_REGISTRY_PATH",
+        str(
+            (
+                tmp_path.parent
+                / f"{tmp_path.name}-isolated-user-config"
+                / "models.yaml"
+            ).resolve()
+        ),
+    )
+
+
 @pytest.fixture
 def fake_sandbox_exec(
     tmp_path: Path,

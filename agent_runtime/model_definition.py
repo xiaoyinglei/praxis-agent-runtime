@@ -6,8 +6,9 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue
 
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelSpec
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
@@ -69,7 +70,7 @@ class ModelExecutionDefinition(BaseModel):
     timeout_seconds: float
     base_url: str | None
     api_key_env: str | None
-    defaults: dict[str, object]
+    defaults: dict[str, JsonValue]
     context_window_tokens: int
     request_context_tokens: int | None
     supports_tools: bool
@@ -106,7 +107,7 @@ def build_model_execution_definition(
         timeout_seconds=spec.timeout_seconds,
         base_url=spec.base_url,
         api_key_env=spec.api_key_env,
-        defaults=dict(spec.defaults),
+        defaults=deepcopy(spec.defaults),
         context_window_tokens=spec.context_window_tokens,
         request_context_tokens=spec.request_context_tokens,
         supports_tools=spec.supports_tools,
@@ -138,7 +139,7 @@ def build_model_execution_definition(
 def canonical_definition_json(definition: ModelExecutionDefinition) -> bytes:
     """Return the exact canonical bytes used by archives and Turn bindings."""
 
-    _reject_non_finite(definition.model_dump(mode="python", exclude_none=False))
+    _validate_canonical_value(definition.model_dump(mode="python", exclude_none=False))
     payload = definition.model_dump(mode="json", by_alias=True, exclude_none=False)
     return json.dumps(
         payload,
@@ -153,15 +154,25 @@ def definition_revision(definition: ModelExecutionDefinition) -> str:
     return f"sha256:{hashlib.sha256(canonical_definition_json(definition)).hexdigest()}"
 
 
-def _reject_non_finite(value: object) -> None:
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("model execution definition contains a non-finite JSON number")
+def _validate_canonical_value(value: object) -> None:
+    if value is None or isinstance(value, str | bool | int):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("model execution definition contains a non-finite JSON number")
+        return
     if isinstance(value, Mapping):
+        if any(not isinstance(key, str) for key in value):
+            raise ValueError("model execution definition contains a non-string JSON key")
         for item in value.values():
-            _reject_non_finite(item)
+            _validate_canonical_value(item)
     elif isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
         for item in value:
-            _reject_non_finite(item)
+            _validate_canonical_value(item)
+    else:
+        raise ValueError(
+            f"model execution definition contains a non-JSON value: {type(value).__name__}"
+        )
 
 
 def effective_stage_budgets(

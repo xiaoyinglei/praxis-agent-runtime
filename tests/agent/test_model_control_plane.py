@@ -28,17 +28,6 @@ from agent_runtime.models import (
 from agent_runtime.text import load_env_file
 
 
-@pytest.fixture(autouse=True)
-def _isolate_user_model_registry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "PRAXIS_MODEL_REGISTRY_PATH",
-        str((tmp_path / "user-config" / "models.yaml").resolve()),
-    )
-
-
 def _write_models_config(path: Path) -> None:
     path.write_text(
         yaml.safe_dump(
@@ -227,6 +216,26 @@ def test_whole_catalog_override_replaces_layers_and_marks_origin(
     assert [item.id for item in catalog.list_models()] == ["local_qwen", "mimo_cloud"]
     assert catalog.origin("local_qwen") == "override"
     assert not catalog.has("groq_gpt_oss_120b")
+
+
+def test_model_catalog_deep_copies_supplied_definitions() -> None:
+    source = ModelCatalog.from_config_file(Path("configs/models.yaml"))
+    definition = source.definition("kimi_cloud")
+    catalog = ModelCatalog(
+        specs={"kimi_cloud": source.get("kimi_cloud")},
+        default_model_id="kimi_cloud",
+        origins={"kimi_cloud": "builtin"},
+        definitions={"kimi_cloud": definition},
+    )
+    original_revision = catalog.definition("kimi_cloud").definition_revision
+
+    provider_options = definition.defaults["provider_options"]
+    assert isinstance(provider_options, dict)
+    thinking = provider_options["thinking"]
+    assert isinstance(thinking, dict)
+    thinking["type"] = "disabled"
+
+    assert catalog.definition("kimi_cloud").definition_revision == original_revision
 
 
 def test_bundled_default_chat_model_is_groq_control() -> None:

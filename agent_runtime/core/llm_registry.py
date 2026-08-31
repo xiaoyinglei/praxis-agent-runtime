@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -302,7 +303,10 @@ class ModelRegistry:
         except Exception as exc:
             raise ModelNotAvailableError(f"Failed to build provider for {alias!r}: {exc}") from exc
 
-        kwargs: dict[str, Any] = {"max_tokens": spec.max_tokens, **spec.defaults}
+        kwargs: dict[str, Any] = {
+            "max_tokens": spec.max_tokens,
+            **deepcopy(spec.defaults),
+        }
         runtime_context_tokens = min(
             spec.context_window_tokens,
             spec.request_context_tokens or spec.context_window_tokens,

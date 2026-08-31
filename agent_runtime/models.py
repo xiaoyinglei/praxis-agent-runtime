@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -84,7 +85,7 @@ class ModelCatalog:
         self._origins = MappingProxyType(
             dict(origins) if origins is not None else {model_id: "override" for model_id in specs}
         )
-        self._definitions = MappingProxyType(dict(definitions or {}))
+        self._definitions = MappingProxyType(deepcopy(dict(definitions or {})))
         self.default_model_id = default_model_id
 
     @classmethod
