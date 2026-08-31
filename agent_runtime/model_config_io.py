@@ -45,28 +45,33 @@ def discover_git_worktree(workspace: Path) -> Path:
         text=True,
     )
     if completed.returncode != 0:
-        return resolved_workspace
+        error_output = completed.stderr.strip()
+        if "not a git repository" in error_output.lower():
+            return resolved_workspace
+        raise RuntimeError(
+            f"Unable to discover Git worktree for {resolved_workspace}: {error_output}"
+        )
     top_level = completed.stdout.strip()
     return Path(top_level).resolve() if top_level else resolved_workspace
 
 
 def validate_user_config_path(path: Path, *, workspace: Path, worktree: Path) -> Path:
-    """Resolve *path* and require it to stay in the workspace or worktree."""
+    """Resolve an absolute target outside the explicit workspace and worktree."""
 
     resolved_workspace = workspace.expanduser().resolve()
     resolved_worktree = worktree.expanduser().resolve()
-    candidate = (
-        path.expanduser()
-        if path.is_absolute()
-        else resolved_workspace / path.expanduser()
-    ).resolve()
-    if _is_within(candidate, resolved_workspace) or _is_within(
-        candidate, resolved_worktree
-    ):
-        return candidate
-    raise UntrustedConfigPathError(
-        f"Config path {path} resolves outside workspace/worktree trust boundary"
-    )
+    if not path.is_absolute():
+        raise UntrustedConfigPathError("Config path must be absolute")
+    candidate = path.expanduser().resolve()
+    if _is_within(candidate, resolved_workspace):
+        raise UntrustedConfigPathError(
+            f"Config path {path} resolves inside the explicit workspace"
+        )
+    if _is_within(candidate, resolved_worktree):
+        raise UntrustedConfigPathError(
+            f"Config path {path} resolves inside the explicit Git worktree"
+        )
+    return candidate
 
 
 def file_fingerprint(payload: bytes) -> str:

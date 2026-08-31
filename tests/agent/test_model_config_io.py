@@ -37,11 +37,14 @@ def _contending_lock_worker(path: str, events: multiprocessing.Queue[tuple[str, 
 def _install_config_worker(
     path: str,
     payload: bytes,
-    outcomes: multiprocessing.Queue[str],
+    start: multiprocessing.synchronize.Event,
+    outcomes: multiprocessing.Queue[tuple[bytes, str]],
 ) -> None:
     """Race a no-replace install from a separate Python process."""
 
-    outcomes.put(atomic_install_bytes(Path(path), payload))
+    if not start.wait(timeout=10):
+        raise RuntimeError("concurrent install did not receive start signal")
+    outcomes.put((payload, atomic_install_bytes(Path(path), payload)))
 
 
 def _make_git_worktree(tmp_path: Path) -> Path:
@@ -82,47 +85,76 @@ class TestDiscoverGitWorktree:
 
         assert discover_git_worktree(workspace) == worktree.resolve()
 
+    def test_raises_for_git_failure_other_than_not_a_repository(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "ordinary"
+        workspace.mkdir()
+
+        def inaccessible_git(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                args=["git"],
+                returncode=128,
+                stdout="",
+                stderr="fatal: cannot access current directory: Permission denied",
+            )
+
+        monkeypatch.setattr(model_config_io.subprocess, "run", inaccessible_git)
+
+        with pytest.raises(RuntimeError, match="cannot access current directory"):
+            discover_git_worktree(workspace)
+
 
 class TestValidateUserConfigPath:
-    def test_rejects_absolute_external_path(self, tmp_path: Path) -> None:
+    def test_allows_absolute_external_path(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         external = tmp_path / "external" / "models.json"
 
-        with pytest.raises(UntrustedConfigPathError):
+        assert (
             validate_user_config_path(
                 external,
                 workspace=workspace,
                 worktree=workspace,
             )
+            == external.resolve()
+        )
 
-    def test_resolves_relative_path_from_workspace(self, tmp_path: Path) -> None:
+    def test_rejects_relative_path(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
 
-        result = validate_user_config_path(
-            Path(".praxis/models.json"),
-            workspace=workspace,
-            worktree=workspace,
-        )
+        with pytest.raises(UntrustedConfigPathError, match="absolute"):
+            validate_user_config_path(
+                Path(".praxis/models.json"),
+                workspace=workspace,
+                worktree=workspace,
+            )
 
-        assert result == (workspace / ".praxis" / "models.json").resolve()
+    def test_rejects_tilde_path_before_expansion(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
 
-    def test_accepts_direct_workspace_path(self, tmp_path: Path) -> None:
+        with pytest.raises(UntrustedConfigPathError, match="absolute"):
+            validate_user_config_path(
+                Path("~/models.json"),
+                workspace=workspace,
+                worktree=workspace,
+            )
+
+    def test_rejects_direct_workspace_path(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         direct = workspace / ".praxis" / "models.json"
 
-        assert (
+        with pytest.raises(UntrustedConfigPathError, match="workspace"):
             validate_user_config_path(
                 direct,
                 workspace=workspace,
                 worktree=workspace,
             )
-            == direct.resolve()
-        )
 
-    def test_accepts_path_in_worktree_outside_nested_workspace(
+    def test_rejects_path_in_worktree_outside_nested_workspace(
         self, tmp_path: Path
     ) -> None:
         worktree = _make_git_worktree(tmp_path)
@@ -130,16 +162,14 @@ class TestValidateUserConfigPath:
         workspace.mkdir(parents=True)
         shared = worktree / ".praxis" / "models.json"
 
-        assert (
+        with pytest.raises(UntrustedConfigPathError, match="worktree"):
             validate_user_config_path(
                 shared,
                 workspace=workspace,
                 worktree=worktree,
             )
-            == shared.resolve()
-        )
 
-    def test_accepts_symlink_resolving_into_workspace(self, tmp_path: Path) -> None:
+    def test_rejects_symlink_resolving_into_workspace(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         target = workspace / ".praxis" / "models.json"
@@ -148,16 +178,14 @@ class TestValidateUserConfigPath:
         alias = tmp_path / "workspace-link.json"
         alias.symlink_to(target)
 
-        assert (
+        with pytest.raises(UntrustedConfigPathError, match="workspace"):
             validate_user_config_path(
                 alias,
                 workspace=workspace,
                 worktree=workspace,
             )
-            == target.resolve()
-        )
 
-    def test_accepts_symlink_resolving_elsewhere_in_worktree(self, tmp_path: Path) -> None:
+    def test_rejects_symlink_resolving_elsewhere_in_worktree(self, tmp_path: Path) -> None:
         worktree = _make_git_worktree(tmp_path)
         workspace = worktree / "apps" / "praxis"
         workspace.mkdir(parents=True)
@@ -167,16 +195,14 @@ class TestValidateUserConfigPath:
         alias = workspace / "models-link.json"
         alias.symlink_to(target)
 
-        assert (
+        with pytest.raises(UntrustedConfigPathError, match="worktree"):
             validate_user_config_path(
                 alias,
                 workspace=workspace,
                 worktree=worktree,
             )
-            == target.resolve()
-        )
 
-    def test_rejects_symlink_resolving_outside_worktree(self, tmp_path: Path) -> None:
+    def test_allows_symlink_resolving_outside_worktree(self, tmp_path: Path) -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
         external = tmp_path / "external" / "models.json"
@@ -185,12 +211,14 @@ class TestValidateUserConfigPath:
         alias = workspace / "models-link.json"
         alias.symlink_to(external)
 
-        with pytest.raises(UntrustedConfigPathError):
+        assert (
             validate_user_config_path(
                 alias,
                 workspace=workspace,
                 worktree=workspace,
             )
+            == external.resolve()
+        )
 
 
 class TestAtomicConfigWrites:
@@ -318,25 +346,62 @@ class TestAtomicConfigWrites:
         target = tmp_path / "models.json"
         payload = b"same config"
         context = multiprocessing.get_context("spawn")
-        outcomes: multiprocessing.Queue[str] = context.Queue()
+        start = context.Event()
+        outcomes: multiprocessing.Queue[tuple[bytes, str]] = context.Queue()
         first = context.Process(
             target=_install_config_worker,
-            args=(str(target), payload, outcomes),
+            args=(str(target), payload, start, outcomes),
         )
         second = context.Process(
             target=_install_config_worker,
-            args=(str(target), payload, outcomes),
+            args=(str(target), payload, start, outcomes),
         )
 
         first.start()
         second.start()
+        start.set()
         first.join(timeout=10)
         second.join(timeout=10)
 
         assert first.exitcode == 0
         assert second.exitcode == 0
-        assert sorted(outcomes.get(timeout=2) for _ in range(2)) == ["created", "exists"]
+        assert sorted(outcome for _, outcome in (outcomes.get(timeout=2) for _ in range(2))) == [
+            "created",
+            "exists",
+        ]
         assert target.read_bytes() == payload
+
+    def test_concurrent_different_installs_choose_one_complete_payload(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "models.json"
+        first_payload = b'{"model":"first"}'
+        second_payload = b'{"model":"second"}'
+        context = multiprocessing.get_context("spawn")
+        start = context.Event()
+        outcomes: multiprocessing.Queue[tuple[bytes, str]] = context.Queue()
+        first = context.Process(
+            target=_install_config_worker,
+            args=(str(target), first_payload, start, outcomes),
+        )
+        second = context.Process(
+            target=_install_config_worker,
+            args=(str(target), second_payload, start, outcomes),
+        )
+
+        first.start()
+        second.start()
+        start.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        assert first.exitcode == 0
+        assert second.exitcode == 0
+        results = [outcomes.get(timeout=2) for _ in range(2)]
+        assert sorted(outcome for _, outcome in results) == ["created", "exists"]
+        winner = next(payload for payload, outcome in results if outcome == "created")
+        assert winner in {first_payload, second_payload}
+        assert target.read_bytes() == winner
 
     def test_two_processes_serialize_on_adjacent_config_lock(self, tmp_path: Path) -> None:
         target = tmp_path / "models.json"
