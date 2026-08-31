@@ -19,6 +19,7 @@ from agent_runtime.core.llm_registry import (
     UnknownModelAliasError,
 )
 from agent_runtime.model_config_io import (
+    CommitOutcomeUnknown,
     ConfigVersionConflict,
     FileVersion,
     atomic_replace_bytes,
@@ -174,9 +175,27 @@ class ModelSessionState:
         stored = ModelSessionStore(path).select(
             self.current_model_id,
             expected=self.file_version,
+            selection_requester=self.selection_requester,
         )
         self.file_revision = stored.file_revision
         self.fingerprint = stored.fingerprint
+
+
+@dataclass(frozen=True, slots=True)
+class SessionMutationReceipt:
+    base_version: FileVersion
+    intended_revision: int
+    intended_fingerprint: str
+    intended_model_id: str
+    selection_requester: ModelSwitchRequester
+
+
+class SessionCommitOutcomeUnknown(CommitOutcomeUnknown):  # noqa: N818
+    """A session switch became visible but its durability is unconfirmed."""
+
+    def __init__(self, message: str, *, receipt: SessionMutationReceipt) -> None:
+        super().__init__(message)
+        self.receipt = receipt
 
 
 class ModelSessionStore:
@@ -203,7 +222,9 @@ class ModelSessionStore:
         model_id: str,
         *,
         expected: FileVersion,
+        selection_requester: ModelSwitchRequester = "user",
     ) -> ModelSessionState:
+        selection_requester = validate_model_switch_requester(selection_requester)
         if not isinstance(model_id, str) or not model_id.strip() or model_id != model_id.strip():
             raise ValueError("model session current_model_id must be a non-empty trimmed string")
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -220,17 +241,41 @@ class ModelSessionStore:
                 current_model_id=model_id,
             )
             fingerprint = file_fingerprint(encoded)
-            atomic_replace_bytes(
-                self.path,
-                encoded,
+            receipt = SessionMutationReceipt(
+                base_version=observed.file_version,
+                intended_revision=revision,
                 intended_fingerprint=fingerprint,
+                intended_model_id=model_id,
+                selection_requester=selection_requester,
             )
+            try:
+                atomic_replace_bytes(
+                    self.path,
+                    encoded,
+                    intended_fingerprint=fingerprint,
+                )
+            except CommitOutcomeUnknown as error:
+                raise SessionCommitOutcomeUnknown(str(error), receipt=receipt) from error
         return ModelSessionState(
             current_model_id=model_id,
-            selection_requester="user",
+            selection_requester=selection_requester,
             file_revision=revision,
             fingerprint=fingerprint,
         )
+
+    def reconcile(self, receipt: SessionMutationReceipt) -> ModelSessionState:
+        with exclusive_config_lock(self.path):
+            observed = self.read(default_model_id=receipt.intended_model_id)
+            if (
+                observed.current_model_id != receipt.intended_model_id
+                or observed.file_revision != receipt.intended_revision
+                or observed.fingerprint != receipt.intended_fingerprint
+            ):
+                raise ConfigVersionConflict(
+                    "model session does not match the exact intended post-state"
+                )
+            observed.selection_requester = receipt.selection_requester
+            return observed
 
 
 def _parse_session_document(payload: bytes) -> tuple[dict[str, object], bool]:
@@ -457,12 +502,28 @@ class ModelControlPlane:
             persisted = self._session_store.select(
                 spec.id,
                 expected=self.state.file_version,
+                selection_requester=requested_by,
             )
         self.state.current_model_id = spec.id
         self.state.selection_requester = requested_by
         if persisted is not None:
             self.state.file_revision = persisted.file_revision
             self.state.fingerprint = persisted.fingerprint
+        return spec
+
+    def reconcile_model_switch(self, receipt: SessionMutationReceipt) -> ModelSpec:
+        if self._session_store is None:
+            raise RuntimeError("model session storage is not configured")
+        spec = self.policy.review_switch(
+            catalog=self.catalog,
+            target_model_id=receipt.intended_model_id,
+            requested_by=receipt.selection_requester,
+        )
+        persisted = self._session_store.reconcile(receipt)
+        self.state.current_model_id = persisted.current_model_id
+        self.state.selection_requester = persisted.selection_requester
+        self.state.file_revision = persisted.file_revision
+        self.state.fingerprint = persisted.fingerprint
         return spec
 
     def request_model_switch(self, model_id: str) -> ModelSpec:
@@ -656,6 +717,8 @@ __all__ = [
     "ModelSessionStore",
     "ModelSpec",
     "ModelSwitchRequester",
+    "SessionCommitOutcomeUnknown",
+    "SessionMutationReceipt",
     "format_model_rows",
     "validate_model_switch_requester",
 ]

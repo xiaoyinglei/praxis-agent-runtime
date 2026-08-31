@@ -31,6 +31,7 @@ from agent_runtime.models import (
     ModelSessionState,
     ModelSessionStore,
     ModelSpec,
+    SessionCommitOutcomeUnknown,
 )
 from agent_runtime.text import load_env_file
 
@@ -675,6 +676,49 @@ def test_model_switch_unknown_commit_outcome_retains_in_memory_selection(
 
     assert control.current_model().id == "local_qwen"
     assert control.state.selection_requester == "system"
+
+
+def test_model_switch_unknown_post_replace_outcome_can_reconcile_exact_intent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="system",
+        session_path=session_path,
+    )
+
+    def fail_directory_fsync(_path: Path) -> None:
+        raise OSError("directory fsync unavailable")
+
+    monkeypatch.setattr(
+        "agent_runtime.model_config_io._fsync_directory",
+        fail_directory_fsync,
+    )
+
+    with pytest.raises(SessionCommitOutcomeUnknown) as captured:
+        control.switch_model("mimo_cloud", requested_by="user")
+
+    assert control.current_model().id == "local_qwen"
+    assert control.state.selection_requester == "system"
+    assert json.loads(session_path.read_text(encoding="utf-8")) == {
+        "version": 1,
+        "revision": 1,
+        "current_model_id": "mimo_cloud",
+    }
+    with pytest.raises(ConfigVersionConflict):
+        control.switch_model("mimo_cloud", requested_by="user")
+
+    recovered = control.reconcile_model_switch(captured.value.receipt)
+
+    assert recovered.id == "mimo_cloud"
+    assert control.current_model().id == "mimo_cloud"
+    assert control.state.selection_requester == "user"
+    assert control.state.file_revision == 1
 
 
 def test_stale_persisted_alias_is_atomically_repaired_to_catalog_default(
