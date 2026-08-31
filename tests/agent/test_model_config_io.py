@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import multiprocessing
+import os
 import stat
 import subprocess
 import time
@@ -59,6 +60,19 @@ def _make_git_worktree(tmp_path: Path) -> Path:
     return worktree
 
 
+def _alternate_case_samefile(path: Path) -> Path:
+    alternate = path.with_name(path.name.swapcase())
+    if alternate.name == path.name or not alternate.exists() or not alternate.samefile(path):
+        pytest.skip("filesystem is case-sensitive")
+    return alternate
+
+
+def _open_fd_count() -> int:
+    if not Path("/dev/fd").is_dir():
+        pytest.skip("descriptor enumeration is unavailable")
+    return len(os.listdir("/dev/fd"))
+
+
 class TestFileVersion:
     def test_is_immutable_value(self) -> None:
         version = FileVersion(revision=4, fingerprint="abc")
@@ -103,6 +117,29 @@ class TestDiscoverGitWorktree:
 
         with pytest.raises(RuntimeError, match="cannot access current directory"):
             discover_git_worktree(workspace)
+
+    def test_forces_c_locale_for_git_error_classification(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workspace = tmp_path / "ordinary"
+        workspace.mkdir()
+        captured: dict[str, object] = {}
+
+        def not_a_repository(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(
+                args=["git"],
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository",
+            )
+
+        monkeypatch.setattr(model_config_io.subprocess, "run", not_a_repository)
+
+        assert discover_git_worktree(workspace) == workspace.resolve()
+        environment = captured.get("env")
+        assert isinstance(environment, dict)
+        assert environment["LC_ALL"] == "C"
 
 
 class TestValidateUserConfigPath:
@@ -220,6 +257,37 @@ class TestValidateUserConfigPath:
             == external.resolve()
         )
 
+    def test_rejects_case_variant_of_existing_workspace_target(
+        self, tmp_path: Path
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        target = workspace / "models.json"
+        target.write_bytes(b"{}")
+        alternate_workspace = _alternate_case_samefile(workspace)
+
+        with pytest.raises(UntrustedConfigPathError, match="workspace"):
+            validate_user_config_path(
+                alternate_workspace / target.name,
+                workspace=workspace,
+                worktree=workspace,
+            )
+
+    def test_rejects_case_variant_of_uncreated_worktree_target(
+        self, tmp_path: Path
+    ) -> None:
+        worktree = _make_git_worktree(tmp_path)
+        workspace = worktree / "apps" / "praxis"
+        workspace.mkdir(parents=True)
+        alternate_worktree = _alternate_case_samefile(worktree)
+
+        with pytest.raises(UntrustedConfigPathError, match="worktree"):
+            validate_user_config_path(
+                alternate_worktree / "new-config" / "models.json",
+                workspace=workspace,
+                worktree=worktree,
+            )
+
 
 class TestAtomicConfigWrites:
     def test_fingerprint_is_sha256_of_exact_payload(self) -> None:
@@ -252,6 +320,23 @@ class TestAtomicConfigWrites:
 
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
 
+    def test_rejects_symlinked_adjacent_lock_without_changing_victim_mode(
+        self, tmp_path: Path
+    ) -> None:
+        target = tmp_path / "models.json"
+        victim = tmp_path / "victim.txt"
+        victim.write_bytes(b"do not chmod")
+        victim.chmod(0o644)
+        lock_path = target.with_name(f".{target.name}.lock")
+        lock_path.symlink_to(victim)
+        original_mode = stat.S_IMODE(victim.stat().st_mode)
+
+        with pytest.raises(OSError, match="unsafe config lock"):
+            with exclusive_config_lock(target):
+                pass
+
+        assert stat.S_IMODE(victim.stat().st_mode) == original_mode
+
     def test_rejects_mismatched_intended_fingerprint(self, tmp_path: Path) -> None:
         target = tmp_path / "models.json"
 
@@ -261,6 +346,23 @@ class TestAtomicConfigWrites:
                 b"new",
                 intended_fingerprint=file_fingerprint(b"other"),
             )
+
+    def test_fchmod_failure_closes_temp_fd_and_removes_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "models.json"
+        fd_count_before = _open_fd_count()
+
+        def fail_fchmod(_fd: int, _mode: int) -> None:
+            raise OSError("injected fchmod failure")
+
+        monkeypatch.setattr(model_config_io.os, "fchmod", fail_fchmod)
+
+        with pytest.raises(OSError, match="injected fchmod failure"):
+            model_config_io._write_adjacent_temp(target, b"new")
+
+        assert _open_fd_count() == fd_count_before
+        assert not list(tmp_path.glob(f".{target.name}.*.tmp"))
 
     def test_failure_before_replace_leaves_old_bytes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         target = tmp_path / "models.json"

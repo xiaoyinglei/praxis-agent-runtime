@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import os
+import stat
 import subprocess
 import tempfile
 from collections.abc import Iterator
@@ -38,10 +39,13 @@ def discover_git_worktree(workspace: Path) -> Path:
     """Return the resolved Git top-level directory, or the workspace if absent."""
 
     resolved_workspace = workspace.expanduser().resolve()
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
     completed = subprocess.run(
         ["git", "-C", os.fspath(resolved_workspace), "rev-parse", "--show-toplevel"],
         check=False,
         capture_output=True,
+        env=environment,
         text=True,
     )
     if completed.returncode != 0:
@@ -85,8 +89,9 @@ def exclusive_config_lock(path: Path) -> Iterator[None]:
     """Take an advisory inter-process lock stored beside the config path."""
 
     lock_path = path.with_name(f".{path.name}.lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fd = _open_config_lock(lock_path)
     try:
+        _validate_config_lock_fd(fd, lock_path)
         os.fchmod(fd, 0o600)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
@@ -139,8 +144,80 @@ def _is_within(candidate: Path, root: Path) -> bool:
     try:
         candidate.relative_to(root)
     except ValueError:
-        return False
-    return True
+        pass
+    else:
+        return True
+    return _has_ancestor_identity(candidate, root)
+
+
+def _has_ancestor_identity(candidate: Path, root: Path) -> bool:
+    ancestor = _nearest_existing_ancestor(candidate)
+    while ancestor is not None:
+        try:
+            if ancestor.samefile(root):
+                return True
+        except OSError:
+            return False
+        parent = ancestor.parent
+        ancestor = None if parent == ancestor else parent
+    return False
+
+
+def _nearest_existing_ancestor(path: Path) -> Path | None:
+    ancestor = path
+    while True:
+        try:
+            ancestor.stat()
+        except FileNotFoundError:
+            parent = ancestor.parent
+            if parent == ancestor:
+                return None
+            ancestor = parent
+        except OSError:
+            return None
+        else:
+            return ancestor
+
+
+def _open_config_lock(lock_path: Path) -> int:
+    flags = os.O_CREAT | os.O_RDWR
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    if no_follow:
+        try:
+            return os.open(lock_path, flags | no_follow, 0o600)
+        except OSError as error:
+            raise OSError(f"unsafe config lock: {lock_path}") from error
+    return _open_config_lock_without_nofollow(lock_path, flags)
+
+
+def _open_config_lock_without_nofollow(lock_path: Path, flags: int) -> int:
+    while True:
+        try:
+            before_open = lock_path.lstat()
+        except FileNotFoundError:
+            try:
+                return os.open(lock_path, flags | os.O_EXCL, 0o600)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise OSError(f"unsafe config lock: {lock_path}") from error
+        if not stat.S_ISREG(before_open.st_mode):
+            raise OSError(f"unsafe config lock: {lock_path}")
+        try:
+            fd = os.open(lock_path, flags)
+        except OSError as error:
+            raise OSError(f"unsafe config lock: {lock_path}") from error
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (before_open.st_dev, before_open.st_ino):
+            os.close(fd)
+            raise OSError(f"unsafe config lock: {lock_path}")
+        return fd
+
+
+def _validate_config_lock_fd(fd: int, lock_path: Path) -> None:
+    lock_stat = os.fstat(fd)
+    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.geteuid():
+        raise OSError(f"unsafe config lock: {lock_path}")
 
 
 def _write_adjacent_temp(path: Path, payload: bytes) -> Path:
@@ -152,7 +229,13 @@ def _write_adjacent_temp(path: Path, payload: bytes) -> Path:
     temporary_path = Path(temporary_name)
     try:
         os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb", closefd=True) as temporary_file:
+        temporary_file = os.fdopen(fd, "wb", closefd=True)
+    except BaseException:
+        os.close(fd)
+        _remove_temp_if_present(temporary_path)
+        raise
+    try:
+        with temporary_file:
             temporary_file.write(payload)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
