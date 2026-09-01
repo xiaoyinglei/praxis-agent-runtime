@@ -26,9 +26,8 @@
 - [ ] Add direct dependencies with `uv add 'prompt-toolkit>=3.0.52' 'regex>=2025.7.34' 'wcwidth>=0.2.13'`, implement only the 100-entry FIFO boundary, and rerun the exact test; expect PASS.
 - [ ] Write `test_history_evicts_oldest_by_utf8_byte_limit` and `test_empty_submission_is_not_recorded`; run both and expect FAIL on the missing byte/empty rules.
 - [ ] Implement the 64 KiB UTF-8 boundary plus empty filtering and rerun both; expect PASS and no history file under `tmp_path`.
-- [ ] Write prompt delegation and EOF/interrupt propagation tests; run them and expect FAIL because `TerminalComposer` is missing.
-- [ ] Implement `TerminalComposer` with injectable session construction and rerun; expect PASS and reuse of one history instance for the process.
-- [ ] Write and run a PTY subprocess regression that enters `你好`, sends two backspaces, and submits; expect the old bare-input control to return a surrogate-containing value and the new composer command to return empty valid Unicode.
+- [ ] Write prompt delegation, EOF/interrupt propagation, and PTY subprocess tests before adding `TerminalComposer`; the PTY test enters `你好`, sends two backspaces, and submits. Run them and expect FAIL because `TerminalComposer` is missing, while the bare-input control demonstrates a surrogate-containing value.
+- [ ] Implement `TerminalComposer` with injectable session construction and rerun; expect PASS, empty valid Unicode from the PTY case, and reuse of one history instance for the process.
 - [ ] Run `uv run pytest -q tests/agent/test_terminal_input.py && uv run mypy agent_runtime/terminal_input.py`; expect PASS.
 - [ ] Commit with `git add pyproject.toml uv.lock agent_runtime/terminal_input.py tests/agent/test_terminal_input.py && git commit -m 'feat(cli): add Unicode-safe chat composer'`.
 
@@ -52,10 +51,10 @@
 
 ### Task 4: Canonical lifecycle renderer and CLI integration
 
-- [ ] Write start tests for preview-present, preview-absent resume, same item id in different turns, and duplicate `(turn_id,item_id,ITEM_STARTED)`; run and expect FAIL because `TerminalToolEventDisplay` is missing. Implement only start projection and rerun; expect PASS.
+- [ ] Write start tests for preview-present, preview-absent resume, same item id in different turns, duplicate `(turn_id,item_id,ITEM_STARTED)`, and renderer non-mutation of the start event; run and expect FAIL because `TerminalToolEventDisplay` is missing. Implement only start projection without changing event mappings and rerun; expect PASS.
+- [ ] Write renderer-level completion tests proving a short result, default eight-row head/tail projection with the exact omitted marker, verbose output of the complete structured result, and deep equality of `StreamEvent.data` before/after. Include a `RolloutStore` reopen assertion that the persisted source payload remains identical. Run and expect FAIL because completion rendering is missing; implement completion projection using the existing pure formatter and rerun; expect PASS.
 - [ ] Write completion tests for duplicate completion and total 256-key LRU capacity across start/completion keys; run and expect FAIL. Implement the exact lifecycle key plus bounded LRU and rerun; expect PASS.
 - [ ] Write top-level `result.truncated` and `run_command` `structured_content.truncated` tests with distinct exact warnings; run and expect FAIL. Implement non-recursive checks and rerun; expect PASS.
-- [ ] Write a mutation regression that deep-copies `StreamEvent.data`, renders in default and verbose modes, and asserts equality afterward; add a `RolloutStore` reopen assertion that the persisted tool-result payload is identical. Run and expect FAIL until renderer integration exists; implement without mutating event mappings and rerun; expect PASS.
 - [ ] Write chat-loop composer injection and `/verbose`-before-next-Turn tests; run and expect FAIL because the loop still calls `input()`. Inject one composer instance, call `event_display.set_verbose(verbose)`, retain `_CLIToolEventDisplay` as a compatibility alias, and rerun; expect PASS.
 - [ ] Run `uv run pytest -q tests/agent/test_terminal_input.py tests/agent/test_terminal_render.py tests/agent/test_cli_chat_commands.py tests/agent/test_cli_wiring.py tests/agent/test_canonical_streaming_protocol.py`; expect PASS.
 - [ ] Commit with `git add agent_runtime/cli.py agent_runtime/terminal_render.py tests/agent/test_terminal_render.py tests/agent/test_cli_chat_commands.py tests/agent/test_cli_wiring.py && git commit -m 'feat(cli): render Codex-style tool lifecycle'`.
