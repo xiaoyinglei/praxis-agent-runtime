@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -74,6 +75,14 @@ class ModelProbe:
     ) -> ModelProbeEvidence:
         if not isinstance(level, ProbeLevel):
             raise TypeError("level must be a ProbeLevel")
+        credential_name = definition.api_key_env
+        if credential_name is not None:
+            credential = os.environ.get(credential_name)
+            if not isinstance(credential, str) or not credential.strip():
+                raise ModelProbeError(
+                    phase="authentication",
+                    detail=f"credential environment {credential_name} is not set",
+                )
         resolved = await _safe_phase(
             "resolve",
             lambda: asyncio.to_thread(self._registry.resolve_definition, definition),

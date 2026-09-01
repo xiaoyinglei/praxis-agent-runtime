@@ -6,18 +6,26 @@ import logging
 import os
 import shlex
 import sys
-from collections.abc import Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 import click
 import typer
 import yaml
+from pydantic import ValidationError
 
+from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelAliasError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.knowledge import RAGKnowledgeConfig
+from agent_runtime.model_admin import (
+    ModelAdminService,
+    ModelDefinitionArguments,
+    ModelMutationOutcome,
+)
+from agent_runtime.model_probe import ModelProbeEvidence, ProbeLevel
 from agent_runtime.models import (
     ModelNotAvailableError,
     ModelPolicyError,
@@ -26,7 +34,7 @@ from agent_runtime.models import (
     format_model_rows,
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
-from agent_runtime.runtime.builder import build_model_control_plane
+from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
@@ -42,7 +50,9 @@ if TYPE_CHECKING:
 
 agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
+model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
+model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑定的本地信任域。")
 logger = logging.getLogger(__name__)
 
 
@@ -879,18 +889,59 @@ def _handle_model_slash_command(
 
 @model_app.command(name="list")
 def model_list(
+    source: Annotated[
+        bool,
+        typer.Option("--source", help="显示 builtin/user/override 来源"),
+    ] = False,
     session_path: Annotated[
         Path,
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """列出可用模型，并标记当前会话模型。"""
-    control_plane = build_model_control_plane(session_path=session_path)
-    for line in format_model_rows(
-        control_plane.list_models(),
-        current_model_id=control_plane.current_model().id,
-    ):
-        print(line)
+    service = _model_admin_service(session_path)
+    selection = _model_admin_call(service.current_selection)
+    _print_model_session_diagnostics(selection.diagnostics)
+    current_id = selection.spec.id
+    for entry in _model_admin_call(service.list_models):
+        marker = "*" if entry.alias == current_id else " "
+        suffix = f" source={entry.origin}" if source else ""
+        print(f"{marker} {entry.alias} -> {entry.spec.provider_model}{suffix}")
+
+
+@model_app.command(name="show")
+def model_show(
+    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """显示一个模型的规范化定义摘要，不解析凭据值。"""
+    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(alias))
+    print(f"alias: {entry.alias}")
+    print(f"source: {entry.origin}")
+    print(f"provider: {entry.definition.provider.value}")
+    print(f"provider_name: {entry.definition.provider_name or '<none>'}")
+    print(f"model: {entry.spec.provider_model}")
+    print(f"protocol: {entry.spec.protocol or '<none>'}")
+    print(f"location: {entry.spec.location}")
+    print(f"base_url: {entry.spec.base_url or '<default>'}")
+    print(f"api_key_env: {entry.spec.api_key_env or '<none>'}")
+    print(f"tokenizer_model: {entry.definition.tokenizer_model or '<default>'}")
+    print(f"context_window_tokens: {entry.definition.context_window_tokens}")
+    print(
+        "request_context_tokens: "
+        f"{entry.definition.request_context_tokens or entry.definition.context_window_tokens}"
+    )
+    print(f"max_output_tokens: {entry.definition.max_tokens}")
+    print(f"timeout_seconds: {entry.definition.timeout_seconds}")
+    print(f"supports_tools: {str(entry.spec.supports_tools).lower()}")
+    print(
+        "supports_structured_output: "
+        f"{str(entry.spec.supports_structured_output).lower()}"
+    )
+    print(f"definition_revision: {entry.definition_revision}")
 
 
 @model_app.command(name="current")
@@ -901,7 +952,9 @@ def model_current(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示当前会话模型。"""
-    _print_current_model(build_model_control_plane(session_path=session_path).current_model())
+    selection = _model_admin_call(_model_admin_service(session_path).current_selection)
+    _print_model_session_diagnostics(selection.diagnostics)
+    _print_current_model(selection.spec)
 
 
 @model_app.command(name="switch")
@@ -913,12 +966,297 @@ def model_switch(
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """切换当前模型 session state，不修改 models.yaml。"""
-    control_plane = build_model_control_plane(session_path=session_path)
-    try:
-        spec = control_plane.switch_model(model_id, requested_by="user")
-    except (ModelPolicyError, UnknownModelAliasError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    spec = _model_admin_call(lambda: _model_admin_service(session_path).switch(model_id))
     print(f"已切换模型: {spec.id}")
+
+
+@model_app.command(name="probe")
+def model_probe(
+    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    level: Annotated[
+        ProbeLevel,
+        typer.Option("--level", help="connectivity、stream 或 full"),
+    ] = ProbeLevel.FULL,
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """探测已注册模型，不修改注册表或 session。"""
+    service = _model_admin_service(session_path)
+    evidence = _model_admin_call(lambda: _run_cli_async(service.probe(alias, level=level)))
+    _print_probe_evidence(evidence)
+
+
+@model_app.command(name="add")
+def model_add(
+    alias: Annotated[str, typer.Argument(help="新模型 alias")],
+    provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
+    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
+    base_url: Annotated[str | None, typer.Option("--base-url")] = None,
+    api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
+    tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
+    provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
+    protocol: Annotated[str | None, typer.Option("--protocol")] = None,
+    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
+    timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
+    context_window_tokens: Annotated[
+        int | None,
+        typer.Option("--context-window-tokens"),
+    ] = None,
+    request_context_tokens: Annotated[
+        int | None,
+        typer.Option("--request-context-tokens"),
+    ] = None,
+    supports_tools: Annotated[
+        bool | None,
+        typer.Option("--tools/--no-tools"),
+    ] = None,
+    supports_structured_output: Annotated[
+        bool | None,
+        typer.Option("--structured-output/--no-structured-output"),
+    ] = None,
+    location: Annotated[Literal["local", "cloud"] | None, typer.Option("--location")] = None,
+    from_path: Annotated[Path | None, typer.Option("--from", help="单模型 YAML 定义")] = None,
+    skip_probe: Annotated[
+        bool,
+        typer.Option("--skip-probe", help="离线登记；明确标记为未验证"),
+    ] = False,
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """验证并登记一个用户模型；默认在提交前执行 full probe。"""
+    service = _model_admin_service(session_path)
+    arguments = _model_definition_arguments(
+        provider=provider,
+        provider_model=provider_model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        tokenizer_model=tokenizer_model,
+        provider_name=provider_name,
+        protocol=protocol,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        context_window_tokens=context_window_tokens,
+        request_context_tokens=request_context_tokens,
+        supports_tools=supports_tools,
+        supports_structured_output=supports_structured_output,
+        location=location,
+    )
+    outcome = _model_admin_call(
+        lambda: _run_cli_async(
+            service.add(
+                alias,
+                arguments=arguments,
+                from_path=from_path,
+                skip_probe=skip_probe,
+            )
+        )
+    )
+    _print_model_mutation(outcome)
+
+
+@model_app.command(name="update")
+def model_update(
+    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
+    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
+    base_url: Annotated[str | None, typer.Option("--base-url")] = None,
+    api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
+    tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
+    provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
+    protocol: Annotated[str | None, typer.Option("--protocol")] = None,
+    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
+    timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
+    context_window_tokens: Annotated[
+        int | None,
+        typer.Option("--context-window-tokens"),
+    ] = None,
+    request_context_tokens: Annotated[
+        int | None,
+        typer.Option("--request-context-tokens"),
+    ] = None,
+    supports_tools: Annotated[
+        bool | None,
+        typer.Option("--tools/--no-tools"),
+    ] = None,
+    supports_structured_output: Annotated[
+        bool | None,
+        typer.Option("--structured-output/--no-structured-output"),
+    ] = None,
+    location: Annotated[Literal["local", "cloud"] | None, typer.Option("--location")] = None,
+    unset: Annotated[list[str] | None, typer.Option("--unset", help="清除可空字段路径")] = None,
+    from_path: Annotated[Path | None, typer.Option("--from", help="完整替换定义 YAML")] = None,
+    skip_probe: Annotated[bool, typer.Option("--skip-probe")] = False,
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """以类型化 patch 或完整定义更新用户模型。"""
+    service = _model_admin_service(session_path)
+    arguments = _model_definition_arguments(
+        provider=provider,
+        provider_model=provider_model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        tokenizer_model=tokenizer_model,
+        provider_name=provider_name,
+        protocol=protocol,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        context_window_tokens=context_window_tokens,
+        request_context_tokens=request_context_tokens,
+        supports_tools=supports_tools,
+        supports_structured_output=supports_structured_output,
+        location=location,
+    )
+    outcome = _model_admin_call(
+        lambda: _run_cli_async(
+            service.update(
+                alias,
+                arguments=arguments,
+                from_path=from_path,
+                unset_paths=tuple(unset or ()),
+                skip_probe=skip_probe,
+            )
+        )
+    )
+    _print_model_mutation(outcome)
+
+
+@model_app.command(name="remove")
+def model_remove(
+    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """删除非当前会话选中的用户模型。"""
+    result = _model_admin_call(lambda: _model_admin_service(session_path).remove(alias))
+    print(f"removed: {alias}")
+    print(f"registry_revision: {result.snapshot.document.revision}")
+
+
+@model_trust_app.command(name="init")
+def model_trust_init(
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """幂等初始化本地模型绑定信任域。"""
+    status = _model_admin_call(lambda: _model_admin_service(session_path).trust_init())
+    _print_trust_status(status.trust_domain_id, status.signing_key_id)
+
+
+@model_trust_app.command(name="status")
+def model_trust_status(
+    session_path: Annotated[
+        Path,
+        typer.Option("--session-path", help="模型 session state 文件"),
+    ] = DEFAULT_MODEL_SESSION_PATH,
+) -> None:
+    """显示信任域标识与签名 key id，不显示密钥。"""
+    status = _model_admin_call(lambda: _model_admin_service(session_path).trust_status())
+    _print_trust_status(status.trust_domain_id, status.signing_key_id)
+
+
+def _model_admin_service(session_path: Path) -> ModelAdminService:
+    return _model_admin_call(lambda: build_model_admin_service(session_path=session_path))
+
+
+def _model_admin_call[T](operation: Callable[[], T]) -> T:
+    try:
+        return operation()
+    except ValidationError as exc:
+        fields = sorted(
+            ".".join(str(part) for part in error.get("loc", ())) or "configuration"
+            for error in exc.errors(include_url=False, include_input=False)
+        )
+        raise click.ClickException(
+            "Invalid model configuration fields: " + ", ".join(fields)
+        ) from None
+    except (OSError, KeyError, RuntimeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from None
+
+
+def _model_definition_arguments(
+    *,
+    provider: ModelProvider | None,
+    provider_model: str | None,
+    base_url: str | None,
+    api_key_env: str | None,
+    tokenizer_model: str | None,
+    provider_name: str | None,
+    protocol: str | None,
+    max_tokens: int | None,
+    timeout_seconds: float | None,
+    context_window_tokens: int | None,
+    request_context_tokens: int | None,
+    supports_tools: bool | None,
+    supports_structured_output: bool | None,
+    location: Literal["local", "cloud"] | None,
+) -> ModelDefinitionArguments:
+    return ModelDefinitionArguments(
+        provider=provider,
+        model=provider_model,
+        base_url=base_url,
+        api_key_env=api_key_env,
+        tokenizer_model=tokenizer_model,
+        provider_name=provider_name,
+        protocol=protocol,
+        max_tokens=max_tokens,
+        timeout_seconds=timeout_seconds,
+        context_window_tokens=context_window_tokens,
+        request_context_tokens=request_context_tokens,
+        supports_tools=supports_tools,
+        supports_structured_output=supports_structured_output,
+        location=location,
+    )
+
+
+def _print_probe_evidence(evidence: ModelProbeEvidence) -> None:
+    print(f"level: {evidence.level.value}")
+    print(f"connectivity_ok: {str(evidence.connectivity_ok).lower()}")
+    print(f"text_delta_count: {evidence.text_delta_count}")
+    print(f"completion_ok: {str(evidence.completion_ok).lower()}")
+    print(f"tool_call_ok: {_optional_bool(evidence.tool_call_ok)}")
+    print(f"structured_output_ok: {_optional_bool(evidence.structured_output_ok)}")
+
+
+def _print_model_mutation(outcome: ModelMutationOutcome) -> None:
+    print(f"alias: {outcome.alias}")
+    print("source: user")
+    print(f"changed: {str(outcome.changed).lower()}")
+    print(f"definition_revision: {outcome.definition_revision}")
+    print(f"registry_revision: {outcome.registry_revision}")
+    print(f"registry_fingerprint: {outcome.registry_fingerprint}")
+    if outcome.unverified:
+        print("probe: skipped (unverified)")
+    elif outcome.probe_evidence is not None:
+        print("probe: verified")
+        _print_probe_evidence(outcome.probe_evidence)
+    else:
+        print("probe: skipped (normalized no-op)")
+
+
+def _print_trust_status(trust_domain_id: str, signing_key_id: str) -> None:
+    print("initialized: true")
+    print(f"trust_domain_id: {trust_domain_id}")
+    print(f"signing_key_id: {signing_key_id}")
+
+
+def _optional_bool(value: bool | None) -> str:
+    return "not_run" if value is None else str(value).lower()
+
+
+def _print_model_session_diagnostics(diagnostics: tuple[str, ...]) -> None:
+    for diagnostic in diagnostics:
+        typer.echo(f"model session diagnostic: {diagnostic}", err=True)
 
 
 def _latest_cli_turn(

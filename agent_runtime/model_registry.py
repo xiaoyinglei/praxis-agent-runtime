@@ -64,6 +64,7 @@ _UNSET_PATHS = frozenset(
         "defaults.seed",
     }
 )
+_SINGLE_DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 
 
 class RegistryCollisionError(ValueError):
@@ -315,6 +316,41 @@ class UserModelRegistryStore:
     def read(self) -> RegistrySnapshot:
         return self._read_unlocked()
 
+    def preview_add(
+        self,
+        alias: str,
+        definition: UserModelDefinition,
+        *,
+        snapshot: RegistrySnapshot,
+    ) -> UserModelDefinition:
+        """Validate one candidate against an observed snapshot without writing."""
+
+        self._reject_override_mode()
+        _validate_alias(alias)
+        if alias in self._built_in_aliases:
+            raise RegistryCollisionError(f"Model alias {alias!r} is owned by the built-in catalog")
+        if alias in snapshot.document.models:
+            raise RegistryCollisionError(f"User model alias {alias!r} already exists")
+        return UserModelDefinition.model_validate(
+            definition.model_dump(mode="python", exclude_none=True, warnings=False)
+        )
+
+    def preview_update(
+        self,
+        alias: str,
+        mutation: ModelDefinitionPatch,
+        *,
+        snapshot: RegistrySnapshot,
+    ) -> UserModelDefinition:
+        """Return the exact candidate that update would commit for this snapshot."""
+
+        self._reject_override_mode()
+        _validate_alias(alias)
+        current = snapshot.document.models.get(alias)
+        if current is None:
+            raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
+        return _apply_patch(current, _revalidate_patch(mutation))
+
     def add(
         self,
         alias: str,
@@ -563,8 +599,50 @@ def _load_registry_yaml(payload: bytes) -> object:
     except RegistryConfigValidationError:
         raise
     except yaml.YAMLError as error:
-        raise RegistryConfigValidationError(f"Invalid registry YAML: {error}") from error
+        mark = getattr(error, "problem_mark", None)
+        location = (
+            f" at line {mark.line + 1}, column {mark.column + 1}"
+            if mark is not None
+            else ""
+        )
+        raise RegistryConfigValidationError(f"Invalid registry YAML{location}") from None
     return parsed
+
+
+def load_user_model_definition(path: Path) -> UserModelDefinition:
+    """Parse exactly one strict user definition, never a complete catalog."""
+
+    try:
+        payload = path.read_bytes()
+    except OSError as error:
+        raise RegistryConfigValidationError(
+            f"Cannot read model definition file {path}"
+        ) from error
+    if len(payload) > _SINGLE_DEFINITION_FILE_LIMIT:
+        raise RegistryConfigValidationError("Model definition file exceeds 4 MiB")
+    parsed = _load_registry_yaml(payload)
+    if not isinstance(parsed, Mapping):
+        raise RegistryConfigValidationError("Model definition file must contain one mapping")
+    forbidden = {"version", "revision", "models"}.intersection(parsed)
+    if forbidden:
+        raise RegistryConfigValidationError(
+            "Model definition file must contain one definition, not a registry or catalog"
+        )
+    try:
+        return UserModelDefinition.model_validate(dict(parsed))
+    except Exception as error:
+        errors = getattr(error, "errors", None)
+        if callable(errors):
+            paths = sorted(
+                ".".join(str(part) for part in item.get("loc", ())) or "definition"
+                for item in errors(include_url=False, include_input=False)
+            )
+            detail = ", ".join(paths)
+        else:
+            detail = type(error).__name__
+        raise RegistryConfigValidationError(
+            f"Invalid model definition fields: {detail}"
+        ) from None
 
 
 __all__ = [
@@ -583,4 +661,5 @@ __all__ = [
     "UserModelDefinition",
     "UserModelRegistryDocument",
     "UserModelRegistryStore",
+    "load_user_model_definition",
 ]

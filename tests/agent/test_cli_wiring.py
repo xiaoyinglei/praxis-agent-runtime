@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from pathlib import Path
 
 import click
@@ -19,6 +21,8 @@ from agent_runtime.cli import (
     agent_app,
 )
 from agent_runtime.harness import RolloutStore
+from agent_runtime.model_probe import ModelProbe, ModelProbeEvidence, ProbeLevel
+from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentPause, AgentResult, AgentToolCall, AgentUsage
@@ -252,6 +256,432 @@ def test_agent_command_options_match_the_clean_public_contract(
         assert option in option_names
     for option in removed:
         assert option not in option_names
+
+
+def test_model_management_help_exposes_complete_public_aci() -> None:
+    result = CliRunner().invoke(agent_app, ["model", "--help"], env={"COLUMNS": "240"})
+
+    assert result.exit_code == 0, result.output
+    for command in ("list", "show", "current", "switch", "probe", "add", "update", "remove", "trust"):
+        assert command in result.output
+
+
+def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_provider(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("read-only model commands must not construct a provider")
+
+    monkeypatch.setattr(OpenAICompatibleChatGenerator, "__init__", reject_provider)
+    runner = CliRunner()
+    session = str(tmp_path / "session.json")
+
+    listed = runner.invoke(
+        agent_app,
+        ["model", "list", "--source", "--session-path", session],
+        env={"COLUMNS": "240"},
+    )
+    shown = runner.invoke(
+        agent_app,
+        ["model", "show", "qwen3_5_9b_mlx_4bit", "--session-path", session],
+        env={"COLUMNS": "240"},
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert "source=builtin" in listed.output
+    assert shown.exit_code == 0, shown.output
+    assert "source: builtin" in shown.output
+
+
+def test_model_current_surfaces_stale_session_repair_diagnostic(tmp_path: Path) -> None:
+    session_path = tmp_path / "session.json"
+    session_path.write_text(
+        '{"version":1,"revision":3,"current_model_id":"removed-model"}\n',
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        agent_app,
+        ["model", "current", "--session-path", str(session_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "model session diagnostic:" in result.output
+    assert "removed-model" in result.output
+
+
+def test_model_trust_init_and_status_are_idempotent_and_redacted(tmp_path: Path) -> None:
+    runner = CliRunner()
+    session_options = ["--session-path", str(tmp_path / "session.json")]
+
+    initialized = runner.invoke(agent_app, ["model", "trust", "init", *session_options])
+    repeated = runner.invoke(agent_app, ["model", "trust", "init", *session_options])
+    status = runner.invoke(agent_app, ["model", "trust", "status", *session_options])
+
+    assert initialized.exit_code == 0, initialized.output
+    assert repeated.output == initialized.output
+    assert status.output == initialized.output
+    registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+    trust_payload = json.loads((registry_path.parent / "binding-trust.json").read_text())
+    assert trust_payload["hmac_key_base64"] not in initialized.output
+    assert "signing_key_id: sha256:" in initialized.output
+
+
+def test_model_add_skip_probe_update_noop_and_remove_lifecycle(tmp_path: Path) -> None:
+    runner = CliRunner()
+    session_options = ["--session-path", str(tmp_path / "session.json")]
+    common = [
+        "--provider",
+        "openai_compatible",
+        "--provider-model",
+        "local-test",
+        "--base-url",
+        "http://127.0.0.1:9911/v1",
+        "--location",
+        "local",
+    ]
+
+    added = runner.invoke(
+        agent_app,
+        ["model", "add", "local-test", *common, "--skip-probe", *session_options],
+    )
+    noop = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "update",
+            "local-test",
+            "--provider-model",
+            "local-test",
+            *session_options,
+        ],
+    )
+    removed = runner.invoke(agent_app, ["model", "remove", "local-test", *session_options])
+
+    assert added.exit_code == 0, added.output
+    assert "probe: skipped (unverified)" in added.output
+    assert noop.exit_code == 0, noop.output
+    assert "changed: false" in noop.output
+    assert "normalized no-op" in noop.output
+    assert removed.exit_code == 0, removed.output
+    assert "registry_revision: 2" in removed.output
+
+
+def test_model_add_from_imports_exactly_one_definition(tmp_path: Path) -> None:
+    definition_path = tmp_path / "one-model.yaml"
+    definition_path.write_text(
+        "\n".join(
+            (
+                "provider: openai_compatible",
+                "model: imported-model",
+                "base_url: http://127.0.0.1:9912/v1",
+                "location: local",
+                "supports_tools: false",
+                "supports_structured_output: false",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "imported-model",
+            "--from",
+            str(definition_path),
+            "--skip-probe",
+            "--session-path",
+            str(tmp_path / "session.json"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "alias: imported-model" in result.output
+    assert "probe: skipped (unverified)" in result.output
+
+
+def test_model_update_supports_unset_and_complete_replacement(tmp_path: Path) -> None:
+    runner = CliRunner()
+    session_options = ["--session-path", str(tmp_path / "session.json")]
+    added = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "mutable-model",
+            "--provider",
+            "openai_compatible",
+            "--provider-model",
+            "model-v1",
+            "--provider-name",
+            "display-provider",
+            "--base-url",
+            "http://127.0.0.1:9915/v1",
+            "--location",
+            "local",
+            "--skip-probe",
+            *session_options,
+        ],
+    )
+    unset = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "update",
+            "mutable-model",
+            "--unset",
+            "provider_name",
+            "--skip-probe",
+            *session_options,
+        ],
+    )
+    replacement_path = tmp_path / "replacement.yaml"
+    replacement_path.write_text(
+        "\n".join(
+            (
+                "provider: openai_compatible",
+                "model: model-v2",
+                "base_url: http://127.0.0.1:9916/v1",
+                "location: local",
+            )
+        ),
+        encoding="utf-8",
+    )
+    replaced = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "update",
+            "mutable-model",
+            "--from",
+            str(replacement_path),
+            "--skip-probe",
+            *session_options,
+        ],
+    )
+
+    assert added.exit_code == 0, added.output
+    assert unset.exit_code == 0, unset.output
+    assert replaced.exit_code == 0, replaced.output
+    registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+    registry_text = registry_path.read_text(encoding="utf-8")
+    assert "provider_name" not in registry_text
+    assert "model: model-v2" in registry_text
+
+
+def test_model_probe_failure_writes_nothing_and_redacts_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "cli-secret-must-not-leak"
+    monkeypatch.setenv("PROBE_SECRET", secret)
+    registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "offline-model",
+            "--provider",
+            "openai_compatible",
+            "--provider-model",
+            "offline-model",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--location",
+            "local",
+            "--api-key-env",
+            "PROBE_SECRET",
+            "--timeout-seconds",
+            "0.05",
+            "--session-path",
+            str(tmp_path / "session.json"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "connectivity" in result.output
+    assert secret not in result.output
+    assert "Traceback" not in result.output
+    assert not registry_path.exists()
+
+
+def test_model_add_probes_before_registry_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+
+    async def observe_probe(
+        _self: ModelProbe,
+        _definition: object,
+        *,
+        level: ProbeLevel,
+    ) -> ModelProbeEvidence:
+        assert level is ProbeLevel.FULL
+        assert not registry_path.exists()
+        return ModelProbeEvidence(
+            level=level,
+            connectivity_ok=True,
+            text_delta_count=2,
+            completion_ok=True,
+            tool_call_ok=True,
+            structured_output_ok=True,
+        )
+
+    monkeypatch.setattr(ModelProbe, "run", observe_probe)
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "probed-model",
+            "--provider",
+            "openai_compatible",
+            "--provider-model",
+            "probed-model",
+            "--base-url",
+            "http://127.0.0.1:9914/v1",
+            "--location",
+            "local",
+            "--session-path",
+            str(tmp_path / "session.json"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert registry_path.exists()
+    assert "probe: verified" in result.output
+
+
+def test_model_add_cancellation_writes_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
+
+    async def cancel_probe(
+        _self: ModelProbe,
+        _definition: object,
+        *,
+        level: ProbeLevel,
+    ) -> ModelProbeEvidence:
+        del level
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(ModelProbe, "run", cancel_probe)
+    with pytest.raises(asyncio.CancelledError):
+        CliRunner().invoke(
+            agent_app,
+            [
+                "model",
+                "add",
+                "cancelled-model",
+                "--provider",
+                "openai_compatible",
+                "--provider-model",
+                "cancelled-model",
+                "--base-url",
+                "http://127.0.0.1:9917/v1",
+                "--location",
+                "local",
+                "--session-path",
+                str(tmp_path / "session.json"),
+            ],
+        )
+
+    assert not registry_path.exists()
+
+
+def test_model_add_rejects_whole_catalog_override_before_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    override = {
+        "version": 1,
+        "models": {
+            "override-model": {
+                "provider": "openai_compatible",
+                "model": "override-model",
+                "base_url": "http://127.0.0.1:9920/v1",
+                "location": "local",
+            }
+        },
+        "default_model": "override-model",
+    }
+    monkeypatch.setenv("RAG_AGENT_MODELS", json.dumps(override))
+
+    async def reject_probe(*_args: object, **_kwargs: object) -> ModelProbeEvidence:
+        raise AssertionError("override mode must fail before probe")
+
+    monkeypatch.setattr(ModelProbe, "run", reject_probe)
+    result = CliRunner().invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "blocked-model",
+            "--provider",
+            "openai_compatible",
+            "--provider-model",
+            "blocked-model",
+            "--base-url",
+            "http://127.0.0.1:9921/v1",
+            "--location",
+            "local",
+            "--session-path",
+            str(tmp_path / "session.json"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "whole-catalog override" in result.output
+
+
+def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> None:
+    runner = CliRunner()
+    session_options = ["--session-path", str(tmp_path / "session.json")]
+    builtin = runner.invoke(
+        agent_app,
+        ["model", "remove", "qwen3_5_9b_mlx_4bit", *session_options],
+    )
+    added = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "selected-model",
+            "--provider",
+            "openai_compatible",
+            "--provider-model",
+            "selected-model",
+            "--base-url",
+            "http://127.0.0.1:9913/v1",
+            "--location",
+            "local",
+            "--skip-probe",
+            *session_options,
+        ],
+    )
+    switched = runner.invoke(
+        agent_app,
+        ["model", "switch", "selected-model", *session_options],
+    )
+    current = runner.invoke(
+        agent_app,
+        ["model", "remove", "selected-model", *session_options],
+    )
+
+    assert builtin.exit_code == 1
+    assert "not user-owned" in builtin.output
+    assert added.exit_code == 0, added.output
+    assert switched.exit_code == 0, switched.output
+    assert current.exit_code == 1
+    assert "switch this session" in current.output
 
 
 def test_workspace_change_help_discloses_post_change_verification_gate() -> None:

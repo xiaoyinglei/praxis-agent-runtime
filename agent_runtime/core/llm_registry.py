@@ -148,6 +148,20 @@ class ModelRegistry:
         except KeyError as exc:
             raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
 
+    def execution_definition_for_user_model(
+        self,
+        definition: UserModelDefinition,
+    ) -> ModelExecutionDefinition:
+        """Normalize an uncommitted user candidate with current runtime policy."""
+
+        normalized = UserModelDefinition.model_validate(
+            definition.model_dump(mode="python", exclude_none=True, warnings=False)
+        )
+        return build_model_execution_definition(
+            spec=_user_definition_to_model_spec(normalized),
+            config=self._config,
+        )
+
     @classmethod
     def from_env(
         cls,

@@ -21,6 +21,7 @@ class _ProviderState:
     mode: str = "ok"
     advertised_model: str = "probe-model"
     requests: list[dict[str, Any]] = field(default_factory=list)
+    model_list_requests: int = 0
     stream_started: threading.Event = field(default_factory=threading.Event)
     release_stream: threading.Event = field(default_factory=threading.Event)
 
@@ -39,6 +40,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/models":
             self.send_error(404)
             return
+        self.server.state.model_list_requests += 1
         if not self._authorized():
             self._json_response(401, {"error": {"message": "bad key"}})
             return
@@ -328,6 +330,21 @@ async def test_probe_redacts_credentials_and_provider_exception_chain(
     assert secret not in repr(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+@pytest.mark.anyio
+async def test_probe_rejects_missing_credential_before_provider_io(
+    provider_server: tuple[_ProviderState, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state, base_url = provider_server
+    monkeypatch.delenv("PROBE_API_KEY", raising=False)
+
+    with pytest.raises(ModelProbeError, match="authentication.*PROBE_API_KEY"):
+        await _run_probe(_probe(base_url), level=ProbeLevel.CONNECTIVITY)
+
+    assert state.model_list_requests == 0
+    assert state.requests == []
 
 
 @pytest.mark.anyio
