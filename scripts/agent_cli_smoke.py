@@ -138,7 +138,10 @@ def run_smoke() -> CLISmokeResult:
                 "plan": (
                     "计划 (revision 2)" in rendered and "✓ Inspect source" in rendered and "→ Verify CLI" in rendered
                 ),
-                "tool_result": ("→ apply_patch" in rendered and "✓ apply_patch: patched fixture.txt" in rendered),
+                "tool_result": (
+                    "→ apply_patch: file_path='fixture.txt'" in rendered
+                    and "✓ apply_patch\n  patched fixture.txt" in rendered
+                ),
                 "tool_error": "✗ read_file: file not found" in rendered,
                 "diff": ("--- a/fixture.txt" in rendered and "+after" in rendered),
                 "recovery": "↻ 恢复: retry" in rendered,
