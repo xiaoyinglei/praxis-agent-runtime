@@ -31,6 +31,16 @@ _UNSAFE_CONTROL = regex.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _GRAPHEME = regex.compile(r"\X")
 
 
+def _omission_marker(count: int, *, unit: str, width: int) -> str:
+    candidates = (
+        f"… +{count} {unit} (/verbose 查看完整结果)",
+        f"… +{count} {unit}",
+        f"… +{count}",
+        "…",
+    )
+    return next(marker for marker in candidates if wcswidth(marker) <= width)
+
+
 class _BoundedPartialRow:
     def __init__(self, max_bytes: int) -> None:
         self._max_bytes = max_bytes
@@ -159,7 +169,9 @@ class BoundedCommandPreview:
         visible.extend(self._forced_markers)
         omitted = self._suppressed_rows - len(self._tail)
         if omitted > 0:
-            visible.append(f"… +{omitted} lines (/verbose 查看完整结果)")
+            visible.append(
+                _omission_marker(omitted, unit="lines", width=self._width)
+            )
         visible.extend(self._tail)
         self._tail.clear()
         self._forced_markers.clear()
@@ -173,7 +185,9 @@ class BoundedCommandPreview:
         for row in display_rows(head, width=self._width):
             visible.extend(self._accept_row(row))
         if omitted_chars:
-            self._forced_markers.append(f"… +{omitted_chars} chars")
+            self._forced_markers.append(
+                _omission_marker(omitted_chars, unit="chars", width=self._width)
+            )
             for row in display_rows(tail, width=self._width):
                 visible.extend(self._accept_row(row))
         return visible
@@ -267,7 +281,7 @@ def bounded_result_lines(
     head_count = retained // 2
     tail_count = retained - head_count
     omitted = len(rows) - head_count - tail_count
-    marker = f"… +{omitted} lines (/verbose 查看完整结果)"
+    marker = _omission_marker(omitted, unit="lines", width=width)
     tail = rows[-tail_count:] if tail_count else []
     return [*rows[:head_count], marker, *tail]
 
@@ -293,7 +307,7 @@ class TerminalToolEventDisplay:
         if max_lifecycle_keys < 1:
             raise ValueError("lifecycle key limit must be positive")
         terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
-        self._width = max(20, width if width is not None else terminal_width)
+        self._width = max(1, width if width is not None else terminal_width)
         self._max_lifecycle_keys = max_lifecycle_keys
         self._lifecycle: OrderedDict[
             tuple[str, str, EventType], None
@@ -363,7 +377,7 @@ class TerminalToolEventDisplay:
         )
         state = _ItemDisplayState(name=name, kind=event.item_kind)
         if event.item_kind is TurnItemKind.COMMAND:
-            state.command = BoundedCommandPreview(width=self._width - 2)
+            state.command = BoundedCommandPreview(width=max(1, self._width - 2))
         else:
             state.progress = BoundedProgressPreview()
         self._store_item((event.turn_id, event.item_id), state)
@@ -388,7 +402,7 @@ class TerminalToolEventDisplay:
                 state = _ItemDisplayState(
                     name="command",
                     kind=TurnItemKind.COMMAND,
-                    command=BoundedCommandPreview(width=self._width - 2),
+                    command=BoundedCommandPreview(width=max(1, self._width - 2)),
                 )
                 self._store_item(key, state)
             state.command_output_streamed = True
@@ -396,7 +410,7 @@ class TerminalToolEventDisplay:
                 self._render_text(delta, answer=False)
                 return
             if state.command is None:
-                state.command = BoundedCommandPreview(width=self._width - 2)
+                state.command = BoundedCommandPreview(width=max(1, self._width - 2))
             for line in state.command.feed(delta):
                 self._write_line(f"  {line}")
             return
@@ -586,7 +600,7 @@ class TerminalToolEventDisplay:
     def _write_result(self, value: object) -> None:
         for line in bounded_result_lines(
             value,
-            width=self._width - 2,
+            width=max(1, self._width - 2),
             verbose=self._verbose,
         ):
             self._write_line(f"  {line}")
@@ -669,11 +683,13 @@ class TerminalToolEventDisplay:
     def _write_line(self, value: str) -> None:
         if self._line_open:
             print()
-        print(safe_terminal_text(value), flush=True)
+        for row in display_rows(value, width=self._width):
+            print(row, flush=True)
         self._line_open = False
 
     def _write_block(self, value: str) -> None:
         if self._line_open:
             print()
-        print(safe_terminal_text(value).rstrip("\n"), flush=True)
+        for row in display_rows(value.rstrip("\n"), width=self._width):
+            print(row, flush=True)
         self._line_open = False

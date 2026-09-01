@@ -95,7 +95,7 @@ uv run agent chat
 
 `agent chat` 使用 Unicode-aware Composer，中文和 emoji 的退格、Delete、光标移动按
 完整字符处理。工具与命令按同一个 Item 生命周期显示；长输出默认保留头尾并明确显示
-省略行数，不再在字典或句子中间硬切。可在两个 Turn 之间输入 `/verbose`，让后续工具
+省略行数，不再在字典或句子中间硬切；极窄终端会改用能容纳的紧凑标记。可在两个 Turn 之间输入 `/verbose`，让后续工具
 结果完整展开。若工具或 ACI 本身已经丢弃超预算内容，CLI 会另行警告；这与 UI 折叠
 不同，verbose 不能恢复上游未保留的数据。
 

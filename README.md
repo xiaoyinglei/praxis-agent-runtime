@@ -166,7 +166,8 @@ Interactive chat uses a Unicode-aware line editor, so Backspace/Delete and
 cursor movement operate on complete Chinese characters and emoji. Tool and
 command events are rendered as correlated lifecycle items. The default view
 keeps a readable head and tail for long output and reports the exact omitted
-row count instead of cutting a result mid-value. Enter `/verbose` between Turns
+row count instead of cutting a result mid-value; very narrow terminals use a
+compact marker that fits the actual column width. Enter `/verbose` between Turns
 to show complete subsequent tool results. A separate warning identifies output
 already truncated by the tool or ACI; UI folding never changes durable history.
 

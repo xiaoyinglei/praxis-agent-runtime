@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from wcwidth import wcswidth
 
 from agent_runtime.harness import RolloutStore
 from agent_runtime.streaming.events import (
@@ -80,6 +81,15 @@ def test_bounded_result_lines_verbose_returns_every_row() -> None:
     assert lines == [f"line {index}" for index in range(12)]
 
 
+def test_bounded_result_lines_keeps_markers_within_narrow_width() -> None:
+    value = "\n".join(f"line {index}" for index in range(12))
+
+    lines = bounded_result_lines(value, width=10, max_rows=8)
+
+    assert all(wcswidth(line) <= 10 for line in lines)
+    assert any("+" in line for line in lines)
+
+
 def test_command_preview_preserves_chunk_order_and_equal_deltas() -> None:
     preview = BoundedCommandPreview(width=80)
 
@@ -121,6 +131,18 @@ def test_command_preview_keeps_six_head_and_three_tail_rows() -> None:
         "line 10",
         "line 11",
     ]
+
+
+def test_command_preview_keeps_markers_within_narrow_width() -> None:
+    preview = BoundedCommandPreview(width=8)
+    visible: list[str] = []
+
+    for index in range(12):
+        visible.extend(preview.feed(f"line {index}\n"))
+    visible.extend(preview.finish())
+
+    assert all(wcswidth(line) <= 8 for line in visible)
+    assert any("+" in line for line in visible)
 
 
 def test_command_preview_bounds_a_long_line_and_reports_omitted_characters() -> None:
@@ -211,7 +233,7 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
         data={"result": payload},
     )
     event_before = copy.deepcopy(event.data)
-    display = TerminalToolEventDisplay(width=32)
+    display = TerminalToolEventDisplay(width=80)
 
     await display.emit(event)
 
@@ -381,7 +403,36 @@ async def test_renderer_narrow_terminal_accepts_long_tool_name_preview(
         )
     )
 
-    assert "→ a_very_long_tool_name" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert all(wcswidth(line) <= 20 for line in output.splitlines())
+
+
+@pytest.mark.anyio
+async def test_renderer_uses_actual_width_below_twenty_cells(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=10)
+
+    await display.emit(
+        item_completed(
+            turn_id="turn-tiny",
+            item_id="tool-tiny",
+            item_kind=TurnItemKind.TOOL,
+            status=ItemStatus.SUCCESS,
+            data={
+                "result": {
+                    "tool_name": "read_file",
+                    "structured_content": {
+                        "lines": [f"value {index}" for index in range(20)]
+                    },
+                }
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert any("+" in line for line in output.splitlines())
+    assert all(wcswidth(line) <= 10 for line in output.splitlines())
 
 
 @pytest.mark.anyio
