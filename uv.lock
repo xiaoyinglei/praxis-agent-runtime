@@ -2440,6 +2440,7 @@ dev = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "types-regex" },
 ]
 
 [package.metadata]
@@ -2488,6 +2489,7 @@ dev = [
     { name = "mypy", specifier = ">=1.15.0" },
     { name = "pytest", specifier = ">=8.3.5" },
     { name = "ruff", specifier = ">=0.11.0" },
+    { name = "types-regex", specifier = ">=2025.7.34" },
 ]
 
 [[package]]
@@ -3854,6 +3856,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f2/1e/a27cc02a0cd715118c71fa2aef2c687fdefc3c28d90fd0dd789c5118154c/typer-0.21.2.tar.gz", hash = "sha256:1abd95a3b675e17ff61b0838ac637fe9478d446d62ad17fa4bb81ea57cc54028", size = 120426, upload-time = "2026-02-10T19:33:46.182Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b8/cc/d59f893fbdfb5f58770c05febfc4086a46875f1084453621c35605cec946/typer-0.21.2-py3-none-any.whl", hash = "sha256:c3d8de54d00347ef90b82131ca946274f017cffb46683ae3883c360fa958f55c", size = 56728, upload-time = "2026-02-10T19:33:48.01Z" },
+]
+
+[[package]]
+name = "types-regex"
+version = "2026.8.31.20260901"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/92/22/a7584e309eedda86d7b53b66e611b815495413ee552b16ef27051a23e8d7/types_regex-2026.8.31.20260901.tar.gz", hash = "sha256:f3355508458a3f731b7511ed94daf67e0fd8de9ac693863bb7409a19248bb266", size = 13813, upload-time = "2026-09-01T06:54:44.531Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/aa/ad/fa732c3f21fe0dbcd42bbe334a36ef1049c296630c9ba8f6f7f33808e370/types_regex-2026.8.31.20260901-py3-none-any.whl", hash = "sha256:37fc7862abda53107e66a39cf4f040c4512f134b421712a4179d9cb847f5afdc", size = 11194, upload-time = "2026-09-01T06:54:43.725Z" },
 ]
 
 [[package]]
