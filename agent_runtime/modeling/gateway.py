@@ -322,9 +322,10 @@ class LLMGateway:
             text = ""
             reasoning_content = ""
             calls: list[ToolCall] = []
-            current_id = ""
-            current_name = ""
-            current_arguments = ""
+            active_tool_id = ""
+            tool_names: dict[str, str] = {}
+            tool_arguments: dict[str, str] = {}
+            completed_tool_ids: set[str] = set()
             stop_reason = "end_turn"
             final_usage: LLMUsage | None = None
             async for chunk in chunks:
@@ -358,22 +359,28 @@ class LLMGateway:
                             ),
                         )
                 elif chunk.type == "tool_use_start":
-                    current_id = chunk.tool_id
-                    current_name = chunk.tool_name
-                    current_arguments = ""
+                    active_tool_id = chunk.tool_id or f"call_{len(tool_names) + 1}"
+                    tool_names[active_tool_id] = chunk.tool_name
+                    tool_arguments[active_tool_id] = ""
                 elif chunk.type == "tool_input_delta":
-                    current_arguments += chunk.content
-                elif chunk.type == "content_block_stop" and current_name:
+                    tool_id = chunk.tool_id or active_tool_id
+                    if tool_id in tool_arguments:
+                        tool_arguments[tool_id] += chunk.content
+                elif chunk.type == "content_block_stop":
+                    tool_id = chunk.tool_id or active_tool_id
+                    tool_name = tool_names.get(tool_id, "")
+                    if not tool_name or tool_id in completed_tool_ids:
+                        continue
                     calls.append(
                         ToolCall(
-                            id=current_id or f"call_{len(calls) + 1}",
-                            name=current_name,
-                            input=_tool_arguments(current_arguments),
+                            id=tool_id,
+                            name=tool_name,
+                            input=_tool_arguments(tool_arguments.get(tool_id, "")),
                         )
                     )
-                    current_id = ""
-                    current_name = ""
-                    current_arguments = ""
+                    completed_tool_ids.add(tool_id)
+                    if active_tool_id == tool_id:
+                        active_tool_id = ""
                 elif chunk.type == "message_stop":
                     stop_reason = chunk.stop_reason or stop_reason
                     final_usage = chunk.usage

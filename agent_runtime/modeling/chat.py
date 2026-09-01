@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+from collections.abc import Iterator
 from typing import Any, TypeVar, cast
 
 from agent_runtime.modeling.contracts import LLMProviderResult, LLMUsage
@@ -38,6 +40,8 @@ class OpenAICompatibleChatGenerator:
             if supports_tools is None
             else supports_tools
         )
+        self._stream_lock = threading.Lock()
+        self._active_stream: object | None = None
 
     @property
     def supports_tools(self) -> bool:
@@ -96,6 +100,97 @@ class OpenAICompatibleChatGenerator:
         )  # type: ignore[call-overload]
         return LLMProviderResult(value=response, usage=_openai_response_usage(response))
 
+    def list_models(self) -> tuple[str, ...]:
+        """Return provider-advertised model ids through the configured client."""
+
+        response = self._client.models.list()
+        return tuple(str(model.id) for model in response.data)
+
+    def stream_with_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        **kwargs: object,
+    ) -> Iterator[dict[str, object]]:
+        """Translate the OpenAI-compatible SSE stream into gateway chunks."""
+
+        stream = self._client.chat.completions.create(
+            model=self.chat_model_name,
+            messages=messages,
+            tools=tools or None,
+            stream=True,
+            **kwargs,
+        )  # type: ignore[call-overload]
+        with self._stream_lock:
+            self._active_stream = stream
+        tool_blocks: dict[int, tuple[str, str]] = {}
+        authoritative_stop = False
+        try:
+            for response_chunk in stream:
+                choices = response_chunk.choices
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.delta
+                content = getattr(delta, "content", None)
+                if content:
+                    yield {"type": "text_delta", "content": str(content)}
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield {"type": "thinking_delta", "content": str(reasoning)}
+                plan = getattr(delta, "plan", None)
+                if plan:
+                    yield {"type": "plan_delta", "content": str(plan)}
+                for tool_call in getattr(delta, "tool_calls", None) or ():
+                    index = int(tool_call.index)
+                    function = tool_call.function
+                    if index not in tool_blocks:
+                        tool_id = str(tool_call.id or f"tool-{index}")
+                        tool_name = str(function.name or "")
+                        tool_blocks[index] = (tool_id, tool_name)
+                        yield {
+                            "type": "tool_use_start",
+                            "tool_name": tool_name,
+                            "tool_id": tool_id,
+                        }
+                    if function.arguments:
+                        tool_id, _tool_name = tool_blocks[index]
+                        yield {
+                            "type": "tool_input_delta",
+                            "content": str(function.arguments),
+                            "tool_id": tool_id,
+                        }
+                finish_reason = choice.finish_reason
+                if finish_reason is not None:
+                    for _index in sorted(tool_blocks):
+                        tool_id, _tool_name = tool_blocks[_index]
+                        yield {"type": "content_block_stop", "tool_id": tool_id}
+                    yield {
+                        "type": "message_stop",
+                        "stop_reason": _stream_stop_reason(str(finish_reason)),
+                        "usage": _openai_response_usage(response_chunk),
+                    }
+                    authoritative_stop = True
+            if not authoritative_stop:
+                raise RuntimeError("OpenAI-compatible stream ended without a finish reason")
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+            with self._stream_lock:
+                if self._active_stream is stream:
+                    self._active_stream = None
+
+    def cancel_stream(self) -> None:
+        """Best-effort cancellation hook used by the gateway's async bridge."""
+
+        with self._stream_lock:
+            stream = self._active_stream
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+
     def __repr__(self) -> str:
         return f"OpenAICompatibleChatGenerator(model={self.chat_model_name!r}, base_url={self._base_url!r})"
 
@@ -120,6 +215,14 @@ def _openai_response_usage(response: object) -> LLMUsage | None:
     usage = getattr(response, "usage", None)
     details = getattr(usage, "completion_tokens_details", None)
     return normalized.model_copy(update={"reasoning_tokens": int(getattr(details, "reasoning_tokens", 0) or 0)})
+
+
+def _stream_stop_reason(value: str) -> str:
+    if value == "tool_calls":
+        return "tool_use"
+    if value == "length":
+        return "max_tokens"
+    return "end_turn"
 
 
 __all__ = ["OpenAICompatibleChatGenerator"]
