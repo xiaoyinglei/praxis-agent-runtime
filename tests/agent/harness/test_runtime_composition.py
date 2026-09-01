@@ -20,7 +20,7 @@ from agent_runtime.harness import (
 
 
 class PlainModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "test-model", "model_revision": "test-model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:

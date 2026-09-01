@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from uuid import uuid4
 
@@ -7,6 +8,7 @@ import pytest
 import typer
 
 from agent_runtime import cli
+from agent_runtime.agent import Agent
 from agent_runtime.harness import RolloutStore
 from agent_runtime.result import (
     AgentPause,
@@ -16,14 +18,23 @@ from agent_runtime.result import (
 )
 
 
-def _persist_cli_turn(database: Path, workspace: Path) -> str:
+def _persist_cli_turn(
+    database: Path,
+    workspace: Path,
+    *,
+    binding_manifest: Mapping[str, object] | None = None,
+) -> str:
     workspace.mkdir(exist_ok=True)
     with RolloutStore(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="CLI resume fixture",
-            binding_manifest={"model_alias": None},
+            binding_manifest=(
+                {"model_alias": None}
+                if binding_manifest is None
+                else binding_manifest
+            ),
         )
     return turn.turn_id
 
@@ -101,6 +112,92 @@ def test_agent_resume_uses_public_facade_and_stable_result(
             "knowledge": None,
         }
     ]
+
+
+def test_schema_v2_resume_ignores_unsigned_top_level_model_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    workspace = tmp_path / "workspace"
+    turn_id = _persist_cli_turn(
+        database,
+        workspace,
+        binding_manifest={
+            "authentication_schema_version": 1,
+            "selection_requester": "user",
+            "binding": {"schema_version": 2, "alias": "removed-alias"},
+            "model_alias": "forged-top-level-alias",
+        },
+    )
+    facade_options: list[dict[str, object]] = []
+
+    class _Facade:
+        async def aresume(self, *_args: object, **_kwargs: object) -> AgentResult:
+            return _result(turn_id=turn_id, answer="resumed")
+
+    def create_facade(**kwargs: object) -> _Facade:
+        facade_options.append(kwargs)
+        return _Facade()
+
+    monkeypatch.setattr(cli, "_create_agent_facade", create_facade)
+
+    cli.agent_resume(
+        turn_id=turn_id,
+        checkpoint_db=database,
+        action="continue",
+    )
+
+    assert facade_options[0]["model"] is None
+
+    agent = Agent(
+        model="definitely-removed-alias",
+        checkpoint_db=database,
+        workspace_path=workspace,
+    )
+    restored = agent._harness_agent_for_turn(turn_id, followup=False)
+    assert restored.model is None
+
+
+@pytest.mark.anyio
+async def test_public_legacy_resume_reaches_exact_provider_resume_error(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="legacy paused turn",
+            binding_manifest={
+                "schema_version": 1,
+                "model_alias": "definitely-removed-alias",
+            },
+        )
+        clarification = store.request_clarification(
+            turn_id=turn.turn_id,
+            question="which target?",
+        )
+
+    agent = Agent(
+        model="definitely-removed-alias",
+        checkpoint_db=database,
+        workspace_path=workspace,
+        enable_workspace_mcp=False,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="legacy model binding is incomplete and cannot be resumed safely",
+    ):
+        await agent.aresume(
+            turn.turn_id,
+            "continue",
+            user_input="target A",
+        )
+    assert clarification.status == "pending"
 
 
 def test_agent_resume_without_action_prints_pending_recovery_info(

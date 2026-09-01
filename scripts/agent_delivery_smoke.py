@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,11 +69,23 @@ class _SmokeModel:
     def __init__(self, case: SmokeCase) -> None:
         self.case = case
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
             "model_alias": f"smoke-{self.case.name}",
             "model_revision": "public-harness-smoke-v1",
         }
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("smoke binding belongs to a different Turn")
+        if binding.get("model_alias") != f"smoke-{self.case.name}":
+            raise RuntimeError("smoke model alias changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(

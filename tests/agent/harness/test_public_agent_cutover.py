@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -25,11 +26,23 @@ from agent_runtime.streaming.sink import TurnEventDispatcher
 
 
 class PublicHarnessModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
             "model_alias": "public-harness-model",
             "model_revision": "public-harness-v1",
         }
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("public harness binding belongs to a different Turn")
+        if binding.get("model_revision") != "public-harness-v1":
+            raise RuntimeError("public harness binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"{request.turn_id}:{request.step}".encode()).hexdigest()
@@ -222,11 +235,23 @@ async def test_public_followup_restores_disabled_workspace_mcp_from_runtime_bind
 
 
 class PatchThenAnswerModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
             "model_alias": "patch-model",
             "model_revision": "patch-model-v1",
         }
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("patch-model binding belongs to a different Turn")
+        if binding.get("model_revision") != "patch-model-v1":
+            raise RuntimeError("patch-model binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"step:{request.step}".encode()).hexdigest()

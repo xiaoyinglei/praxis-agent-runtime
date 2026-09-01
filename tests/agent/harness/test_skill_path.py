@@ -43,8 +43,20 @@ class FakeSkillRuntime:
 
 
 class SkillAssetModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "skill-model", "model_revision": "v1"}
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("skill-model binding belongs to a different Turn")
+        if binding.get("model_revision") != "v1":
+            raise RuntimeError("skill-model binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         invoke_skill = next(

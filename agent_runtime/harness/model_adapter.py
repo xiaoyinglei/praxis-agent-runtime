@@ -5,10 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, cast
 
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import ModelMessage, StopReason
@@ -44,7 +43,8 @@ from agent_runtime.modeling.gateway import (
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request
-from agent_runtime.models import ModelControlPlane, ModelSpec
+from agent_runtime.models import ModelControlPlane
+from agent_runtime.tools.tool import JsonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,28 +275,37 @@ class ControlPlaneHarnessModel:
         self._control_plane = control_plane
         self._instructions = instructions
 
-    def snapshot(self) -> dict[str, Any]:
-        spec = self._control_plane.current_model()
-        catalog_revision = _catalog_revision(self._control_plane)
-        policy_revision = _hash_json(asdict(self._control_plane.policy))
-        selected = _model_spec_payload(spec)
-        return {
-            "schema_version": 1,
-            "model_alias": spec.id,
-            "provider": spec.provider,
-            "provider_model": spec.provider_model,
-            "model_catalog_revision": catalog_revision,
-            "model_policy_revision": policy_revision,
-            "model_binding_revision": _hash_json(selected),
-        }
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, JsonValue]:
+        return self._control_plane.freeze_model_binding(
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
 
-    def ensure_available(self, binding: Mapping[str, Any]) -> None:
-        self._resolve_frozen(binding)
+    def ensure_available(
+        self,
+        binding: Mapping[str, Any],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        model_binding = _authenticated_model_binding(binding)
+        self._resolve_frozen(
+            model_binding,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        binding = request.binding_manifest
-        resolved = self._resolve_frozen(binding)
-        alias = binding["model_alias"]
+        binding = _authenticated_model_binding(request.binding_manifest)
+        resolved = self._resolve_frozen(
+            binding,
+            thread_id=request.thread_id,
+            turn_id=request.turn_id,
+        )
+        envelope = binding["binding"]
+        if not isinstance(envelope, Mapping):
+            raise RuntimeError("validated model binding envelope changed type")
+        alias = envelope["alias"]
         if not isinstance(alias, str):
             raise RuntimeError("validated model alias changed type")
         return GatewayHarnessModel(
@@ -305,20 +314,18 @@ class ControlPlaneHarnessModel:
             instructions=self._instructions,
         ).prepare(request)
 
-    def _resolve_frozen(self, binding: Mapping[str, Any]) -> ResolvedModel:
-        alias = binding.get("model_alias")
-        if not isinstance(alias, str) or not alias:
-            raise ValueError("Turn binding is missing model_alias")
-        if binding.get("model_catalog_revision") != _catalog_revision(self._control_plane):
-            raise RuntimeError("frozen model catalog revision is unavailable")
-        spec = self._control_plane.catalog.get(alias)
-        expected_revision = binding.get("model_binding_revision")
-        if expected_revision != _hash_json(_model_spec_payload(spec)):
-            raise RuntimeError("frozen model binding revision no longer resolves")
-        resolved = self._control_plane.resolve(alias)
-        if resolved.model != binding.get("provider_model") or resolved.provider != binding.get("provider"):
-            raise RuntimeError("resolved provider identity differs from frozen binding")
-        return resolved
+    def _resolve_frozen(
+        self,
+        binding: Mapping[str, JsonValue],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> ResolvedModel:
+        return self._control_plane.resolve_frozen_binding(
+            binding,
+            thread_id=thread_id,
+            turn_id=turn_id,
+        )
 
     async def dispatch(
         self,
@@ -336,29 +343,36 @@ class ControlPlaneHarnessModel:
         ).dispatch(prepared, delta_sink=delta_sink)
 
 
-def _catalog_revision(control_plane: ModelControlPlane) -> str:
-    return _hash_json([_model_spec_payload(spec) for spec in control_plane.list_models()])
+_AUTHENTICATED_MODEL_BINDING_FIELDS = frozenset(
+    {
+        "authentication_schema_version",
+        "trust_domain_id",
+        "signing_key_id",
+        "thread_id",
+        "turn_id",
+        "selection_requester",
+        "binding",
+        "signature",
+    }
+)
 
 
-def _model_spec_payload(spec: ModelSpec) -> dict[str, Any]:
-    return asdict(spec)
-
-
-def _hash_json(value: object) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            value,
-            sort_keys=True,
-            separators=(",", ":"),
-            default=_json_default,
-        ).encode()
-    ).hexdigest()
-
-
-def _json_default(value: object) -> object:
-    if isinstance(value, (frozenset, set)):
-        return sorted(value)
-    raise TypeError(f"unsupported revision value: {type(value).__name__}")
+def _authenticated_model_binding(
+    manifest: Mapping[str, Any],
+) -> dict[str, JsonValue]:
+    if "authentication_schema_version" not in manifest:
+        raise RuntimeError(
+            "legacy model binding is incomplete and cannot be resumed safely"
+        )
+    missing = _AUTHENTICATED_MODEL_BINDING_FIELDS.difference(manifest)
+    if missing:
+        raise ValueError(
+            "Turn binding is missing authenticated model fields: " + ", ".join(sorted(missing))
+        )
+    return cast(
+        dict[str, JsonValue],
+        {key: manifest[key] for key in _AUTHENTICATED_MODEL_BINDING_FIELDS},
+    )
 
 
 def _is_uncertain_transport_failure(error: BaseException) -> bool:

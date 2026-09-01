@@ -350,7 +350,7 @@ class ZeroDeltaToolThenAnswerModel:
     def __init__(self) -> None:
         self.dispatch_count = 0
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "test-model"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
@@ -481,6 +481,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
             )
             running = asyncio.create_task(
                 runner.run(
+                    turn_id="turn-cancel-blocked-provider",
                     user_message="cancel a blocked sync provider",
                     binding_manifest={"model_alias": "test-model"},
                 )
@@ -597,6 +598,7 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-answer-plainly",
                 user_message="answer plainly",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -642,6 +644,7 @@ def test_single_final_response_over_frozen_token_budget_fails_the_turn(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-over-token-budget",
                 user_message="stay within budget",
                 binding_manifest={
                     "model_alias": "test-model",
@@ -682,6 +685,7 @@ def test_model_preflight_rejection_fails_without_an_unknown_outcome(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-preflight-budget",
                 user_message="do not call above budget",
                 binding_manifest={
                     "model_alias": "test-model",
@@ -718,6 +722,7 @@ def test_incomplete_model_response_is_durable_failure_not_unknown(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-incomplete-response",
                 user_message="return a complete response",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -909,6 +914,7 @@ def test_provider_failure_leaves_durable_unknown_attempt_for_reconciliation(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-provider-unknown",
                 user_message="provider may fail",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -946,6 +952,7 @@ def test_known_model_rejection_fails_without_unknown_or_retry_state(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-provider-rejected",
                 user_message="do not retry a deterministic rejection",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -985,6 +992,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
         )
 
         result = await runner.run(
+            turn_id="turn-partial-failure",
             user_message="fail after partial channels",
             binding_manifest={"model_alias": "test-model"},
         )
@@ -1041,6 +1049,7 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
         )
 
         result = await runner.run(
+            turn_id="turn-cancel-acknowledged",
             user_message="cancel definitively",
             binding_manifest={"model_alias": "test-model"},
         )
@@ -1090,6 +1099,7 @@ def test_model_retry_uses_a_new_attempt_on_the_same_logical_operation(
         )
         paused = asyncio.run(
             runner.run(
+                turn_id="turn-retry-provider",
                 user_message="recover provider",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1133,6 +1143,7 @@ async def test_model_retry_uses_new_attempt_and_public_item_ids(
         )
 
         paused = await runner.run(
+            turn_id="turn-retry-streaming",
             user_message="retry uncertain streaming output",
             binding_manifest={"model_alias": "test-model"},
         )
@@ -1195,6 +1206,7 @@ def test_completion_gate_continue_feeds_the_gap_back_into_the_same_turn(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-completion-feedback",
                 user_message="finish with evidence",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1231,6 +1243,7 @@ def test_completion_gate_pause_creates_a_durable_clarification(tmp_path: Path) -
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-clarification-pause",
                 user_message="ambiguous task",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1264,6 +1277,7 @@ def test_completion_gate_fail_releases_the_thread_without_an_agent_answer(
 
         result = asyncio.run(
             runner.run(
+                turn_id="turn-completion-fail",
                 user_message="unsafe completion",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1295,6 +1309,7 @@ def test_clarification_response_resumes_the_same_turn_without_granting_permissio
         )
         paused = asyncio.run(
             runner.run(
+                turn_id="turn-clarification-resume",
                 user_message="answer the ambiguous task",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1341,6 +1356,7 @@ def test_repeated_identical_clarification_response_returns_the_completed_turn(
         )
         paused = asyncio.run(
             runner.run(
+                turn_id="turn-clarification-idempotent",
                 user_message="answer the ambiguous task",
                 binding_manifest={"model_alias": "test-model"},
             )
@@ -1386,6 +1402,7 @@ def test_conflicting_or_wrong_clarification_response_fails_before_model_io(
         )
         paused = asyncio.run(
             runner.run(
+                turn_id="turn-clarification-conflict",
                 user_message="answer the ambiguous task",
                 binding_manifest={"model_alias": "test-model"},
             )

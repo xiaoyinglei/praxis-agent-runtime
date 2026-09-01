@@ -811,7 +811,7 @@ class ToolThenAnswerModel:
     def __init__(self) -> None:
         self.requests: list[HarnessModelRequest] = []
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "tool-model", "model_revision": "tool-model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:

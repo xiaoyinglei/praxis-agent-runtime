@@ -126,6 +126,7 @@ class Session:
     async def run(
         self,
         *,
+        turn_id: str,
         user_message: str,
         binding_manifest: Mapping[str, Any],
         input_files: tuple[Mapping[str, Any], ...] = (),
@@ -133,6 +134,7 @@ class Session:
         turn = await self._commit(
             lambda: self._store.start_turn(
                 thread_id=self.thread_id,
+                turn_id=turn_id,
                 user_message=user_message,
                 binding_manifest=binding_manifest,
                 input_files=input_files,

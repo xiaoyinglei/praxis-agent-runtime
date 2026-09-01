@@ -88,8 +88,23 @@ class _CompositionBindingProvider:
         self._model_step_budget = model_step_budget
         self._model_token_budget_total = model_token_budget_total
 
-    def snapshot(self) -> Mapping[str, object]:
-        binding = dict(self._model.snapshot())
+    def snapshot(self, *, thread_id: str, turn_id: str) -> Mapping[str, object]:
+        binding = dict(
+            self._model.snapshot(
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        )
+        for field_name, expected in (("thread_id", thread_id), ("turn_id", turn_id)):
+            observed = binding.get(field_name)
+            if observed is not None and observed != expected:
+                raise RuntimeError(f"model binding returned the wrong {field_name}")
+            binding[field_name] = expected
+        binding.update(self._static_snapshot())
+        return binding
+
+    def _static_snapshot(self) -> dict[str, object]:
+        binding: dict[str, object] = {}
         binding["toolset_revision"] = toolset_revision_for_tools(self._tools)
         binding["tool_execution_revisions"] = {tool.definition.name: tool.execution_revision for tool in self._tools}
         binding["tool_execution_policy"] = self._tool_execution_policy
@@ -102,15 +117,30 @@ class _CompositionBindingProvider:
             binding["knowledge_config"] = self._knowledge_config
         return binding
 
-    def ensure_available(self, binding: Mapping[str, object]) -> None:
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        stored_thread_id = binding.get("thread_id")
+        stored_turn_id = binding.get("turn_id")
+        if (
+            stored_thread_id is not None
+            or stored_turn_id is not None
+        ) and (stored_thread_id != thread_id or stored_turn_id != turn_id):
+            raise RuntimeError("frozen runtime binding belongs to a different Turn")
         model_validator = getattr(self._model, "ensure_available", None)
         if callable(model_validator):
-            model_validator(binding)
+            model_validator(
+                binding,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
         else:
-            for key, value in self._model.snapshot().items():
-                if binding.get(key) != value:
-                    raise RuntimeError(f"frozen runtime binding is unavailable: {key} changed")
-        current = self.snapshot()
+            raise RuntimeError("bound model cannot validate frozen bindings")
+        current = self._static_snapshot()
         for key in (
             "toolset_revision",
             "tool_execution_revisions",

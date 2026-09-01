@@ -55,10 +55,16 @@ class AcceptPlainAnswer:
 class RotatingBindingProvider:
     def __init__(self) -> None:
         self.revision = 0
+        self.identities: list[tuple[str, str]] = []
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         self.revision += 1
-        return {"model_alias": f"model-v{self.revision}"}
+        self.identities.append((thread_id, turn_id))
+        return {
+            "model_alias": f"model-v{self.revision}",
+            "thread_id": thread_id,
+            "turn_id": turn_id,
+        }
 
 
 class RecoveryEntryRunner:
@@ -117,6 +123,10 @@ def test_thread_manager_creates_thread_and_reuses_it_for_followup(tmp_path: Path
         assert second.thread_id == first.thread_id
         assert opened_sessions == [first.thread_id]
         assert second.turn_id != first.turn_id
+        assert bindings.identities == [
+            (first.thread_id, first.turn_id),
+            (second.thread_id, second.turn_id),
+        ]
         assert [(message.role, message.content) for message in model.requests[1].messages] == [
             ("user", "first"),
             ("assistant", "answer-1"),
@@ -145,13 +155,15 @@ def test_public_recovery_entries_validate_frozen_binding_before_runner_io(
             question="which target?",
         )
         runner = RecoveryEntryRunner(thread.thread_id)
-        validated: list[dict[str, object]] = []
+        validated: list[tuple[dict[str, object], str, str]] = []
         manager = ThreadManager(
             store=store,
             session_factory=lambda _thread_id: runner,  # type: ignore[return-value]
             workspace=workspace,
             binding_provider=RotatingBindingProvider(),
-            binding_validator=lambda binding: validated.append(dict(binding)),
+            binding_validator=lambda binding, *, thread_id, turn_id: validated.append(
+                (dict(binding), thread_id, turn_id)
+            ),
         )
         agent = HarnessAgent(manager)
 
@@ -169,8 +181,8 @@ def test_public_recovery_entries_validate_frozen_binding_before_runner_io(
             ("retry", turn.turn_id),
         ]
         assert validated == [
-            {"model_alias": "model-v1"},
-            {"model_alias": "model-v1"},
+            ({"model_alias": "model-v1"}, thread.thread_id, turn.turn_id),
+            ({"model_alias": "model-v1"}, thread.thread_id, turn.turn_id),
         ]
 
 
@@ -196,7 +208,9 @@ def test_interrupted_turn_can_be_cancelled_without_restoring_legacy_binding(
             session_factory=lambda thread_id: RecoveryEntryRunner(thread_id),  # type: ignore[return-value]
             workspace=workspace,
             binding_provider=RotatingBindingProvider(),
-            binding_validator=lambda _binding: (_ for _ in ()).throw(RuntimeError("legacy binding unavailable")),
+            binding_validator=lambda _binding, **_identity: (_ for _ in ()).throw(
+                RuntimeError("legacy binding unavailable")
+            ),
         )
 
         result = manager.cancel(turn_id=turn.turn_id)
@@ -264,6 +278,7 @@ def test_previous_turn_compatibility_forks_when_predecessor_is_not_head(
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         model = EchoHistoryModel()
+        bindings = RotatingBindingProvider()
         manager = ThreadManager(
             store=store,
             session_factory=lambda thread_id: Session(
@@ -274,7 +289,7 @@ def test_previous_turn_compatibility_forks_when_predecessor_is_not_head(
                 completion_gate=AcceptPlainAnswer(),
             ),
             workspace=workspace,
-            binding_provider=RotatingBindingProvider(),
+            binding_provider=bindings,
         )
         first = asyncio.run(manager.run(user_message="first"))
         second = asyncio.run(manager.run(thread_id=first.thread_id, user_message="second"))
@@ -287,6 +302,7 @@ def test_previous_turn_compatibility_forks_when_predecessor_is_not_head(
         )
 
         assert branch.thread_id != first.thread_id
+        assert bindings.identities[-1] == (branch.thread_id, branch.turn_id)
         assert store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
         assert [(message.role, message.content) for message in model.requests[2].messages] == [
             ("user", "first"),
@@ -294,3 +310,38 @@ def test_previous_turn_compatibility_forks_when_predecessor_is_not_head(
             ("user", "branch"),
         ]
         assert store.read_thread(first.thread_id).head_turn_id == second.turn_id
+
+
+def test_child_turn_uses_one_identity_for_binding_and_durable_start(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        model = EchoHistoryModel()
+        bindings = RotatingBindingProvider()
+        manager = ThreadManager(
+            store=store,
+            session_factory=lambda thread_id: Session(
+                thread_id=thread_id,
+                store=store,
+                model=model,
+                context_manager=RolloutContextManager(store),
+                completion_gate=AcceptPlainAnswer(),
+            ),
+            workspace=workspace,
+            binding_provider=bindings,
+        )
+
+        child = asyncio.run(
+            manager.run_child(
+                user_message="isolated child",
+                max_steps=2,
+                max_tokens_total=100,
+            )
+        )
+
+        assert bindings.identities == [(child.thread_id, child.turn_id)]
+        binding = store.read_turn(child.turn_id).binding_manifest
+        assert binding["thread_id"] == child.thread_id
+        assert binding["turn_id"] == child.turn_id

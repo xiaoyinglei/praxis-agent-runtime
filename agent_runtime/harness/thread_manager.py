@@ -5,8 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
-from agent_runtime.harness.protocol import BindingProvider, TurnResult
+from agent_runtime.harness.protocol import BindingProvider, BindingValidator, TurnResult
 from agent_runtime.harness.rollout import RolloutStore, TurnSnapshot
 from agent_runtime.harness.session import Session
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -20,7 +21,7 @@ class ThreadManager:
         session_factory: Callable[[str], Session],
         workspace: Path,
         binding_provider: BindingProvider,
-        binding_validator: Callable[[Mapping[str, Any]], None] | None = None,
+        binding_validator: BindingValidator | None = None,
         event_dispatcher: TurnEventDispatcher | None = None,
     ) -> None:
         resolved_workspace = Path(workspace).resolve()
@@ -63,12 +64,17 @@ class ThreadManager:
             thread = self._store.read_thread(thread_id)
             if Path(thread.workspace) != self._workspace:
                 raise RuntimeError("thread belongs to a different workspace security domain")
+        turn_id = f"turn_{uuid4().hex}"
         return await self._session_for_thread(
             thread_id,
             event_dispatcher=event_dispatcher or self._event_dispatcher,
         ).run(
+            turn_id=turn_id,
             user_message=user_message,
-            binding_manifest=self._binding_provider.snapshot(),
+            binding_manifest=self._binding_provider.snapshot(
+                thread_id=thread_id,
+                turn_id=turn_id,
+            ),
             input_files=input_files,
         )
 
@@ -88,14 +94,21 @@ class ThreadManager:
     ) -> TurnResult:
         """Start an isolated child Thread with an explicitly narrowed budget."""
 
-        binding = dict(self._binding_provider.snapshot())
+        thread_id = self._store.create_thread(workspace=self._workspace).thread_id
+        turn_id = f"turn_{uuid4().hex}"
+        binding = dict(
+            self._binding_provider.snapshot(
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        )
         if max_steps is not None:
             binding["model_step_budget"] = max_steps
         if max_tokens_total is not None:
             binding["model_token_budget_total"] = max_tokens_total
         binding["completion_policy"] = {"require_workspace_change": False}
-        thread_id = self._store.create_thread(workspace=self._workspace).thread_id
         return await self._session_for_thread(thread_id).run(
+            turn_id=turn_id,
             user_message=user_message,
             binding_manifest=binding,
         )
@@ -165,7 +178,11 @@ class ThreadManager:
     def _validate_recovery_turn(self, turn_id: str) -> None:
         turn = self._validate_turn_workspace(turn_id)
         if self._binding_validator is not None:
-            self._binding_validator(turn.binding_manifest)
+            self._binding_validator(
+                turn.binding_manifest,
+                thread_id=turn.thread_id,
+                turn_id=turn.turn_id,
+            )
 
     def _session_for_turn(self, turn_id: str) -> Session:
         turn = self._store.read_turn(turn_id)

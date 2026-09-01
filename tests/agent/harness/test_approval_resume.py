@@ -42,9 +42,23 @@ from agent_runtime.tools.tool import (
 class WriteThenAnswerModel:
     def __init__(self) -> None:
         self.requests: list[HarnessModelRequest] = []
+        self.snapshot_calls = 0
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
+        self.snapshot_calls += 1
         return {"model_alias": "write-model", "model_revision": "write-model-v1"}
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("write-model binding belongs to a different Turn")
+        if binding.get("model_revision") != "write-model-v1":
+            raise RuntimeError("write-model binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         self.requests.append(request)
@@ -241,6 +255,7 @@ def test_approved_write_resumes_same_turn_without_regenerating_tool_call(
         assert resumed.thread_id == paused.thread_id
         assert resumed.status == "completed"
         assert resumed.answer == "file written"
+        assert model.snapshot_calls == 1
         assert runner_calls == ["approved.txt"]
         assert (workspace / "approved.txt").read_text(encoding="utf-8") == ("approved content")
         assert len(model.requests) == 2

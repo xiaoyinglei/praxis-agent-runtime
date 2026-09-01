@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 
 from agent_runtime.harness import (
@@ -20,8 +21,20 @@ class ParentChildModel:
     def __init__(self) -> None:
         self.requests: list[HarnessModelRequest] = []
 
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "parent-child-model", "model_revision": "v1"}
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("parent-child binding belongs to a different Turn")
+        if binding.get("model_revision") != "v1":
+            raise RuntimeError("parent-child binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         self.requests.append(request)

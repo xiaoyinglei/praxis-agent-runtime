@@ -117,7 +117,7 @@ class AcceptRecoveredAnswer:
 
 
 class FrozenBinding:
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, object]:
         return {"model_alias": "model-v1", "model_step_budget": 2}
 
 

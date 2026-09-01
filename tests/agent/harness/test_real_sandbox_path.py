@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -23,8 +24,20 @@ from agent_runtime.workspace import open_workspace
 
 
 class SandboxCommandModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "sandbox-model", "model_revision": "sandbox-v1"}
+
+    def ensure_available(
+        self,
+        binding: Mapping[str, object],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> None:
+        if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
+            raise RuntimeError("sandbox binding belongs to a different Turn")
+        if binding.get("model_revision") != "sandbox-v1":
+            raise RuntimeError("sandbox binding revision changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"step:{request.step}".encode()).hexdigest()

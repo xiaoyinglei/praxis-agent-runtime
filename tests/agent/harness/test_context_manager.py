@@ -160,6 +160,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
             context_manager=RolloutContextManager(store, max_item_bytes=100),
             completion_gate=Accept(),
         ).run(
+            turn_id="turn-context-budget",
             user_message="x" * 200,
             binding_manifest={"model_step_budget": 1},
         )

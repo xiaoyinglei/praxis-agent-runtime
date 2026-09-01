@@ -980,7 +980,11 @@ def _latest_harness_turn(
 
 def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
-    alias = turn.binding_manifest.get("model_alias")
+    alias = (
+        None
+        if "authentication_schema_version" in turn.binding_manifest
+        else turn.binding_manifest.get("model_alias")
+    )
     knowledge_value = turn.binding_manifest.get("knowledge_config")
     knowledge = (
         RAGKnowledgeConfig.model_validate(knowledge_value)
@@ -1306,7 +1310,7 @@ def agent_resume(
         raise typer.BadParameter("--input 需要同时指定 --action")
     turn_metadata = _cli_turn(checkpoint_db, effective_turn_id)
     facade = _create_agent_facade(
-        model=turn_metadata.runtime.model_alias,
+        model=None,
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,

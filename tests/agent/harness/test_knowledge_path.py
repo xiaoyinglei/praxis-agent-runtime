@@ -23,7 +23,7 @@ from agent_runtime.tools.permissions import ToolExecutionContext
 
 
 class KnowledgeModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "knowledge-model", "model_revision": "model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:

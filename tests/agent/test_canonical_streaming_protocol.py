@@ -412,7 +412,7 @@ def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) 
 
 
 class _StaticHarnessModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "stream-test", "model_revision": "v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:

@@ -53,7 +53,7 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
 
 
 class PublicAnswerModel:
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {"model_alias": "public-model", "model_revision": "public-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:

@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
 
-from agent_runtime.core.llm_registry import ResolvedModel
+from agent_runtime.core.llm_config import (
+    AgentModelsConfig,
+    ModelProvider,
+)
+from agent_runtime.core.llm_config import (
+    ModelSpec as InternalModelSpec,
+)
+from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -21,6 +28,11 @@ from agent_runtime.harness import (
     RolloutContextManager,
     RolloutStore,
     RuntimeComposition,
+)
+from agent_runtime.model_trust import (
+    BindingAuthenticationError,
+    ModelBindingTrustDomain,
+    TrustedModelDefinitionArchive,
 )
 from agent_runtime.modeling.contracts import (
     LLMCallStage,
@@ -176,7 +188,7 @@ class NonStreamingProvider:
 
 
 class BoundGatewayHarnessModel(GatewayHarnessModel):
-    def snapshot(self) -> dict[str, str]:
+    def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
             "model_alias": "test-model",
             "model_revision": "native-delta-v1",
@@ -809,6 +821,10 @@ class ResolvedRegistry:
     def resolve(self, alias: str) -> ResolvedModel:
         return self._models[alias]
 
+    def resolve_definition(self, definition: object) -> ResolvedModel:
+        model_id = definition.model
+        return next(model for model in self._models.values() if model.model == model_id)
+
 
 def _spec(model_id: str) -> ModelSpec:
     return ModelSpec(
@@ -819,6 +835,22 @@ def _spec(model_id: str) -> ModelSpec:
         supports_tools=True,
         supports_structured_output=False,
         location="cloud",
+    )
+
+
+def _declarations(alias: str, provider_model: str) -> ModelRegistry:
+    return ModelRegistry(
+        AgentModelsConfig(
+            models={
+                alias: InternalModelSpec(
+                    provider=ModelProvider.OPENAI_COMPATIBLE,
+                    model=provider_model,
+                    base_url="https://api.example.com/v1",
+                    location="cloud",
+                )
+            },
+            default_model=alias,
+        )
     )
 
 
@@ -841,22 +873,46 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
             model="provider-model-b",
         ),
     }
-    control_plane = ModelControlPlane(
-        catalog=ModelCatalog(
-            specs={model_id: _spec(model_id) for model_id in resolved},
-            default_model_id="model-a",
-        ),
-        state=ModelSessionState(current_model_id="model-a"),
-        registry=ResolvedRegistry(resolved),
-    )
+    class FrozenControlPlane:
+        def __init__(self) -> None:
+            self.current = "model-a"
+
+        def freeze_model_binding(self, *, thread_id: str, turn_id: str) -> dict[str, object]:
+            return {
+                "authentication_schema_version": 1,
+                "trust_domain_id": "domain",
+                "signing_key_id": "key",
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "selection_requester": "user",
+                "binding": {"alias": self.current},
+                "signature": "signature",
+            }
+
+        def resolve_frozen_binding(
+            self,
+            binding: Mapping[str, object],
+            *,
+            thread_id: str,
+            turn_id: str,
+        ) -> ResolvedModel:
+            assert binding["thread_id"] == thread_id
+            assert binding["turn_id"] == turn_id
+            envelope = binding["binding"]
+            assert isinstance(envelope, Mapping)
+            alias = envelope["alias"]
+            assert isinstance(alias, str)
+            return resolved[alias]
+
+    control_plane = FrozenControlPlane()
     model = ControlPlaneHarnessModel(
-        control_plane=control_plane,
+        control_plane=control_plane,  # type: ignore[arg-type]
         instructions=("Answer the user directly.",),
     )
-    frozen = model.snapshot()
-    control_plane.switch_model("model-b", requested_by="user", persist=False)
+    frozen = model.snapshot(thread_id="thread-1", turn_id="turn-1")
+    control_plane.current = "model-b"
 
-    model.ensure_available(frozen)
+    model.ensure_available(frozen, thread_id="thread-1", turn_id="turn-1")
 
     prepared = model.prepare(
         HarnessModelRequest(
@@ -868,10 +924,104 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
     )
     asyncio.run(model.dispatch(prepared))
 
-    assert frozen["model_alias"] == "model-a"
-    assert isinstance(frozen["model_catalog_revision"], str)
+    envelope = frozen["binding"]
+    assert isinstance(envelope, Mapping)
+    assert envelope["alias"] == "model-a"
     assert len(first_gateway.requests) == 1
     assert second_gateway.requests == []
+
+
+def test_legacy_binding_replays_but_provider_resume_fails_closed(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            turn_id="turn-legacy",
+            user_message="legacy history",
+            binding_manifest={"schema_version": 1, "model_alias": "legacy-model"},
+        )
+        store.complete_turn(turn_id=turn.turn_id, answer="durable legacy answer")
+
+        assert store.read_turn(turn.turn_id).binding_manifest["model_alias"] == "legacy-model"
+        assert store.verify().valid is True
+
+        model = ControlPlaneHarnessModel(
+            control_plane=object(),  # type: ignore[arg-type]
+            instructions=("Answer directly.",),
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="legacy model binding is incomplete and cannot be resumed safely",
+        ):
+            model.ensure_available(
+                store.read_turn(turn.turn_id).binding_manifest,
+                thread_id=thread.thread_id,
+                turn_id=turn.turn_id,
+            )
+
+
+def test_authenticated_turn_resolves_after_selected_alias_is_removed(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir()
+    trusted_root.mkdir(mode=0o700)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    archive = TrustedModelDefinitionArchive(
+        trusted_root / "model-definitions",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    frozen_gateway = CapturingGateway()
+    frozen_resolved = ResolvedModel(
+        generator=object(),
+        kwargs={"max_tokens": 256},
+        gateway=frozen_gateway,
+        provider="openai-compatible",
+        model="provider-model-a",
+    )
+    original = ModelControlPlane(
+        catalog=ModelCatalog.from_registry(_declarations("model-a", "provider-model-a")),
+        state=ModelSessionState(current_model_id="model-a", selection_requester="user"),
+        registry=ResolvedRegistry({"model-a": frozen_resolved}),
+        trust_domain=trust,
+        definition_archive=archive,
+    )
+    binding = original.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+    current = ModelControlPlane(
+        catalog=ModelCatalog.from_registry(_declarations("model-b", "provider-model-b")),
+        state=ModelSessionState(current_model_id="model-b", selection_requester="user"),
+        registry=ResolvedRegistry({"model-a": frozen_resolved}),
+        trust_domain=trust,
+        definition_archive=archive,
+    )
+    model = ControlPlaneHarnessModel(
+        control_plane=current,
+        instructions=("Answer directly.",),
+    )
+
+    model.ensure_available(binding, thread_id="thread-1", turn_id="turn-1")
+    with pytest.raises(BindingAuthenticationError, match="different Turn"):
+        model.ensure_available(binding, thread_id="thread-2", turn_id="turn-2")
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            messages=(HarnessMessage(role="user", content="resume"),),
+            binding_manifest=binding,
+        )
+    )
+    asyncio.run(model.dispatch(prepared))
+
+    assert len(frozen_gateway.requests) == 1
 
 
 class AcceptAnswer:
@@ -891,6 +1041,14 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    trusted_root = tmp_path / "trusted"
+    trusted_root.mkdir(mode=0o700)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
     gateway = CapturingGateway()
     resolved = ResolvedModel(
         generator=object(),
@@ -899,13 +1057,29 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
         provider="openai-compatible",
         model="provider-model-a",
     )
+    declarations = ModelRegistry(
+        AgentModelsConfig(
+            models={
+                "model-a": InternalModelSpec(
+                    provider=ModelProvider.OPENAI_COMPATIBLE,
+                    model="provider-model-a",
+                    base_url="https://api.example.com/v1",
+                    location="cloud",
+                )
+            },
+            default_model="model-a",
+        )
+    )
     control_plane = ModelControlPlane(
-        catalog=ModelCatalog(
-            specs={"model-a": _spec("model-a")},
-            default_model_id="model-a",
-        ),
+        catalog=ModelCatalog.from_registry(declarations),
         state=ModelSessionState(current_model_id="model-a"),
         registry=ResolvedRegistry({"model-a": resolved}),
+        trust_domain=trust,
+        definition_archive=TrustedModelDefinitionArchive(
+            trusted_root / "model-definitions",
+            workspace=workspace,
+            worktree=workspace,
+        ),
     )
     model = ControlPlaneHarnessModel(
         control_plane=control_plane,
@@ -923,5 +1097,17 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
         assert result.answer == "real gateway answer"
         assert len(gateway.requests) == 1
         turn = runtime.store.read_turn(result.turn_id)
-        assert turn.binding_manifest["model_alias"] == "model-a"
+        model_binding = turn.binding_manifest["binding"]
+        assert isinstance(model_binding, Mapping)
+        assert model_binding["alias"] == "model-a"
+        tampered = dict(turn.binding_manifest)
+        tampered_envelope = dict(model_binding)
+        tampered_envelope["alias"] = "substituted-model"
+        tampered["binding"] = tampered_envelope
+        with pytest.raises(BindingAuthenticationError):
+            model.ensure_available(
+                tampered,
+                thread_id=turn.thread_id,
+                turn_id=turn.turn_id,
+            )
         assert runtime.store.verify().valid is True

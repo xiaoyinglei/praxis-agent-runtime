@@ -456,19 +456,24 @@ class Agent:
         with RolloutStore(self._harness_database()) as store:
             turn = store.read_turn(turn_id)
             thread = store.read_thread(turn.thread_id)
-            alias = turn.binding_manifest.get("model_alias")
+            alias = (
+                None
+                if "authentication_schema_version" in turn.binding_manifest
+                else turn.binding_manifest.get("model_alias")
+            )
             knowledge_value = turn.binding_manifest.get("knowledge_config")
             mcp_policy = turn.binding_manifest.get("mcp_policy")
         frozen_knowledge = (
             RAGKnowledgeConfig.model_validate(knowledge_value) if isinstance(knowledge_value, Mapping) else None
         )
-        model = (
-            self._followup_model_id
-            if followup and self._followup_model_id is not None
-            else alias
-            if isinstance(alias, str) and alias
-            else self.model
-        )
+        if not followup:
+            model = None
+        elif self._followup_model_id is not None:
+            model = self._followup_model_id
+        elif isinstance(alias, str) and alias:
+            model = alias
+        else:
+            model = self.model
         restored = Agent(
             model=model,
             checkpoint_db=self.checkpoint_db,
