@@ -122,7 +122,14 @@ class OpenAICompatibleChatGenerator:
             stream=True,
             **kwargs,
         )  # type: ignore[call-overload]
-        with self._stream_lock:
+        if _is_complete_chat_response(stream):
+            yield from _complete_response_chunks(stream)
+            return
+        stream_lock = getattr(self, "_stream_lock", None)
+        if stream_lock is None:
+            stream_lock = threading.Lock()
+            self._stream_lock = stream_lock
+        with stream_lock:
             self._active_stream = stream
         tool_blocks: dict[int, tuple[str, str]] = {}
         authoritative_stop = False
@@ -178,15 +185,18 @@ class OpenAICompatibleChatGenerator:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
-            with self._stream_lock:
+            with stream_lock:
                 if self._active_stream is stream:
                     self._active_stream = None
 
     def cancel_stream(self) -> None:
         """Best-effort cancellation hook used by the gateway's async bridge."""
 
-        with self._stream_lock:
-            stream = self._active_stream
+        stream_lock = getattr(self, "_stream_lock", None)
+        if stream_lock is None:
+            return
+        with stream_lock:
+            stream = getattr(self, "_active_stream", None)
         close = getattr(stream, "close", None)
         if callable(close):
             close()
@@ -223,6 +233,45 @@ def _stream_stop_reason(value: str) -> str:
     if value == "length":
         return "max_tokens"
     return "end_turn"
+
+
+def _is_complete_chat_response(value: object) -> bool:
+    choices = getattr(value, "choices", None)
+    return isinstance(choices, (list, tuple)) and bool(choices) and hasattr(choices[0], "message")
+
+
+def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
+    """Normalize providers that ignore stream=True and return one completion."""
+
+    choice = response.choices[0]  # type: ignore[attr-defined]
+    message = choice.message
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning:
+        yield {"type": "thinking_delta", "content": str(reasoning)}
+    content = getattr(message, "content", None)
+    if content:
+        yield {"type": "text_delta", "content": str(content)}
+    tool_calls = getattr(message, "tool_calls", None) or ()
+    for index, tool_call in enumerate(tool_calls):
+        tool_id = str(tool_call.id or f"tool-{index}")
+        function = tool_call.function
+        yield {
+            "type": "tool_use_start",
+            "tool_name": str(function.name or ""),
+            "tool_id": tool_id,
+        }
+        if function.arguments:
+            yield {
+                "type": "tool_input_delta",
+                "content": str(function.arguments),
+                "tool_id": tool_id,
+            }
+        yield {"type": "content_block_stop", "tool_id": tool_id}
+    yield {
+        "type": "message_stop",
+        "stop_reason": _stream_stop_reason(str(choice.finish_reason or "stop")),
+        "usage": _openai_response_usage(response),
+    }
 
 
 __all__ = ["OpenAICompatibleChatGenerator"]
