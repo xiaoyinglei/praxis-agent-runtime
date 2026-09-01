@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
 from rag.retrieval.models import QueryOptions, RetrievalProfile, normalize_retrieval_profile
@@ -146,7 +145,6 @@ class PlanningGraph:
         self._whitelist_threshold = whitelist_threshold
         self._attribute_value_cap = attribute_value_cap
         self._use_summary_hybrid_paths = use_summary_hybrid_paths
-        self._compiled_graph = self._build_graph()
 
     def plan(
         self,
@@ -183,7 +181,7 @@ class PlanningGraph:
         resolved_retrieval_profile: RetrievalProfile | str | None,
         query_options: QueryOptions | None,
     ) -> PlanningState:
-        state = await self._compiled_graph.ainvoke(
+        state: dict[str, Any] = dict(
             self._initial_state(
                 query=query,
                 source_scope=source_scope,
@@ -193,6 +191,14 @@ class PlanningGraph:
                 query_options=query_options,
             )
         )
+        state.update(await self._node_complexity_gate(state))
+        if state.get("complexity_gate") is ComplexityGate.COMPLEX:
+            state.update(await self._node_query_decompose(state))
+        state.update(await self._node_query_variants(state))
+        state.update(await self._node_semantic_route(state))
+        state.update(await self._node_version_gate(state))
+        state.update(await self._node_predicate_plan(state))
+        state.update(await self._node_execution_plan(state))
         retrieval_profile = state["retrieval_profile"]
         predicate_plan = state["predicate_plan"]
         complexity_gate = state["complexity_gate"]
@@ -220,32 +226,6 @@ class PlanningGraph:
             fusion_strategy=str(state["fusion_strategy"]),
             fusion_alpha=float(state["fusion_alpha"]),
         )
-
-    def _build_graph(self) -> Any:
-        graph: Any = StateGraph(_PlannerState)
-        graph.add_node("complexity_gate", self._node_complexity_gate)
-        graph.add_node("query_decompose", self._node_query_decompose)
-        graph.add_node("query_variants", self._node_query_variants)
-        graph.add_node("semantic_route", self._node_semantic_route)
-        graph.add_node("version_gate", self._node_version_gate)
-        graph.add_node("predicate_plan", self._node_predicate_plan)
-        graph.add_node("execution_plan", self._node_execution_plan)
-        graph.add_edge(START, "complexity_gate")
-        graph.add_conditional_edges(
-            "complexity_gate",
-            self._route_after_complexity_gate,
-            {
-                "decompose": "query_decompose",
-                "rewrite": "query_variants",
-            },
-        )
-        graph.add_edge("query_decompose", "query_variants")
-        graph.add_edge("query_variants", "semantic_route")
-        graph.add_edge("semantic_route", "version_gate")
-        graph.add_edge("version_gate", "predicate_plan")
-        graph.add_edge("predicate_plan", "execution_plan")
-        graph.add_edge("execution_plan", END)
-        return graph.compile(name="l3_planning_graph")
 
     def _initial_state(
         self,
