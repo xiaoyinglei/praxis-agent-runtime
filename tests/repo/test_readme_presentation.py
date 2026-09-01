@@ -7,8 +7,6 @@ import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
@@ -19,7 +17,6 @@ MODEL_QUALITY_REPORT = (
 )
 MODEL_QUALITY_RENDERER = ROOT / "scripts" / "render_model_quality_report.py"
 RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
-MODEL_CATALOG = ROOT / "configs" / "models.yaml"
 
 
 def _read(path: Path) -> str:
@@ -107,6 +104,49 @@ def test_readme_sdk_examples_use_the_real_public_facade() -> None:
         compile(snippet, f"README.md:python-example-{index}", "exec")
 
 
+def test_model_integration_docs_cover_requirements_registration_and_switching_only() -> None:
+    readme = _read(README)
+    runbook = _read(RUNBOOK)
+    readme_section = readme.split("### Connect and switch models", 1)[1].split(
+        "### Run a task",
+        1,
+    )[0]
+    runbook_section = runbook.split("## 接入和切换 chat 模型", 1)[1].split(
+        "## RAG 服务准备",
+        1,
+    )[0]
+
+    required_commands = (
+        "agent model trust init",
+        "agent model trust status",
+        "agent model list --source",
+        "agent model show",
+        "agent model add",
+        "agent model update",
+        "agent model probe",
+        "agent model remove",
+        "agent model switch",
+        "--from",
+        "--skip-probe",
+    )
+    for section in (readme_section, runbook_section):
+        for command in required_commands:
+            assert command in section
+        for requirement in (
+            "OpenAI-compatible",
+            "text delta",
+            "authoritative completion",
+            "tool call",
+            "structured output",
+            "environment variable",
+            "Turn",
+        ):
+            assert requirement in section
+        for model_family in ("Qwen", "Kimi", "DeepSeek"):
+            assert model_family not in section
+        assert "API_KEY=" not in section
+
+
 def test_readme_describes_a_source_only_distribution_without_unearned_claims() -> None:
     readme = _read(README)
     old_repository = "Private" + "-RAG-Agent"
@@ -146,36 +186,14 @@ def test_runbook_uses_the_praxis_source_checkout_without_personal_paths() -> Non
     assert personal_path not in runbook
 
 
-def test_runbook_defaults_are_bound_to_the_model_catalog() -> None:
+def test_runbook_keeps_builtins_read_only_and_user_models_cli_managed() -> None:
     runbook = _read(RUNBOOK)
-    catalog = yaml.safe_load(MODEL_CATALOG.read_text(encoding="utf-8"))
-    defaults = catalog["defaults"]
-    models = catalog["models"]
-    providers = catalog["providers"]
 
-    expected = {
-        "primary_model": (
-            defaults["primary_model"],
-            models[defaults["primary_model"]]["model"],
-        ),
-        "embedding_model": (
-            defaults["embedding_model"],
-            models[defaults["embedding_model"]]["model"],
-        ),
-        "reranker_model": (
-            defaults["reranker_model"],
-            models[defaults["reranker_model"]]["model"],
-        ),
-    }
-    for alias, model in expected.values():
-        assert f"`{alias}`" in runbook
-        assert f"`{model}`" in runbook
-
-    primary = models[defaults["primary_model"]]
-    assert providers[primary["provider"]]["api_key_env"] == "GROQ_API_KEY"
-    assert "`GROQ_API_KEY`" in runbook
-    assert "qwen3_8b_mlx_4bit" in runbook
-    assert "显式可选" in runbook
+    assert "无需手工编辑 `configs/models.yaml`" in runbook
+    assert "内置 alias 是只读层" in runbook
+    assert "版本化的用户注册表" in runbook
+    assert "compare-and-swap" in runbook
+    assert "不保存解析后的值" in runbook
 
 
 def test_checked_in_live_evidence_pages_match_renderer() -> None:

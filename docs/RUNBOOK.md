@@ -13,69 +13,70 @@ cd /path/to/praxis-agent-runtime
 uv sync
 ```
 
-默认 chat 模型使用 Groq，先在 `.env` 中提供它声明的密钥：
+## 接入和切换 chat 模型
+
+无需手工编辑 `configs/models.yaml`。该文件中的内置 alias 是只读层；
+`agent model add`、`update`、`remove` 管理版本化的用户注册表，并通过
+compare-and-swap 防止并发覆盖。
+注册表和 Turn binding 只保存 credential environment variable 的名字，不保存解析后的值。
+
+### 接口要求
+
+一个完整可用的 Agent chat endpoint 必须满足：
+
+- 提供 OpenAI-compatible 模型发现和 chat 接口，并返回配置中声明的 model identity；
+- 流式响应至少包含一个真实 text delta，随后给出 authoritative completion；
+- 声明支持工具时，能按指定 JSON Schema 返回一个 forced tool call；probe 只校验，绝不执行它；
+- 声明支持结构化响应时，能返回可验证的 structured output；
+- 遵守配置的 timeout，并允许取消仍在进行的 stream。
+
+`connectivity` 只检查连接、鉴权和模型身份；`stream` 继续检查真实流式文本和完成信号；
+`full` 再按显式 capability flags 检查 tool call 与 structured output。探测证据是当次结果，
+不会反向猜测或改写 capability flags。
+
+### 初始化与注册
+
+首次启动新 Turn 前初始化本地 HMAC trust domain；命令只显示 domain/key id，不显示 key material：
 
 ```bash
-cat > .env <<'EOF'
-GROQ_API_KEY=your_groq_key
-EOF
-```
-
-本地 Qwen chat 是显式可选路径，选择它时不需要云端 API key。
-
-确认基础设施：
-
-```bash
-lsof -nP -iTCP:19530 -sTCP:LISTEN
-lsof -nP -iTCP:5432 -sTCP:LISTEN
-lsof -nP -iTCP:6379 -sTCP:LISTEN
-```
-
-默认本地端口：
-
-| 服务 | 端口 | 说明 |
-| --- | ---: | --- |
-| Milvus | `19530` | 向量索引 |
-| Milvus Web/metrics | `9091` | 已被 Milvus docker 占用，不要给 rerank 用 |
-| Postgres | `5432` | metadata |
-| Redis | `6379` | cache |
-| Optional local Qwen generation service | `8080` | 本地 OpenAI-compatible chat |
-| Embedding service | `9090` | `mlx-community/Qwen3-Embedding-8B-4bit-DWQ` |
-| Rerank service | `9092` | `Qwen/Qwen3-Reranker-4B` |
-
-## 模型服务管理
-
-当前默认模型配置在 `configs/models.yaml`：
-
-| 能力 | 默认别名 | 实际模型 / 服务 |
-| --- | --- | --- |
-| 生成 / 摘要 / Agent tool decision | `groq_gpt_oss_120b` | `openai/gpt-oss-120b`，Groq，`GROQ_API_KEY` |
-| Embedding | `qwen3_embedding_8b_4bit_dwq` | `mlx-community/Qwen3-Embedding-8B-4bit-DWQ`，HTTP service，`127.0.0.1:9090` |
-| Rerank | `qwen3_reranker_4b` | `Qwen/Qwen3-Reranker-4B`，HTTP service，`127.0.0.1:9092` |
-
-内存策略：
-
-- 默认 chat 走 `groq_gpt_oss_120b`，不会因为省略 `--model` 而启动本地 MLX 服务。
-- 显式可选的 `agent run --model qwen3_8b_mlx_4bit` 会先检查
-  `runtime.health_url`，未启动时按 `runtime.launch_command` 自动拉起
-  `127.0.0.1:8080` 的 OpenAI-compatible server。
-- 入库和查询需要 embedding；建议启动 embedding HTTP 服务，避免每条命令重复加载模型。
-- rerank 是可选服务，默认省内存时关闭。
-- 切换 embedding 模型后必须换新的 Milvus collection prefix，旧向量不能混用。
-- chat 模型的当前选择是 Agent session state，不是 `configs/models.yaml`
-  的全局改写。
-- 指定什么 chat 模型就必须用什么模型；不会 silent fallback，不会自动换端口，也不会自动杀已有进程。如果 `8080` 已经跑着别的模型，会报 endpoint conflict。
-
-查看和切换当前 Agent 模型 session：
-
-```bash
-uv run agent model list
+uv run agent model trust init
+uv run agent model trust status
+uv run agent model list --source
 uv run agent model current
-uv run agent model switch groq_gpt_oss_120b
+export MODEL_ALIAS=my-model-alias
+export PROVIDER_MODEL_ID=provider-model-id
+export PROVIDER_BASE_URL=https://provider.example/v1
+export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
+
+uv run agent model show "$MODEL_ALIAS"
+uv run agent model add "$MODEL_ALIAS" \
+  --provider openai_compatible \
+  --provider-model "$PROVIDER_MODEL_ID" \
+  --base-url "$PROVIDER_BASE_URL" \
+  --api-key-env "$PROVIDER_CREDENTIAL_ENV"
+
+uv run agent model probe "$MODEL_ALIAS" --level full
+uv run agent model update "$MODEL_ALIAS" --timeout-seconds 90
+uv run agent model remove "$MODEL_ALIAS"
 ```
 
-`agent model switch` 写入 `.praxis/` 目录中的 `model_session.json`。临时只跑一次其他模型时，用
-`agent run --model qwen3_8b_mlx_4bit ...`，不要改 `configs/models.yaml`。
+`add/update` 的事务顺序是：严格解析和规范化 → 读取预期 registry revision → full probe
+→ CAS commit。失败或取消发生在 commit 前，因此注册表不变。高级字段（例如无 shell 的
+launch argv）使用 `--from <one-model.yaml>`；离线登记必须显式写 `--skip-probe`，输出会标记
+`unverified`。`update --unset <nullable-field>` 清除支持的可空字段；规范化 no-op 不 probe、
+不写文件、也不增加 revision。
+
+### 切换与持久化语义
+
+查看和切换当前 Agent model session：
+
+```bash
+uv run agent model list --source
+uv run agent model current
+uv run agent model switch "$MODEL_ALIAS"
+```
+
+`agent model switch` 只更新 `.praxis/model_session.json`，不改注册表定义。
 
 交互式 `agent chat` 复用同一个 catalog、policy 和 session state，不维护第二套
 alias 或路由：
@@ -83,13 +84,13 @@ alias 或路由：
 ```text
 uv run agent chat
 > /model
-当前模型: groq_gpt_oss_120b
+当前模型: current-alias
 可用模型:
-* groq_gpt_oss_120b  ...
-  qwen3_8b_mlx_4bit  ...
+* current-alias  ...
+  another-alias  ...
 切换: /model <alias>
-> /model qwen3_8b_mlx_4bit
-已切换模型: qwen3_8b_mlx_4bit
+> /model another-alias
+已切换模型: another-alias
 ```
 
 也可写 `/model switch <alias>`；`/model current` 只看当前详情，`/model list`
@@ -98,15 +99,18 @@ uv run agent chat
 `/new`。输入不存在或被 policy 拒绝的 alias 时，CLI 会显示错误和所有可用
 alias，原选择保持不变，而且校验阶段不会发起 provider 请求。
 
-模型绑定以 Turn 为单位持久化：重新用 `agent chat --previous-turn-id <id>` 或
-`--last` 进入历史链时，先恢复该 Turn 的模型、workspace 和 knowledge binding；
-之后仍可用 `/model <alias>` 给下一个 Turn 换模。`agent resume` 是恢复同一个暂停/
-中断 Turn，不是新建后续 Turn，因此始终使用 checkpoint 所属 Turn 的原模型；
-session state 后来切到别的 alias 也不会影响 resume。
+session alias 是未来 Turn 的可变偏好；每个已创建 Turn 则持久化经过 HMAC 认证、
+content-addressed archive 校验的完整不可变定义。更新或删除 alias 只影响未来 Turn。
+`agent resume` 恢复同一个暂停/中断 Turn，必须使用其原定义；`previous_turn_id` 创建
+新 Turn，才会读取当前 session 选择。历史 replay 只读 durable history，不要求 provider 在线。
 
 早期版本写在 `.rag/` 中的 `agent_checkpoints.sqlite` 和
 `agent_model_session.json` 不迁移、不读取、也不删除；新的运行从 `.praxis/`
 中的全新状态开始，RAG 知识数据则继续留在 `.rag/`。
+
+## RAG 服务准备
+
+下面是知识库 embedding/rerank 的运维示例，与 chat alias 注册表相互独立。
 
 先检查是否已经有同模型服务，避免重复常驻占内存：
 
@@ -147,44 +151,26 @@ uv run rag rerank-service \
 '
 ```
 
-显式可选：手动预热本地 `qwen3_8b_mlx_4bit` chat 服务。这不是默认
-chat 路径；当显式选择该 alias 时，Agent 也可按 `configs/models.yaml` 的
-runtime 配置自动启动。手动预热只用于减少首次请求等待：
-
-```bash
-screen -S rag_qwen_8080 -X quit >/dev/null 2>&1 || true
-screen -dmS rag_qwen_8080 zsh -lc '
-cd /path/to/praxis-agent-runtime
-uv run python -m mlx_lm.server \
-  --model mlx-community/Qwen3-8B-4bit \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --chat-template-args '"'"'{"enable_thinking": false}'"'"'
-'
-```
-
 健康检查：
 
 ```bash
 curl -sS http://127.0.0.1:9090/health
 curl -sS http://127.0.0.1:9092/health
-curl -sS http://127.0.0.1:8080/v1/models
 screen -ls
 ```
 
 关闭服务：
 
 ```bash
-screen -S rag_qwen_8080 -X quit >/dev/null 2>&1 || true
 screen -S rag_embedding_9090 -X quit >/dev/null 2>&1 || true
 screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 ```
 
 ## 私有文档端到端运行手册
 
-先准备 embedding 服务；rerank 默认不开，需要时再按"常用开关"打开。默认
-chat 走 `configs/models.yaml` 中的 `groq_gpt_oss_120b`，需要已导出或在
-`.env` 中配置 `GROQ_API_KEY`；它不会自动启动本地 chat 服务。
+先准备 embedding 服务；rerank 默认不开，需要时再按"常用开关"打开。chat 使用
+当前 session 选中的 alias；先用 `agent model current` 确认其 endpoint 与 credential
+environment variable 已可用。
 
 ### 统一变量
 
@@ -393,8 +379,8 @@ uv run agent chat
 | 普通制度问答 | 直接问 `agent run` |
 | 已入库的文档证据问题 | `agent run ... --knowledge-config <path>`，模型会按需调用 `search_knowledge` |
 | Agent 直接读本地文件 | `agent run ... --file "/path/to/file.xlsx"` |
-| 查看/切换当前 chat 模型 | chat 外用 `agent model list/current/switch <model_id>`；chat 内用 `/model` 与 `/model <alias>`；都是 session state，不改 YAML |
-| 一次性指定模型 | 默认是 Groq；显式可选本地路径可用 `--model qwen3_8b_mlx_4bit` |
+| 查看/切换当前 chat 模型 | chat 外用 `agent model list --source`、`current`、`switch <alias>`；chat 内用 `/model` 与 `/model <alias>`；都是 session state，不改注册表定义 |
+| 一次性指定模型 | `agent run --model <alias> ...`，只影响该次新 Turn |
 | 恢复常驻 embedding | `export RAG_EMBEDDING_SERVICE_URL=http://127.0.0.1:9090` |
 
 ### 快速 smoke 测试

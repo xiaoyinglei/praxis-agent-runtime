@@ -101,37 +101,76 @@ cd praxis-agent-runtime
 uv sync --frozen
 ```
 
-Inspect the configured model aliases and choose one that is available in your
-environment:
+### Connect and switch models
+
+Praxis accepts a secret-free model definition and reads any credential through
+the named environment variable at runtime. For full Agent behavior, an endpoint
+must provide:
+
+- an OpenAI-compatible model-discovery and chat interface that advertises the
+  configured model identity;
+- a real streamed text delta followed by an authoritative completion;
+- a schema-valid forced tool call when `supports_tools` is enabled, without
+  Praxis executing the probe tool;
+- valid structured output when `supports_structured_output` is enabled; and
+- bounded timeouts and cancellable streaming.
+
+Built-in aliases remain read-only. User registrations live in the versioned
+user registry; initialize the local binding trust domain once, then inspect or
+register aliases through the CLI:
 
 ```bash
-uv run agent model list
+uv run agent model trust init
+uv run agent model trust status
+uv run agent model list --source
 uv run agent model current
-uv run agent model switch <model-alias>
+export MODEL_ALIAS=my-model-alias
+export PROVIDER_MODEL_ID=provider-model-id
+export PROVIDER_BASE_URL=https://provider.example/v1
+export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
+
+uv run agent model show "$MODEL_ALIAS"
+uv run agent model add "$MODEL_ALIAS" \
+  --provider openai_compatible \
+  --provider-model "$PROVIDER_MODEL_ID" \
+  --base-url "$PROVIDER_BASE_URL" \
+  --api-key-env "$PROVIDER_CREDENTIAL_ENV"
+
+uv run agent model probe "$MODEL_ALIAS" --level full
+uv run agent model update "$MODEL_ALIAS" --timeout-seconds 90
+uv run agent model switch "$MODEL_ALIAS"
+uv run agent model remove "$MODEL_ALIAS"
 ```
 
-The same control plane is available inside an interactive chat. Bare `/model`
-shows the current model and every alias from `configs/models.yaml`; switch with
-the direct alias form:
+`agent model add` and `update` run the full probe before their compare-and-swap
+registry commit. Probe failure or cancellation writes nothing. Advanced typed
+definitions can use `--from <one-model.yaml>`; `--skip-probe` is an explicit
+offline escape hatch and reports the alias as unverified. Registry files store
+only the environment variable name, never its resolved value.
+
+The session selection is mutable, both outside and inside interactive chat:
 
 ```text
 $ uv run agent chat
 > /model
-当前模型: groq_gpt_oss_120b
+当前模型: current-alias
 可用模型:
-* groq_gpt_oss_120b  ...
-  qwen3_8b_mlx_4bit  ...
+* current-alias  ...
+  another-alias  ...
 切换: /model <alias>
-> /model qwen3_8b_mlx_4bit
-已切换模型: qwen3_8b_mlx_4bit
+> /model another-alias
+已切换模型: another-alias
 ```
 
 The next message keeps the current conversation history and creates a new Turn
 bound to the selected alias; no restart or `/new` is required. An invalid alias
 prints the available aliases, keeps the previous model, and does not contact a
-provider. Each completed/paused Turn retains its own immutable model binding,
-so `agent resume` always continues a checkpoint with that Turn's original
-model even if the session selection changed later.
+provider. Each completed or paused Turn retains an authenticated, immutable
+definition in durable history. `agent resume` therefore continues that Turn's
+original model even after the alias is updated, removed, or selected differently
+for later Turns.
+
+### Run a task
 
 Run a read-only task explicitly:
 
