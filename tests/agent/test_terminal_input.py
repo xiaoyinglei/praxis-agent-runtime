@@ -78,7 +78,13 @@ def test_composer_propagates_terminal_exit(error: BaseException) -> None:
         composer.prompt("> ")
 
 
-def _pty_exchange(program: str, *, wait_for_raw_mode: bool = False) -> str:
+def _pty_exchange(
+    program: str,
+    *,
+    typed_text: str = "你好",
+    backspaces: int = 2,
+    wait_for_raw_mode: bool = False,
+) -> str:
     master, slave = os.openpty()
     os.set_blocking(master, False)
     process = subprocess.Popen(
@@ -108,8 +114,8 @@ def _pty_exchange(program: str, *, wait_for_raw_mode: bool = False) -> str:
             if not termios.tcgetattr(slave)[3] & termios.ICANON:
                 break
             time.sleep(0.01)
-        os.write(master, "你好".encode())
-        os.write(master, b"\x7f\x7f\n")
+        os.write(master, typed_text.encode())
+        os.write(master, (b"\x7f" * backspaces) + b"\n")
         os.close(slave)
         slave = -1
         while process.poll() is None and time.monotonic() < deadline:
@@ -150,3 +156,17 @@ def test_composer_backspace_removes_whole_chinese_characters() -> None:
 
     assert "RESULT=''" in composed
     assert "\\udc" not in composed
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS PTY integration")
+@pytest.mark.parametrize("typed_text", ["e\u0301", "👨‍👩‍👧‍👦"])
+def test_composer_backspace_removes_one_grapheme_cluster(typed_text: str) -> None:
+    composed = _pty_exchange(
+        "from agent_runtime.terminal_input import TerminalComposer; "
+        "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
+        typed_text=typed_text,
+        backspaces=1,
+        wait_for_raw_mode=True,
+    )
+
+    assert "RESULT=''" in composed

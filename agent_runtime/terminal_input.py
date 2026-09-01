@@ -5,11 +5,37 @@ import sys
 from collections.abc import Iterable
 from typing import Protocol
 
+import regex
 from prompt_toolkit import PromptSession
+from prompt_toolkit.document import Document
 from prompt_toolkit.history import History
+from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 
 DEFAULT_HISTORY_ENTRIES = 100
 DEFAULT_HISTORY_BYTES = 64 * 1024
+_GRAPHEME = regex.compile(r"\X")
+
+
+_COMPOSER_BINDINGS = KeyBindings()
+
+
+@_COMPOSER_BINDINGS.add("backspace", eager=True)
+def _delete_previous_grapheme(event: KeyPressEvent) -> None:
+    buffer = event.current_buffer
+    if buffer.selection_state is not None:
+        data = buffer.cut_selection()
+        event.app.clipboard.set_data(data)
+        return
+    cursor = buffer.cursor_position
+    if cursor == 0:
+        return
+    for match in _GRAPHEME.finditer(buffer.text):
+        if match.start() < cursor <= match.end():
+            buffer.document = Document(
+                buffer.text[: match.start()] + buffer.text[match.end() :],
+                cursor_position=match.start(),
+            )
+            return
 
 
 class _PromptSession(Protocol):
@@ -81,6 +107,7 @@ class TerminalComposer:
             self._session = PromptSession(
                 history=self.history,
                 enable_history_search=True,
+                key_bindings=_COMPOSER_BINDINGS,
             )
         else:
             self._session = _BuiltinInputSession()

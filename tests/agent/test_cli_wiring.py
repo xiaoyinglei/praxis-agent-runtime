@@ -932,6 +932,20 @@ def test_cli_does_not_repeat_an_answer_that_was_already_streamed(
     assert "already visible" not in capsys.readouterr().out
 
 
+def test_cli_sanitizes_non_streamed_final_answer(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _display_agent_result(
+        _result(answer="before\x1b[2J\x07after"),
+        verbose=False,
+    )
+
+    output = capsys.readouterr().out
+    assert "beforeafter" in output
+    assert "\x1b" not in output
+    assert "\x07" not in output
+
+
 def test_cli_shows_untyped_pause_reason_exactly_once(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -36,7 +36,7 @@ from agent_runtime.models import (
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.terminal_input import TerminalComposer
-from agent_runtime.terminal_render import TerminalToolEventDisplay
+from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -187,7 +187,7 @@ def _display_agent_result(
                 _print_diagnostic(diagnostic)
 
     if result.answer and not answer_streamed:
-        print(f"\n{result.answer}")
+        print(f"\n{safe_terminal_text(result.answer)}")
 
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")

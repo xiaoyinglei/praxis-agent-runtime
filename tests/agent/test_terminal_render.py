@@ -14,6 +14,10 @@ from agent_runtime.streaming.events import (
     item_completed,
     item_delta,
     item_started,
+    text_delta,
+    tool_use_progress,
+    tool_use_result,
+    tool_use_start,
 )
 from agent_runtime.terminal_render import (
     BoundedCommandPreview,
@@ -87,6 +91,14 @@ def test_command_preview_preserves_chunk_order_and_equal_deltas() -> None:
     ]
 
     assert visible == ["same", "same", "error", "last"]
+
+
+def test_command_preview_treats_split_crlf_as_one_newline() -> None:
+    preview = BoundedCommandPreview(width=80)
+
+    visible = [*preview.feed("a\r"), *preview.feed("\nb\n"), *preview.finish()]
+
+    assert visible == ["a", "b"]
 
 
 def test_command_preview_keeps_six_head_and_three_tail_rows() -> None:
@@ -299,6 +311,92 @@ async def test_renderer_distinguishes_aci_and_command_truncation(
     output = capsys.readouterr().out
     assert output.count("ACI 截断") == 1
     assert output.count("命令输出达到工具预算") == 1
+
+
+@pytest.mark.anyio
+async def test_renderer_sanitizes_streamed_model_text_controls(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=80)
+
+    await display.emit(text_delta("before\x1b[2J\x07after"))
+
+    output = capsys.readouterr().out
+    assert output == "beforeafter"
+    assert "\x1b" not in output
+    assert "\x07" not in output
+
+
+@pytest.mark.anyio
+async def test_renderer_failed_completion_keeps_result_metadata_and_warnings(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=80)
+
+    await display.emit(
+        item_completed(
+            turn_id="turn-failed-command",
+            item_id="command-failed",
+            item_kind=TurnItemKind.COMMAND,
+            status=ItemStatus.FAILED,
+            error="command failed",
+            data={
+                "result": {
+                    "tool_name": "run_command",
+                    "structured_content": {
+                        "stdout": "partial output",
+                        "stderr": "fatal detail",
+                        "exit_code": 2,
+                        "truncated": True,
+                    },
+                    "truncated": True,
+                }
+            },
+        )
+    )
+
+    output = capsys.readouterr().out
+    assert "✗ run_command: exit_code=2: command failed" in output
+    assert "partial output" in output
+    assert "fatal detail" in output
+    assert output.count("ACI 截断") == 1
+    assert output.count("命令输出达到工具预算") == 1
+
+
+@pytest.mark.anyio
+async def test_renderer_narrow_terminal_accepts_long_tool_name_preview(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=20)
+
+    await display.emit(
+        item_started(
+            turn_id="turn-narrow",
+            item_id="tool-narrow",
+            item_kind=TurnItemKind.TOOL,
+            data={
+                "tool_name": "a_very_long_tool_name",
+                "input_preview": "path='fixture.txt'",
+            },
+        )
+    )
+
+    assert "→ a_very_long_tool_name" in capsys.readouterr().out
+
+
+@pytest.mark.anyio
+async def test_renderer_bounds_legacy_progress_and_reports_suppression(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=80)
+    await display.emit(tool_use_start("read_file", "legacy-call"))
+    for index in range(12):
+        await display.emit(tool_use_progress("legacy-call", f"progress {index}"))
+    await display.emit(tool_use_result("read_file", "legacy-call", {"ok": True}))
+
+    output = capsys.readouterr().out
+    assert output.count("… read_file: progress ") == 8
+    assert "… read_file: … +4 progress updates" in output
 
 
 @pytest.mark.anyio

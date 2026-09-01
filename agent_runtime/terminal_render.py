@@ -27,7 +27,7 @@ DEFAULT_PROGRESS_MESSAGES = 8
 _ANSI_ESCAPE = regex.compile(
     r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|(?:\x1b\[[0-?]*[ -/]*[@-~])"
 )
-_UNSAFE_CONTROL = regex.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_UNSAFE_CONTROL = regex.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _GRAPHEME = regex.compile(r"\X")
 
 
@@ -122,6 +122,7 @@ class BoundedCommandPreview:
         self._rows = 0
         self._suppressed_rows = 0
         self._forced_markers: list[str] = []
+        self._pending_cr = False
         self._finished = False
 
     @property
@@ -130,10 +131,20 @@ class BoundedCommandPreview:
             len(line.encode("utf-8")) for line in self._tail
         )
 
+    @property
+    def has_output(self) -> bool:
+        return self._rows > 0 or self._partial.has_content or self._pending_cr
+
     def feed(self, delta: str) -> list[str]:
         if self._finished:
             return []
         visible: list[str] = []
+        if self._pending_cr:
+            delta = "\n" + (delta[1:] if delta.startswith("\n") else delta)
+            self._pending_cr = False
+        if delta.endswith("\r"):
+            delta = delta[:-1]
+            self._pending_cr = True
         parts = safe_terminal_text(delta).split("\n")
         for part in parts[:-1]:
             self._partial.append(part)
@@ -144,7 +155,11 @@ class BoundedCommandPreview:
     def finish(self) -> list[str]:
         if self._finished:
             return []
-        visible = self._complete_partial() if self._partial.has_content else []
+        if self._pending_cr:
+            self._pending_cr = False
+            visible = self._complete_partial()
+        else:
+            visible = self._complete_partial() if self._partial.has_content else []
         visible.extend(self._forced_markers)
         omitted = self._suppressed_rows - len(self._tail)
         if omitted > 0:
@@ -422,9 +437,18 @@ class TerminalToolEventDisplay:
             else event.item_kind.value
         )
         self._flush_item_state(state)
+        command_output_streamed = (
+            state is not None
+            and state.command is not None
+            and state.command.has_output
+        )
         if event.status is ItemStatus.SUCCESS:
             if event.item_kind is TurnItemKind.COMMAND or name == "run_command":
                 self._write_line(f"✓ {name}{self._command_suffix(result)}")
+                if not command_output_streamed:
+                    structured = result.get("structured_content")
+                    if structured is not None:
+                        self._write_result(structured)
             else:
                 self._write_line(f"✓ {name}")
                 structured = result.get("structured_content")
@@ -435,7 +459,20 @@ class TerminalToolEventDisplay:
             return
         error = event.error or result.get("error_message")
         suffix = f": {safe_terminal_text(error)}" if isinstance(error, str) else ""
-        self._write_line(f"✗ {name}{suffix}")
+        command_suffix = (
+            self._command_suffix(result)
+            if event.item_kind is TurnItemKind.COMMAND or name == "run_command"
+            else ""
+        )
+        self._write_line(f"✗ {name}{command_suffix}{suffix}")
+        structured = result.get("structured_content")
+        if structured is not None and (
+            event.item_kind is not TurnItemKind.COMMAND and name != "run_command"
+            or not command_output_streamed
+        ):
+            self._write_result(structured)
+        self._render_truncation_warnings(name, result)
+        self._render_diff(result.get("metadata"))
 
     def _render_legacy_start(self, event: StreamEvent) -> None:
         tool_id = event.data.get("tool_id")
@@ -460,10 +497,21 @@ class TerminalToolEventDisplay:
         if not isinstance(tool_id, str) or not isinstance(progress, str):
             return
         state = self._items.get((event.turn_id, tool_id))
-        name = state.name if state is not None else "tool"
+        if state is None:
+            state = _ItemDisplayState(
+                name="tool",
+                kind=TurnItemKind.TOOL,
+                progress=BoundedProgressPreview(),
+            )
+            self._store_item((event.turn_id, tool_id), state)
+        if state.progress is None:
+            state.progress = BoundedProgressPreview()
+        name = state.name
         percent = event.data.get("percent")
         percent_text = f" ({percent:g}%)" if isinstance(percent, (int, float)) else ""
-        self._write_line(f"… {name}: {safe_terminal_text(progress)}{percent_text}")
+        visible = state.progress.feed(f"{progress}{percent_text}")
+        if visible is not None:
+            self._write_line(f"… {name}: {visible}")
 
     def _render_legacy_result(self, event: StreamEvent) -> None:
         tool_id = event.data.get("tool_id")
@@ -528,7 +576,12 @@ class TerminalToolEventDisplay:
         if not isinstance(preview, str) or not preview:
             self._write_line(f"→ {name}")
             return
-        lines = bounded_result_lines(preview, width=self._width - len(name) - 4, max_rows=2)
+        name_width = max(wcswidth(safe_terminal_text(name)), 0)
+        lines = bounded_result_lines(
+            preview,
+            width=max(1, self._width - name_width - 4),
+            max_rows=2,
+        )
         self._write_line(f"→ {name}: {lines[0]}")
         for line in lines[1:]:
             self._write_line(f"  {line}")
@@ -608,19 +661,22 @@ class TerminalToolEventDisplay:
     def _render_text(self, value: object, *, answer: bool = True) -> None:
         if not isinstance(value, str) or not value:
             return
-        print(value, end="", flush=True)
+        rendered = safe_terminal_text(value)
+        if not rendered:
+            return
+        print(rendered, end="", flush=True)
         if answer:
             self.answer_streamed = True
-        self._line_open = not value.endswith("\n")
+        self._line_open = not rendered.endswith("\n")
 
     def _write_line(self, value: str) -> None:
         if self._line_open:
             print()
-        print(value, flush=True)
+        print(safe_terminal_text(value), flush=True)
         self._line_open = False
 
     def _write_block(self, value: str) -> None:
         if self._line_open:
             print()
-        print(value.rstrip("\n"), flush=True)
+        print(safe_terminal_text(value).rstrip("\n"), flush=True)
         self._line_open = False
