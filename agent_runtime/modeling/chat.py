@@ -16,13 +16,23 @@ class OpenAICompatibleChatGenerator:
     """Lazy OpenAI-compatible chat client used by the agent and RAG assembly."""
 
     def __init__(
-        self, *, model: str, base_url: str, api_key: str | None = None, supports_tools: bool | None = None
+        self,
+        *,
+        model: str,
+        base_url: str,
+        api_key: str | None = None,
+        supports_tools: bool | None = None,
+        timeout_seconds: float = 120.0,
     ) -> None:
         from openai import OpenAI
 
         self.chat_model_name = model
         self._base_url = base_url
-        self._client = OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+        self._client = OpenAI(
+            base_url=base_url,
+            api_key=api_key or "not-needed",
+            timeout=timeout_seconds,
+        )
         self._supports_tools = (
             (os.environ.get("RAG_NATIVE_TOOL_CALLING", "").lower() not in {"0", "false", "no", "off"})
             if supports_tools is None

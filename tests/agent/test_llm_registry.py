@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -747,6 +748,45 @@ class TestModelRegistryResolve:
             expected = definition.llm_stage_budgets[stage.value]
             actual = resolved.gateway.stage_budget(stage)
             assert actual.model_dump() == expected.model_dump()
+
+    def test_resolve_definition_applies_timeout_and_structured_capability_to_real_provider(
+        self,
+    ) -> None:
+        source_config = _make_config()
+        source_config.models["main"] = ModelSpec(
+            provider=ModelProvider.OPENAI_COMPATIBLE,
+            model="provider/frozen-v1",
+            timeout_seconds=1.25,
+            base_url="http://127.0.0.1:9090/v1",
+            supports_structured_output=False,
+            location="local",
+        )
+        definition = ModelRegistry(source_config).get_model_definition("main")
+
+        resolved = ModelRegistry(_make_config()).resolve_definition(definition)
+
+        assert resolved.supports_structured_output is False
+        client = cast(Any, resolved.generator)._client
+        assert client.timeout == 1.25
+
+    def test_provider_construction_error_does_not_retain_secret_in_exception_chain(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        secret = "resolved-secret-value"
+
+        def fail_provider(_spec: ModelSpec) -> object:
+            raise RuntimeError(f"provider rejected {secret}")
+
+        monkeypatch.setattr(llm_registry_module, "_build_chat_generator", fail_provider)
+        definition = ModelRegistry(_make_config()).get_model_definition("main")
+
+        with pytest.raises(ModelNotAvailableError) as captured:
+            ModelRegistry(_make_config()).resolve_definition(definition)
+
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+        assert secret not in repr(captured.value)
 
     def test_resolve_definition_reloads_current_credential_for_each_dispatch(
         self,

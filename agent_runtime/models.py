@@ -11,8 +11,12 @@ from types import MappingProxyType
 from typing import Literal, Protocol, cast
 from urllib.parse import urlsplit
 
-from agent_runtime.core.llm_config import ModelSpec as InternalModelSpec
-from agent_runtime.core.llm_config import normalize_model_endpoint
+from agent_runtime.core.llm_config import (
+    ModelSpec as InternalModelSpec,
+)
+from agent_runtime.core.llm_config import (
+    normalize_model_endpoint,
+)
 from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
@@ -21,6 +25,7 @@ from agent_runtime.core.llm_registry import (
     UnknownModelAliasError,
     user_model_registry_path,
 )
+from agent_runtime.core.messages import canonical_json_text
 from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
     ConfigVersionConflict,
@@ -428,10 +433,22 @@ class ModelPolicy:
             host = urlsplit(normalized.base_url or "").hostname
             if host is None or host.rstrip(".").lower() not in self.allowed_remote_hosts:
                 raise ModelPolicyError(f"Frozen model remote host {host!r} is not allowed")
+        runtime = normalized.runtime
+        if normalized.location == "local" and runtime is not None and runtime.health_url:
+            try:
+                normalize_model_endpoint(
+                    provider=normalized.provider,
+                    base_url=runtime.health_url,
+                    location="local",
+                )
+            except ValueError:
+                raise ModelPolicyError(
+                    "Frozen model local health endpoint is not loopback"
+                ) from None
         if (
             not self.allow_local_launch
-            and normalized.runtime is not None
-            and normalized.runtime.launch_command
+            and runtime is not None
+            and runtime.launch_command
         ):
             raise ModelPolicyError("Frozen model local launch command is not allowed")
         return normalized
@@ -721,7 +738,15 @@ class ModelControlPlane:
         _validate_binding_identity(turn_id, field_name="turn_id")
         if not isinstance(binding, Mapping):
             raise BindingAuthenticationError("frozen model binding must be a mapping")
-        association = dict(binding)
+        try:
+            snapshotted = json.loads(canonical_json_text(cast(JsonValue, binding)))
+        except (TypeError, ValueError):
+            raise BindingAuthenticationError(
+                "frozen model binding must contain canonical JSON values"
+            ) from None
+        if type(snapshotted) is not dict:
+            raise BindingAuthenticationError("frozen model binding must be a JSON object")
+        association = cast(dict[str, JsonValue], snapshotted)
         signature = association.pop("signature", None)
         if type(signature) is not str:
             raise BindingAuthenticationError("frozen model binding signature is missing")
@@ -747,10 +772,10 @@ class ModelControlPlane:
             definition=archived,
             requested_by=requester,
         )
-        self._ensure_model_ready(_to_public_definition_spec(alias, reviewed))
         resolver = getattr(self._registry, "resolve_definition", None)
         if not callable(resolver):
             raise RuntimeError("Model resolver cannot resolve frozen definitions")
+        self._ensure_model_ready(_to_public_definition_spec(alias, reviewed))
         return cast(ResolvedModel, resolver(reviewed))
 
     def resolve(self, alias: str) -> ResolvedModel:
@@ -774,6 +799,14 @@ class ModelControlPlane:
         return self.resolve(model_id)
 
     def _ensure_model_ready(self, spec: ModelSpec) -> None:
+        if spec.api_key_env:
+            value = os.environ.get(spec.api_key_env)
+            if not isinstance(value, str) or not value.strip():
+                raise ModelNotAvailableError(
+                    f"Model {spec.id!r} is unavailable because environment variable "
+                    f"{spec.api_key_env} is not set. Export it or add it to .env; "
+                    "use AGENT_ENV_FILE to select a different env file"
+                )
         if spec.location == "local":
             manager = self._local_runtime_manager
             if manager is None:
@@ -783,14 +816,6 @@ class ModelControlPlane:
                 self._local_runtime_manager = manager
             manager.ensure_ready(spec)
             return
-        if spec.api_key_env:
-            value = os.environ.get(spec.api_key_env)
-            if not isinstance(value, str) or not value.strip():
-                raise ModelNotAvailableError(
-                    f"Model {spec.id!r} is unavailable because environment variable "
-                    f"{spec.api_key_env} is not set. Export it or add it to .env; "
-                    "use AGENT_ENV_FILE to select a different env file"
-                )
 
     def close(self) -> None:
         manager = self._local_runtime_manager

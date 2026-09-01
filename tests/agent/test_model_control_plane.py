@@ -402,6 +402,20 @@ def test_model_policy_rejects_frozen_provider_host_and_local_launch(
             definition=local,
             requested_by="user",
         )
+    assert local.runtime is not None
+    unsafe_health = local.model_copy(
+        update={
+            "runtime": local.runtime.model_copy(
+                update={"health_url": "https://metadata.evil.example/status"}
+            )
+        }
+    )
+    with pytest.raises(ModelPolicyError, match="health"):
+        ModelPolicy().review_binding(
+            alias="local_qwen",
+            definition=unsafe_health,
+            requested_by="user",
+        )
 
 
 def test_model_policy_revalidates_frozen_endpoint_and_credential_reference(
@@ -585,6 +599,156 @@ def test_frozen_binding_checks_current_credential_before_provider_construction(
         )
 
     assert provider_calls == []
+
+
+def test_local_frozen_binding_checks_current_credential_before_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["models"]["local_qwen"]["api_key_env"] = "LOCAL_AUTH_TOKEN"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    archive = TrustedModelDefinitionArchive(
+        trusted_root / "model-definitions",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    readiness_calls: list[str] = []
+    provider_calls: list[object] = []
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="user",
+        trust_domain=trust,
+        definition_archive=archive,
+        local_runtime_manager=SimpleNamespace(
+            ensure_ready=lambda spec: readiness_calls.append(spec.id)
+        ),
+    )
+    monkeypatch.setenv("LOCAL_AUTH_TOKEN", "present-while-freezing")
+    binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+    monkeypatch.delenv("LOCAL_AUTH_TOKEN")
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_definition",
+        lambda _registry, definition: provider_calls.append(definition),
+    )
+
+    with pytest.raises(ModelNotAvailableError, match="LOCAL_AUTH_TOKEN"):
+        control.resolve_frozen_binding(
+            binding,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+
+    assert readiness_calls == []
+    assert provider_calls == []
+
+
+def test_frozen_binding_requires_resolver_before_local_readiness(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    readiness_calls: list[str] = []
+    control = ModelControlPlane(
+        catalog=ModelCatalog.from_config_file(config_path),
+        state=ModelSessionState(current_model_id="local_qwen"),
+        registry=None,
+        trust_domain=trust,
+        definition_archive=TrustedModelDefinitionArchive(
+            trusted_root / "model-definitions",
+            workspace=workspace,
+            worktree=workspace,
+        ),
+        local_runtime_manager=SimpleNamespace(
+            ensure_ready=lambda spec: readiness_calls.append(spec.id)
+        ),
+    )
+    binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+
+    with pytest.raises(RuntimeError, match="cannot resolve frozen definitions"):
+        control.resolve_frozen_binding(
+            binding,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+
+    assert readiness_calls == []
+
+
+def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    workspace = tmp_path / "workspace"
+    trusted_root = tmp_path / "trusted"
+    workspace.mkdir(mode=0o700)
+    trusted_root.mkdir(mode=0o700)
+    _write_models_config(config_path)
+    trust = ModelBindingTrustDomain(
+        trusted_root / "binding-trust.json",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    archive = TrustedModelDefinitionArchive(
+        trusted_root / "model-definitions",
+        workspace=workspace,
+        worktree=workspace,
+    )
+    trust.initialize()
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="local_qwen",
+        initial_selection_requester="user",
+        trust_domain=trust,
+        definition_archive=archive,
+        local_runtime_manager=SimpleNamespace(ensure_ready=lambda _spec: None),
+    )
+    binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
+    envelope = binding["binding"]
+    assert isinstance(envelope, dict)
+    original_load = archive.load
+
+    def mutate_original_after_verification(revision: str) -> object:
+        envelope["alias"] = "mimo_cloud"
+        return original_load(revision)
+
+    monkeypatch.setattr(archive, "load", mutate_original_after_verification)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve_definition",
+        lambda _registry, _definition: object(),
+    )
+    control.policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo_cloud"}))
+
+    with pytest.raises(ModelPolicyError, match="local_qwen"):
+        control.resolve_frozen_binding(
+            binding,
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
 
 
 def test_agent_selection_requester_paths_are_explicit(tmp_path: Path) -> None:

@@ -47,6 +47,7 @@ class ResolvedModel:
     provider: str = "openai-compatible"
     model: str = "agent-model"
     supports_native_tools: bool = True
+    supports_structured_output: bool = True
     definition_revision: str | None = None
     generation_config: GenerationConfig | None = None
 
@@ -357,10 +358,13 @@ class ModelRegistry:
         from agent_runtime.modeling.gateway import LLMGateway
         from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 
+        generator: object | None = None
         try:
             generator = _build_chat_generator(spec)
-        except Exception as exc:
-            raise ModelNotAvailableError(f"Failed to build provider for {subject}") from exc
+        except Exception:
+            pass
+        if generator is None:
+            raise ModelNotAvailableError(f"Failed to build provider for {subject}")
 
         kwargs: dict[str, Any] = {
             "max_tokens": definition.max_tokens,
@@ -404,6 +408,7 @@ class ModelRegistry:
             provider=definition.provider_name or definition.provider.value,
             model=definition.model,
             supports_native_tools=definition.supports_tools,
+            supports_structured_output=definition.supports_structured_output,
             definition_revision=definition.definition_revision,
             generation_config=_generation_config_from_definition(definition),
         )
@@ -501,6 +506,7 @@ def _build_chat_generator(spec: ModelSpec) -> object:
             base_url=config.base_url,
             api_key=config.api_key,
             supports_tools=spec.supports_tools,
+            timeout_seconds=spec.timeout_seconds,
         )
     if spec.provider is ModelProvider.OLLAMA:
         from agent_runtime.modeling.providers.ollama.generator import OllamaGenerator
