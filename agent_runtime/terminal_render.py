@@ -131,10 +131,6 @@ class BoundedCommandPreview:
             len(line.encode("utf-8")) for line in self._tail
         )
 
-    @property
-    def has_output(self) -> bool:
-        return self._rows > 0 or self._partial.has_content or self._pending_cr
-
     def feed(self, delta: str) -> list[str]:
         if self._finished:
             return []
@@ -282,6 +278,7 @@ class _ItemDisplayState:
     kind: TurnItemKind
     command: BoundedCommandPreview | None = None
     progress: BoundedProgressPreview | None = None
+    command_output_streamed: bool = False
 
 
 class TerminalToolEventDisplay:
@@ -387,9 +384,6 @@ class TerminalToolEventDisplay:
             ItemDeltaKind.COMMAND_STDOUT,
             ItemDeltaKind.COMMAND_STDERR,
         }:
-            if self._verbose:
-                self._render_text(safe_terminal_text(delta), answer=False)
-                return
             if state is None:
                 state = _ItemDisplayState(
                     name="command",
@@ -397,6 +391,10 @@ class TerminalToolEventDisplay:
                     command=BoundedCommandPreview(width=self._width - 2),
                 )
                 self._store_item(key, state)
+            state.command_output_streamed = True
+            if self._verbose:
+                self._render_text(delta, answer=False)
+                return
             if state.command is None:
                 state.command = BoundedCommandPreview(width=self._width - 2)
             for line in state.command.feed(delta):
@@ -439,8 +437,7 @@ class TerminalToolEventDisplay:
         self._flush_item_state(state)
         command_output_streamed = (
             state is not None
-            and state.command is not None
-            and state.command.has_output
+            and state.command_output_streamed
         )
         if event.status is ItemStatus.SUCCESS:
             if event.item_kind is TurnItemKind.COMMAND or name == "run_command":

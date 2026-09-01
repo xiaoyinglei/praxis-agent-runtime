@@ -83,6 +83,7 @@ def _pty_exchange(
     *,
     typed_text: str = "你好",
     backspaces: int = 2,
+    edit_keys: bytes | None = None,
     wait_for_raw_mode: bool = False,
 ) -> str:
     master, slave = os.openpty()
@@ -115,7 +116,10 @@ def _pty_exchange(
                 break
             time.sleep(0.01)
         os.write(master, typed_text.encode())
-        os.write(master, (b"\x7f" * backspaces) + b"\n")
+        os.write(
+            master,
+            edit_keys if edit_keys is not None else (b"\x7f" * backspaces) + b"\n",
+        )
         os.close(slave)
         slave = -1
         while process.poll() is None and time.monotonic() < deadline:
@@ -170,3 +174,41 @@ def test_composer_backspace_removes_one_grapheme_cluster(typed_text: str) -> Non
     )
 
     assert "RESULT=''" in composed
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS PTY integration")
+@pytest.mark.parametrize("typed_text", ["e\u0301", "👨‍👩‍👧‍👦"])
+def test_composer_forward_delete_removes_one_grapheme_cluster(typed_text: str) -> None:
+    composed = _pty_exchange(
+        "from agent_runtime.terminal_input import TerminalComposer; "
+        "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
+        typed_text=typed_text,
+        edit_keys=b"\x1b[H\x1b[3~\n",
+        wait_for_raw_mode=True,
+    )
+
+    assert "RESULT=''" in composed
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS PTY integration")
+@pytest.mark.parametrize("typed_text", ["e\u0301", "👨‍👩‍👧‍👦"])
+def test_composer_cursor_moves_across_one_grapheme_cluster(typed_text: str) -> None:
+    composed = _pty_exchange(
+        "from agent_runtime.terminal_input import TerminalComposer; "
+        "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
+        typed_text=typed_text,
+        edit_keys=b"\x1b[DX\n",
+        wait_for_raw_mode=True,
+    )
+
+    assert f"RESULT={ascii('X' + typed_text)}" in composed
+
+    composed = _pty_exchange(
+        "from agent_runtime.terminal_input import TerminalComposer; "
+        "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
+        typed_text=typed_text,
+        edit_keys=b"\x1b[H\x1b[CX\n",
+        wait_for_raw_mode=True,
+    )
+
+    assert f"RESULT={ascii(typed_text + 'X')}" in composed

@@ -447,3 +447,53 @@ async def test_renderer_streams_bounded_command_once_and_cleans_item_state(
     assert output.count("line 11") == 1
     assert "… +3 lines" in output
     assert display.active_item_count == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("status", [ItemStatus.SUCCESS, ItemStatus.FAILED])
+async def test_renderer_verbose_command_does_not_repeat_streamed_output(
+    status: ItemStatus,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    display = TerminalToolEventDisplay(width=80)
+    display.set_verbose(True)
+    await display.emit(
+        item_started(
+            turn_id="turn-verbose-command",
+            item_id="command-verbose",
+            item_kind=TurnItemKind.COMMAND,
+            data={"tool_name": "run_command"},
+        )
+    )
+    await display.emit(
+        item_delta(
+            turn_id="turn-verbose-command",
+            item_id="command-verbose",
+            item_kind=TurnItemKind.COMMAND,
+            delta_kind=ItemDeltaKind.COMMAND_STDOUT,
+            delta="unique streamed line\n",
+        )
+    )
+    await display.emit(
+        item_completed(
+            turn_id="turn-verbose-command",
+            item_id="command-verbose",
+            item_kind=TurnItemKind.COMMAND,
+            status=status,
+            error="command failed" if status is ItemStatus.FAILED else None,
+            data={
+                "result": {
+                    "tool_name": "run_command",
+                    "structured_content": {
+                        "stdout": "unique streamed line\n",
+                        "stderr": "",
+                        "exit_code": 0 if status is ItemStatus.SUCCESS else 1,
+                        "truncated": False,
+                    },
+                    "truncated": False,
+                }
+            },
+        )
+    )
+
+    assert capsys.readouterr().out.count("unique streamed line") == 1

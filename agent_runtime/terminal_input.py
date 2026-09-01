@@ -38,6 +38,47 @@ def _delete_previous_grapheme(event: KeyPressEvent) -> None:
             return
 
 
+@_COMPOSER_BINDINGS.add("delete", eager=True)
+def _delete_next_grapheme(event: KeyPressEvent) -> None:
+    buffer = event.current_buffer
+    if buffer.selection_state is not None:
+        data = buffer.cut_selection()
+        event.app.clipboard.set_data(data)
+        return
+    cursor = buffer.cursor_position
+    for match in _GRAPHEME.finditer(buffer.text):
+        if match.start() <= cursor < match.end():
+            buffer.document = Document(
+                buffer.text[: match.start()] + buffer.text[match.end() :],
+                cursor_position=match.start(),
+            )
+            return
+
+
+@_COMPOSER_BINDINGS.add("left", eager=True)
+def _move_left_one_grapheme(event: KeyPressEvent) -> None:
+    buffer = event.current_buffer
+    cursor = buffer.cursor_position
+    for match in _GRAPHEME.finditer(buffer.text):
+        if match.start() < cursor <= match.end():
+            buffer.cursor_position = match.start()
+            if buffer.selection_state is not None:
+                buffer.exit_selection()
+            return
+
+
+@_COMPOSER_BINDINGS.add("right", eager=True)
+def _move_right_one_grapheme(event: KeyPressEvent) -> None:
+    buffer = event.current_buffer
+    cursor = buffer.cursor_position
+    for match in _GRAPHEME.finditer(buffer.text):
+        if match.start() <= cursor < match.end():
+            buffer.cursor_position = match.end()
+            if buffer.selection_state is not None:
+                buffer.exit_selection()
+            return
+
+
 class _PromptSession(Protocol):
     def prompt(self, prompt: str) -> str: ...
 
