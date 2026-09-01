@@ -12,6 +12,7 @@ from agent_runtime.core.llm_registry import UnknownModelAliasError
 from agent_runtime.harness import RolloutStore
 from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
+from agent_runtime.streaming.events import ItemStatus, TurnItemKind, item_completed
 
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
@@ -138,6 +139,52 @@ async def test_chat_loop_carries_the_previous_turn_automatically(
     assert calls[0][1]["max_turns"] == 3
     assert calls[0][1]["require_workspace_change"] is False
     assert isinstance(calls[0][1]["event_sink"], cli._CLIToolEventDisplay)
+
+
+@pytest.mark.anyio
+async def test_verbose_command_expands_subsequent_turn_tool_results(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class _Facade:
+        checkpoint_db = tmp_path / "agent.sqlite"
+        workspace_path = tmp_path
+
+        def current_model(self) -> SimpleNamespace:
+            return SimpleNamespace(id="fake-model")
+
+        async def arun(self, message: str, **kwargs: object) -> AgentResult:
+            assert message == "inspect"
+            sink = kwargs["event_sink"]
+            await sink.emit(  # type: ignore[union-attr]
+                item_completed(
+                    turn_id="turn-verbose",
+                    item_id="tool-verbose",
+                    item_kind=TurnItemKind.TOOL,
+                    status=ItemStatus.SUCCESS,
+                    data={
+                        "result": {
+                            "tool_name": "read_file",
+                            "structured_content": {
+                                "lines": [f"line {index}" for index in range(12)]
+                            },
+                        }
+                    },
+                )
+            )
+            return _result(turn_id="turn-verbose", answer="")
+
+    commands = iter(["/verbose", "inspect", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
+
+    await cli._chat_facade_loop(_Facade(), max_tokens_total=None)  # type: ignore[arg-type]
+
+    output = capsys.readouterr().out
+    assert "详细输出: 开" in output
+    assert "line 0" in output
+    assert "line 11" in output
+    assert "/verbose 查看完整结果" not in output
 
 
 @pytest.mark.anyio

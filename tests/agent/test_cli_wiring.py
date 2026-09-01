@@ -177,7 +177,8 @@ async def test_cli_renders_canonical_text_tool_and_plan_items(
     output = capsys.readouterr().out
     assert "answer" in output
     assert "→ read_file: path='a.py'" in output
-    assert "✓ read_file: {'ok': True}" in output
+    assert "✓ read_file\n" in output
+    assert '    "ok": true' in output
     assert "计划 (revision 2)" in output
 
 
@@ -1085,9 +1086,9 @@ async def test_cli_displays_correlated_tool_lifecycle_once(
     output = capsys.readouterr().out
     assert "→ read_file: path='src/service.py'" in output
     assert "… read_file: reading (50%)" in output
-    assert "✓ read_file:" in output
+    assert "✓ read_file\n" in output
     assert "size_bytes" in output
-    assert output.count("✓ read_file:") == 1
+    assert output.count("✓ read_file\n") == 1
 
 
 @pytest.mark.anyio
@@ -1128,7 +1129,7 @@ async def test_cli_displays_patch_diff_from_existing_result_event(
     await display.emit(event)
 
     output = capsys.readouterr().out
-    assert "✓ apply_patch:" in output
+    assert "✓ apply_patch\n" in output
     assert "--- a/src/example.py" in output
     assert "+++ b/src/example.py" in output
     assert "-old" in output

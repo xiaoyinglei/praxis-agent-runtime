@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import builtins
+import sys
 from collections.abc import Iterable
 from typing import Protocol
 
@@ -12,6 +14,11 @@ DEFAULT_HISTORY_BYTES = 64 * 1024
 
 class _PromptSession(Protocol):
     def prompt(self, prompt: str) -> str: ...
+
+
+class _BuiltinInputSession:
+    def prompt(self, prompt: str) -> str:
+        return builtins.input(prompt)
 
 
 class BoundedPromptHistory(History):
@@ -68,10 +75,15 @@ class TerminalComposer:
         history: BoundedPromptHistory | None = None,
     ) -> None:
         self.history = history or BoundedPromptHistory()
-        self._session: _PromptSession = session or PromptSession(
-            history=self.history,
-            enable_history_search=True,
-        )
+        if session is not None:
+            self._session = session
+        elif sys.stdin.isatty() and sys.stdout.isatty():
+            self._session = PromptSession(
+                history=self.history,
+                enable_history_search=True,
+            )
+        else:
+            self._session = _BuiltinInputSession()
 
     def prompt(self, prompt: str = "> ") -> str:
         return self._session.prompt(prompt)

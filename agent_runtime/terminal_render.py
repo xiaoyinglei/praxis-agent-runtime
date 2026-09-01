@@ -1,10 +1,21 @@
 from __future__ import annotations
 
 import json
-from collections import deque
+import shutil
+from collections import OrderedDict, deque
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 import regex
 from wcwidth import wcswidth
+
+from agent_runtime.streaming.events import (
+    EventType,
+    ItemDeltaKind,
+    ItemStatus,
+    StreamEvent,
+    TurnItemKind,
+)
 
 DEFAULT_RESULT_ROWS = 8
 DEFAULT_TERMINAL_WIDTH = 100
@@ -248,3 +259,368 @@ def bounded_result_lines(
     marker = f"… +{omitted} lines (/verbose 查看完整结果)"
     tail = rows[-tail_count:] if tail_count else []
     return [*rows[:head_count], marker, *tail]
+
+
+@dataclass(slots=True)
+class _ItemDisplayState:
+    name: str
+    kind: TurnItemKind
+    command: BoundedCommandPreview | None = None
+    progress: BoundedProgressPreview | None = None
+
+
+class TerminalToolEventDisplay:
+    """Project canonical and legacy stream events into bounded terminal output."""
+
+    def __init__(
+        self,
+        *,
+        width: int | None = None,
+        max_lifecycle_keys: int = 256,
+    ) -> None:
+        if max_lifecycle_keys < 1:
+            raise ValueError("lifecycle key limit must be positive")
+        terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+        self._width = max(20, width if width is not None else terminal_width)
+        self._max_lifecycle_keys = max_lifecycle_keys
+        self._lifecycle: OrderedDict[
+            tuple[str, str, EventType], None
+        ] = OrderedDict()
+        self._items: OrderedDict[tuple[str, str], _ItemDisplayState] = OrderedDict()
+        self._plans: OrderedDict[tuple[str, int | str], None] = OrderedDict()
+        self._verbose = False
+        self._line_open = False
+        self.answer_streamed = False
+
+    @property
+    def lifecycle_key_count(self) -> int:
+        return len(self._lifecycle)
+
+    @property
+    def active_item_count(self) -> int:
+        return len(self._items)
+
+    def set_verbose(self, verbose: bool) -> None:
+        self._verbose = verbose
+
+    async def emit(self, event: StreamEvent) -> None:
+        if event.type is EventType.ITEM_STARTED:
+            self._render_item_start(event)
+        elif event.type is EventType.ITEM_DELTA:
+            self._render_item_delta(event)
+        elif event.type is EventType.ITEM_COMPLETED:
+            self._render_item_completed(event)
+        elif event.type is EventType.TEXT_DELTA:
+            self._render_text(event.data.get("text"))
+        elif event.type is EventType.TOOL_USE_START:
+            self._render_legacy_start(event)
+        elif event.type is EventType.TOOL_USE_PROGRESS:
+            self._render_legacy_progress(event)
+        elif event.type is EventType.TOOL_USE_RESULT:
+            self._render_legacy_result(event)
+        elif event.type is EventType.TOOL_USE_ERROR:
+            self._render_legacy_error(event)
+        elif event.type is EventType.PLAN_UPDATED:
+            self._render_plan(event)
+        elif event.type is EventType.RECOVERY:
+            strategy = event.data.get("strategy")
+            if isinstance(strategy, str) and strategy:
+                detail = event.data.get("detail")
+                suffix = f" — {detail}" if isinstance(detail, str) and detail else ""
+                self._write_line(f"↻ 恢复: {strategy}{suffix}")
+
+    def begin_turn(self) -> None:
+        self.finish()
+        self.answer_streamed = False
+
+    def finish(self) -> None:
+        if self._line_open:
+            print(flush=True)
+            self._line_open = False
+
+    def _render_item_start(self, event: StreamEvent) -> None:
+        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
+            return
+        if event.item_id is None or not self._remember(event, event.item_id):
+            return
+        name_value = event.data.get("tool_name")
+        name = (
+            name_value
+            if isinstance(name_value, str) and name_value
+            else event.item_kind.value
+        )
+        state = _ItemDisplayState(name=name, kind=event.item_kind)
+        if event.item_kind is TurnItemKind.COMMAND:
+            state.command = BoundedCommandPreview(width=self._width - 2)
+        else:
+            state.progress = BoundedProgressPreview()
+        self._store_item((event.turn_id, event.item_id), state)
+        self._render_start_line(name, event.data.get("input_preview"))
+
+    def _render_item_delta(self, event: StreamEvent) -> None:
+        delta = event.data.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return
+        if event.delta_kind is ItemDeltaKind.TEXT:
+            self._render_text(delta)
+            return
+        if event.item_id is None:
+            return
+        key = (event.turn_id, event.item_id)
+        state = self._items.get(key)
+        if event.delta_kind in {
+            ItemDeltaKind.COMMAND_STDOUT,
+            ItemDeltaKind.COMMAND_STDERR,
+        }:
+            if self._verbose:
+                self._render_text(safe_terminal_text(delta), answer=False)
+                return
+            if state is None:
+                state = _ItemDisplayState(
+                    name="command",
+                    kind=TurnItemKind.COMMAND,
+                    command=BoundedCommandPreview(width=self._width - 2),
+                )
+                self._store_item(key, state)
+            if state.command is None:
+                state.command = BoundedCommandPreview(width=self._width - 2)
+            for line in state.command.feed(delta):
+                self._write_line(f"  {line}")
+            return
+        if event.delta_kind is ItemDeltaKind.TOOL_PROGRESS:
+            if state is None:
+                state = _ItemDisplayState(
+                    name="tool",
+                    kind=TurnItemKind.TOOL,
+                    progress=BoundedProgressPreview(),
+                )
+                self._store_item(key, state)
+            if state.progress is None:
+                state.progress = BoundedProgressPreview()
+            progress = state.progress.feed(delta)
+            if progress is not None:
+                self._write_line(f"… {state.name}: {progress}")
+
+    def _render_item_completed(self, event: StreamEvent) -> None:
+        if event.item_kind is TurnItemKind.PLAN:
+            self._render_plan(event)
+            return
+        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
+            return
+        if event.item_id is None or not self._remember(event, event.item_id):
+            return
+        key = (event.turn_id, event.item_id)
+        state = self._items.pop(key, None)
+        result_value = event.data.get("result")
+        result = result_value if isinstance(result_value, Mapping) else {}
+        name_value = result.get("tool_name")
+        name = (
+            name_value
+            if isinstance(name_value, str) and name_value
+            else state.name
+            if state is not None
+            else event.item_kind.value
+        )
+        self._flush_item_state(state)
+        if event.status is ItemStatus.SUCCESS:
+            if event.item_kind is TurnItemKind.COMMAND or name == "run_command":
+                self._write_line(f"✓ {name}{self._command_suffix(result)}")
+            else:
+                self._write_line(f"✓ {name}")
+                structured = result.get("structured_content")
+                if structured is not None:
+                    self._write_result(structured)
+            self._render_truncation_warnings(name, result)
+            self._render_diff(result.get("metadata"))
+            return
+        error = event.error or result.get("error_message")
+        suffix = f": {safe_terminal_text(error)}" if isinstance(error, str) else ""
+        self._write_line(f"✗ {name}{suffix}")
+
+    def _render_legacy_start(self, event: StreamEvent) -> None:
+        tool_id = event.data.get("tool_id")
+        name = event.data.get("tool_name")
+        if not isinstance(tool_id, str) or not tool_id or not isinstance(name, str):
+            return
+        if not self._remember(event, tool_id):
+            return
+        self._store_item(
+            (event.turn_id, tool_id),
+            _ItemDisplayState(
+                name=name,
+                kind=TurnItemKind.TOOL,
+                progress=BoundedProgressPreview(),
+            ),
+        )
+        self._render_start_line(name, event.data.get("input_preview"))
+
+    def _render_legacy_progress(self, event: StreamEvent) -> None:
+        tool_id = event.data.get("tool_id")
+        progress = event.data.get("progress")
+        if not isinstance(tool_id, str) or not isinstance(progress, str):
+            return
+        state = self._items.get((event.turn_id, tool_id))
+        name = state.name if state is not None else "tool"
+        percent = event.data.get("percent")
+        percent_text = f" ({percent:g}%)" if isinstance(percent, (int, float)) else ""
+        self._write_line(f"… {name}: {safe_terminal_text(progress)}{percent_text}")
+
+    def _render_legacy_result(self, event: StreamEvent) -> None:
+        tool_id = event.data.get("tool_id")
+        if not isinstance(tool_id, str) or not tool_id or not self._remember(event, tool_id):
+            return
+        state = self._items.pop((event.turn_id, tool_id), None)
+        name_value = event.data.get("tool_name")
+        name = (
+            name_value
+            if isinstance(name_value, str) and name_value
+            else state.name
+            if state is not None
+            else "tool"
+        )
+        self._flush_item_state(state)
+        self._write_line(f"✓ {name}")
+        result = event.data.get("result")
+        if result is not None and result != "":
+            self._write_result(result)
+        self._render_diff(event.data.get("details"))
+
+    def _render_legacy_error(self, event: StreamEvent) -> None:
+        tool_id = event.data.get("tool_id")
+        if not isinstance(tool_id, str) or not tool_id or not self._remember(event, tool_id):
+            return
+        state = self._items.pop((event.turn_id, tool_id), None)
+        name = state.name if state is not None else "tool"
+        self._flush_item_state(state)
+        error = event.data.get("error")
+        suffix = f": {safe_terminal_text(error)}" if isinstance(error, str) else ""
+        self._write_line(f"✗ {name}{suffix}")
+
+    def _render_plan(self, event: StreamEvent) -> None:
+        plan = event.data.get("plan")
+        if not isinstance(plan, Mapping):
+            return
+        revision = plan.get("revision")
+        if not isinstance(revision, (int, str)):
+            return
+        key = (event.turn_id, revision)
+        if key in self._plans:
+            return
+        self._plans[key] = None
+        if len(self._plans) > self._max_lifecycle_keys:
+            self._plans.popitem(last=False)
+        self._write_line(f"计划 (revision {revision})")
+        steps = plan.get("steps")
+        if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
+            return
+        symbols = {"completed": "✓", "in_progress": "→", "failed": "✗"}
+        for step in steps:
+            if not isinstance(step, Mapping):
+                continue
+            title = step.get("title")
+            if not isinstance(title, str) or not title:
+                continue
+            status = step.get("status")
+            symbol = symbols.get(status, "○") if isinstance(status, str) else "○"
+            self._write_line(f"  {symbol} {safe_terminal_text(title)}")
+
+    def _render_start_line(self, name: str, preview: object) -> None:
+        if not isinstance(preview, str) or not preview:
+            self._write_line(f"→ {name}")
+            return
+        lines = bounded_result_lines(preview, width=self._width - len(name) - 4, max_rows=2)
+        self._write_line(f"→ {name}: {lines[0]}")
+        for line in lines[1:]:
+            self._write_line(f"  {line}")
+
+    def _write_result(self, value: object) -> None:
+        for line in bounded_result_lines(
+            value,
+            width=self._width - 2,
+            verbose=self._verbose,
+        ):
+            self._write_line(f"  {line}")
+
+    def _flush_item_state(self, state: _ItemDisplayState | None) -> None:
+        if state is None:
+            return
+        if state.command is not None and not self._verbose:
+            for line in state.command.finish():
+                self._write_line(f"  {line}")
+        if state.progress is not None:
+            marker = state.progress.finish()
+            if marker is not None:
+                self._write_line(f"… {state.name}: {marker}")
+
+    def _render_truncation_warnings(
+        self,
+        name: str,
+        result: Mapping[str, object],
+    ) -> None:
+        if result.get("truncated") is True:
+            self._write_line("⚠ 工具结果已由 ACI 截断。")
+        structured = result.get("structured_content")
+        if (
+            name == "run_command"
+            and isinstance(structured, Mapping)
+            and structured.get("truncated") is True
+        ):
+            self._write_line("⚠ 命令输出达到工具预算，已保留头尾。")
+
+    def _render_diff(self, metadata: object) -> None:
+        if not isinstance(metadata, Mapping):
+            return
+        diff = metadata.get("diff")
+        if isinstance(diff, str) and diff:
+            self._write_block(safe_terminal_text(diff))
+
+    def _command_suffix(self, result: Mapping[str, object]) -> str:
+        structured = result.get("structured_content")
+        if not isinstance(structured, Mapping):
+            return ""
+        fields: list[str] = []
+        for key in ("exit_code", "timed_out", "duration_ms"):
+            value = structured.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                fields.append(f"{key}={value}")
+        return f": {', '.join(fields)}" if fields else ""
+
+    def _remember(self, event: StreamEvent, identity: str) -> bool:
+        key = (event.turn_id, identity, event.type)
+        if key in self._lifecycle:
+            self._lifecycle.move_to_end(key)
+            return False
+        self._lifecycle[key] = None
+        if len(self._lifecycle) > self._max_lifecycle_keys:
+            self._lifecycle.popitem(last=False)
+        return True
+
+    def _store_item(
+        self,
+        key: tuple[str, str],
+        state: _ItemDisplayState,
+    ) -> None:
+        self._items[key] = state
+        self._items.move_to_end(key)
+        if len(self._items) > self._max_lifecycle_keys:
+            self._items.popitem(last=False)
+
+    def _render_text(self, value: object, *, answer: bool = True) -> None:
+        if not isinstance(value, str) or not value:
+            return
+        print(value, end="", flush=True)
+        if answer:
+            self.answer_streamed = True
+        self._line_open = not value.endswith("\n")
+
+    def _write_line(self, value: str) -> None:
+        if self._line_open:
+            print()
+        print(value, flush=True)
+        self._line_open = False
+
+    def _write_block(self, value: str) -> None:
+        if self._line_open:
+            print()
+        print(value.rstrip("\n"), flush=True)
+        self._line_open = False

@@ -35,13 +35,8 @@ from agent_runtime.models import (
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
-from agent_runtime.streaming.events import (
-    EventType,
-    ItemDeltaKind,
-    ItemStatus,
-    StreamEvent,
-    TurnItemKind,
-)
+from agent_runtime.terminal_input import TerminalComposer
+from agent_runtime.terminal_render import TerminalToolEventDisplay
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -69,246 +64,8 @@ class _CLITurn:
     status: str
     runtime: _CLIRuntimeBinding
 
-class _CLIToolEventDisplay:
-    """Project canonical stream events into bounded terminal output."""
 
-    def __init__(self) -> None:
-        self._displayed_tool_ids: set[str] = set()
-        self._displayed_tool_events: set[tuple[EventType, str]] = set()
-        self._displayed_plan_revisions: set[int | str] = set()
-        self._tool_names: dict[str, str] = {}
-        self._line_open = False
-        self.answer_streamed = False
-
-    async def emit(self, event: StreamEvent) -> None:
-        if event.type is EventType.ITEM_STARTED:
-            self._render_canonical_item_start(event)
-            return
-        if event.type is EventType.ITEM_DELTA:
-            self._render_canonical_item_delta(event)
-            return
-        if event.type is EventType.ITEM_COMPLETED:
-            self._render_canonical_item_completed(event)
-            return
-        if event.type is EventType.TEXT_DELTA:
-            text = event.data.get("text")
-            if not isinstance(text, str) or not text:
-                return
-            print(text, end="", flush=True)
-            self.answer_streamed = True
-            self._line_open = not text.endswith("\n")
-            return
-
-        if event.type is EventType.TOOL_USE_START:
-            self._render_tool_start(event)
-            return
-        if event.type is EventType.TOOL_USE_PROGRESS:
-            self._render_tool_progress(event)
-            return
-        if event.type is EventType.TOOL_USE_RESULT:
-            self._render_tool_result(event)
-            return
-        if event.type is EventType.TOOL_USE_ERROR:
-            self._render_tool_error(event)
-            return
-        if event.type is EventType.PLAN_UPDATED:
-            self._render_plan(event)
-            return
-        if event.type is EventType.RECOVERY:
-            strategy = event.data.get("strategy")
-            if not isinstance(strategy, str) or not strategy:
-                return
-            detail = event.data.get("detail")
-            suffix = f" — {detail}" if isinstance(detail, str) and detail else ""
-            self._write_line(f"↻ 恢复: {strategy}{suffix}")
-
-    def _render_canonical_item_start(self, event: StreamEvent) -> None:
-        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
-            return
-        item_id = event.item_id
-        tool_name = event.data.get("tool_name")
-        if not isinstance(item_id, str) or not isinstance(tool_name, str):
-            return
-        if item_id in self._displayed_tool_ids:
-            return
-        self._displayed_tool_ids.add(item_id)
-        self._tool_names[item_id] = tool_name
-        preview = event.data.get("input_preview")
-        suffix = f": {preview}" if isinstance(preview, str) and preview else ""
-        self._write_line(f"→ {tool_name}{suffix}")
-
-    def _render_canonical_item_delta(self, event: StreamEvent) -> None:
-        delta = event.data.get("delta")
-        if not isinstance(delta, str) or not delta:
-            return
-        if event.delta_kind is ItemDeltaKind.TEXT:
-            print(delta, end="", flush=True)
-            self.answer_streamed = True
-            self._line_open = not delta.endswith("\n")
-            return
-        if event.delta_kind in {
-            ItemDeltaKind.COMMAND_STDOUT,
-            ItemDeltaKind.COMMAND_STDERR,
-        }:
-            print(delta, end="", flush=True)
-            self._line_open = not delta.endswith("\n")
-            return
-        if event.delta_kind is ItemDeltaKind.TOOL_PROGRESS:
-            name = self._tool_names.get(event.item_id or "", "tool")
-            self._write_line(f"… {name}: {delta}")
-
-    def _render_canonical_item_completed(self, event: StreamEvent) -> None:
-        if event.item_kind is TurnItemKind.PLAN:
-            self._render_plan(event)
-            return
-        if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
-            return
-        item_id = event.item_id
-        if not isinstance(item_id, str):
-            return
-        marker = (EventType.ITEM_COMPLETED, item_id)
-        if marker in self._displayed_tool_events:
-            return
-        self._displayed_tool_events.add(marker)
-        result = event.data.get("result")
-        result_map = result if isinstance(result, Mapping) else {}
-        event_name = result_map.get("tool_name")
-        tool_name = (
-            event_name
-            if isinstance(event_name, str) and event_name
-            else self._tool_names.get(item_id, event.item_kind.value)
-        )
-        if event.status is ItemStatus.SUCCESS:
-            structured = result_map.get("structured_content")
-            suffix = (
-                f": {_bounded_cli_text(str(structured))}"
-                if structured is not None
-                else ""
-            )
-            self._write_line(f"✓ {tool_name}{suffix}")
-            metadata = result_map.get("metadata")
-            if isinstance(metadata, Mapping):
-                diff = metadata.get("diff")
-                if isinstance(diff, str) and diff:
-                    self._write_block(diff)
-            return
-        error = event.error or result_map.get("error_message")
-        suffix = f": {_bounded_cli_text(error)}" if isinstance(error, str) else ""
-        self._write_line(f"✗ {tool_name}{suffix}")
-
-    def _render_tool_start(self, event: StreamEvent) -> None:
-        tool_id = event.data.get("tool_id")
-        if not isinstance(tool_id, str) or not tool_id:
-            return
-        if tool_id in self._displayed_tool_ids:
-            return
-        self._displayed_tool_ids.add(tool_id)
-        tool_name = event.data.get("tool_name")
-        if not isinstance(tool_name, str) or not tool_name:
-            return
-        self._tool_names[tool_id] = tool_name
-        preview = event.data.get("input_preview")
-        suffix = f": {preview}" if isinstance(preview, str) and preview else ""
-        self._write_line(f"→ {tool_name}{suffix}")
-
-    def _render_tool_progress(self, event: StreamEvent) -> None:
-        tool_id = event.data.get("tool_id")
-        progress = event.data.get("progress")
-        if not isinstance(tool_id, str) or not isinstance(progress, str):
-            return
-        tool_name = self._tool_names.get(tool_id, "tool")
-        percent = event.data.get("percent")
-        percent_text = f" ({percent:g}%)" if isinstance(percent, (int, float)) else ""
-        self._write_line(f"… {tool_name}: {progress}{percent_text}")
-
-    def _render_tool_result(self, event: StreamEvent) -> None:
-        tool_id = event.data.get("tool_id")
-        if not isinstance(tool_id, str) or not tool_id:
-            return
-        marker = (EventType.TOOL_USE_RESULT, tool_id)
-        if marker in self._displayed_tool_events:
-            return
-        self._displayed_tool_events.add(marker)
-        event_name = event.data.get("tool_name")
-        tool_name = event_name if isinstance(event_name, str) and event_name else self._tool_names.get(tool_id, "tool")
-        result = event.data.get("result")
-        suffix = f": {_bounded_cli_text(str(result))}" if result is not None else ""
-        self._write_line(f"✓ {tool_name}{suffix}")
-        details = event.data.get("details")
-        if not isinstance(details, Mapping):
-            return
-        diff = details.get("diff")
-        if isinstance(diff, str) and diff:
-            self._write_block(diff)
-
-    def _render_tool_error(self, event: StreamEvent) -> None:
-        tool_id = event.data.get("tool_id")
-        if not isinstance(tool_id, str) or not tool_id:
-            return
-        marker = (EventType.TOOL_USE_ERROR, tool_id)
-        if marker in self._displayed_tool_events:
-            return
-        self._displayed_tool_events.add(marker)
-        error = event.data.get("error")
-        suffix = f": {_bounded_cli_text(error)}" if isinstance(error, str) and error else ""
-        self._write_line(f"✗ {self._tool_names.get(tool_id, 'tool')}{suffix}")
-
-    def _render_plan(self, event: StreamEvent) -> None:
-        plan = event.data.get("plan")
-        if not isinstance(plan, Mapping):
-            return
-        revision = plan.get("revision")
-        if not isinstance(revision, (int, str)):
-            return
-        if revision in self._displayed_plan_revisions:
-            return
-        self._displayed_plan_revisions.add(revision)
-        self._write_line(f"计划 (revision {revision})")
-        steps = plan.get("steps")
-        if not isinstance(steps, Sequence) or isinstance(steps, (str, bytes)):
-            return
-        symbols = {
-            "completed": "✓",
-            "in_progress": "→",
-            "failed": "✗",
-        }
-        for step in steps:
-            if not isinstance(step, Mapping):
-                continue
-            title = step.get("title")
-            if not isinstance(title, str) or not title:
-                continue
-            status = step.get("status")
-            symbol = symbols.get(status, "○") if isinstance(status, str) else "○"
-            self._write_line(f"  {symbol} {title}")
-
-    def _write_line(self, value: str) -> None:
-        if self._line_open:
-            print()
-        print(value, flush=True)
-        self._line_open = False
-
-    def _write_block(self, value: str) -> None:
-        if self._line_open:
-            print()
-        print(value.rstrip("\n"), flush=True)
-        self._line_open = False
-
-    def begin_turn(self) -> None:
-        self.finish()
-        self.answer_streamed = False
-
-    def finish(self) -> None:
-        if self._line_open:
-            print(flush=True)
-            self._line_open = False
-
-
-def _bounded_cli_text(value: str, *, limit: int = 180) -> str:
-    compact = " ".join(value.split())
-    if len(compact) <= limit:
-        return compact
-    return f"{compact[: limit - 1]}…"
+_CLIToolEventDisplay = TerminalToolEventDisplay
 
 
 def _load_knowledge_config(path: Path | None) -> RAGKnowledgeConfig | None:
@@ -744,6 +501,7 @@ async def _chat_facade_loop(
     allow_execute_tools: bool = False,
 ) -> None:
     event_display = _CLIToolEventDisplay()
+    composer = TerminalComposer()
     current_turn_id = previous_turn_id
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
@@ -752,7 +510,7 @@ async def _chat_facade_loop(
     _print_startup_banner(model_alias)
     while True:
         try:
-            query = input("> ").strip()
+            query = composer.prompt("> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见。")
             return
@@ -777,6 +535,7 @@ async def _chat_facade_loop(
             continue
         if query == "/verbose":
             verbose = not verbose
+            event_display.set_verbose(verbose)
             print(f"详细输出: {'开' if verbose else '关'}")
             continue
         if query == "/model" or query.startswith("/model "):
