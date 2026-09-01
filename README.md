@@ -162,6 +162,14 @@ $ uv run agent chat
 已切换模型: another-alias
 ```
 
+Interactive chat uses a Unicode-aware line editor, so Backspace/Delete and
+cursor movement operate on complete Chinese characters and emoji. Tool and
+command events are rendered as correlated lifecycle items. The default view
+keeps a readable head and tail for long output and reports the exact omitted
+row count instead of cutting a result mid-value. Enter `/verbose` between Turns
+to show complete subsequent tool results. A separate warning identifies output
+already truncated by the tool or ACI; UI folding never changes durable history.
+
 The next message keeps the current conversation history and creates a new Turn
 bound to the selected alias; no restart or `/new` is required. An invalid alias
 prints the available aliases, keeps the previous model, and does not contact a

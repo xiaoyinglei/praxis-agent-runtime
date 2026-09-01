@@ -93,6 +93,12 @@ uv run agent chat
 已切换模型: another-alias
 ```
 
+`agent chat` 使用 Unicode-aware Composer，中文和 emoji 的退格、Delete、光标移动按
+完整字符处理。工具与命令按同一个 Item 生命周期显示；长输出默认保留头尾并明确显示
+省略行数，不再在字典或句子中间硬切。可在两个 Turn 之间输入 `/verbose`，让后续工具
+结果完整展开。若工具或 ACI 本身已经丢弃超预算内容，CLI 会另行警告；这与 UI 折叠
+不同，verbose 不能恢复上游未保留的数据。
+
 也可写 `/model switch <alias>`；`/model current` 只看当前详情，`/model list`
 只列 catalog。成功切换后，当前聊天的下一条消息继续使用原来的
 `previous_turn_id` 历史，但新 Turn 会绑定新 alias，因此不需要退出、重启或
