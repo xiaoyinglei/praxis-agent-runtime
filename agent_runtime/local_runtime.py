@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import signal
 import subprocess
 import time
 from collections.abc import Callable
+from threading import Lock
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
 
@@ -111,6 +113,36 @@ class LocalRuntimeManager:
             self._stop_process(process)
 
 
+_process_runtime_lock = Lock()
+_process_runtime_manager: LocalRuntimeManager | None = None
+
+def get_process_local_runtime_manager() -> LocalRuntimeManager:
+    global _process_runtime_manager
+
+    manager = _process_runtime_manager
+    if manager is not None:
+        return manager
+
+    with _process_runtime_lock:
+        manager = _process_runtime_manager
+        if manager is None:
+            manager = LocalRuntimeManager()
+            _process_runtime_manager = manager
+        return manager
+
+
+def close_process_local_runtime_manager() -> None:
+    global _process_runtime_manager
+
+    with _process_runtime_lock:
+        manager = _process_runtime_manager
+        _process_runtime_manager = None
+
+    if manager is not None:
+        manager.close()
+
+atexit.register(close_process_local_runtime_manager)
+
 def _request_json(url: str, timeout: float) -> object:
     with urlopen(url, timeout=timeout) as response:  # noqa: S310 - local/user-configured health URL
         return json.loads(response.read().decode("utf-8"))
@@ -207,4 +239,6 @@ __all__ = [
     "LocalRuntimeError",
     "LocalRuntimeManager",
     "LocalRuntimeTimeoutError",
+    "close_process_local_runtime_manager",
+    "get_process_local_runtime_manager",
 ]

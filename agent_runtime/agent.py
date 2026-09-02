@@ -603,8 +603,10 @@ class Agent:
 
             workspace = self._workspace_path()
             session_path = self.model_session_path
+
             if session_path is not None and not session_path.is_absolute():
                 session_path = workspace / session_path
+
             self._model_control_plane = ModelControlPlane.from_env(
                 initial_model_id=self.model,
                 initial_selection_requester=self._selection_requester,
@@ -612,6 +614,7 @@ class Agent:
                 workspace=workspace,
                 worktree=discover_git_worktree(workspace),
             )
+
         return self._model_control_plane
 
     async def _close_model_control_plane(self) -> None:

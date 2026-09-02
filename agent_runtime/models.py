@@ -56,8 +56,12 @@ ModelOrigin = Literal["builtin", "user", "override"]
 _MISSING_SESSION_FINGERPRINT = "missing"
 
 
-class LocalRuntimeReadyManager(Protocol):
-    def ensure_ready(self, spec: ModelSpec) -> None: ...
+class LocalProviderReadinessProbe(Protocol):
+    def ensure_ready(
+        self,
+        spec: ModelSpec,
+    ) -> None: ...
+
 
 
 class ModelPolicyError(ValueError):
@@ -475,26 +479,47 @@ class ModelControlPlane:
         policy: ModelPolicy | None = None,
         registry: ModelResolver | None = None,
         session_path: Path | None = None,
-        local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        local_provider_probe: LocalProviderReadinessProbe | None = None,
         session_diagnostics: tuple[str, ...] = (),
         trust_domain: ModelBindingTrustDomain | None = None,
         definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> None:
         if not catalog.has(state.current_model_id):
-            raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
+            raise UnknownModelAliasError(
+                f"Model alias {state.current_model_id!r} "
+                "not found in catalog"
+            )
+
         self.catalog = catalog
         self.state = state
         self.policy = policy or ModelPolicy()
+
         self.policy.review_switch(
             catalog=self.catalog,
             target_model_id=self.state.current_model_id,
             requested_by=self.state.selection_requester,
         )
+
         self._registry = registry
         self._session_path = session_path
-        self._session_store = ModelSessionStore(session_path) if session_path is not None else None
-        self._pending_session_receipt: SessionMutationReceipt | None = None
-        self._local_runtime_manager = local_runtime_manager
+        self._session_store = (
+            ModelSessionStore(session_path)
+            if session_path is not None
+            else None
+        )
+        self._pending_session_receipt: (
+            SessionMutationReceipt | None
+        ) = None
+
+        if local_provider_probe is None:
+            from agent_runtime.local_runtime import (
+                LocalProviderProbe,
+            )
+
+            local_provider_probe = LocalProviderProbe()
+
+        self._local_provider_probe = local_provider_probe
+
         self._trust_domain = trust_domain
         self._definition_archive = definition_archive
         self.session_diagnostics = session_diagnostics
@@ -508,7 +533,7 @@ class ModelControlPlane:
         initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
-        local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        local_provider_probe: LocalProviderReadinessProbe | None = None,
         trust_domain: ModelBindingTrustDomain | None = None,
         definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> ModelControlPlane:
@@ -519,7 +544,7 @@ class ModelControlPlane:
             initial_selection_requester=initial_selection_requester,
             session_path=session_path,
             policy=policy,
-            local_runtime_manager=local_runtime_manager,
+            local_provider_probe=local_provider_probe,
             trust_domain=trust_domain,
             definition_archive=definition_archive,
         )
@@ -533,7 +558,7 @@ class ModelControlPlane:
         initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
-        local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        local_provider_probe: LocalProviderReadinessProbe | None = None,
         trust_domain: ModelBindingTrustDomain | None = None,
         definition_archive: TrustedModelDefinitionArchive | None = None,
         workspace: Path | None = None,
@@ -567,7 +592,7 @@ class ModelControlPlane:
             initial_selection_requester=initial_selection_requester,
             session_path=session_path,
             policy=policy,
-            local_runtime_manager=local_runtime_manager,
+            local_provider_probe=local_provider_probe,
             trust_domain=effective_trust,
             definition_archive=effective_archive,
         )
@@ -581,7 +606,7 @@ class ModelControlPlane:
         initial_selection_requester: ModelSwitchRequester = "system",
         session_path: Path | None = None,
         policy: ModelPolicy | None = None,
-        local_runtime_manager: LocalRuntimeReadyManager | None = None,
+        local_provider_probe: LocalProviderReadinessProbe | None = None,
         trust_domain: ModelBindingTrustDomain | None = None,
         definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> ModelControlPlane:
@@ -600,7 +625,7 @@ class ModelControlPlane:
             policy=effective_policy,
             registry=registry,
             session_path=session_path,
-            local_runtime_manager=local_runtime_manager,
+            local_provider_probe=local_provider_probe,
             session_diagnostics=diagnostics,
             trust_domain=trust_domain,
             definition_archive=definition_archive,
@@ -798,31 +823,30 @@ class ModelControlPlane:
         model_id = node_model or self.state.current_model_id
         return self.resolve(model_id)
 
-    def _ensure_model_ready(self, spec: ModelSpec) -> None:
+    def _ensure_model_ready(
+        self,
+        spec: ModelSpec,
+    ) -> None:
         if spec.api_key_env:
-            value = os.environ.get(spec.api_key_env)
-            if not isinstance(value, str) or not value.strip():
+            value = os.environ.get(
+                spec.api_key_env
+            )
+
+            if (
+                not isinstance(value, str)
+                or not value.strip()
+            ):
                 raise ModelNotAvailableError(
-                    f"Model {spec.id!r} is unavailable because environment variable "
-                    f"{spec.api_key_env} is not set. Export it or add it to .env; "
-                    "use AGENT_ENV_FILE to select a different env file"
+                    f"Model {spec.id!r} is unavailable "
+                    "because environment variable "
+                    f"{spec.api_key_env} is not set. "
+                    "Export it or add it to .env; "
+                    "use AGENT_ENV_FILE to select "
+                    "a different env file"
                 )
+
         if spec.location == "local":
-            manager = self._local_runtime_manager
-            if manager is None:
-                from agent_runtime.local_runtime import LocalRuntimeManager
-
-                manager = cast(LocalRuntimeReadyManager, LocalRuntimeManager())
-                self._local_runtime_manager = manager
-            manager.ensure_ready(spec)
-            return
-
-    def close(self) -> None:
-        manager = self._local_runtime_manager
-        close = getattr(manager, "close", None)
-        if callable(close):
-            close()
-
+            self._local_provider_probe.ensure_ready(spec)
 
 def _load_session_state(
     *,
