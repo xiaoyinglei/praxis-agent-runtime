@@ -77,7 +77,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def arun(self, *args: object, **kwargs: object) -> AgentResult:
+        async def run(self, *args: object, **kwargs: object) -> AgentResult:
             turn_calls.append((args, kwargs))
             raise AssertionError("slash commands must not reach the agent")
 
@@ -116,7 +116,7 @@ async def test_chat_loop_carries_the_previous_turn_automatically(
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def arun(
+        async def run(
             self,
             message: str,
             **kwargs: object,
@@ -154,7 +154,7 @@ async def test_verbose_command_expands_subsequent_turn_tool_results(
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def arun(self, message: str, **kwargs: object) -> AgentResult:
+        async def run(self, message: str, **kwargs: object) -> AgentResult:
             assert message == "inspect"
             sink = kwargs["event_sink"]
             await sink.emit(  # type: ignore[union-attr]
@@ -248,7 +248,7 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
             selected = model_id
             return models[model_id]
 
-        async def arun(
+        async def run(
             self,
             message: str,
             **kwargs: object,
@@ -295,7 +295,7 @@ async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_tur
             switch_attempts.append(model_id)
             raise UnknownModelAliasError(f"Model alias {model_id!r} not found in catalog")
 
-        async def arun(self, message: str, **kwargs: object) -> AgentResult:
+        async def run(self, message: str, **kwargs: object) -> AgentResult:
             del kwargs
             turn_calls.append(message)
             return _result()

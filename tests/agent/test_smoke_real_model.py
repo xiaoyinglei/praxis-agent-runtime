@@ -37,7 +37,7 @@ class TestRealModelSmoke:
     async def test_hello(self, tmp_path: Path) -> None:
         """Agent returns a simple text response via DeepSeek."""
         agent = _deepseek_agent(tmp_path)
-        result = await agent.arun(
+        result = await agent.run(
             'Say exactly: "OK"',
             max_turns=10,
             require_workspace_change=False,
@@ -50,7 +50,7 @@ class TestRealModelSmoke:
     async def test_simple_math(self, tmp_path: Path) -> None:
         """Model answers 2+2 correctly."""
         agent = _deepseek_agent(tmp_path)
-        result = await agent.arun(
+        result = await agent.run(
             "What is 2 + 2? Answer with just the number.",
             max_turns=10,
             require_workspace_change=False,

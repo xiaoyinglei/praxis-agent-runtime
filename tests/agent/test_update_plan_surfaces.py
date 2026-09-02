@@ -89,7 +89,7 @@ async def _run_plan_turn(
     model = _UpdatePlanThenAnswerModel()
     agent._harness_model = lambda: model
 
-    result = await agent.arun(
+    result = await agent.run(
         "Make update_plan durable.",
         require_workspace_change=False,
     )

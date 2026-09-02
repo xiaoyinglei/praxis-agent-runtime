@@ -74,7 +74,7 @@ def test_agent_resume_uses_public_facade_and_stable_result(
     facade_options: list[dict[str, object]] = []
 
     class _Facade:
-        async def aresume(
+        async def resume(
             self,
             turn_id: str,
             action: str,
@@ -133,7 +133,7 @@ def test_schema_v2_resume_ignores_unsigned_top_level_model_alias(
     facade_options: list[dict[str, object]] = []
 
     class _Facade:
-        async def aresume(self, *_args: object, **_kwargs: object) -> AgentResult:
+        async def resume(self, *_args: object, **_kwargs: object) -> AgentResult:
             return _result(turn_id=turn_id, answer="resumed")
 
     def create_facade(**kwargs: object) -> _Facade:
@@ -192,7 +192,7 @@ async def test_public_legacy_resume_reaches_exact_provider_resume_error(
         RuntimeError,
         match="legacy model binding is incomplete and cannot be resumed safely",
     ):
-        await agent.aresume(
+        await agent.resume(
             turn.turn_id,
             "continue",
             user_input="target A",
@@ -223,14 +223,14 @@ def test_agent_resume_without_action_prints_pending_recovery_info(
     resumed: list[bool] = []
 
     class _Facade:
-        async def apending_input(
+        async def pending_input(
             self,
             passed_turn_id: str,
         ) -> AgentPause:
             assert passed_turn_id == turn_id
             return request
 
-        async def aresume(self, **_kwargs: object) -> AgentResult:
+        async def resume(self, **_kwargs: object) -> AgentResult:
             resumed.append(True)
             raise AssertionError("inspection must not mutate the Turn")
 
@@ -263,7 +263,7 @@ def test_agent_resume_without_pending_request_offers_continue(
     turn_id = _persist_cli_turn(database, tmp_path / "workspace")
 
     class _Facade:
-        async def apending_input(
+        async def pending_input(
             self,
             passed_turn_id: str,
         ) -> None:
@@ -333,13 +333,13 @@ async def test_inline_approval_uses_public_execution_chain(
     turn_id = str(uuid4())
 
     class _Facade:
-        async def arun(self, task: str, **kwargs: object) -> AgentResult:
+        async def run(self, task: str, **kwargs: object) -> AgentResult:
             assert task == "run tests"
             displays.append(kwargs["event_sink"])
             calls.append("execute")
             return _result(turn_id=turn_id, status="paused", pause=pause)
 
-        async def aresume(
+        async def resume(
             self,
             turn_id: str,
             action: str,

@@ -87,34 +87,7 @@ class Agent:
         self._followup_model_id = spec.id
         return spec
 
-    def run(
-        self,
-        task: str,
-        *,
-        previous_turn_id: str | None = None,
-        files: Sequence[str] | None = None,
-        max_turns: int | None = None,
-        max_tokens_total: int | None = None,
-        require_workspace_change: bool = True,
-        allow_write_tools: bool = False,
-        allow_execute_tools: bool = False,
-        event_sink: AgentEventSink | None = None,
-    ) -> AgentResult:
-        return asyncio.run(
-            self.arun(
-                task,
-                previous_turn_id=previous_turn_id,
-                files=files,
-                max_turns=max_turns,
-                max_tokens_total=max_tokens_total,
-                require_workspace_change=require_workspace_change,
-                allow_write_tools=allow_write_tools,
-                allow_execute_tools=allow_execute_tools,
-                event_sink=event_sink,
-            )
-        )
-
-    async def arun(
+    async def run(
         self,
         task: str,
         *,
@@ -154,24 +127,7 @@ class Agent:
                 files=tuple(files or ()),
             )
 
-    def resume(
-        self,
-        turn_id: str,
-        action: str,
-        *,
-        user_input: str | None = None,
-        event_sink: AgentEventSink | None = None,
-    ) -> AgentResult:
-        return asyncio.run(
-            self.aresume(
-                turn_id,
-                action,
-                user_input=user_input,
-                event_sink=event_sink,
-            )
-        )
-
-    async def aresume(
+    async def resume(
         self,
         turn_id: str,
         action: str,
@@ -323,10 +279,7 @@ class Agent:
                 raise RuntimeError("resume action does not match the Turn's durable pending state")
             return AgentResult._from_harness(internal, store=runtime.store)
 
-    def read_result(self, turn_id: str) -> AgentResult:
-        return asyncio.run(self.aread_result(turn_id))
-
-    async def aread_result(self, turn_id: str) -> AgentResult:
+    async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
         with RolloutStore(self._harness_database()) as store:
@@ -365,7 +318,7 @@ class Agent:
                 store=store,
             )
 
-    async def astream(
+    async def stream(
         self,
         task: str,
         *,
@@ -382,7 +335,7 @@ class Agent:
         dispatcher = TurnEventDispatcher()
         stream = dispatcher.subscribe_controlling()
         run_task = asyncio.create_task(
-            self.arun(
+            self.run(
                 task,
                 previous_turn_id=previous_turn_id,
                 files=files,
@@ -417,10 +370,7 @@ class Agent:
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)
 
-    def pending_input(self, turn_id: str) -> AgentPause | None:
-        return asyncio.run(self.apending_input(turn_id))
-
-    async def apending_input(self, turn_id: str) -> AgentPause | None:
+    async def pending_input(self, turn_id: str) -> AgentPause | None:
         from agent_runtime.harness import RolloutStore, TurnResult
 
         with RolloutStore(self._harness_database()) as store:
@@ -456,6 +406,8 @@ class Agent:
         with RolloutStore(self._harness_database()) as store:
             turn = store.read_turn(turn_id)
             thread = store.read_thread(turn.thread_id)
+            if Path(thread.workspace).expanduser().resolve() != self._workspace_path():
+                raise RuntimeError("turn belongs to a different workspace security domain")
             alias = (
                 None
                 if "authentication_schema_version" in turn.binding_manifest

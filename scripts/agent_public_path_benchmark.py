@@ -681,7 +681,7 @@ def _crash_child(args: argparse.Namespace) -> int:
         model_session_path=args.model_session_path,
     )
     asyncio.run(
-        agent.arun(
+        agent.run(
             args.prompt,
             max_turns=30,
             require_workspace_change=True,

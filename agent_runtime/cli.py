@@ -413,7 +413,7 @@ async def _run_facade_command(
     display = event_display or _CLIToolEventDisplay()
     try:
         display.begin_turn()
-        result = await facade.arun(
+        result = await facade.run(
             task,
             previous_turn_id=previous_turn_id,
             files=files,
@@ -430,7 +430,7 @@ async def _run_facade_command(
             if action is None:
                 break
             display.begin_turn()
-            result = await facade.aresume(
+            result = await facade.resume(
                 result.turn_id,
                 action,
                 event_sink=display,
@@ -451,7 +451,7 @@ async def _resume_facade_command(
     display = event_display or _CLIToolEventDisplay()
     display.begin_turn()
     try:
-        return await facade.aresume(
+        return await facade.resume(
             turn_id,
             action,
             user_input=user_input,
@@ -470,7 +470,7 @@ async def _pending_resume_request(
     display = event_display or _CLIToolEventDisplay()
     display.begin_turn()
     try:
-        return await facade.apending_input(turn_id)
+        return await facade.pending_input(turn_id)
     finally:
         display.finish()
 
@@ -550,7 +550,7 @@ async def _chat_facade_loop(
             continue
 
         event_display.begin_turn()
-        result = await facade.arun(
+        result = await facade.run(
             query,
             previous_turn_id=current_turn_id,
             max_turns=max_turns,
@@ -568,7 +568,7 @@ async def _chat_facade_loop(
                 print("已取消。")
                 break
             event_display.begin_turn()
-            result = await facade.aresume(
+            result = await facade.resume(
                 result.turn_id,
                 action,
                 event_sink=event_display,

@@ -654,7 +654,7 @@ async def test_run_live_case_leaves_workspace_change_checks_to_the_evaluator(
         def __init__(self, **_kwargs: object) -> None:
             self._turn_store = None
 
-        async def arun(
+        async def run(
             self,
             _task: str,
             *,
@@ -773,10 +773,10 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
                 ),
             )
 
-        async def arun(self, _task: str, **_kwargs: object) -> object:
+        async def run(self, _task: str, **_kwargs: object) -> object:
             return self.result(status="paused")
 
-        async def aresume(self, _turn_id: str, action: str) -> object:
+        async def resume(self, _turn_id: str, action: str) -> object:
             resume_actions.append(action)
             if len(resume_actions) == 1:
                 self.runtime_file.write_text("after_gate\n", encoding="utf-8")
@@ -876,7 +876,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
             self.runtime_file.write_text("before_gate\n", encoding="utf-8")
             self.calls: tuple[AgentToolCall, ...] = ()
 
-        async def arun(self, _task: str, **_kwargs: object) -> object:
+        async def run(self, _task: str, **_kwargs: object) -> object:
             return SimpleNamespace(
                 status="paused",
                 answer=None,
@@ -898,7 +898,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
                 ),
             )
 
-        async def aresume(self, _turn_id: str, action: str) -> object:
+        async def resume(self, _turn_id: str, action: str) -> object:
             resume_actions.append(action)
             self.runtime_file.write_text("after_gate\n", encoding="utf-8")
             self.calls = (

@@ -616,11 +616,11 @@ Python SDK：
 
 ```python
 agent = Agent(...)
-first = agent.run("inspect this repository")
-second = agent.run("continue", thread_id=first.thread_id)
+first = await agent.run("inspect this repository")
+second = await agent.run("continue", thread_id=first.thread_id)
 
-paused = agent.run("apply the approved change")
-resumed = agent.resume(paused.turn_id, "allow_once")
+paused = await agent.run("apply the approved change")
+resumed = await agent.resume(paused.turn_id, "allow_once")
 ```
 
 `AgentResult` 必须同时暴露真实 `thread_id` 与 `turn_id`。当前 `previous_turn_id` 可由一个

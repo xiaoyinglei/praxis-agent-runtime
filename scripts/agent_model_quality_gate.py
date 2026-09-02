@@ -532,7 +532,7 @@ async def run_live_case(
         approval_resumes = 0
         result: AgentResult | None = None
         try:
-            result = await agent.arun(
+            result = await agent.run(
                 str(case["task"]),
                 files=files,
                 require_workspace_change=False,
@@ -547,7 +547,7 @@ async def run_live_case(
                     workspace=workspace,
                     turn_id=result.turn_id,
                 ):
-                    result = await agent.aresume(result.turn_id, "allow_once")
+                    result = await agent.resume(result.turn_id, "allow_once")
                     approval_resumes = 1
 
             evidence = tuple(_tool_call_evidence(call) for call in result.tool_calls)

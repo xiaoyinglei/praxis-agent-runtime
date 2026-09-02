@@ -456,7 +456,7 @@ async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> 
     )
     agent._harness_model = _StaticHarnessModel
 
-    await agent.arun(
+    await agent.run(
         "hello",
         event_sink=sink,
         require_workspace_change=False,

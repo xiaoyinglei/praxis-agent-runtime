@@ -207,7 +207,7 @@ agent run "..." --max-tokens-total 100000
 from agent_runtime import Agent
 
 agent = Agent(model="qwen14b")
-result = agent.run("总结这个项目")
+result = await agent.run("总结这个项目")
 
 print(result.answer)
 ```
@@ -215,8 +215,8 @@ print(result.answer)
 The same method continues context without a separate conversation object:
 
 ```python
-first = agent.run("记住项目代号 ORCHID-731")
-second = agent.run("项目代号是什么？", previous_turn_id=first.turn_id)
+first = await agent.run("记住项目代号 ORCHID-731")
+second = await agent.run("项目代号是什么？", previous_turn_id=first.turn_id)
 ```
 
 Omitting `previous_turn_id` always starts a root Turn. `resume(turn_id, ...)`
@@ -225,7 +225,7 @@ is reserved for continuing paused or interrupted execution of that same Turn.
 ### 7.2 Files
 
 ```python
-result = agent.run(
+result = await agent.run(
     "读取这个 Excel，列出结构并给出摘要",
     files=["report.xlsx"],
 )
@@ -241,13 +241,13 @@ agent = Agent(
     knowledge=["company_docs"],
 )
 
-result = agent.run("P1 工单首次响应目标是多少？请给出处")
+result = await agent.run("P1 工单首次响应目标是多少？请给出处")
 ```
 
 ### 7.4 Async and Streaming
 
 ```python
-async for event in agent.astream("分析这个文件", files=["report.xlsx"]):
+async for event in agent.stream("分析这个文件", files=["report.xlsx"]):
     print(event.type, event.data)
 ```
 
@@ -326,7 +326,7 @@ from agent_runtime import Agent
 
 agent = Agent(model="qwen14b")
 agent.switch_model("mimo_cloud")
-result = agent.run("继续当前任务")
+result = await agent.run("继续当前任务")
 ```
 
 Internal responsibilities:

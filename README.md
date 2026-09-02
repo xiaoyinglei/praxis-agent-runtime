@@ -207,26 +207,35 @@ non-interactive run pauses instead of silently approving them and prints the
 ### Python API
 
 ```python
+import asyncio
 from pathlib import Path
 
 from agent_runtime import Agent
 
-agent = Agent(
-    model="<model-alias>",
-    workspace_path=Path("."),
-)
-result = agent.run(
-    "Read pyproject.toml and summarize the package boundaries.",
-    require_workspace_change=False,
-)
 
-print(result.answer)
-print(result.turn_id)
+async def main() -> None:
+    agent = Agent(
+        model="<model-alias>",
+        workspace_path=Path("."),
+    )
+    result = await agent.run(
+        "Read pyproject.toml and summarize the package boundaries.",
+        require_workspace_change=False,
+    )
+
+    print(result.answer)
+    print(result.turn_id)
+
+
+asyncio.run(main())
 ```
 
-Use `previous_turn_id` for a new conversational Turn. Use `resume()` only for an
-existing paused or interrupted Turn. Async applications can use `arun()`,
-`astream()`, and `aresume()` on the same facade.
+The Python SDK execution surface is async-only. Use `await agent.run(...)` for a
+new Turn, `await agent.resume(...)` only for an existing paused or interrupted
+Turn, `await agent.read_result(...)` / `await agent.pending_input(...)` for durable
+state reads, and `async for event in agent.stream(...): ...` for live events.
+Standalone scripts may create the event loop once at their application boundary
+with `asyncio.run(main())`; async applications should directly `await` the Agent.
 
 ## Capability map
 
@@ -251,18 +260,26 @@ or knowledge services.
 Attach private knowledge explicitly with a lazy provider:
 
 ```python
+import asyncio
+
 from agent_runtime import Agent, RAGKnowledgeConfig
 
-knowledge = RAGKnowledgeConfig(
-    storage_root="data/indexes/private_docs_v1",
-    vector_backend="milvus",
-    vector_collection_prefix="private_docs_v1",
-)
-agent = Agent(workspace_path=".", knowledge=knowledge)
-result = agent.run(
-    "Find the relevant policy evidence and summarize it.",
-    require_workspace_change=False,
-)
+
+async def main() -> None:
+    knowledge = RAGKnowledgeConfig(
+        storage_root="data/indexes/private_docs_v1",
+        vector_backend="milvus",
+        vector_collection_prefix="private_docs_v1",
+    )
+    agent = Agent(workspace_path=".", knowledge=knowledge)
+    result = await agent.run(
+        "Find the relevant policy evidence and summarize it.",
+        require_workspace_change=False,
+    )
+    print(result.answer)
+
+
+asyncio.run(main())
 ```
 
 The RAG runtime initializes only when the model first calls the knowledge tool.

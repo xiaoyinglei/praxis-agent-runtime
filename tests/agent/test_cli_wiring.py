@@ -726,7 +726,7 @@ def test_agent_run_can_store_model_session_outside_workspace(
     facade_options: list[dict[str, object]] = []
 
     class _Facade:
-        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+        async def run(self, _task: str, **_kwargs: object) -> AgentResult:
             return _result()
 
     def create_facade(**kwargs: object) -> _Facade:
@@ -755,7 +755,7 @@ def test_agent_run_can_disable_workspace_mcp_discovery(
     facade_options: list[dict[str, object]] = []
 
     class _Facade:
-        async def arun(self, _task: str, **_kwargs: object) -> AgentResult:
+        async def run(self, _task: str, **_kwargs: object) -> AgentResult:
             return _result()
 
     def create_facade(**kwargs: object) -> _Facade:
@@ -841,7 +841,7 @@ def test_agent_run_forwards_workspace_change_contract(
     run_options: list[dict[str, object]] = []
 
     class _Facade:
-        async def arun(self, _task: str, **kwargs: object) -> AgentResult:
+        async def run(self, _task: str, **kwargs: object) -> AgentResult:
             run_options.append(kwargs)
             return _result()
 

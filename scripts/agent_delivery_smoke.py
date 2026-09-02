@@ -164,13 +164,13 @@ async def _run_case(case: SmokeCase) -> SmokeResult:
         )
         model = _SmokeModel(case)
         agent._harness_model = lambda: model
-        result = await agent.arun(
+        result = await agent.run(
             case.task,
             allow_write_tools=True,
             require_workspace_change=False,
         )
         if result.status == "paused":
-            result = await agent.aresume(result.turn_id, "allow_once")
+            result = await agent.resume(result.turn_id, "allow_once")
         tools = tuple(call.tool_name for call in result.tool_calls)
         expected_answer = "4" if case.name == "direct_answer" else "praxis demo complete"
         passed = (
