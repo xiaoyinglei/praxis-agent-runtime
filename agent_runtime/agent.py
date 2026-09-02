@@ -411,11 +411,7 @@ class Agent:
             thread = store.read_thread(turn.thread_id)
             if Path(thread.workspace).expanduser().resolve() != self._workspace_path():
                 raise RuntimeError("turn belongs to a different workspace security domain")
-            alias = (
-                None
-                if "authentication_schema_version" in turn.binding_manifest
-                else turn.binding_manifest.get("model_alias")
-            )
+            
             knowledge_value = turn.binding_manifest.get("knowledge_config")
             mcp_policy = turn.binding_manifest.get("mcp_policy")
         frozen_knowledge = (
@@ -425,8 +421,6 @@ class Agent:
             model = None
         elif self._followup_model_id is not None:
             model = self._followup_model_id
-        elif isinstance(alias, str) and alias:
-            model = alias
         else:
             model = self.model
         restored = Agent(
@@ -611,17 +605,12 @@ class Agent:
             ensure_local_provider_ready,
         )
 
-        control_plane = (
-            self._get_model_control_plane()
-        )
-
         if frozen_turn_id is None:
+            control_plane = self._get_model_control_plane()
             spec = control_plane.current_model()
 
         else:
-            from agent_runtime.harness import (
-                RolloutStore,
-            )
+            from agent_runtime.harness import RolloutStore
 
             with RolloutStore(
                 self._harness_database()
@@ -629,7 +618,6 @@ class Agent:
                 turn = store.read_turn(
                     frozen_turn_id
                 )
-
                 thread = store.read_thread(
                     turn.thread_id
                 )
@@ -644,6 +632,20 @@ class Agent:
                         "turn belongs to a different "
                         "workspace security domain"
                     )
+
+                # Legacy / injected Harness bindings cannot be
+                # authenticated by ModelControlPlane. Do not perform
+                # provider bootstrap for them; the Harness model adapter
+                # remains responsible for failing closed before dispatch.
+                if (
+                    "authentication_schema_version"
+                    not in turn.binding_manifest
+                ):
+                    return
+
+                control_plane = (
+                    self._get_model_control_plane()
+                )
 
                 spec = (
                     control_plane

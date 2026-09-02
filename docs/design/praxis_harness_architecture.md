@@ -207,8 +207,7 @@ AgentService。它只负责构造、共享和逆序关闭资源，不创建 Turn
 
 生命周期所有权：
 
-- process/Agent 级：ModelControlPlane、provider client pool、LocalRuntimeManager、冻结 ToolRegistry、
-  RolloutStore、MCP connection manager；
+- process/Agent 级：ModelControlPlane、provider client pool、冻结 ToolRegistry、RolloutStore、MCP connection manager；
 - Session 级：事件 tailer/subscription、取消 scope、当前 active Turn handle；
 - Turn/Step 级：TurnContext、ContextManager view、ToolRouter snapshot、ModelOperation 和 resource claims；
 - ToolRuntime 自己声明是否有 close hook，composition root 统一调用；

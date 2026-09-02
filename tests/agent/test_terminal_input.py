@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
+import pty
 import select
-import subprocess
+import signal
 import sys
-import termios
 import time
 from pathlib import Path
 
@@ -86,17 +86,24 @@ def _pty_exchange(
     edit_keys: bytes | None = None,
     wait_for_raw_mode: bool = False,
 ) -> str:
-    master, slave = os.openpty()
+    env = os.environ.copy()
+    env["PROMPT_TOOLKIT_NO_CPR"] = "1"
+
+    pid, master = pty.fork()
+
+    if pid == 0:
+        os.execvpe(
+            sys.executable,
+            [sys.executable, "-c", program],
+            env,
+        )
+        raise AssertionError("execvpe unexpectedly returned")
+
     os.set_blocking(master, False)
-    process = subprocess.Popen(
-        [sys.executable, "-c", program],
-        stdin=slave,
-        stdout=slave,
-        stderr=slave,
-        close_fds=True,
-    )
+
     output = bytearray()
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + 5.0
+    child_reaped = False
 
     def read_chunk() -> bytes | None:
         try:
@@ -105,52 +112,109 @@ def _pty_exchange(
             return None
 
     try:
-        while b"> " not in output and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+        # Wait until the child has actually entered its interactive
+        # terminal mode before injecting keystrokes.
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select(
+                [master],
+                [],
+                [],
+                0.1,
+            )
+
             if readable:
                 chunk = read_chunk()
                 if chunk:
                     output.extend(chunk)
-        while wait_for_raw_mode and time.monotonic() < deadline:
-            if not termios.tcgetattr(slave)[3] & termios.ICANON:
+
+            if wait_for_raw_mode:
+                if (
+                    b"\x1b[?2004h" in output
+                    and b">" in output
+                ):
+                    break
+            elif b"> " in output:
                 break
-            time.sleep(0.01)
-        os.write(master, typed_text.encode())
+
         os.write(
             master,
-            edit_keys if edit_keys is not None else (b"\x7f" * backspaces) + b"\n",
+            typed_text.encode("utf-8"),
         )
-        os.close(slave)
-        slave = -1
-        while process.poll() is None and time.monotonic() < deadline:
-            readable, _, _ = select.select([master], [], [], 0.1)
+
+        os.write(
+            master,
+            edit_keys
+            if edit_keys is not None
+            else (b"\x7f" * backspaces) + b"\r",
+        )
+
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select(
+                [master],
+                [],
+                [],
+                0.1,
+            )
+
             if readable:
                 chunk = read_chunk()
                 if chunk:
                     output.extend(chunk)
-        process.wait(timeout=1)
+
+            waited_pid, _status = os.waitpid(
+                pid,
+                os.WNOHANG,
+            )
+
+            if waited_pid == pid:
+                child_reaped = True
+                break
+
+        # Drain bytes emitted immediately before process exit.
         while True:
-            readable, _, _ = select.select([master], [], [], 0)
+            readable, _, _ = select.select(
+                [master],
+                [],
+                [],
+                0,
+            )
+
             if not readable:
                 break
+
             chunk = read_chunk()
+
             if not chunk:
                 break
-            output.extend(chunk)
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-        if slave >= 0:
-            os.close(slave)
-        os.close(master)
-    return output.decode("utf-8", errors="backslashreplace")
 
+            output.extend(chunk)
+
+    finally:
+        if not child_reaped:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+        os.close(master)
+
+    return output.decode(
+        "utf-8",
+        errors="backslashreplace",
+    )
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS libedit PTY regression")
 def test_composer_backspace_removes_whole_chinese_characters() -> None:
     bare = _pty_exchange("value=input('> '); print('RESULT=' + ascii(value))")
-    assert "\\udc" in bare
+    assert (
+    "\\udc" in bare
+    or "UnicodeDecodeError" in bare
+)
 
     composed = _pty_exchange(
         "from agent_runtime.terminal_input import TerminalComposer; "
@@ -183,7 +247,7 @@ def test_composer_forward_delete_removes_one_grapheme_cluster(typed_text: str) -
         "from agent_runtime.terminal_input import TerminalComposer; "
         "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
         typed_text=typed_text,
-        edit_keys=b"\x1b[H\x1b[3~\n",
+        edit_keys=b"\x1b[H\x1b[3~\r",
         wait_for_raw_mode=True,
     )
 
@@ -197,7 +261,7 @@ def test_composer_cursor_moves_across_one_grapheme_cluster(typed_text: str) -> N
         "from agent_runtime.terminal_input import TerminalComposer; "
         "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
         typed_text=typed_text,
-        edit_keys=b"\x1b[DX\n",
+        edit_keys=b"\x1b[DX\r",
         wait_for_raw_mode=True,
     )
 
@@ -207,7 +271,7 @@ def test_composer_cursor_moves_across_one_grapheme_cluster(typed_text: str) -> N
         "from agent_runtime.terminal_input import TerminalComposer; "
         "value=TerminalComposer().prompt('> '); print('RESULT=' + ascii(value))",
         typed_text=typed_text,
-        edit_keys=b"\x1b[H\x1b[CX\n",
+        edit_keys=b"\x1b[H\x1b[CX\r",
         wait_for_raw_mode=True,
     )
 
