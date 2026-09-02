@@ -20,7 +20,6 @@ from agent_runtime.core.llm_registry import (
 from agent_runtime.local_runtime import (
     EndpointConflictError,
     LocalProviderProbe,
-    LocalRuntimeError,
 )
 from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
@@ -466,11 +465,6 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
         worktree=workspace,
     )
     trust.initialize()
-    ready: list[str] = []
-
-    probe = SimpleNamespace(
-        ensure_ready=lambda spec: ready.append(spec.id)
-    )
 
     control = ModelControlPlane.from_config_file(
         config_path,
@@ -478,7 +472,6 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_provider_probe=probe,
     )
     frozen_definition = control.catalog.definition("local_qwen")
     resolved_sentinel = SimpleNamespace(model="resolved-frozen")
@@ -498,7 +491,7 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
     )
 
     assert resolved is resolved_sentinel
-    assert ready == ["local_qwen"]
+
     assert resolved_definitions == [frozen_definition]
     assert binding["selection_requester"] == "user"
     assert binding["thread_id"] == "thread-1"
@@ -515,7 +508,6 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
             thread_id="thread-1",
             turn_id="turn-2",
         )
-    assert ready == ["local_qwen"]
     assert resolved_definitions == [frozen_definition]
 
     archived_path = archive.path / f"{frozen_definition.definition_revision}.json"
@@ -526,7 +518,6 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
             thread_id="thread-1",
             turn_id="turn-1",
         )
-    assert ready == ["local_qwen"]
     assert resolved_definitions == [frozen_definition]
 
 
@@ -641,9 +632,6 @@ def test_local_frozen_binding_checks_current_credential_before_readiness(
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_provider_probe=SimpleNamespace(
-            ensure_ready=lambda spec: readiness_calls.append(spec.id)
-        ),
     )
     monkeypatch.setenv("LOCAL_AUTH_TOKEN", "present-while-freezing")
     binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
@@ -691,11 +679,6 @@ def test_frozen_binding_requires_resolver_before_local_readiness(tmp_path: Path)
             workspace=workspace,
             worktree=workspace,
         ),
-        local_provider_probe=SimpleNamespace(
-            ensure_ready=lambda spec: (
-                readiness_calls.append(spec.id)
-            )
-        ),
     )
     binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
 
@@ -736,9 +719,6 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_provider_probe=SimpleNamespace(
-            ensure_ready=lambda _spec: None
-        ),
     )
     binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
     envelope = binding["binding"]
@@ -911,9 +891,6 @@ def test_control_plane_does_not_fallback_from_explicit_model(
 
     control = ModelControlPlane.from_env(
         initial_model_id="local_qwen",
-        local_provider_probe=(
-            FakeLocalProviderProbe()
-        ),
     )
 
     with pytest.raises(
@@ -929,32 +906,19 @@ def test_control_plane_does_not_fallback_from_explicit_model(
         "local_qwen"
     ]
 
-def test_control_plane_probes_local_provider_before_resolving(
+def test_control_plane_resolves_local_model_without_provider_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
 
-    monkeypatch.setenv(
-        "RAG_AGENT_MODELS_PATH",
-        str(config_path),
-    )
-
-    ensured: list[str] = []
     resolved_aliases: list[str] = []
-
-    class FakeLocalProviderProbe:
-        def ensure_ready(
-            self,
-            spec: ModelSpec,
-        ) -> None:
-            ensured.append(spec.id)
 
     def fake_resolve(
         self: ModelRegistry,
         alias: str,
-    ):  # type: ignore[no-untyped-def]
+    ) -> object:
         del self
         resolved_aliases.append(alias)
         return object()
@@ -965,20 +929,14 @@ def test_control_plane_probes_local_provider_before_resolving(
         fake_resolve,
     )
 
-    control = ModelControlPlane.from_env(
+    control = ModelControlPlane.from_config_file(
+        config_path,
         initial_model_id="local_qwen",
-        local_provider_probe=(
-            FakeLocalProviderProbe()
-        ),
     )
 
-    result = control.resolve_for_node(
-        node_model=None,
-        node_name="tool_decision",
-    )
+    result = control.resolve("local_qwen")
 
     assert result is not None
-    assert ensured == ["local_qwen"]
     assert resolved_aliases == [
         "local_qwen"
     ]
@@ -1446,20 +1404,29 @@ def test_agent_model_cli_uses_session_state_not_yaml(
     assert "mimo_cloud" in after.output
     assert config_path.read_text(encoding="utf-8") == before
 
-def test_local_provider_probe_rejects_endpoint_conflict() -> None:
-    probe = LocalProviderProbe(
-        request_json=lambda *_: {
+@pytest.mark.anyio
+async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
+    async def request_json(
+        url: str,
+        timeout: float,
+    ) -> object:
+        del url, timeout
+
+        return {
             "data": [
                 {"id": "other-model"}
             ]
-        },
+        }
+
+    probe = LocalProviderProbe(
+        request_json=request_json,
     )
 
     with pytest.raises(
         EndpointConflictError,
         match="endpoint conflict",
     ):
-        probe.ensure_ready(
+        await probe.ensure_ready(
             ModelSpec(
                 id="local_qwen",
                 provider="qwen",
@@ -1490,15 +1457,21 @@ def test_local_provider_probe_rejects_endpoint_conflict() -> None:
             )
         )
 
-def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
+@pytest.mark.anyio
+async def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
     spec = ModelCatalog.from_config_file(
         Path("configs/models.yaml")
     ).get("qwen3_14b_mlx_4bit")
 
     assert spec.runtime is not None
 
-    probe = LocalProviderProbe(
-        request_json=lambda *_: {
+    async def request_json(
+        url: str,
+        timeout: float,
+    ) -> object:
+        del url, timeout
+
+        return {
             "data": [
                 {
                     "id": (
@@ -1507,8 +1480,11 @@ def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
                     )
                 }
             ]
-        },
-    )
+        }
 
-    probe.ensure_ready(spec)
+    probe = LocalProviderProbe(
+            request_json=request_json,
+        )
+
+    await probe.ensure_ready(spec)
 

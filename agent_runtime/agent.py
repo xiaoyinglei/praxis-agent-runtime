@@ -117,7 +117,6 @@ class Agent:
             max_steps=max_turns,
             max_tokens_total=max_tokens_total,
             event_dispatcher=dispatcher,
-            frozen_turn_id=turn_id,
         ) as runtime:
             internal = await runtime.thread_manager.run(
                 user_message=task,
@@ -485,7 +484,8 @@ class Agent:
                 }
             )
         return tuple(values)
-
+    
+    @asynccontextmanager
     async def _open_harness_runtime(
         self,
         *,
@@ -513,9 +513,8 @@ class Agent:
         from agent_runtime.tools.permissions import ToolExecutionContext
         from agent_runtime.workspace import open_workspace
 
-        await self._bootstrap_model_provider(frozen_turn_id=frozen_turn_id,)
-
         workspace = open_workspace(self._workspace_path(), create=True)
+        await self._bootstrap_model_provider(frozen_turn_id=frozen_turn_id,)
 
         def acknowledge_plan_update(_arguments: object) -> dict[str, object]:
             return {

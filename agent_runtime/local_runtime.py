@@ -69,8 +69,7 @@ class LocalProviderProbe:
 
         try:
             payload = await self._request_json(str(health_url),5.0,)
-        except EndpointConflictError:
-            raise
+    
         except Exception as exc:
             raise LocalRuntimeError(
                 _provider_not_running_message(

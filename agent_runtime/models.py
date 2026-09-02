@@ -520,6 +520,141 @@ class ModelControlPlane:
         self._definition_archive = definition_archive
         self.session_diagnostics = session_diagnostics
 
+    @classmethod
+    def from_config_file(
+        cls,
+        path: Path,
+        *,
+        initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
+        session_path: Path | None = None,
+        policy: ModelPolicy | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
+    ) -> ModelControlPlane:
+        registry = ModelRegistry(
+            ModelRegistry._load_yaml_file(path)
+        )
+
+        return cls.from_registry(
+            registry,
+            initial_model_id=initial_model_id,
+            initial_selection_requester=initial_selection_requester,
+            session_path=session_path,
+            policy=policy,
+            trust_domain=trust_domain,
+            definition_archive=definition_archive,
+        )
+
+    @classmethod
+    def from_env(
+        cls,
+        env_path: str = ".env",
+        *,
+        initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
+        session_path: Path | None = None,
+        policy: ModelPolicy | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
+        workspace: Path | None = None,
+        worktree: Path | None = None,
+    ) -> ModelControlPlane:
+        resolved_workspace = (
+            workspace or Path.cwd()
+        ).expanduser().resolve()
+
+        resolved_worktree = (
+            discover_git_worktree(
+                resolved_workspace
+            )
+            if worktree is None
+            else worktree.expanduser().resolve()
+        )
+
+        registry = ModelRegistry.from_env(
+            env_path=env_path,
+            workspace=resolved_workspace,
+            worktree=resolved_worktree,
+        )
+
+        registry_path = (
+            user_model_registry_path()
+        )
+
+        effective_trust = (
+            trust_domain
+            or ModelBindingTrustDomain(
+                registry_path.parent
+                / "binding-trust.json",
+                workspace=resolved_workspace,
+                worktree=resolved_worktree,
+            )
+        )
+
+        effective_archive = (
+            definition_archive
+            or TrustedModelDefinitionArchive(
+                registry_path.parent
+                / "model-definitions",
+                workspace=resolved_workspace,
+                worktree=resolved_worktree,
+            )
+        )
+
+        return cls.from_registry(
+            registry,
+            initial_model_id=initial_model_id,
+            initial_selection_requester=initial_selection_requester,
+            session_path=session_path,
+            policy=policy,
+            trust_domain=effective_trust,
+            definition_archive=effective_archive,
+        )
+
+    @classmethod
+    def from_registry(
+        cls,
+        registry: ModelRegistry,
+        *,
+        initial_model_id: str | None = None,
+        initial_selection_requester: ModelSwitchRequester = "system",
+        session_path: Path | None = None,
+        policy: ModelPolicy | None = None,
+        trust_domain: ModelBindingTrustDomain | None = None,
+        definition_archive: TrustedModelDefinitionArchive | None = None,
+    ) -> ModelControlPlane:
+        catalog = ModelCatalog.from_registry(
+            registry
+        )
+
+        effective_policy = (
+            policy or ModelPolicy()
+        )
+
+        state, diagnostics = (
+            _load_session_state(
+                catalog=catalog,
+                initial_model_id=initial_model_id,
+                initial_selection_requester=(
+                    initial_selection_requester
+                ),
+                session_path=session_path,
+                policy=effective_policy,
+            )
+        )
+
+        return cls(
+            catalog=catalog,
+            state=state,
+            policy=effective_policy,
+            registry=registry,
+            session_path=session_path,
+            session_diagnostics=diagnostics,
+            trust_domain=trust_domain,
+            definition_archive=definition_archive,
+        )    
+
     @property
     def default_model(self) -> str:
         return self.state.current_model_id
