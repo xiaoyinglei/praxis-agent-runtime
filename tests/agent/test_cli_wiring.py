@@ -64,43 +64,64 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
     legacy_session.write_text(legacy_session_text, encoding="utf-8")
 
     agent = Agent()
+
     assert agent.checkpoint_db == Path(".praxis/checkpoints.sqlite")
     assert agent.model_session_path == Path(".praxis/model_session.json")
-    try:
-        current = agent.current_model()
-        switched = agent.switch_model(current.id)
 
-        assert switched.id == current.id
-        assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
-        assert json.loads(cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(encoding="utf-8")) == {
-            "version": 1,
-            "revision": 1,
-            "current_model_id": current.id,
-        }
-        assert legacy_checkpoint.read_bytes() == b"legacy checkpoint sentinel"
-        assert legacy_session.read_text(encoding="utf-8") == legacy_session_text
-    finally:
-        if agent._model_control_plane is not None:
-            agent._model_control_plane.close()
+    current = agent.current_model()
+    switched = agent.switch_model(current.id)
 
+    assert switched.id == current.id
+    assert not cli_module.DEFAULT_CHECKPOINT_PATH.exists()
+    assert json.loads(
+        cli_module.DEFAULT_MODEL_SESSION_PATH.read_text(
+            encoding="utf-8"
+        )
+    ) == {
+        "version": 1,
+        "revision": 1,
+        "current_model_id": current.id,
+    }
+
+    assert (
+        legacy_checkpoint.read_bytes()
+        == b"legacy checkpoint sentinel"
+    )
+
+    assert (
+        legacy_session.read_text(encoding="utf-8")
+        == legacy_session_text
+    )
 
 def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
     agent = Agent(
-        model="qwen3_5_9b_mlx_4bit",
-        model_session_path=None,
+    model="qwen3_5_9b_mlx_4bit",
+    model_session_path=None,
     )
-    try:
-        current = agent.current_model()
-        assert agent._get_model_control_plane().state.selection_requester == "system"
 
-        agent.switch_model(current.id)
-        assert agent._get_model_control_plane().state.selection_requester == "user"
+    current = agent.current_model()
 
-        agent._request_model_switch(current.id)
-        assert agent._get_model_control_plane().state.selection_requester == "agent"
-    finally:
-        if agent._model_control_plane is not None:
-            agent._model_control_plane.close()
+    assert (
+        agent._get_model_control_plane()
+        .state.selection_requester
+        == "system"
+    )
+
+    agent.switch_model(current.id)
+
+    assert (
+        agent._get_model_control_plane()
+        .state.selection_requester
+        == "user"
+    )
+
+    agent._request_model_switch(current.id)
+
+    assert (
+        agent._get_model_control_plane()
+        .state.selection_requester
+        == "agent"
+    )
 
 
 def test_agent_and_builder_pass_explicit_workspace_security_domain(

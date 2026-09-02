@@ -117,6 +117,7 @@ class Agent:
             max_steps=max_turns,
             max_tokens_total=max_tokens_total,
             event_dispatcher=dispatcher,
+            frozen_turn_id=turn_id,
         ) as runtime:
             internal = await runtime.thread_manager.run(
                 user_message=task,
@@ -218,6 +219,7 @@ class Agent:
             max_steps=step_budget,
             max_tokens_total=token_budget,
             event_dispatcher=dispatcher,
+            frozen_turn_id=turn_id,
         ) as runtime:
             if len(pending) == 1 and pending[0].kind == "tool_approval":
                 decision = {
@@ -484,7 +486,6 @@ class Agent:
             )
         return tuple(values)
 
-    @asynccontextmanager
     async def _open_harness_runtime(
         self,
         *,
@@ -493,7 +494,10 @@ class Agent:
         allow_execute_tools: bool,
         max_steps: int | None,
         max_tokens_total: int | None,
-        event_dispatcher: TurnEventDispatcher | None = None,
+        event_dispatcher: (
+            TurnEventDispatcher | None
+        ) = None,
+        frozen_turn_id: str | None = None,
     ) -> AsyncIterator[RuntimeComposition]:
         from agent_runtime.harness import RuntimeComposition
         from agent_runtime.runtime.mcp import (
@@ -508,6 +512,8 @@ class Agent:
         from agent_runtime.tools.builtins import create_resident_coding_tools
         from agent_runtime.tools.permissions import ToolExecutionContext
         from agent_runtime.workspace import open_workspace
+
+        await self._bootstrap_model_provider(frozen_turn_id=frozen_turn_id,)
 
         workspace = open_workspace(self._workspace_path(), create=True)
 
@@ -596,6 +602,63 @@ class Agent:
                         label="knowledge provider",
                     )
                 await self._close_model_control_plane()
+
+    async def _bootstrap_model_provider(
+        self,
+        *,
+        frozen_turn_id: str | None = None,
+    ) -> None:
+        from agent_runtime.local_runtime import (
+            ensure_local_provider_ready,
+        )
+
+        control_plane = (
+            self._get_model_control_plane()
+        )
+
+        if frozen_turn_id is None:
+            spec = control_plane.current_model()
+
+        else:
+            from agent_runtime.harness import (
+                RolloutStore,
+            )
+
+            with RolloutStore(
+                self._harness_database()
+            ) as store:
+                turn = store.read_turn(
+                    frozen_turn_id
+                )
+
+                thread = store.read_thread(
+                    turn.thread_id
+                )
+
+                if (
+                    Path(thread.workspace)
+                    .expanduser()
+                    .resolve()
+                    != self._workspace_path()
+                ):
+                    raise RuntimeError(
+                        "turn belongs to a different "
+                        "workspace security domain"
+                    )
+
+                spec = (
+                    control_plane
+                    .model_spec_for_frozen_binding(
+                        turn.binding_manifest,
+                        thread_id=turn.thread_id,
+                        turn_id=turn.turn_id,
+                    )
+                )
+
+        await ensure_local_provider_ready(
+            spec
+        )
+
 
     def _get_model_control_plane(self) -> ModelControlPlane:
         if self._model_control_plane is None:

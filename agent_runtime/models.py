@@ -8,7 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, Protocol, cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 
 from agent_runtime.core.llm_config import (
@@ -55,12 +55,18 @@ ModelSwitchRequester = Literal["user", "agent", "system"]
 ModelOrigin = Literal["builtin", "user", "override"]
 _MISSING_SESSION_FINGERPRINT = "missing"
 
-
-class LocalProviderReadinessProbe(Protocol):
-    def ensure_ready(
-        self,
-        spec: ModelSpec,
-    ) -> None: ...
+_MODEL_BINDING_FIELDS = frozenset(
+    {
+        "authentication_schema_version",
+        "trust_domain_id",
+        "signing_key_id",
+        "thread_id",
+        "turn_id",
+        "selection_requester",
+        "binding",
+        "signature",
+    }
+)
 
 
 
@@ -479,7 +485,6 @@ class ModelControlPlane:
         policy: ModelPolicy | None = None,
         registry: ModelResolver | None = None,
         session_path: Path | None = None,
-        local_provider_probe: LocalProviderReadinessProbe | None = None,
         session_diagnostics: tuple[str, ...] = (),
         trust_domain: ModelBindingTrustDomain | None = None,
         definition_archive: TrustedModelDefinitionArchive | None = None,
@@ -511,125 +516,9 @@ class ModelControlPlane:
             SessionMutationReceipt | None
         ) = None
 
-        if local_provider_probe is None:
-            from agent_runtime.local_runtime import (
-                LocalProviderProbe,
-            )
-
-            local_provider_probe = LocalProviderProbe()
-
-        self._local_provider_probe = local_provider_probe
-
         self._trust_domain = trust_domain
         self._definition_archive = definition_archive
         self.session_diagnostics = session_diagnostics
-
-    @classmethod
-    def from_config_file(
-        cls,
-        path: Path,
-        *,
-        initial_model_id: str | None = None,
-        initial_selection_requester: ModelSwitchRequester = "system",
-        session_path: Path | None = None,
-        policy: ModelPolicy | None = None,
-        local_provider_probe: LocalProviderReadinessProbe | None = None,
-        trust_domain: ModelBindingTrustDomain | None = None,
-        definition_archive: TrustedModelDefinitionArchive | None = None,
-    ) -> ModelControlPlane:
-        registry = ModelRegistry(ModelRegistry._load_yaml_file(path))
-        return cls.from_registry(
-            registry,
-            initial_model_id=initial_model_id,
-            initial_selection_requester=initial_selection_requester,
-            session_path=session_path,
-            policy=policy,
-            local_provider_probe=local_provider_probe,
-            trust_domain=trust_domain,
-            definition_archive=definition_archive,
-        )
-
-    @classmethod
-    def from_env(
-        cls,
-        env_path: str = ".env",
-        *,
-        initial_model_id: str | None = None,
-        initial_selection_requester: ModelSwitchRequester = "system",
-        session_path: Path | None = None,
-        policy: ModelPolicy | None = None,
-        local_provider_probe: LocalProviderReadinessProbe | None = None,
-        trust_domain: ModelBindingTrustDomain | None = None,
-        definition_archive: TrustedModelDefinitionArchive | None = None,
-        workspace: Path | None = None,
-        worktree: Path | None = None,
-    ) -> ModelControlPlane:
-        resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
-        resolved_worktree = (
-            discover_git_worktree(resolved_workspace)
-            if worktree is None
-            else worktree.expanduser().resolve()
-        )
-        registry = ModelRegistry.from_env(
-            env_path=env_path,
-            workspace=resolved_workspace,
-            worktree=resolved_worktree,
-        )
-        registry_path = user_model_registry_path()
-        effective_trust = trust_domain or ModelBindingTrustDomain(
-            registry_path.parent / "binding-trust.json",
-            workspace=resolved_workspace,
-            worktree=resolved_worktree,
-        )
-        effective_archive = definition_archive or TrustedModelDefinitionArchive(
-            registry_path.parent / "model-definitions",
-            workspace=resolved_workspace,
-            worktree=resolved_worktree,
-        )
-        return cls.from_registry(
-            registry,
-            initial_model_id=initial_model_id,
-            initial_selection_requester=initial_selection_requester,
-            session_path=session_path,
-            policy=policy,
-            local_provider_probe=local_provider_probe,
-            trust_domain=effective_trust,
-            definition_archive=effective_archive,
-        )
-
-    @classmethod
-    def from_registry(
-        cls,
-        registry: ModelRegistry,
-        *,
-        initial_model_id: str | None = None,
-        initial_selection_requester: ModelSwitchRequester = "system",
-        session_path: Path | None = None,
-        policy: ModelPolicy | None = None,
-        local_provider_probe: LocalProviderReadinessProbe | None = None,
-        trust_domain: ModelBindingTrustDomain | None = None,
-        definition_archive: TrustedModelDefinitionArchive | None = None,
-    ) -> ModelControlPlane:
-        catalog = ModelCatalog.from_registry(registry)
-        effective_policy = policy or ModelPolicy()
-        state, diagnostics = _load_session_state(
-            catalog=catalog,
-            initial_model_id=initial_model_id,
-            initial_selection_requester=initial_selection_requester,
-            session_path=session_path,
-            policy=effective_policy,
-        )
-        return cls(
-            catalog=catalog,
-            state=state,
-            policy=effective_policy,
-            registry=registry,
-            session_path=session_path,
-            local_provider_probe=local_provider_probe,
-            session_diagnostics=diagnostics,
-            trust_domain=trust_domain,
-            definition_archive=definition_archive,
-        )
 
     @property
     def default_model(self) -> str:
@@ -755,59 +644,237 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ResolvedModel:
+        alias, reviewed = (
+            self._review_frozen_binding(
+                binding,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        )
+
+        resolver = getattr(
+            self._registry,
+            "resolve_definition",
+            None,
+        )
+
+        if not callable(resolver):
+            raise RuntimeError(
+                "Model resolver cannot resolve "
+                "frozen definitions"
+            )
+
+        spec = _to_public_definition_spec(
+            alias,
+            reviewed,
+        )
+        self._ensure_model_credentials(
+            spec
+        )
+        return cast(
+            ResolvedModel,
+            resolver(reviewed),
+        )
+
+
+    def _review_frozen_binding(
+        self,
+        binding: Mapping[str, JsonValue],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> tuple[
+        str,
+        ModelExecutionDefinition,
+    ]:
         trust = self._trust_domain
         archive = self._definition_archive
+
         if trust is None or archive is None:
-            raise RuntimeError("model binding trust services are not configured")
-        _validate_binding_identity(thread_id, field_name="thread_id")
-        _validate_binding_identity(turn_id, field_name="turn_id")
+            raise RuntimeError(
+                "model binding trust services "
+                "are not configured"
+            )
+
+        _validate_binding_identity(
+            thread_id,
+            field_name="thread_id",
+        )
+        _validate_binding_identity(
+            turn_id,
+            field_name="turn_id",
+        )
+
         if not isinstance(binding, Mapping):
-            raise BindingAuthenticationError("frozen model binding must be a mapping")
+            raise BindingAuthenticationError(
+                "frozen model binding must "
+                "be a mapping"
+            )
+
+        missing = (
+            _MODEL_BINDING_FIELDS
+            .difference(binding)
+        )
+
+        if missing:
+            raise BindingAuthenticationError(
+                "frozen model binding is missing "
+                "authenticated fields: "
+                + ", ".join(sorted(missing))
+            )
+
+        projected = {
+            key: binding[key]
+            for key in _MODEL_BINDING_FIELDS
+        }
+
         try:
-            snapshotted = json.loads(canonical_json_text(cast(JsonValue, binding)))
+            snapshotted = json.loads(
+                canonical_json_text(
+                    cast(JsonValue, projected)
+                )
+            )
         except (TypeError, ValueError):
             raise BindingAuthenticationError(
-                "frozen model binding must contain canonical JSON values"
+                "frozen model binding must "
+                "contain canonical JSON values"
             ) from None
+
         if type(snapshotted) is not dict:
-            raise BindingAuthenticationError("frozen model binding must be a JSON object")
-        association = cast(dict[str, JsonValue], snapshotted)
-        signature = association.pop("signature", None)
-        if type(signature) is not str:
-            raise BindingAuthenticationError("frozen model binding signature is missing")
-        trust.verify(cast(Mapping[str, JsonValue], association), signature)
-        if association["thread_id"] != thread_id or association["turn_id"] != turn_id:
-            raise BindingAuthenticationError("frozen model binding belongs to a different Turn")
-        envelope = cast(Mapping[str, JsonValue], association["binding"])
-        revision = cast(str, envelope["definition_revision"])
-        archived = archive.load(revision)
-        raw_definition = cast(Mapping[str, object], envelope["definition"])
-        try:
-            turn_definition = ModelExecutionDefinition.model_validate(dict(raw_definition))
-        except (TypeError, ValueError) as error:
-            raise BindingAuthenticationError("frozen model definition is invalid") from error
-        if canonical_definition_json(archived) != canonical_definition_json(turn_definition):
             raise BindingAuthenticationError(
-                "frozen model definition does not match the trusted archive"
+                "frozen model binding must "
+                "be a JSON object"
             )
-        alias = cast(str, envelope["alias"])
-        requester = validate_model_switch_requester(association["selection_requester"])
+
+        association = cast(
+            dict[str, JsonValue],
+            snapshotted,
+        )
+
+        signature = association.pop(
+            "signature",
+            None,
+        )
+
+        if type(signature) is not str:
+            raise BindingAuthenticationError(
+                "frozen model binding signature "
+                "is missing"
+            )
+
+        trust.verify(
+            cast(
+                Mapping[str, JsonValue],
+                association,
+            ),
+            signature,
+        )
+
+        if (
+            association["thread_id"]
+            != thread_id
+            or association["turn_id"]
+            != turn_id
+        ):
+            raise BindingAuthenticationError(
+                "frozen model binding belongs "
+                "to a different Turn"
+            )
+
+        envelope = cast(
+            Mapping[str, JsonValue],
+            association["binding"],
+        )
+
+        revision = cast(
+            str,
+            envelope["definition_revision"],
+        )
+
+        archived = archive.load(revision)
+
+        raw_definition = cast(
+            Mapping[str, object],
+            envelope["definition"],
+        )
+
+        try:
+            turn_definition = (
+                ModelExecutionDefinition
+                .model_validate(
+                    dict(raw_definition)
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise BindingAuthenticationError(
+                "frozen model definition "
+                "is invalid"
+            ) from error
+
+        if (
+            canonical_definition_json(
+                archived
+            )
+            != canonical_definition_json(
+                turn_definition
+            )
+        ):
+            raise BindingAuthenticationError(
+                "frozen model definition "
+                "does not match the trusted archive"
+            )
+
+        alias = cast(
+            str,
+            envelope["alias"],
+        )
+
+        requester = (
+            validate_model_switch_requester(
+                association[
+                    "selection_requester"
+                ]
+            )
+        )
+
         reviewed = self.policy.review_binding(
             alias=alias,
             definition=archived,
             requested_by=requester,
         )
-        resolver = getattr(self._registry, "resolve_definition", None)
-        if not callable(resolver):
-            raise RuntimeError("Model resolver cannot resolve frozen definitions")
-        self._ensure_model_ready(_to_public_definition_spec(alias, reviewed))
-        return cast(ResolvedModel, resolver(reviewed))
 
-    def resolve(self, alias: str) -> ResolvedModel:
+        return alias, reviewed
+
+    def model_spec_for_frozen_binding(
+        self,
+        binding: Mapping[str, JsonValue],
+        *,
+        thread_id: str,
+        turn_id: str,
+    ) -> ModelSpec:
+        alias, reviewed = (
+            self._review_frozen_binding(
+                binding,
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        )
+
+        return _to_public_definition_spec(
+            alias,
+            reviewed,
+        )
+
+    def resolve(
+        self,
+        alias: str,
+    ) -> ResolvedModel:
         if self._registry is None:
-            raise RuntimeError("Model resolver is not configured")
+            raise RuntimeError(
+                "Model resolver is not configured"
+            )
         spec = self.catalog.get(alias)
-        self._ensure_model_ready(spec)
+        self._ensure_model_credentials(spec)
         return self._registry.resolve(alias)
 
     def resolve_or_fallback(self, alias: str) -> ResolvedModel:
@@ -823,7 +890,7 @@ class ModelControlPlane:
         model_id = node_model or self.state.current_model_id
         return self.resolve(model_id)
 
-    def _ensure_model_ready(
+    def _ensure_model_credentials(
         self,
         spec: ModelSpec,
     ) -> None:
@@ -844,10 +911,7 @@ class ModelControlPlane:
                     "use AGENT_ENV_FILE to select "
                     "a different env file"
                 )
-
-        if spec.location == "local":
-            self._local_provider_probe.ensure_ready(spec)
-
+            
 def _load_session_state(
     *,
     catalog: ModelCatalog,

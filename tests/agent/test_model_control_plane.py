@@ -17,7 +17,11 @@ from agent_runtime.core.llm_registry import (
     ModelRegistry,
     UnknownModelAliasError,
 )
-from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeManager
+from agent_runtime.local_runtime import (
+    EndpointConflictError,
+    LocalProviderProbe,
+    LocalRuntimeError,
+)
 from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
     ConfigVersionConflict,
@@ -463,14 +467,18 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
     )
     trust.initialize()
     ready: list[str] = []
-    manager = SimpleNamespace(ensure_ready=lambda spec: ready.append(spec.id))
+
+    probe = SimpleNamespace(
+        ensure_ready=lambda spec: ready.append(spec.id)
+    )
+
     control = ModelControlPlane.from_config_file(
         config_path,
         initial_model_id="local_qwen",
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_runtime_manager=manager,
+        local_provider_probe=probe,
     )
     frozen_definition = control.catalog.definition("local_qwen")
     resolved_sentinel = SimpleNamespace(model="resolved-frozen")
@@ -633,7 +641,7 @@ def test_local_frozen_binding_checks_current_credential_before_readiness(
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_runtime_manager=SimpleNamespace(
+        local_provider_probe=SimpleNamespace(
             ensure_ready=lambda spec: readiness_calls.append(spec.id)
         ),
     )
@@ -673,7 +681,9 @@ def test_frozen_binding_requires_resolver_before_local_readiness(tmp_path: Path)
     readiness_calls: list[str] = []
     control = ModelControlPlane(
         catalog=ModelCatalog.from_config_file(config_path),
-        state=ModelSessionState(current_model_id="local_qwen"),
+        state=ModelSessionState(
+            current_model_id="local_qwen"
+        ),
         registry=None,
         trust_domain=trust,
         definition_archive=TrustedModelDefinitionArchive(
@@ -681,8 +691,10 @@ def test_frozen_binding_requires_resolver_before_local_readiness(tmp_path: Path)
             workspace=workspace,
             worktree=workspace,
         ),
-        local_runtime_manager=SimpleNamespace(
-            ensure_ready=lambda spec: readiness_calls.append(spec.id)
+        local_provider_probe=SimpleNamespace(
+            ensure_ready=lambda spec: (
+                readiness_calls.append(spec.id)
+            )
         ),
     )
     binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
@@ -724,7 +736,9 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
-        local_runtime_manager=SimpleNamespace(ensure_ready=lambda _spec: None),
+        local_provider_probe=SimpleNamespace(
+            ensure_ready=lambda _spec: None
+        ),
     )
     binding = control.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
     envelope = binding["binding"]
@@ -865,52 +879,109 @@ def test_control_plane_does_not_fallback_from_explicit_model(
 ) -> None:
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
-    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(config_path))
+    monkeypatch.setenv(
+        "RAG_AGENT_MODELS_PATH",
+        str(config_path),
+    )
+
     resolved_aliases: list[str] = []
 
-    def fail_resolve(self: ModelRegistry, alias: str):  # type: ignore[no-untyped-def]
+    class FakeLocalProviderProbe:
+        def ensure_ready(
+            self,
+            spec: ModelSpec,
+        ) -> None:
+            del spec
+
+    def fail_resolve(
+        self: ModelRegistry,
+        alias: str,
+    ):  # type: ignore[no-untyped-def]
+        del self
         resolved_aliases.append(alias)
-        raise ModelNotAvailableError(f"{alias} failed")
+        raise ModelNotAvailableError(
+            f"{alias} failed"
+        )
 
-    monkeypatch.setattr(ModelRegistry, "resolve", fail_resolve)
-    monkeypatch.setattr(LocalRuntimeManager, "ensure_ready", lambda self, spec: None)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve",
+        fail_resolve,
+    )
 
-    control = ModelControlPlane.from_env(initial_model_id="local_qwen")
+    control = ModelControlPlane.from_env(
+        initial_model_id="local_qwen",
+        local_provider_probe=(
+            FakeLocalProviderProbe()
+        ),
+    )
 
-    with pytest.raises(ModelNotAvailableError, match="local_qwen failed"):
-        control.resolve_for_node(node_model=None, node_name="tool_decision")
+    with pytest.raises(
+        ModelNotAvailableError,
+        match="local_qwen failed",
+    ):
+        control.resolve_for_node(
+            node_model=None,
+            node_name="tool_decision",
+        )
 
-    assert resolved_aliases == ["local_qwen"]
+    assert resolved_aliases == [
+        "local_qwen"
+    ]
 
-
-def test_control_plane_ensures_local_runtime_before_resolving(
+def test_control_plane_probes_local_provider_before_resolving(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
-    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(config_path))
+
+    monkeypatch.setenv(
+        "RAG_AGENT_MODELS_PATH",
+        str(config_path),
+    )
+
     ensured: list[str] = []
     resolved_aliases: list[str] = []
 
-    def ensure_ready(self: LocalRuntimeManager, spec: ModelSpec) -> None:
-        del self
-        ensured.append(spec.id)
+    class FakeLocalProviderProbe:
+        def ensure_ready(
+            self,
+            spec: ModelSpec,
+        ) -> None:
+            ensured.append(spec.id)
 
-    def fake_resolve(self: ModelRegistry, alias: str):  # type: ignore[no-untyped-def]
+    def fake_resolve(
+        self: ModelRegistry,
+        alias: str,
+    ):  # type: ignore[no-untyped-def]
+        del self
         resolved_aliases.append(alias)
         return object()
 
-    monkeypatch.setattr(LocalRuntimeManager, "ensure_ready", ensure_ready)
-    monkeypatch.setattr(ModelRegistry, "resolve", fake_resolve)
+    monkeypatch.setattr(
+        ModelRegistry,
+        "resolve",
+        fake_resolve,
+    )
 
-    control = ModelControlPlane.from_env(initial_model_id="local_qwen")
-    result = control.resolve_for_node(node_model=None, node_name="tool_decision")
+    control = ModelControlPlane.from_env(
+        initial_model_id="local_qwen",
+        local_provider_probe=(
+            FakeLocalProviderProbe()
+        ),
+    )
+
+    result = control.resolve_for_node(
+        node_model=None,
+        node_name="tool_decision",
+    )
 
     assert result is not None
     assert ensured == ["local_qwen"]
-    assert resolved_aliases == ["local_qwen"]
-
+    assert resolved_aliases == [
+        "local_qwen"
+    ]
 
 def test_control_plane_rejects_cloud_model_without_api_key(
     tmp_path: Path,
@@ -1375,141 +1446,69 @@ def test_agent_model_cli_uses_session_state_not_yaml(
     assert "mimo_cloud" in after.output
     assert config_path.read_text(encoding="utf-8") == before
 
-
-def test_local_runtime_manager_launches_and_polls_until_expected_model() -> None:
-    requests = [
-        OSError("not listening"),
-        {"data": [{"id": "models--mlx-community--Qwen3-14B-4bit"}]},
-    ]
-    launched: list[list[str]] = []
-
-    def request_json(url: str, timeout: float) -> object:
-        del url, timeout
-        item = requests.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def launch(command: list[str]) -> object:
-        launched.append(command)
-        return SimpleNamespace(pid=123)
-
-    manager = LocalRuntimeManager(
-        request_json=request_json,
-        launch_process=launch,
-        sleep=lambda _: None,
-        monotonic=_counter(),
+def test_local_provider_probe_rejects_endpoint_conflict() -> None:
+    probe = LocalProviderProbe(
+        request_json=lambda *_: {
+            "data": [
+                {"id": "other-model"}
+            ]
+        },
     )
 
-    manager.ensure_ready(
-        ModelSpec(
-            id="local_qwen",
-            provider="qwen",
-            provider_model="models--mlx-community--Qwen3-14B-4bit",
-            context_window=32768,
-            supports_tools=True,
-            supports_structured_output=True,
-            location="local",
-            runtime=ModelRuntimeSpec(
-                health_url="http://127.0.0.1:8080/v1/models",
-                launch_command=("uv", "run", "python", "-m", "mlx_lm.server"),
-                expected_model_contains="Qwen3-14B",
-                startup_timeout_seconds=5,
-            ),
-        )
-    )
-
-    assert launched == [["uv", "run", "python", "-m", "mlx_lm.server"]]
-
-
-def test_local_runtime_manager_closes_only_the_process_it_launched() -> None:
-    requests = [
-        OSError("not listening"),
-        {"data": [{"id": "models--mlx-community--Qwen3-14B-4bit"}]},
-    ]
-    process = SimpleNamespace(pid=123)
-    stopped: list[object] = []
-
-    def request_json(url: str, timeout: float) -> object:
-        del url, timeout
-        item = requests.pop(0)
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    manager = LocalRuntimeManager(
-        request_json=request_json,
-        launch_process=lambda _command: process,
-        stop_process=stopped.append,
-        sleep=lambda _: None,
-        monotonic=_counter(),
-    )
-    manager.ensure_ready(
-        ModelSpec(
-            id="local_qwen",
-            provider="qwen",
-            provider_model="models--mlx-community--Qwen3-14B-4bit",
-            context_window=32768,
-            supports_tools=True,
-            supports_structured_output=True,
-            location="local",
-            runtime=ModelRuntimeSpec(
-                health_url="http://127.0.0.1:8080/v1/models",
-                launch_command=("uv", "run", "python", "-m", "mlx_lm.server"),
-                expected_model_contains="Qwen3-14B",
-                startup_timeout_seconds=5,
-            ),
-        )
-    )
-
-    manager.close()
-    manager.close()
-
-    assert stopped == [process]
-
-
-def test_local_runtime_manager_rejects_endpoint_conflict() -> None:
-    manager = LocalRuntimeManager(
-        request_json=lambda *_: {"data": [{"id": "other-model"}]},
-    )
-
-    with pytest.raises(EndpointConflictError, match="endpoint conflict"):
-        manager.ensure_ready(
+    with pytest.raises(
+        EndpointConflictError,
+        match="endpoint conflict",
+    ):
+        probe.ensure_ready(
             ModelSpec(
                 id="local_qwen",
                 provider="qwen",
-                provider_model="models--mlx-community--Qwen3-14B-4bit",
+                provider_model=(
+                    "models--mlx-community--"
+                    "Qwen3-14B-4bit"
+                ),
                 context_window=32768,
                 supports_tools=True,
                 supports_structured_output=True,
                 location="local",
                 runtime=ModelRuntimeSpec(
-                    health_url="http://127.0.0.1:8080/v1/models",
-                    launch_command=("uv", "run", "python", "-m", "mlx_lm.server"),
-                    expected_model_contains="Qwen3-14B",
+                    health_url=(
+                        "http://127.0.0.1:"
+                        "8080/v1/models"
+                    ),
+                    launch_command=(
+                        "uv",
+                        "run",
+                        "python",
+                        "-m",
+                        "mlx_lm.server",
+                    ),
+                    expected_model_contains=(
+                        "Qwen3-14B"
+                    ),
                 ),
             )
         )
 
-
 def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
-    spec = ModelCatalog.from_config_file(Path("configs/models.yaml")).get("qwen3_14b_mlx_4bit")
+    spec = ModelCatalog.from_config_file(
+        Path("configs/models.yaml")
+    ).get("qwen3_14b_mlx_4bit")
+
     assert spec.runtime is not None
 
-    manager = LocalRuntimeManager(
-        request_json=lambda *_: {"data": [{"id": "mlx-community/Qwen3-14B-4bit"}]},
-        launch_process=lambda command: pytest.fail(f"unexpected launch: {command}"),
+    probe = LocalProviderProbe(
+        request_json=lambda *_: {
+            "data": [
+                {
+                    "id": (
+                        "mlx-community/"
+                        "Qwen3-14B-4bit"
+                    )
+                }
+            ]
+        },
     )
 
-    manager.ensure_ready(spec)
+    probe.ensure_ready(spec)
 
-
-def _counter():
-    value = -1.0
-
-    def now() -> float:
-        nonlocal value
-        value += 1.0
-        return value
-
-    return now

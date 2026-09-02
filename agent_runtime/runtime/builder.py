@@ -5,9 +5,7 @@ from pathlib import Path
 from agent_runtime.model_admin import ModelAdminService
 from agent_runtime.model_config_io import discover_git_worktree
 from agent_runtime.models import ModelControlPlane
-from agent_runtime.local_runtime import (
-    get_process_local_runtime_manager,
-)
+
 
 def build_model_control_plane(
     *,
@@ -26,22 +24,28 @@ def build_model_control_plane(
         worktree=discover_git_worktree(
             resolved_workspace
         ),
-        local_provider_probe=(
-            get_process_local_runtime_manager()
-        ),
     )
+
 
 def build_model_admin_service(
     *,
     session_path: Path,
     workspace: Path | None = None,
 ) -> ModelAdminService:
-    resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
+    resolved_workspace = (
+        workspace or Path.cwd()
+    ).expanduser().resolve()
+
     return ModelAdminService(
         workspace=resolved_workspace,
-        worktree=discover_git_worktree(resolved_workspace),
+        worktree=discover_git_worktree(
+            resolved_workspace
+        ),
         session_path=session_path,
     )
 
 
-__all__ = ["build_model_admin_service", "build_model_control_plane"]
+__all__ = [
+    "build_model_admin_service",
+    "build_model_control_plane",
+]
