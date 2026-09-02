@@ -57,7 +57,9 @@ class Agent:
         selection_requester = validate_model_switch_requester(_selection_requester)
         self.model = model
         self.checkpoint_db = checkpoint_db
-        self.workspace_path = None if workspace_path is None else Path(workspace_path).expanduser().resolve()
+    
+        workspace = (Path.cwd() if workspace_path is None else Path(workspace_path))
+        self.workspace_path = (workspace.expanduser().resolve())
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self.enable_workspace_mcp = enable_workspace_mcp
@@ -450,7 +452,7 @@ class Agent:
         return self._workspace_path() / ".praxis" / "runtime" / "rollout.sqlite3"
 
     def _workspace_path(self) -> Path:
-        return (self.workspace_path or Path.cwd()).expanduser().resolve()
+        return self.workspace_path
 
     def _stage_harness_files(
         self,
