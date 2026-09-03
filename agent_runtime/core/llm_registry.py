@@ -409,12 +409,17 @@ class ModelRegistry:
             TokenizerContract,
         )
 
+        generator: object | None = None
+
         try:
             generator = _build_chat_generator(spec)
-        except Exception as exc:
+        except Exception:
+            pass
+
+        if generator is None:
             raise ModelNotAvailableError(
                 f"Failed to build provider for {subject}"
-            ) from exc
+            )
 
         capabilities = definition.capabilities
 

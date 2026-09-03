@@ -213,7 +213,12 @@ def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = {"provider": "ollama", "model": "main-model", **unsafe_fields}
+    model = {
+    "provider": "ollama",
+    "model": "main-model",
+    "context_window_tokens": 32_768,
+    **unsafe_fields,
+}
     monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
     monkeypatch.setenv(
         "RAG_AGENT_MODELS",
@@ -233,7 +238,7 @@ def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
 @pytest.mark.parametrize(
     "invalid_fields",
     [
-        {"max_tokens": -7},
+        {"max_output_tokens": -7},
         {"timeout_seconds": -1},
         {"input_cost_per_1m": -3},
         {"location": "local", "base_url": "https://api.example.com/v1"},
@@ -255,6 +260,7 @@ def test_whole_catalog_json_override_rejects_invalid_or_unknown_model_fields(
     model: dict[str, object] = {
         "provider": "openai_compatible",
         "model": "main-model",
+        "context_window_tokens": 32_768,
         "base_url": "https://api.example.com/v1",
         "location": "cloud",
     }
@@ -391,14 +397,11 @@ def test_resolved_request_defaults_do_not_mutate_cached_definition(
 
     resolved = registry.resolve("main")
 
-    assert (
-        resolved
-        .request_defaults
-        .provider_options
-        .thinking
-        .type
-        == "enabled"
-    )
+    provider_options = resolved.request_defaults.provider_options
+
+    assert provider_options is not None
+    assert provider_options.thinking is not None
+    assert provider_options.thinking.type == "enabled"
 
     assert (
         registry
@@ -471,6 +474,7 @@ def test_load_configs_models_preserves_api_key_env_for_cloud_models(
                         "provider": "mimo",
                         "protocol": "openai_compatible",
                         "model": "mimo-v2-flash",
+                        "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                         "api_key_env": "MIMO_API_KEY",
                     }
@@ -611,6 +615,7 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
                         "provider": "qwen",
                         "protocol": "openai_compatible",
                         "model": "main-model",
+                        "context_window_tokens": 32_768,
                         "base_url": "http://127.0.0.1:8080/v1",
                     },
                     "mimo_cloud": {
@@ -618,6 +623,7 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
                         "provider": "mimo",
                         "protocol": "openai_compatible",
                         "model": "mimo-v2-flash",
+                        "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                     },
                 },
@@ -625,7 +631,7 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
                 "generation": {
                     "factcheck": {
                         "model": "mimo_cloud",
-                        "context_window_tokens": 32_768,
+                        "max_tokens": 2048,
                         "temperature": 0.3,
                     }
                 },
@@ -655,6 +661,7 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
                         "provider": "mimo",
                         "protocol": "openai_compatible",
                         "model": "mimo-v2-flash",
+                        "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                         "api_key_env": "MIMO_API_KEY",
                     }
@@ -712,6 +719,7 @@ class TestModelRegistryResolve:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         source_config = _make_config()
+
         source_config.models["main"] = ModelSpec(
             provider=ModelProvider.OPENAI_COMPATIBLE,
             provider_name="frozen-provider",
@@ -732,12 +740,17 @@ class TestModelRegistryResolve:
             location="local",
             runtime={
                 "health_url": "http://127.0.0.1:9090/health",
-                "launch_command": ["frozen-server", "--port", "9090"],
+                "launch_command": [
+                    "frozen-server",
+                    "--port",
+                    "9090",
+                ],
                 "expected_model_contains": "frozen-v1",
                 "startup_timeout_seconds": 17.0,
                 "poll_interval_seconds": 0.25,
             },
         )
+
         source_config.generation = replace(
             source_config.generation,
             answer=GenerationTaskConfig(
@@ -746,6 +759,7 @@ class TestModelRegistryResolve:
                 temperature=0.15,
             ),
         )
+
         source_config.llm_stage_budgets = {
             stage: LLMStageBudget(
                 max_input_tokens=10_000 + index,
@@ -754,8 +768,13 @@ class TestModelRegistryResolve:
             )
             for index, stage in enumerate(LLMCallStage)
         }
-        definition = ModelRegistry(source_config).get_model_definition("main")
+
+        definition = ModelRegistry(
+            source_config
+        ).get_model_definition("main")
+
         target = ModelRegistry(_make_config())
+
         observed: dict[str, ModelSpec] = {}
         generator = object()
 
@@ -763,37 +782,80 @@ class TestModelRegistryResolve:
             observed["spec"] = spec.model_copy(deep=True)
             return generator
 
-        monkeypatch.setattr(llm_registry_module, "_build_chat_generator", build_frozen)
+        monkeypatch.setattr(
+            llm_registry_module,
+            "_build_chat_generator",
+            build_frozen,
+        )
 
         resolved = target.resolve_definition(definition)
 
         frozen_spec = observed["spec"]
+
         assert frozen_spec.model == "provider/frozen-v1"
         assert frozen_spec.tokenizer_model == "frozen-tokenizer"
+        assert frozen_spec.context_window_tokens == 777
+        assert frozen_spec.max_context_window_tokens == 777
+        assert frozen_spec.max_output_tokens is None
         assert frozen_spec.timeout_seconds == 45.5
+
         assert frozen_spec.runtime is not None
-        assert frozen_spec.runtime.launch_command == ("frozen-server", "--port", "9090")
+        assert frozen_spec.runtime.launch_command == (
+            "frozen-server",
+            "--port",
+            "9090",
+        )
+
         assert resolved.generator is generator
-        assert resolved.kwargs == {
-            "context_window_tokens": 777,
-            "temperature": 0.25,
-            "top_p": 0.8,
-            "parallel_tool_calls": False,
-            "seed": 9,
-        }
-        assert resolved.context_window_tokens == 12_345
+
         assert resolved.model == "provider/frozen-v1"
         assert resolved.provider == "frozen-provider"
-        assert resolved.capabilities.supports_native_tools is False
-        assert resolved.definition_revision == definition.definition_revision
-        assert resolved.generation_config is not None
-        assert resolved.generation_config.answer.max_tokens == 701
-        assert resolved.gateway is not None
-        for stage in LLMCallStage:
-            expected = definition.llm_stage_budgets[stage.value]
-            actual = resolved.gateway.stage_budget(stage)
-            assert actual.model_dump() == expected.model_dump()
 
+        assert (
+            resolved.capabilities.context_window_tokens
+            == 777
+        )
+        assert (
+            resolved.capabilities.max_context_window_tokens
+            == 777
+        )
+        assert resolved.capabilities.max_output_tokens is None
+        assert resolved.capabilities.supports_native_tools is False
+        assert (
+            resolved.capabilities.supports_structured_output
+            is False
+        )
+
+        assert resolved.request_defaults.temperature == 0.25
+        assert resolved.request_defaults.top_p == 0.8
+        assert (
+            resolved.request_defaults.parallel_tool_calls
+            is False
+        )
+        assert resolved.request_defaults.seed == 9
+
+        assert (
+            resolved.definition_revision
+            == definition.definition_revision
+        )
+
+        assert resolved.generation_config.answer.model == "main"
+        assert resolved.generation_config.answer.max_tokens == 701
+        assert (
+            resolved.generation_config.answer.temperature
+            == 0.15
+        )
+
+        for stage in LLMCallStage:
+            expected = definition.llm_stage_budgets[
+                stage.value
+            ]
+            actual = resolved.gateway.stage_budget(stage)
+
+            assert (
+                actual.model_dump()
+                == expected.model_dump()
+            )
     def test_resolve_definition_applies_timeout_and_structured_capability_to_real_provider(
         self,
     ) -> None:
@@ -888,7 +950,10 @@ class TestModelRegistryResolve:
         reg = ModelRegistry(_make_config())
         resolved = reg.resolve("main")
         assert resolved.generator is not None
-        assert resolved.context_window_tokens == 32768
+        assert (
+    resolved.capabilities.context_window_tokens
+    == 32_768
+)
         assert resolved.gateway is not None
         assert resolved.token_accounting is resolved.gateway.token_accounting
 
@@ -898,32 +963,43 @@ class TestModelRegistryResolve:
         r2 = reg.resolve("main")
         assert r1.generator is r2.generator
 
-    def test_kwargs_include_model_defaults(self) -> None:
+    def test_resolved_model_separates_capabilities_and_request_defaults(
+        self,
+    ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
             model="x",
             context_window_tokens=32_768,
             max_output_tokens=512,
-            defaults={"temperature": 0.3, "top_p": 0.8},
+            defaults={
+                "temperature": 0.3,
+                "top_p": 0.8,
+            },
         )
+
         config = AgentModelsConfig(
             models={"test": spec},
             default_model="test",
         )
+
         reg = ModelRegistry(config)
         resolved = reg.resolve("test")
-        assert resolved.kwargs["max_output_tokens"] == 512
-        assert resolved.kwargs["temperature"] == 0.3
-        assert resolved.kwargs["top_p"] == 0.8
 
-    def test_request_context_limit_caps_runtime_without_rewriting_model_window(
+        assert resolved.capabilities.max_output_tokens == 512
+
+        assert resolved.request_defaults.temperature == 0.3
+        assert resolved.request_defaults.top_p == 0.8
+
+    def test_active_context_window_caps_gateway_without_rewriting_model_maximum(
         self,
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
             model="request-capped",
-            context_window_tokens=131_072,
+            context_window_tokens=8_000,
+            max_context_window_tokens=131_072,
         )
+
         registry = ModelRegistry(
             AgentModelsConfig(
                 models={"capped": spec},
@@ -933,8 +1009,21 @@ class TestModelRegistryResolve:
 
         resolved = registry.resolve("capped")
 
-        assert registry.get_model_spec("capped").context_window_tokens == 131_072
-        assert resolved.context_window_tokens == 8_000
+        stored = registry.get_model_spec("capped")
+
+        assert stored.context_window_tokens == 8_000
+        assert stored.max_context_window_tokens == 131_072
+
+        assert (
+            resolved.capabilities.context_window_tokens
+            == 8_000
+        )
+
+        assert (
+            resolved.capabilities.max_context_window_tokens
+            == 131_072
+        )
+
         assert (
             resolved.gateway.effective_stage_budget(
                 LLMCallStage.TOOL_DECISION,
@@ -942,7 +1031,6 @@ class TestModelRegistryResolve:
             ).max_input_tokens
             == 5_440
         )
-
     def test_explicit_tokenizer_model_avoids_provider_id_fallback_counting(
         self,
     ) -> None:
