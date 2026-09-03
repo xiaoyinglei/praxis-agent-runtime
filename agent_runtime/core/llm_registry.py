@@ -38,18 +38,17 @@ class ModelNotAvailableError(RuntimeError):
 
 
 @dataclass(slots=True)
-class ResolvedModel:
+class ResolvedModelRuntime:
     generator: object
-    kwargs: dict[str, Any]
-    context_window_tokens: int = 32_768
-    gateway: Any | None = None
-    token_accounting: Any | None = None
-    provider: str = "openai-compatible"
-    model: str = "agent-model"
-    supports_native_tools: bool = True
-    supports_structured_output: bool = True
+    gateway: LLMGateway
+    model_id: str
+    provider: str
+    capabilities: ModelCapabilities
+    token_accounting: TokenAccounting
+    request_defaults: ModelRequestDefaults
+    supports_native_tools: bool
+    supports_structured_output: bool
     definition_revision: str | None = None
-    generation_config: GenerationConfig | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -291,12 +290,14 @@ class ModelRegistry:
             if not isinstance(cost, dict):
                 cost = {}
             agent_models[alias] = {
-                "provider": _agent_provider_kind(merged),
-                "provider_name": entry.get("provider"),
-                "protocol": merged.get("protocol"),
+                "provider": ...,
+                "provider_name": ...,
+                "protocol": ...,
                 "model": entry["model"],
                 "tokenizer_model": entry.get("tokenizer_model"),
-                "max_tokens": entry.get("max_tokens", 2048),
+                "context_window_tokens": entry.get("context_window_tokens",32_768,),
+                "max_context_window_tokens": entry.get("max_context_window_tokens"),
+                "max_output_tokens": entry.get("max_output_tokens"),
                 "timeout_seconds": entry.get("timeout_seconds", 120.0),
                 "defaults": entry.get("defaults", {}),
                 "base_url": merged.get("base_url"),

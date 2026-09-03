@@ -76,7 +76,7 @@ class ToolChoice:
 @dataclass(frozen=True, slots=True)
 class ModelSettings:
     model: str
-    max_output_tokens: int = 2048
+    max_output_tokens: int | None = None
     temperature: float = 0.0
     top_p: float | None = 1.0
     parallel_tool_calls: bool = True
@@ -85,12 +85,19 @@ class ModelSettings:
 
     def __post_init__(self) -> None:
         _require_non_empty_string(self.model, field_name="model")
-        if (
-            not isinstance(self.max_output_tokens, int)
-            or isinstance(self.max_output_tokens, bool)
-            or self.max_output_tokens <= 0
-        ):
-            raise ValueError("max_output_tokens must be a positive integer")
+        if self.max_output_tokens is not None:
+            if (
+                isinstance(self.max_output_tokens, bool)
+                or not isinstance(
+                    self.max_output_tokens,
+                    int,
+                )
+                or self.max_output_tokens <= 0
+            ):
+                raise ValueError(
+                    "max_output_tokens must be "
+                    "a positive integer or None"
+                )
         _validate_real_range(
             self.temperature,
             field_name="temperature",
