@@ -7,7 +7,11 @@ from copy import deepcopy
 from dataclasses import dataclass
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from agent_runtime.modeling.gateway import LLMGateway
+    from agent_runtime.modeling.tokenization import TokenAccountingService
 
 from agent_runtime.core.llm_config import (
     AgentModelsConfig,
@@ -17,7 +21,9 @@ from agent_runtime.core.llm_config import (
 )
 from agent_runtime.model_config_io import discover_git_worktree
 from agent_runtime.model_definition import (
+    ModelCapabilities,
     ModelExecutionDefinition,
+    RequestDefaultsDefinition,
     build_model_execution_definition,
 )
 from agent_runtime.model_registry import UserModelDefinition, UserModelRegistryStore
@@ -28,7 +34,6 @@ from agent_runtime.modeling.contracts import (
     parse_llm_stage_budgets,
 )
 
-
 class UnknownModelAliasError(KeyError):
     """别名在 models 中不存在。"""
 
@@ -38,18 +43,16 @@ class ModelNotAvailableError(RuntimeError):
 
 
 @dataclass(slots=True)
-class ResolvedModelRuntime:
+class ResolvedModel:
     generator: object
     gateway: LLMGateway
-    model_id: str
+    model: str
     provider: str
     capabilities: ModelCapabilities
-    token_accounting: TokenAccounting
-    request_defaults: ModelRequestDefaults
-    supports_native_tools: bool
-    supports_structured_output: bool
+    token_accounting: TokenAccountingService
+    request_defaults: RequestDefaultsDefinition
+    generation_config: GenerationConfig
     definition_revision: str | None = None
-
 
 @dataclass(frozen=True, slots=True)
 class ChatProviderConfig:
@@ -57,7 +60,7 @@ class ChatProviderConfig:
     api_key: str | None
 
 
-class ModelResolver(Protocol):
+class ModelRuntimeResolver(Protocol):
     @property
     def default_model(self) -> str: ...
 
@@ -79,7 +82,7 @@ class ModelResolver(Protocol):
     ) -> ResolvedModel: ...
 
 
-class ModelRegistry:
+class ModelRuntimeRegistry:
     """按 alias 解析并缓存 Generator 实例。
 
     加载顺序：RAG_AGENT_MODELS_PATH(YAML) > RAG_AGENT_MODELS(JSON) > models.yaml 内置默认
@@ -111,7 +114,7 @@ class ModelRegistry:
             # Validate canonical JSON at the catalog boundary so unsupported
             # values fail before a model can be selected or dispatched.
             _ = definition.definition_revision
-        self._cache: dict[str, ResolvedModel] = {}
+        self._cache: dict[str,ResolvedModel,] = {}
 
     @property
     def default_model(self) -> str:
@@ -290,32 +293,61 @@ class ModelRegistry:
             if not isinstance(cost, dict):
                 cost = {}
             agent_models[alias] = {
-                "provider": ...,
-                "provider_name": ...,
-                "protocol": ...,
+                "provider": _agent_provider_kind(merged),
+                "provider_name": entry.get("provider"),
+                "protocol": merged.get("protocol"),
                 "model": entry["model"],
-                "tokenizer_model": entry.get("tokenizer_model"),
-                "context_window_tokens": entry.get("context_window_tokens",32_768,),
-                "max_context_window_tokens": entry.get("max_context_window_tokens"),
-                "max_output_tokens": entry.get("max_output_tokens"),
-                "timeout_seconds": entry.get("timeout_seconds", 120.0),
-                "defaults": entry.get("defaults", {}),
+                "tokenizer_model": entry.get(
+                    "tokenizer_model"
+                ),
+                "context_window_tokens": entry.get(
+                    "context_window_tokens"
+                ),
+                "max_context_window_tokens": entry.get(
+                    "max_context_window_tokens"
+                ),
+                "max_output_tokens": entry.get(
+                    "max_output_tokens"
+                ),
+                "timeout_seconds": entry.get(
+                    "timeout_seconds",
+                    120.0,
+                ),
+                "defaults": entry.get(
+                    "defaults",
+                    {},
+                ),
                 "base_url": merged.get("base_url"),
                 "api_key_env": merged.get("api_key_env"),
-                "context_window_tokens": entry.get("context_window_tokens", 32_768),
-                "supports_tools": entry.get("tools", entry.get("supports_tools", True)),
+                "supports_tools": entry.get(
+                    "tools",
+                    entry.get(
+                        "supports_tools",
+                        True,
+                    ),
+                ),
                 "supports_structured_output": entry.get(
                     "structured_output",
-                    entry.get("supports_structured_output", True),
+                    entry.get(
+                        "supports_structured_output",
+                        True,
+                    ),
                 ),
                 "location": merged.get("location"),
-                "input_cost_per_1m": cost.get("input_per_1m"),
-                "output_cost_per_1m": cost.get("output_per_1m"),
-                "cache_read_cost_per_1m": cost.get("cache_read_per_1m"),
-                "cache_write_cost_per_1m": cost.get("cache_write_per_1m"),
+                "input_cost_per_1m": cost.get(
+                    "input_per_1m"
+                ),
+                "output_cost_per_1m": cost.get(
+                    "output_per_1m"
+                ),
+                "cache_read_cost_per_1m": cost.get(
+                    "cache_read_per_1m"
+                ),
+                "cache_write_cost_per_1m": cost.get(
+                    "cache_write_per_1m"
+                ),
                 "runtime": merged.get("runtime"),
             }
-
         default_model = defaults.get("primary_model", "")
         if not default_model and agent_models:
             default_model = next(iter(agent_models))
@@ -369,63 +401,70 @@ class ModelRegistry:
         spec: ModelSpec,
         subject: str,
     ) -> ResolvedModel:
-        from agent_runtime.modeling.gateway import LLMGateway
-        from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
+        from agent_runtime.modeling.gateway import (
+            LLMGateway,
+        )
+        from agent_runtime.modeling.tokenization import (
+            TokenAccountingService,
+            TokenizerContract,
+        )
 
-        generator: object | None = None
         try:
             generator = _build_chat_generator(spec)
-        except Exception:
-            pass
-        if generator is None:
-            raise ModelNotAvailableError(f"Failed to build provider for {subject}")
+        except Exception as exc:
+            raise ModelNotAvailableError(
+                f"Failed to build provider for {subject}"
+            ) from exc
 
-        kwargs: dict[str, Any] = {
-            "max_tokens": definition.max_output_tokens,
-            **deepcopy(
-                definition.defaults.model_dump(
-                    mode="python",
-                    exclude_none=True,
-                )
-            ),
-        }
-        runtime_context_tokens = min(
-            definition.context_window_tokens,
-            definition.request_context_tokens or definition.context_window_tokens,
-        )
+        capabilities = definition.capabilities
+
         token_accounting = TokenAccountingService(
             TokenizerContract(
                 embedding_model_name=definition.model,
-                tokenizer_model_name=definition.tokenizer_model or definition.model,
-                chunking_tokenizer_model_name=(definition.tokenizer_model or definition.model),
+                tokenizer_model_name=(
+                    definition.tokenizer_model
+                    or definition.model
+                ),
+                chunking_tokenizer_model_name=(
+                    definition.tokenizer_model
+                    or definition.model
+                ),
                 tokenizer_backend="auto",
-                max_context_tokens=runtime_context_tokens,
+                max_context_tokens=capabilities.context_window_tokens,
                 prompt_reserved_tokens=512,
                 local_files_only=True,
             )
         )
+
         stage_budgets = {
-            LLMCallStage(stage): LLMStageBudget.model_validate(budget.model_dump())
+            LLMCallStage(stage): LLMStageBudget.model_validate(
+                budget.model_dump()
+            )
             for stage, budget in definition.llm_stage_budgets.items()
         }
+
         resolved = ResolvedModel(
             generator=generator,
-            kwargs=kwargs,
-            context_window_tokens=runtime_context_tokens,
             gateway=LLMGateway(
                 generator=generator,
                 token_accounting=token_accounting,
-                model_context_tokens=runtime_context_tokens,
+                model_context_tokens=capabilities.context_window_tokens,
                 stage_budgets=stage_budgets,
             ),
-            token_accounting=token_accounting,
-            provider=definition.provider_name or definition.provider.value,
             model=definition.model,
-            supports_native_tools=definition.supports_tools,
-            supports_structured_output=definition.supports_structured_output,
+            provider=(
+                definition.provider_name
+                or definition.provider.value
+            ),
+            capabilities=capabilities,
+            token_accounting=token_accounting,
+            request_defaults=definition.defaults,
+            generation_config=_generation_config_from_definition(
+                definition
+            ),
             definition_revision=definition.definition_revision,
-            generation_config=_generation_config_from_definition(definition),
         )
+
         return resolved
 
     def resolve_or_fallback(self, alias: str) -> ResolvedModel:
@@ -456,25 +495,77 @@ def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSp
     return ModelSpec.model_validate(
         {
             "provider": definition.provider,
-            "provider_name": definition.provider_name,
+            "provider_name": (
+                definition.provider_name
+            ),
             "protocol": definition.protocol,
+
             "model": definition.model,
-            "tokenizer_model": definition.tokenizer_model,
-            "max_tokens": definition.max_output_tokens,
-            "timeout_seconds": definition.timeout_seconds,
+
+            "tokenizer_model": (
+                definition.tokenizer_model
+            ),
+
+            "context_window_tokens": (
+                definition.context_window_tokens
+            ),
+
+            "max_context_window_tokens": (
+                definition.max_context_window_tokens
+            ),
+
+            "max_output_tokens": (
+                definition.max_output_tokens
+            ),
+
+            "timeout_seconds": (
+                definition.timeout_seconds
+            ),
+
             "base_url": definition.base_url,
-            "api_key_env": definition.api_key_env,
-            "defaults": definition.defaults.model_dump(mode="python", exclude_none=True),
-            "context_window_tokens": definition.context_window_tokens,
-            "supports_tools": definition.supports_tools,
-            "supports_structured_output": definition.supports_structured_output,
+
+            "api_key_env": (
+                definition.api_key_env
+            ),
+
+            "defaults": (
+                definition.defaults.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
+            ),
+
+            "supports_tools": (
+                definition.supports_tools
+            ),
+
+            "supports_structured_output": (
+                definition.supports_structured_output
+            ),
+
             "location": definition.location,
-            "input_cost_per_1m": definition.input_cost_per_1m,
-            "output_cost_per_1m": definition.output_cost_per_1m,
-            "cache_read_cost_per_1m": definition.cache_read_cost_per_1m,
-            "cache_write_cost_per_1m": definition.cache_write_cost_per_1m,
+
+            "input_cost_per_1m": (
+                definition.input_cost_per_1m
+            ),
+
+            "output_cost_per_1m": (
+                definition.output_cost_per_1m
+            ),
+
+            "cache_read_cost_per_1m": (
+                definition.cache_read_cost_per_1m
+            ),
+
+            "cache_write_cost_per_1m": (
+                definition.cache_write_cost_per_1m
+            ),
+
             "runtime": (
-                definition.runtime.model_dump(mode="python", exclude_none=True)
+                definition.runtime.model_dump(
+                    mode="python",
+                    exclude_none=True,
+                )
                 if definition.runtime is not None
                 else None
             ),
@@ -709,17 +800,22 @@ def _validate_raw_catalog(data: object) -> None:
                 "protocol",
                 "model",
                 "tokenizer_model",
-                "max_tokens",
+
+                "context_window_tokens",
+                "max_context_window_tokens",
+                "max_output_tokens",
+
                 "timeout_seconds",
                 "defaults",
                 "base_url",
                 "api_key_env",
-                "context_window_tokens",
-                "request_context_tokens",
+
                 "tools",
                 "supports_tools",
+
                 "structured_output",
                 "supports_structured_output",
+
                 "location",
                 "cost",
                 "runtime",
@@ -727,6 +823,11 @@ def _validate_raw_catalog(data: object) -> None:
             },
             where=f"chat model {alias!r}",
         )
+        if "context_window_tokens" not in raw_entry:
+            raise ValueError(
+                f"chat model {alias!r} requires "
+                "context_window_tokens"
+            )
         cost = raw_entry.get("cost")
         if cost is not None:
             if not isinstance(cost, dict):
@@ -807,32 +908,88 @@ def user_model_registry_path() -> Path:
     return root / "praxis" / "models.yaml"
 
 
-def _user_definition_to_model_spec(definition: UserModelDefinition) -> ModelSpec:
+def _user_definition_to_model_spec(
+    definition: UserModelDefinition,
+) -> ModelSpec:
     runtime = (
-        definition.runtime.model_dump(mode="json", exclude_none=True)
+        definition.runtime.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
         if definition.runtime is not None
         else None
     )
+
     return ModelSpec.model_validate(
         {
             "provider": definition.provider,
             "model": definition.model,
-            "tokenizer_model": definition.tokenizer_model,
-            "provider_name": definition.provider_name,
+
+            "tokenizer_model": (
+                definition.tokenizer_model
+            ),
+
+            "provider_name": (
+                definition.provider_name
+            ),
+
             "protocol": definition.protocol,
-            "max_tokens": definition.max_output_tokens,
-            "timeout_seconds": definition.timeout_seconds,
+
+            "context_window_tokens": (
+                definition.context_window_tokens
+            ),
+
+            "max_context_window_tokens": (
+                definition.max_context_window_tokens
+            ),
+
+            "max_output_tokens": (
+                definition.max_output_tokens
+            ),
+
+            "timeout_seconds": (
+                definition.timeout_seconds
+            ),
+
             "base_url": definition.base_url,
-            "api_key_env": definition.api_key_env,
-            "defaults": definition.defaults.model_dump(mode="json", exclude_none=True),
-            "context_window_tokens": definition.context_window_tokens,
-            "supports_tools": definition.supports_tools,
-            "supports_structured_output": definition.supports_structured_output,
+
+            "api_key_env": (
+                definition.api_key_env
+            ),
+
+            "defaults": (
+                definition.defaults.model_dump(
+                    mode="json",
+                    exclude_none=True,
+                )
+            ),
+
+            "supports_tools": (
+                definition.supports_tools
+            ),
+
+            "supports_structured_output": (
+                definition.supports_structured_output
+            ),
+
             "location": definition.location,
-            "input_cost_per_1m": definition.input_cost_per_1m,
-            "output_cost_per_1m": definition.output_cost_per_1m,
-            "cache_read_cost_per_1m": definition.cache_read_cost_per_1m,
-            "cache_write_cost_per_1m": definition.cache_write_cost_per_1m,
+
+            "input_cost_per_1m": (
+                definition.input_cost_per_1m
+            ),
+
+            "output_cost_per_1m": (
+                definition.output_cost_per_1m
+            ),
+
+            "cache_read_cost_per_1m": (
+                definition.cache_read_cost_per_1m
+            ),
+
+            "cache_write_cost_per_1m": (
+                definition.cache_write_cost_per_1m
+            ),
+
             "runtime": runtime,
         }
     )

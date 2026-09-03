@@ -155,7 +155,7 @@ class ModelProbe:
                 stage=LLMCallStage.AGENT_STEP,
                 request=request,
                 provider=resolved.provider,
-                supports_native_tools=resolved.supports_native_tools,
+                supports_native_tools=(resolved.capabilities.supports_native_tools),
                 stream=True,
                 delta_sink=record_delta,
             ),
@@ -186,7 +186,7 @@ class ModelProbe:
                 stage=LLMCallStage.AGENT_STEP,
                 request=request,
                 provider=resolved.provider,
-                supports_native_tools=resolved.supports_native_tools,
+                supports_native_tools=(resolved.capabilities.supports_native_tools),
                 stream=True,
             ),
             definition=definition,
@@ -215,7 +215,10 @@ class ModelProbe:
                 stage=LLMCallStage.AGENT_STEP,
                 prompt="Return an object whose ok field is true.",
                 schema=_StructuredProbe,
-                kwargs=resolved.kwargs,
+                kwargs={
+                    **request_defaults,
+                    "max_tokens": probe_output_limit,
+                },
             ),
             definition=definition,
         )
@@ -256,23 +259,47 @@ def _probe_request(
     tool_choice: ToolChoice,
 ) -> ModelRequest:
     defaults = definition.defaults
+
+    probe_output_limit = (
+        32
+        if definition.max_output_tokens is None
+        else min(
+            definition.max_output_tokens,
+            32,
+        )
+    )
+
     provider_options = (
-        defaults.provider_options.model_dump(mode="python", exclude_none=True)
+        defaults.provider_options.model_dump(
+            mode="python",
+            exclude_none=True,
+        )
         if defaults.provider_options is not None
         else {}
     )
+
     return build_model_request(
         request_id=f"model-probe-{uuid4().hex}",
         context=build_stable_context(
-            instructions=("You are a provider capability probe.",),
+            instructions=(
+                "You are a provider capability probe.",
+            ),
             initial_user_task="Reply with the text probe.",
         ),
         selected_tools=tools,
         settings=ModelSettings(
             model=definition.model,
-            max_output_tokens=min(definition.max_output_tokens, 32),
-            temperature=defaults.temperature or 0.0,
-            top_p=defaults.top_p if defaults.top_p is not None else 1.0,
+            max_output_tokens=probe_output_limit,
+            temperature=(
+                defaults.temperature
+                if defaults.temperature is not None
+                else 0.0
+            ),
+            top_p=(
+                defaults.top_p
+                if defaults.top_p is not None
+                else 1.0
+            ),
             parallel_tool_calls=(
                 defaults.parallel_tool_calls
                 if defaults.parallel_tool_calls is not None
@@ -283,7 +310,6 @@ def _probe_request(
         ),
         tool_choice=tool_choice,
     )
-
 
 def _probe_tool() -> Tool:
     schema: dict[str, JsonValue] = {

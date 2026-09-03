@@ -95,7 +95,7 @@ class ModelSpec:
     protocol: str | None = None
     base_url: str | None = None
     api_key_env: str | None = None
-    max_output_tokens: int = 2048
+    max_output_tokens: int | None = None
     input_cost_per_1m: float | None = None
     output_cost_per_1m: float | None = None
     runtime: ModelRuntimeSpec | None = None
@@ -1176,7 +1176,7 @@ def _to_public_spec(
         protocol=spec.protocol,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
-        max_output_tokens=int(spec.max_tokens),
+        max_output_tokens=spec.max_output_tokens,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
         runtime=_to_public_runtime_spec(spec.runtime),

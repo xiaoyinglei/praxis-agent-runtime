@@ -160,32 +160,34 @@ class ModelRuntimeConfig(BaseModel):
 
 
 class ModelSpec(BaseModel):
+    """One normalized chat-model declaration."""
+
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
     model: str = Field(min_length=1)
-    tokenizer_model: str | None = Field(default=None, min_length=1)
+    tokenizer_model: str | None = Field(
+        default=None,
+        min_length=1,
+    )
 
     provider_name: str | None = None
     protocol: str | None = None
 
-    # Praxis 默认给这个模型使用的 context window。
+    # Praxis 默认使用的 context window。
     context_window_tokens: int = Field(
-        default=32_768,
         gt=0,
         strict=True,
     )
 
-    # 模型/provider 真正允许的最大 context window。
-    # None = 和 context_window_tokens 相同。
+    # 模型/provider 能够支持的最大 context window。
     max_context_window_tokens: int | None = Field(
         default=None,
         gt=0,
         strict=True,
     )
 
-    # 模型/provider 的输出上限。
-    # None = Praxis 不额外发送输出硬限制。
+    # 模型/provider 明确的单次输出上限。
     max_output_tokens: int | None = Field(
         default=None,
         gt=0,
@@ -201,10 +203,18 @@ class ModelSpec(BaseModel):
     base_url: str | None = None
     api_key_env: str | None = None
 
-    defaults: dict[str, Any] = Field(default_factory=dict)
+    defaults: dict[str, Any] = Field(
+        default_factory=dict,
+    )
 
-    supports_tools: bool = Field(default=True, strict=True)
-    supports_structured_output: bool = Field(default=True, strict=True)
+    supports_tools: bool = Field(
+        default=True,
+        strict=True,
+    )
+    supports_structured_output: bool = Field(
+        default=True,
+        strict=True,
+    )
 
     location: Literal["local", "cloud"] | None = None
 
@@ -233,10 +243,44 @@ class ModelSpec(BaseModel):
 
     @property
     def effective_max_context_window_tokens(self) -> int:
-        return (
-            self.max_context_window_tokens
-            or self.context_window_tokens
+        if self.max_context_window_tokens is None:
+            return self.context_window_tokens
+
+        return self.max_context_window_tokens
+    
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return validate_http_url(
+            value,
+            field_name="base_url",
         )
+
+    @field_validator("api_key_env")
+    @classmethod
+    def validate_api_key_environment_name(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return validate_api_key_env_name(value)
+
+    @field_validator("defaults", mode="before")
+    @classmethod
+    def reject_null_request_defaults(
+        cls,
+        value: object,
+    ) -> object:
+        if isinstance(value, dict):
+            null_path = _first_null_path(value)
+            if null_path is not None:
+                raise ValueError(
+                    "model defaults do not accept null: "
+                    f"{null_path}"
+                )
+        return value
 
     @model_validator(mode="after")
     def validate_capabilities(self) -> "ModelSpec":

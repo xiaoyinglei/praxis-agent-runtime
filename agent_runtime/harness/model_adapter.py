@@ -110,7 +110,7 @@ class GatewayHarnessModel:
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
         tool_hash = hashlib.sha256(canonical_request.toolset_revision.encode()).hexdigest()
-        if self._resolved.provider in {"mlx", "ollama"} and not self._resolved.supports_native_tools:
+        if (self._resolved.provider in {"mlx", "ollama"} and not self._resolved.capabilities.supports_native_tools):
             local_wire = render_local_agent_request(
                 canonical_request,
                 provider=self._resolved.provider,
@@ -187,7 +187,7 @@ class GatewayHarnessModel:
                 stage=LLMCallStage.AGENT_STEP,
                 request=payload.request,
                 provider=resolved.provider,
-                supports_native_tools=resolved.supports_native_tools,
+                supports_native_tools=resolved.capabilities.supports_native_tools,
                 stream=delta_sink is not None,
                 delta_sink=forward_delta if delta_sink is not None else None,
                 ledger=ledger,
@@ -419,15 +419,37 @@ def _model_messages(messages: tuple[HarnessMessage, ...]) -> tuple[ModelMessage,
 
 
 def _model_settings(resolved: ResolvedModel) -> ModelSettings:
-    max_output_tokens = resolved.kwargs.get("max_tokens", 2_048)
-    temperature = resolved.kwargs.get("temperature", 0.0)
-    top_p = resolved.kwargs.get("top_p", 1.0)
+    defaults = resolved.request_defaults
+
+    provider_options = (
+        defaults.provider_options.model_dump(
+            mode="python",
+            exclude_none=True,
+        )
+        if defaults.provider_options is not None
+        else {}
+    )
+
     return ModelSettings(
         model=resolved.model,
-        max_output_tokens=int(max_output_tokens),
-        temperature=float(temperature),
-        top_p=None if top_p is None else float(top_p),
-        parallel_tool_calls=False,
+        max_output_tokens=resolved.capabilities.max_output_tokens,
+        temperature=(
+            defaults.temperature
+            if defaults.temperature is not None
+            else 0.0
+        ),
+        top_p=(
+            defaults.top_p
+            if defaults.top_p is not None
+            else 1.0
+        ),
+        parallel_tool_calls=(
+            defaults.parallel_tool_calls
+            if defaults.parallel_tool_calls is not None
+            else False
+        ),
+        seed=defaults.seed,
+        provider_options=provider_options,
     )
 
 
@@ -468,7 +490,7 @@ def _budgeted_request(
                 model_request_input_text(
                     candidate,
                     provider=resolved.provider,
-                    supports_native_tools=resolved.supports_native_tools,
+                    supports_native_tools=(resolved.capabilities.supports_native_tools),
                 )
             )
         )

@@ -142,11 +142,14 @@ def render_local_agent_request(
 
     settings = model_settings_payload(request.settings)
     generation_options: dict[str, JsonValue] = {
-        "model": request.settings.model,
-        "max_tokens": request.settings.max_output_tokens,
-        "temperature": float(request.settings.temperature),
-        "parallel_tool_calls": request.settings.parallel_tool_calls,
-    }
+    "model": request.settings.model,
+    "temperature": float(request.settings.temperature),
+    "parallel_tool_calls": request.settings.parallel_tool_calls,}
+
+    if request.settings.max_output_tokens is not None:
+        generation_options["max_tokens"] = (
+            request.settings.max_output_tokens
+        )
     if request.settings.top_p is not None:
         generation_options["top_p"] = float(request.settings.top_p)
     if request.settings.seed is not None:
