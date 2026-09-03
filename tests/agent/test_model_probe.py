@@ -202,6 +202,7 @@ def _probe(
     base_url: str,
     *,
     timeout_seconds: float = 1.0,
+    max_output_tokens: int | None = None,
 ) -> tuple[ModelProbe, ModelExecutionDefinition]:
     config = AgentModelsConfig(
         models={
@@ -210,21 +211,25 @@ def _probe(
                 provider_name="probe-provider",
                 model="probe-model",
                 tokenizer_model="probe-model",
-                max_tokens=32,
+                context_window_tokens=4_096,
+                max_context_window_tokens=65_536,
+                max_output_tokens=max_output_tokens,
                 timeout_seconds=timeout_seconds,
                 base_url=base_url,
                 api_key_env="PROBE_API_KEY",
-                context_window_tokens=4_096,
                 supports_tools=True,
                 supports_structured_output=True,
             )
         },
         default_model="probe",
     )
+
     registry = ModelRegistry(config)
-    return ModelProbe(registry), registry.get_model_definition("probe")
 
-
+    return (
+        ModelProbe(registry),
+        registry.get_model_definition("probe"),
+    )
 async def _run_probe(
     configured_probe: tuple[ModelProbe, ModelExecutionDefinition],
     *,
@@ -233,6 +238,50 @@ async def _run_probe(
     probe, definition = configured_probe
     return await probe.run(definition, level=level)
 
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    (
+        "max_output_tokens",
+        "expected_probe_limit",
+    ),
+    [
+        (None, 32),
+        (16, 16),
+        (32_768, 32),
+    ],
+)
+async def test_probe_output_limit_is_probe_policy_not_model_capability(
+    provider_server: tuple[_ProviderState, str],
+    monkeypatch: pytest.MonkeyPatch,
+    max_output_tokens: int | None,
+    expected_probe_limit: int,
+) -> None:
+    state, base_url = provider_server
+    monkeypatch.setenv(
+        "PROBE_API_KEY",
+        "probe-secret",
+    )
+
+    evidence = await _run_probe(
+        _probe(
+            base_url,
+            max_output_tokens=max_output_tokens,
+        ),
+        level=ProbeLevel.FULL,
+    )
+
+    assert evidence.completion_ok is True
+    assert evidence.tool_call_ok is True
+    assert evidence.structured_output_ok is True
+
+    assert state.requests
+
+    assert all(
+        request["max_tokens"]
+        == expected_probe_limit
+        for request in state.requests
+    )
 
 @pytest.mark.anyio
 async def test_connectivity_probe_verifies_advertised_model(

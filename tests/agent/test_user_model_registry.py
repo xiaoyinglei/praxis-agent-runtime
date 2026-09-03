@@ -32,7 +32,7 @@ def _definition(**updates: object) -> UserModelDefinition:
         "location": "local",
         "base_url": "http://127.0.0.1:8080/v1",
         "context_window_tokens": 32_768,
-        "max_tokens": 2_048,
+        "max_output_tokens": 2_048,
     }
     values.update(updates)
     return UserModelDefinition.model_validate(values)
@@ -222,33 +222,47 @@ def test_schema_rejects_unknown_fields(payload: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         _definition(**payload)
 
-
 @pytest.mark.parametrize(
     "updates",
     [
-        {"max_tokens": 0},
+        {"max_output_tokens": 0},
+        {"max_context_window_tokens": 0},
         {"timeout_seconds": 0},
         {"context_window_tokens": 0},
-        {"request_context_tokens": 0},
-        {"max_tokens": 4097, "context_window_tokens": 4096},
-        {"max_tokens": 2048, "request_context_tokens": 1024},
-        {"request_context_tokens": 4097, "context_window_tokens": 4096},
+        {
+            "context_window_tokens": 4_097,
+            "max_context_window_tokens": 4_096,
+        },
+        {
+            "context_window_tokens": 4_096,
+            "max_output_tokens": 4_097,
+        },
+        {
+            "context_window_tokens": 4_096,
+            "max_context_window_tokens": 8_192,
+            "max_output_tokens": 8_193,
+        },
         {"input_cost_per_1m": -1},
     ],
 )
-def test_schema_rejects_invalid_budgets(updates: dict[str, object]) -> None:
+def test_schema_rejects_invalid_capabilities(
+    updates: dict[str, object],
+) -> None:
     with pytest.raises(ValidationError):
         _definition(**updates)
-
 
 def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.path.write_text(
-        "version: 1\nrevision: 0\nmodels:\n"
-        "  mine:\n    provider: mlx\n    model: m\n"
-        "    defaults:\n      temperature: null\n",
-        encoding="utf-8",
-    )
+    "version: 1\nrevision: 0\nmodels:\n"
+    "  mine:\n"
+    "    provider: mlx\n"
+    "    model: m\n"
+    "    context_window_tokens: 32768\n"
+    "    defaults:\n"
+    "      temperature: null\n",
+    encoding="utf-8",
+)
     with pytest.raises(ValidationError, match="null"):
         store.read()
 
@@ -300,11 +314,11 @@ def test_add_rejects_user_and_builtin_collisions(tmp_path: Path) -> None:
 def test_add_revalidates_adversarial_constructed_definition_under_lock(tmp_path: Path) -> None:
     store = _store(tmp_path)
     bypass = UserModelDefinition.model_construct(
-        provider="anthropic",
-        model="",
-        max_tokens=0,
-        context_window_tokens=0,
-    )
+    provider="anthropic",
+    model="",
+    max_output_tokens=0,
+    context_window_tokens=0,
+)
 
     with pytest.raises(ValidationError):
         store.add("mine", bypass, expected=store.read().version)
@@ -318,14 +332,17 @@ def test_patch_update_and_complete_replacement(tmp_path: Path) -> None:
     patched = store.update(
         "mine",
         ModelDefinitionPatch(
-            changes={"max_tokens": 1024, "defaults": {"temperature": 0.5}},
+            changes={
+    "max_output_tokens": 1024,
+    "defaults": {"temperature": 0.5},
+},
         ),
         expected=added.snapshot.version,
     )
     updated = patched.snapshot.document.models["mine"]
     assert updated.model == "Qwen/Qwen3.5-9B"
     assert updated.tokenizer_model == "old"
-    assert updated.max_tokens == 1024
+    assert updated.max_output_tokens == 1024
     assert updated.defaults.temperature == 0.5
 
     replacement = _definition(provider="ollama", model="qwen:latest", base_url=None)
@@ -342,11 +359,11 @@ def test_replacement_revalidates_adversarial_constructed_definition_under_lock(t
     added = store.add("mine", _definition(), expected=store.read().version)
     before = store.path.read_bytes()
     bypass = UserModelDefinition.model_construct(
-        provider="anthropic",
-        model="",
-        max_tokens=0,
-        context_window_tokens=0,
-    )
+    provider="anthropic",
+    model="",
+    max_output_tokens=0,
+    context_window_tokens=0,
+)
 
     with pytest.raises(ValidationError):
         store.update(
@@ -395,7 +412,7 @@ def test_store_rejects_constructed_patch_with_none_deletion(tmp_path: Path) -> N
     [
         ({"protocol": None}, ("tokenizer_model",)),
         ({}, ("runtime.launch_command",)),
-        ({"max_tokens": 1024}, ("tokenizer_model",)),
+        ({"max_output_tokens": 1024}, ("tokenizer_model",)),
     ],
 )
 def test_store_revalidates_constructed_replacement_patch_shape_under_lock(
@@ -423,7 +440,14 @@ _UNSET_CASES: tuple[tuple[str, Callable[[UserModelDefinition], object]], ...] = 
     ("provider_name", lambda value: value.provider_name),
     ("base_url", lambda value: value.base_url),
     ("api_key_env", lambda value: value.api_key_env),
-    ("request_context_tokens", lambda value: value.request_context_tokens),
+    (
+    "max_context_window_tokens",
+    lambda value: value.max_context_window_tokens,
+),
+    (
+        "max_output_tokens",
+        lambda value: value.max_output_tokens,
+    ),
     ("input_cost_per_1m", lambda value: value.input_cost_per_1m),
     ("output_cost_per_1m", lambda value: value.output_cost_per_1m),
     ("cache_read_cost_per_1m", lambda value: value.cache_read_cost_per_1m),
@@ -448,16 +472,26 @@ def test_update_supports_every_allowed_unset_path(
         tokenizer_model="tokenizer",
         provider_name="provider",
         api_key_env="MODEL_API_KEY",
-        request_context_tokens=8192,
+        max_context_window_tokens=65_536,
+        max_output_tokens=8_192,
         input_cost_per_1m=1,
         output_cost_per_1m=2,
         cache_read_cost_per_1m=0.1,
         cache_write_cost_per_1m=0.2,
-        defaults={"temperature": 0.4, "top_p": 0.9, "parallel_tool_calls": True, "seed": 7},
+        defaults={
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "parallel_tool_calls": True,
+            "seed": 7,
+        },
         runtime={
             "health_url": "http://127.0.0.1:8080/health",
             "expected_model_contains": "Qwen",
-            "launch_command": ["uv", "run", "server"],
+            "launch_command": [
+                "uv",
+                "run",
+                "server",
+            ],
         },
     )
     added = store.add("mine", complete, expected=store.read().version)
@@ -503,7 +537,7 @@ def test_identical_normalized_update_is_noop(tmp_path: Path) -> None:
     before = store.path.read_bytes()
     result = store.update(
         "mine",
-        ModelDefinitionPatch(changes={"max_tokens": 2048}),
+        ModelDefinitionPatch(changes={"max_output_tokens": 2048}),
         expected=added.snapshot.version,
     )
     assert result.changed is False

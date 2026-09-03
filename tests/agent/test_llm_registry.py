@@ -55,7 +55,6 @@ def test_model_execution_definition_has_canonical_capabilities() -> None:
     assert b'"context_window_tokens":32768' in payload
     assert b'"max_context_window_tokens":32768' in payload
     assert b'"max_output_tokens":null' in payload
-    assert b'"request_context_tokens"' not in payload
 
     assert definition.definition_revision.startswith("sha256:")
 

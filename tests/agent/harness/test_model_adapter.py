@@ -14,6 +14,11 @@ from agent_runtime.core.llm_config import (
     ModelSpec as InternalModelSpec,
 )
 from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
+from agent_runtime.model_definition import (
+    ModelCapabilities,
+    RequestDefaultsDefinition,
+)
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -286,18 +291,103 @@ class BudgetAwareCapturingGateway(CapturingGateway):
         )
         return await super().agenerate_model_request(**kwargs)
 
+def _resolved_model(
+    *,
+    gateway: object,
+    generator: object | None = None,
+    model: str = "provider-model",
+    provider: str = "openai-compatible",
+    context_window_tokens: int = 8_192,
+    max_context_window_tokens: int | None = None,
+    max_output_tokens: int | None = 256,
+    supports_native_tools: bool = True,
+    supports_structured_output: bool = True,
+    temperature: float | None = 0.0,
+    top_p: float | None = None,
+    parallel_tool_calls: bool | None = None,
+    seed: int | None = None,
+    token_accounting: object | None = None,
+) -> ResolvedModel:
+    effective_max_context = (
+        context_window_tokens
+        if max_context_window_tokens is None
+        else max_context_window_tokens
+    )
+
+    return ResolvedModel(
+        generator=(
+            object()
+            if generator is None
+            else generator
+        ),
+        gateway=gateway,  # type: ignore[arg-type]
+        model=model,
+        provider=provider,
+        capabilities=ModelCapabilities(
+            context_window_tokens=context_window_tokens,
+            max_context_window_tokens=effective_max_context,
+            max_output_tokens=max_output_tokens,
+            supports_native_tools=supports_native_tools,
+            supports_structured_output=(
+                supports_structured_output
+            ),
+        ),
+        token_accounting=(
+            token_accounting
+            if token_accounting is not None
+            else CharacterAccounting()
+        ),  # type: ignore[arg-type]
+        request_defaults=RequestDefaultsDefinition(
+            temperature=temperature,
+            top_p=top_p,
+            parallel_tool_calls=parallel_tool_calls,
+            seed=seed,
+        ),
+        generation_config=GenerationConfig(),
+    )
+
+def test_model_settings_preserve_unknown_model_output_limit() -> None:
+    gateway = CapturingGateway()
+
+    resolved = _resolved_model(
+        gateway=gateway,
+        max_output_tokens=None,
+    )
+
+    model = GatewayHarnessModel(
+        model_alias="test-model",
+        resolved=resolved,
+        instructions=("Answer directly.",),
+    )
+
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            messages=(
+                HarnessMessage(
+                    role="user",
+                    content="hello",
+                ),
+            ),
+            binding_manifest={
+                "model_alias": "test-model",
+            },
+        )
+    )
+
+    payload = prepared.dispatch_payload
+    request = payload.request  # type: ignore[attr-defined]
+
+    assert request.settings.max_output_tokens is None
 
 def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
     gateway = CapturingGateway()
-    resolved = ResolvedModel(
-        generator=object(),
-        kwargs={"max_tokens": 256, "temperature": 0.0},
-        context_window_tokens=8_192,
-        gateway=gateway,
-        provider="openai-compatible",
-        model="provider-model",
-        supports_native_tools=True,
-    )
+    resolved = _resolved_model(
+    gateway=gateway,
+    max_output_tokens=256,
+    temperature=0.0,
+)
     model = GatewayHarnessModel(
         model_alias="test-model",
         resolved=resolved,
@@ -331,15 +421,11 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
 
 def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> None:
     gateway = MaxTokensGateway()
-    resolved = ResolvedModel(
-        generator=object(),
-        kwargs={"max_tokens": 256, "temperature": 0.0},
-        context_window_tokens=8_192,
-        gateway=gateway,
-        provider="openai-compatible",
-        model="provider-model",
-        supports_native_tools=True,
-    )
+    resolved = _resolved_model(
+    gateway=gateway,
+    max_output_tokens=256,
+    temperature=0.0,
+)
     model = GatewayHarnessModel(
         model_alias="test-model",
         resolved=resolved,
@@ -372,12 +458,9 @@ async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
     gateway = NativeTextDeltaGateway()
     model = BoundGatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
+        resolved=_resolved_model(
             gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
+            max_output_tokens=256,
         ),
         instructions=("Answer the user directly.",),
     )
@@ -433,12 +516,9 @@ async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
     gateway = NativeReasoningPlanGateway()
     model = BoundGatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
+        resolved=_resolved_model(
             gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
+            max_output_tokens=256,
         ),
         instructions=("Answer the user directly.",),
     )
@@ -512,13 +592,11 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
     )
     model = BoundGatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=provider,
-            kwargs={"max_tokens": 2_048},
-            gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
-        ),
+        resolved=_resolved_model(
+    gateway=gateway,
+    generator=provider,
+    max_output_tokens=2_048,
+),
         instructions=("Answer the user directly.",),
     )
     dispatcher = TurnEventDispatcher(capacity=1)
@@ -568,13 +646,11 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
     )
     model = GatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=provider,
-            kwargs={"max_tokens": 256},
-            gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
-        ),
+        resolved=_resolved_model(
+    gateway=gateway,
+    generator=provider,
+    max_output_tokens=256,
+),
         instructions=("Answer the user directly.",),
     )
     prepared = model.prepare(
@@ -600,16 +676,13 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
 
 def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:
     gateway = BudgetAwareCapturingGateway(max_input_tokens=9_000)
-    resolved = ResolvedModel(
-        generator=object(),
-        kwargs={"max_tokens": 256, "temperature": 0.0},
-        context_window_tokens=32_768,
-        gateway=gateway,
-        token_accounting=gateway.token_accounting,
-        provider="openai-compatible",
-        model="provider-model",
-        supports_native_tools=True,
-    )
+    resolved = _resolved_model(
+    gateway=gateway,
+    context_window_tokens=32_768,
+    max_output_tokens=256,
+    temperature=0.0,
+    token_accounting=gateway.token_accounting,
+)
     model = GatewayHarnessModel(
         model_alias="test-model",
         resolved=resolved,
@@ -651,15 +724,10 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256, "temperature": 0.0},
-            context_window_tokens=8_192,
-            gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
-            supports_native_tools=True,
-        ),
+        resolved=_resolved_model(
+    gateway=gateway,
+    max_output_tokens=256,
+),
         instructions=("Stable system instruction.",),
     )
     first = model.prepare(
@@ -700,15 +768,10 @@ def test_gateway_adapter_enforces_remaining_budget_before_provider_io() -> None:
     gateway = BudgetRejectingGateway()
     model = GatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
-            context_window_tokens=8_192,
-            gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
-            supports_native_tools=True,
-        ),
+        resolved=_resolved_model(
+    gateway=gateway,
+    max_output_tokens=256,
+),
         instructions=("Answer the user directly.",),
     )
     prepared = model.prepare(
@@ -736,15 +799,10 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
         model_alias="test-model",
-        resolved=ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
-            context_window_tokens=8_192,
-            gateway=gateway,
-            provider="openai-compatible",
-            model="provider-model",
-            supports_native_tools=True,
-        ),
+        resolved=_resolved_model(
+    gateway=gateway,
+    max_output_tokens=256,
+),
         instructions=("Answer the user directly.",),
     )
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
@@ -845,6 +903,7 @@ def _declarations(alias: str, provider_model: str) -> ModelRegistry:
                 alias: InternalModelSpec(
                     provider=ModelProvider.OPENAI_COMPATIBLE,
                     model=provider_model,
+                    context_window_tokens=8_192,
                     base_url="https://api.example.com/v1",
                     location="cloud",
                 )
@@ -858,19 +917,15 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
     first_gateway = CapturingGateway()
     second_gateway = CapturingGateway()
     resolved = {
-        "model-a": ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
+        "model-a": _resolved_model(
             gateway=first_gateway,
-            provider="openai-compatible",
             model="provider-model-a",
+            max_output_tokens=256,
         ),
-        "model-b": ResolvedModel(
-            generator=object(),
-            kwargs={"max_tokens": 256},
+        "model-b": _resolved_model(
             gateway=second_gateway,
-            provider="openai-compatible",
             model="provider-model-b",
+            max_output_tokens=256,
         ),
     }
     class FrozenControlPlane:
@@ -981,13 +1036,11 @@ def test_authenticated_turn_resolves_after_selected_alias_is_removed(
         worktree=workspace,
     )
     frozen_gateway = CapturingGateway()
-    frozen_resolved = ResolvedModel(
-        generator=object(),
-        kwargs={"max_tokens": 256},
-        gateway=frozen_gateway,
-        provider="openai-compatible",
-        model="provider-model-a",
-    )
+    frozen_resolved = _resolved_model(
+    gateway=frozen_gateway,
+    model="provider-model-a",
+    max_output_tokens=256,
+)
     original = ModelControlPlane(
         catalog=ModelCatalog.from_registry(_declarations("model-a", "provider-model-a")),
         state=ModelSessionState(current_model_id="model-a", selection_requester="user"),
@@ -1050,13 +1103,11 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
     )
     trust.initialize()
     gateway = CapturingGateway()
-    resolved = ResolvedModel(
-        generator=object(),
-        kwargs={"max_tokens": 256},
-        gateway=gateway,
-        provider="openai-compatible",
-        model="provider-model-a",
-    )
+    resolved = _resolved_model(
+    gateway=gateway,
+    model="provider-model-a",
+    max_output_tokens=256,
+)
     declarations = ModelRegistry(
         AgentModelsConfig(
             models={
@@ -1065,6 +1116,7 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
                     model="provider-model-a",
                     base_url="https://api.example.com/v1",
                     location="cloud",
+                    context_window_tokens=8_192,
                 )
             },
             default_model="model-a",
