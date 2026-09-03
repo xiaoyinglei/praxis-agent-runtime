@@ -209,6 +209,22 @@ class ModelProbe:
         definition: ModelExecutionDefinition,
     ) -> None:
         gateway = _gateway(resolved)
+
+        request_defaults = resolved.request_defaults.model_dump(
+            mode="python",
+            exclude_none=True,
+        )
+
+        max_output_tokens = (
+            resolved.capabilities.max_output_tokens
+        )
+
+        probe_output_limit = (
+            32
+            if max_output_tokens is None
+            else min(max_output_tokens, 32)
+        )
+
         result = await _safe_phase(
             "structured_output",
             lambda: gateway.agenerate_structured(
@@ -222,12 +238,15 @@ class ModelProbe:
             ),
             definition=definition,
         )
+
         if result.value.ok is not True:
             raise ModelProbeError(
                 phase="structured_output",
-                detail="provider returned an invalid structured probe result",
+                detail=(
+                    "provider returned an invalid "
+                    "structured probe result"
+                ),
             )
-
 
 async def _safe_phase[T](
     phase: str,

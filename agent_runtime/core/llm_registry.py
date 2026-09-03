@@ -60,7 +60,7 @@ class ChatProviderConfig:
     api_key: str | None
 
 
-class ModelRuntimeResolver(Protocol):
+class ModelResolver(Protocol):
     @property
     def default_model(self) -> str: ...
 
@@ -82,10 +82,10 @@ class ModelRuntimeResolver(Protocol):
     ) -> ResolvedModel: ...
 
 
-class ModelRuntimeRegistry:
+class ModelRegistry:
     """按 alias 解析并缓存 Generator 实例。
 
-    加载顺序：RAG_AGENT_MODELS_PATH(YAML) > RAG_AGENT_MODELS(JSON) > models.yaml 内置默认
+    加载顺序：AGENT_MODELS_PATH(YAML) > AGENT_MODELS(JSON) > models.yaml 内置默认
     """
 
     _BUNDLED_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "models.yaml"

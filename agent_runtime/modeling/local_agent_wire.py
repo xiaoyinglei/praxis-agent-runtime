@@ -140,7 +140,10 @@ def render_local_agent_request(
         )
     )
 
-    settings = model_settings_payload(request.settings)
+    settings = dict(model_settings_payload(request.settings))
+
+    if request.settings.max_output_tokens is None:
+        settings.pop("max_output_tokens", None)
     generation_options: dict[str, JsonValue] = {
     "model": request.settings.model,
     "temperature": float(request.settings.temperature),
