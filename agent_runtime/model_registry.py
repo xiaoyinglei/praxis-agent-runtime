@@ -51,11 +51,11 @@ _UNSET_PATHS = frozenset(
         "provider_name",
         "base_url",
         "api_key_env",
-        "request_context_tokens",
         "input_cost_per_1m",
         "output_cost_per_1m",
         "cache_read_cost_per_1m",
         "cache_write_cost_per_1m",
+        
         "runtime.health_url",
         "runtime.expected_model_contains",
         "defaults.temperature",
@@ -158,13 +158,13 @@ class UserModelDefinition(BaseModel):
     tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = Field(default=None, min_length=1)
     protocol: str | None = Field(default=None, min_length=1)
-    max_tokens: int = Field(default=2048, gt=0, strict=True)
     timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     base_url: str | None = None
     api_key_env: str | None = None
     defaults: ModelGenerationDefaults = Field(default_factory=ModelGenerationDefaults)
-    context_window_tokens: int = Field(default=32_768, gt=0, strict=True)
-    request_context_tokens: int | None = Field(default=None, gt=0, strict=True)
+    context_window_tokens: int = Field(default=32_768,gt=0,strict=True,)
+    max_context_window_tokens: int | None = Field(default=None,gt=0,strict=True,)
+    max_output_tokens: int | None = Field(default=None,gt=0,strict=True,)
     supports_tools: bool = Field(default=True, strict=True)
     supports_structured_output: bool = Field(default=True, strict=True)
     location: Literal["local", "cloud"] | None = None

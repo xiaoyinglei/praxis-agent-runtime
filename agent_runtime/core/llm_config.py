@@ -160,64 +160,112 @@ class ModelRuntimeConfig(BaseModel):
 
 
 class ModelSpec(BaseModel):
-    """单个模型声明：只允许填写当前已实现 provider 支持的模型。"""
-
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
     model: str = Field(min_length=1)
     tokenizer_model: str | None = Field(default=None, min_length=1)
+
     provider_name: str | None = None
     protocol: str | None = None
-    max_tokens: int = Field(default=2048, gt=0, strict=True)
-    timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
+
+    # Praxis 默认给这个模型使用的 context window。
+    context_window_tokens: int = Field(
+        default=32_768,
+        gt=0,
+        strict=True,
+    )
+
+    # 模型/provider 真正允许的最大 context window。
+    # None = 和 context_window_tokens 相同。
+    max_context_window_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        strict=True,
+    )
+
+    # 模型/provider 的输出上限。
+    # None = Praxis 不额外发送输出硬限制。
+    max_output_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        strict=True,
+    )
+
+    timeout_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        allow_inf_nan=False,
+    )
+
     base_url: str | None = None
     api_key_env: str | None = None
+
     defaults: dict[str, Any] = Field(default_factory=dict)
-    context_window_tokens: int = Field(default=32_768, gt=0, strict=True)
-    request_context_tokens: int | None = Field(default=None, gt=0, strict=True)
+
     supports_tools: bool = Field(default=True, strict=True)
     supports_structured_output: bool = Field(default=True, strict=True)
+
     location: Literal["local", "cloud"] | None = None
-    input_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    output_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    cache_read_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    input_cost_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    output_cost_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    cache_read_cost_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+    cache_write_cost_per_1m: float | None = Field(
+        default=None,
+        ge=0,
+        allow_inf_nan=False,
+    )
+
     runtime: ModelRuntimeConfig | None = None
 
-    @field_validator("base_url")
-    @classmethod
-    def validate_base_url(cls, value: str | None) -> str | None:
-        return validate_http_url(value, field_name="base_url")
-
-    @field_validator("api_key_env")
-    @classmethod
-    def validate_api_key_environment_name(cls, value: str | None) -> str | None:
-        return validate_api_key_env_name(value)
-
-    @field_validator("defaults", mode="before")
-    @classmethod
-    def reject_null_request_defaults(cls, value: object) -> object:
-        if isinstance(value, dict):
-            null_path = _first_null_path(value)
-            if null_path is not None:
-                raise ValueError(f"model defaults do not accept null: {null_path}")
-        return value
+    @property
+    def effective_max_context_window_tokens(self) -> int:
+        return (
+            self.max_context_window_tokens
+            or self.context_window_tokens
+        )
 
     @model_validator(mode="after")
-    def validate_request_context_limit(self) -> ModelSpec:
-        if self.request_context_tokens is not None and self.request_context_tokens > self.context_window_tokens:
-            raise ValueError("request_context_tokens must not exceed context_window_tokens")
-        request_limit = self.request_context_tokens or self.context_window_tokens
-        if self.max_tokens > request_limit:
-            raise ValueError("max_tokens must not exceed the effective request context limit")
+    def validate_capabilities(self) -> "ModelSpec":
+        if (
+            self.context_window_tokens
+            > self.effective_max_context_window_tokens
+        ):
+            raise ValueError(
+                "context_window_tokens must not exceed "
+                "max_context_window_tokens"
+            )
+
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens
+            > self.effective_max_context_window_tokens
+        ):
+            raise ValueError(
+                "max_output_tokens must not exceed "
+                "max_context_window_tokens"
+            )
+
         _ = normalize_model_endpoint(
             provider=self.provider,
             base_url=self.base_url,
             location=self.location,
         )
-        return self
 
+        return self
 
 def _first_null_path(value: dict[object, object], *, prefix: str = "") -> str | None:
     for key, item in value.items():

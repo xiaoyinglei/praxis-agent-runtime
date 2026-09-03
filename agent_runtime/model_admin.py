@@ -40,7 +40,6 @@ class ModelDefinitionArguments:
     base_url: str | None = None
     api_key_env: str | None = None
     context_window_tokens: int | None = None
-    request_context_tokens: int | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
     location: Literal["local", "cloud"] | None = None
@@ -69,7 +68,6 @@ class ModelDefinitionArguments:
             "base_url": self.base_url,
             "api_key_env": self.api_key_env,
             "context_window_tokens": self.context_window_tokens,
-            "request_context_tokens": self.request_context_tokens,
             "supports_tools": self.supports_tools,
             "supports_structured_output": self.supports_structured_output,
             "location": self.location,

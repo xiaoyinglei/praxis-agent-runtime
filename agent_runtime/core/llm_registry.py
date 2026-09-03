@@ -302,7 +302,6 @@ class ModelRegistry:
                 "base_url": merged.get("base_url"),
                 "api_key_env": merged.get("api_key_env"),
                 "context_window_tokens": entry.get("context_window_tokens", 32_768),
-                "request_context_tokens": entry.get("request_context_tokens"),
                 "supports_tools": entry.get("tools", entry.get("supports_tools", True)),
                 "supports_structured_output": entry.get(
                     "structured_output",
@@ -381,7 +380,7 @@ class ModelRegistry:
             raise ModelNotAvailableError(f"Failed to build provider for {subject}")
 
         kwargs: dict[str, Any] = {
-            "max_tokens": definition.max_tokens,
+            "max_tokens": definition.max_output_tokens,
             **deepcopy(
                 definition.defaults.model_dump(
                     mode="python",
@@ -460,13 +459,12 @@ def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSp
             "protocol": definition.protocol,
             "model": definition.model,
             "tokenizer_model": definition.tokenizer_model,
-            "max_tokens": definition.max_tokens,
+            "max_tokens": definition.max_output_tokens,
             "timeout_seconds": definition.timeout_seconds,
             "base_url": definition.base_url,
             "api_key_env": definition.api_key_env,
             "defaults": definition.defaults.model_dump(mode="python", exclude_none=True),
             "context_window_tokens": definition.context_window_tokens,
-            "request_context_tokens": definition.request_context_tokens,
             "supports_tools": definition.supports_tools,
             "supports_structured_output": definition.supports_structured_output,
             "location": definition.location,
@@ -821,13 +819,12 @@ def _user_definition_to_model_spec(definition: UserModelDefinition) -> ModelSpec
             "tokenizer_model": definition.tokenizer_model,
             "provider_name": definition.provider_name,
             "protocol": definition.protocol,
-            "max_tokens": definition.max_tokens,
+            "max_tokens": definition.max_output_tokens,
             "timeout_seconds": definition.timeout_seconds,
             "base_url": definition.base_url,
             "api_key_env": definition.api_key_env,
             "defaults": definition.defaults.model_dump(mode="json", exclude_none=True),
             "context_window_tokens": definition.context_window_tokens,
-            "request_context_tokens": definition.request_context_tokens,
             "supports_tools": definition.supports_tools,
             "supports_structured_output": definition.supports_structured_output,
             "location": definition.location,

@@ -89,27 +89,42 @@ class RequestDefaultsDefinition(BaseModel):
 
 
 class ModelExecutionDefinition(BaseModel):
-    """Every request-affecting value needed to execute one selected model.
-
-    Alias, catalog origin, registry/file revisions, policy state, and resolved
-    credential values deliberately do not belong to this content-addressed
-    definition.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
 
     provider: ModelProvider
     provider_name: str | None
     protocol: str | None
+
     model: str = Field(min_length=1)
     tokenizer_model: str | None
-    max_tokens: int = Field(gt=0, strict=True)
-    timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    context_window_tokens: int = Field(
+        gt=0,
+        strict=True,
+    )
+
+    max_context_window_tokens: int = Field(
+        gt=0,
+        strict=True,
+    )
+
+    max_output_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        strict=True,
+    )
+
+    timeout_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+    )
     base_url: str | None
     api_key_env: str | None
     defaults: RequestDefaultsDefinition
     context_window_tokens: int = Field(gt=0, strict=True)
-    request_context_tokens: int | None = Field(gt=0, strict=True)
     supports_tools: bool
     supports_structured_output: bool
     location: Literal["local", "cloud"] | None
@@ -132,19 +147,29 @@ class ModelExecutionDefinition(BaseModel):
         return validate_api_key_env_name(value)
 
     @model_validator(mode="after")
-    def validate_normalized_execution_values(self) -> ModelExecutionDefinition:
-        endpoint = normalize_model_endpoint(
-            provider=self.provider,
-            base_url=self.base_url,
-            location=self.location,
-        )
-        if self.base_url != endpoint.base_url or self.location != endpoint.location:
-            raise ValueError("model execution endpoint and location must be normalized")
-        request_limit = self.request_context_tokens or self.context_window_tokens
-        if request_limit > self.context_window_tokens:
-            raise ValueError("request_context_tokens must not exceed context_window_tokens")
-        if self.max_tokens > request_limit:
-            raise ValueError("max_tokens must not exceed the effective request context limit")
+    def validate_capabilities(
+        self,
+    ) -> "ModelExecutionDefinition":
+
+        if (
+            self.context_window_tokens
+            > self.max_context_window_tokens
+        ):
+            raise ValueError(
+                "context_window_tokens must not exceed "
+                "max_context_window_tokens"
+            )
+
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens
+            > self.max_context_window_tokens
+        ):
+            raise ValueError(
+                "max_output_tokens must not exceed "
+                "max_context_window_tokens"
+            )
+
         return self
 
     @property
@@ -169,15 +194,17 @@ def build_model_execution_definition(
         provider=spec.provider,
         provider_name=spec.provider_name,
         protocol=spec.protocol,
+
         model=spec.model,
-        tokenizer_model=spec.tokenizer_model or spec.model,
-        max_tokens=spec.max_tokens,
+        tokenizer_model=(spec.tokenizer_model or spec.model),
+        context_window_tokens=(spec.context_window_tokens),
+        max_context_window_tokens=(spec.effective_max_context_window_tokens),
+        max_output_tokens=(spec.max_output_tokens),
         timeout_seconds=spec.timeout_seconds,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
         defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),
         context_window_tokens=spec.context_window_tokens,
-        request_context_tokens=spec.request_context_tokens,
         supports_tools=spec.supports_tools,
         supports_structured_output=spec.supports_structured_output,
         location=endpoint.location,
@@ -257,9 +284,9 @@ def _effective_stage_budgets(
 ) -> dict[LLMCallStage, LLMStageBudget]:
     budgets = {stage: budget.model_copy() for stage, budget in config.llm_stage_budgets.items()}
     tool_decision = budgets[LLMCallStage.TOOL_DECISION]
-    if spec.max_tokens > tool_decision.max_output_tokens:
+    if spec.max_output_tokens > tool_decision.max_output_tokens:
         budgets[LLMCallStage.TOOL_DECISION] = tool_decision.model_copy(
-            update={"max_output_tokens": spec.max_tokens}
+            update={"max_output_tokens": spec.max_output_tokens}
         )
     return budgets
 

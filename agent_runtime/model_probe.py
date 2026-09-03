@@ -270,7 +270,7 @@ def _probe_request(
         selected_tools=tools,
         settings=ModelSettings(
             model=definition.model,
-            max_output_tokens=min(definition.max_tokens, 32),
+            max_output_tokens=min(definition.max_output_tokens, 32),
             temperature=defaults.temperature or 0.0,
             top_p=defaults.top_p if defaults.top_p is not None else 1.0,
             parallel_tool_calls=(

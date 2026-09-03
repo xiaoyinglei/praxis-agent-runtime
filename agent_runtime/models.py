@@ -1137,7 +1137,7 @@ def _to_public_definition_spec(
         protocol=definition.protocol,
         base_url=definition.base_url,
         api_key_env=definition.api_key_env,
-        max_output_tokens=definition.max_tokens,
+        max_output_tokens=definition.max_output_tokens,
         input_cost_per_1m=definition.input_cost_per_1m,
         output_cost_per_1m=definition.output_cost_per_1m,
         runtime=(

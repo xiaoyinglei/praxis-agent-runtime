@@ -142,7 +142,6 @@ models:
     model: openai/gpt-oss-120b
     tokenizer_model: gpt-oss-120b
     context_window_tokens: 131072
-    request_context_tokens: 8000
 
   groq_llama_3_3_70b:
     capability: chat
