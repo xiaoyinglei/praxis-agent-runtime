@@ -162,7 +162,6 @@ models:
     capability: chat
     provider: kimi
     model: kimi-k2.6
-    max_tokens: 32768
     context_window_tokens: 262144
     defaults:
       temperature: 1.0

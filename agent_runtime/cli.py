@@ -688,8 +688,20 @@ def model_show(
     print(f"base_url: {entry.spec.base_url or '<default>'}")
     print(f"api_key_env: {entry.spec.api_key_env or '<none>'}")
     print(f"tokenizer_model: {entry.definition.tokenizer_model or '<default>'}")
-    print(f"context_window_tokens: {entry.definition.context_window_tokens}")
-    print(f"max_output_tokens: {entry.definition.max_output_tokens}")
+    print(
+        f"context_window_tokens: "
+        f"{entry.definition.context_window_tokens}"
+    )
+
+    print(
+        "max_context_window_tokens: "
+        f"{entry.definition.max_context_window_tokens}"
+    )
+
+    print(
+        f"max_output_tokens: "
+        f"{entry.definition.max_output_tokens}"
+    )
     print(f"timeout_seconds: {entry.definition.timeout_seconds}")
     print(f"supports_tools: {str(entry.spec.supports_tools).lower()}")
     print(
@@ -753,11 +765,19 @@ def model_add(
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
     provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
-    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
     timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
     context_window_tokens: Annotated[
         int | None,
         typer.Option("--context-window-tokens"),
+    ] = None,
+    max_context_window_tokens: Annotated[
+        int | None,
+        typer.Option("--max-context-window-tokens"),
+    ] = None,
+
+    max_output_tokens: Annotated[
+        int | None,
+        typer.Option("--max-output-tokens"),
     ] = None,
     supports_tools: Annotated[
         bool | None,
@@ -788,9 +808,10 @@ def model_add(
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
+        max_context_window_tokens=max_context_window_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,
@@ -818,11 +839,20 @@ def model_update(
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
     provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
-    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
     timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
     context_window_tokens: Annotated[
         int | None,
         typer.Option("--context-window-tokens"),
+    ] = None,
+
+    max_context_window_tokens: Annotated[
+        int | None,
+        typer.Option("--max-context-window-tokens"),
+    ] = None,
+
+    max_output_tokens: Annotated[
+        int | None,
+        typer.Option("--max-output-tokens"),
     ] = None,
     supports_tools: Annotated[
         bool | None,
@@ -851,9 +881,10 @@ def model_update(
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
+        max_context_window_tokens=max_context_window_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,
@@ -938,9 +969,10 @@ def _model_definition_arguments(
     tokenizer_model: str | None,
     provider_name: str | None,
     protocol: str | None,
-    max_tokens: int | None,
     timeout_seconds: float | None,
     context_window_tokens: int | None,
+    max_context_window_tokens: int | None,
+    max_output_tokens: int | None,
     supports_tools: bool | None,
     supports_structured_output: bool | None,
     location: Literal["local", "cloud"] | None,
@@ -953,9 +985,10 @@ def _model_definition_arguments(
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
+        max_context_window_tokens=max_context_window_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,

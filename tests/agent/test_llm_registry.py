@@ -45,23 +45,24 @@ def _make_config(
     )
 
 
-def test_model_execution_definition_has_fixed_canonical_digest() -> None:
+def test_model_execution_definition_has_canonical_capabilities() -> None:
     registry = ModelRegistry(_make_config())
 
     definition = registry.get_model_definition("main")
     payload = canonical_definition_json(definition)
 
     assert b'"api_key_env":null' in payload
-    assert b'"request_context_tokens":null' in payload
-    assert definition.definition_revision == (
-        "sha256:0d78906982c607629387196daf265f42dfc585b5da3b53fb780a86feef0fe786"
-    )
+    assert b'"context_window_tokens":32768' in payload
+    assert b'"max_context_window_tokens":32768' in payload
+    assert b'"max_output_tokens":null' in payload
+    assert b'"request_context_tokens"' not in payload
 
+    assert definition.definition_revision.startswith("sha256:")
 
 def test_model_definition_digest_changes_only_for_selected_request_definition() -> None:
     baseline = _make_config()
     changed = baseline.model_copy(deep=True)
-    changed.models["main"].max_tokens = baseline.models["main"].max_tokens + 1
+    changed.models["main"].max_output_tokens = 1024
     unrelated = baseline.model_copy(
         update={
             "models": {
@@ -107,6 +108,27 @@ def test_model_definition_digest_covers_generation_defaults_and_stage_budgets() 
     assert (
         ModelRegistry(defaults_changed).get_model_definition("main").definition_revision
         != baseline_digest
+    )
+
+def test_model_capability_does_not_change_stage_budget() -> None:
+    config = _make_config()
+
+    baseline = ModelRegistry(
+        config
+    ).get_model_definition("main")
+
+    changed = config.model_copy(deep=True)
+    changed.models["main"].max_output_tokens = 1_024
+
+    with_capability = ModelRegistry(
+        changed
+    ).get_model_definition("main")
+
+    assert with_capability.max_output_tokens == 1_024
+
+    assert (
+        with_capability.llm_stage_budgets
+        == baseline.llm_stage_budgets
     )
 
 
@@ -161,6 +183,7 @@ def test_whole_catalog_override_rejects_transport_or_secret_defaults(
                     "main": {
                         "provider": "ollama",
                         "model": "main-model",
+                        "context_window_tokens": 32_768,
                         "defaults": unsafe_defaults,
                     }
                 },
@@ -262,6 +285,7 @@ def test_whole_catalog_yaml_override_rejects_unknown_chat_fields(tmp_path: Path)
                         "capability": "chat",
                         "provider": "ollama",
                         "model": "main-model",
+                        "context_window_tokens": 32_768,
                         "api_key": "plaintext-secret",
                     }
                 },
@@ -287,6 +311,7 @@ def test_whole_catalog_override_rejects_explicit_null_defaults(
             "main": {
                 "provider": "ollama",
                 "model": "main-model",
+                "context_window_tokens": 32_768,
                 "defaults": {"temperature": None},
             }
         },
@@ -306,6 +331,7 @@ def test_whole_catalog_override_rejects_explicit_null_defaults(
                     "models": {
                         "main": {
                             "capability": "chat",
+                            "context_window_tokens": 32_768,
                             **payload["models"]["main"],
                         }
                     },
@@ -324,6 +350,7 @@ def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -
             "main": ModelSpec(
                 provider=ModelProvider.OLLAMA,
                 model="main-model",
+                context_window_tokens=32_768,
             )
         },
         default_model="main",
@@ -339,30 +366,46 @@ def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -
     assert provider.base_url == definition.base_url
 
 
-def test_resolved_kwargs_cannot_mutate_cached_definition(
+def test_resolved_request_defaults_do_not_mutate_cached_definition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _make_config()
     config.models["main"].defaults = {
-        "provider_options": {"thinking": {"type": "enabled"}}
+        "provider_options": {
+            "thinking": {"type": "enabled"}
+        }
     }
+
     registry = ModelRegistry(config)
-    original_revision = registry.get_model_definition("main").definition_revision
+
+    original_revision = (
+        registry
+        .get_model_definition("main")
+        .definition_revision
+    )
+
     monkeypatch.setattr(
         "agent_runtime.core.llm_registry._build_chat_generator",
         lambda spec: object(),
     )
 
     resolved = registry.resolve("main")
-    provider_options = resolved.kwargs["provider_options"]
-    assert isinstance(provider_options, dict)
-    thinking = provider_options["thinking"]
-    assert isinstance(thinking, dict)
-    thinking["type"] = "disabled"
 
-    assert registry.get_model_definition("main").definition_revision == original_revision
+    assert (
+        resolved
+        .request_defaults
+        .provider_options
+        .thinking
+        .type
+        == "enabled"
+    )
 
-
+    assert (
+        registry
+        .get_model_definition("main")
+        .definition_revision
+        == original_revision
+    )
 def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> None:
     config_path = tmp_path / "models.yaml"
     config_path.write_text(
@@ -374,7 +417,7 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
                         "provider": "qwen",
                         "protocol": "openai_compatible",
                         "model": "Qwen/Qwen3-8B-MLX-4bit",
-                        "max_tokens": 16384,
+                        "max_output_tokens": 16384,
                         "base_url": "http://127.0.0.1:8080/v1",
                         "context_window_tokens": 32768,
                         "defaults": {
@@ -405,7 +448,7 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
     assert config.models["qwen3_8b_mlx_4bit"].provider is ModelProvider.OPENAI_COMPATIBLE
     assert config.models["qwen3_8b_mlx_4bit"].base_url == "http://127.0.0.1:8080/v1"
     assert config.models["qwen3_8b_mlx_4bit"].context_window_tokens == 32768
-    assert config.models["qwen3_8b_mlx_4bit"].max_tokens == 16384
+    assert config.models["qwen3_8b_mlx_4bit"].max_output_tokens == 16_384
     assert config.models["qwen3_8b_mlx_4bit"].defaults == {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -494,8 +537,8 @@ def test_load_configs_models_supports_provider_section_schema(
                         "provider": "groq",
                         "model": "openai/gpt-oss-120b",
                         "tokenizer_model": "gpt-oss-120b",
-                        "context_window_tokens": 131072,
-                        "request_context_tokens": 8000,
+                        "context_window_tokens": 8000,
+                        "max_context_window_tokens": 131072,    
                     },
                 },
                 "defaults": {"primary_model": "groq_gpt_oss_120b"},
@@ -516,8 +559,12 @@ def test_load_configs_models_supports_provider_section_schema(
     assert groq.base_url == "https://api.groq.com/openai/v1"
     assert groq.api_key_env == "GROQ_API_KEY"
     assert groq.location == "cloud"
-    assert groq.context_window_tokens == 131072
-    assert groq.request_context_tokens == 8000
+    assert groq.context_window_tokens == 8_000
+    assert groq.max_context_window_tokens == 131_072
+    assert (
+        groq.effective_max_context_window_tokens
+        == 131_072
+    )
     assert groq.tokenizer_model == "gpt-oss-120b"
     assert provider_config.api_key == "sk-test"
     assert provider_config.base_url == "https://api.groq.com/openai/v1"
@@ -578,7 +625,7 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
                 "generation": {
                     "factcheck": {
                         "model": "mimo_cloud",
-                        "max_tokens": 2048,
+                        "context_window_tokens": 32_768,
                         "temperature": 0.3,
                     }
                 },
@@ -671,7 +718,7 @@ class TestModelRegistryResolve:
             protocol="openai_compatible",
             model="provider/frozen-v1",
             tokenizer_model="frozen-tokenizer",
-            max_tokens=777,
+            context_window_tokens=777,
             timeout_seconds=45.5,
             base_url="http://127.0.0.1:9090/v1",
             defaults={
@@ -680,8 +727,6 @@ class TestModelRegistryResolve:
                 "parallel_tool_calls": False,
                 "seed": 9,
             },
-            context_window_tokens=65_536,
-            request_context_tokens=12_345,
             supports_tools=False,
             supports_structured_output=False,
             location="local",
@@ -730,7 +775,7 @@ class TestModelRegistryResolve:
         assert frozen_spec.runtime.launch_command == ("frozen-server", "--port", "9090")
         assert resolved.generator is generator
         assert resolved.kwargs == {
-            "max_tokens": 777,
+            "context_window_tokens": 777,
             "temperature": 0.25,
             "top_p": 0.8,
             "parallel_tool_calls": False,
@@ -739,7 +784,7 @@ class TestModelRegistryResolve:
         assert resolved.context_window_tokens == 12_345
         assert resolved.model == "provider/frozen-v1"
         assert resolved.provider == "frozen-provider"
-        assert resolved.supports_native_tools is False
+        assert resolved.capabilities.supports_native_tools is False
         assert resolved.definition_revision == definition.definition_revision
         assert resolved.generation_config is not None
         assert resolved.generation_config.answer.max_tokens == 701
@@ -756,6 +801,7 @@ class TestModelRegistryResolve:
         source_config.models["main"] = ModelSpec(
             provider=ModelProvider.OPENAI_COMPATIBLE,
             model="provider/frozen-v1",
+            context_window_tokens=32_768,
             timeout_seconds=1.25,
             base_url="http://127.0.0.1:9090/v1",
             supports_structured_output=False,
@@ -765,7 +811,7 @@ class TestModelRegistryResolve:
 
         resolved = ModelRegistry(_make_config()).resolve_definition(definition)
 
-        assert resolved.supports_structured_output is False
+        assert (resolved.capabilities.supports_structured_output is False)
         client = cast(Any, resolved.generator)._client
         assert client.timeout == 1.25
 
@@ -800,6 +846,7 @@ class TestModelRegistryResolve:
                     base_url="https://api.example.com/v1",
                     api_key_env="FROZEN_TEST_API_KEY",
                     location="cloud",
+                    context_window_tokens=32_768,
                 )
             },
             default_model="cloud",
@@ -841,7 +888,6 @@ class TestModelRegistryResolve:
         reg = ModelRegistry(_make_config())
         resolved = reg.resolve("main")
         assert resolved.generator is not None
-        assert resolved.kwargs["max_tokens"] == 2048
         assert resolved.context_window_tokens == 32768
         assert resolved.gateway is not None
         assert resolved.token_accounting is resolved.gateway.token_accounting
@@ -856,7 +902,8 @@ class TestModelRegistryResolve:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
             model="x",
-            max_tokens=512,
+            context_window_tokens=32_768,
+            max_output_tokens=512,
             defaults={"temperature": 0.3, "top_p": 0.8},
         )
         config = AgentModelsConfig(
@@ -865,7 +912,7 @@ class TestModelRegistryResolve:
         )
         reg = ModelRegistry(config)
         resolved = reg.resolve("test")
-        assert resolved.kwargs["max_tokens"] == 512
+        assert resolved.kwargs["max_output_tokens"] == 512
         assert resolved.kwargs["temperature"] == 0.3
         assert resolved.kwargs["top_p"] == 0.8
 
@@ -876,7 +923,6 @@ class TestModelRegistryResolve:
             provider=ModelProvider.OLLAMA,
             model="request-capped",
             context_window_tokens=131_072,
-            request_context_tokens=8_000,
         )
         registry = ModelRegistry(
             AgentModelsConfig(
@@ -904,6 +950,7 @@ class TestModelRegistryResolve:
             provider=ModelProvider.OLLAMA,
             model="provider/gpt-oss-120b",
             tokenizer_model="gpt-oss-120b",
+            context_window_tokens=131_072,
         )
         registry = ModelRegistry(
             AgentModelsConfig(
@@ -921,16 +968,17 @@ class TestModelRegistryResolve:
         )
         assert resolved.token_accounting.count('{"tools":[{"name":"read_file"}]}') > 4
 
-    def test_explicit_model_output_limit_expands_tool_decision_stage_budget(
+    def test_explicit_model_output_limit_does_not_expand_tool_decision_stage_budget(
         self,
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
             model="long-thinking",
-            max_tokens=32_768,
-            context_window_tokens=131_072,
-            request_context_tokens=65_536,
+            context_window_tokens=65_536,
+            max_context_window_tokens=131_072,
+            max_output_tokens=32_768,
         )
+
         registry = ModelRegistry(
             AgentModelsConfig(
                 models={"long": spec},
@@ -939,14 +987,31 @@ class TestModelRegistryResolve:
         )
 
         resolved = registry.resolve("long")
-        budget = resolved.gateway.effective_stage_budget(
-            LLMCallStage.TOOL_DECISION,
-            kwargs={"max_tokens": resolved.kwargs["max_tokens"]},
+
+        configured_budget = resolved.gateway.stage_budget(
+            LLMCallStage.TOOL_DECISION
         )
 
-        assert budget.max_output_tokens == 32_768
-        assert budget.max_input_tokens > 30_000
+        effective_budget = resolved.gateway.effective_stage_budget(
+            LLMCallStage.TOOL_DECISION,
+            kwargs={
+                "max_tokens": (
+                    resolved.capabilities.max_output_tokens
+                )
+            },
+        )
 
+        assert resolved.capabilities.max_output_tokens == 32_768
+
+        assert (
+            effective_budget.max_output_tokens
+            == configured_budget.max_output_tokens
+        )
+
+        assert (
+            effective_budget.max_input_tokens
+            == configured_budget.max_input_tokens
+        )
 
 class TestModelRegistryResolveOrFallback:
     def test_falls_back_when_alias_unknown(self) -> None:

@@ -51,6 +51,8 @@ _UNSET_PATHS = frozenset(
         "provider_name",
         "base_url",
         "api_key_env",
+        "max_context_window_tokens",
+        "max_output_tokens",
         "input_cost_per_1m",
         "output_cost_per_1m",
         "cache_read_cost_per_1m",
@@ -162,7 +164,7 @@ class UserModelDefinition(BaseModel):
     base_url: str | None = None
     api_key_env: str | None = None
     defaults: ModelGenerationDefaults = Field(default_factory=ModelGenerationDefaults)
-    context_window_tokens: int = Field(default=32_768,gt=0,strict=True,)
+    context_window_tokens: int = Field(gt=0,strict=True,)
     max_context_window_tokens: int | None = Field(default=None,gt=0,strict=True,)
     max_output_tokens: int | None = Field(default=None,gt=0,strict=True,)
     supports_tools: bool = Field(default=True, strict=True)
@@ -173,6 +175,13 @@ class UserModelDefinition(BaseModel):
     cache_read_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     runtime: ModelRuntimeDeclaration | None = None
+
+    @property
+    def effective_max_context_window_tokens(self) -> int:
+        if self.max_context_window_tokens is None:
+            return self.context_window_tokens
+
+        return self.max_context_window_tokens
 
     @field_validator("model", "tokenizer_model", "provider_name", "protocol")
     @classmethod
@@ -190,20 +199,37 @@ class UserModelDefinition(BaseModel):
         return validate_api_key_env_name(value)
 
     @model_validator(mode="after")
-    def validate_budget_and_endpoint_consistency(self) -> Self:
-        request_limit = self.request_context_tokens or self.context_window_tokens
-        if request_limit > self.context_window_tokens:
-            raise ValueError("request_context_tokens must not exceed context_window_tokens")
-        if self.max_tokens > request_limit:
-            raise ValueError("max_tokens must not exceed the effective request context limit")
+    def validate_capabilities_and_endpoint(self) -> Self:
+        effective_max = (
+            self.effective_max_context_window_tokens
+        )
+
+        if self.context_window_tokens > effective_max:
+            raise ValueError(
+                "context_window_tokens must not exceed "
+                "max_context_window_tokens"
+            )
+
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens > effective_max
+        ):
+            raise ValueError(
+                "max_output_tokens must not exceed "
+                "the effective maximum context window"
+            )
 
         if self.location == "cloud" and self.base_url is None:
-            raise ValueError("cloud model requires base_url")
+            raise ValueError(
+                "cloud model requires base_url"
+            )
+
         _ = normalize_model_endpoint(
             provider=self.provider,
             base_url=self.base_url,
             location=self.location,
         )
+
         return self
 
     def to_persisted_mapping(self) -> dict[str, object]:

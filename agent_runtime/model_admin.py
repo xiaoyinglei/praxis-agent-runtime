@@ -35,18 +35,27 @@ class ModelDefinitionArguments:
     tokenizer_model: str | None = None
     provider_name: str | None = None
     protocol: str | None = None
-    max_tokens: int | None = None
     timeout_seconds: float | None = None
     base_url: str | None = None
     api_key_env: str | None = None
     context_window_tokens: int | None = None
+    max_context_window_tokens: int | None = None
+    max_output_tokens: int | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
     location: Literal["local", "cloud"] | None = None
 
     def for_add(self) -> UserModelDefinition:
-        if self.provider is None or self.model is None:
-            raise ValueError("--provider and --provider-model are required without --from")
+        if (
+            self.provider is None
+            or self.model is None
+            or self.context_window_tokens is None
+        ):
+            raise ValueError(
+                "--provider, --provider-model, and "
+                "--context-window-tokens are required "
+                "without --from"
+            )
         values = self._changes()
         return UserModelDefinition.model_validate(values)
 
@@ -63,13 +72,18 @@ class ModelDefinitionArguments:
             "tokenizer_model": self.tokenizer_model,
             "provider_name": self.provider_name,
             "protocol": self.protocol,
-            "max_tokens": self.max_tokens,
             "timeout_seconds": self.timeout_seconds,
             "base_url": self.base_url,
             "api_key_env": self.api_key_env,
             "context_window_tokens": self.context_window_tokens,
+            "max_context_window_tokens": (
+                self.max_context_window_tokens
+            ),
+            "max_output_tokens": self.max_output_tokens,
             "supports_tools": self.supports_tools,
-            "supports_structured_output": self.supports_structured_output,
+            "supports_structured_output": (
+                self.supports_structured_output
+            ),
             "location": self.location,
         }
         return {key: value for key, value in values.items() if value is not None}

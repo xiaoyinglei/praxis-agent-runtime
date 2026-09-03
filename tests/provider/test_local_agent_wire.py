@@ -69,6 +69,7 @@ def _tool(name: str, schema: Mapping[str, JsonValue] | None = None) -> Tool:
 
 def _request(
     *,
+    max_output_tokens: int | None = 512,
     top_p: float | None = 0.95,
     seed: int | None = None,
 ):
@@ -98,7 +99,7 @@ def _request(
         ),
         settings=ModelSettings(
             model="models--mlx-community--Qwen3-14B-4bit",
-            max_output_tokens=512,
+            max_output_tokens=max_output_tokens,
             temperature=0.0,
             top_p=top_p,
             parallel_tool_calls=True,
@@ -171,6 +172,32 @@ def test_local_wire_omits_unset_optional_generation_fields() -> None:
     assert with_optional.generation_options["top_p"] == 0.8
     assert with_optional.generation_options["seed"] == 7
 
+def test_local_wire_omits_unknown_model_output_limit() -> None:
+    wire = render_local_agent_request(
+        _request(max_output_tokens=None),
+        provider="mlx",
+    )
+
+    assert "max_tokens" not in wire.generation_options
+
+    serialized = json.loads(wire.serialized_json)
+    canonical_settings = serialized["canonical_settings"]
+
+    assert "max_output_tokens" not in canonical_settings
+
+
+def test_local_wire_serializes_explicit_model_output_limit() -> None:
+    wire = render_local_agent_request(
+        _request(max_output_tokens=32_768),
+        provider="mlx",
+    )
+
+    assert wire.generation_options["max_tokens"] == 32_768
+
+    serialized = json.loads(wire.serialized_json)
+    canonical_settings = serialized["canonical_settings"]
+
+    assert canonical_settings["max_output_tokens"] == 32_768
 
 def test_local_response_parser_returns_the_same_provider_neutral_turn_type() -> None:
     raw = json.dumps(

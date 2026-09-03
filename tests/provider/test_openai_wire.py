@@ -73,6 +73,7 @@ def _tool(name: str, schema: Mapping[str, JsonValue] | None = None) -> Tool:
 
 def _request(
     *,
+    max_output_tokens: int | None = 777,
     top_p: float | None = 0.9,
     seed: int | None = 42,
     provider_options: Mapping[str, JsonValue] | None = None,
@@ -109,7 +110,7 @@ def _request(
         selected_tools=tools,
         settings=ModelSettings(
             model="gpt-compatible",
-            max_output_tokens=777,
+            max_output_tokens=max_output_tokens,
             temperature=0.1,
             top_p=top_p,
             parallel_tool_calls=True,
@@ -285,6 +286,26 @@ def test_openai_wire_omits_unset_optional_generation_fields() -> None:
     assert "top_p" not in payload
     assert "seed" not in payload
 
+def test_openai_wire_omits_unknown_model_output_limit() -> None:
+    wire = serialize_openai_request(
+        _request(max_output_tokens=None)
+    )
+
+    assert "max_completion_tokens" not in wire.payload
+
+    serialized = json.loads(wire.serialized_json)
+    assert "max_completion_tokens" not in serialized
+
+
+def test_openai_wire_serializes_explicit_model_output_limit() -> None:
+    wire = serialize_openai_request(
+        _request(max_output_tokens=32_768)
+    )
+
+    assert wire.payload["max_completion_tokens"] == 32_768
+
+    serialized = json.loads(wire.serialized_json)
+    assert serialized["max_completion_tokens"] == 32_768
 
 @pytest.mark.parametrize("field_name", ["prompt_cache_key", "prompt_cache_retention"])
 def test_provider_options_cannot_override_serializer_owned_cache_fields(
