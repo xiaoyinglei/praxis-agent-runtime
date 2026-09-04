@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.tools.tool import JsonValue, Tool
 
 
@@ -54,6 +55,7 @@ class PreparedModelCall:
     tool_hash: str
     wire_hash: str
     request_ref: Mapping[str, Any]
+    resource_request: ResourceUsage = ResourceUsage()
     dispatch_payload: object = field(default=None, repr=False, compare=False)
 
 

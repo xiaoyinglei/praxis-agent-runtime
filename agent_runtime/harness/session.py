@@ -11,6 +11,7 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.budget import BudgetLimitExceededError
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.protocol import (
     CompletionGate,
@@ -187,10 +188,9 @@ class Session:
             step=step,
             messages=messages,
             tools=tools,
-            model_token_budget_remaining=_remaining_model_tokens(
-                turn_context.binding_manifest,
-                consumed=self._consumed_model_tokens(turn_context.turn_id),
-            ),
+            model_token_budget_remaining=self._store.read_budget_state(
+                turn_context.turn_id
+            ).remaining("tokens"),
         )
 
     async def resume(self, *, turn_id: str, decision: str) -> TurnResult:
@@ -464,7 +464,8 @@ class Session:
             raise RuntimeError("frozen model token budget is invalid")
         effective_step_budget = min(self._max_steps, step_budget)
         for step in range(start_step, effective_step_budget + 1):
-            if token_budget is not None and self._consumed_model_tokens(turn_id) >= token_budget:
+            remaining_tokens = self._store.read_budget_state(turn_id).remaining("tokens")
+            if remaining_tokens is not None and remaining_tokens < 1:
                 return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -525,20 +526,9 @@ class Session:
         )
 
     def _consumed_model_tokens(self, turn_id: str) -> int:
-        consumed = 0
-        for operation in self._store.list_model_operations(turn_id):
-            for attempt in self._store.list_model_attempts(operation.operation_id):
-                if attempt.status != "completed":
-                    continue
-                total = attempt.usage.get("total_tokens")
-                if isinstance(total, int) and not isinstance(total, bool) and total >= 0:
-                    consumed += total
-                    continue
-                for key in ("input_tokens", "output_tokens"):
-                    value = attempt.usage.get(key)
-                    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-                        consumed += value
-        return consumed
+        # Transitional compatibility for existing callers. The authoritative
+        # accounting view now comes from durable budget reservations.
+        return self._store.read_budget_state(turn_id).used.total_tokens
 
     async def _fail_turn(
         self,
@@ -563,13 +553,21 @@ class Session:
         operation: ModelOperationSnapshot,
         prepared: PreparedModelCall,
     ) -> HarnessModelResponse | TurnResult:
-        attempt = await self._commit(
-            lambda: self._store.dispatch_model_attempt(
-                operation.operation_id,
-                worker_id=self._worker_id,
-                lease_seconds=self._model_lease_seconds,
+        try:
+            attempt = await self._commit(
+                lambda: self._store.dispatch_model_attempt(
+                    operation.operation_id,
+                    worker_id=self._worker_id,
+                    lease_seconds=self._model_lease_seconds,
+                    resource_request=prepared.resource_request,
+                )
             )
-        )
+        except BudgetLimitExceededError as exc:
+            return await self._fail_turn(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                reason=str(exc),
+            )
         streamed_content: dict[str, list[str]] = {
             "text": [],
             "reasoning": [],
@@ -716,6 +714,11 @@ class Session:
             )
             raise
         except Exception as exc:
+            # The HarnessModel contract owns provider-outcome classification.
+            # Explicit transport/unknown failures are handled above. A generic
+            # exception is therefore a deterministic operation failure, but it
+            # still does not prove zero provider billing. Fail the Attempt/Turn
+            # while conservatively keeping the reservation as UNKNOWN exposure.
             message = str(exc).strip() or "model dispatch failed with a known error"
             await self._commit(
                 partial(
@@ -731,6 +734,7 @@ class Session:
                         "reasoning": "".join(streamed_content["reasoning"]),
                         "plan": "".join(streamed_content["plan"]),
                     },
+                    budget_outcome="unknown",
                 )
             )
             return await self._fail_turn(

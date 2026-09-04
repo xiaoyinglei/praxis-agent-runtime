@@ -10,6 +10,8 @@ import pytest
 
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.model_request import toolset_revision_for_tools
+from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
@@ -918,11 +920,19 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
         model_alias="tool-model",
         resolved=ResolvedModel(
             generator=object(),
-            kwargs={"max_tokens": 256},
-            gateway=object(),
+            gateway=object(),  # prepare-only fixture; no provider dispatch occurs
             provider="openai-compatible",
             model="provider-model",
-            supports_native_tools=True,
+            capabilities=ModelCapabilities(
+                context_window_tokens=8_192,
+                max_context_window_tokens=8_192,
+                max_output_tokens=256,
+                supports_native_tools=True,
+                supports_structured_output=True,
+            ),
+            token_accounting=object(),  # prepare path tolerates unavailable accounting
+            request_defaults=RequestDefaultsDefinition(temperature=0.0),
+            generation_config=GenerationConfig(),
         ),
         instructions=("Answer from tool evidence.",),
     )

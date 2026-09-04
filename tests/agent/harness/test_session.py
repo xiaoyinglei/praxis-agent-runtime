@@ -10,6 +10,8 @@ import pytest
 
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.model_request import toolset_revision_for_tools
+from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
@@ -459,10 +461,19 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
         model_alias="test-model",
         resolved=ResolvedModel(
             generator=provider,
-            kwargs={"max_tokens": 256},
             gateway=gateway,
             provider="openai-compatible",
             model="provider-model",
+            capabilities=ModelCapabilities(
+                context_window_tokens=8_192,
+                max_context_window_tokens=8_192,
+                max_output_tokens=256,
+                supports_native_tools=True,
+                supports_structured_output=True,
+            ),
+            token_accounting=CharacterAccounting(),
+            request_defaults=RequestDefaultsDefinition(temperature=0.0),
+            generation_config=GenerationConfig(),
         ),
         instructions=("Answer the user directly.",),
     )

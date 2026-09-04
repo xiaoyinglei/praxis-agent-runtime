@@ -16,6 +16,15 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.budget import (
+    BudgetLimits,
+    BudgetReservation,
+    BudgetState,
+    ReservationStatus,
+    ResourceUsage,
+    reserve as reserve_budget,
+    resource_usage_from_model_usage,
+)
 from agent_runtime.harness.reducer import ProjectionState, apply_record
 from agent_runtime.streaming.events import (
     derive_model_public_item_id,
@@ -1458,11 +1467,14 @@ class RolloutStore:
         worker_id: str = "direct-model-worker",
         lease_seconds: float = 300.0,
         now: float | None = None,
+        resource_request: ResourceUsage | None = None,
     ) -> ModelAttemptSnapshot:
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise ValueError("model worker_id must be non-empty")
         if lease_seconds <= 0:
             raise ValueError("model lease_seconds must be positive")
+        if resource_request is not None and not isinstance(resource_request, ResourceUsage):
+            raise TypeError("resource_request must be ResourceUsage or None")
         self._assert_artifact_integrity()
         dispatched_at = time.time() if now is None else float(now)
         with self._transaction():
@@ -1474,6 +1486,30 @@ class RolloutStore:
                 raise KeyError(f"unknown model operation: {operation_id}")
             if operation["status"] != "prepared":
                 raise RuntimeError(f"model operation is not prepared: {operation_id}")
+            reservation_id: str | None = None
+            if resource_request is not None:
+                attempt_id = str(operation["active_attempt_id"])
+                reservation_id = f"reservation_{attempt_id}"
+                mutation = reserve_budget(
+                    self.read_budget_state(str(operation["turn_id"])),
+                    reservation_id=reservation_id,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    amount=resource_request,
+                )
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="budget_reserved",
+                    producer="runtime",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "scope_id": mutation.reservation.scope_id,
+                        "operation_id": operation_id,
+                        "attempt_id": attempt_id,
+                        "reserved": resource_request.to_dict(),
+                    },
+                )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -1487,6 +1523,14 @@ class RolloutStore:
                     "lease_expires_at": dispatched_at + lease_seconds,
                 },
             )
+            if reservation_id is not None:
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="budget_dispatched",
+                    producer="runtime",
+                    payload={"reservation_id": reservation_id},
+                )
         return self.list_model_attempts(operation_id)[-1]
 
     def expire_model_attempt_dispatch(
@@ -1526,6 +1570,12 @@ class RolloutStore:
                     "reason": "dispatch lease expired",
                     "observed_at": observed_at,
                 },
+            )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=str(attempt["attempt_id"]),
+                outcome="unknown",
+                producer="recovery",
             )
             turn = self._connection.execute(
                 "SELECT status FROM turns WHERE turn_id = ?",
@@ -1660,6 +1710,11 @@ class RolloutStore:
                 producer="runtime",
                 payload=payload,
             )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="unknown",
+            )
             self._close_started_model_output_channels(
                 operation=operation,
                 attempt_id=attempt_id,
@@ -1698,9 +1753,12 @@ class RolloutStore:
         error_type: str | None = None,
         error_message: str | None = None,
         channel_content: Mapping[str, str] | None = None,
+        budget_outcome: str = "released",
     ) -> ModelAttemptSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("model rejection reason must be non-empty")
+        if budget_outcome not in {"released", "unknown"}:
+            raise ValueError("model rejection budget_outcome is unsupported")
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model rejection error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
@@ -1735,6 +1793,11 @@ class RolloutStore:
                 record_type="model_attempt_rejected",
                 producer="runtime",
                 payload=payload,
+            )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome=budget_outcome,
             )
             self._close_started_model_output_channels(
                 operation=operation,
@@ -1861,6 +1924,13 @@ class RolloutStore:
                     "generation": generation,
                     "reason": reason.strip()[:2_000],
                 },
+            )
+            # Provider-side cancellation does not prove zero billing. Keep the
+            # reservation as uncertain exposure unless usage is later reconciled.
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="unknown",
             )
             self._close_started_model_output_channels(
                 operation=operation,
@@ -2039,6 +2109,12 @@ class RolloutStore:
                     "public_item_id": public_item_id,
                 },
             )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="settled",
+                usage=frozen_usage,
+            )
             if started_response is None:
                 self._append_and_reduce(
                     thread_id=operation["thread_id"],
@@ -2116,6 +2192,142 @@ class RolloutStore:
             (operation_id,),
         ).fetchall()
         return tuple(_model_attempt_snapshot(row) for row in rows)
+
+
+    def read_budget_state(self, turn_id: str) -> BudgetState:
+        """Derive the Turn budget from durable reservation projections."""
+
+        turn = self.read_turn(turn_id)
+        raw_limit = turn.binding_manifest.get("model_token_budget_total")
+        if raw_limit is None:
+            token_limit: int | None = None
+        elif isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 0:
+            raise RuntimeError("frozen model token budget is invalid")
+        else:
+            token_limit = raw_limit
+
+        used = ResourceUsage()
+        reserved = ResourceUsage()
+        uncertain = ResourceUsage()
+        tracked_attempt_ids: set[str] = set()
+        rows = self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE turn_id = ? ORDER BY rowid",
+            (turn_id,),
+        ).fetchall()
+        for row in rows:
+            tracked_attempt_ids.add(str(row["attempt_id"]))
+            reserved_usage = ResourceUsage.from_dict(json.loads(row["reserved_json"]))
+            status = ReservationStatus(str(row["status"]))
+            if status in {ReservationStatus.RESERVED, ReservationStatus.DISPATCHED}:
+                reserved = reserved + reserved_usage
+            elif status is ReservationStatus.UNKNOWN:
+                uncertain = uncertain + reserved_usage
+            elif status is ReservationStatus.SETTLED:
+                used = used + ResourceUsage.from_dict(json.loads(row["actual_json"]))
+
+        # Compatibility for Turns created before durable reservations existed.
+        # Once an attempt is tracked by a reservation, its usage is sourced only
+        # from that reservation projection to avoid double-counting.
+        for operation in self.list_model_operations(turn_id):
+            for attempt in self.list_model_attempts(operation.operation_id):
+                if attempt.attempt_id in tracked_attempt_ids or attempt.status != "completed":
+                    continue
+                used = used + resource_usage_from_model_usage(attempt.usage)
+
+        return BudgetState(
+            scope_id=turn_id,
+            parent_scope_id=None,
+            limits=BudgetLimits(tokens=token_limit),
+            used=used,
+            reserved=reserved,
+            uncertain=uncertain,
+        )
+
+    def read_budget_reservation(self, attempt_id: str) -> BudgetReservation:
+        row = self._budget_reservation_row_for_attempt(attempt_id)
+        if row is None:
+            raise KeyError(f"model attempt has no budget reservation: {attempt_id}")
+        return BudgetReservation(
+            reservation_id=str(row["reservation_id"]),
+            scope_id=str(row["scope_id"]),
+            operation_id=str(row["operation_id"]),
+            attempt_id=str(row["attempt_id"]),
+            reserved=ResourceUsage.from_dict(json.loads(row["reserved_json"])),
+            status=ReservationStatus(str(row["status"])),
+        )
+
+    def _budget_reservation_row_for_attempt(
+        self,
+        attempt_id: str,
+    ) -> sqlite3.Row | None:
+        return self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+
+    def _append_budget_outcome(
+        self,
+        *,
+        operation: sqlite3.Row,
+        attempt_id: str,
+        outcome: str,
+        usage: Mapping[str, Any] | None = None,
+        producer: str = "runtime",
+    ) -> None:
+        row = self._budget_reservation_row_for_attempt(attempt_id)
+        if row is None:
+            return
+        reservation_id = str(row["reservation_id"])
+        status = ReservationStatus(str(row["status"]))
+        if outcome == "settled":
+            if status not in {
+                ReservationStatus.RESERVED,
+                ReservationStatus.DISPATCHED,
+                ReservationStatus.UNKNOWN,
+            }:
+                raise RuntimeError("budget reservation cannot be settled")
+            if usage is None:
+                raise RuntimeError("settled budget requires provider usage")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_settled",
+                producer=producer,
+                payload={
+                    "reservation_id": reservation_id,
+                    "actual": resource_usage_from_model_usage(usage).to_dict(),
+                },
+            )
+            return
+        if outcome == "released":
+            if status not in {
+                ReservationStatus.RESERVED,
+                ReservationStatus.DISPATCHED,
+                ReservationStatus.UNKNOWN,
+            }:
+                raise RuntimeError("budget reservation cannot be released")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_released",
+                producer=producer,
+                payload={"reservation_id": reservation_id},
+            )
+            return
+        if outcome == "unknown":
+            if status is ReservationStatus.UNKNOWN:
+                return
+            if status is not ReservationStatus.DISPATCHED:
+                raise RuntimeError("only a dispatched budget can become unknown")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_unknown",
+                producer=producer,
+                payload={"reservation_id": reservation_id},
+            )
+            return
+        raise ValueError(f"unsupported budget outcome: {outcome}")
 
     def record_tool_call(
         self,
@@ -3573,6 +3785,10 @@ class RolloutStore:
             row["attempt_id"]: _model_attempt_row_payload(row)
             for row in self._connection.execute("SELECT * FROM model_attempts")
         }
+        actual_budget_reservations = {
+            row["reservation_id"]: _budget_reservation_row_payload(row)
+            for row in self._connection.execute("SELECT * FROM budget_reservations")
+        }
         actual_tool_operations = {
             row["operation_id"]: _tool_operation_row_payload(row)
             for row in self._connection.execute("SELECT * FROM tool_operations")
@@ -3594,6 +3810,7 @@ class RolloutStore:
             ("items", expected.items, actual_items),
             ("model_operations", expected.model_operations, actual_model_operations),
             ("model_attempts", expected.model_attempts, actual_model_attempts),
+            ("budget_reservations", expected.budget_reservations, actual_budget_reservations),
             ("tool_operations", expected.tool_operations, actual_tool_operations),
             ("interactions", expected.interactions, actual_interactions),
             ("approvals", expected.approvals, actual_approvals),
@@ -3725,6 +3942,7 @@ class RolloutStore:
                     reducer_version=_REDUCER_VERSION,
                 )
             self._connection.execute("DELETE FROM projection_meta")
+            self._connection.execute("DELETE FROM budget_reservations")
             self._connection.execute("DELETE FROM model_attempts")
             self._connection.execute("DELETE FROM model_operations")
             self._connection.execute("DELETE FROM approvals")
@@ -3836,6 +4054,11 @@ class RolloutStore:
             (thread_id,),
         ):
             state.model_attempts[row["attempt_id"]] = _model_attempt_row_payload(row)
+        for row in self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE thread_id = ?",
+            (thread_id,),
+        ):
+            state.budget_reservations[row["reservation_id"]] = _budget_reservation_row_payload(row)
         for row in self._connection.execute("SELECT * FROM tool_operations WHERE thread_id = ?", (thread_id,)):
             state.tool_operations[row["operation_id"]] = _tool_operation_row_payload(row)
         for row in self._connection.execute("SELECT * FROM interactions WHERE thread_id = ?", (thread_id,)):
@@ -4018,6 +4241,34 @@ class RolloutStore:
                     attempt["lease_expires_at"],
                     attempt["applied_thread_sequence"],
                     attempt["reducer_version"],
+                ),
+            )
+        for reservation in state.budget_reservations.values():
+            self._connection.execute(
+                """
+                INSERT INTO budget_reservations (
+                    reservation_id, thread_id, turn_id, scope_id, operation_id,
+                    attempt_id, reserved_json, actual_json, status,
+                    applied_thread_sequence, reducer_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reservation_id) DO UPDATE SET
+                    actual_json = excluded.actual_json,
+                    status = excluded.status,
+                    applied_thread_sequence = excluded.applied_thread_sequence,
+                    reducer_version = excluded.reducer_version
+                """,
+                (
+                    reservation["reservation_id"],
+                    reservation["thread_id"],
+                    reservation["turn_id"],
+                    reservation["scope_id"],
+                    reservation["operation_id"],
+                    reservation["attempt_id"],
+                    _canonical_json(reservation["reserved"]),
+                    _canonical_json(reservation["actual"]),
+                    reservation["status"],
+                    reservation["applied_thread_sequence"],
+                    reservation["reducer_version"],
                 ),
             )
         for operation in state.tool_operations.values():
@@ -4254,6 +4505,20 @@ class RolloutStore:
                 reducer_version INTEGER NOT NULL,
                 UNIQUE(operation_id, generation)
             );
+            CREATE TABLE IF NOT EXISTS budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+                turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+                scope_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL REFERENCES model_operations(operation_id),
+                attempt_id TEXT NOT NULL REFERENCES model_attempts(attempt_id),
+                reserved_json TEXT NOT NULL,
+                actual_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL,
+                applied_thread_sequence INTEGER NOT NULL,
+                reducer_version INTEGER NOT NULL,
+                UNIQUE(attempt_id)
+            );
             CREATE TABLE IF NOT EXISTS tool_operations (
                 operation_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),
@@ -4351,6 +4616,13 @@ def _projection_hash(state: ProjectionState, thread_id: str) -> str:
         "interactions": {key: value for key, value in state.interactions.items() if value["thread_id"] == thread_id},
         "approvals": {key: value for key, value in state.approvals.items() if value["thread_id"] == thread_id},
     }
+    budget_reservations = {
+        key: value
+        for key, value in state.budget_reservations.items()
+        if value["thread_id"] == thread_id
+    }
+    if budget_reservations:
+        payload["budget_reservations"] = budget_reservations
     artifacts = {key: value for key, value in state.artifacts.items() if value["thread_id"] == thread_id}
     if artifacts:
         payload["artifacts"] = artifacts
@@ -4759,6 +5031,22 @@ def _model_attempt_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "reducer_version": row["reducer_version"],
     }
 
+
+
+def _budget_reservation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "reservation_id": row["reservation_id"],
+        "thread_id": row["thread_id"],
+        "turn_id": row["turn_id"],
+        "scope_id": row["scope_id"],
+        "operation_id": row["operation_id"],
+        "attempt_id": row["attempt_id"],
+        "reserved": json.loads(row["reserved_json"]),
+        "actual": json.loads(row["actual_json"]),
+        "status": row["status"],
+        "applied_thread_sequence": row["applied_thread_sequence"],
+        "reducer_version": row["reducer_version"],
+    }
 
 def _tool_operation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {

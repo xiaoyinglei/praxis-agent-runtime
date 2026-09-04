@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import ModelMessage, StopReason
 from agent_runtime.core.messages import ToolCall as ModelToolCall
@@ -137,6 +138,11 @@ class GatewayHarnessModel:
                 "model_token_budget_remaining": remaining,
                 **({"context_projection": context_projection} if context_projection is not None else {}),
             },
+            resource_request=_model_resource_request(
+                request=canonical_request,
+                settings=settings,
+                resolved=self._resolved,
+            ),
             dispatch_payload=_GatewayDispatch(
                 request=canonical_request,
                 wire_hash=wire_hash,
@@ -452,6 +458,43 @@ def _model_settings(resolved: ResolvedModel) -> ModelSettings:
         provider_options=provider_options,
     )
 
+
+
+def _model_resource_request(
+    *,
+    request: ModelRequest,
+    settings: ModelSettings,
+    resolved: ResolvedModel,
+) -> ResourceUsage:
+    """Compute the amount that must be reserved before provider dispatch."""
+
+    input_tokens = 0
+    count = getattr(resolved.token_accounting, "count", None)
+    if callable(count):
+        measured = count(
+            model_request_input_text(
+                request,
+                provider=resolved.provider,
+                supports_native_tools=resolved.capabilities.supports_native_tools,
+            )
+        )
+        if isinstance(measured, bool) or not isinstance(measured, int) or measured < 0:
+            raise RuntimeError("token accounting returned an invalid input count")
+        input_tokens = measured
+
+    max_output_tokens = settings.max_output_tokens or 0
+    if (
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens < 0
+    ):
+        raise RuntimeError("model max_output_tokens is invalid")
+
+    return ResourceUsage(
+        input_tokens=input_tokens,
+        output_tokens=max_output_tokens,
+        model_calls=1,
+    )
 
 def _budgeted_request(
     *,

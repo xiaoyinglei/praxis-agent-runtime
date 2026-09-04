@@ -37,6 +37,7 @@ class ProjectionState:
     items: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    budget_reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     interactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -199,6 +200,54 @@ def apply_record(
             attempt["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
         case "model_attempt_late_response":
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_reserved":
+            reservation_id = payload["reservation_id"]
+            if reservation_id in state.budget_reservations:
+                raise RuntimeError("duplicate budget reservation identity")
+            turn_id = _turn_id(record)
+            state.budget_reservations[reservation_id] = {
+                "reservation_id": reservation_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "scope_id": payload["scope_id"],
+                "operation_id": payload["operation_id"],
+                "attempt_id": payload["attempt_id"],
+                "reserved": payload["reserved"],
+                "actual": {},
+                "status": "reserved",
+                "applied_thread_sequence": sequence,
+                "reducer_version": reducer_version,
+            }
+            _advance(state, thread_id, turn_id, sequence)
+        case "budget_dispatched":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] != "reserved":
+                raise RuntimeError("only a reserved budget can be dispatched")
+            reservation["status"] = "dispatched"
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_settled":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] not in {"reserved", "dispatched", "unknown"}:
+                raise RuntimeError("budget reservation cannot be settled from its current state")
+            reservation["status"] = "settled"
+            reservation["actual"] = payload["actual"]
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_released":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] not in {"reserved", "dispatched", "unknown"}:
+                raise RuntimeError("budget reservation cannot be released from its current state")
+            reservation["status"] = "released"
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_unknown":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] != "dispatched":
+                raise RuntimeError("only a dispatched budget can become unknown")
+            reservation["status"] = "unknown"
+            reservation["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
         case "tool_operation_prepared":
             operation_id = payload["operation_id"]
