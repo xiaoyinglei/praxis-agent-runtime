@@ -69,6 +69,9 @@ def test_deleted_legacy_orchestration_cannot_be_imported_by_public_runtime() -> 
 
 
 def test_provider_wire_and_model_dispatch_ownership_is_explicit() -> None:
+    model_adapter = (RUNTIME / "harness" / "model_adapter.py").read_text(encoding="utf-8")
+    assert "LLMBudgetLedger" not in model_adapter
+    assert "inherit_budget_ledger=False" in model_adapter
     assert _sources_containing("def serialize_openai_request(") == {Path("agent_runtime/modeling/openai_wire.py")}
     assert _sources_containing("def render_local_agent_request(") == {
         Path("agent_runtime/modeling/local_agent_wire.py")

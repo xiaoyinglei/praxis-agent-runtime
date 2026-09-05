@@ -30,6 +30,10 @@ from agent_runtime.modeling.local_agent_wire import (
     parse_local_agent_response,
     render_local_agent_request,
 )
+from agent_runtime.modeling.quota import (
+    ProviderQuotaGate,
+    acquire_provider_quota,
+)
 from agent_runtime.modeling.openai_wire import (
     parse_openai_response,
     parse_openai_usage,
@@ -137,6 +141,18 @@ def llm_budget_scope(
         _ACTIVE_LLM_BUDGET_LEDGER.reset(token)
 
 
+def _resolve_budget_ledger(
+    explicit: AsyncBudgetLedger | None,
+    *,
+    inherit_ambient: bool,
+) -> AsyncBudgetLedger | None:
+    if type(inherit_ambient) is not bool:
+        raise TypeError("inherit_ambient must be a bool")
+    if explicit is not None:
+        return explicit
+    return current_llm_budget_ledger() if inherit_ambient else None
+
+
 class LLMGatewayError(RuntimeError):
     pass
 
@@ -184,6 +200,7 @@ class LLMGateway:
         token_accounting: TokenAccounting,
         model_context_tokens: int,
         stage_budgets: Mapping[LLMCallStage, LLMStageBudget] | None = None,
+        provider_quota_gate: ProviderQuotaGate | None = None,
     ) -> None:
         if model_context_tokens <= 0:
             raise ValueError("model_context_tokens must be positive")
@@ -191,6 +208,7 @@ class LLMGateway:
         self._token_accounting = token_accounting
         self._model_context_tokens = model_context_tokens
         self._stage_budgets = dict(stage_budgets or DEFAULT_LLM_STAGE_BUDGETS)
+        self._provider_quota_gate = provider_quota_gate
 
     @property
     def token_accounting(self) -> TokenAccounting:
@@ -237,6 +255,7 @@ class LLMGateway:
         delta_sink: ProviderDeltaSink | None = None,
         ledger: AsyncBudgetLedger | None = None,
         lease_id: str | None = None,
+        inherit_budget_ledger: bool = True,
     ) -> AgentModelResponse:
         """Serialize and execute one already-selected canonical agent request."""
 
@@ -256,8 +275,17 @@ class LLMGateway:
                 prompt=local_wire.prompt,
                 kwargs=local_wire.generation_options,
             )
+            await acquire_provider_quota(
+                self._provider_quota_gate,
+                provider=provider,
+                model=request.settings.model,
+                requested_tokens=reservation,
+            )
             del budget
-            effective_ledger = ledger or current_llm_budget_ledger()
+            effective_ledger = _resolve_budget_ledger(
+                ledger,
+                inherit_ambient=inherit_budget_ledger,
+            )
             effective_lease_id = lease_id or f"{stage.value}:canonical:{request.request_id}"
             if effective_ledger is not None:
                 if not await effective_ledger.reserve(effective_lease_id, reservation):
@@ -317,6 +345,9 @@ class LLMGateway:
                 tools=tools,
                 ledger=ledger,
                 lease_id=lease_id or f"{stage.value}:canonical-stream:{request.request_id}",
+                inherit_budget_ledger=inherit_budget_ledger,
+                quota_provider=provider,
+                quota_model=request.settings.model,
                 kwargs=provider_kwargs,
             )
             text = ""
@@ -414,8 +445,17 @@ class LLMGateway:
             prompt=accounted_prompt,
             kwargs=provider_kwargs,
         )
+        await acquire_provider_quota(
+            self._provider_quota_gate,
+            provider=provider,
+            model=request.settings.model,
+            requested_tokens=reservation,
+        )
         del budget
-        effective_ledger = ledger or current_llm_budget_ledger()
+        effective_ledger = _resolve_budget_ledger(
+            ledger,
+            inherit_ambient=inherit_budget_ledger,
+        )
         effective_lease_id = lease_id or f"{stage.value}:canonical:{request.request_id}"
         if effective_ledger is not None:
             if not await effective_ledger.reserve(effective_lease_id, reservation):
@@ -629,6 +669,9 @@ class LLMGateway:
         tools: list[dict[str, Any]],
         ledger: AsyncBudgetLedger | None = None,
         lease_id: str | None = None,
+        inherit_budget_ledger: bool = True,
+        quota_provider: str | None = None,
+        quota_model: str | None = None,
         kwargs: Mapping[str, Any] | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """流式调用 LLM（带工具）。
@@ -644,8 +687,13 @@ class LLMGateway:
             StreamChunk: text_delta / tool_use_start / tool_input_delta /
                          content_block_stop / message_stop
         """
-        # 预算管理
-        effective_ledger = ledger or current_llm_budget_ledger()
+        # Legacy ledger accounting is optional. Harness canonical calls
+        # explicitly disable ambient inheritance because durable Rollout
+        # reservations are their authoritative cumulative budget.
+        effective_ledger = _resolve_budget_ledger(
+            ledger,
+            inherit_ambient=inherit_budget_ledger,
+        )
         accounted_prompt = _account_messages(messages, tools)
         budget, call_kwargs, input_tokens, reservation = self._prepare_call(
             stage=stage,
@@ -653,6 +701,15 @@ class LLMGateway:
             kwargs=kwargs,
         )
         effective_lease_id = lease_id or f"{stage.value}:stream:{id(messages)}"
+        if quota_provider is not None or quota_model is not None:
+            if not quota_provider or not quota_model:
+                raise ValueError("quota_provider and quota_model must be supplied together")
+            await acquire_provider_quota(
+                self._provider_quota_gate,
+                provider=quota_provider,
+                model=quota_model,
+                requested_tokens=reservation,
+            )
         if effective_ledger is not None:
             reserved = await effective_ledger.reserve(effective_lease_id, reservation)
             if not reserved:

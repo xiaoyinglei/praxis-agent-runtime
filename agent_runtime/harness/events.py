@@ -62,6 +62,8 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
         "budget_settled",
         "budget_released",
         "budget_unknown",
+        "budget_child_allocated",
+        "budget_child_settled",
         "model_operation_prepared",
         "model_retry_prepared",
         "model_attempt_dispatched",

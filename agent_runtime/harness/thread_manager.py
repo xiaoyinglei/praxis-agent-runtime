@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.harness.protocol import BindingProvider, BindingValidator, TurnResult
 from agent_runtime.harness.rollout import RolloutStore, TurnSnapshot
 from agent_runtime.harness.session import Session
@@ -65,16 +66,20 @@ class ThreadManager:
             if Path(thread.workspace) != self._workspace:
                 raise RuntimeError("thread belongs to a different workspace security domain")
         turn_id = f"turn_{uuid4().hex}"
+        binding = dict(
+            self._binding_provider.snapshot(
+                thread_id=thread_id,
+                turn_id=turn_id,
+            )
+        )
+        binding["budget_root_turn_id"] = turn_id
         return await self._session_for_thread(
             thread_id,
             event_dispatcher=event_dispatcher or self._event_dispatcher,
         ).run(
             turn_id=turn_id,
             user_message=user_message,
-            binding_manifest=self._binding_provider.snapshot(
-                thread_id=thread_id,
-                turn_id=turn_id,
-            ),
+            binding_manifest=binding,
             input_files=input_files,
         )
 
@@ -91,10 +96,16 @@ class ThreadManager:
         user_message: str,
         max_steps: int | None,
         max_tokens_total: int | None,
+        max_cost_micros: int | None = None,
+        parent_turn_id: str | None = None,
     ) -> TurnResult:
-        """Start an isolated child Thread with an explicitly narrowed budget."""
+        """Start a child Thread; budgeted children inherit capacity from a parent.
 
-        thread_id = self._store.create_thread(workspace=self._workspace).thread_id
+        parent_turn_id=None is retained only for explicit standalone child runs.
+        The model-visible subagent tool always supplies the trusted parent Turn.
+        """
+
+        thread_id = f"thread_{uuid4().hex}"
         turn_id = f"turn_{uuid4().hex}"
         binding = dict(
             self._binding_provider.snapshot(
@@ -104,14 +115,50 @@ class ThreadManager:
         )
         if max_steps is not None:
             binding["model_step_budget"] = max_steps
-        if max_tokens_total is not None:
-            binding["model_token_budget_total"] = max_tokens_total
         binding["completion_policy"] = {"require_workspace_change": False}
-        return await self._session_for_thread(thread_id).run(
-            turn_id=turn_id,
+
+        if parent_turn_id is None:
+            # Compatibility for non-delegated callers. This path is not used by
+            # the `task` tool and therefore does not claim parent inheritance.
+            self._store.create_thread(
+                workspace=self._workspace,
+                thread_id=thread_id,
+            )
+            if max_tokens_total is not None:
+                binding["model_token_budget_total"] = max_tokens_total
+            if max_cost_micros is not None:
+                binding["model_cost_budget_total_micros"] = max_cost_micros
+            binding["budget_root_turn_id"] = turn_id
+            return await self._session_for_thread(thread_id).run(
+                turn_id=turn_id,
+                user_message=user_message,
+                binding_manifest=binding,
+            )
+
+        parent = self._validate_turn_workspace(parent_turn_id)
+        if parent.status != "running":
+            raise RuntimeError("subagent parent Turn must still be running")
+        child_turn = self._store.start_budgeted_child_turn(
+            parent_turn_id=parent_turn_id,
+            child_thread_id=thread_id,
+            child_turn_id=turn_id,
             user_message=user_message,
             binding_manifest=binding,
+            requested_tokens=max_tokens_total,
+            requested_cost_micros=max_cost_micros,
         )
+        session = self._session_for_thread(thread_id)
+        result = await session.run_turn(
+            session.restore_turn_context(child_turn.turn_id),
+            start_step=1,
+        )
+
+        if result.status in {"completed", "failed", "cancelled"}:
+            state = self._store.read_budget_state(child_turn.turn_id)
+            unresolved = state.reserved + state.uncertain + state.child_reserved
+            if unresolved == ResourceUsage():
+                self._store.settle_child_budget(child_turn_id=child_turn.turn_id)
+        return result
 
     async def respond_interaction(
         self,

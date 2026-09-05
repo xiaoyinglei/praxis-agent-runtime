@@ -11,7 +11,12 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
-from agent_runtime.budget import BudgetLimitExceededError
+from agent_runtime.budget import (
+    BudgetLimitExceededError,
+    PricingUnavailableError,
+    budget_pressure_active,
+    normal_token_remaining,
+)
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.protocol import (
     CompletionGate,
@@ -47,6 +52,14 @@ from agent_runtime.streaming.sink import EventChannelClosed, TurnEventDispatcher
 from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
 
 
+_BUDGET_PRESSURE_MESSAGE = (
+    "Runtime budget pressure is active. Stop broad exploration and converge on "
+    "the best defensible completion from evidence already gathered. Prefer a "
+    "final answer; use additional tools only when strictly required to avoid "
+    "an incorrect or unsafe result."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class TurnContext:
     """Immutable identity and durable settings for one Turn in this Session."""
@@ -72,6 +85,8 @@ class StepContext:
     messages: tuple[HarnessMessage, ...]
     tools: tuple[Tool, ...]
     model_token_budget_remaining: int | None
+    budget_pressure: bool = False
+    budget_pressure: bool = False
 
     def model_request(self) -> HarnessModelRequest:
         return HarnessModelRequest(
@@ -82,6 +97,7 @@ class StepContext:
             tools=self.tools,
             step=self.step,
             model_token_budget_remaining=self.model_token_budget_remaining,
+            budget_pressure=self.budget_pressure,
         )
 
 
@@ -171,10 +187,23 @@ class Session:
         turn_context: TurnContext,
         *,
         step: int,
+        budget_pressure: bool | None = None,
     ) -> StepContext:
         if turn_context.thread_id != self.thread_id:
             raise RuntimeError("Turn belongs to a different Session")
+        state = self._store.read_budget_state(turn_context.turn_id)
+        if budget_pressure is None:
+            pressure = budget_pressure_active(state)
+        elif type(budget_pressure) is not bool:
+            raise TypeError("budget_pressure must be a bool or None")
+        else:
+            pressure = budget_pressure
         messages = self._context_manager.build(turn_context.turn_id)
+        if pressure:
+            messages = (
+                *messages,
+                HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
+            )
         tools = (
             ()
             if self._tool_router is None
@@ -188,9 +217,8 @@ class Session:
             step=step,
             messages=messages,
             tools=tools,
-            model_token_budget_remaining=self._store.read_budget_state(
-                turn_context.turn_id
-            ).remaining("tokens"),
+            model_token_budget_remaining=state.remaining("tokens"),
+            budget_pressure=pressure,
         )
 
     async def resume(self, *, turn_id: str, decision: str) -> TurnResult:
@@ -267,7 +295,12 @@ class Session:
             raise RuntimeError("model retry requires one unknown logical operation")
         operation = unknown[0]
         step = len(self._store.list_model_operations(turn_id))
-        request = self.capture_step_context(turn_context, step=step).model_request()
+        prior_pressure = operation.request_ref.get("budget_pressure") is True
+        request = self.capture_step_context(
+            turn_context,
+            step=step,
+            budget_pressure=prior_pressure,
+        ).model_request()
         prepared = self._model.prepare(request)
         if (
             prepared.request_hash != operation.request_hash
@@ -282,6 +315,7 @@ class Session:
             turn_id=turn_id,
             operation=operation,
             prepared=prepared,
+            allow_protected_budget=True,
         )
         if isinstance(dispatched, TurnResult):
             return dispatched
@@ -474,13 +508,46 @@ class Session:
             try:
                 step_context = self.capture_step_context(turn_context, step=step)
                 request = step_context.model_request()
-            except ContextBudgetExceededError as exc:
+                # Model preparation owns canonical serialization, context
+                # projection and invocation-limit validation. It must complete
+                # before any durable provider reservation/dispatch is created.
+                prepared = self._model.prepare(request)
+                if not step_context.budget_pressure:
+                    normal_remaining = normal_token_remaining(
+                        self._store.read_budget_state(turn_id)
+                    )
+                    if (
+                        normal_remaining is not None
+                        and prepared.resource_request.total_tokens > normal_remaining
+                    ):
+                        step_context = self.capture_step_context(
+                            turn_context,
+                            step=step,
+                            budget_pressure=True,
+                        )
+                        request = step_context.model_request()
+                        prepared = self._model.prepare(request)
+                if not step_context.budget_pressure:
+                    normal_remaining = normal_token_remaining(
+                        self._store.read_budget_state(turn_id)
+                    )
+                    if (
+                        normal_remaining is not None
+                        and prepared.resource_request.total_tokens > normal_remaining
+                    ):
+                        step_context = self.capture_step_context(
+                            turn_context,
+                            step=step,
+                            budget_pressure=True,
+                        )
+                        request = step_context.model_request()
+                        prepared = self._model.prepare(request)
+            except (ContextBudgetExceededError, PricingUnavailableError) as exc:
                 return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
                     reason=str(exc),
                 )
-            prepared = self._model.prepare(request)
             durable_request_ref = {
                 **prepared.request_ref,
                 "request_id": prepared.request_ref.get("request_id") or f"{turn_id}:step:{step}",
@@ -501,6 +568,7 @@ class Session:
                 turn_id=turn_id,
                 operation=operation,
                 prepared=prepared,
+                allow_protected_budget=step_context.budget_pressure,
             )
             if isinstance(dispatched, TurnResult):
                 return dispatched
@@ -552,6 +620,7 @@ class Session:
         turn_id: str,
         operation: ModelOperationSnapshot,
         prepared: PreparedModelCall,
+        allow_protected_budget: bool = False,
     ) -> HarnessModelResponse | TurnResult:
         try:
             attempt = await self._commit(
@@ -560,6 +629,7 @@ class Session:
                     worker_id=self._worker_id,
                     lease_seconds=self._model_lease_seconds,
                     resource_request=prepared.resource_request,
+                    allow_protected_budget=allow_protected_budget,
                 )
             )
         except BudgetLimitExceededError as exc:

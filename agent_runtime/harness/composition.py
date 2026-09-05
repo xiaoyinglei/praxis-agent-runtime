@@ -15,7 +15,7 @@ from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.session import Session
 from agent_runtime.harness.thread_manager import ThreadManager
-from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
+from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.integrations.knowledge import (
@@ -77,6 +77,7 @@ class _CompositionBindingProvider:
         require_workspace_change: bool,
         model_step_budget: int,
         model_token_budget_total: int | None,
+        model_cost_budget_total_micros: int | None,
     ) -> None:
         self._model = model
         self._tools = tuple(tools.values())
@@ -87,6 +88,7 @@ class _CompositionBindingProvider:
         self._require_workspace_change = require_workspace_change
         self._model_step_budget = model_step_budget
         self._model_token_budget_total = model_token_budget_total
+        self._model_cost_budget_total_micros = model_cost_budget_total_micros
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> Mapping[str, object]:
         binding = dict(
@@ -112,6 +114,7 @@ class _CompositionBindingProvider:
         binding["completion_policy"] = {"require_workspace_change": self._require_workspace_change}
         binding["model_step_budget"] = self._model_step_budget
         binding["model_token_budget_total"] = self._model_token_budget_total
+        binding["model_cost_budget_total_micros"] = self._model_cost_budget_total_micros
         if self._knowledge_revision is not None:
             binding["knowledge_revision"] = self._knowledge_revision
             binding["knowledge_config"] = self._knowledge_config
@@ -147,12 +150,65 @@ class _CompositionBindingProvider:
             "knowledge_revision",
             "knowledge_config",
             "mcp_policy",
-            "completion_policy",
-            "model_step_budget",
-            "model_token_budget_total",
         ):
             if binding.get(key) != current.get(key):
                 raise RuntimeError(f"frozen runtime binding is unavailable: {key} changed")
+
+        parent_turn_id = binding.get("budget_parent_turn_id")
+        if isinstance(parent_turn_id, str) and parent_turn_id:
+            completion_policy = binding.get("completion_policy")
+            if completion_policy != {"require_workspace_change": False}:
+                raise RuntimeError("frozen child completion policy is invalid")
+            child_steps = binding.get("model_step_budget")
+            current_steps = current.get("model_step_budget")
+            if (
+                isinstance(child_steps, bool)
+                or not isinstance(child_steps, int)
+                or child_steps < 1
+                or isinstance(current_steps, bool)
+                or not isinstance(current_steps, int)
+                or child_steps > current_steps
+            ):
+                raise RuntimeError("frozen child model step budget is invalid")
+            child_tokens = binding.get("model_token_budget_total")
+            current_tokens = current.get("model_token_budget_total")
+            if child_tokens is not None and (
+                isinstance(child_tokens, bool)
+                or not isinstance(child_tokens, int)
+                or child_tokens < 1
+            ):
+                raise RuntimeError("frozen child model token budget is invalid")
+            if (
+                isinstance(current_tokens, int)
+                and not isinstance(current_tokens, bool)
+                and child_tokens is not None
+                and child_tokens > current_tokens
+            ):
+                raise RuntimeError("frozen child model token budget exceeds runtime ceiling")
+            child_cost = binding.get("model_cost_budget_total_micros")
+            current_cost = current.get("model_cost_budget_total_micros")
+            if child_cost is not None and (
+                isinstance(child_cost, bool)
+                or not isinstance(child_cost, int)
+                or child_cost < 1
+            ):
+                raise RuntimeError("frozen child model cost budget is invalid")
+            if (
+                isinstance(current_cost, int)
+                and not isinstance(current_cost, bool)
+                and child_cost is not None
+                and child_cost > current_cost
+            ):
+                raise RuntimeError("frozen child model cost budget exceeds runtime ceiling")
+        else:
+            for key in (
+                "completion_policy",
+                "model_step_budget",
+                "model_token_budget_total",
+                "model_cost_budget_total_micros",
+            ):
+                if binding.get(key) != current.get(key):
+                    raise RuntimeError(f"frozen runtime binding is unavailable: {key} changed")
 
 
 class RuntimeComposition:
@@ -186,6 +242,7 @@ class RuntimeComposition:
         skill_runtime: HarnessSkillRuntime | None = None,
         max_steps: int = 16,
         max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
         event_dispatcher: TurnEventDispatcher | None = None,
     ) -> RuntimeComposition:
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
@@ -194,6 +251,12 @@ class RuntimeComposition:
             isinstance(max_tokens_total, bool) or not isinstance(max_tokens_total, int) or max_tokens_total < 1
         ):
             raise ValueError("max_tokens_total must be a positive integer or None")
+        if max_cost_micros is not None and (
+            isinstance(max_cost_micros, bool)
+            or not isinstance(max_cost_micros, int)
+            or max_cost_micros < 1
+        ):
+            raise ValueError("max_cost_micros must be a positive integer or None")
         if (knowledge_runner is None) != (knowledge_revision is None):
             raise ValueError("knowledge_runner and knowledge_revision must be configured together")
         if (knowledge_revision is None) != (knowledge_config is None):
@@ -215,9 +278,11 @@ class RuntimeComposition:
             if payload.context_summary:
                 child_task += "\n\nContext supplied by the parent agent:\n" + payload.context_summary
             child = await manager.run_child(
+                parent_turn_id=current_tool_turn_id(),
                 user_message=child_task,
                 max_steps=payload.max_turns,
                 max_tokens_total=payload.llm_budget_total,
+                max_cost_micros=payload.llm_cost_budget_micros,
             )
             return {
                 "conclusion": child.answer or child.interaction_id or "",
@@ -263,7 +328,7 @@ class RuntimeComposition:
             (
                 create_subagent_tool(
                     run_subagent,
-                    execution_revision="harness-child-thread-v1",
+                    execution_revision="harness-child-thread-v3",
                 ),
             )
             if enable_subagents
@@ -358,6 +423,7 @@ class RuntimeComposition:
             require_workspace_change=require_workspace_change,
             model_step_budget=max_steps,
             model_token_budget_total=max_tokens_total,
+            model_cost_budget_total_micros=max_cost_micros,
         )
         thread_manager = ThreadManager(
             store=store,

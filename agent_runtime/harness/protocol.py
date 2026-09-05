@@ -34,6 +34,8 @@ class HarnessModelRequest:
     tools: tuple[Tool, ...] = ()
     step: int = 1
     model_token_budget_remaining: int | None = None
+    budget_pressure: bool = False
+    budget_pressure: bool = False
 
 
 class ModelDispatchPreflightError(RuntimeError):

@@ -97,6 +97,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
@@ -116,6 +117,7 @@ class Agent:
             allow_execute_tools=allow_execute_tools,
             max_steps=max_turns,
             max_tokens_total=max_tokens_total,
+            max_cost_micros=max_cost_micros,
             event_dispatcher=dispatcher,
         ) as runtime:
             internal = await runtime.thread_manager.run(
@@ -156,6 +158,7 @@ class Agent:
             )
             step_budget = _positive_integer(turn.binding_manifest.get("model_step_budget"))
             token_budget = _positive_integer(turn.binding_manifest.get("model_token_budget_total"))
+            cost_budget = _positive_integer(turn.binding_manifest.get("model_cost_budget_total_micros"))
             unknown_model = tuple(
                 operation for operation in store.list_model_operations(turn_id) if operation.status == "unknown"
             )
@@ -217,6 +220,7 @@ class Agent:
             allow_execute_tools=allow_execute_tools,
             max_steps=step_budget,
             max_tokens_total=token_budget,
+            max_cost_micros=cost_budget,
             event_dispatcher=dispatcher,
             frozen_turn_id=turn_id,
         ) as runtime:
@@ -329,6 +333,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
@@ -344,6 +349,7 @@ class Agent:
                 files=files,
                 max_turns=max_turns,
                 max_tokens_total=max_tokens_total,
+                max_cost_micros=max_cost_micros,
                 require_workspace_change=require_workspace_change,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
@@ -488,6 +494,7 @@ class Agent:
         allow_execute_tools: bool,
         max_steps: int | None,
         max_tokens_total: int | None,
+        max_cost_micros: int | None,
         event_dispatcher: (
             TurnEventDispatcher | None
         ) = None,
@@ -583,6 +590,7 @@ class Agent:
                 skill_runtime=skill_runtime,
                 max_steps=16 if max_steps is None else max_steps,
                 max_tokens_total=max_tokens_total,
+                max_cost_micros=max_cost_micros,
                 event_dispatcher=event_dispatcher,
             )
             try:

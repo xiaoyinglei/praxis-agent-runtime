@@ -184,6 +184,66 @@ def resource_usage_from_model_usage(usage: Mapping[str, Any]) -> ResourceUsage:
     )
 
 
+def protected_tokens_for_limit(limit: int | None) -> int:
+    """Deterministic token tail reserved for finalization and recovery."""
+    if limit is None:
+        return 0
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+        raise ValueError("token limit must be a non-negative integer or None")
+    if limit <= 1:
+        return 0
+    return min(8_192, max(1, limit // 10), limit - 1)
+
+
+def pressure_threshold_for_limit(limit: int | None) -> int:
+    protected = protected_tokens_for_limit(limit)
+    if limit is None or protected == 0:
+        return 0
+    return min(limit, protected * 2)
+
+
+def normal_token_remaining(state: BudgetState) -> int | None:
+    """Capacity available to ordinary work, excluding the protected tail."""
+    remaining = state.remaining("tokens")
+    if remaining is None:
+        return None
+    return max(remaining - protected_tokens_for_limit(state.limits.tokens), 0)
+
+
+def budget_pressure_active(state: BudgetState) -> bool:
+    threshold = pressure_threshold_for_limit(state.limits.tokens)
+    if threshold <= 0:
+        return False
+    remaining = state.remaining("tokens")
+    return remaining is not None and remaining <= threshold
+
+
+def ensure_token_headroom(
+    state: BudgetState,
+    *,
+    requested_tokens: int,
+    allow_protected: bool,
+) -> None:
+    """Reject ordinary reservations that would consume the protected tail."""
+    if isinstance(requested_tokens, bool) or not isinstance(requested_tokens, int) or requested_tokens < 0:
+        raise ValueError("requested_tokens must be a non-negative integer")
+    if type(allow_protected) is not bool:
+        raise TypeError("allow_protected must be a bool")
+    limit = state.limits.tokens
+    if limit is None:
+        return
+    protected = protected_tokens_for_limit(limit)
+    effective_limit = limit if allow_protected else max(limit - protected, 0)
+    current = state.exposure.total_tokens
+    if current + requested_tokens > effective_limit:
+        raise BudgetLimitExceededError(
+            resource="tokens",
+            limit=effective_limit,
+            current_exposure=current,
+            requested=requested_tokens,
+        )
+
+
 def _ensure_within_limits(
     state: BudgetState,
     requested: ResourceUsage,

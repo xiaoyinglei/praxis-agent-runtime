@@ -19,6 +19,7 @@ from agent_runtime.model_definition import (
     RequestDefaultsDefinition,
 )
 from agent_runtime.modeling.config import GenerationConfig
+from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -52,6 +53,7 @@ from agent_runtime.modeling.gateway import (
     ProviderDelta,
     ProviderDeltaChannel,
     StreamChunk,
+    llm_budget_scope,
     model_request_input_text,
 )
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -764,14 +766,29 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
     assert first.wire_hash != second.wire_hash
 
 
-def test_gateway_adapter_enforces_remaining_budget_before_provider_io() -> None:
-    gateway = BudgetRejectingGateway()
+def test_gateway_adapter_uses_durable_reservation_not_ambient_legacy_ledger() -> None:
+    provider = NonStreamingProvider()
+    accounting = CharacterAccounting()
+    gateway = LLMGateway(
+        generator=provider,
+        token_accounting=accounting,
+        model_context_tokens=8_192,
+        stage_budgets={
+            LLMCallStage.AGENT_STEP: LLMStageBudget(
+                max_input_tokens=4_096,
+                max_output_tokens=64,
+                safety_margin_tokens=0,
+            )
+        },
+    )
     model = GatewayHarnessModel(
         model_alias="test-model",
         resolved=_resolved_model(
-    gateway=gateway,
-    max_output_tokens=256,
-),
+            gateway=gateway,
+            generator=provider,
+            max_output_tokens=256,
+            token_accounting=accounting,
+        ),
         instructions=("Answer the user directly.",),
     )
     prepared = model.prepare(
@@ -784,11 +801,16 @@ def test_gateway_adapter_enforces_remaining_budget_before_provider_io() -> None:
         )
     )
 
-    with pytest.raises(ModelDispatchPreflightError, match="remaining model token budget"):
-        asyncio.run(model.dispatch(prepared))
-
+    assert prepared.resource_request.output_tokens == 64
+    assert prepared.resource_request.input_tokens > 0
     assert prepared.request_ref["model_token_budget_remaining"] == 10
-    assert gateway.provider_calls == 0
+
+    # This ambient ledger would reject the call if Harness still inherited
+    # the legacy ContextVar budget path.
+    with llm_budget_scope(LLMBudgetLedger(total=1)):
+        response = asyncio.run(model.dispatch(prepared))
+
+    assert response.text == "one complete response"
 
 
 def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_facts(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from stat import S_ISLNK
@@ -46,6 +47,20 @@ _TOOL_LEASE_GRACE_SECONDS = 30.0
 _INSPECTION_TOOL_NAMES = frozenset({"find_tools", "inspect_data_file", "list_files", "read_file", "search_text"})
 _INITIAL_INSPECTION_BUDGET = 12
 _PLANNED_INSPECTION_BUDGET = 20
+
+_ACTIVE_TOOL_TURN_ID: ContextVar[str | None] = ContextVar(
+    "praxis_active_tool_turn_id",
+    default=None,
+)
+
+
+def current_tool_turn_id() -> str:
+    """Return the trusted Turn identity for the currently executing tool."""
+
+    turn_id = _ACTIVE_TOOL_TURN_ID.get()
+    if turn_id is None:
+        raise RuntimeError("tool runner is not executing inside a Harness Turn")
+    return turn_id
 
 
 def tool_consumes_inspection_budget(tool: Tool) -> bool:
@@ -225,7 +240,7 @@ class ToolOrchestrator:
                 resolved.targets,
             )
 
-        execution = await self._executor.execute(
+        execution = await self._execute_in_turn(turn_id, 
             call,
             context=execution_context,
             record_sink=persist,
@@ -265,6 +280,19 @@ class ToolOrchestrator:
             execution=execution,
         )
         return execution.result
+
+
+    async def _execute_in_turn(
+        self,
+        turn_id: str,
+        call: ToolCall,
+        **kwargs: Any,
+    ) -> ToolExecution:
+        token = _ACTIVE_TOOL_TURN_ID.set(turn_id)
+        try:
+            return await self._executor.execute(call, **kwargs)
+        finally:
+            _ACTIVE_TOOL_TURN_ID.reset(token)
 
     async def _publish_tool_progress(
         self,
@@ -416,7 +444,7 @@ class ToolOrchestrator:
                 denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
                 require_confirmation_for=(execution_context.require_confirmation_for | {call.tool_name}),
             )
-            preflight = await self._executor.execute(
+            preflight = await self._execute_in_turn(turn_id, 
                 call,
                 context=preflight_context,
             )
@@ -483,7 +511,7 @@ class ToolOrchestrator:
                 progress=progress,
             )
 
-        execution = await self._executor.execute(
+        execution = await self._execute_in_turn(turn_id, 
             call,
             context=context,
             record=record,
@@ -529,7 +557,7 @@ class ToolOrchestrator:
             denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
             require_confirmation_for=(execution_context.require_confirmation_for | {call.tool_name}),
         )
-        preflight = await self._executor.execute(call, context=preflight_context)
+        preflight = await self._execute_in_turn(turn_id, call, context=preflight_context)
         fresh_record = ToolExecutionRecord.prepare(call, tool)
         current_request = _approval_request(
             preflight,
@@ -583,7 +611,7 @@ class ToolOrchestrator:
                 progress=progress,
             )
 
-        execution = await self._executor.execute(
+        execution = await self._execute_in_turn(turn_id, 
             call,
             context=context,
             record=record,

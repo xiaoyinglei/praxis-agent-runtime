@@ -38,6 +38,7 @@ class ProjectionState:
     model_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
     budget_reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    child_budget_allocations: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     interactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -248,6 +249,31 @@ def apply_record(
                 raise RuntimeError("only a dispatched budget can become unknown")
             reservation["status"] = "unknown"
             reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_child_allocated":
+            allocation_id = payload["allocation_id"]
+            if allocation_id in state.child_budget_allocations:
+                raise RuntimeError("duplicate child budget allocation identity")
+            state.child_budget_allocations[allocation_id] = {
+                "allocation_id": allocation_id,
+                "thread_id": thread_id,
+                "parent_turn_id": payload["parent_turn_id"],
+                "child_turn_id": payload["child_turn_id"],
+                "allocated_tokens": payload["allocated_tokens"],
+                "allocated_cost_micros": payload.get("allocated_cost_micros"),
+                "actual": {},
+                "status": "active",
+                "applied_thread_sequence": sequence,
+                "reducer_version": reducer_version,
+            }
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "budget_child_settled":
+            allocation = state.child_budget_allocations[payload["allocation_id"]]
+            if allocation["status"] != "active":
+                raise RuntimeError("only an active child allocation can be settled")
+            allocation["status"] = "settled"
+            allocation["actual"] = payload["actual"]
+            allocation["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
         case "tool_operation_prepared":
             operation_id = payload["operation_id"]

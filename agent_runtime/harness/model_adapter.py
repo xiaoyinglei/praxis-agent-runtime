@@ -10,6 +10,11 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from agent_runtime.budget import ResourceUsage
+from agent_runtime.budget.pricing import (
+    PricingUnavailableError,
+    actual_model_cost_micros,
+    estimated_model_cost_micros,
+)
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import ModelMessage, StopReason
 from agent_runtime.core.messages import ToolCall as ModelToolCall
@@ -23,6 +28,7 @@ from agent_runtime.core.model_request import (
     canonical_model_request_json,
 )
 from agent_runtime.harness.protocol import (
+    ContextBudgetExceededError,
     HarnessMessage,
     HarnessModelDelta,
     HarnessModelDeltaSink,
@@ -34,14 +40,13 @@ from agent_runtime.harness.protocol import (
     ModelDispatchPreflightError,
     PreparedModelCall,
 )
-from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import (
-    LLMBudgetExceededError,
     LLMContextOverflowError,
     ProviderDelta,
     model_request_input_text,
 )
+from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from agent_runtime.models import ModelControlPlane
@@ -53,7 +58,6 @@ class _GatewayDispatch:
     request: ModelRequest
     wire_hash: str
     resolved: ResolvedModel
-    model_token_budget_remaining: int | None
 
 
 class GatewayHarnessModel:
@@ -122,6 +126,15 @@ class GatewayHarnessModel:
             openai_wire = serialize_openai_request(canonical_request)
             wire_hash = openai_wire.provider_wire_hash
             serializer_revision = openai_wire.serializer_revision
+        resource_request, pricing_known = _model_resource_request(
+            request=canonical_request,
+            settings=settings,
+            resolved=self._resolved,
+            require_pricing=(
+                request.binding_manifest.get("model_cost_budget_total_micros")
+                is not None
+            ),
+        )
         return PreparedModelCall(
             request_hash=request_hash,
             context_hash=context_hash,
@@ -136,18 +149,17 @@ class GatewayHarnessModel:
                 "message_count": len(canonical_request.messages),
                 "exposed_tool_names": canonical_request.exposed_tool_names,
                 "model_token_budget_remaining": remaining,
+                "budget_pressure": request.budget_pressure,
+                "pricing_revision": self._resolved.pricing_revision,
+                "pricing_known": pricing_known,
+                "reserved_cost_micros": resource_request.cost_micros,
                 **({"context_projection": context_projection} if context_projection is not None else {}),
             },
-            resource_request=_model_resource_request(
-                request=canonical_request,
-                settings=settings,
-                resolved=self._resolved,
-            ),
+            resource_request=resource_request,
             dispatch_payload=_GatewayDispatch(
                 request=canonical_request,
                 wire_hash=wire_hash,
                 resolved=self._resolved,
-                model_token_budget_remaining=remaining,
             ),
         )
 
@@ -164,11 +176,6 @@ class GatewayHarnessModel:
         gateway = resolved.gateway
         if gateway is None:
             raise RuntimeError("resolved model gateway disappeared before dispatch")
-        ledger = (
-            None
-            if payload.model_token_budget_remaining is None
-            else LLMBudgetLedger(total=payload.model_token_budget_remaining)
-        )
         streamed_content: dict[str, list[str]] = {
             "text": [],
             "reasoning": [],
@@ -196,11 +203,12 @@ class GatewayHarnessModel:
                 supports_native_tools=resolved.capabilities.supports_native_tools,
                 stream=delta_sink is not None,
                 delta_sink=forward_delta if delta_sink is not None else None,
-                ledger=ledger,
+                ledger=None,
                 lease_id=f"{payload.request.request_id}:provider",
+                inherit_budget_ledger=False,
             )
-        except LLMBudgetExceededError as exc:
-            raise ModelDispatchPreflightError("Provider call exceeds the Turn's remaining model token budget.") from exc
+        except ProviderQuotaPreflightError as exc:
+            raise ModelDispatchPreflightError(str(exc)) from exc
         except LLMContextOverflowError as exc:
             raise ModelDispatchPreflightError(
                 f"Model context exceeds the effective stage input budget: {exc.input_tokens} > {exc.max_input_tokens}."
@@ -222,7 +230,7 @@ class GatewayHarnessModel:
             return HarnessModelResponse(
                 text=response.turn.text,
                 provider_response_id=None,
-                usage=response.usage.model_dump(mode="json"),
+                usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
                 tool_calls=tuple(
                     HarnessToolCall(
                         id=call.id,
@@ -249,7 +257,7 @@ class GatewayHarnessModel:
         return HarnessModelResponse(
             text=response.turn.text,
             provider_response_id=None,
-            usage=response.usage.model_dump(mode="json"),
+            usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
             tool_calls=tuple(
                 HarnessToolCall(
                     id=call.id,
@@ -465,9 +473,11 @@ def _model_resource_request(
     request: ModelRequest,
     settings: ModelSettings,
     resolved: ResolvedModel,
-) -> ResourceUsage:
-    """Compute the amount that must be reserved before provider dispatch."""
-
+    require_pricing: bool,
+) -> tuple[ResourceUsage, bool]:
+    """Compute exact token reservation plus conservative monetary exposure."""
+    if type(require_pricing) is not bool:
+        raise TypeError("require_pricing must be a bool")
     input_tokens = 0
     count = getattr(resolved.token_accounting, "count", None)
     if callable(count):
@@ -483,18 +493,60 @@ def _model_resource_request(
         input_tokens = measured
 
     max_output_tokens = settings.max_output_tokens or 0
-    if (
-        isinstance(max_output_tokens, bool)
-        or not isinstance(max_output_tokens, int)
-        or max_output_tokens < 0
-    ):
+    max_input_tokens: int | None = None
+    gateway = resolved.gateway
+    effective_budget = getattr(gateway, "effective_stage_budget", None)
+    if callable(effective_budget):
+        invocation = effective_budget(
+            LLMCallStage.AGENT_STEP,
+            kwargs={"max_tokens": settings.max_output_tokens},
+        )
+        max_input_tokens = getattr(invocation, "max_input_tokens", None)
+        max_output_tokens = getattr(invocation, "max_output_tokens", None)
+        if isinstance(max_input_tokens, bool) or not isinstance(max_input_tokens, int) or max_input_tokens < 1:
+            raise RuntimeError("gateway returned an invalid effective input budget")
+        if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
+            raise RuntimeError("gateway returned an invalid effective output budget")
+    elif isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 0:
         raise RuntimeError("model max_output_tokens is invalid")
 
-    return ResourceUsage(
+    if max_input_tokens is not None and input_tokens > max_input_tokens:
+        raise ContextBudgetExceededError(
+            "Committed model context cannot fit inside the effective provider "
+            f"boundary: {input_tokens} > {max_input_tokens} input tokens."
+        )
+    estimated_cost = estimated_model_cost_micros(
         input_tokens=input_tokens,
-        output_tokens=max_output_tokens,
-        model_calls=1,
+        max_output_tokens=max_output_tokens,
+        pricing=resolved.pricing_micros_per_1m,
     )
+    pricing_known = estimated_cost is not None
+    if require_pricing and not pricing_known:
+        raise PricingUnavailableError(
+            "Turn has a monetary budget but the frozen model lacks complete input/output pricing."
+        )
+    return (
+        ResourceUsage(
+            input_tokens=input_tokens,
+            output_tokens=max_output_tokens,
+            cost_micros=estimated_cost or 0,
+            model_calls=1,
+        ),
+        pricing_known,
+    )
+
+
+def _priced_usage_payload(
+    usage: Mapping[str, Any],
+    resolved: ResolvedModel,
+) -> dict[str, Any]:
+    payload = dict(usage)
+    payload["cost_micros"] = actual_model_cost_micros(
+        payload, pricing=resolved.pricing_micros_per_1m
+    )
+    payload["pricing_revision"] = resolved.pricing_revision
+    return payload
+
 
 def _budgeted_request(
     *,

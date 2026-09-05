@@ -4,7 +4,7 @@ import json
 import os
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     from agent_runtime.modeling.gateway import LLMGateway
     from agent_runtime.modeling.tokenization import TokenAccountingService
 
+from agent_runtime.budget.pricing import (
+    pricing_micros_per_1m,
+    pricing_revision,
+)
 from agent_runtime.core.llm_config import (
     AgentModelsConfig,
     ModelProvider,
@@ -53,6 +57,8 @@ class ResolvedModel:
     request_defaults: RequestDefaultsDefinition
     generation_config: GenerationConfig
     definition_revision: str | None = None
+    pricing_micros_per_1m: Mapping[str, int | None] = field(default_factory=dict)
+    pricing_revision: str | None = None
 
 @dataclass(frozen=True, slots=True)
 class ChatProviderConfig:
@@ -448,6 +454,14 @@ class ModelRegistry:
             for stage, budget in definition.llm_stage_budgets.items()
         }
 
+        pricing = pricing_micros_per_1m(
+            input_cost_per_1m=definition.input_cost_per_1m,
+            output_cost_per_1m=definition.output_cost_per_1m,
+            cache_read_cost_per_1m=definition.cache_read_cost_per_1m,
+            cache_write_cost_per_1m=definition.cache_write_cost_per_1m,
+        )
+        resolved_provider = definition.provider_name or definition.provider.value
+
         resolved = ResolvedModel(
             generator=generator,
             gateway=LLMGateway(
@@ -457,10 +471,7 @@ class ModelRegistry:
                 stage_budgets=stage_budgets,
             ),
             model=definition.model,
-            provider=(
-                definition.provider_name
-                or definition.provider.value
-            ),
+            provider=resolved_provider,
             capabilities=capabilities,
             token_accounting=token_accounting,
             request_defaults=definition.defaults,
@@ -468,6 +479,12 @@ class ModelRegistry:
                 definition
             ),
             definition_revision=definition.definition_revision,
+            pricing_micros_per_1m=pricing,
+            pricing_revision=pricing_revision(
+                provider=resolved_provider,
+                model=definition.model,
+                pricing=pricing,
+            ),
         )
 
         return resolved
