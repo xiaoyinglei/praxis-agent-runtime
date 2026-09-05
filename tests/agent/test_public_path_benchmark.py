@@ -28,7 +28,7 @@ def test_manifest_freezes_five_distinct_public_path_scenarios() -> None:
 
     manifest = module.load_manifest(MANIFEST)
 
-    assert manifest.model == "qwen3_5_9b_mlx_4bit"
+    assert manifest.model == "mlx-community/Qwen3.5-9B-4bit"
     assert manifest.repetitions == 3
     assert tuple(scenario.scenario_id for scenario in manifest.scenarios) == (
         "single_file_fix",

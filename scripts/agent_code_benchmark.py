@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import TextIO
 from uuid import uuid4
 
-_PRIMARY_MODEL = "qwen3_5_9b_mlx_4bit"
-_CONTROL_MODEL = "groq_gpt_oss_120b"
-_DIAGNOSTIC_MODEL = "kimi_cloud"
+_PRIMARY_MODEL = "mlx-community/Qwen3.5-9B-4bit"
+_CONTROL_MODEL = "openai/gpt-oss-120b"
+_DIAGNOSTIC_MODEL = "kimi-k2.6"
 _CLOUD_BENCHMARK_MODELS = frozenset({_CONTROL_MODEL, _DIAGNOSTIC_MODEL})
 _IMPLEMENTATION_INSTRUCTION_PREFIX = (
     "This is an implementation task in the current repository. "

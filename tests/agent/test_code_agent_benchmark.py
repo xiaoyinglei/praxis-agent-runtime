@@ -322,9 +322,9 @@ def _task_payload(
 def _manifest_payload(
     *,
     benchmark_version: str = "code-agent-v1",
-    primary_model: str = "qwen3_5_9b_mlx_4bit",
-    control_model: str = "groq_gpt_oss_120b",
-    diagnostic_model: str = "kimi_cloud",
+    primary_model: str = "mlx-community/Qwen3.5-9B-4bit",
+    control_model: str = "openai/gpt-oss-120b",
+    diagnostic_model: str = "kimi-k2.6",
     tasks: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
@@ -353,9 +353,9 @@ def test_manifest_locks_qwen_primary_and_groq_control(tmp_path: Path) -> None:
 
     manifest = module.load_manifest(path)
 
-    assert manifest.primary_model == "qwen3_5_9b_mlx_4bit"
-    assert manifest.control_model == "groq_gpt_oss_120b"
-    assert manifest.diagnostic_model == "kimi_cloud"
+    assert manifest.primary_model == "mlx-community/Qwen3.5-9B-4bit"
+    assert manifest.control_model == "openai/gpt-oss-120b"
+    assert manifest.diagnostic_model == "kimi-k2.6"
     assert manifest.benchmark_version == "code-agent-v1"
     assert len(manifest.fingerprint) == 64
 
@@ -363,9 +363,9 @@ def test_manifest_locks_qwen_primary_and_groq_control(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "model"),
     [
-        ("primary_model", "deepseek_chat"),
-        ("control_model", "deepseek_reasoner"),
-        ("diagnostic_model", "deepseek_chat"),
+        ("primary_model", "deepseek-chat"),
+        ("control_model", "deepseek-reasoner"),
+        ("diagnostic_model", "deepseek-chat"),
     ],
 )
 def test_manifest_rejects_deepseek_models(
@@ -909,7 +909,7 @@ def test_provider_error_parser_keeps_pre_runtime_failures_out_of_execution_closu
 def test_provider_limit_diagnosis_preserves_causes_observed_before_limit() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_alias="openai/gpt-oss-120b",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -942,7 +942,7 @@ def test_provider_limit_diagnosis_preserves_causes_observed_before_limit() -> No
 def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_alias="openai/gpt-oss-120b",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -972,7 +972,7 @@ def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
 def test_incomplete_model_response_is_diagnosed_from_public_harness_evidence() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="deepseek_v4_flash",
+        model_alias="deepseek-v4-flash",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -1001,7 +1001,7 @@ def test_incomplete_model_response_is_diagnosed_from_public_harness_evidence() -
 def test_false_completion_diagnosis_names_execution_closure() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_alias="openai/gpt-oss-120b",
         turn_status="done",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -1028,7 +1028,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
     [
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_alias": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": True,
@@ -1037,7 +1037,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_alias": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": False,
@@ -1046,7 +1046,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "groq_gpt_oss_120b",
+                "model_alias": "openai/gpt-oss-120b",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1056,7 +1056,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "kimi_cloud",
+                "model_alias": "kimi-k2.6",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1066,7 +1066,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_alias": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1076,7 +1076,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_alias": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": True,
@@ -1163,7 +1163,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
         "required.add('--require-workspace-change')\n"
         "required.add('--disable-workspace-mcp')\n"
         "assert required <= set(sys.argv)\n"
-        "assert sys.argv[sys.argv.index('--model') + 1] == 'kimi_cloud'\n"
+        "assert sys.argv[sys.argv.index('--model') + 1] == 'kimi-k2.6'\n"
         "assert '--max-tokens-total' not in sys.argv\n"
         "Path('app.py').write_text(\"VALUE = 'fixed'\\n\", encoding='utf-8')\n"
         "print('Turn: fake-turn')\n"
@@ -1191,7 +1191,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="kimi_cloud",
+        model_alias="kimi-k2.6",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1278,7 +1278,7 @@ def test_run_task_retries_only_a_durable_unknown_model_operation(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="kimi_cloud",
+        model_alias="kimi-k2.6",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1491,7 +1491,7 @@ def test_setup_failure_is_benchmark_invalid_not_runtime_failure(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="qwen3_5_9b_mlx_4bit",
+        model_alias="mlx-community/Qwen3.5-9B-4bit",
         agent_command=(sys.executable, "-c", "raise AssertionError('must not run')"),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1559,7 +1559,7 @@ def test_secret_written_to_workspace_blocks_run_and_is_redacted_from_artifacts(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="qwen3_5_9b_mlx_4bit",
+        model_alias="mlx-community/Qwen3.5-9B-4bit",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )

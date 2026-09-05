@@ -24,7 +24,7 @@ def _deepseek_agent(workspace: Path):
     from agent_runtime.agent import Agent
 
     return Agent(
-        model="deepseek_chat",
+        model="deepseek-chat",
         workspace_path=workspace,
         checkpoint_db=workspace / ".praxis" / "runtime" / "rollout.sqlite3",
         model_session_path=workspace / ".praxis" / "runtime" / "model-session.json",
