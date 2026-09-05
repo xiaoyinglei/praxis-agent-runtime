@@ -31,7 +31,6 @@ class CurrentModelRemovalError(ValueError):
 @dataclass(frozen=True, slots=True)
 class ModelDefinitionArguments:
     provider: ModelProvider | None = None
-    model: str | None = None
     tokenizer_model: str | None = None
     provider_name: str | None = None
     protocol: str | None = None
@@ -39,7 +38,6 @@ class ModelDefinitionArguments:
     base_url: str | None = None
     api_key_env: str | None = None
     context_window_tokens: int | None = None
-    max_context_window_tokens: int | None = None
     max_output_tokens: int | None = None
     supports_tools: bool | None = None
     supports_structured_output: bool | None = None
@@ -48,11 +46,10 @@ class ModelDefinitionArguments:
     def for_add(self) -> UserModelDefinition:
         if (
             self.provider is None
-            or self.model is None
             or self.context_window_tokens is None
         ):
             raise ValueError(
-                "--provider, --provider-model, and "
+                "--provider and "
                 "--context-window-tokens are required "
                 "without --from"
             )
@@ -68,7 +65,6 @@ class ModelDefinitionArguments:
     def _changes(self) -> dict[str, object]:
         values = {
             "provider": self.provider,
-            "model": self.model,
             "tokenizer_model": self.tokenizer_model,
             "provider_name": self.provider_name,
             "protocol": self.protocol,
@@ -76,9 +72,6 @@ class ModelDefinitionArguments:
             "base_url": self.base_url,
             "api_key_env": self.api_key_env,
             "context_window_tokens": self.context_window_tokens,
-            "max_context_window_tokens": (
-                self.max_context_window_tokens
-            ),
             "max_output_tokens": self.max_output_tokens,
             "supports_tools": self.supports_tools,
             "supports_structured_output": (
@@ -214,7 +207,7 @@ class ModelAdminService:
         )
         snapshot = self.store.read()
         candidate = self.store.preview_add(alias, definition, snapshot=snapshot)
-        execution = self.registry.execution_definition_for_user_model(candidate)
+        execution = self.registry.execution_definition_for_user_model(alias, candidate)
         evidence = None if skip_probe else await self.probe_service.run(execution, level=ProbeLevel.FULL)
         result = self.store.add(alias, candidate, expected=snapshot.version)
         return _mutation_outcome(
@@ -244,7 +237,7 @@ class ModelAdminService:
         snapshot = self.store.read()
         candidate = self.store.preview_update(alias, mutation, snapshot=snapshot)
         current = snapshot.document.models[alias]
-        execution = self.registry.execution_definition_for_user_model(candidate)
+        execution = self.registry.execution_definition_for_user_model(alias, candidate)
         if candidate.to_persisted_mapping() == current.to_persisted_mapping():
             return _mutation_outcome(
                 alias=alias,

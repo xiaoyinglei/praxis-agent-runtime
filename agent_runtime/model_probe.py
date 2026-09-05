@@ -129,10 +129,10 @@ class ModelProbe:
             lambda: asyncio.to_thread(list_models),
             definition=definition,
         )
-        if definition.model not in model_ids:
+        if definition.model_id not in model_ids:
             raise ModelProbeError(
                 phase="model_identity",
-                detail=f"configured model {definition.model!r} was not advertised",
+                detail=f"configured model {definition.model_id!r} was not advertised",
             )
 
     async def _check_stream(
@@ -307,7 +307,7 @@ def _probe_request(
         ),
         selected_tools=tools,
         settings=ModelSettings(
-            model=definition.model,
+            model=definition.model_id,
             max_output_tokens=probe_output_limit,
             temperature=(
                 defaults.temperature

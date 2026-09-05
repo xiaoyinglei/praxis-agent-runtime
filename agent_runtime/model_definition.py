@@ -7,8 +7,9 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from typing import Literal
 from dataclasses import dataclass
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from agent_runtime.core.llm_config import (
@@ -116,7 +117,6 @@ class RequestDefaultsDefinition(BaseModel):
 class ModelCapabilities:
     """Resolved provider/model capabilities used by runtime execution."""
     context_window_tokens: int
-    max_context_window_tokens: int
     max_output_tokens: int | None
     supports_native_tools: bool
     supports_structured_output: bool
@@ -128,26 +128,6 @@ class ModelCapabilities:
         ):
             raise ValueError(
                 "context_window_tokens must be positive"
-            )
-
-        if (
-            isinstance(
-                self.max_context_window_tokens,
-                bool,
-            )
-            or self.max_context_window_tokens <= 0
-        ):
-            raise ValueError(
-                "max_context_window_tokens must be positive"
-            )
-
-        if (
-            self.context_window_tokens
-            > self.max_context_window_tokens
-        ):
-            raise ValueError(
-                "context_window_tokens must not exceed "
-                "max_context_window_tokens"
             )
 
         if self.max_output_tokens is not None:
@@ -162,11 +142,11 @@ class ModelCapabilities:
 
             if (
                 self.max_output_tokens
-                > self.max_context_window_tokens
+                > self.context_window_tokens
             ):
                 raise ValueError(
                     "max_output_tokens must not exceed "
-                    "max_context_window_tokens"
+                    "context_window_tokens"
                 )
 
 class ModelExecutionDefinition(BaseModel):
@@ -179,14 +159,10 @@ class ModelExecutionDefinition(BaseModel):
     provider_name: str | None
     protocol: str | None
 
-    model: str = Field(min_length=1)
+    model_id: str = Field(min_length=1)
     tokenizer_model: str | None
 
     context_window_tokens: int = Field(
-        gt=0,
-        strict=True,
-    )
-    max_context_window_tokens: int = Field(
         gt=0,
         strict=True,
     )
@@ -253,25 +229,22 @@ class ModelExecutionDefinition(BaseModel):
     @model_validator(mode="after")
     def validate_capabilities(
         self,
-    ) -> "ModelExecutionDefinition":
-        if (
-            self.context_window_tokens
-            > self.max_context_window_tokens
-        ):
-            raise ValueError(
-                "context_window_tokens must not exceed "
-                "max_context_window_tokens"
-            )
-
+    ) -> ModelExecutionDefinition:
         if (
             self.max_output_tokens is not None
             and self.max_output_tokens
-            > self.max_context_window_tokens
+            > self.context_window_tokens
         ):
             raise ValueError(
                 "max_output_tokens must not exceed "
-                "max_context_window_tokens"
+                "context_window_tokens"
             )
+
+        _ = normalize_model_endpoint(
+            provider=self.provider,
+            base_url=self.base_url,
+            location=self.location,
+        )
 
         return self
 
@@ -280,9 +253,6 @@ class ModelExecutionDefinition(BaseModel):
         return ModelCapabilities(
             context_window_tokens=(
                 self.context_window_tokens
-            ),
-            max_context_window_tokens=(
-                self.max_context_window_tokens
             ),
             max_output_tokens=(
                 self.max_output_tokens
@@ -301,6 +271,7 @@ class ModelExecutionDefinition(BaseModel):
 
 def build_model_execution_definition(
     *,
+    model_id: str,
     spec: ModelSpec,
     config: AgentModelsConfig,
 ) -> ModelExecutionDefinition:
@@ -316,16 +287,13 @@ def build_model_execution_definition(
         provider=spec.provider,
         provider_name=spec.provider_name,
         protocol=spec.protocol,
-        model=spec.model,
+        model_id=model_id,
         tokenizer_model=(
             spec.tokenizer_model
-            or spec.model
+            or model_id
         ),
         context_window_tokens=(
             spec.context_window_tokens
-        ),
-        max_context_window_tokens=(
-            spec.effective_max_context_window_tokens
         ),
         max_output_tokens=(
             spec.max_output_tokens

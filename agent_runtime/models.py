@@ -1129,7 +1129,7 @@ def _to_public_definition_spec(
     return ModelSpec(
         id=alias,
         provider=definition.provider_name or definition.provider.value,
-        provider_model=definition.model,
+        provider_model=definition.model_id,
         context_window=definition.context_window_tokens,
         supports_tools=definition.supports_tools,
         supports_structured_output=definition.supports_structured_output,
@@ -1159,7 +1159,7 @@ def _to_public_spec(
     spec: InternalModelSpec,
 ) -> ModelSpec:
     provider = str(spec.provider_name or spec.provider)
-    provider_model = str(spec.model)
+    provider_model = model_id
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,

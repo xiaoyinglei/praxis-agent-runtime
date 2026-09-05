@@ -78,34 +78,30 @@ models:
   # -------------------------------------------------------------------------
   # Chat models: local MLX.
   # -------------------------------------------------------------------------
-  qwen3_0_6b_mlx_4bit:
+  mlx-community/Qwen3-0.6B-4bit:
     capability: chat
     provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-0.6B-4bit
     context_window_tokens: 32768
     runtime:
       expected_model_contains: Qwen3-0.6B-4bit
 
-  qwen3_8b_mlx_4bit:
+  mlx-community/Qwen3-8B-4bit:
     capability: chat
     provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-8B-4bit
     context_window_tokens: 32768
     runtime:
       expected_model_contains: Qwen3-8B-4bit
 
-  qwen3_14b_mlx_4bit:
+  mlx-community/Qwen3-14B-4bit:
     capability: chat
     provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-14B-4bit
     context_window_tokens: 32768
     runtime:
       expected_model_contains: Qwen3-14B-4bit
 
-  qwen3_5_9b_mlx_4bit:
+  mlx-community/Qwen3.5-9B-4bit:
     capability: chat
     provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3.5-9B-4bit
     context_window_tokens: 262144
     runtime:
       expected_model_contains: Qwen3.5-9B-4bit
@@ -113,55 +109,48 @@ models:
   # -------------------------------------------------------------------------
   # Chat models: DeepSeek.
   # -------------------------------------------------------------------------
-  deepseek_chat:
+  deepseek-chat:
     capability: chat
     provider: deepseek
-    model: deepseek-chat
     context_window_tokens: 128000
 
-  deepseek_reasoner:
+  deepseek-reasoner:
     capability: chat
     provider: deepseek
-    model: deepseek-reasoner
     context_window_tokens: 128000
 
   # Keep only if your DeepSeek account actually supports this model.
-  deepseek_v4_flash:
+  deepseek-v4-flash:
     capability: chat
     provider: deepseek
-    model: deepseek-v4-flash
     context_window_tokens: 128000
     experimental: true
 
   # -------------------------------------------------------------------------
   # Chat models: Groq.
   # -------------------------------------------------------------------------
-  groq_gpt_oss_120b:
+  openai/gpt-oss-120b:
     capability: chat
     provider: groq
-    model: openai/gpt-oss-120b
     tokenizer_model: gpt-oss-120b
     context_window_tokens: 131072
 
-  groq_llama_3_3_70b:
+  llama-3.3-70b-versatile:
     capability: chat
     provider: groq
-    model: llama-3.3-70b-versatile
     context_window_tokens: 32768
 
   # -------------------------------------------------------------------------
   # Chat models: MiMo.
   # -------------------------------------------------------------------------
-  mimo_cloud:
+  mimo-v2.5-pro:
     capability: chat
     provider: mimo
-    model: mimo-v2.5-pro
     context_window_tokens: 256000
 
-  kimi_cloud:
+  kimi-k2.6:
     capability: chat
     provider: kimi
-    model: kimi-k2.6
     context_window_tokens: 262144
     defaults:
       temperature: 1.0
@@ -205,7 +194,7 @@ models:
 defaults:
   # Product runs default to Groq so an omitted --model never starts a local
   # MLX server. Benchmark release lanes remain explicit in their manifest.
-  primary_model: groq_gpt_oss_120b
+  primary_model: openai/gpt-oss-120b
 
   embedding_model: qwen3_embedding_8b_4bit_dwq
   reranker_model: qwen3_reranker_4b

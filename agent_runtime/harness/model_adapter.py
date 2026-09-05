@@ -46,9 +46,9 @@ from agent_runtime.modeling.gateway import (
     ProviderDelta,
     model_request_input_text,
 )
-from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request
+from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.tools.tool import JsonValue
 
@@ -445,7 +445,7 @@ def _model_settings(resolved: ResolvedModel) -> ModelSettings:
     )
 
     return ModelSettings(
-        model=resolved.model,
+        model=resolved.model_id,
         max_output_tokens=resolved.capabilities.max_output_tokens,
         temperature=(
             defaults.temperature

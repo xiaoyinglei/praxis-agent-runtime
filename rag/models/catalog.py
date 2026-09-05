@@ -62,15 +62,35 @@ class ModelCatalog:
         providers = raw_providers if isinstance(raw_providers, dict) else {}
 
         models: dict[str, ModelSpec] = {}
-        for alias, entry in raw_models.items():
+        for model_id, entry in raw_models.items():
+            if (
+                type(model_id) is not str
+                or not model_id
+                or model_id != model_id.strip()
+            ):
+                raise ValueError(
+                    "model catalog keys must be non-empty trimmed IDs"
+                )
             if not isinstance(entry, dict):
-                raise ValueError(f"Model entry {alias!r} must be a dict, got {type(entry).__name__}")
+                raise ValueError(f"Model entry {model_id!r} must be a dict, got {type(entry).__name__}")
+            capability = ModelCapability(entry["capability"])
+            if capability is ModelCapability.CHAT:
+                redundant = sorted(
+                    field
+                    for field in ("model", "max_context_window_tokens")
+                    if field in entry
+                )
+                if redundant:
+                    raise ValueError(
+                        f"Chat model {model_id!r} contains redundant fields: "
+                        + ", ".join(redundant)
+                    )
             merged = _merge_provider_model_entry(entry, providers)
-            models[alias] = ModelSpec(
-                alias=alias,
-                capability=ModelCapability(entry["capability"]),
+            models[model_id] = ModelSpec(
+                alias=model_id,
+                capability=capability,
                 provider=str(merged.get("protocol") or merged.get("provider") or entry["provider"]),
-                model=entry["model"],
+                model=(model_id if capability is ModelCapability.CHAT else entry["model"]),
                 base_url=_optional_str(merged.get("base_url")),
                 api_key_env=_optional_str(merged.get("api_key_env")),
                 embedding_space=entry.get("embedding_space"),

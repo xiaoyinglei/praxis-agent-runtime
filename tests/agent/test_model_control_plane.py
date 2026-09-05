@@ -54,11 +54,10 @@ def _write_models_config(path: Path) -> None:
         yaml.safe_dump(
             {
                 "models": {
-                    "local_qwen": {
+                    "mlx-community/Qwen3-14B-4bit": {
                         "capability": "chat",
                         "provider": "qwen",
                         "protocol": "openai_compatible",
-                        "model": "mlx-community/Qwen3-14B-4bit",
                         "base_url": "http://127.0.0.1:8080/v1",
                         "context_window_tokens": 32768,
                         "tools": True,
@@ -71,11 +70,10 @@ def _write_models_config(path: Path) -> None:
                             "startup_timeout_seconds": 5,
                         },
                     },
-                    "mimo_cloud": {
+                    "mimo-v2.5-pro": {
                         "capability": "chat",
                         "provider": "mimo",
                         "protocol": "openai_compatible",
-                        "model": "mimo-v2.5-pro",
                         "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
                         "api_key_env": "MIMO_API_KEY",
                         "context_window_tokens": 256000,
@@ -93,7 +91,7 @@ def _write_models_config(path: Path) -> None:
                         "model": "embedding-model",
                     },
                 },
-                "defaults": {"primary_model": "local_qwen"},
+                "defaults": {"primary_model": "mlx-community/Qwen3-14B-4bit"},
             }
         ),
         encoding="utf-8",
@@ -106,8 +104,11 @@ def test_model_catalog_loads_runtime_specs_without_embedding_models(tmp_path: Pa
 
     catalog = ModelCatalog.from_config_file(config_path)
 
-    assert [spec.id for spec in catalog.list_models()] == ["local_qwen", "mimo_cloud"]
-    spec = catalog.get("mimo_cloud")
+    assert [spec.id for spec in catalog.list_models()] == [
+        "mimo-v2.5-pro",
+        "mlx-community/Qwen3-14B-4bit",
+    ]
+    spec = catalog.get("mimo-v2.5-pro")
     assert spec.provider == "mimo"
     assert spec.provider_model == "mimo-v2.5-pro"
     assert spec.context_window == 256000
@@ -117,11 +118,108 @@ def test_model_catalog_loads_runtime_specs_without_embedding_models(tmp_path: Pa
     assert spec.runtime is None
     assert spec.input_cost_per_1m == 0.5
     assert spec.output_cost_per_1m == 2.0
-    assert catalog.default_model_id == "local_qwen"
-    local = catalog.get("local_qwen")
+    assert catalog.default_model_id == "mlx-community/Qwen3-14B-4bit"
+    local = catalog.get("mlx-community/Qwen3-14B-4bit")
     assert local.runtime is not None
     assert local.runtime.health_url == "http://127.0.0.1:8080/v1/models"
     assert local.runtime.expected_model_contains == "Qwen3-14B"
+
+
+def test_catalog_key_survives_as_execution_and_resolved_model_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "openai/gpt-oss-120b": {
+                        "capability": "chat",
+                        "provider": "openai_compatible",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "context_window_tokens": 131072,
+                    }
+                },
+                "defaults": {"primary_model": "openai/gpt-oss-120b"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "agent_runtime.core.llm_registry._build_chat_generator",
+        lambda **_kwargs: object(),
+    )
+
+    registry = ModelRegistry(ModelRegistry._load_yaml_file(config_path))
+    definition = registry.get_model_definition("openai/gpt-oss-120b")
+    resolved = registry.resolve("openai/gpt-oss-120b")
+
+    assert definition.model_id == "openai/gpt-oss-120b"
+    assert definition.tokenizer_model == "openai/gpt-oss-120b"
+    assert resolved.model_id == "openai/gpt-oss-120b"
+
+
+@pytest.mark.parametrize(
+    "forbidden_field, forbidden_value",
+    [
+        ("model", "shadow/model"),
+        ("max_context_window_tokens", 262144),
+    ],
+)
+def test_core_catalog_rejects_redundant_identity_and_context_fields(
+    tmp_path: Path,
+    forbidden_field: str,
+    forbidden_value: object,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "openai/gpt-oss-120b": {
+                        "capability": "chat",
+                        "provider": "openai_compatible",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "context_window_tokens": 131072,
+                        forbidden_field: forbidden_value,
+                    }
+                },
+                "defaults": {"primary_model": "openai/gpt-oss-120b"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=forbidden_field):
+        ModelRegistry._load_yaml_file(config_path)
+
+
+@pytest.mark.parametrize("model_id", ["", " openai/gpt-oss-120b "])
+def test_core_catalog_rejects_non_trimmed_or_empty_model_ids(
+    tmp_path: Path,
+    model_id: str,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    model_id: {
+                        "capability": "chat",
+                        "provider": "openai_compatible",
+                        "base_url": "http://127.0.0.1:8080/v1",
+                        "context_window_tokens": 131072,
+                    }
+                },
+                "defaults": {"primary_model": model_id},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="non-empty trimmed IDs"):
+        ModelRegistry._load_yaml_file(config_path)
 
 
 def test_effective_catalog_layers_user_registry_with_provenance(
@@ -136,12 +234,12 @@ def test_effective_catalog_layers_user_registry_with_provenance(
                 "version": 1,
                 "revision": 1,
                 "models": {
-                    "my_qwen": {
+                    "Qwen/Qwen3.5-9B": {
                         "provider": "openai_compatible",
                         "provider_name": "local-test",
-                        "model": "Qwen/Qwen3.5-9B",
                         "base_url": "http://127.0.0.1:8080/v1",
                         "location": "local",
+                        "context_window_tokens": 262144,
                     }
                 },
             }
@@ -153,22 +251,25 @@ def test_effective_catalog_layers_user_registry_with_provenance(
     monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
 
     first = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
-    assert first.origin("groq_gpt_oss_120b") == "builtin"
-    assert first.origin("my_qwen") == "user"
-    assert first.get("my_qwen").provider_model == "Qwen/Qwen3.5-9B"
-    assert first.default_model_id == "groq_gpt_oss_120b"
-    first_definition_revision = first.definition("my_qwen").definition_revision
-    assert first.definition("my_qwen").provider == "openai_compatible"
-    assert first.definition("my_qwen").generation.answer.max_tokens == 4096
+    assert first.origin("openai/gpt-oss-120b") == "builtin"
+    assert first.origin("Qwen/Qwen3.5-9B") == "user"
+    assert first.get("Qwen/Qwen3.5-9B").provider_model == "Qwen/Qwen3.5-9B"
+    assert first.default_model_id == "openai/gpt-oss-120b"
+    first_definition_revision = first.definition("Qwen/Qwen3.5-9B").definition_revision
+    assert first.definition("Qwen/Qwen3.5-9B").provider == "openai_compatible"
+    assert first.definition("Qwen/Qwen3.5-9B").generation.answer.max_tokens == 4096
 
     registry_path.write_text(
-        registry_path.read_text(encoding="utf-8").replace("Qwen3.5-9B", "Qwen3.5-14B"),
+        registry_path.read_text(encoding="utf-8").replace("local-test", "refreshed-local-test"),
         encoding="utf-8",
     )
-    assert first.get("my_qwen").provider_model == "Qwen/Qwen3.5-9B"
+    assert first.get("Qwen/Qwen3.5-9B").provider == "local-test"
     refreshed = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
-    assert refreshed.get("my_qwen").provider_model == "Qwen/Qwen3.5-14B"
-    assert refreshed.definition("my_qwen").definition_revision != first_definition_revision
+    assert refreshed.get("Qwen/Qwen3.5-9B").provider == "refreshed-local-test"
+    assert (
+        refreshed.definition("Qwen/Qwen3.5-9B").definition_revision
+        != first_definition_revision
+    )
 
 
 def test_effective_catalog_rejects_user_shadowing_builtin(
@@ -183,11 +284,11 @@ def test_effective_catalog_rejects_user_shadowing_builtin(
                 "version": 1,
                 "revision": 1,
                 "models": {
-                    "groq_gpt_oss_120b": {
+                    "openai/gpt-oss-120b": {
                         "provider": "openai_compatible",
-                        "model": "attacker/model",
                         "base_url": "https://example.com/v1",
                         "location": "cloud",
+                        "context_window_tokens": 131072,
                     }
                 },
             }
@@ -234,21 +335,24 @@ def test_whole_catalog_override_replaces_layers_and_marks_origin(
 
     catalog = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
 
-    assert [item.id for item in catalog.list_models()] == ["local_qwen", "mimo_cloud"]
-    assert catalog.origin("local_qwen") == "override"
-    assert not catalog.has("groq_gpt_oss_120b")
+    assert [item.id for item in catalog.list_models()] == [
+        "mimo-v2.5-pro",
+        "mlx-community/Qwen3-14B-4bit",
+    ]
+    assert catalog.origin("mlx-community/Qwen3-14B-4bit") == "override"
+    assert not catalog.has("openai/gpt-oss-120b")
 
 
 def test_model_catalog_deep_copies_supplied_definitions() -> None:
     source = ModelCatalog.from_config_file(Path("configs/models.yaml"))
-    definition = source.definition("kimi_cloud")
+    definition = source.definition("kimi-k2.6")
     catalog = ModelCatalog(
-        specs={"kimi_cloud": source.get("kimi_cloud")},
-        default_model_id="kimi_cloud",
-        origins={"kimi_cloud": "builtin"},
-        definitions={"kimi_cloud": definition},
+        specs={"kimi-k2.6": source.get("kimi-k2.6")},
+        default_model_id="kimi-k2.6",
+        origins={"kimi-k2.6": "builtin"},
+        definitions={"kimi-k2.6": definition},
     )
-    original_revision = catalog.definition("kimi_cloud").definition_revision
+    original_revision = catalog.definition("kimi-k2.6").definition_revision
 
     provider_options = definition.defaults.provider_options
     assert provider_options is not None
@@ -256,7 +360,7 @@ def test_model_catalog_deep_copies_supplied_definitions() -> None:
     assert thinking is not None
     object.__setattr__(thinking, "type", "disabled")
 
-    assert catalog.definition("kimi_cloud").definition_revision == original_revision
+    assert catalog.definition("kimi-k2.6").definition_revision == original_revision
 
 
 def test_bundled_default_chat_model_is_groq_control() -> None:
@@ -264,7 +368,7 @@ def test_bundled_default_chat_model_is_groq_control() -> None:
 
     spec = catalog.get(catalog.default_model_id)
 
-    assert catalog.default_model_id == "groq_gpt_oss_120b"
+    assert catalog.default_model_id == "openai/gpt-oss-120b"
     assert spec.provider == "groq"
     assert spec.provider_model == "openai/gpt-oss-120b"
     assert spec.location == "cloud"
@@ -274,7 +378,7 @@ def test_bundled_default_chat_model_is_groq_control() -> None:
 def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
-    spec = catalog.get("kimi_cloud")
+    spec = catalog.get("kimi-k2.6")
 
     assert spec.provider == "kimi"
     assert spec.provider_model == "kimi-k2.6"
@@ -286,7 +390,7 @@ def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
 def test_bundled_local_qwen8_runtime_is_available_for_local_testing() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
-    spec = catalog.get("qwen3_8b_mlx_4bit")
+    spec = catalog.get("mlx-community/Qwen3-8B-4bit")
 
     assert spec.provider == "local_mlx_chat_8080"
     assert spec.provider_model == "mlx-community/Qwen3-8B-4bit"
@@ -339,16 +443,16 @@ def test_model_policy_reviews_agent_model_switch_requests(tmp_path: Path) -> Non
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
     catalog = ModelCatalog.from_config_file(config_path)
-    state = ModelSessionState(current_model_id="local_qwen")
-    policy = ModelPolicy(allowed_agent_model_ids=frozenset({"local_qwen"}))
+    state = ModelSessionState(current_model_id="mlx-community/Qwen3-14B-4bit")
+    policy = ModelPolicy(allowed_agent_model_ids=frozenset({"mlx-community/Qwen3-14B-4bit"}))
     control = ModelControlPlane(catalog=catalog, state=state, policy=policy)
 
     with pytest.raises(ModelPolicyError, match="not allowed"):
-        control.switch_model("mimo_cloud", requested_by="agent")
+        control.switch_model("mimo-v2.5-pro", requested_by="agent")
 
-    assert state.current_model_id == "local_qwen"
-    control.switch_model("mimo_cloud", requested_by="user")
-    assert state.current_model_id == "mimo_cloud"
+    assert state.current_model_id == "mlx-community/Qwen3-14B-4bit"
+    control.switch_model("mimo-v2.5-pro", requested_by="user")
+    assert state.current_model_id == "mimo-v2.5-pro"
     assert state.selection_requester == "user"
 
 
@@ -360,17 +464,17 @@ def test_model_policy_reviews_frozen_definition_without_catalog(
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
     catalog = ModelCatalog.from_config_file(config_path)
-    definition = catalog.definition("mimo_cloud")
+    definition = catalog.definition("mimo-v2.5-pro")
     policy = ModelPolicy(
-        allowed_user_model_ids=frozenset({"mimo_cloud"}),
-        allowed_agent_model_ids=frozenset({"mimo_cloud"}),
-        allowed_system_model_ids=frozenset({"mimo_cloud"}),
+        allowed_user_model_ids=frozenset({"mimo-v2.5-pro"}),
+        allowed_agent_model_ids=frozenset({"mimo-v2.5-pro"}),
+        allowed_system_model_ids=frozenset({"mimo-v2.5-pro"}),
         allowed_provider_kinds=frozenset({definition.provider.value}),
         allowed_remote_hosts=frozenset({"token-plan-cn.xiaomimimo.com"}),
     )
 
     reviewed = policy.review_binding(
-        alias="mimo_cloud",
+        alias="mimo-v2.5-pro",
         definition=definition,
         requested_by=requested_by,
     )
@@ -384,24 +488,24 @@ def test_model_policy_rejects_frozen_provider_host_and_local_launch(
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
     catalog = ModelCatalog.from_config_file(config_path)
-    cloud = catalog.definition("mimo_cloud")
-    local = catalog.definition("local_qwen")
+    cloud = catalog.definition("mimo-v2.5-pro")
+    local = catalog.definition("mlx-community/Qwen3-14B-4bit")
 
     with pytest.raises(ModelPolicyError, match="provider"):
         ModelPolicy(allowed_provider_kinds=frozenset({"ollama"})).review_binding(
-            alias="mimo_cloud",
+            alias="mimo-v2.5-pro",
             definition=cloud,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="host"):
         ModelPolicy(allowed_remote_hosts=frozenset({"api.example.com"})).review_binding(
-            alias="mimo_cloud",
+            alias="mimo-v2.5-pro",
             definition=cloud,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="launch"):
         ModelPolicy(allow_local_launch=False).review_binding(
-            alias="local_qwen",
+            alias="mlx-community/Qwen3-14B-4bit",
             definition=local,
             requested_by="user",
         )
@@ -415,7 +519,7 @@ def test_model_policy_rejects_frozen_provider_host_and_local_launch(
     )
     with pytest.raises(ModelPolicyError, match="health"):
         ModelPolicy().review_binding(
-            alias="local_qwen",
+            alias="mlx-community/Qwen3-14B-4bit",
             definition=unsafe_health,
             requested_by="user",
         )
@@ -426,19 +530,19 @@ def test_model_policy_revalidates_frozen_endpoint_and_credential_reference(
 ) -> None:
     config_path = tmp_path / "models.yaml"
     _write_models_config(config_path)
-    definition = ModelCatalog.from_config_file(config_path).definition("mimo_cloud")
+    definition = ModelCatalog.from_config_file(config_path).definition("mimo-v2.5-pro")
     wrong_location = definition.model_copy(update={"location": "local"})
     unsafe_credential = definition.model_copy(update={"api_key_env": "TOKEN=value"})
 
     with pytest.raises(ModelPolicyError, match="invalid"):
         ModelPolicy().review_binding(
-            alias="mimo_cloud",
+            alias="mimo-v2.5-pro",
             definition=wrong_location,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="invalid"):
         ModelPolicy().review_binding(
-            alias="mimo_cloud",
+            alias="mimo-v2.5-pro",
             definition=unsafe_credential,
             requested_by="user",
         )
@@ -468,12 +572,12 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
 
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
     )
-    frozen_definition = control.catalog.definition("local_qwen")
+    frozen_definition = control.catalog.definition("mlx-community/Qwen3-14B-4bit")
     resolved_sentinel = SimpleNamespace(model="resolved-frozen")
     resolved_definitions: list[object] = []
 
@@ -497,7 +601,7 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
     assert binding["thread_id"] == "thread-1"
     envelope = binding["binding"]
     assert isinstance(envelope, dict)
-    assert envelope["alias"] == "local_qwen"
+    assert envelope["alias"] == "mlx-community/Qwen3-14B-4bit"
     assert envelope["origin"] == "override"
     assert archive.load(frozen_definition.definition_revision) == frozen_definition
 
@@ -532,7 +636,7 @@ def test_freeze_requires_explicit_trust_before_archive_mutation(tmp_path: Path) 
     archive_path = trusted_root / "model-definitions"
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         trust_domain=ModelBindingTrustDomain(
             trust_path,
             workspace=workspace,
@@ -575,7 +679,7 @@ def test_frozen_binding_checks_current_credential_before_provider_construction(
     trust.initialize()
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="mimo_cloud",
+        initial_model_id="mimo-v2.5-pro",
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
@@ -611,7 +715,7 @@ def test_local_frozen_binding_checks_current_credential_before_readiness(
     trusted_root.mkdir(mode=0o700)
     _write_models_config(config_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    config["models"]["local_qwen"]["api_key_env"] = "LOCAL_AUTH_TOKEN"
+    config["models"]["mlx-community/Qwen3-14B-4bit"]["api_key_env"] = "LOCAL_AUTH_TOKEN"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     trust = ModelBindingTrustDomain(
         trusted_root / "binding-trust.json",
@@ -628,7 +732,7 @@ def test_local_frozen_binding_checks_current_credential_before_readiness(
     provider_calls: list[object] = []
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
@@ -670,7 +774,7 @@ def test_frozen_binding_requires_resolver_before_local_readiness(tmp_path: Path)
     control = ModelControlPlane(
         catalog=ModelCatalog.from_config_file(config_path),
         state=ModelSessionState(
-            current_model_id="local_qwen"
+            current_model_id="mlx-community/Qwen3-14B-4bit"
         ),
         registry=None,
         trust_domain=trust,
@@ -715,7 +819,7 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
     trust.initialize()
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="user",
         trust_domain=trust,
         definition_archive=archive,
@@ -726,7 +830,7 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
     original_load = archive.load
 
     def mutate_original_after_verification(revision: str) -> object:
-        envelope["alias"] = "mimo_cloud"
+        envelope["alias"] = "mimo-v2.5-pro"
         return original_load(revision)
 
     monkeypatch.setattr(archive, "load", mutate_original_after_verification)
@@ -735,9 +839,9 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
         "resolve_definition",
         lambda _registry, _definition: object(),
     )
-    control.policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo_cloud"}))
+    control.policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo-v2.5-pro"}))
 
-    with pytest.raises(ModelPolicyError, match="local_qwen"):
+    with pytest.raises(ModelPolicyError, match="mlx-community/Qwen3-14B-4bit"):
         control.resolve_frozen_binding(
             binding,
             thread_id="thread-1",
@@ -750,17 +854,17 @@ def test_agent_selection_requester_paths_are_explicit(tmp_path: Path) -> None:
     _write_models_config(config_path)
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="system",
         session_path=None,
     )
 
     assert control.state.selection_requester == "system"
 
-    control.switch_model("mimo_cloud", requested_by="user", persist=False)
+    control.switch_model("mimo-v2.5-pro", requested_by="user", persist=False)
     assert control.state.selection_requester == "user"
 
-    control.request_model_switch("local_qwen")
+    control.request_model_switch("mlx-community/Qwen3-14B-4bit")
     assert control.state.selection_requester == "agent"
 
 
@@ -770,13 +874,13 @@ def test_selection_requester_rejects_unknown_policy_domains(tmp_path: Path) -> N
 
     with pytest.raises(ValueError, match="requester"):
         ModelSessionState(
-            current_model_id="local_qwen",
+            current_model_id="mlx-community/Qwen3-14B-4bit",
             selection_requester="root",  # type: ignore[arg-type]
         )
     with pytest.raises(ValueError, match="requester"):
         ModelControlPlane.from_config_file(
             config_path,
-            initial_model_id="local_qwen",
+            initial_model_id="mlx-community/Qwen3-14B-4bit",
             initial_selection_requester="root",  # type: ignore[arg-type]
         )
 
@@ -791,7 +895,7 @@ def test_selection_requester_rejects_objects_that_compare_equal_to_system() -> N
 
     with pytest.raises(ValueError, match="requester"):
         ModelSessionState(
-            current_model_id="local_qwen",
+            current_model_id="mlx-community/Qwen3-14B-4bit",
             selection_requester=ForgedRequester(),  # type: ignore[arg-type]
         )
 
@@ -802,12 +906,12 @@ def test_initial_and_restored_selections_are_reviewed_in_requester_domain(
     config_path = tmp_path / "models.yaml"
     session_path = tmp_path / "model-session.json"
     _write_models_config(config_path)
-    user_policy = ModelPolicy(allowed_user_model_ids=frozenset({"local_qwen"}))
+    user_policy = ModelPolicy(allowed_user_model_ids=frozenset({"mlx-community/Qwen3-14B-4bit"}))
 
     with pytest.raises(ModelPolicyError, match="not allowed"):
         ModelControlPlane.from_config_file(
             config_path,
-            initial_model_id="mimo_cloud",
+            initial_model_id="mimo-v2.5-pro",
             initial_selection_requester="user",
             policy=user_policy,
         )
@@ -817,7 +921,7 @@ def test_initial_and_restored_selections_are_reviewed_in_requester_domain(
             {
                 "version": 1,
                 "revision": 3,
-                "current_model_id": "mimo_cloud",
+                "current_model_id": "mimo-v2.5-pro",
             }
         ),
         encoding="utf-8",
@@ -846,11 +950,11 @@ def test_control_plane_resolves_provider_from_session_current_model(
 
     monkeypatch.setattr(ModelRegistry, "resolve", fake_resolve)
 
-    control = ModelControlPlane.from_env(initial_model_id="mimo_cloud")
+    control = ModelControlPlane.from_env(initial_model_id="mimo-v2.5-pro")
     resolved = control.resolve_for_node(node_model=None, node_name="tool_decision")
 
     assert resolved is not None
-    assert resolved_aliases == ["mimo_cloud"]
+    assert resolved_aliases == ["mimo-v2.5-pro"]
 
 
 def test_control_plane_does_not_fallback_from_explicit_model(
@@ -890,12 +994,12 @@ def test_control_plane_does_not_fallback_from_explicit_model(
     )
 
     control = ModelControlPlane.from_env(
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
     )
 
     with pytest.raises(
         ModelNotAvailableError,
-        match="local_qwen failed",
+        match="mlx-community/Qwen3-14B-4bit failed",
     ):
         control.resolve_for_node(
             node_model=None,
@@ -903,7 +1007,7 @@ def test_control_plane_does_not_fallback_from_explicit_model(
         )
 
     assert resolved_aliases == [
-        "local_qwen"
+        "mlx-community/Qwen3-14B-4bit"
     ]
 
 def test_control_plane_resolves_local_model_without_provider_io(
@@ -931,14 +1035,14 @@ def test_control_plane_resolves_local_model_without_provider_io(
 
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
     )
 
-    result = control.resolve("local_qwen")
+    result = control.resolve("mlx-community/Qwen3-14B-4bit")
 
     assert result is not None
     assert resolved_aliases == [
-        "local_qwen"
+        "mlx-community/Qwen3-14B-4bit"
     ]
 
 def test_control_plane_rejects_cloud_model_without_api_key(
@@ -949,7 +1053,7 @@ def test_control_plane_rejects_cloud_model_without_api_key(
     _write_models_config(config_path)
     monkeypatch.delenv("MIMO_API_KEY", raising=False)
 
-    control = ModelControlPlane.from_config_file(config_path, initial_model_id="mimo_cloud")
+    control = ModelControlPlane.from_config_file(config_path, initial_model_id="mimo-v2.5-pro")
 
     with pytest.raises(
         ModelNotAvailableError,
@@ -968,13 +1072,13 @@ def test_model_session_state_persists_without_rewriting_yaml(tmp_path: Path) -> 
         config_path,
         session_path=session_path,
     )
-    control.switch_model("mimo_cloud", requested_by="user")
+    control.switch_model("mimo-v2.5-pro", requested_by="user")
 
     restored = ModelControlPlane.from_config_file(
         config_path,
         session_path=session_path,
     )
-    assert restored.current_model().id == "mimo_cloud"
+    assert restored.current_model().id == "mimo-v2.5-pro"
     assert config_path.read_text(encoding="utf-8") == before
 
 
@@ -984,7 +1088,7 @@ def test_model_session_legacy_record_loads_as_user_and_upgrades_on_switch(
     config_path = tmp_path / "models.yaml"
     session_path = tmp_path / "model-session.json"
     _write_models_config(config_path)
-    legacy_bytes = b'{"current_model_id":"local_qwen"}\n'
+    legacy_bytes = b'{"current_model_id":"mlx-community/Qwen3-14B-4bit"}\n'
     session_path.write_bytes(legacy_bytes)
 
     control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
@@ -994,12 +1098,12 @@ def test_model_session_legacy_record_loads_as_user_and_upgrades_on_switch(
     assert control.state.fingerprint == file_fingerprint(legacy_bytes)
     assert session_path.read_bytes() == legacy_bytes
 
-    control.switch_model("mimo_cloud", requested_by="user")
+    control.switch_model("mimo-v2.5-pro", requested_by="user")
 
     assert json.loads(session_path.read_text(encoding="utf-8")) == {
         "version": 1,
         "revision": 1,
-        "current_model_id": "mimo_cloud",
+        "current_model_id": "mimo-v2.5-pro",
     }
 
 
@@ -1008,12 +1112,12 @@ def test_model_session_legacy_record_loads_as_user_and_upgrades_on_switch(
     [
         {},
         {"version": 1, "revision": 0},
-        {"version": 1, "revision": True, "current_model_id": "local_qwen"},
-        {"version": 2, "revision": 0, "current_model_id": "local_qwen"},
+        {"version": 1, "revision": True, "current_model_id": "mlx-community/Qwen3-14B-4bit"},
+        {"version": 2, "revision": 0, "current_model_id": "mlx-community/Qwen3-14B-4bit"},
         {
             "version": 1,
             "revision": 0,
-            "current_model_id": "local_qwen",
+            "current_model_id": "mlx-community/Qwen3-14B-4bit",
             "selection_requester": "system",
         },
     ],
@@ -1026,7 +1130,7 @@ def test_model_session_store_rejects_malformed_or_privileged_records(
     session_path.write_text(json.dumps(payload), encoding="utf-8")
 
     with pytest.raises(ValueError, match="session"):
-        ModelSessionStore(session_path).read(default_model_id="local_qwen")
+        ModelSessionStore(session_path).read(default_model_id="mlx-community/Qwen3-14B-4bit")
 
 
 def test_model_session_switch_uses_revision_and_exact_fingerprint_cas(
@@ -1038,13 +1142,13 @@ def test_model_session_switch_uses_revision_and_exact_fingerprint_cas(
     first = ModelControlPlane.from_config_file(config_path, session_path=session_path)
     second = ModelControlPlane.from_config_file(config_path, session_path=session_path)
 
-    first.switch_model("mimo_cloud", requested_by="user")
+    first.switch_model("mimo-v2.5-pro", requested_by="user")
 
     with pytest.raises(ConfigVersionConflict, match="session"):
-        second.switch_model("mimo_cloud", requested_by="user")
+        second.switch_model("mimo-v2.5-pro", requested_by="user")
 
-    assert second.current_model().id == "local_qwen"
-    assert json.loads(session_path.read_text(encoding="utf-8"))["current_model_id"] == "mimo_cloud"
+    assert second.current_model().id == "mlx-community/Qwen3-14B-4bit"
+    assert json.loads(session_path.read_text(encoding="utf-8"))["current_model_id"] == "mimo-v2.5-pro"
 
 
 def test_model_session_fingerprint_detects_same_revision_rewrite(tmp_path: Path) -> None:
@@ -1052,19 +1156,19 @@ def test_model_session_fingerprint_detects_same_revision_rewrite(tmp_path: Path)
     session_path = tmp_path / "model-session.json"
     _write_models_config(config_path)
     session_path.write_text(
-        json.dumps({"version": 1, "revision": 7, "current_model_id": "local_qwen"}),
+        json.dumps({"version": 1, "revision": 7, "current_model_id": "mlx-community/Qwen3-14B-4bit"}),
         encoding="utf-8",
     )
     control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
     session_path.write_text(
-        json.dumps({"version": 1, "revision": 7, "current_model_id": "mimo_cloud"}),
+        json.dumps({"version": 1, "revision": 7, "current_model_id": "mimo-v2.5-pro"}),
         encoding="utf-8",
     )
 
     with pytest.raises(ConfigVersionConflict, match="session"):
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
 
 
 def test_model_switch_write_failure_retains_selection_and_requester(
@@ -1076,7 +1180,7 @@ def test_model_switch_write_failure_retains_selection_and_requester(
     _write_models_config(config_path)
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="system",
         session_path=session_path,
     )
@@ -1087,9 +1191,9 @@ def test_model_switch_write_failure_retains_selection_and_requester(
     monkeypatch.setattr("agent_runtime.models.atomic_replace_bytes", fail_write)
 
     with pytest.raises(OSError, match="disk unavailable"):
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "system"
 
 
@@ -1102,7 +1206,7 @@ def test_model_switch_unknown_commit_outcome_retains_in_memory_selection(
     _write_models_config(config_path)
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="system",
         session_path=session_path,
     )
@@ -1113,9 +1217,9 @@ def test_model_switch_unknown_commit_outcome_retains_in_memory_selection(
     monkeypatch.setattr("agent_runtime.models.atomic_replace_bytes", unknown_outcome)
 
     with pytest.raises(CommitOutcomeUnknown, match="cannot confirm"):
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "system"
 
 
@@ -1128,7 +1232,7 @@ def test_model_switch_unknown_post_replace_outcome_can_reconcile_exact_intent(
     _write_models_config(config_path)
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="system",
         session_path=session_path,
     )
@@ -1144,23 +1248,23 @@ def test_model_switch_unknown_post_replace_outcome_can_reconcile_exact_intent(
     )
 
     with pytest.raises(SessionCommitOutcomeUnknown) as captured:
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "system"
     assert json.loads(session_path.read_text(encoding="utf-8")) == {
         "version": 1,
         "revision": 1,
-        "current_model_id": "mimo_cloud",
+        "current_model_id": "mimo-v2.5-pro",
     }
     with pytest.raises(ConfigVersionConflict):
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
 
     with pytest.raises(SessionCommitOutcomeUnknown) as still_unknown:
         control.reconcile_model_switch(captured.value.receipt)
 
     assert still_unknown.value.receipt == captured.value.receipt
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "system"
 
     monkeypatch.setattr(
@@ -1169,8 +1273,8 @@ def test_model_switch_unknown_post_replace_outcome_can_reconcile_exact_intent(
     )
     recovered = control.reconcile_model_switch(captured.value.receipt)
 
-    assert recovered.id == "mimo_cloud"
-    assert control.current_model().id == "mimo_cloud"
+    assert recovered.id == "mimo-v2.5-pro"
+    assert control.current_model().id == "mimo-v2.5-pro"
     assert control.state.selection_requester == "user"
     assert control.state.file_revision == 1
 
@@ -1184,12 +1288,12 @@ def test_model_switch_reconcile_rejects_reconstructed_privileged_receipt(
     _write_models_config(config_path)
     control = ModelControlPlane.from_config_file(
         config_path,
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         initial_selection_requester="system",
         session_path=session_path,
         policy=ModelPolicy(
-            allowed_user_model_ids=frozenset({"local_qwen", "mimo_cloud"}),
-            allowed_system_model_ids=frozenset({"local_qwen", "mimo_cloud"}),
+            allowed_user_model_ids=frozenset({"mlx-community/Qwen3-14B-4bit", "mimo-v2.5-pro"}),
+            allowed_system_model_ids=frozenset({"mlx-community/Qwen3-14B-4bit", "mimo-v2.5-pro"}),
         ),
     )
     real_directory_fsync = model_config_io._fsync_directory
@@ -1199,17 +1303,17 @@ def test_model_switch_reconcile_rejects_reconstructed_privileged_receipt(
 
     monkeypatch.setattr(model_config_io, "_fsync_directory", fail_directory_fsync)
     with pytest.raises(SessionCommitOutcomeUnknown) as captured:
-        control.switch_model("mimo_cloud", requested_by="user")
+        control.switch_model("mimo-v2.5-pro", requested_by="user")
     monkeypatch.setattr(model_config_io, "_fsync_directory", real_directory_fsync)
 
     forged = replace(captured.value.receipt, selection_requester="system")
     with pytest.raises(ValueError, match="issued by this control plane"):
         control.reconcile_model_switch(forged)
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "system"
     recovered = control.reconcile_model_switch(captured.value.receipt)
-    assert recovered.id == "mimo_cloud"
+    assert recovered.id == "mimo-v2.5-pro"
     assert control.state.selection_requester == "user"
 
 
@@ -1226,14 +1330,14 @@ def test_stale_persisted_alias_is_atomically_repaired_to_catalog_default(
 
     control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert control.state.selection_requester == "user"
     assert control.state.file_revision == 5
     assert any("removed-model" in diagnostic for diagnostic in control.session_diagnostics)
     assert json.loads(session_path.read_text(encoding="utf-8")) == {
         "version": 1,
         "revision": 5,
-        "current_model_id": "local_qwen",
+        "current_model_id": "mlx-community/Qwen3-14B-4bit",
     }
 
 
@@ -1249,9 +1353,9 @@ def test_stale_repair_reviews_default_before_writing_session(tmp_path: Path) -> 
         }
     ).encode()
     session_path.write_bytes(original)
-    policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo_cloud"}))
+    policy = ModelPolicy(allowed_user_model_ids=frozenset({"mimo-v2.5-pro"}))
 
-    with pytest.raises(ModelPolicyError, match="local_qwen.*not allowed"):
+    with pytest.raises(ModelPolicyError, match="mlx-community/Qwen3-14B-4bit.*not allowed"):
         ModelControlPlane.from_config_file(
             config_path,
             session_path=session_path,
@@ -1284,8 +1388,8 @@ def test_stale_repair_conflict_preserves_newer_valid_selection(
         nonlocal calls
         calls += 1
         if calls == 1:
-            current = self.read(default_model_id="local_qwen")
-            original_select(self, "mimo_cloud", expected=current.file_version)
+            current = self.read(default_model_id="mlx-community/Qwen3-14B-4bit")
+            original_select(self, "mimo-v2.5-pro", expected=current.file_version)
             raise ConfigVersionConflict("simulated session race")
         return original_select(self, model_id, expected=expected)  # type: ignore[arg-type]
 
@@ -1294,7 +1398,7 @@ def test_stale_repair_conflict_preserves_newer_valid_selection(
     control = ModelControlPlane.from_config_file(config_path, session_path=session_path)
 
     assert calls == 1
-    assert control.current_model().id == "mimo_cloud"
+    assert control.current_model().id == "mimo-v2.5-pro"
     assert control.state.file_revision == 3
 
 
@@ -1320,7 +1424,7 @@ def test_stale_repair_retries_newer_invalid_selection_only_once(
     ) -> ModelSessionState:
         nonlocal calls
         calls += 1
-        current = self.read(default_model_id="local_qwen")
+        current = self.read(default_model_id="mlx-community/Qwen3-14B-4bit")
         original_select(self, f"still-invalid-{calls}", expected=current.file_version)
         raise ConfigVersionConflict("simulated session race")
 
@@ -1349,14 +1453,14 @@ def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
 
     monkeypatch.setattr(ModelRegistry, "resolve", resolve_model)
     control = ModelControlPlane.from_env(
-        initial_model_id="local_qwen",
+        initial_model_id="mlx-community/Qwen3-14B-4bit",
         session_path=session_path,
     )
 
     with pytest.raises(UnknownModelAliasError, match="missing"):
         control.switch_model("missing", requested_by="user")
 
-    assert control.current_model().id == "local_qwen"
+    assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert resolved_aliases == []
     assert not session_path.exists()
 
@@ -1384,7 +1488,7 @@ def test_agent_model_cli_uses_session_state_not_yaml(
     )
     switched = runner.invoke(
         agent_app,
-        ["model", "switch", "mimo_cloud", "--session-path", str(session_path)],
+        ["model", "switch", "mimo-v2.5-pro", "--session-path", str(session_path)],
         env={"COLUMNS": "240"},
     )
     after = runner.invoke(
@@ -1394,14 +1498,14 @@ def test_agent_model_cli_uses_session_state_not_yaml(
     )
 
     assert listed.exit_code == 0, listed.output
-    assert "local_qwen" in listed.output
-    assert "mimo_cloud" in listed.output
+    assert "mlx-community/Qwen3-14B-4bit" in listed.output
+    assert "mimo-v2.5-pro" in listed.output
     assert current.exit_code == 0, current.output
-    assert "local_qwen" in current.output
+    assert "mlx-community/Qwen3-14B-4bit" in current.output
     assert switched.exit_code == 0, switched.output
-    assert "mimo_cloud" in switched.output
+    assert "mimo-v2.5-pro" in switched.output
     assert after.exit_code == 0, after.output
-    assert "mimo_cloud" in after.output
+    assert "mimo-v2.5-pro" in after.output
     assert config_path.read_text(encoding="utf-8") == before
 
 @pytest.mark.anyio
@@ -1428,7 +1532,7 @@ async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
     ):
         await probe.ensure_ready(
             ModelSpec(
-                id="local_qwen",
+                id="mlx-community/Qwen3-14B-4bit",
                 provider="qwen",
                 provider_model=(
                     "models--mlx-community--"
@@ -1461,7 +1565,7 @@ async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
 async def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
     spec = ModelCatalog.from_config_file(
         Path("configs/models.yaml")
-    ).get("qwen3_14b_mlx_4bit")
+    ).get("mlx-community/Qwen3-14B-4bit")
 
     assert spec.runtime is not None
 
@@ -1487,4 +1591,3 @@ async def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
         )
 
     await probe.ensure_ready(spec)
-

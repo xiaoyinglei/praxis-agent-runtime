@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,29 +28,12 @@ from agent_runtime.model_config_io import (
     validate_user_config_path,
 )
 
-_ALIAS_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
-_RESERVED_ALIASES = frozenset(
-    {
-        "list",
-        "current",
-        "switch",
-        "use",
-        "add",
-        "update",
-        "probe",
-        "remove",
-        "show",
-        "trust",
-        "default",
-    }
-)
 _UNSET_PATHS = frozenset(
     {
         "tokenizer_model",
         "provider_name",
         "base_url",
         "api_key_env",
-        "max_context_window_tokens",
         "max_output_tokens",
         "input_cost_per_1m",
         "output_cost_per_1m",
@@ -156,7 +138,6 @@ class UserModelDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
-    model: str = Field(min_length=1)
     tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = Field(default=None, min_length=1)
     protocol: str | None = Field(default=None, min_length=1)
@@ -165,7 +146,6 @@ class UserModelDefinition(BaseModel):
     api_key_env: str | None = None
     defaults: ModelGenerationDefaults = Field(default_factory=ModelGenerationDefaults)
     context_window_tokens: int = Field(gt=0,strict=True,)
-    max_context_window_tokens: int | None = Field(default=None,gt=0,strict=True,)
     max_output_tokens: int | None = Field(default=None,gt=0,strict=True,)
     supports_tools: bool = Field(default=True, strict=True)
     supports_structured_output: bool = Field(default=True, strict=True)
@@ -176,14 +156,7 @@ class UserModelDefinition(BaseModel):
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     runtime: ModelRuntimeDeclaration | None = None
 
-    @property
-    def effective_max_context_window_tokens(self) -> int:
-        if self.max_context_window_tokens is None:
-            return self.context_window_tokens
-
-        return self.max_context_window_tokens
-
-    @field_validator("model", "tokenizer_model", "provider_name", "protocol")
+    @field_validator("tokenizer_model", "provider_name", "protocol")
     @classmethod
     def reject_blank_or_padded_text(cls, value: str | None) -> str | None:
         return _reject_blank_or_padded_text(value)
@@ -200,23 +173,13 @@ class UserModelDefinition(BaseModel):
 
     @model_validator(mode="after")
     def validate_capabilities_and_endpoint(self) -> Self:
-        effective_max = (
-            self.effective_max_context_window_tokens
-        )
-
-        if self.context_window_tokens > effective_max:
-            raise ValueError(
-                "context_window_tokens must not exceed "
-                "max_context_window_tokens"
-            )
-
         if (
             self.max_output_tokens is not None
-            and self.max_output_tokens > effective_max
+            and self.max_output_tokens > self.context_window_tokens
         ):
             raise ValueError(
                 "max_output_tokens must not exceed "
-                "the effective maximum context window"
+                "context_window_tokens"
             )
 
         if self.location == "cloud" and self.base_url is None:
@@ -514,13 +477,10 @@ class UserModelRegistryStore:
 
 
 def _validate_alias(alias: str) -> None:
-    if _ALIAS_PATTERN.fullmatch(alias) is None:
+    if type(alias) is not str or not alias or alias != alias.strip():
         raise ValueError(
-            "Model alias must be 1-64 lowercase letters, digits, dots, underscores, or hyphens, "
-            "and must start and end with a letter or digit"
+            "Model ID must be a non-empty trimmed string"
         )
-    if alias in _RESERVED_ALIASES:
-        raise ValueError(f"Model alias {alias!r} is reserved")
 
 
 def _reject_blank_or_padded_text(value: str | None) -> str | None:

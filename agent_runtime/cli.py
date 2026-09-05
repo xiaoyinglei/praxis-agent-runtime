@@ -693,10 +693,6 @@ def model_show(
         f"{entry.definition.context_window_tokens}"
     )
 
-    print(
-        "max_context_window_tokens: "
-        f"{entry.definition.max_context_window_tokens}"
-    )
 
     print(
         f"max_output_tokens: "
@@ -759,7 +755,6 @@ def model_probe(
 def model_add(
     alias: Annotated[str, typer.Argument(help="新模型 alias")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
-    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
@@ -770,11 +765,6 @@ def model_add(
         int | None,
         typer.Option("--context-window-tokens"),
     ] = None,
-    max_context_window_tokens: Annotated[
-        int | None,
-        typer.Option("--max-context-window-tokens"),
-    ] = None,
-
     max_output_tokens: Annotated[
         int | None,
         typer.Option("--max-output-tokens"),
@@ -802,7 +792,6 @@ def model_add(
     service = _model_admin_service(session_path)
     arguments = _model_definition_arguments(
         provider=provider,
-        provider_model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
@@ -810,7 +799,6 @@ def model_add(
         protocol=protocol,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        max_context_window_tokens=max_context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
@@ -833,7 +821,6 @@ def model_add(
 def model_update(
     alias: Annotated[str, typer.Argument(help="用户模型 alias")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
-    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
@@ -843,11 +830,6 @@ def model_update(
     context_window_tokens: Annotated[
         int | None,
         typer.Option("--context-window-tokens"),
-    ] = None,
-
-    max_context_window_tokens: Annotated[
-        int | None,
-        typer.Option("--max-context-window-tokens"),
     ] = None,
 
     max_output_tokens: Annotated[
@@ -875,7 +857,6 @@ def model_update(
     service = _model_admin_service(session_path)
     arguments = _model_definition_arguments(
         provider=provider,
-        provider_model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
@@ -883,7 +864,6 @@ def model_update(
         protocol=protocol,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        max_context_window_tokens=max_context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
@@ -963,7 +943,6 @@ def _model_admin_call[T](operation: Callable[[], T]) -> T:
 def _model_definition_arguments(
     *,
     provider: ModelProvider | None,
-    provider_model: str | None,
     base_url: str | None,
     api_key_env: str | None,
     tokenizer_model: str | None,
@@ -971,7 +950,6 @@ def _model_definition_arguments(
     protocol: str | None,
     timeout_seconds: float | None,
     context_window_tokens: int | None,
-    max_context_window_tokens: int | None,
     max_output_tokens: int | None,
     supports_tools: bool | None,
     supports_structured_output: bool | None,
@@ -979,7 +957,6 @@ def _model_definition_arguments(
 ) -> ModelDefinitionArguments:
     return ModelDefinitionArguments(
         provider=provider,
-        model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
@@ -987,7 +964,6 @@ def _model_definition_arguments(
         protocol=protocol,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        max_context_window_tokens=max_context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,

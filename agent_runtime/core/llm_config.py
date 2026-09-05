@@ -165,7 +165,6 @@ class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
-    model: str = Field(min_length=1)
     tokenizer_model: str | None = Field(
         default=None,
         min_length=1,
@@ -176,13 +175,6 @@ class ModelSpec(BaseModel):
 
     # Praxis 默认使用的 context window。
     context_window_tokens: int = Field(
-        gt=0,
-        strict=True,
-    )
-
-    # 模型/provider 能够支持的最大 context window。
-    max_context_window_tokens: int | None = Field(
-        default=None,
         gt=0,
         strict=True,
     )
@@ -241,13 +233,6 @@ class ModelSpec(BaseModel):
 
     runtime: ModelRuntimeConfig | None = None
 
-    @property
-    def effective_max_context_window_tokens(self) -> int:
-        if self.max_context_window_tokens is None:
-            return self.context_window_tokens
-
-        return self.max_context_window_tokens
-    
     @field_validator("base_url")
     @classmethod
     def validate_base_url(
@@ -283,24 +268,15 @@ class ModelSpec(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def validate_capabilities(self) -> "ModelSpec":
-        if (
-            self.context_window_tokens
-            > self.effective_max_context_window_tokens
-        ):
-            raise ValueError(
-                "context_window_tokens must not exceed "
-                "max_context_window_tokens"
-            )
-
+    def validate_capabilities(self) -> ModelSpec:
         if (
             self.max_output_tokens is not None
             and self.max_output_tokens
-            > self.effective_max_context_window_tokens
+            > self.context_window_tokens
         ):
             raise ValueError(
                 "max_output_tokens must not exceed "
-                "max_context_window_tokens"
+                "context_window_tokens"
             )
 
         _ = normalize_model_endpoint(
@@ -336,6 +312,21 @@ class AgentModelsConfig(BaseModel):
     llm_stage_budgets: dict[LLMCallStage, LLMStageBudget] = Field(
         default_factory=lambda: {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}
     )
+
+    @field_validator("models", mode="before")
+    @classmethod
+    def validate_model_ids(cls, value: object) -> object:
+        if isinstance(value, dict):
+            for model_id in value:
+                if (
+                    type(model_id) is not str
+                    or not model_id
+                    or model_id != model_id.strip()
+                ):
+                    raise ValueError(
+                        "model keys must be non-empty trimmed IDs"
+                    )
+        return value
 
     @model_validator(mode="after")
     def validate_model_refs(self) -> AgentModelsConfig:

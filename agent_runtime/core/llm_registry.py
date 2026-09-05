@@ -3,11 +3,10 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Mapping
-from copy import deepcopy
 from dataclasses import dataclass, field
 from importlib.resources import as_file, files
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from agent_runtime.modeling.gateway import LLMGateway
@@ -38,6 +37,7 @@ from agent_runtime.modeling.contracts import (
     parse_llm_stage_budgets,
 )
 
+
 class UnknownModelAliasError(KeyError):
     """别名在 models 中不存在。"""
 
@@ -50,7 +50,7 @@ class ModelNotAvailableError(RuntimeError):
 class ResolvedModel:
     generator: object
     gateway: LLMGateway
-    model: str
+    model_id: str
     provider: str
     capabilities: ModelCapabilities
     token_accounting: TokenAccountingService
@@ -113,8 +113,12 @@ class ModelRegistry:
             for alias in self._config.models
         }
         self._definitions = {
-            alias: build_model_execution_definition(spec=spec, config=self._config)
-            for alias, spec in self._config.models.items()
+            model_id: build_model_execution_definition(
+                model_id=model_id,
+                spec=spec,
+                config=self._config,
+            )
+            for model_id, spec in self._config.models.items()
         }
         for definition in self._definitions.values():
             # Validate canonical JSON at the catalog boundary so unsupported
@@ -158,6 +162,7 @@ class ModelRegistry:
 
     def execution_definition_for_user_model(
         self,
+        model_id: str,
         definition: UserModelDefinition,
     ) -> ModelExecutionDefinition:
         """Normalize an uncommitted user candidate with current runtime policy."""
@@ -166,6 +171,7 @@ class ModelRegistry:
             definition.model_dump(mode="python", exclude_none=True, warnings=False)
         )
         return build_model_execution_definition(
+            model_id=model_id,
             spec=_user_definition_to_model_spec(normalized),
             config=self._config,
         )
@@ -230,8 +236,8 @@ class ModelRegistry:
         models = dict(built_in.models)
         models.update(
             {
-                alias: _user_definition_to_model_spec(definition)
-                for alias, definition in user_snapshot.document.models.items()
+                model_id: _user_definition_to_model_spec(definition)
+                for model_id, definition in user_snapshot.document.models.items()
             }
         )
         effective = built_in.model_copy(update={"models": models}, deep=True)
@@ -285,32 +291,29 @@ class ModelRegistry:
         providers = raw_providers if isinstance(raw_providers, dict) else {}
 
         agent_models: dict[str, dict[str, object]] = {}
-        for alias, entry in raw_models.items():
+        for model_id, entry in raw_models.items():
             if not isinstance(entry, dict):
                 continue
             if entry.get("capability") != "chat":
                 continue
             merged = _merge_provider_model_entry(
-                alias=str(alias),
+                alias=str(model_id),
+                model_id=str(model_id),
                 entry=entry,
                 providers=providers,
             )
             cost = entry.get("cost")
             if not isinstance(cost, dict):
                 cost = {}
-            agent_models[alias] = {
+            agent_models[model_id] = {
                 "provider": _agent_provider_kind(merged),
                 "provider_name": entry.get("provider"),
                 "protocol": merged.get("protocol"),
-                "model": entry["model"],
                 "tokenizer_model": entry.get(
                     "tokenizer_model"
                 ),
                 "context_window_tokens": entry.get(
                     "context_window_tokens"
-                ),
-                "max_context_window_tokens": entry.get(
-                    "max_context_window_tokens"
                 ),
                 "max_output_tokens": entry.get(
                     "max_output_tokens"
@@ -418,7 +421,10 @@ class ModelRegistry:
         generator: object | None = None
 
         try:
-            generator = _build_chat_generator(spec)
+            generator = _build_chat_generator(
+                model_id=definition.model_id,
+                spec=spec,
+            )
         except Exception:
             pass
 
@@ -431,14 +437,14 @@ class ModelRegistry:
 
         token_accounting = TokenAccountingService(
             TokenizerContract(
-                embedding_model_name=definition.model,
+                embedding_model_name=definition.model_id,
                 tokenizer_model_name=(
                     definition.tokenizer_model
-                    or definition.model
+                    or definition.model_id
                 ),
                 chunking_tokenizer_model_name=(
                     definition.tokenizer_model
-                    or definition.model
+                    or definition.model_id
                 ),
                 tokenizer_backend="auto",
                 max_context_tokens=capabilities.context_window_tokens,
@@ -470,7 +476,7 @@ class ModelRegistry:
                 model_context_tokens=capabilities.context_window_tokens,
                 stage_budgets=stage_budgets,
             ),
-            model=definition.model,
+            model_id=definition.model_id,
             provider=resolved_provider,
             capabilities=capabilities,
             token_accounting=token_accounting,
@@ -482,7 +488,7 @@ class ModelRegistry:
             pricing_micros_per_1m=pricing,
             pricing_revision=pricing_revision(
                 provider=resolved_provider,
-                model=definition.model,
+                model=definition.model_id,
                 pricing=pricing,
             ),
         )
@@ -522,18 +528,12 @@ def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSp
             ),
             "protocol": definition.protocol,
 
-            "model": definition.model,
-
             "tokenizer_model": (
                 definition.tokenizer_model
             ),
 
             "context_window_tokens": (
                 definition.context_window_tokens
-            ),
-
-            "max_context_window_tokens": (
-                definition.max_context_window_tokens
             ),
 
             "max_output_tokens": (
@@ -615,7 +615,7 @@ def _generation_config_from_definition(
     )
 
 
-def _build_chat_generator(spec: ModelSpec) -> object:
+def _build_chat_generator(*, model_id: str, spec: ModelSpec) -> object:
     """Construct only the chat capability required by AgentRuntime.
 
     Embedding and reranking construction remains owned by RAG assembly.
@@ -628,7 +628,7 @@ def _build_chat_generator(spec: ModelSpec) -> object:
         from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
 
         return OpenAICompatibleChatGenerator(
-            model=spec.model,
+            model=model_id,
             base_url=config.base_url,
             api_key=config.api_key,
             supports_tools=spec.supports_tools,
@@ -639,7 +639,7 @@ def _build_chat_generator(spec: ModelSpec) -> object:
 
         return OllamaGenerator(
             base_url=config.base_url,
-            default_model=spec.model,
+            default_model=model_id,
             timeout_seconds=spec.timeout_seconds,
         )
     raise ValueError(f"Unsupported provider: {spec.provider}")
@@ -664,6 +664,7 @@ def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
 def _merge_provider_model_entry(
     *,
     alias: str,
+    model_id: str,
     entry: dict[str, object],
     providers: dict[object, object],
 ) -> dict[str, object]:
@@ -685,7 +686,7 @@ def _merge_provider_model_entry(
     }
     runtime = _merge_runtime_config(
         alias=alias,
-        model=str(entry.get("model", "")),
+        model=model_id,
         provider_runtime=provider.get("runtime"),
         model_runtime=entry.get("runtime"),
     )
@@ -811,7 +812,15 @@ def _validate_raw_catalog(data: object) -> None:
     raw_providers = data.get("providers", {})
     if not isinstance(raw_models, dict) or not isinstance(raw_providers, dict):
         raise ValueError("model catalog models/providers must be mappings")
-    for alias, raw_entry in raw_models.items():
+    for model_id, raw_entry in raw_models.items():
+        if (
+            type(model_id) is not str
+            or not model_id
+            or model_id != model_id.strip()
+        ):
+            raise ValueError(
+                "model catalog keys must be non-empty trimmed IDs"
+            )
         if not isinstance(raw_entry, dict) or raw_entry.get("capability") != "chat":
             continue
         _reject_unknown_keys(
@@ -820,11 +829,9 @@ def _validate_raw_catalog(data: object) -> None:
                 "capability",
                 "provider",
                 "protocol",
-                "model",
                 "tokenizer_model",
 
                 "context_window_tokens",
-                "max_context_window_tokens",
                 "max_output_tokens",
 
                 "timeout_seconds",
@@ -843,17 +850,17 @@ def _validate_raw_catalog(data: object) -> None:
                 "runtime",
                 "experimental",
             },
-            where=f"chat model {alias!r}",
+            where=f"chat model {model_id!r}",
         )
         if "context_window_tokens" not in raw_entry:
             raise ValueError(
-                f"chat model {alias!r} requires "
+                f"chat model {model_id!r} requires "
                 "context_window_tokens"
             )
         cost = raw_entry.get("cost")
         if cost is not None:
             if not isinstance(cost, dict):
-                raise ValueError(f"chat model {alias!r} cost must be a mapping")
+                raise ValueError(f"chat model {model_id!r} cost must be a mapping")
             _reject_unknown_keys(
                 cost,
                 {
@@ -862,9 +869,9 @@ def _validate_raw_catalog(data: object) -> None:
                     "cache_read_per_1m",
                     "cache_write_per_1m",
                 },
-                where=f"chat model {alias!r} cost",
+                where=f"chat model {model_id!r} cost",
             )
-        _validate_raw_runtime(raw_entry.get("runtime"), where=f"chat model {alias!r}")
+        _validate_raw_runtime(raw_entry.get("runtime"), where=f"chat model {model_id!r}")
         provider_ref = raw_entry.get("provider")
         provider_entry = raw_providers.get(provider_ref)
         if provider_entry is not None:
@@ -945,8 +952,6 @@ def _user_definition_to_model_spec(
     return ModelSpec.model_validate(
         {
             "provider": definition.provider,
-            "model": definition.model,
-
             "tokenizer_model": (
                 definition.tokenizer_model
             ),
@@ -959,10 +964,6 @@ def _user_definition_to_model_spec(
 
             "context_window_tokens": (
                 definition.context_window_tokens
-            ),
-
-            "max_context_window_tokens": (
-                definition.max_context_window_tokens
             ),
 
             "max_output_tokens": (

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import yaml
 from pydantic import BaseModel
 
 from agent_runtime.modeling.config import GenerationTaskConfig, ModelCapability, ModelRuntimeConfig
@@ -23,17 +24,15 @@ class _StructuredPayload(BaseModel):
 
 CATALOG_YAML = """
 models:
-  qwen_local:
+  mlx-community/Qwen3-14B-4bit:
     capability: chat
     provider: openai_compatible
-    model: mlx-community/Qwen3-14B-4bit
     base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
 
-  deepseek:
+  deepseek-chat:
     capability: chat
     provider: openai_compatible
-    model: deepseek-chat
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
 
@@ -49,7 +48,7 @@ models:
     model: Qwen/Qwen3-Reranker-4B
 
 defaults:
-  primary_model: qwen_local
+  primary_model: mlx-community/Qwen3-14B-4bit
   embedding_model: qwen_embedding_mlx
   reranker_model: qwen3_reranker
 
@@ -77,11 +76,11 @@ def catalog(catalog_path: Path) -> ModelCatalog:
 
 
 def test_catalog_loads_models(catalog: ModelCatalog) -> None:
-    assert catalog.get_model("qwen_local").capability == ModelCapability.CHAT
-    assert catalog.get_model("deepseek").capability == ModelCapability.CHAT
+    assert catalog.get_model("mlx-community/Qwen3-14B-4bit").capability == ModelCapability.CHAT
+    assert catalog.get_model("deepseek-chat").capability == ModelCapability.CHAT
     assert catalog.get_model("qwen_embedding_mlx").capability == ModelCapability.EMBEDDING
     assert catalog.get_model("qwen3_reranker").capability == ModelCapability.RERANKER
-    assert catalog.get_model("qwen_local").context_window_tokens == 32768
+    assert catalog.get_model("mlx-community/Qwen3-14B-4bit").context_window_tokens == 32768
 
 
 def test_catalog_supports_provider_section_schema(tmp_path: Path) -> None:
@@ -102,10 +101,9 @@ providers:
     location: local
 
 models:
-  groq_gpt_oss_120b:
+  openai/gpt-oss-120b:
     capability: chat
     provider: groq
-    model: openai/gpt-oss-120b
     context_window_tokens: 131072
   qwen_embedding_mlx:
     capability: embedding
@@ -118,7 +116,7 @@ models:
     model: Qwen/Qwen3-Reranker-4B
 
 defaults:
-  primary_model: groq_gpt_oss_120b
+  primary_model: openai/gpt-oss-120b
   embedding_model: qwen_embedding_mlx
   reranker_model: qwen3_reranker
 """,
@@ -152,7 +150,7 @@ def test_catalog_loads_llm_stage_budgets(catalog: ModelCatalog) -> None:
 
 
 def test_catalog_defaults(catalog: ModelCatalog) -> None:
-    assert catalog.get_default_primary().alias == "qwen_local"
+    assert catalog.get_default_primary().alias == "mlx-community/Qwen3-14B-4bit"
     assert catalog.get_default_embedding().alias == "qwen_embedding_mlx"
     assert catalog.get_default_reranker().alias == "qwen3_reranker"
 
@@ -160,7 +158,70 @@ def test_catalog_defaults(catalog: ModelCatalog) -> None:
 def test_catalog_list_models(catalog: ModelCatalog) -> None:
     chat_models = catalog.list_models(ModelCapability.CHAT)
     assert len(chat_models) == 2
-    assert {m.alias for m in chat_models} == {"deepseek", "qwen_local"}
+    assert {m.alias for m in chat_models} == {
+        "deepseek-chat",
+        "mlx-community/Qwen3-14B-4bit",
+    }
+
+
+@pytest.mark.parametrize(
+    "forbidden_field, forbidden_value",
+    [
+        ("model", "shadow/model"),
+        ("max_context_window_tokens", 65536),
+    ],
+)
+def test_catalog_rejects_redundant_chat_identity_and_context_fields(
+    tmp_path: Path,
+    forbidden_field: str,
+    forbidden_value: object,
+) -> None:
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "openai/gpt-oss-120b": {
+                        "capability": "chat",
+                        "provider": "openai_compatible",
+                        "context_window_tokens": 131072,
+                        forbidden_field: forbidden_value,
+                    }
+                },
+                "defaults": {"primary_model": "openai/gpt-oss-120b"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=forbidden_field):
+        ModelCatalog.from_yaml(str(path))
+
+
+@pytest.mark.parametrize("model_id", ["", " openai/gpt-oss-120b "])
+def test_catalog_rejects_non_trimmed_or_empty_model_ids(
+    tmp_path: Path,
+    model_id: str,
+) -> None:
+    path = tmp_path / "models.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    model_id: {
+                        "capability": "chat",
+                        "provider": "openai_compatible",
+                        "context_window_tokens": 131072,
+                    }
+                },
+                "defaults": {"primary_model": model_id},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="non-empty trimmed IDs"):
+        ModelCatalog.from_yaml(str(path))
 
 
 def test_catalog_unknown_model_raises(catalog: ModelCatalog) -> None:
@@ -173,7 +234,7 @@ def test_catalog_unknown_model_raises(catalog: ModelCatalog) -> None:
 
 def test_runtime_default_primary_model(catalog: ModelCatalog) -> None:
     config = resolve_runtime_config(RuntimeOverrides(), catalog=catalog)
-    assert config.primary_model.alias == "qwen_local"
+    assert config.primary_model.alias == "mlx-community/Qwen3-14B-4bit"
     assert config.llm_stage_budgets[LLMCallStage.TOOL_DECISION].max_input_tokens == 12000
 
 
@@ -206,10 +267,10 @@ def test_runtime_generator_bindings_attach_budget_gateway(catalog: ModelCatalog)
 
 def test_runtime_override_primary_model(catalog: ModelCatalog) -> None:
     config = resolve_runtime_config(
-        RuntimeOverrides(model_alias="deepseek"),
+        RuntimeOverrides(model_alias="deepseek-chat"),
         catalog=catalog,
     )
-    assert config.primary_model.alias == "deepseek"
+    assert config.primary_model.alias == "deepseek-chat"
     assert config.primary_model.base_url == "https://api.deepseek.com/v1"
 
 
@@ -262,7 +323,7 @@ def test_embedding_space_mismatch_raises() -> None:
 
 
 def test_assembly_adapter_produces_chat_provider_config(catalog: ModelCatalog) -> None:
-    spec = catalog.get_model("qwen_local")
+    spec = catalog.get_model("mlx-community/Qwen3-14B-4bit")
     config = ModelRuntimeConfig(
         primary_model=spec,
         embedding_model=catalog.get_model("qwen_embedding_mlx"),
@@ -280,7 +341,7 @@ def test_assembly_adapter_produces_chat_provider_config(catalog: ModelCatalog) -
 def test_assembly_adapter_embedding_provider_config(catalog: ModelCatalog) -> None:
     spec = catalog.get_model("qwen_embedding_mlx")
     config = ModelRuntimeConfig(
-        primary_model=catalog.get_model("qwen_local"),
+        primary_model=catalog.get_model("mlx-community/Qwen3-14B-4bit"),
         embedding_model=spec,
     )
     overrides = to_assembly_overrides(config)
@@ -293,7 +354,7 @@ def test_assembly_adapter_embedding_provider_config(catalog: ModelCatalog) -> No
 def test_assembly_adapter_reranker_maps_to_local_bge(catalog: ModelCatalog) -> None:
     spec = catalog.get_model("qwen3_reranker")
     config = ModelRuntimeConfig(
-        primary_model=catalog.get_model("qwen_local"),
+        primary_model=catalog.get_model("mlx-community/Qwen3-14B-4bit"),
         embedding_model=catalog.get_model("qwen_embedding_mlx"),
         reranker_model=spec,
     )
@@ -306,7 +367,7 @@ def test_assembly_adapter_reranker_maps_to_local_bge(catalog: ModelCatalog) -> N
 
 def test_assembly_adapter_none_reranker(catalog: ModelCatalog) -> None:
     config = ModelRuntimeConfig(
-        primary_model=catalog.get_model("qwen_local"),
+        primary_model=catalog.get_model("mlx-community/Qwen3-14B-4bit"),
         embedding_model=catalog.get_model("qwen_embedding_mlx"),
         reranker_model=None,
     )
@@ -482,7 +543,7 @@ def test_e2e_model_runtime_driven_ingest_and_query(
     1. catalog → runtime_config → assembly_overrides 链路正确
     2. 模型信息通过 runtime_config 控制，不硬编码
     3. ingest 和 query 正常执行
-    4. --model deepseek 可以覆盖默认 primary_model
+    4. --model deepseek-chat 可以覆盖默认 primary_model
     """
     from rag import (
         AssemblyRequest,
@@ -514,12 +575,12 @@ def test_e2e_model_runtime_driven_ingest_and_query(
             reranker=FakeReranker() if config.rerank_model else None,
         )
 
-    # ── 3. 解析 runtime config（默认 qwen_local）──
+    # ── 3. 解析 runtime config（默认 mlx-community/Qwen3-14B-4bit）──
     runtime_config = resolve_runtime_config(
         RuntimeOverrides(),
         catalog_path=str(catalog_path),
     )
-    assert runtime_config.primary_model.alias == "qwen_local"
+    assert runtime_config.primary_model.alias == "mlx-community/Qwen3-14B-4bit"
     assert runtime_config.embedding_model.alias == "qwen_embedding_mlx"
     assert runtime_config.reranker_model.alias == "qwen3_reranker"
 
@@ -606,9 +667,9 @@ def test_e2e_model_runtime_driven_ingest_and_query(
     finally:
         runtime.close()
 
-    # ── 7. --model deepseek 覆盖测试 ──
+    # ── 7. --model deepseek-chat 覆盖测试 ──
     ds_config = resolve_runtime_config(
-        RuntimeOverrides(model_alias="deepseek"),
+        RuntimeOverrides(model_alias="deepseek-chat"),
         catalog_path=str(catalog_path),
     )
     ds_overrides = to_assembly_overrides(ds_config)
@@ -648,7 +709,7 @@ class _FakeEmbedder:
 
 
 def test_override_priority_model_beats_compat_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """--model deepseek must override compatible environment chat config."""
+    """--model deepseek-chat must override compatible environment chat config."""
     from rag.assembly import (
         AssemblyConfig,
         AssemblyOverrides,
@@ -672,7 +733,7 @@ def test_override_priority_model_beats_compat_env(monkeypatch: pytest.MonkeyPatc
 
     service = _isolated_service(monkeypatch, compatibility_config=compatibility_config)
 
-    # CLI 传入 --model deepseek 对应的 overrides
+    # CLI 传入 --model deepseek-chat 对应的 overrides
     override_chat = ProviderConfig(
         provider_kind="openai-compatible",
         chat_model="deepseek-chat",
@@ -698,25 +759,25 @@ _GENERATION_CATALOG_YAML = (
     + """
 generation:
   summary:
-    model: qwen_local
+    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 8192
     temperature: 0.3
 
   answer:
-    model: deepseek
+    model: deepseek-chat
     max_tokens: 4096
 
   planner:
-    model: qwen_local
+    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 4096
     temperature: 0.3
 
   synthesize:
-    model: qwen_local
+    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 8192
 
   factcheck:
-    model: qwen_local
+    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 2048
     temperature: 0.1
 """
@@ -739,11 +800,11 @@ def test_generation_config_parsing(gen_catalog: ModelCatalog) -> None:
     """models.yaml 中 generation.summary 能正确解析"""
     gen = gen_catalog.generation
 
-    assert gen.summary.model == "qwen_local"
+    assert gen.summary.model == "mlx-community/Qwen3-14B-4bit"
     assert gen.summary.max_tokens == 8192
     assert gen.summary.temperature == 0.3
 
-    assert gen.answer.model == "deepseek"
+    assert gen.answer.model == "deepseek-chat"
     assert gen.answer.max_tokens == 4096
     assert gen.answer.temperature is None  # YAML 未配置 temperature
 
@@ -765,14 +826,14 @@ def test_generation_config_defaults_when_missing(catalog: ModelCatalog) -> None:
 def test_resolve_runtime_config_includes_generation(gen_catalog: ModelCatalog) -> None:
     """resolve_runtime_config 返回的 ModelRuntimeConfig 包含 generation"""
     config = resolve_runtime_config(catalog=gen_catalog)
-    assert config.generation.summary.model == "qwen_local"
+    assert config.generation.summary.model == "mlx-community/Qwen3-14B-4bit"
     assert config.generation.summary.max_tokens == 8192
 
 
 def test_resolve_task_model_uses_explicit_model(gen_catalog: ModelCatalog) -> None:
     """task_config.model 有值时直接使用"""
     spec = resolve_task_model(gen_catalog.generation.answer, gen_catalog)
-    assert spec.alias == "deepseek"
+    assert spec.alias == "deepseek-chat"
     assert spec.model == "deepseek-chat"
 
 
@@ -780,7 +841,7 @@ def test_resolve_task_model_falls_back_to_default(gen_catalog: ModelCatalog) -> 
     """task_config.model 为 None 时 fallback 到 defaults.primary_model"""
     task = GenerationTaskConfig(max_tokens=4096)  # model=None
     spec = resolve_task_model(task, gen_catalog)
-    assert spec.alias == "qwen_local"
+    assert spec.alias == "mlx-community/Qwen3-14B-4bit"
 
 
 def test_summarizer_receives_max_tokens(gen_catalog: ModelCatalog) -> None:
@@ -800,17 +861,17 @@ def test_summarizer_receives_max_tokens(gen_catalog: ModelCatalog) -> None:
 
 def test_switch_summary_model(gen_catalog: ModelCatalog) -> None:
     """只改 generation.summary.model，不改业务代码即可切换到其他模型"""
-    # 用 qwen_local（默认）
+    # 用 mlx-community/Qwen3-14B-4bit（默认）
     spec1 = resolve_task_model(gen_catalog.generation.summary, gen_catalog)
-    assert spec1.alias == "qwen_local"
+    assert spec1.alias == "mlx-community/Qwen3-14B-4bit"
 
-    # 构造一个新的 task config，切换到 deepseek（模型池中存在）
+    # 构造一个新的 task config，切换到 deepseek-chat（模型池中存在）
     switched = GenerationTaskConfig(
-        model="deepseek",
+        model="deepseek-chat",
         max_tokens=gen_catalog.generation.summary.max_tokens,
     )
     spec2 = resolve_task_model(switched, gen_catalog)
-    assert spec2.alias == "deepseek"
+    assert spec2.alias == "deepseek-chat"
     assert spec2.model == "deepseek-chat"
     assert spec2.base_url == "https://api.deepseek.com/v1"
     # 业务逻辑不变：只需 resolve_task_model(task_config, catalog)
