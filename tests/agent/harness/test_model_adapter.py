@@ -14,12 +14,6 @@ from agent_runtime.core.llm_config import (
     ModelSpec as InternalModelSpec,
 )
 from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
-from agent_runtime.model_definition import (
-    ModelCapabilities,
-    RequestDefaultsDefinition,
-)
-from agent_runtime.modeling.config import GenerationConfig
-from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -30,16 +24,21 @@ from agent_runtime.harness import (
     HarnessMessage,
     HarnessModelDelta,
     HarnessModelRequest,
-    ModelDispatchPreflightError,
     RolloutContextManager,
     RolloutStore,
     RuntimeComposition,
+)
+from agent_runtime.model_definition import (
+    ModelCapabilities,
+    RequestDefaultsDefinition,
 )
 from agent_runtime.model_trust import (
     BindingAuthenticationError,
     ModelBindingTrustDomain,
     TrustedModelDefinitionArchive,
 )
+from agent_runtime.modeling.budget import LLMBudgetLedger
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import (
     LLMCallStage,
     LLMProviderResult,
@@ -297,10 +296,9 @@ def _resolved_model(
     *,
     gateway: object,
     generator: object | None = None,
-    model: str = "provider-model",
+    model_id: str = "provider-model",
     provider: str = "openai-compatible",
     context_window_tokens: int = 8_192,
-    max_context_window_tokens: int | None = None,
     max_output_tokens: int | None = 256,
     supports_native_tools: bool = True,
     supports_structured_output: bool = True,
@@ -310,12 +308,6 @@ def _resolved_model(
     seed: int | None = None,
     token_accounting: object | None = None,
 ) -> ResolvedModel:
-    effective_max_context = (
-        context_window_tokens
-        if max_context_window_tokens is None
-        else max_context_window_tokens
-    )
-
     return ResolvedModel(
         generator=(
             object()
@@ -323,11 +315,10 @@ def _resolved_model(
             else generator
         ),
         gateway=gateway,  # type: ignore[arg-type]
-        model=model,
+        model_id=model_id,
         provider=provider,
         capabilities=ModelCapabilities(
             context_window_tokens=context_window_tokens,
-            max_context_window_tokens=effective_max_context,
             max_output_tokens=max_output_tokens,
             supports_native_tools=supports_native_tools,
             supports_structured_output=(
@@ -902,8 +893,8 @@ class ResolvedRegistry:
         return self._models[alias]
 
     def resolve_definition(self, definition: object) -> ResolvedModel:
-        model_id = definition.model
-        return next(model for model in self._models.values() if model.model == model_id)
+        model_id = definition.model_id
+        return next(model for model in self._models.values() if model.model_id == model_id)
 
 
 def _spec(model_id: str) -> ModelSpec:
@@ -918,19 +909,18 @@ def _spec(model_id: str) -> ModelSpec:
     )
 
 
-def _declarations(alias: str, provider_model: str) -> ModelRegistry:
+def _declarations(model_id: str) -> ModelRegistry:
     return ModelRegistry(
         AgentModelsConfig(
             models={
-                alias: InternalModelSpec(
+                model_id: InternalModelSpec(
                     provider=ModelProvider.OPENAI_COMPATIBLE,
-                    model=provider_model,
                     context_window_tokens=8_192,
                     base_url="https://api.example.com/v1",
                     location="cloud",
                 )
             },
-            default_model=alias,
+            default_model=model_id,
         )
     )
 
@@ -941,12 +931,12 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
     resolved = {
         "model-a": _resolved_model(
             gateway=first_gateway,
-            model="provider-model-a",
+            model_id="model-a",
             max_output_tokens=256,
         ),
         "model-b": _resolved_model(
             gateway=second_gateway,
-            model="provider-model-b",
+            model_id="model-b",
             max_output_tokens=256,
         ),
     }
@@ -1059,12 +1049,12 @@ def test_authenticated_turn_resolves_after_selected_alias_is_removed(
     )
     frozen_gateway = CapturingGateway()
     frozen_resolved = _resolved_model(
-    gateway=frozen_gateway,
-    model="provider-model-a",
-    max_output_tokens=256,
-)
+        gateway=frozen_gateway,
+        model_id="model-a",
+        max_output_tokens=256,
+    )
     original = ModelControlPlane(
-        catalog=ModelCatalog.from_registry(_declarations("model-a", "provider-model-a")),
+        catalog=ModelCatalog.from_registry(_declarations("model-a")),
         state=ModelSessionState(current_model_id="model-a", selection_requester="user"),
         registry=ResolvedRegistry({"model-a": frozen_resolved}),
         trust_domain=trust,
@@ -1072,7 +1062,7 @@ def test_authenticated_turn_resolves_after_selected_alias_is_removed(
     )
     binding = original.freeze_model_binding(thread_id="thread-1", turn_id="turn-1")
     current = ModelControlPlane(
-        catalog=ModelCatalog.from_registry(_declarations("model-b", "provider-model-b")),
+        catalog=ModelCatalog.from_registry(_declarations("model-b")),
         state=ModelSessionState(current_model_id="model-b", selection_requester="user"),
         registry=ResolvedRegistry({"model-a": frozen_resolved}),
         trust_domain=trust,
@@ -1126,16 +1116,15 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
     trust.initialize()
     gateway = CapturingGateway()
     resolved = _resolved_model(
-    gateway=gateway,
-    model="provider-model-a",
-    max_output_tokens=256,
-)
+        gateway=gateway,
+        model_id="model-a",
+        max_output_tokens=256,
+    )
     declarations = ModelRegistry(
         AgentModelsConfig(
             models={
                 "model-a": InternalModelSpec(
                     provider=ModelProvider.OPENAI_COMPATIBLE,
-                    model="provider-model-a",
                     base_url="https://api.example.com/v1",
                     location="cloud",
                     context_window_tokens=8_192,

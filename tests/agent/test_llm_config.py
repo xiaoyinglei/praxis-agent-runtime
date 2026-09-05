@@ -14,15 +14,11 @@ class TestModelSpec:
     def test_minimal_mlx_spec_requires_explicit_context_window(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="Qwen3-14B-MLX-4bit",
             context_window_tokens=32_768,
         )
 
         assert spec.provider == ModelProvider.MLX
-        assert spec.model == "Qwen3-14B-MLX-4bit"
         assert spec.context_window_tokens == 32_768
-        assert spec.max_context_window_tokens is None
-        assert spec.effective_max_context_window_tokens == 32_768
         assert spec.max_output_tokens is None
         assert spec.timeout_seconds == 120.0
         assert spec.base_url is None
@@ -36,28 +32,22 @@ class TestModelSpec:
             ModelSpec.model_validate(
                 {
                     "provider": "mlx",
-                    "model": "test-model",
                 }
             )
 
-    def test_explicit_max_context_and_output_capabilities(self) -> None:
+    def test_explicit_output_capability(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="test-model",
             context_window_tokens=32_768,
-            max_context_window_tokens=65_536,
             max_output_tokens=16_384,
         )
 
         assert spec.context_window_tokens == 32_768
-        assert spec.max_context_window_tokens == 65_536
-        assert spec.effective_max_context_window_tokens == 65_536
         assert spec.max_output_tokens == 16_384
 
     def test_ollama_spec_with_output_limit(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
-            model="qwen3.5:9b",
             base_url="http://localhost:11434",
             context_window_tokens=32_768,
             max_output_tokens=1_024,
@@ -70,7 +60,6 @@ class TestModelSpec:
     def test_defaults_stores_temperature(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="test-model",
             context_window_tokens=32_768,
             defaults={
                 "temperature": 0.0,
@@ -81,16 +70,17 @@ class TestModelSpec:
         assert spec.defaults["temperature"] == 0.0
         assert spec.defaults["top_p"] == 0.9
 
-    def test_rejects_context_window_above_declared_maximum(self) -> None:
+    def test_rejects_removed_max_context_window_field(self) -> None:
         with pytest.raises(
             ValueError,
-            match="context_window_tokens",
+            match="extra",
         ):
-            ModelSpec(
-                provider=ModelProvider.MLX,
-                model="test-model",
-                context_window_tokens=65_536,
-                max_context_window_tokens=32_768,
+            ModelSpec.model_validate(
+                {
+                    "provider": "mlx",
+                    "context_window_tokens": 65_536,
+                    "max_context_window_tokens": 32_768,
+                }
             )
 
     def test_rejects_output_limit_above_effective_maximum(self) -> None:
@@ -100,7 +90,6 @@ class TestModelSpec:
         ):
             ModelSpec(
                 provider=ModelProvider.MLX,
-                model="test-model",
                 context_window_tokens=32_768,
                 max_output_tokens=32_769,
             )
@@ -146,7 +135,6 @@ class TestModelSpec:
             ModelSpec.model_validate(
                 {
                     "provider": "ollama",
-                    "model": "m",
                     "context_window_tokens": 32_768,
                     "headers": {"x": "secret"},
                 }
@@ -158,7 +146,6 @@ class TestModelSpec:
         ):
             ModelSpec(
                 provider=ModelProvider.OLLAMA,
-                model="m",
                 context_window_tokens=32_768,
                 max_output_tokens=-1,
             )
@@ -168,7 +155,6 @@ class TestAgentModelsConfig:
     def test_minimal_config(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="main-model",
             context_window_tokens=32_768,
         )
 
@@ -185,12 +171,10 @@ class TestAgentModelsConfig:
     def test_config_with_fallback(self) -> None:
         main = ModelSpec(
             provider=ModelProvider.MLX,
-            model="main-model",
             context_window_tokens=32_768,
         )
         fast = ModelSpec(
             provider=ModelProvider.MLX,
-            model="fast-model",
             context_window_tokens=16_384,
         )
 
@@ -217,7 +201,6 @@ class TestAgentModelsConfig:
     def test_rejects_missing_default_model(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="real-model",
             context_window_tokens=32_768,
         )
 
@@ -233,7 +216,6 @@ class TestAgentModelsConfig:
     def test_rejects_missing_fallback_model(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="real-model",
             context_window_tokens=32_768,
         )
 
@@ -250,7 +232,6 @@ class TestAgentModelsConfig:
     def test_default_and_fallback_same_model_is_valid(self) -> None:
         spec = ModelSpec(
             provider=ModelProvider.MLX,
-            model="shared-model",
             context_window_tokens=32_768,
         )
 
@@ -272,26 +253,24 @@ class TestAgentModelsConfig:
         yaml_text = """
 version: 1
 models:
-  local_main:
+  Qwen3-14B-MLX-4bit:
     provider: mlx
-    model: Qwen3-14B-MLX-4bit
     context_window_tokens: 32768
     max_output_tokens: 4096
-  local_fast:
+  Qwen3-8B-MLX-4bit:
     provider: mlx
-    model: Qwen3-8B-MLX-4bit
     context_window_tokens: 16384
-default_model: local_main
-fallback_model: local_fast
+default_model: Qwen3-14B-MLX-4bit
+fallback_model: Qwen3-8B-MLX-4bit
 """
 
         data = yaml.safe_load(yaml_text)
         config = AgentModelsConfig.model_validate(data)
 
-        assert config.default_model == "local_main"
-        assert config.fallback_model == "local_fast"
+        assert config.default_model == "Qwen3-14B-MLX-4bit"
+        assert config.fallback_model == "Qwen3-8B-MLX-4bit"
 
-        main = config.models["local_main"]
+        main = config.models["Qwen3-14B-MLX-4bit"]
 
         assert main.provider == ModelProvider.MLX
         assert main.context_window_tokens == 32_768

@@ -21,10 +21,9 @@ from agent_runtime.modeling.config import GenerationTaskConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 
 
-def _ollama_spec(model: str = "test-model") -> ModelSpec:
+def _ollama_spec() -> ModelSpec:
     return ModelSpec(
         provider=ModelProvider.OLLAMA,
-        model=model,
         base_url="http://localhost:11434",
         context_window_tokens=32768,
     )
@@ -35,9 +34,9 @@ def _make_config(
     default_model: str = "main",
     fallback_model: str | None = None,
 ) -> AgentModelsConfig:
-    models: dict[str, ModelSpec] = {"main": _ollama_spec("main-model")}
+    models: dict[str, ModelSpec] = {"main": _ollama_spec()}
     if fallback_model:
-        models["fast"] = _ollama_spec("fast-model")
+        models["fast"] = _ollama_spec()
     return AgentModelsConfig(
         models=models,
         default_model=default_model,
@@ -53,7 +52,8 @@ def test_model_execution_definition_has_canonical_capabilities() -> None:
 
     assert b'"api_key_env":null' in payload
     assert b'"context_window_tokens":32768' in payload
-    assert b'"max_context_window_tokens":32768' in payload
+    assert b'"model_id":"main"' in payload
+    assert b'"max_context_window_tokens"' not in payload
     assert b'"max_output_tokens":null' in payload
 
     assert definition.definition_revision.startswith("sha256:")
@@ -66,7 +66,7 @@ def test_model_definition_digest_changes_only_for_selected_request_definition() 
         update={
             "models": {
                 **baseline.models,
-                "unrelated": _ollama_spec("other-model"),
+                "unrelated": _ollama_spec(),
             }
         },
         deep=True,
@@ -181,7 +181,6 @@ def test_whole_catalog_override_rejects_transport_or_secret_defaults(
                 "models": {
                     "main": {
                         "provider": "ollama",
-                        "model": "main-model",
                         "context_window_tokens": 32_768,
                         "defaults": unsafe_defaults,
                     }
@@ -214,7 +213,6 @@ def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
 ) -> None:
     model = {
     "provider": "ollama",
-    "model": "main-model",
     "context_window_tokens": 32_768,
     **unsafe_fields,
 }
@@ -258,7 +256,6 @@ def test_whole_catalog_json_override_rejects_invalid_or_unknown_model_fields(
 ) -> None:
     model: dict[str, object] = {
         "provider": "openai_compatible",
-        "model": "main-model",
         "context_window_tokens": 32_768,
         "base_url": "https://api.example.com/v1",
         "location": "cloud",
@@ -289,7 +286,6 @@ def test_whole_catalog_yaml_override_rejects_unknown_chat_fields(tmp_path: Path)
                     "main": {
                         "capability": "chat",
                         "provider": "ollama",
-                        "model": "main-model",
                         "context_window_tokens": 32_768,
                         "api_key": "plaintext-secret",
                     }
@@ -315,7 +311,6 @@ def test_whole_catalog_override_rejects_explicit_null_defaults(
         "models": {
             "main": {
                 "provider": "ollama",
-                "model": "main-model",
                 "context_window_tokens": 32_768,
                 "defaults": {"temperature": None},
             }
@@ -354,7 +349,6 @@ def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -
         models={
             "main": ModelSpec(
                 provider=ModelProvider.OLLAMA,
-                model="main-model",
                 context_window_tokens=32_768,
             )
         },
@@ -367,7 +361,7 @@ def test_execution_definition_freezes_the_same_effective_endpoint_as_runtime() -
 
     assert definition.base_url == "http://localhost:11434"
     assert definition.location == "local"
-    assert definition.tokenizer_model == "main-model"
+    assert definition.tokenizer_model == "main"
     assert provider.base_url == definition.base_url
 
 
@@ -391,7 +385,7 @@ def test_resolved_request_defaults_do_not_mutate_cached_definition(
 
     monkeypatch.setattr(
         "agent_runtime.core.llm_registry._build_chat_generator",
-        lambda spec: object(),
+        lambda **_kwargs: object(),
     )
 
     resolved = registry.resolve("main")
@@ -414,11 +408,10 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
         yaml.safe_dump(
             {
                 "models": {
-                    "qwen3_8b_mlx_4bit": {
+                    "Qwen/Qwen3-8B-MLX-4bit": {
                         "capability": "chat",
                         "provider": "qwen",
                         "protocol": "openai_compatible",
-                        "model": "Qwen/Qwen3-8B-MLX-4bit",
                         "max_output_tokens": 16384,
                         "base_url": "http://127.0.0.1:8080/v1",
                         "context_window_tokens": 32768,
@@ -431,7 +424,7 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
                         },
                     }
                 },
-                "defaults": {"primary_model": "qwen3_8b_mlx_4bit"},
+                "defaults": {"primary_model": "Qwen/Qwen3-8B-MLX-4bit"},
                 "llm_budgets": {
                     "tool_decision": {
                         "max_input_tokens": 12000,
@@ -446,12 +439,12 @@ def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> 
 
     config = ModelRegistry._load_yaml_file(config_path)
 
-    assert config.default_model == "qwen3_8b_mlx_4bit"
-    assert config.models["qwen3_8b_mlx_4bit"].provider is ModelProvider.OPENAI_COMPATIBLE
-    assert config.models["qwen3_8b_mlx_4bit"].base_url == "http://127.0.0.1:8080/v1"
-    assert config.models["qwen3_8b_mlx_4bit"].context_window_tokens == 32768
-    assert config.models["qwen3_8b_mlx_4bit"].max_output_tokens == 16_384
-    assert config.models["qwen3_8b_mlx_4bit"].defaults == {
+    assert config.default_model == "Qwen/Qwen3-8B-MLX-4bit"
+    assert config.models["Qwen/Qwen3-8B-MLX-4bit"].provider is ModelProvider.OPENAI_COMPATIBLE
+    assert config.models["Qwen/Qwen3-8B-MLX-4bit"].base_url == "http://127.0.0.1:8080/v1"
+    assert config.models["Qwen/Qwen3-8B-MLX-4bit"].context_window_tokens == 32768
+    assert config.models["Qwen/Qwen3-8B-MLX-4bit"].max_output_tokens == 16_384
+    assert config.models["Qwen/Qwen3-8B-MLX-4bit"].defaults == {
         "temperature": 1.0,
         "top_p": 0.95,
         "provider_options": {"thinking": {"type": "enabled"}},
@@ -468,17 +461,16 @@ def test_load_configs_models_preserves_api_key_env_for_cloud_models(
         yaml.safe_dump(
             {
                 "models": {
-                    "mimo_cloud": {
+                    "mimo-v2-flash": {
                         "capability": "chat",
                         "provider": "mimo",
                         "protocol": "openai_compatible",
-                        "model": "mimo-v2-flash",
                         "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                         "api_key_env": "MIMO_API_KEY",
                     }
                 },
-                "defaults": {"primary_model": "mimo_cloud"},
+                "defaults": {"primary_model": "mimo-v2-flash"},
             }
         ),
         encoding="utf-8",
@@ -486,9 +478,9 @@ def test_load_configs_models_preserves_api_key_env_for_cloud_models(
     monkeypatch.setenv("MIMO_API_KEY", "sk-test")
 
     config = ModelRegistry._load_yaml_file(config_path)
-    provider_config = _chat_provider_config(config.models["mimo_cloud"])
+    provider_config = _chat_provider_config(config.models["mimo-v2-flash"])
 
-    assert config.models["mimo_cloud"].api_key_env == "MIMO_API_KEY"
+    assert config.models["mimo-v2-flash"].api_key_env == "MIMO_API_KEY"
     assert provider_config.api_key == "sk-test"
 
 
@@ -526,25 +518,22 @@ def test_load_configs_models_supports_provider_section_schema(
                     },
                 },
                 "models": {
-                    "qwen3_8b_mlx_4bit": {
+                    "mlx-community/Qwen3-8B-4bit": {
                         "capability": "chat",
                         "provider": "local_mlx_chat_8080",
-                        "model": "mlx-community/Qwen3-8B-4bit",
                         "context_window_tokens": 32768,
                         "runtime": {
                             "expected_model_contains": "Qwen3-8B-4bit",
                         },
                     },
-                    "groq_gpt_oss_120b": {
+                    "openai/gpt-oss-120b": {
                         "capability": "chat",
                         "provider": "groq",
-                        "model": "openai/gpt-oss-120b",
                         "tokenizer_model": "gpt-oss-120b",
                         "context_window_tokens": 8000,
-                        "max_context_window_tokens": 131072,    
                     },
                 },
-                "defaults": {"primary_model": "groq_gpt_oss_120b"},
+                "defaults": {"primary_model": "openai/gpt-oss-120b"},
             }
         ),
         encoding="utf-8",
@@ -552,22 +541,17 @@ def test_load_configs_models_supports_provider_section_schema(
     monkeypatch.setenv("GROQ_API_KEY", "sk-test")
 
     config = ModelRegistry._load_yaml_file(config_path)
-    groq = config.models["groq_gpt_oss_120b"]
-    local = config.models["qwen3_8b_mlx_4bit"]
+    groq = config.models["openai/gpt-oss-120b"]
+    local = config.models["mlx-community/Qwen3-8B-4bit"]
     provider_config = _chat_provider_config(groq)
 
-    assert config.default_model == "groq_gpt_oss_120b"
+    assert config.default_model == "openai/gpt-oss-120b"
     assert groq.provider is ModelProvider.OPENAI_COMPATIBLE
     assert groq.provider_name == "groq"
     assert groq.base_url == "https://api.groq.com/openai/v1"
     assert groq.api_key_env == "GROQ_API_KEY"
     assert groq.location == "cloud"
     assert groq.context_window_tokens == 8_000
-    assert groq.max_context_window_tokens == 131_072
-    assert (
-        groq.effective_max_context_window_tokens
-        == 131_072
-    )
     assert groq.tokenizer_model == "gpt-oss-120b"
     assert provider_config.api_key == "sk-test"
     assert provider_config.base_url == "https://api.groq.com/openai/v1"
@@ -592,10 +576,9 @@ def test_load_configs_models_supports_provider_section_schema(
 def test_repository_catalog_declares_local_qwen35_9b() -> None:
     config = ModelRegistry._load_yaml_file(Path("configs/models.yaml"))
 
-    spec = config.models["qwen3_5_9b_mlx_4bit"]
+    spec = config.models["mlx-community/Qwen3.5-9B-4bit"]
     assert spec.provider is ModelProvider.OPENAI_COMPATIBLE
     assert spec.provider_name == "local_mlx_chat_8080"
-    assert spec.model == "mlx-community/Qwen3.5-9B-4bit"
     assert spec.context_window_tokens == 262_144
     assert spec.location == "local"
     assert spec.runtime is not None
@@ -609,27 +592,25 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
         yaml.safe_dump(
             {
                 "models": {
-                    "main": {
+                    "main-model": {
                         "capability": "chat",
                         "provider": "qwen",
                         "protocol": "openai_compatible",
-                        "model": "main-model",
                         "context_window_tokens": 32_768,
                         "base_url": "http://127.0.0.1:8080/v1",
                     },
-                    "mimo_cloud": {
+                    "mimo-v2-flash": {
                         "capability": "chat",
                         "provider": "mimo",
                         "protocol": "openai_compatible",
-                        "model": "mimo-v2-flash",
                         "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                     },
                 },
-                "defaults": {"primary_model": "main"},
+                "defaults": {"primary_model": "main-model"},
                 "generation": {
                     "factcheck": {
-                        "model": "mimo_cloud",
+                        "model": "mimo-v2-flash",
                         "max_tokens": 2048,
                         "temperature": 0.3,
                     }
@@ -641,7 +622,7 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
 
     config = ModelRegistry._load_yaml_file(config_path)
 
-    assert config.generation.factcheck.model == "mimo_cloud"
+    assert config.generation.factcheck.model == "mimo-v2-flash"
     assert config.generation.factcheck.max_tokens == 2048
     assert config.generation.factcheck.temperature == 0.3
 
@@ -655,17 +636,16 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
         yaml.safe_dump(
             {
                 "models": {
-                    "mimo_cloud": {
+                    "mimo-v2-flash": {
                         "capability": "chat",
                         "provider": "mimo",
                         "protocol": "openai_compatible",
-                        "model": "mimo-v2-flash",
                         "context_window_tokens": 32_768,
                         "base_url": "https://api.xiaomimimo.com/v1",
                         "api_key_env": "MIMO_API_KEY",
                     }
                 },
-                "defaults": {"primary_model": "mimo_cloud"},
+                "defaults": {"primary_model": "mimo-v2-flash"},
             }
         ),
         encoding="utf-8",
@@ -679,10 +659,10 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
     monkeypatch.delenv("MIMO_API_KEY", raising=False)
 
     registry = ModelRegistry.from_env(env_path=str(env_path))
-    spec = registry._config.models["mimo_cloud"]
+    spec = registry._config.models["mimo-v2-flash"]
     provider_config = _chat_provider_config(spec)
 
-    assert registry.default_model == "mimo_cloud"
+    assert registry.default_model == "mimo-v2-flash"
     assert provider_config.api_key == "sk-dotenv"
     # _load_env_file writes directly to os.environ, so release monkeypatch's
     # original snapshots before removing those dynamically-created values.
@@ -723,7 +703,6 @@ class TestModelRegistryResolve:
             provider=ModelProvider.OPENAI_COMPATIBLE,
             provider_name="frozen-provider",
             protocol="openai_compatible",
-            model="provider/frozen-v1",
             tokenizer_model="frozen-tokenizer",
             context_window_tokens=777,
             timeout_seconds=45.5,
@@ -777,7 +756,8 @@ class TestModelRegistryResolve:
         observed: dict[str, ModelSpec] = {}
         generator = object()
 
-        def build_frozen(spec: ModelSpec) -> object:
+        def build_frozen(*, model_id: str, spec: ModelSpec) -> object:
+            assert model_id == "main"
             observed["spec"] = spec.model_copy(deep=True)
             return generator
 
@@ -791,10 +771,8 @@ class TestModelRegistryResolve:
 
         frozen_spec = observed["spec"]
 
-        assert frozen_spec.model == "provider/frozen-v1"
         assert frozen_spec.tokenizer_model == "frozen-tokenizer"
         assert frozen_spec.context_window_tokens == 777
-        assert frozen_spec.max_context_window_tokens == 777
         assert frozen_spec.max_output_tokens is None
         assert frozen_spec.timeout_seconds == 45.5
 
@@ -807,15 +785,11 @@ class TestModelRegistryResolve:
 
         assert resolved.generator is generator
 
-        assert resolved.model == "provider/frozen-v1"
+        assert resolved.model_id == "main"
         assert resolved.provider == "frozen-provider"
 
         assert (
             resolved.capabilities.context_window_tokens
-            == 777
-        )
-        assert (
-            resolved.capabilities.max_context_window_tokens
             == 777
         )
         assert resolved.capabilities.max_output_tokens is None
@@ -861,7 +835,6 @@ class TestModelRegistryResolve:
         source_config = _make_config()
         source_config.models["main"] = ModelSpec(
             provider=ModelProvider.OPENAI_COMPATIBLE,
-            model="provider/frozen-v1",
             context_window_tokens=32_768,
             timeout_seconds=1.25,
             base_url="http://127.0.0.1:9090/v1",
@@ -882,7 +855,7 @@ class TestModelRegistryResolve:
     ) -> None:
         secret = "resolved-secret-value"
 
-        def fail_provider(_spec: ModelSpec) -> object:
+        def fail_provider(**_kwargs: object) -> object:
             raise RuntimeError(f"provider rejected {secret}")
 
         monkeypatch.setattr(llm_registry_module, "_build_chat_generator", fail_provider)
@@ -903,7 +876,6 @@ class TestModelRegistryResolve:
             models={
                 "cloud": ModelSpec(
                     provider=ModelProvider.OPENAI_COMPATIBLE,
-                    model="cloud-model",
                     base_url="https://api.example.com/v1",
                     api_key_env="FROZEN_TEST_API_KEY",
                     location="cloud",
@@ -916,7 +888,8 @@ class TestModelRegistryResolve:
         definition = registry.get_model_definition("cloud")
         observed_keys: list[str | None] = []
 
-        def capture_credential(spec: ModelSpec) -> object:
+        def capture_credential(*, model_id: str, spec: ModelSpec) -> object:
+            assert model_id == "cloud"
             observed_keys.append(_chat_provider_config(spec).api_key)
             return object()
 
@@ -936,7 +909,7 @@ class TestModelRegistryResolve:
         registry = ModelRegistry(_make_config())
         definition = registry.get_model_definition("main")
 
-        def fail_with_secret(_spec: ModelSpec) -> object:
+        def fail_with_secret(**_kwargs: object) -> object:
             raise RuntimeError("provider rejected secret-value")
 
         monkeypatch.setattr(llm_registry_module, "_build_chat_generator", fail_with_secret)
@@ -967,7 +940,6 @@ class TestModelRegistryResolve:
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
-            model="x",
             context_window_tokens=32_768,
             max_output_tokens=512,
             defaults={
@@ -989,14 +961,12 @@ class TestModelRegistryResolve:
         assert resolved.request_defaults.temperature == 0.3
         assert resolved.request_defaults.top_p == 0.8
 
-    def test_active_context_window_caps_gateway_without_rewriting_model_maximum(
+    def test_active_context_window_caps_gateway(
         self,
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
-            model="request-capped",
             context_window_tokens=8_000,
-            max_context_window_tokens=131_072,
         )
 
         registry = ModelRegistry(
@@ -1011,16 +981,9 @@ class TestModelRegistryResolve:
         stored = registry.get_model_spec("capped")
 
         assert stored.context_window_tokens == 8_000
-        assert stored.max_context_window_tokens == 131_072
-
         assert (
             resolved.capabilities.context_window_tokens
             == 8_000
-        )
-
-        assert (
-            resolved.capabilities.max_context_window_tokens
-            == 131_072
         )
 
         assert (
@@ -1035,18 +998,17 @@ class TestModelRegistryResolve:
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
-            model="provider/gpt-oss-120b",
             tokenizer_model="gpt-oss-120b",
             context_window_tokens=131_072,
         )
         registry = ModelRegistry(
             AgentModelsConfig(
-                models={"tokenized": spec},
-                default_model="tokenized",
+                models={"provider/gpt-oss-120b": spec},
+                default_model="provider/gpt-oss-120b",
             )
         )
 
-        resolved = registry.resolve("tokenized")
+        resolved = registry.resolve("provider/gpt-oss-120b")
 
         assert resolved.token_accounting is not None
         assert resolved.token_accounting.backend_descriptor() == (
@@ -1060,9 +1022,7 @@ class TestModelRegistryResolve:
     ) -> None:
         spec = ModelSpec(
             provider=ModelProvider.OLLAMA,
-            model="long-thinking",
             context_window_tokens=65_536,
-            max_context_window_tokens=131_072,
             max_output_tokens=32_768,
         )
 

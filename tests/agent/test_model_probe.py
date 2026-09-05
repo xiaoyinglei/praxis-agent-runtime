@@ -206,13 +206,11 @@ def _probe(
 ) -> tuple[ModelProbe, ModelExecutionDefinition]:
     config = AgentModelsConfig(
         models={
-            "probe": ModelSpec(
+            "probe-model": ModelSpec(
                 provider=ModelProvider.OPENAI_COMPATIBLE,
                 provider_name="probe-provider",
-                model="probe-model",
                 tokenizer_model="probe-model",
                 context_window_tokens=4_096,
-                max_context_window_tokens=65_536,
                 max_output_tokens=max_output_tokens,
                 timeout_seconds=timeout_seconds,
                 base_url=base_url,
@@ -221,14 +219,14 @@ def _probe(
                 supports_structured_output=True,
             )
         },
-        default_model="probe",
+        default_model="probe-model",
     )
 
     registry = ModelRegistry(config)
 
     return (
         ModelProbe(registry),
-        registry.get_model_definition("probe"),
+        registry.get_model_definition("probe-model"),
     )
 async def _run_probe(
     configured_probe: tuple[ModelProbe, ModelExecutionDefinition],
@@ -248,7 +246,7 @@ async def _run_probe(
     [
         (None, 32),
         (16, 16),
-        (32_768, 32),
+        (4_096, 32),
     ],
 )
 async def test_probe_output_limit_is_probe_policy_not_model_capability(

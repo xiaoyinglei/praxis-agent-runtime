@@ -28,7 +28,6 @@ from agent_runtime.model_registry import (
 def _definition(**updates: object) -> UserModelDefinition:
     values: dict[str, object] = {
         "provider": "openai_compatible",
-        "model": "Qwen/Qwen3.5-9B",
         "location": "local",
         "base_url": "http://127.0.0.1:8080/v1",
         "context_window_tokens": 32_768,
@@ -55,35 +54,23 @@ def _store(tmp_path: Path, **updates: object) -> UserModelRegistryStore:
 
 
 @pytest.mark.parametrize(
-    "alias",
+    "model_id",
     [
-        "A",
-        "two words",
-        "-leading",
-        "trailing_",
-        "a" * 65,
-        "list",
-        "current",
-        "switch",
-        "use",
-        "add",
-        "update",
-        "probe",
-        "remove",
-        "show",
-        "trust",
-        "default",
+        "",
+        " padded",
+        "padded ",
+        "\t",
     ],
 )
-def test_schema_rejects_invalid_or_reserved_alias(alias: str) -> None:
+def test_schema_rejects_empty_or_padded_model_id(model_id: str) -> None:
     with pytest.raises(ValidationError):
-        UserModelRegistryDocument(revision=0, models={alias: _definition()})
+        UserModelRegistryDocument(revision=0, models={model_id: _definition()})
 
 
-@pytest.mark.parametrize("alias", ["a", "a.b-c_d9", "a" * 64])
-def test_schema_accepts_exact_alias_grammar(alias: str) -> None:
-    document = UserModelRegistryDocument(revision=0, models={alias: _definition()})
-    assert tuple(document.models) == (alias,)
+@pytest.mark.parametrize("model_id", ["a", "Qwen/Qwen3.5-9B", "list", "a" * 65])
+def test_schema_accepts_trimmed_model_ids(model_id: str) -> None:
+    document = UserModelRegistryDocument(revision=0, models={model_id: _definition()})
+    assert tuple(document.models) == (model_id,)
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "custom"])
@@ -226,21 +213,11 @@ def test_schema_rejects_unknown_fields(payload: dict[str, object]) -> None:
     "updates",
     [
         {"max_output_tokens": 0},
-        {"max_context_window_tokens": 0},
         {"timeout_seconds": 0},
         {"context_window_tokens": 0},
         {
-            "context_window_tokens": 4_097,
-            "max_context_window_tokens": 4_096,
-        },
-        {
             "context_window_tokens": 4_096,
             "max_output_tokens": 4_097,
-        },
-        {
-            "context_window_tokens": 4_096,
-            "max_context_window_tokens": 8_192,
-            "max_output_tokens": 8_193,
         },
         {"input_cost_per_1m": -1},
     ],
@@ -257,7 +234,6 @@ def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
     "version: 1\nrevision: 0\nmodels:\n"
     "  mine:\n"
     "    provider: mlx\n"
-    "    model: m\n"
     "    context_window_tokens: 32768\n"
     "    defaults:\n"
     "      temperature: null\n",
@@ -272,18 +248,18 @@ def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
     [
         (
             "version: 1\nrevision: 0\nmodels:\n"
-            "  mine: {provider: mlx, model: first}\n"
-            "  mine: {provider: mlx, model: second}\n",
+            "  mine: {provider: mlx}\n"
+            "  mine: {provider: mlx}\n",
             "mine",
         ),
         (
             "version: 1\nrevision: 0\nmodels:\n  mine:\n"
-            "    provider: mlx\n    provider: ollama\n    model: m\n",
+            "    provider: mlx\n    provider: ollama\n",
             "provider",
         ),
         (
             "version: 1\nrevision: 0\nmodels:\n  mine:\n"
-            "    provider: mlx\n    model: m\n    defaults:\n"
+            "    provider: mlx\n    defaults:\n"
             "      temperature: 0.1\n      temperature: 0.2\n",
             "temperature",
         ),
@@ -306,7 +282,7 @@ def test_add_rejects_user_and_builtin_collisions(tmp_path: Path) -> None:
     initial = store.read().version
     committed = store.add("mine", _definition(), expected=initial)
     with pytest.raises(RegistryCollisionError, match="already exists"):
-        store.add("mine", _definition(model="other"), expected=committed.snapshot.version)
+        store.add("mine", _definition(), expected=committed.snapshot.version)
     with pytest.raises(RegistryCollisionError, match="built-in"):
         store.add("builtin", _definition(), expected=committed.snapshot.version)
 
@@ -314,11 +290,10 @@ def test_add_rejects_user_and_builtin_collisions(tmp_path: Path) -> None:
 def test_add_revalidates_adversarial_constructed_definition_under_lock(tmp_path: Path) -> None:
     store = _store(tmp_path)
     bypass = UserModelDefinition.model_construct(
-    provider="anthropic",
-    model="",
-    max_output_tokens=0,
-    context_window_tokens=0,
-)
+        provider="anthropic",
+        max_output_tokens=0,
+        context_window_tokens=0,
+    )
 
     with pytest.raises(ValidationError):
         store.add("mine", bypass, expected=store.read().version)
@@ -340,12 +315,11 @@ def test_patch_update_and_complete_replacement(tmp_path: Path) -> None:
         expected=added.snapshot.version,
     )
     updated = patched.snapshot.document.models["mine"]
-    assert updated.model == "Qwen/Qwen3.5-9B"
     assert updated.tokenizer_model == "old"
     assert updated.max_output_tokens == 1024
     assert updated.defaults.temperature == 0.5
 
-    replacement = _definition(provider="ollama", model="qwen:latest", base_url=None)
+    replacement = _definition(provider="ollama", base_url=None)
     replaced = store.update(
         "mine",
         ModelDefinitionPatch(replacement=replacement),
@@ -359,11 +333,10 @@ def test_replacement_revalidates_adversarial_constructed_definition_under_lock(t
     added = store.add("mine", _definition(), expected=store.read().version)
     before = store.path.read_bytes()
     bypass = UserModelDefinition.model_construct(
-    provider="anthropic",
-    model="",
-    max_output_tokens=0,
-    context_window_tokens=0,
-)
+        provider="anthropic",
+        max_output_tokens=0,
+        context_window_tokens=0,
+    )
 
     with pytest.raises(ValidationError):
         store.update(
@@ -424,7 +397,7 @@ def test_store_revalidates_constructed_replacement_patch_shape_under_lock(
     added = store.add("mine", _definition(), expected=store.read().version)
     before = store.path.read_bytes()
     bypass = ModelDefinitionPatch.model_construct(
-        replacement=_definition(model="replacement"),
+        replacement=_definition(),
         changes=changes,
         unset_paths=unset_paths,
     )
@@ -440,10 +413,6 @@ _UNSET_CASES: tuple[tuple[str, Callable[[UserModelDefinition], object]], ...] = 
     ("provider_name", lambda value: value.provider_name),
     ("base_url", lambda value: value.base_url),
     ("api_key_env", lambda value: value.api_key_env),
-    (
-    "max_context_window_tokens",
-    lambda value: value.max_context_window_tokens,
-),
     (
         "max_output_tokens",
         lambda value: value.max_output_tokens,
@@ -472,7 +441,6 @@ def test_update_supports_every_allowed_unset_path(
         tokenizer_model="tokenizer",
         provider_name="provider",
         api_key_env="MODEL_API_KEY",
-        max_context_window_tokens=65_536,
         max_output_tokens=8_192,
         input_cost_per_1m=1,
         output_cost_per_1m=2,

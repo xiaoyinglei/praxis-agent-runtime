@@ -10,8 +10,6 @@ import pytest
 
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.model_request import toolset_revision_for_tools
-from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
-from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
@@ -28,6 +26,8 @@ from agent_runtime.harness import (
 )
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.streaming.events import EventType, ItemDeltaKind, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -922,10 +922,9 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
             generator=object(),
             gateway=object(),  # prepare-only fixture; no provider dispatch occurs
             provider="openai-compatible",
-            model="provider-model",
+            model_id="provider-model",
             capabilities=ModelCapabilities(
                 context_window_tokens=8_192,
-                max_context_window_tokens=8_192,
                 max_output_tokens=256,
                 supports_native_tools=True,
                 supports_structured_output=True,

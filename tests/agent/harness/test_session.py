@@ -10,8 +10,6 @@ import pytest
 
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.model_request import toolset_revision_for_tools
-from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
-from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
@@ -30,6 +28,8 @@ from agent_runtime.harness import (
     RuntimeComposition,
     Session,
 )
+from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway, StreamChunk
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
@@ -463,10 +463,9 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
             generator=provider,
             gateway=gateway,
             provider="openai-compatible",
-            model="provider-model",
+            model_id="provider-model",
             capabilities=ModelCapabilities(
                 context_window_tokens=8_192,
-                max_context_window_tokens=8_192,
                 max_output_tokens=256,
                 supports_native_tools=True,
                 supports_structured_output=True,

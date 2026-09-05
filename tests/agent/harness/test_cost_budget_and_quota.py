@@ -108,11 +108,10 @@ def _resolved(
     return ResolvedModel(
         generator=object(),
         gateway=gateway,  # type: ignore[arg-type]
-        model="provider-model",
+        model_id="provider-model",
         provider="openai-compatible",
         capabilities=ModelCapabilities(
             context_window_tokens=8192,
-            max_context_window_tokens=8192,
             max_output_tokens=100,
             supports_native_tools=True,
             supports_structured_output=True,
