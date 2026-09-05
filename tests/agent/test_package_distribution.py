@@ -44,7 +44,7 @@ def test_built_wheel_loads_bundled_qwen35_model_outside_repo(
         print(json.dumps({
             "agent_runtime_file": agent_runtime.__file__,
             "registry_file": registry_module.__file__,
-            "model": spec.provider_model,
+            "model": spec.id,
         }))
         """
     )

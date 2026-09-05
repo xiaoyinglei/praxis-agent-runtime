@@ -901,7 +901,6 @@ def _spec(model_id: str) -> ModelSpec:
     return ModelSpec(
         id=model_id,
         provider="openai-compatible",
-        provider_model=f"provider-{model_id}",
         context_window=8_192,
         supports_tools=True,
         supports_structured_output=False,

@@ -52,11 +52,11 @@ _SINGLE_DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 
 
 class RegistryCollisionError(ValueError):
-    """An alias is already owned by the user or built-in catalog."""
+    """A model ID is already owned by the user or built-in catalog."""
 
 
 class RegistryEntryNotFound(KeyError):  # noqa: N818
-    """A registry mutation referred to an absent user alias."""
+    """A registry mutation referred to an absent user model ID."""
 
 
 class InvalidUnsetPath(ValueError):  # noqa: N818
@@ -212,9 +212,9 @@ class UserModelRegistryDocument(BaseModel):
 
     @field_validator("models")
     @classmethod
-    def validate_aliases(cls, value: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-        for alias in value:
-            _validate_alias(alias)
+    def validate_model_ids(cls, value: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
+        for model_id in value:
+            _validate_model_id(model_id)
         return value
 
     def to_persisted_mapping(self) -> dict[str, object]:
@@ -222,8 +222,8 @@ class UserModelRegistryDocument(BaseModel):
             "version": self.version,
             "revision": self.revision,
             "models": {
-                alias: definition.to_persisted_mapping()
-                for alias, definition in sorted(self.models.items())
+                model_id: definition.to_persisted_mapping()
+                for model_id, definition in sorted(self.models.items())
             },
         }
 
@@ -291,11 +291,11 @@ class UserModelRegistryStore:
         path: Path,
         workspace: Path,
         worktree: Path,
-        built_in_aliases: Collection[str],
+        built_in_model_ids: Collection[str],
         whole_catalog_override_active: bool | None = None,
     ) -> None:
         self.path = validate_user_config_path(path, workspace=workspace, worktree=worktree)
-        self._built_in_aliases = frozenset(built_in_aliases)
+        self._built_in_model_ids = frozenset(built_in_model_ids)
         self._whole_catalog_override_active = (
             bool(os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"))
             if whole_catalog_override_active is None
@@ -307,7 +307,7 @@ class UserModelRegistryStore:
 
     def preview_add(
         self,
-        alias: str,
+        model_id: str,
         definition: UserModelDefinition,
         *,
         snapshot: RegistrySnapshot,
@@ -315,18 +315,18 @@ class UserModelRegistryStore:
         """Validate one candidate against an observed snapshot without writing."""
 
         self._reject_override_mode()
-        _validate_alias(alias)
-        if alias in self._built_in_aliases:
-            raise RegistryCollisionError(f"Model alias {alias!r} is owned by the built-in catalog")
-        if alias in snapshot.document.models:
-            raise RegistryCollisionError(f"User model alias {alias!r} already exists")
+        _validate_model_id(model_id)
+        if model_id in self._built_in_model_ids:
+            raise RegistryCollisionError(f"Model ID {model_id!r} is owned by the built-in catalog")
+        if model_id in snapshot.document.models:
+            raise RegistryCollisionError(f"User model ID {model_id!r} already exists")
         return UserModelDefinition.model_validate(
             definition.model_dump(mode="python", exclude_none=True, warnings=False)
         )
 
     def preview_update(
         self,
-        alias: str,
+        model_id: str,
         mutation: ModelDefinitionPatch,
         *,
         snapshot: RegistrySnapshot,
@@ -334,57 +334,57 @@ class UserModelRegistryStore:
         """Return the exact candidate that update would commit for this snapshot."""
 
         self._reject_override_mode()
-        _validate_alias(alias)
-        current = snapshot.document.models.get(alias)
+        _validate_model_id(model_id)
+        current = snapshot.document.models.get(model_id)
         if current is None:
-            raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
+            raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
         return _apply_patch(current, _revalidate_patch(mutation))
 
     def add(
         self,
-        alias: str,
+        model_id: str,
         definition: UserModelDefinition,
         *,
         expected: FileVersion,
     ) -> RegistryMutationResult:
-        _validate_alias(alias)
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-            if alias in self._built_in_aliases:
-                raise RegistryCollisionError(f"Model alias {alias!r} is owned by the built-in catalog")
-            if alias in models:
-                raise RegistryCollisionError(f"User model alias {alias!r} already exists")
-            models[alias] = definition
+            if model_id in self._built_in_model_ids:
+                raise RegistryCollisionError(f"Model ID {model_id!r} is owned by the built-in catalog")
+            if model_id in models:
+                raise RegistryCollisionError(f"User model ID {model_id!r} already exists")
+            models[model_id] = definition
             return models
 
         return self._mutate(expected=expected, apply=apply)
 
     def update(
         self,
-        alias: str,
+        model_id: str,
         mutation: ModelDefinitionPatch,
         *,
         expected: FileVersion,
     ) -> RegistryMutationResult:
-        _validate_alias(alias)
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
             validated_mutation = _revalidate_patch(mutation)
-            current = models.get(alias)
+            current = models.get(model_id)
             if current is None:
-                raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
-            models[alias] = _apply_patch(current, validated_mutation)
+                raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
+            models[model_id] = _apply_patch(current, validated_mutation)
             return models
 
         return self._mutate(expected=expected, apply=apply)
 
-    def remove(self, alias: str, *, expected: FileVersion) -> RegistryMutationResult:
-        _validate_alias(alias)
+    def remove(self, model_id: str, *, expected: FileVersion) -> RegistryMutationResult:
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-            if alias not in models:
-                raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
-            del models[alias]
+            if model_id not in models:
+                raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
+            del models[model_id]
             return models
 
         return self._mutate(expected=expected, apply=apply)
@@ -421,7 +421,7 @@ class UserModelRegistryStore:
                 models=models,
             )
             models = validated.models
-            self._validate_effective_aliases(models)
+            self._validate_effective_model_ids(models)
             unchanged = _normalized_models(models) == _normalized_models(current.document.models)
             if unchanged:
                 receipt = MutationReceipt(
@@ -461,11 +461,11 @@ class UserModelRegistryStore:
         document = UserModelRegistryDocument.model_validate(parsed)
         return RegistrySnapshot(document=document, fingerprint=file_fingerprint(payload))
 
-    def _validate_effective_aliases(self, models: Mapping[str, UserModelDefinition]) -> None:
-        collisions = sorted(self._built_in_aliases.intersection(models))
+    def _validate_effective_model_ids(self, models: Mapping[str, UserModelDefinition]) -> None:
+        collisions = sorted(self._built_in_model_ids.intersection(models))
         if collisions:
             raise RegistryCollisionError(
-                f"User registry collides with built-in aliases: {', '.join(collisions)}"
+                f"User registry collides with built-in model IDs: {', '.join(collisions)}"
             )
 
     def _reject_override_mode(self) -> None:
@@ -476,8 +476,8 @@ class UserModelRegistryStore:
             )
 
 
-def _validate_alias(alias: str) -> None:
-    if type(alias) is not str or not alias or alias != alias.strip():
+def _validate_model_id(model_id: str) -> None:
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
         raise ValueError(
             "Model ID must be a non-empty trimmed string"
         )
@@ -523,7 +523,10 @@ def _unset_path(payload: dict[str, Any], path: str) -> None:
 
 
 def _normalized_models(models: Mapping[str, UserModelDefinition]) -> dict[str, dict[str, object]]:
-    return {alias: definition.to_persisted_mapping() for alias, definition in sorted(models.items())}
+    return {
+        model_id: definition.to_persisted_mapping()
+        for model_id, definition in sorted(models.items())
+    }
 
 
 def _revalidate_document(
@@ -534,8 +537,8 @@ def _revalidate_document(
     """Cross the mutation trust boundary using plain data, never model identity."""
 
     plain_models = {
-        alias: definition.model_dump(mode="python", exclude_none=True, warnings=False)
-        for alias, definition in models.items()
+        model_id: definition.model_dump(mode="python", exclude_none=True, warnings=False)
+        for model_id, definition in models.items()
     }
     return UserModelRegistryDocument.model_validate(
         {

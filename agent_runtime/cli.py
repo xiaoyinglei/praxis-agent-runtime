@@ -584,7 +584,6 @@ async def _chat_facade_loop(
 def _print_current_model(spec: ModelSpec) -> None:
     print(f"{spec.id}")
     print(f"provider: {spec.provider}")
-    print(f"provider_model: {spec.provider_model}")
     print(f"context_window: {spec.context_window}")
     print(f"location: {spec.location}")
 
@@ -598,7 +597,7 @@ def _print_model_menu(agent: Agent) -> None:
         current_model_id=current.id,
     ):
         print(line)
-    print("切换: /model <alias>")
+    print("切换: /model <model_id>")
 
 
 def _handle_model_slash_command(
@@ -663,26 +662,25 @@ def model_list(
     _print_model_session_diagnostics(selection.diagnostics)
     current_id = selection.spec.id
     for entry in _model_admin_call(service.list_models):
-        marker = "*" if entry.alias == current_id else " "
+        marker = "*" if entry.model_id == current_id else " "
         suffix = f" source={entry.origin}" if source else ""
-        print(f"{marker} {entry.alias} -> {entry.spec.provider_model}{suffix}")
+        print(f"{marker} {entry.model_id} provider={entry.spec.provider}{suffix}")
 
 
 @model_app.command(name="show")
 def model_show(
-    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="模型 id")],
     session_path: Annotated[
         Path,
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示一个模型的规范化定义摘要，不解析凭据值。"""
-    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(alias))
-    print(f"alias: {entry.alias}")
+    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(model_id))
+    print(f"model_id: {entry.model_id}")
     print(f"source: {entry.origin}")
     print(f"provider: {entry.definition.provider.value}")
     print(f"provider_name: {entry.definition.provider_name or '<none>'}")
-    print(f"model: {entry.spec.provider_model}")
     print(f"protocol: {entry.spec.protocol or '<none>'}")
     print(f"location: {entry.spec.location}")
     print(f"base_url: {entry.spec.base_url or '<default>'}")
@@ -735,7 +733,7 @@ def model_switch(
 
 @model_app.command(name="probe")
 def model_probe(
-    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="模型 id")],
     level: Annotated[
         ProbeLevel,
         typer.Option("--level", help="connectivity、stream 或 full"),
@@ -747,13 +745,13 @@ def model_probe(
 ) -> None:
     """探测已注册模型，不修改注册表或 session。"""
     service = _model_admin_service(session_path)
-    evidence = _model_admin_call(lambda: _run_cli_async(service.probe(alias, level=level)))
+    evidence = _model_admin_call(lambda: _run_cli_async(service.probe(model_id, level=level)))
     _print_probe_evidence(evidence)
 
 
 @model_app.command(name="add")
 def model_add(
-    alias: Annotated[str, typer.Argument(help="新模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="新模型 id")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
@@ -807,7 +805,7 @@ def model_add(
     outcome = _model_admin_call(
         lambda: _run_cli_async(
             service.add(
-                alias,
+                model_id,
                 arguments=arguments,
                 from_path=from_path,
                 skip_probe=skip_probe,
@@ -819,7 +817,7 @@ def model_add(
 
 @model_app.command(name="update")
 def model_update(
-    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="用户模型 id")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
@@ -872,7 +870,7 @@ def model_update(
     outcome = _model_admin_call(
         lambda: _run_cli_async(
             service.update(
-                alias,
+                model_id,
                 arguments=arguments,
                 from_path=from_path,
                 unset_paths=tuple(unset or ()),
@@ -885,15 +883,15 @@ def model_update(
 
 @model_app.command(name="remove")
 def model_remove(
-    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="用户模型 id")],
     session_path: Annotated[
         Path,
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """删除非当前会话选中的用户模型。"""
-    result = _model_admin_call(lambda: _model_admin_service(session_path).remove(alias))
-    print(f"removed: {alias}")
+    result = _model_admin_call(lambda: _model_admin_service(session_path).remove(model_id))
+    print(f"removed: {model_id}")
     print(f"registry_revision: {result.snapshot.document.revision}")
 
 
@@ -981,7 +979,7 @@ def _print_probe_evidence(evidence: ModelProbeEvidence) -> None:
 
 
 def _print_model_mutation(outcome: ModelMutationOutcome) -> None:
-    print(f"alias: {outcome.alias}")
+    print(f"model_id: {outcome.model_id}")
     print("source: user")
     print(f"changed: {str(outcome.changed).lower()}")
     print(f"definition_revision: {outcome.definition_revision}")

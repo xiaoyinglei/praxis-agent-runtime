@@ -27,19 +27,18 @@ from agent_runtime.model_trust import (
 )
 
 
-def _definition(model: str = "main-model"):
+def _definition(model_id: str = "main-model"):
     config = AgentModelsConfig(
         models={
-            "main": ModelSpec(
+            model_id: ModelSpec(
                 provider=ModelProvider.OLLAMA,
-                model=model,
                 base_url="http://localhost:11434",
                 context_window_tokens=32_768,
             )
         },
-        default_model="main",
+        default_model=model_id,
     )
-    return ModelRegistry(config).get_model_definition("main")
+    return ModelRegistry(config).get_model_definition(model_id)
 
 
 def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:

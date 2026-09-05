@@ -40,7 +40,6 @@ def _model_spec(model_id: str) -> ModelSpec:
     return ModelSpec(
         id=model_id,
         provider=f"provider-{model_id}",
-        provider_model=f"provider/{model_id}",
         context_window=32_768,
         supports_tools=True,
         supports_structured_output=True,
@@ -217,7 +216,7 @@ async def test_bare_model_command_shows_current_available_and_switch_usage(
     assert "当前模型: model-a" in output
     assert "* model-a" in output
     assert "  model-b" in output
-    assert "切换: /model <alias>" in output
+    assert "切换: /model <model_id>" in output
 
 
 @pytest.mark.anyio

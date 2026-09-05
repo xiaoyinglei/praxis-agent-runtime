@@ -17,7 +17,6 @@ def _local_spec(model_id: str) -> ModelSpec:
     return ModelSpec(
         id=model_id,
         provider="local_mlx_chat_8080",
-        provider_model=model_id,
         context_window=32_768,
         supports_tools=True,
         supports_structured_output=True,
@@ -320,6 +319,7 @@ async def test_provider_bootstrap_completes_before_runtime_composition_opens(
         allow_execute_tools=False,
         max_steps=1,
         max_tokens_total=None,
+        max_cost_micros=None,
     ):
         lifecycle.append(
             "inside_runtime"

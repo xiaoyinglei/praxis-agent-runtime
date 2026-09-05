@@ -224,14 +224,14 @@ class ModelRegistry:
             path=registry_path,
             workspace=workspace,
             worktree=worktree,
-            built_in_aliases=built_in.models,
+            built_in_model_ids=built_in.models,
             whole_catalog_override_active=False,
         )
         user_snapshot = store.read()
         collisions = sorted(set(built_in.models).intersection(user_snapshot.document.models))
         if collisions:
             raise ValueError(
-                "User model registry collides with built-in aliases: " + ", ".join(collisions)
+                "User model registry collides with built-in model IDs: " + ", ".join(collisions)
             )
         models = dict(built_in.models)
         models.update(

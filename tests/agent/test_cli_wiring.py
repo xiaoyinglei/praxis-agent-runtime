@@ -318,7 +318,13 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
 
     assert listed.exit_code == 0, listed.output
     assert "source=builtin" in listed.output
+    assert " -> " not in listed.output
+    assert "model=" not in listed.output
+    assert "provider=" in listed.output
     assert shown.exit_code == 0, shown.output
+    assert "model_id: mlx-community/Qwen3.5-9B-4bit" in shown.output
+    assert "alias:" not in shown.output
+    assert "\nmodel:" not in shown.output
     assert "source: builtin" in shown.output
 
 
@@ -337,6 +343,8 @@ def test_model_current_surfaces_stale_session_repair_diagnostic(tmp_path: Path) 
     assert result.exit_code == 0, result.output
     assert "model session diagnostic:" in result.output
     assert "removed-model" in result.output
+    assert "provider:" in result.output
+    assert "provider_model:" not in result.output
 
 
 def test_model_trust_init_and_status_are_idempotent_and_redacted(tmp_path: Path) -> None:
@@ -425,7 +433,7 @@ def test_model_add_from_imports_exactly_one_definition(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "alias: imported-model" in result.output
+    assert "model_id: imported-model" in result.output
     assert "probe: skipped (unverified)" in result.output
 
 

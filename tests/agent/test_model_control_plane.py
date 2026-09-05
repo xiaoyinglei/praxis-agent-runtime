@@ -109,8 +109,9 @@ def test_model_catalog_loads_runtime_specs_without_embedding_models(tmp_path: Pa
         "mlx-community/Qwen3-14B-4bit",
     ]
     spec = catalog.get("mimo-v2.5-pro")
+    assert spec.id == "mimo-v2.5-pro"
+    assert not hasattr(spec, "provider_model")
     assert spec.provider == "mimo"
-    assert spec.provider_model == "mimo-v2.5-pro"
     assert spec.context_window == 256000
     assert spec.supports_tools is True
     assert spec.supports_structured_output is True
@@ -253,7 +254,7 @@ def test_effective_catalog_layers_user_registry_with_provenance(
     first = ModelCatalog.from_env(env_path=str(tmp_path / "missing.env"))
     assert first.origin("openai/gpt-oss-120b") == "builtin"
     assert first.origin("Qwen/Qwen3.5-9B") == "user"
-    assert first.get("Qwen/Qwen3.5-9B").provider_model == "Qwen/Qwen3.5-9B"
+    assert first.get("Qwen/Qwen3.5-9B").id == "Qwen/Qwen3.5-9B"
     assert first.default_model_id == "openai/gpt-oss-120b"
     first_definition_revision = first.definition("Qwen/Qwen3.5-9B").definition_revision
     assert first.definition("Qwen/Qwen3.5-9B").provider == "openai_compatible"
@@ -370,7 +371,7 @@ def test_bundled_default_chat_model_is_groq_control() -> None:
 
     assert catalog.default_model_id == "openai/gpt-oss-120b"
     assert spec.provider == "groq"
-    assert spec.provider_model == "openai/gpt-oss-120b"
+    assert spec.id == "openai/gpt-oss-120b"
     assert spec.location == "cloud"
     assert spec.api_key_env == "GROQ_API_KEY"
 
@@ -381,7 +382,7 @@ def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
     spec = catalog.get("kimi-k2.6")
 
     assert spec.provider == "kimi"
-    assert spec.provider_model == "kimi-k2.6"
+    assert spec.id == "kimi-k2.6"
     assert spec.location == "cloud"
     assert spec.api_key_env == "MOONSHOT_API_KEY"
     assert spec.context_window == 262_144
@@ -393,7 +394,7 @@ def test_bundled_local_qwen8_runtime_is_available_for_local_testing() -> None:
     spec = catalog.get("mlx-community/Qwen3-8B-4bit")
 
     assert spec.provider == "local_mlx_chat_8080"
-    assert spec.provider_model == "mlx-community/Qwen3-8B-4bit"
+    assert spec.id == "mlx-community/Qwen3-8B-4bit"
     assert spec.location == "local"
     assert spec.runtime is not None
     assert spec.runtime.health_url == "http://127.0.0.1:8080/v1/models"
@@ -1457,9 +1458,11 @@ def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
         session_path=session_path,
     )
 
-    with pytest.raises(UnknownModelAliasError, match="missing"):
+    with pytest.raises(UnknownModelAliasError, match="missing") as captured:
         control.switch_model("missing", requested_by="user")
 
+    assert "mimo-v2.5-pro" in str(captured.value)
+    assert "mlx-community/Qwen3-14B-4bit" in str(captured.value)
     assert control.current_model().id == "mlx-community/Qwen3-14B-4bit"
     assert resolved_aliases == []
     assert not session_path.exists()
@@ -1534,10 +1537,6 @@ async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
             ModelSpec(
                 id="mlx-community/Qwen3-14B-4bit",
                 provider="qwen",
-                provider_model=(
-                    "models--mlx-community--"
-                    "Qwen3-14B-4bit"
-                ),
                 context_window=32768,
                 supports_tools=True,
                 supports_structured_output=True,

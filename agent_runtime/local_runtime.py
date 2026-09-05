@@ -65,7 +65,7 @@ class LocalProviderProbe:
             getattr(runtime, "expected_model_contains", None)
             if runtime is not None
             else None
-        ) or getattr(spec, "provider_model", "")
+        ) or spec.id
 
         try:
             payload = await self._request_json(str(health_url),5.0,)

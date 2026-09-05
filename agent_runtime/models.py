@@ -87,7 +87,6 @@ class ModelRuntimeSpec:
 class ModelSpec:
     id: str
     provider: str
-    provider_model: str
     context_window: int
     supports_tools: bool
     supports_structured_output: bool
@@ -156,7 +155,10 @@ class ModelCatalog:
         try:
             return self._specs[model_id]
         except KeyError as exc:
-            raise UnknownModelAliasError(f"Model alias {model_id!r} not found in catalog") from exc
+            available = ", ".join(sorted(self._specs))
+            raise UnknownModelAliasError(
+                f"Model ID {model_id!r} not found in catalog. Available IDs: {available}"
+            ) from exc
 
     def has(self, model_id: str) -> bool:
         return model_id in self._specs
@@ -230,7 +232,7 @@ class SessionCommitOutcomeUnknown(CommitOutcomeUnknown):  # noqa: N818
 
 
 class ModelSessionStore:
-    """Crash-safe, compare-and-swap storage for one selected model alias."""
+    """Crash-safe, compare-and-swap storage for one selected model ID."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -491,7 +493,7 @@ class ModelControlPlane:
     ) -> None:
         if not catalog.has(state.current_model_id):
             raise UnknownModelAliasError(
-                f"Model alias {state.current_model_id!r} "
+                f"Model ID {state.current_model_id!r} "
                 "not found in catalog"
             )
 
@@ -1075,7 +1077,7 @@ def _load_session_state(
     if catalog.has(state.current_model_id):
         return state, ()
     if initial_model_id is not None or store is None:
-        raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
+        raise UnknownModelAliasError(f"Model ID {state.current_model_id!r} not found in catalog")
     stale_model_id = state.current_model_id
     policy.review_switch(
         catalog=catalog,
@@ -1129,7 +1131,6 @@ def _to_public_definition_spec(
     return ModelSpec(
         id=alias,
         provider=definition.provider_name or definition.provider.value,
-        provider_model=definition.model_id,
         context_window=definition.context_window_tokens,
         supports_tools=definition.supports_tools,
         supports_structured_output=definition.supports_structured_output,
@@ -1159,7 +1160,6 @@ def _to_public_spec(
     spec: InternalModelSpec,
 ) -> ModelSpec:
     provider = str(spec.provider_name or spec.provider)
-    provider_model = model_id
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,
@@ -1168,7 +1168,6 @@ def _to_public_spec(
     return ModelSpec(
         id=model_id,
         provider=provider,
-        provider_model=provider_model,
         context_window=int(spec.context_window_tokens),
         supports_tools=bool(spec.supports_tools),
         supports_structured_output=bool(spec.supports_structured_output),
@@ -1215,7 +1214,7 @@ def format_model_rows(
             cost = f"{spec.input_cost_per_1m or 0:g}/{spec.output_cost_per_1m or 0:g}"
         lines.append(
             f"{marker} {spec.id}  provider={spec.provider}  "
-            f"model={spec.provider_model}  ctx={spec.context_window}  "
+            f"ctx={spec.context_window}  "
             f"{spec.location}  caps={cap_text}  cost={cost}"
         )
     return lines

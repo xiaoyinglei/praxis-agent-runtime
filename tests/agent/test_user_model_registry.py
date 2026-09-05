@@ -46,7 +46,7 @@ def _store(tmp_path: Path, **updates: object) -> UserModelRegistryStore:
         "path": config / "models.yaml",
         "workspace": workspace,
         "worktree": workspace,
-        "built_in_aliases": {"builtin"},
+        "built_in_model_ids": {"builtin"},
         "whole_catalog_override_active": False,
     }
     values.update(updates)
@@ -195,6 +195,34 @@ def test_schema_normalized_mapping_omits_absent_values() -> None:
     assert "tokenizer_model" not in payload
     assert "api_key_env" not in payload
     assert "runtime" not in payload
+
+
+def test_registry_identity_is_only_the_models_mapping_key(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = UserModelRegistryStore(
+        path=tmp_path / "config" / "models.yaml",
+        workspace=workspace,
+        worktree=workspace,
+        built_in_model_ids=(),
+        whole_catalog_override_active=False,
+    )
+    result = store.add("org/model", _definition(), expected=store.read().version)
+
+    persisted = yaml.safe_load(store.path.read_text(encoding="utf-8"))
+    assert tuple(result.snapshot.document.models) == ("org/model",)
+    assert tuple(persisted["models"]) == ("org/model",)
+    assert "model" not in persisted["models"]["org/model"]
+
+
+def test_schema_rejects_nested_model_identity() -> None:
+    with pytest.raises(ValidationError):
+        UserModelDefinition.model_validate(
+            {
+                **_definition().to_persisted_mapping(),
+                "model": "second-identity",
+            }
+        )
 
 
 @pytest.mark.parametrize(
@@ -546,7 +574,7 @@ def _concurrent_add(
     path: str,
     workspace: str,
     expected: FileVersion,
-    alias: str,
+    model_id: str,
     start: multiprocessing.synchronize.Event,
     output: multiprocessing.queues.Queue,
 ) -> None:
@@ -554,12 +582,12 @@ def _concurrent_add(
         path=Path(path),
         workspace=Path(workspace),
         worktree=Path(workspace),
-        built_in_aliases=(),
+        built_in_model_ids=(),
         whole_catalog_override_active=False,
     )
     start.wait(timeout=10)
     try:
-        store.add(alias, _definition(), expected=expected)
+        store.add(model_id, _definition(), expected=expected)
     except ConfigVersionConflict:
         output.put("conflict")
     else:
@@ -567,7 +595,7 @@ def _concurrent_add(
 
 
 def test_two_processes_cannot_lose_an_update(tmp_path: Path) -> None:
-    store = _store(tmp_path, built_in_aliases=())
+    store = _store(tmp_path, built_in_model_ids=())
     expected = store.read().version
     context = multiprocessing.get_context("spawn")
     start = context.Event()
@@ -575,9 +603,9 @@ def test_two_processes_cannot_lose_an_update(tmp_path: Path) -> None:
     processes = [
         context.Process(
             target=_concurrent_add,
-            args=(str(store.path), str(tmp_path / "workspace"), expected, alias, start, output),
+            args=(str(store.path), str(tmp_path / "workspace"), expected, model_id, start, output),
         )
-        for alias in ("one", "two")
+        for model_id in ("one", "two")
     ]
     for process in processes:
         process.start()
