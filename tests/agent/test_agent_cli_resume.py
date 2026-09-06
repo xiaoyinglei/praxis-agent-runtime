@@ -160,7 +160,11 @@ def test_schema_v3_resume_reads_only_outer_model_id(
     assert restored.model is None
 
 
-def test_cli_resume_rejects_legacy_outer_model_alias(tmp_path: Path) -> None:
+@pytest.mark.parametrize("action", ["continue", "retry"])
+def test_cli_resume_rejects_legacy_outer_model_alias_for_provider_actions(
+    tmp_path: Path,
+    action: str,
+) -> None:
     database = tmp_path / "agent.sqlite"
     workspace = tmp_path / "workspace"
     turn_id = _persist_cli_turn(
@@ -173,8 +177,41 @@ def test_cli_resume_rejects_legacy_outer_model_alias(tmp_path: Path) -> None:
         cli.agent_resume(
             turn_id=turn_id,
             checkpoint_db=database,
-            action="continue",
+            action=action,
         )
+
+
+@pytest.mark.parametrize("use_last", [False, True])
+def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_last: bool,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="legacy paused turn",
+            binding_manifest={"model_alias": "removed-legacy-model"},
+        )
+        store.pause_turn(turn_id=turn.turn_id, reason="legacy turn needs cancellation")
+    monkeypatch.chdir(workspace)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.agent_resume(
+            turn_id=None if use_last else turn.turn_id,
+            last=use_last,
+            checkpoint_db=database,
+            action="abort",
+        )
+
+    assert exc_info.value.exit_code == 1
+    with RolloutStore(database) as store:
+        assert store.read_turn(turn.turn_id).status == "cancelled"
+        assert store.read_thread(thread.thread_id).active_turn_id is None
 
 
 @pytest.mark.anyio

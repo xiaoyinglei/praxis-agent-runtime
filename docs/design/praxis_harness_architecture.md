@@ -126,7 +126,7 @@ Turn 从用户输入开始；`paused`、`interrupted` 是仍占用 Thread active
 `completed`、`failed`、`cancelled`、`abandoned` 才是 terminal 状态。
 Turn 创建时冻结以下绑定：
 
-- model alias 和 provider wire revision；
+- model ID 和 provider wire revision；
 - workspace realpath；
 - permission/sandbox policy revision；
 - tool catalog 和 model-visible tool snapshot revision；
@@ -344,7 +344,7 @@ ModelClient 必须根据 durable usage 计算剩余量，并预留预计 input �
 刚好用尽时可接受刚收到的响应，但不得再启动下一次 provider 调用。
 
 Provider 模型调用不得承载不可逆业务副作用；所有外部动作仍必须回到 ToolOrchestrator。敏感 header、
-secret 和无界原始内容不得进入记录，大型内容通过 content hash/artifact 引用。无效模型别名在 provider
+secret 和无界原始内容不得进入记录，大型内容通过 content hash/artifact 引用。无效模型 ID 在 provider
 调用前失败，并保留旧 session 选择。
 
 ## 9. Tool ACI
@@ -812,7 +812,7 @@ ToolExecutionRecord、RuntimeBinding、消息和附件；只迁 TurnStore 不合
   两个 Thread 订阅者使用独立 opaque cursor，不互相吞事件；global tailer 仅使用 `after_record_id`。
 - **API-01**：run/chat/resume 的 Thread 与 Turn 语义不同且可观察。
 - **API-02**：CLI 与 SDK 的 status、pause、tool calls、usage、diagnostics 和 IDs 等价。
-- **API-03**：无效模型别名在 provider 前失败，列出可选项并保留旧选择。
+- **API-03**：无效模型 ID 在 provider 前失败，列出可选项并保留旧选择。
 - **API-04**：同一 Thread 的跨进程并发 Turn 创建只有一个成功；paused/running/interrupted Turn 均占用
   active slot 并阻止 follow-up，只有 durable resume/cancel/abandon 能推进或释放。
 - **API-05**：从非 head predecessor 继续会 fork 到准确历史截止点，不包含后续 Turn。

@@ -13,7 +13,7 @@ from agent_runtime.core.llm_config import (
 from agent_runtime.core.llm_config import (
     ModelSpec as InternalModelSpec,
 )
-from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel, UnknownModelIdError
+from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -1033,7 +1033,7 @@ def test_legacy_binding_replays_but_provider_resume_fails_closed(tmp_path: Path)
             )
 
 
-def test_removed_frozen_model_id_fails_before_provider_io(
+def test_removed_frozen_model_id_resumes_from_trusted_archive(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -1077,21 +1077,21 @@ def test_removed_frozen_model_id_fails_before_provider_io(
         instructions=("Answer directly.",),
     )
 
-    with pytest.raises(UnknownModelIdError, match="model-a"):
-        model.ensure_available(binding, thread_id="thread-1", turn_id="turn-1")
+    model.ensure_available(binding, thread_id="thread-1", turn_id="turn-1")
     with pytest.raises(BindingAuthenticationError, match="different Turn"):
         model.ensure_available(binding, thread_id="thread-2", turn_id="turn-2")
-    with pytest.raises(UnknownModelIdError, match="model-a"):
-        model.prepare(
-            HarnessModelRequest(
-                thread_id="thread-1",
-                turn_id="turn-1",
-                messages=(HarnessMessage(role="user", content="resume"),),
-                binding_manifest=binding,
-            )
-        )
 
-    assert frozen_gateway.requests == []
+    prepared = model.prepare(
+        HarnessModelRequest(
+            thread_id="thread-1",
+            turn_id="turn-1",
+            messages=(HarnessMessage(role="user", content="resume"),),
+            binding_manifest=binding,
+        )
+    )
+    asyncio.run(model.dispatch(prepared))
+
+    assert len(frozen_gateway.requests) == 1
 
 
 class AcceptAnswer:

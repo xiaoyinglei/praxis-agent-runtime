@@ -1015,11 +1015,26 @@ def _latest_cli_turn(
     workspace_path: Path | None,
 ) -> _CLITurn | None:
     with RolloutStore(checkpoint_db) as store:
-        return _latest_harness_turn(
+        turn = _latest_harness_turn(
             store,
             statuses={"paused"},
             workspace_path=workspace_path,
         )
+        return None if turn is None else _project_cli_turn(store, turn)
+
+
+def _latest_abortable_cli_turn(
+    checkpoint_db: Path,
+    *,
+    workspace_path: Path | None,
+) -> _CLITurn | None:
+    with RolloutStore(checkpoint_db) as store:
+        turn = _latest_harness_turn(
+            store,
+            statuses={"paused"},
+            workspace_path=workspace_path,
+        )
+        return None if turn is None else _project_abortable_cli_turn(store, turn)
 
 
 def _latest_completed_cli_turn(
@@ -1028,11 +1043,12 @@ def _latest_completed_cli_turn(
     workspace_path: Path | None,
 ) -> _CLITurn | None:
     with RolloutStore(checkpoint_db) as store:
-        return _latest_harness_turn(
+        turn = _latest_harness_turn(
             store,
             statuses={"completed", "failed", "cancelled"},
             workspace_path=workspace_path,
         )
+        return None if turn is None else _project_cli_turn(store, turn)
 
 
 def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
@@ -1044,12 +1060,21 @@ def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
         return _project_cli_turn(store, turn)
 
 
+def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
+    with RolloutStore(checkpoint_db) as store:
+        try:
+            turn = store.read_turn(turn_id)
+        except KeyError as exc:
+            raise KeyError(f"Turn not found: {turn_id}") from exc
+        return _project_abortable_cli_turn(store, turn)
+
+
 def _latest_harness_turn(
     store: RolloutStore,
     *,
     statuses: set[str],
     workspace_path: Path | None,
-) -> _CLITurn | None:
+) -> TurnSnapshot | None:
     expected_workspace = (
         None if workspace_path is None else workspace_path.expanduser().resolve()
     )
@@ -1062,7 +1087,7 @@ def _latest_harness_turn(
             and Path(thread.workspace).resolve() != expected_workspace
         ):
             continue
-        return _project_cli_turn(store, turn)
+        return turn
     return None
 
 
@@ -1084,6 +1109,22 @@ def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
             model_id=model_id if isinstance(model_id, str) else None,
             workspace_path=thread.workspace,
             knowledge=knowledge,
+        ),
+    )
+
+
+def _project_abortable_cli_turn(
+    store: RolloutStore,
+    turn: TurnSnapshot,
+) -> _CLITurn:
+    thread = store.read_thread(turn.thread_id)
+    return _CLITurn(
+        turn_id=turn.turn_id,
+        status=turn.status,
+        runtime=_CLIRuntimeBinding(
+            model_id=None,
+            workspace_path=thread.workspace,
+            knowledge=None,
         ),
     )
 
@@ -1155,7 +1196,8 @@ def agent_chat(
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
         raise typer.BadParameter(
-            "继续已有 Turn 时不能传 --model；模型已由前一个 Turn 绑定"
+            "--previous-turn-id 仅继承上下文；新 Turn 使用当前 session 模型。"
+            "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     if effective_previous_turn_id is not None and continued_turn is None:
         continued_turn = _cli_turn(checkpoint_db, effective_previous_turn_id)
@@ -1288,7 +1330,8 @@ def agent_run(
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
         raise typer.BadParameter(
-            "继续已有 Turn 时不能传 --model；模型已由前一个 Turn 绑定"
+            "--previous-turn-id 仅继承上下文；新 Turn 使用当前 session 模型。"
+            "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     facade = _create_agent_facade(
         model=model,
@@ -1381,9 +1424,16 @@ def agent_resume(
         raise typer.BadParameter("--all 只能与 --last 一起使用")
     effective_turn_id = turn_id
     if last:
-        latest = _latest_cli_turn(
-            checkpoint_db,
-            workspace_path=None if all_workspaces else Path.cwd(),
+        latest = (
+            _latest_abortable_cli_turn(
+                checkpoint_db,
+                workspace_path=None if all_workspaces else Path.cwd(),
+            )
+            if action == "abort"
+            else _latest_cli_turn(
+                checkpoint_db,
+                workspace_path=None if all_workspaces else Path.cwd(),
+            )
         )
         if latest is None:
             scope = "所有工作区" if all_workspaces else "当前工作区"
@@ -1394,7 +1444,11 @@ def agent_resume(
         raise typer.Exit(code=2)
     if action is None and user_input is not None:
         raise typer.BadParameter("--input 需要同时指定 --action")
-    turn_metadata = _cli_turn(checkpoint_db, effective_turn_id)
+    turn_metadata = (
+        _abortable_cli_turn(checkpoint_db, effective_turn_id)
+        if action == "abort"
+        else _cli_turn(checkpoint_db, effective_turn_id)
+    )
     facade = _create_agent_facade(
         model=None,
         checkpoint_db=checkpoint_db,

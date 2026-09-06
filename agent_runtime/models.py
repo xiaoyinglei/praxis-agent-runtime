@@ -971,8 +971,6 @@ class ModelControlPlane:
             envelope["model_id"],
         )
 
-        self.catalog.get(model_id)
-
         requester = (
             validate_model_switch_requester(
                 association[
