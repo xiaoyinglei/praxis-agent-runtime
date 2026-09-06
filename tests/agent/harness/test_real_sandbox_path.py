@@ -25,7 +25,7 @@ from agent_runtime.workspace import open_workspace
 
 class SandboxCommandModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "sandbox-model", "model_revision": "sandbox-v1"}
+        return {"model_id": "sandbox-model", "model_revision": "sandbox-v1"}
 
     def ensure_available(
         self,

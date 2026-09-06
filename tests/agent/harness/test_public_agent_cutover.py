@@ -28,7 +28,7 @@ from agent_runtime.streaming.sink import TurnEventDispatcher
 class PublicHarnessModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": "public-harness-model",
+            "model_id": "public-harness-model",
             "model_revision": "public-harness-v1",
         }
 
@@ -237,7 +237,7 @@ async def test_public_followup_restores_disabled_workspace_mcp_from_runtime_bind
 class PatchThenAnswerModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": "patch-model",
+            "model_id": "patch-model",
             "model_revision": "patch-model-v1",
         }
 

@@ -66,17 +66,17 @@ class GatewayHarnessModel:
     def __init__(
         self,
         *,
-        model_alias: str,
+        model_id: str,
         resolved: ResolvedModel,
         instructions: tuple[str, ...],
     ) -> None:
-        if not model_alias:
-            raise ValueError("model_alias must be non-empty")
+        if not model_id:
+            raise ValueError("model_id must be non-empty")
         if not instructions:
             raise ValueError("instructions must be non-empty")
         if resolved.gateway is None:
             raise ValueError("resolved model must provide an LLMGateway")
-        self._model_alias = model_alias
+        self._model_id = model_id
         self._resolved = resolved
         self._instructions = instructions
 
@@ -141,7 +141,7 @@ class GatewayHarnessModel:
             tool_hash=tool_hash,
             wire_hash=wire_hash,
             request_ref={
-                "model_alias": self._model_alias,
+                "model_id": self._model_id,
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
                 "toolset_revision": canonical_request.toolset_revision,
@@ -319,11 +319,11 @@ class ControlPlaneHarnessModel:
         envelope = binding["binding"]
         if not isinstance(envelope, Mapping):
             raise RuntimeError("validated model binding envelope changed type")
-        alias = envelope["alias"]
-        if not isinstance(alias, str):
-            raise RuntimeError("validated model alias changed type")
+        model_id = envelope["model_id"]
+        if not isinstance(model_id, str):
+            raise RuntimeError("validated model ID changed type")
         return GatewayHarnessModel(
-            model_alias=alias,
+            model_id=model_id,
             resolved=resolved,
             instructions=self._instructions,
         ).prepare(request)
@@ -351,7 +351,7 @@ class ControlPlaneHarnessModel:
         if not isinstance(payload, _GatewayDispatch):
             raise TypeError("prepared call does not belong to ControlPlaneHarnessModel")
         return await GatewayHarnessModel(
-            model_alias=str(prepared.request_ref["model_alias"]),
+            model_id=str(prepared.request_ref["model_id"]),
             resolved=payload.resolved,
             instructions=self._instructions,
         ).dispatch(prepared, delta_sink=delta_sink)
@@ -360,6 +360,7 @@ class ControlPlaneHarnessModel:
 _AUTHENTICATED_MODEL_BINDING_FIELDS = frozenset(
     {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -378,10 +379,14 @@ def _authenticated_model_binding(
         raise RuntimeError(
             "legacy model binding is incomplete and cannot be resumed safely"
         )
-    missing = _AUTHENTICATED_MODEL_BINDING_FIELDS.difference(manifest)
+    if "model_alias" in manifest:
+        raise ValueError("legacy outer model_alias is unsupported")
+    observed = set(manifest)
+    missing = _AUTHENTICATED_MODEL_BINDING_FIELDS.difference(observed)
     if missing:
         raise ValueError(
-            "Turn binding is missing authenticated model fields: " + ", ".join(sorted(missing))
+            "Turn binding is missing authenticated model fields: "
+            + ", ".join(sorted(missing))
         )
     return cast(
         dict[str, JsonValue],
@@ -492,7 +497,7 @@ def _model_resource_request(
             raise RuntimeError("token accounting returned an invalid input count")
         input_tokens = measured
 
-    max_output_tokens = settings.max_output_tokens or 0
+    max_output_tokens: int | None = settings.max_output_tokens or 0
     max_input_tokens: int | None = None
     gateway = resolved.gateway
     effective_budget = getattr(gateway, "effective_stage_budget", None)

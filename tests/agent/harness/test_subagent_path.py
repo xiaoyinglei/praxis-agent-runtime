@@ -22,7 +22,7 @@ class ParentChildModel:
         self.requests: list[HarnessModelRequest] = []
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "parent-child-model", "model_revision": "v1"}
+        return {"model_id": "parent-child-model", "model_revision": "v1"}
 
     def ensure_available(
         self,

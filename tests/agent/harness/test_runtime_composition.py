@@ -21,7 +21,7 @@ from agent_runtime.harness import (
 
 class PlainModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "test-model", "model_revision": "test-model-v1"}
+        return {"model_id": "test-model", "model_revision": "test-model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(request.messages[-1].content.encode()).hexdigest()
@@ -62,7 +62,7 @@ def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> Non
 
         assert result.answer == "composed answer"
         binding = runtime.store.read_turn(result.turn_id).binding_manifest
-        assert binding["model_alias"] == "test-model"
+        assert binding["model_id"] == "test-model"
         assert binding["model_revision"] == "test-model-v1"
         assert binding["toolset_revision"] == toolset_revision_for_tools(())
         assert binding["tool_execution_revisions"] == {}
@@ -95,7 +95,7 @@ def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) ->
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="canonical",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         item = store.list_items(turn.turn_id)[0]
     with sqlite3.connect(database) as connection:

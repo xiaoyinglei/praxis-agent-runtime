@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class _CLIRuntimeBinding:
-    model_alias: str | None
+    model_id: str | None
     workspace_path: str
     knowledge: RAGKnowledgeConfig | None
 
@@ -475,8 +475,8 @@ async def _pending_resume_request(
         display.finish()
 
 
-def _print_startup_banner(model_alias: str) -> None:
-    print(f"Agent 就绪 (模型: {model_alias})")
+def _print_startup_banner(model_id: str) -> None:
+    print(f"Agent 就绪 (模型: {model_id})")
     print("输入查询，或输入 /help 查看交互命令。")
     print()
 
@@ -506,8 +506,8 @@ async def _chat_facade_loop(
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
     chat_workspace = default_chat_workspace
-    model_alias = facade.current_model().id
-    _print_startup_banner(model_alias)
+    model_id = facade.current_model().id
+    _print_startup_banner(model_id)
     while True:
         try:
             query = composer.prompt("> ").strip()
@@ -523,14 +523,14 @@ async def _chat_facade_loop(
             continue
         if query == "/status":
             print(f"Previous Turn: {current_turn_id or '(none)'}")
-            print(f"模型: {model_alias}")
+            print(f"模型: {model_id}")
             print(f"工作区: {chat_workspace}")
             print(f"详细输出: {'开' if verbose else '关'}")
             continue
         if query in {"/new", "/clear"}:
             current_turn_id = None
             chat_workspace = default_chat_workspace
-            model_alias = facade.current_model().id
+            model_id = facade.current_model().id
             print("下一条消息将使用空历史。")
             continue
         if query == "/verbose":
@@ -543,7 +543,7 @@ async def _chat_facade_loop(
                 query,
                 agent=facade,
             )
-            model_alias = facade.current_model().id
+            model_id = facade.current_model().id
             continue
         if query.startswith("/"):
             print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
@@ -1068,11 +1068,9 @@ def _latest_harness_turn(
 
 def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
-    alias = (
-        None
-        if "authentication_schema_version" in turn.binding_manifest
-        else turn.binding_manifest.get("model_alias")
-    )
+    if "model_alias" in turn.binding_manifest:
+        raise RuntimeError("legacy model_alias binding is unsupported")
+    model_id = turn.binding_manifest.get("model_id")
     knowledge_value = turn.binding_manifest.get("knowledge_config")
     knowledge = (
         RAGKnowledgeConfig.model_validate(knowledge_value)
@@ -1083,7 +1081,7 @@ def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
         turn_id=turn.turn_id,
         status=turn.status,
         runtime=_CLIRuntimeBinding(
-            model_alias=alias if isinstance(alias, str) else None,
+            model_id=model_id if isinstance(model_id, str) else None,
             workspace_path=thread.workspace,
             knowledge=knowledge,
         ),
@@ -1167,7 +1165,7 @@ def agent_chat(
         facade_knowledge = _load_knowledge_config(knowledge_config)
     else:
         binding = continued_turn.runtime
-        facade_model = binding.model_alias
+        facade_model = None
         facade_workspace = binding.workspace_path or Path.cwd()
         facade_knowledge = binding.knowledge
     facade = _create_agent_facade(

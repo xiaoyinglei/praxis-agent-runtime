@@ -44,7 +44,7 @@ class FakeSkillRuntime:
 
 class SkillAssetModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "skill-model", "model_revision": "v1"}
+        return {"model_id": "skill-model", "model_revision": "v1"}
 
     def ensure_available(
         self,

@@ -24,7 +24,7 @@ from agent_runtime.tools.permissions import ToolExecutionContext
 
 class KnowledgeModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "knowledge-model", "model_revision": "model-v1"}
+        return {"model_id": "knowledge-model", "model_revision": "model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"step:{request.step}".encode()).hexdigest()

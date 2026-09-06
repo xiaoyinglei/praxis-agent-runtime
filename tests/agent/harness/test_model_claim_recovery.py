@@ -20,7 +20,7 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="answer once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     prepared = Barrier(2)
 
@@ -75,7 +75,7 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
         turn = first.start_turn(
             thread_id=thread.thread_id,
             user_message="answer once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation = first.prepare_model_operation(
             turn_id=turn.turn_id,

@@ -36,7 +36,7 @@ _PLAN_ARGUMENTS = {
 
 class _UpdatePlanThenAnswerModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "plan-test", "model_revision": "v1"}
+        return {"model_id": "plan-test", "model_revision": "v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(

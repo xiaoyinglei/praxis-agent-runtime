@@ -20,7 +20,7 @@ def _turn(store: RolloutStore, workspace: Path) -> str:
     return store.start_turn(
         thread_id=thread.thread_id,
         user_message="retain one binary artifact",
-        binding_manifest={"model_alias": "test-model"},
+        binding_manifest={"model_id": "test-model"},
     ).turn_id
 
 

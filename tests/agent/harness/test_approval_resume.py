@@ -46,7 +46,7 @@ class WriteThenAnswerModel:
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         self.snapshot_calls += 1
-        return {"model_alias": "write-model", "model_revision": "write-model-v1"}
+        return {"model_id": "write-model", "model_revision": "write-model-v1"}
 
     def ensure_available(
         self,

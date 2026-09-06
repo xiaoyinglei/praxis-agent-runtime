@@ -9,7 +9,7 @@ from agent_runtime.models import ModelControlPlane
 
 def build_model_control_plane(
     *,
-    model_alias: str | None = None,
+    model_id: str | None = None,
     session_path: Path | None = None,
     workspace: Path | None = None,
 ) -> ModelControlPlane:
@@ -18,7 +18,7 @@ def build_model_control_plane(
     ).expanduser().resolve()
 
     return ModelControlPlane.from_env(
-        initial_model_id=model_alias,
+        initial_model_id=model_id,
         session_path=session_path,
         workspace=resolved_workspace,
         worktree=discover_git_worktree(

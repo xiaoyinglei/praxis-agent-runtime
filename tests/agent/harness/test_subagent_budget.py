@@ -23,7 +23,7 @@ from agent_runtime.harness import (
 class FixedBindingProvider:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, object]:
         return {
-            "model_alias": "test-model",
+            "model_id": "test-model",
             "thread_id": thread_id,
             "turn_id": turn_id,
             "model_step_budget": 4,
@@ -116,7 +116,7 @@ def _running_parent(
         turn_id=turn_id,
         user_message="parent task",
         binding_manifest={
-            "model_alias": "test-model",
+            "model_id": "test-model",
             "model_step_budget": 8,
             "model_token_budget_total": token_budget,
             "budget_root_turn_id": turn_id,

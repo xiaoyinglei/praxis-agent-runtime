@@ -148,7 +148,8 @@ async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
     database = tmp_path / "rollout.sqlite3"
 
     frozen_binding = {
-    "authentication_schema_version": 1,
+    "authentication_schema_version": 2,
+    "model_id": "frozen-model",
     "test_marker": "frozen-binding",}
 
     with RolloutStore(database) as store:

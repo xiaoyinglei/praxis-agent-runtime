@@ -117,7 +117,7 @@ def test_read_only_tool_operation_is_durable_before_runner_io(tmp_path: Path) ->
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="read a file",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         registry = ToolRegistry()
         registry.register(_read_tool(store, workspace))
@@ -205,7 +205,7 @@ async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="approve one write",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         orchestrator = ToolOrchestrator(
             store=store,
@@ -302,7 +302,7 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="stream tool progress",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         orchestrator = ToolOrchestrator(
             store=store,
@@ -384,7 +384,7 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="run one command",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         orchestrator = ToolOrchestrator(
             store=store,
@@ -446,7 +446,7 @@ async def test_inspection_budget_forces_a_concrete_action_after_twelve_reads(
             thread_id=thread.thread_id,
             user_message="fix the implementation",
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
                 "completion_policy": {"require_workspace_change": True},
             },
         )
@@ -516,7 +516,7 @@ async def test_inspection_budget_counts_read_only_process_tools_by_effect(
             thread_id=thread.thread_id,
             user_message="fix the implementation",
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
                 "completion_policy": {"require_workspace_change": True},
             },
         )
@@ -610,7 +610,7 @@ async def test_read_only_turn_does_not_enforce_delivery_inspection_budget(
             thread_id=thread.thread_id,
             user_message="analyze the implementation",
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
                 "completion_policy": {"require_workspace_change": False},
             },
         )
@@ -678,7 +678,7 @@ def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
             user_message="read once after recovery",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         crashed_process.record_tool_call(
             turn_id=turn.turn_id,
@@ -767,7 +767,7 @@ def test_normalization_failure_preserves_runner_success_and_never_replays_side_e
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="run once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         orchestrator = ToolOrchestrator(
             store=store,
@@ -814,7 +814,7 @@ class ToolThenAnswerModel:
         self.requests: list[HarnessModelRequest] = []
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "tool-model", "model_revision": "tool-model-v1"}
+        return {"model_id": "tool-model", "model_revision": "tool-model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         self.requests.append(request)
@@ -917,7 +917,7 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
         thread_id = result.thread_id
 
     provider_model = GatewayHarnessModel(
-        model_alias="tool-model",
+        model_id="tool-model",
         resolved=ResolvedModel(
             generator=object(),
             gateway=object(),  # prepare-only fixture; no provider dispatch occurs
@@ -940,7 +940,7 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
             thread_id=thread_id,
             turn_id=result.turn_id,
             messages=messages_before,
-            binding_manifest={"model_alias": "tool-model"},
+            binding_manifest={"model_id": "tool-model"},
         )
     )
     with RolloutStore(database) as reopened:
@@ -950,7 +950,7 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
                 thread_id=thread_id,
                 turn_id=result.turn_id,
                 messages=messages_after,
-                binding_manifest={"model_alias": "tool-model"},
+                binding_manifest={"model_id": "tool-model"},
             )
         )
 
@@ -1008,7 +1008,7 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="invoke remote operation once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         orchestrator = ToolOrchestrator(
             store=store,

@@ -27,13 +27,13 @@ def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> 
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="first question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="first answer")
         second = store.start_turn(
             thread_id=thread.thread_id,
             user_message="follow up",
-            binding_manifest={"model_alias": "model-v2"},
+            binding_manifest={"model_id": "model-v2"},
         )
 
         messages = RolloutContextManager(store).build(second.turn_id)
@@ -56,7 +56,7 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="x" * 200,
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
 
         with pytest.raises(ContextBudgetExceededError, match="single Item"):
@@ -71,7 +71,7 @@ def test_context_manager_enforces_total_bytes_and_message_count(tmp_path: Path) 
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="a" * 80,
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.record_migrated_context_item(
             turn_id=turn.turn_id,
@@ -99,7 +99,7 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="inspect",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.record_migrated_context_item(
             turn_id=turn.turn_id,
@@ -188,13 +188,13 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="old question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="old answer")
         second = store.start_turn(
             thread_id=thread.thread_id,
             user_message="current question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         manager = RolloutContextManager(store)
         original_items = store.list_context_items(second.turn_id)
@@ -241,7 +241,7 @@ def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="current question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
             input_files=({"workspace_path": "input.txt", "sha256": "b" * 64},),
         )
         items = store.list_context_items(turn.turn_id)

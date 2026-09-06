@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 @dataclass
 class LazyRAGKnowledgeProvider:
     config: RAGKnowledgeConfig
-    model_alias: str | None = None
+    model_id: str | None = None
     vector_dsn: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -96,7 +96,7 @@ class LazyRAGKnowledgeProvider:
 
         runtime, diagnostics = _build_optional_rag_runtime(
             config=self.config,
-            model_alias=self.model_alias,
+            model_id=self.model_id,
             vector_dsn=self.vector_dsn,
         )
         self._diagnostics = tuple(diagnostics)
@@ -119,7 +119,7 @@ class LazyRAGKnowledgeProvider:
 def _build_optional_rag_runtime(
     *,
     config: RAGKnowledgeConfig,
-    model_alias: str | None,
+    model_id: str | None,
     vector_dsn: str | None,
 ) -> tuple[RAGRuntime | None, tuple[RuntimeDiagnostic, ...]]:
     try:
@@ -132,7 +132,7 @@ def _build_optional_rag_runtime(
 
         runtime_config = resolve_runtime_config(
             RuntimeOverrides(
-                model_alias=model_alias,
+                model_alias=model_id,
                 embedding_model_alias=config.embedding_model,
                 reranker_model_alias=config.reranker_model or "none",
             )

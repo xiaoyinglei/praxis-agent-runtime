@@ -61,7 +61,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
         previous = store.start_turn(
             thread_id=thread.thread_id,
             user_message="first",
-            binding_manifest={"model_alias": "fake-model"},
+            binding_manifest={"model_id": "fake-model"},
         )
         previous = store.complete_turn(
             turn_id=previous.turn_id,
@@ -270,7 +270,7 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
 
 
 @pytest.mark.anyio
-async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_turn(
+async def test_invalid_model_id_keeps_current_lists_ids_and_starts_no_turn(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

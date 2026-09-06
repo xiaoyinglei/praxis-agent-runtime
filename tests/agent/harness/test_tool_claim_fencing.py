@@ -94,7 +94,7 @@ def test_tool_success_faults_are_atomic_at_every_substep(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="commit tool success atomically",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation_id = _ready_operation(store, turn.turn_id)
         claim = store.claim_tool_operation(
@@ -144,7 +144,7 @@ def test_stale_fencing_token_appends_nothing_and_releases_no_foreign_claim(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="write once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation_id = _ready_operation(store, turn.turn_id)
         claim = store.claim_tool_operation(
@@ -187,7 +187,7 @@ def test_conflicting_resource_claims_are_serialized_across_threads(
             store.start_turn(
                 thread_id=store.create_thread(workspace=workspace).thread_id,
                 user_message=f"writer {index}",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
             for index in range(2)
         ]
@@ -258,7 +258,7 @@ def test_compatible_read_claims_can_overlap_on_the_same_resource(
             turn = store.start_turn(
                 thread_id=store.create_thread(workspace=workspace).thread_id,
                 user_message=f"reader {index}",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
             operation_id = f"read-op-{index}"
             operation_ids.append(operation_id)
@@ -361,7 +361,7 @@ def test_conflicting_orchestrator_never_enters_the_second_runner(
             setup.start_turn(
                 thread_id=setup.create_thread(workspace=workspace).thread_id,
                 user_message=owner,
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
             for owner in ("first", "second")
         ]
@@ -430,7 +430,7 @@ def test_fresh_store_recovers_expired_running_operation_to_unknown_pause(
         turn = first.start_turn(
             thread_id=thread.thread_id,
             user_message="write once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation_id = _ready_operation(first, turn.turn_id)
         first.claim_tool_operation(
@@ -467,7 +467,7 @@ def test_trusted_reconciler_commits_unknown_success_without_replaying_runner(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="reconcile once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation_id = _ready_operation(store, turn.turn_id)
         store.claim_tool_operation(
@@ -537,7 +537,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
         turn = setup.start_turn(
             thread_id=thread.thread_id,
             user_message="read once",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
 
     started = Event()

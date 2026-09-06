@@ -552,7 +552,7 @@ class Agent:
 
             provider = LazyRAGKnowledgeProvider(
                 config=self.knowledge,
-                model_alias=self.model,
+                model_id=self.model,
                 vector_dsn=os.environ.get("AGENT_VECTOR_DSN"),
             )
             knowledge_runner = provider.search_knowledge

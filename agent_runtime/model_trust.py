@@ -43,8 +43,8 @@ _TRUST_FILE_LIMIT = 4096
 _DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 _REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SIGNATURE_PATTERN = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
-_BINDING_SCHEMA_VERSION = 2
-_AUTHENTICATION_SCHEMA_VERSION = 1
+_BINDING_SCHEMA_VERSION = 3
+_AUTHENTICATION_SCHEMA_VERSION = 2
 
 
 class TrustDomainNotInitializedError(RuntimeError):
@@ -348,7 +348,7 @@ def _normalize_definition(definition: ModelExecutionDefinition) -> ModelExecutio
 
 def build_model_binding_envelope(
     *,
-    alias: str,
+    model_id: str,
     origin: str,
     definition: ModelExecutionDefinition,
     policy_revision: str,
@@ -358,7 +358,7 @@ def build_model_binding_envelope(
     normalized = _normalize_definition(definition)
     envelope: dict[str, JsonValue] = {
         "schema_version": _BINDING_SCHEMA_VERSION,
-        "alias": alias,
+        "model_id": model_id,
         "origin": origin,
         "definition_revision": normalized.definition_revision,
         "definition": cast(
@@ -382,8 +382,13 @@ def build_model_binding_association(
 ) -> dict[str, JsonValue]:
     """Build the exact identity association accepted by the trust domain."""
 
+    _validate_binding_envelope(binding)
+    model_id = binding["model_id"]
+    if type(model_id) is not str:
+        raise BindingAuthenticationError("model binding model ID is invalid")
     association: dict[str, JsonValue] = {
         "authentication_schema_version": _AUTHENTICATION_SCHEMA_VERSION,
+        "model_id": model_id,
         "trust_domain_id": status.trust_domain_id,
         "signing_key_id": status.signing_key_id,
         "thread_id": thread_id,
@@ -428,6 +433,7 @@ def _validated_association_bytes(
     document = dict(association)
     required = {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -466,6 +472,11 @@ def _validated_association_bytes(
     if not isinstance(binding, Mapping):
         raise BindingAuthenticationError("model binding envelope must be a mapping")
     _validate_binding_envelope(binding)
+    model_id = document["model_id"]
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
+        raise BindingAuthenticationError("model binding model ID is invalid")
+    if binding["model_id"] != model_id:
+        raise BindingAuthenticationError("model binding model ID does not match envelope")
     try:
         return canonical_json_text(cast(JsonValue, document)).encode("utf-8")
     except (TypeError, ValueError) as error:
@@ -478,7 +489,7 @@ def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
     document = dict(binding)
     required = {
         "schema_version",
-        "alias",
+        "model_id",
         "origin",
         "definition_revision",
         "definition",
@@ -491,9 +502,9 @@ def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
         "schema_version"
     ] != _BINDING_SCHEMA_VERSION:
         raise BindingAuthenticationError("model binding schema is unsupported")
-    alias = document["alias"]
-    if type(alias) is not str or not alias or alias != alias.strip():
-        raise BindingAuthenticationError("model binding alias is invalid")
+    model_id = document["model_id"]
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
+        raise BindingAuthenticationError("model binding model ID is invalid")
     origin = document["origin"]
     if type(origin) is not str or origin not in ("builtin", "user", "override"):
         raise BindingAuthenticationError("model binding origin is invalid")

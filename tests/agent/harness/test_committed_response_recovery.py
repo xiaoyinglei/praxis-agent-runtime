@@ -118,7 +118,7 @@ class AcceptRecoveredAnswer:
 
 class FrozenBinding:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, object]:
-        return {"model_alias": "model-v1", "model_step_budget": 2}
+        return {"model_id": "model-v1", "model_step_budget": 2}
 
 
 class CrashBeforeToolResultStore(RolloutStore):
@@ -145,7 +145,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
             user_message="read README",
-            binding_manifest={"model_alias": "model-v1", "model_step_budget": 2},
+            binding_manifest={"model_id": "model-v1", "model_step_budget": 2},
         )
         operation = crashed_process.prepare_model_operation(
             turn_id=turn.turn_id,
@@ -262,7 +262,7 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
             user_message="read once",
-            binding_manifest={"model_alias": "model-v1", "model_step_budget": 2},
+            binding_manifest={"model_id": "model-v1", "model_step_budget": 2},
         )
         model_operation = crashed_process.prepare_model_operation(
             turn_id=turn.turn_id,

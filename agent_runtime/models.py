@@ -58,6 +58,7 @@ _MISSING_SESSION_FINGERPRINT = "missing"
 _MODEL_BINDING_FIELDS = frozenset(
     {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -419,16 +420,16 @@ class ModelPolicy:
     def review_binding(
         self,
         *,
-        alias: str,
+        model_id: str,
         definition: ModelExecutionDefinition,
         requested_by: ModelSwitchRequester,
     ) -> ModelExecutionDefinition:
         requested_by = validate_model_switch_requester(requested_by)
-        if type(alias) is not str or not alias or alias != alias.strip():
-            raise ModelPolicyError("Frozen model alias is invalid")
+        if type(model_id) is not str or not model_id or model_id != model_id.strip():
+            raise ModelPolicyError("Frozen model ID is invalid")
         allowed = self._allowed_ids_for(requested_by)
-        if allowed is not None and alias not in allowed:
-            raise ModelPolicyError(f"Model {alias!r} is not allowed for {requested_by} requests")
+        if allowed is not None and model_id not in allowed:
+            raise ModelPolicyError(f"Model {model_id!r} is not allowed for {requested_by} requests")
         try:
             normalized = ModelExecutionDefinition.model_validate(
                 definition.model_dump(mode="python", exclude_none=False)
@@ -747,11 +748,11 @@ class ModelControlPlane:
         archive = self._definition_archive
         if trust is None or archive is None:
             raise RuntimeError("model binding trust services are not configured")
-        alias = self.state.current_model_id
+        model_id = self.state.current_model_id
         requester = self.state.selection_requester
         definition = self.policy.review_binding(
-            alias=alias,
-            definition=self.catalog.definition(alias),
+            model_id=model_id,
+            definition=self.catalog.definition(model_id),
             requested_by=requester,
         )
         status = trust.status()
@@ -759,8 +760,8 @@ class ModelControlPlane:
         if revision != definition.definition_revision:
             raise RuntimeError("trusted model definition archive returned a mismatched revision")
         envelope = build_model_binding_envelope(
-            alias=alias,
-            origin=self.catalog.origin(alias),
+            model_id=model_id,
+            origin=self.catalog.origin(model_id),
             definition=definition,
             policy_revision=self.policy.revision,
         )
@@ -781,7 +782,7 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ResolvedModel:
-        alias, reviewed = (
+        model_id, reviewed = (
             self._review_frozen_binding(
                 binding,
                 thread_id=thread_id,
@@ -802,7 +803,7 @@ class ModelControlPlane:
             )
 
         spec = _to_public_definition_spec(
-            alias,
+            model_id,
             reviewed,
         )
         self._ensure_model_credentials(
@@ -846,6 +847,10 @@ class ModelControlPlane:
             raise BindingAuthenticationError(
                 "frozen model binding must "
                 "be a mapping"
+            )
+        if "model_alias" in binding:
+            raise BindingAuthenticationError(
+                "legacy outer model_alias is unsupported"
             )
 
         missing = (
@@ -961,10 +966,12 @@ class ModelControlPlane:
                 "does not match the trusted archive"
             )
 
-        alias = cast(
+        model_id = cast(
             str,
-            envelope["alias"],
+            envelope["model_id"],
         )
+
+        self.catalog.get(model_id)
 
         requester = (
             validate_model_switch_requester(
@@ -975,12 +982,12 @@ class ModelControlPlane:
         )
 
         reviewed = self.policy.review_binding(
-            alias=alias,
+            model_id=model_id,
             definition=archived,
             requested_by=requester,
         )
 
-        return alias, reviewed
+        return model_id, reviewed
 
     def model_spec_for_frozen_binding(
         self,
@@ -989,7 +996,7 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ModelSpec:
-        alias, reviewed = (
+        model_id, reviewed = (
             self._review_frozen_binding(
                 binding,
                 thread_id=thread_id,
@@ -998,7 +1005,7 @@ class ModelControlPlane:
         )
 
         return _to_public_definition_spec(
-            alias,
+            model_id,
             reviewed,
         )
 
@@ -1125,7 +1132,7 @@ def _validate_binding_identity(value: object, *, field_name: str) -> None:
 
 
 def _to_public_definition_spec(
-    alias: str,
+    model_id: str,
     definition: ModelExecutionDefinition,
 ) -> ModelSpec:
     runtime = definition.runtime
@@ -1133,7 +1140,7 @@ def _to_public_definition_spec(
     if location is None:
         raise ValueError("frozen model definition has no normalized location")
     return ModelSpec(
-        id=alias,
+        id=model_id,
         provider=definition.provider_name or definition.provider.value,
         context_window=definition.context_window_tokens,
         supports_tools=definition.supports_tools,

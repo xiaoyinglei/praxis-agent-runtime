@@ -13,7 +13,7 @@ from agent_runtime.core.llm_config import (
 from agent_runtime.core.llm_config import (
     ModelSpec as InternalModelSpec,
 )
-from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
+from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel, UnknownModelIdError
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
@@ -196,7 +196,7 @@ class NonStreamingProvider:
 class BoundGatewayHarnessModel(GatewayHarnessModel):
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": "test-model",
+            "model_id": "test-model",
             "model_revision": "native-delta-v1",
         }
 
@@ -348,7 +348,7 @@ def test_model_settings_preserve_unknown_model_output_limit() -> None:
     )
 
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=resolved,
         instructions=("Answer directly.",),
     )
@@ -364,7 +364,7 @@ def test_model_settings_preserve_unknown_model_output_limit() -> None:
                 ),
             ),
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
             },
         )
     )
@@ -382,7 +382,7 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
     temperature=0.0,
 )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=resolved,
         instructions=("Answer the user directly.",),
     )
@@ -390,7 +390,7 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
         thread_id="thread-1",
         turn_id="turn-1",
         messages=(HarnessMessage(role="user", content="hello"),),
-        binding_manifest={"model_alias": "test-model"},
+        binding_manifest={"model_id": "test-model"},
     )
 
     prepared = model.prepare(request)
@@ -400,7 +400,8 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
     assert len(prepared.context_hash) == 64
     assert len(prepared.tool_hash) == 64
     assert prepared.wire_hash.startswith("wire_")
-    assert prepared.request_ref["model_alias"] == "test-model"
+    assert prepared.request_ref["model_id"] == "test-model"
+    assert "model_alias" not in prepared.request_ref
 
     response = asyncio.run(model.dispatch(prepared))
 
@@ -420,7 +421,7 @@ def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> No
     temperature=0.0,
 )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=resolved,
         instructions=("Answer the user directly.",),
     )
@@ -429,7 +430,7 @@ def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> No
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(HarnessMessage(role="user", content="hello"),),
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     )
 
@@ -450,7 +451,7 @@ async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
     workspace.mkdir()
     gateway = NativeTextDeltaGateway()
     model = BoundGatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
             gateway=gateway,
             max_output_tokens=256,
@@ -508,7 +509,7 @@ async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
     workspace.mkdir()
     gateway = NativeReasoningPlanGateway()
     model = BoundGatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
             gateway=gateway,
             max_output_tokens=256,
@@ -584,7 +585,7 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
         },
     )
     model = BoundGatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
     gateway=gateway,
     generator=provider,
@@ -638,7 +639,7 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
         },
     )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
     gateway=gateway,
     generator=provider,
@@ -651,7 +652,7 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(HarnessMessage(role="user", content="answer once"),),
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     )
     deltas: list[HarnessModelDelta] = []
@@ -677,7 +678,7 @@ def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() 
     token_accounting=gateway.token_accounting,
 )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=resolved,
         instructions=("Answer the user directly.",),
     )
@@ -698,7 +699,7 @@ def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() 
             thread_id="thread-1",
             turn_id="turn-1",
             messages=messages,
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     )
 
@@ -716,7 +717,7 @@ def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() 
 def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
     gateway=gateway,
     max_output_tokens=256,
@@ -728,7 +729,7 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(HarnessMessage(role="user", content="stable initial task"),),
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     )
     asyncio.run(model.dispatch(first))
@@ -740,7 +741,7 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
                 HarnessMessage(role="user", content="stable initial task"),
                 HarnessMessage(role="assistant", content="dynamic transcript tail"),
             ),
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
     )
     asyncio.run(model.dispatch(second))
@@ -773,7 +774,7 @@ def test_gateway_adapter_uses_durable_reservation_not_ambient_legacy_ledger() ->
         },
     )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
             gateway=gateway,
             generator=provider,
@@ -787,7 +788,7 @@ def test_gateway_adapter_uses_durable_reservation_not_ambient_legacy_ledger() ->
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(HarnessMessage(role="user", content="hello"),),
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
             model_token_budget_remaining=10,
         )
     )
@@ -811,7 +812,7 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
     workspace.mkdir()
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=_resolved_model(
     gateway=gateway,
     max_output_tokens=256,
@@ -823,13 +824,13 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="obsolete provider-visible question",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="obsolete answer")
         second = store.start_turn(
             thread_id=thread.thread_id,
             user_message="current provider-visible question",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         manager = RolloutContextManager(store)
         before_messages = manager.build(second.turn_id)
@@ -838,7 +839,7 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
                 thread_id=thread.thread_id,
                 turn_id=second.turn_id,
                 messages=before_messages,
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
         asyncio.run(model.dispatch(before))
@@ -863,7 +864,7 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
                 thread_id=thread.thread_id,
                 turn_id=second.turn_id,
                 messages=after_messages,
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
         asyncio.run(model.dispatch(after))
@@ -889,8 +890,8 @@ class ResolvedRegistry:
     def __init__(self, models: dict[str, ResolvedModel]) -> None:
         self._models = models
 
-    def resolve(self, alias: str) -> ResolvedModel:
-        return self._models[alias]
+    def resolve(self, model_id: str) -> ResolvedModel:
+        return self._models[model_id]
 
     def resolve_definition(self, definition: object) -> ResolvedModel:
         model_id = definition.model_id
@@ -945,13 +946,14 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
 
         def freeze_model_binding(self, *, thread_id: str, turn_id: str) -> dict[str, object]:
             return {
-                "authentication_schema_version": 1,
+                "authentication_schema_version": 2,
+                "model_id": self.current,
                 "trust_domain_id": "domain",
                 "signing_key_id": "key",
                 "thread_id": thread_id,
                 "turn_id": turn_id,
                 "selection_requester": "user",
-                "binding": {"alias": self.current},
+                "binding": {"schema_version": 3, "model_id": self.current},
                 "signature": "signature",
             }
 
@@ -966,9 +968,9 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
             assert binding["turn_id"] == turn_id
             envelope = binding["binding"]
             assert isinstance(envelope, Mapping)
-            alias = envelope["alias"]
-            assert isinstance(alias, str)
-            return resolved[alias]
+            model_id = envelope["model_id"]
+            assert isinstance(model_id, str)
+            return resolved[model_id]
 
     control_plane = FrozenControlPlane()
     model = ControlPlaneHarnessModel(
@@ -992,7 +994,10 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
 
     envelope = frozen["binding"]
     assert isinstance(envelope, Mapping)
-    assert envelope["alias"] == "model-a"
+    assert frozen["model_id"] == "model-a"
+    assert "model_alias" not in frozen
+    assert envelope["model_id"] == "model-a"
+    assert "alias" not in envelope
     assert len(first_gateway.requests) == 1
     assert second_gateway.requests == []
 
@@ -1028,7 +1033,7 @@ def test_legacy_binding_replays_but_provider_resume_fails_closed(tmp_path: Path)
             )
 
 
-def test_authenticated_turn_resolves_after_selected_alias_is_removed(
+def test_removed_frozen_model_id_fails_before_provider_io(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -1072,20 +1077,21 @@ def test_authenticated_turn_resolves_after_selected_alias_is_removed(
         instructions=("Answer directly.",),
     )
 
-    model.ensure_available(binding, thread_id="thread-1", turn_id="turn-1")
+    with pytest.raises(UnknownModelIdError, match="model-a"):
+        model.ensure_available(binding, thread_id="thread-1", turn_id="turn-1")
     with pytest.raises(BindingAuthenticationError, match="different Turn"):
         model.ensure_available(binding, thread_id="thread-2", turn_id="turn-2")
-    prepared = model.prepare(
-        HarnessModelRequest(
-            thread_id="thread-1",
-            turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="resume"),),
-            binding_manifest=binding,
+    with pytest.raises(UnknownModelIdError, match="model-a"):
+        model.prepare(
+            HarnessModelRequest(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                messages=(HarnessMessage(role="user", content="resume"),),
+                binding_manifest=binding,
+            )
         )
-    )
-    asyncio.run(model.dispatch(prepared))
 
-    assert len(frozen_gateway.requests) == 1
+    assert frozen_gateway.requests == []
 
 
 class AcceptAnswer:
@@ -1161,10 +1167,13 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
         turn = runtime.store.read_turn(result.turn_id)
         model_binding = turn.binding_manifest["binding"]
         assert isinstance(model_binding, Mapping)
-        assert model_binding["alias"] == "model-a"
+        assert turn.binding_manifest["model_id"] == "model-a"
+        assert "model_alias" not in turn.binding_manifest
+        assert model_binding["model_id"] == "model-a"
+        assert "alias" not in model_binding
         tampered = dict(turn.binding_manifest)
         tampered_envelope = dict(model_binding)
-        tampered_envelope["alias"] = "substituted-model"
+        tampered_envelope["model_id"] = "substituted-model"
         tampered["binding"] = tampered_envelope
         with pytest.raises(BindingAuthenticationError):
             model.ensure_available(

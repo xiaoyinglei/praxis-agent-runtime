@@ -861,7 +861,7 @@ def test_agent_run_can_disable_workspace_mcp_discovery(
     assert facade_options[0]["enable_workspace_mcp"] is False
 
 
-def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
+def test_agent_chat_followup_restores_workspace_but_uses_current_session_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -880,7 +880,7 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
             thread_id=thread.thread_id,
             user_message="remember cobalt",
             binding_manifest={
-                "model_alias": "mlx-community/Qwen3.5-9B-4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "knowledge_config": knowledge.model_dump(mode="json"),
             },
         )
@@ -909,7 +909,7 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
 
     assert facade_options == [
         {
-            "model": "mlx-community/Qwen3.5-9B-4bit",
+            "model": None,
             "checkpoint_db": database,
             "workspace_path": str(turn_workspace.resolve()),
             "model_session_path": cli_module.DEFAULT_MODEL_SESSION_PATH,

@@ -205,7 +205,7 @@ def test_adapter_records_reserved_and_actual_versioned_cost() -> None:
     }
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
-        model_alias="priced",
+        model_id="priced",
         resolved=_resolved(gateway, pricing=pricing),
         instructions=("Answer.",),
     )
@@ -227,7 +227,7 @@ def test_adapter_records_reserved_and_actual_versioned_cost() -> None:
 def test_cost_limited_turn_rejects_unknown_pricing_before_provider_io() -> None:
     gateway = CapturingGateway()
     model = GatewayHarnessModel(
-        model_alias="unpriced",
+        model_id="unpriced",
         resolved=_resolved(gateway, pricing={}),
         instructions=("Answer.",),
     )

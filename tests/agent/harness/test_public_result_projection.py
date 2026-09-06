@@ -54,7 +54,7 @@ def test_public_result_dto_is_frozen_and_keeps_thread_turn_identity() -> None:
 
 class PublicAnswerModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "public-model", "model_revision": "public-v1"}
+        return {"model_id": "public-model", "model_revision": "public-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(request.messages[-1].content.encode()).hexdigest()
@@ -128,7 +128,7 @@ def test_public_pause_projects_the_frozen_choice_question_and_options(
         turn = runtime.store.start_turn(
             thread_id=thread.thread_id,
             user_message="pick a target",
-            binding_manifest={"model_alias": "public-model"},
+            binding_manifest={"model_id": "public-model"},
         )
         interaction = runtime.store.request_choice(
             turn_id=turn.turn_id,

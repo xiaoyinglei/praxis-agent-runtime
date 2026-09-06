@@ -475,7 +475,7 @@ def test_model_policy_reviews_frozen_definition_without_catalog(
     )
 
     reviewed = policy.review_binding(
-        alias="mimo-v2.5-pro",
+        model_id="mimo-v2.5-pro",
         definition=definition,
         requested_by=requested_by,
     )
@@ -494,19 +494,19 @@ def test_model_policy_rejects_frozen_provider_host_and_local_launch(
 
     with pytest.raises(ModelPolicyError, match="provider"):
         ModelPolicy(allowed_provider_kinds=frozenset({"ollama"})).review_binding(
-            alias="mimo-v2.5-pro",
+            model_id="mimo-v2.5-pro",
             definition=cloud,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="host"):
         ModelPolicy(allowed_remote_hosts=frozenset({"api.example.com"})).review_binding(
-            alias="mimo-v2.5-pro",
+            model_id="mimo-v2.5-pro",
             definition=cloud,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="launch"):
         ModelPolicy(allow_local_launch=False).review_binding(
-            alias="mlx-community/Qwen3-14B-4bit",
+            model_id="mlx-community/Qwen3-14B-4bit",
             definition=local,
             requested_by="user",
         )
@@ -520,7 +520,7 @@ def test_model_policy_rejects_frozen_provider_host_and_local_launch(
     )
     with pytest.raises(ModelPolicyError, match="health"):
         ModelPolicy().review_binding(
-            alias="mlx-community/Qwen3-14B-4bit",
+            model_id="mlx-community/Qwen3-14B-4bit",
             definition=unsafe_health,
             requested_by="user",
         )
@@ -537,19 +537,19 @@ def test_model_policy_revalidates_frozen_endpoint_and_credential_reference(
 
     with pytest.raises(ModelPolicyError, match="invalid"):
         ModelPolicy().review_binding(
-            alias="mimo-v2.5-pro",
+            model_id="mimo-v2.5-pro",
             definition=wrong_location,
             requested_by="user",
         )
     with pytest.raises(ModelPolicyError, match="invalid"):
         ModelPolicy().review_binding(
-            alias="mimo-v2.5-pro",
+            model_id="mimo-v2.5-pro",
             definition=unsafe_credential,
             requested_by="user",
         )
 
 
-def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
+def test_freeze_and_resolve_authenticated_binding_by_model_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -598,13 +598,26 @@ def test_freeze_and_resolve_authenticated_binding_without_alias_resolution(
     assert resolved is resolved_sentinel
 
     assert resolved_definitions == [frozen_definition]
+    assert binding["authentication_schema_version"] == 2
+    assert binding["model_id"] == "mlx-community/Qwen3-14B-4bit"
+    assert "model_alias" not in binding
     assert binding["selection_requester"] == "user"
     assert binding["thread_id"] == "thread-1"
     envelope = binding["binding"]
     assert isinstance(envelope, dict)
-    assert envelope["alias"] == "mlx-community/Qwen3-14B-4bit"
+    assert envelope["schema_version"] == 3
+    assert envelope["model_id"] == "mlx-community/Qwen3-14B-4bit"
+    assert "alias" not in envelope
     assert envelope["origin"] == "override"
     assert archive.load(frozen_definition.definition_revision) == frozen_definition
+
+    with pytest.raises(BindingAuthenticationError, match="legacy outer model_alias"):
+        control.resolve_frozen_binding(
+            {**binding, "model_alias": "mlx-community/Qwen3-14B-4bit"},
+            thread_id="thread-1",
+            turn_id="turn-1",
+        )
+    assert resolved_definitions == [frozen_definition]
 
     tampered = {**binding, "turn_id": "turn-2"}
     with pytest.raises(BindingAuthenticationError):
@@ -831,7 +844,7 @@ def test_frozen_binding_uses_the_same_snapshot_after_hmac_verification(
     original_load = archive.load
 
     def mutate_original_after_verification(revision: str) -> object:
-        envelope["alias"] = "mimo-v2.5-pro"
+        envelope["model_id"] = "mimo-v2.5-pro"
         return original_load(revision)
 
     monkeypatch.setattr(archive, "load", mutate_original_after_verification)

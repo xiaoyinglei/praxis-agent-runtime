@@ -197,6 +197,20 @@ def _migrate_in_place(
                         progressed = True
                         continue
                     binding = _legacy_binding(str(row["runtime_json"]))
+                    model_id = binding.get("model_id")
+                    if (
+                        "model_alias" in binding
+                        or type(model_id) is not str
+                        or not model_id
+                        or model_id != model_id.strip()
+                    ):
+                        blocked[turn_id] = (
+                            "legacy runtime binding requires model_id; "
+                            "model_alias is unsupported"
+                        )
+                        pending.remove(row)
+                        progressed = True
+                        continue
                     workspace_value = binding.get("workspace_path")
                     workspace = (
                         Path.cwd()
@@ -885,7 +899,7 @@ def _harness_binding(
     knowledge = legacy.get("knowledge")
     return {
         "schema_version": 1,
-        "model_alias": legacy.get("model_alias"),
+        "model_id": legacy["model_id"],
         "legacy_runtime_binding": dict(legacy),
         "knowledge_config": knowledge if isinstance(knowledge, Mapping) else None,
         "completion_policy": {"require_workspace_change": False},

@@ -61,7 +61,7 @@ class RotatingBindingProvider:
         self.revision += 1
         self.identities.append((thread_id, turn_id))
         return {
-            "model_alias": f"model-v{self.revision}",
+            "model_id": f"model-v{self.revision}",
             "thread_id": thread_id,
             "turn_id": turn_id,
         }
@@ -133,8 +133,8 @@ def test_thread_manager_creates_thread_and_reuses_it_for_followup(tmp_path: Path
             ("user", "second"),
         ]
         assert store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
-        assert store.read_turn(first.turn_id).binding_manifest["model_alias"] == "model-v1"
-        assert store.read_turn(second.turn_id).binding_manifest["model_alias"] == "model-v2"
+        assert store.read_turn(first.turn_id).binding_manifest["model_id"] == "model-v1"
+        assert store.read_turn(second.turn_id).binding_manifest["model_id"] == "model-v2"
         assert store.verify().valid is True
 
 
@@ -148,7 +148,7 @@ def test_public_recovery_entries_validate_frozen_binding_before_runner_io(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="ambiguous",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         clarification = store.request_clarification(
             turn_id=turn.turn_id,
@@ -181,8 +181,8 @@ def test_public_recovery_entries_validate_frozen_binding_before_runner_io(
             ("retry", turn.turn_id),
         ]
         assert validated == [
-            ({"model_alias": "model-v1"}, thread.thread_id, turn.turn_id),
-            ({"model_alias": "model-v1"}, thread.thread_id, turn.turn_id),
+            ({"model_id": "model-v1"}, thread.thread_id, turn.turn_id),
+            ({"model_id": "model-v1"}, thread.thread_id, turn.turn_id),
         ]
 
 
@@ -228,19 +228,19 @@ def test_fork_from_non_head_turn_has_an_exact_history_cutoff(tmp_path: Path) -> 
         first = store.start_turn(
             thread_id=source.thread_id,
             user_message="source-one",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="answer-one")
         second = store.start_turn(
             thread_id=source.thread_id,
             user_message="source-two",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=second.turn_id, answer="answer-two")
         third = store.start_turn(
             thread_id=source.thread_id,
             user_message="source-three",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=third.turn_id, answer="answer-three")
 
@@ -248,7 +248,7 @@ def test_fork_from_non_head_turn_has_an_exact_history_cutoff(tmp_path: Path) -> 
         branch = store.start_turn(
             thread_id=fork.thread_id,
             user_message="branch-only",
-            binding_manifest={"model_alias": "model-v2"},
+            binding_manifest={"model_id": "model-v2"},
         )
 
         context = store.list_context_items(branch.turn_id)

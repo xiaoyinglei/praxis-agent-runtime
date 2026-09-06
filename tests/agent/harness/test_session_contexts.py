@@ -45,7 +45,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path) ->
             thread_id=thread.thread_id,
             user_message="inspect the workspace",
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
                 "model_step_budget": 3,
                 "model_token_budget_total": 100,
             },
@@ -88,7 +88,7 @@ def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
         foreign_turn = store.start_turn(
             thread_id=second.thread_id,
             user_message="foreign",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         session = Session(
             thread_id=first.thread_id,
