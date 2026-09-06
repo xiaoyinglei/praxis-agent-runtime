@@ -2,7 +2,7 @@
   "schema_version": "praxis-harness-acceptance-v1",
   "contract": {
     "path": "docs/design/praxis_harness_architecture.md",
-    "sha256": "26ab290aa6f3567bf23f600286bebdbedf1cde242b14da7009d79f081300765e"
+    "sha256": "44aa7ec6a6f7655541eaf61f5978c8984116babbae6b8807e3a25927407bf150"
   },
   "baseline_commit": "be4e6a04af8cf01d975b78bac524dd7a333c1d0b",
   "evidence_bindings": {
