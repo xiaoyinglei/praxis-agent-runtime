@@ -76,9 +76,9 @@ class ModelResolver(Protocol):
     @property
     def generation_config(self) -> GenerationConfig: ...
 
-    def resolve(self, alias: str) -> ResolvedModel: ...
+    def resolve(self, model_id: str) -> ResolvedModel: ...
 
-    def resolve_or_fallback(self, alias: str) -> ResolvedModel: ...
+    def resolve_or_fallback(self, model_id: str) -> ResolvedModel: ...
 
     def resolve_for_node(
         self,
@@ -89,7 +89,7 @@ class ModelResolver(Protocol):
 
 
 class ModelRegistry:
-    """按 alias 解析并缓存 Generator 实例。
+    """按模型 ID 解析并缓存 Generator 实例。
 
     加载顺序：AGENT_MODELS_PATH(YAML) > AGENT_MODELS(JSON) > models.yaml 内置默认
     """
@@ -109,8 +109,8 @@ class ModelRegistry:
             raise ValueError("model origins must cover exactly the configured models")
         default_origin: Literal["builtin", "user", "override"] = "override"
         self._origins = {
-            alias: origins[alias] if origins is not None else default_origin
-            for alias in self._config.models
+            model_id: origins[model_id] if origins is not None else default_origin
+            for model_id in self._config.models
         }
         self._definitions = {
             model_id: build_model_execution_definition(
@@ -142,23 +142,23 @@ class ModelRegistry:
     def model_ids(self) -> tuple[str, ...]:
         return tuple(self._config.models)
 
-    def get_model_spec(self, alias: str) -> ModelSpec:
-        spec = self._config.models.get(alias)
+    def get_model_spec(self, model_id: str) -> ModelSpec:
+        spec = self._config.models.get(model_id)
         if spec is None:
-            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config")
+            raise self._unknown_model_id(model_id)
         return spec.model_copy(deep=True)
 
-    def origin(self, alias: str) -> Literal["builtin", "user", "override"]:
+    def origin(self, model_id: str) -> Literal["builtin", "user", "override"]:
         try:
-            return self._origins[alias]
+            return self._origins[model_id]
         except KeyError as exc:
-            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
+            raise self._unknown_model_id(model_id) from exc
 
-    def get_model_definition(self, alias: str) -> ModelExecutionDefinition:
+    def get_model_definition(self, model_id: str) -> ModelExecutionDefinition:
         try:
-            return self._definitions[alias].model_copy(deep=True)
+            return self._definitions[model_id].model_copy(deep=True)
         except KeyError as exc:
-            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config") from exc
+            raise self._unknown_model_id(model_id) from exc
 
     def execution_definition_for_user_model(
         self,
@@ -198,7 +198,11 @@ class ModelRegistry:
         )
         if default_model is not None:
             if default_model not in config.models:
-                raise UnknownModelAliasError(f"Model alias {default_model!r} not found in config")
+                available = ", ".join(sorted(config.models))
+                raise UnknownModelAliasError(
+                    f"Model ID {default_model!r} not found in config. "
+                    f"Available IDs: {available}"
+                )
             config = config.model_copy(
                 update={
                     "default_model": default_model,
@@ -216,7 +220,7 @@ class ModelRegistry:
     ) -> tuple[AgentModelsConfig, dict[str, Literal["builtin", "user", "override"]]]:
         if os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"):
             override = cls._load_config()
-            return override, {alias: "override" for alias in override.models}
+            return override, {model_id: "override" for model_id in override.models}
 
         built_in = cls._load_config()
         registry_path = user_model_registry_path()
@@ -242,9 +246,9 @@ class ModelRegistry:
         )
         effective = built_in.model_copy(update={"models": models}, deep=True)
         origins: dict[str, Literal["builtin", "user", "override"]] = {
-            alias: "builtin" for alias in built_in.models
+            model_id: "builtin" for model_id in built_in.models
         }
-        origins.update({alias: "user" for alias in user_snapshot.document.models})
+        origins.update({model_id: "user" for model_id in user_snapshot.document.models})
         return effective, origins
 
     @classmethod
@@ -372,23 +376,29 @@ class ModelRegistry:
             }
         )
 
-    def resolve(self, alias: str) -> ResolvedModel:
-        """别名 → (Generator, kwargs)。按 alias 缓存，同 alias 多次调用返回同一 Generator。"""
-        if alias in self._cache:
-            return self._cache[alias]
+    def resolve(self, model_id: str) -> ResolvedModel:
+        """模型 ID → (Generator, kwargs)；同一 ID 复用同一 Generator。"""
+        if model_id in self._cache:
+            return self._cache[model_id]
 
-        spec = self._config.models.get(alias)
+        spec = self._config.models.get(model_id)
         if spec is None:
-            raise UnknownModelAliasError(f"Model alias {alias!r} not found in config")
+            raise self._unknown_model_id(model_id)
 
-        definition = self._definitions[alias]
+        definition = self._definitions[model_id]
         resolved = self._resolve_definition(
             definition=definition,
             spec=spec,
-            subject=f"alias {alias!r}",
+            subject=f"model ID {model_id!r}",
         )
-        self._cache[alias] = resolved
+        self._cache[model_id] = resolved
         return resolved
+
+    def _unknown_model_id(self, model_id: str) -> UnknownModelAliasError:
+        available = ", ".join(sorted(self._config.models))
+        return UnknownModelAliasError(
+            f"Model ID {model_id!r} not found in config. Available IDs: {available}"
+        )
 
     def resolve_definition(self, definition: ModelExecutionDefinition) -> ResolvedModel:
         """Resolve one complete frozen definition without a catalog alias lookup."""
@@ -495,12 +505,12 @@ class ModelRegistry:
 
         return resolved
 
-    def resolve_or_fallback(self, alias: str) -> ResolvedModel:
-        """尝试解析 alias，失败时降级到 fallback_model。"""
+    def resolve_or_fallback(self, model_id: str) -> ResolvedModel:
+        """尝试解析模型 ID，失败时降级到 fallback_model。"""
         try:
-            return self.resolve(alias)
+            return self.resolve(model_id)
         except (UnknownModelAliasError, ModelNotAvailableError):
-            if self._config.fallback_model and alias != self._config.fallback_model:
+            if self._config.fallback_model and model_id != self._config.fallback_model:
                 return self.resolve(self._config.fallback_model)
             raise
 
@@ -510,13 +520,13 @@ class ModelRegistry:
         node_model: str | None,
         node_name: str,
     ) -> ResolvedModel:
-        """根据节点指定的 model alias（可为 None）解析 Generator。
+        """根据节点指定的模型 ID（可为 None）解析 Generator。
 
-        node_model 非空 → 直接用该 alias（失败降级到 fallback）
+        node_model 非空 → 直接用该 ID（失败降级到 fallback）
         node_model 为空 → 用 default_model（失败降级到 fallback）
         """
-        alias = node_model or self._config.default_model
-        return self.resolve_or_fallback(alias)
+        model_id = node_model or self._config.default_model
+        return self.resolve_or_fallback(model_id)
 
 
 def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSpec:

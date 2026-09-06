@@ -288,6 +288,15 @@ def test_model_management_help_exposes_complete_public_aci() -> None:
         assert command in result.output
 
 
+@pytest.mark.parametrize("command", ["run", "chat"])
+def test_model_option_help_uses_public_model_id(command: str) -> None:
+    result = CliRunner().invoke(agent_app, [command, "--help"], env={"COLUMNS": "240"})
+
+    assert result.exit_code == 0, result.output
+    assert "主生成模型 ID" in result.output
+    assert "模型别名" not in result.output
+
+
 def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

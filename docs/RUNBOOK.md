@@ -15,7 +15,7 @@ uv sync
 
 ## 接入和切换 chat 模型
 
-无需手工编辑 `configs/models.yaml`。该文件中的内置 alias 是只读层；
+无需手工编辑 `configs/models.yaml`。该文件中的内置模型 ID 是只读层；
 `agent model add`、`update`、`remove` 管理版本化的用户注册表，并通过
 compare-and-swap 防止并发覆盖。
 注册表和 Turn binding 只保存 credential environment variable 的名字，不保存解析后的值。
@@ -43,22 +43,24 @@ uv run agent model trust init
 uv run agent model trust status
 uv run agent model list --source
 uv run agent model current
-export MODEL_ALIAS=my-model-alias
-export PROVIDER_MODEL_ID=provider-model-id
+export MODEL_ID=provider-model-id
 export PROVIDER_BASE_URL=https://provider.example/v1
 export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
 
-uv run agent model show "$MODEL_ALIAS"
-uv run agent model add "$MODEL_ALIAS" \
+uv run agent model show "$MODEL_ID"
+uv run agent model add "$MODEL_ID" \
   --provider openai_compatible \
-  --provider-model "$PROVIDER_MODEL_ID" \
   --base-url "$PROVIDER_BASE_URL" \
   --api-key-env "$PROVIDER_CREDENTIAL_ENV"
 
-uv run agent model probe "$MODEL_ALIAS" --level full
-uv run agent model update "$MODEL_ALIAS" --timeout-seconds 90
-uv run agent model remove "$MODEL_ALIAS"
+uv run agent model probe "$MODEL_ID" --level full
+uv run agent model update "$MODEL_ID" --timeout-seconds 90
+uv run agent model switch "$MODEL_ID"
+uv run agent model remove "$MODEL_ID"
 ```
+
+`--provider` 选择 provider adapter 和传输路由；同一个精确 `MODEL_ID` 会作为请求模型 ID
+发送给 provider，不再另行配置 provider model ID。
 
 `add/update` 的事务顺序是：严格解析和规范化 → 读取预期 registry revision → full probe
 → CAS commit。失败或取消发生在 commit 前，因此注册表不变。高级字段（例如无 shell 的
@@ -73,24 +75,24 @@ launch argv）使用 `--from <one-model.yaml>`；离线登记必须显式写 `--
 ```bash
 uv run agent model list --source
 uv run agent model current
-uv run agent model switch "$MODEL_ALIAS"
+uv run agent model switch "$MODEL_ID"
 ```
 
 `agent model switch` 只更新 `.praxis/model_session.json`，不改注册表定义。
 
 交互式 `agent chat` 复用同一个 catalog、policy 和 session state，不维护第二套
-alias 或路由：
+模型身份或路由：
 
 ```text
 uv run agent chat
 > /model
-当前模型: current-alias
+当前模型: current-model-id
 可用模型:
-* current-alias  ...
-  another-alias  ...
-切换: /model <alias>
-> /model another-alias
-已切换模型: another-alias
+* current-model-id  ...
+  another-model-id  ...
+切换: /model <model_id>
+> /model another-model-id
+已切换模型: another-model-id
 ```
 
 `agent chat` 使用 Unicode-aware Composer，中文和 emoji 的退格、Delete、光标移动按
@@ -99,14 +101,14 @@ uv run agent chat
 结果完整展开。若工具或 ACI 本身已经丢弃超预算内容，CLI 会另行警告；这与 UI 折叠
 不同，verbose 不能恢复上游未保留的数据。
 
-也可写 `/model switch <alias>`；`/model current` 只看当前详情，`/model list`
+也可写 `/model switch <model_id>`；`/model current` 只看当前详情，`/model list`
 只列 catalog。成功切换后，当前聊天的下一条消息继续使用原来的
-`previous_turn_id` 历史，但新 Turn 会绑定新 alias，因此不需要退出、重启或
-`/new`。输入不存在或被 policy 拒绝的 alias 时，CLI 会显示错误和所有可用
-alias，原选择保持不变，而且校验阶段不会发起 provider 请求。
+`previous_turn_id` 历史，但新 Turn 会绑定新模型 ID，因此不需要退出、重启或
+`/new`。输入不存在或被 policy 拒绝的模型 ID 时，CLI 会显示错误和所有可用
+ID，原选择保持不变，而且校验阶段不会发起 provider 请求。
 
-session alias 是未来 Turn 的可变偏好；每个已创建 Turn 则持久化经过 HMAC 认证、
-content-addressed archive 校验的完整不可变定义。更新或删除 alias 只影响未来 Turn。
+session model ID 是未来 Turn 的可变偏好；每个已创建 Turn 则持久化经过 HMAC 认证、
+content-addressed archive 校验的完整不可变定义。更新或删除模型 ID 只影响未来 Turn。
 `agent resume` 恢复同一个暂停/中断 Turn，必须使用其原定义；`previous_turn_id` 创建
 新 Turn，才会读取当前 session 选择。历史 replay 只读 durable history，不要求 provider 在线。
 
@@ -116,7 +118,7 @@ content-addressed archive 校验的完整不可变定义。更新或删除 alias
 
 ## RAG 服务准备
 
-下面是知识库 embedding/rerank 的运维示例，与 chat alias 注册表相互独立。
+下面是知识库 embedding/rerank 的运维示例，与 chat 模型 ID 注册表相互独立。
 
 先检查是否已经有同模型服务，避免重复常驻占内存：
 
@@ -175,7 +177,7 @@ screen -S rag_rerank_9092 -X quit >/dev/null 2>&1 || true
 ## 私有文档端到端运行手册
 
 先准备 embedding 服务；rerank 默认不开，需要时再按"常用开关"打开。chat 使用
-当前 session 选中的 alias；先用 `agent model current` 确认其 endpoint 与 credential
+当前 session 选中的模型 ID；先用 `agent model current` 确认其 endpoint 与 credential
 environment variable 已可用。
 
 ### 统一变量
@@ -385,8 +387,8 @@ uv run agent chat
 | 普通制度问答 | 直接问 `agent run` |
 | 已入库的文档证据问题 | `agent run ... --knowledge-config <path>`，模型会按需调用 `search_knowledge` |
 | Agent 直接读本地文件 | `agent run ... --file "/path/to/file.xlsx"` |
-| 查看/切换当前 chat 模型 | chat 外用 `agent model list --source`、`current`、`switch <alias>`；chat 内用 `/model` 与 `/model <alias>`；都是 session state，不改注册表定义 |
-| 一次性指定模型 | `agent run --model <alias> ...`，只影响该次新 Turn |
+| 查看/切换当前 chat 模型 | chat 外用 `agent model list --source`、`current`、`switch <model_id>`；chat 内用 `/model` 与 `/model <model_id>`；都是 session state，不改注册表定义 |
+| 一次性指定模型 | `agent run --model <model_id> ...`，只影响该次新 Turn |
 | 恢复常驻 embedding | `export RAG_EMBEDDING_SERVICE_URL=http://127.0.0.1:9090` |
 
 ### 快速 smoke 测试

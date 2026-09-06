@@ -1468,6 +1468,26 @@ def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
     assert not session_path.exists()
 
 
+def test_unknown_explicit_initial_model_lists_available_ids_without_session_mutation(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    session_path = tmp_path / "model-session.json"
+    _write_models_config(config_path)
+
+    with pytest.raises(UnknownModelAliasError) as captured:
+        ModelControlPlane.from_config_file(
+            config_path,
+            initial_model_id="missing",
+            session_path=session_path,
+        )
+
+    message = str(captured.value)
+    assert "Model ID 'missing'" in message
+    assert "Available IDs: mimo-v2.5-pro, mlx-community/Qwen3-14B-4bit" in message
+    assert not session_path.exists()
+
+
 def test_agent_model_cli_uses_session_state_not_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

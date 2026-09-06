@@ -1077,7 +1077,11 @@ def _load_session_state(
     if catalog.has(state.current_model_id):
         return state, ()
     if initial_model_id is not None or store is None:
-        raise UnknownModelAliasError(f"Model ID {state.current_model_id!r} not found in catalog")
+        available = ", ".join(sorted(spec.id for spec in catalog.list_models()))
+        raise UnknownModelAliasError(
+            f"Model ID {state.current_model_id!r} not found in catalog. "
+            f"Available IDs: {available}"
+        )
     stale_model_id = state.current_model_id
     policy.review_switch(
         catalog=catalog,

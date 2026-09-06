@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -57,6 +58,23 @@ def test_model_execution_definition_has_canonical_capabilities() -> None:
     assert b'"max_output_tokens":null' in payload
 
     assert definition.definition_revision.startswith("sha256:")
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ["get_model_spec", "origin", "get_model_definition", "resolve"],
+)
+def test_public_registry_identity_parameter_and_unknown_choices(method_name: str) -> None:
+    registry = ModelRegistry(_make_config(fallback_model="fast"))
+    method = getattr(registry, method_name)
+
+    assert tuple(inspect.signature(method).parameters)[0] == "model_id"
+    with pytest.raises(UnknownModelAliasError) as captured:
+        method("missing")
+
+    message = str(captured.value)
+    assert "Model ID 'missing'" in message
+    assert "Available IDs: fast, main" in message
 
 def test_model_definition_digest_changes_only_for_selected_request_definition() -> None:
     baseline = _make_config()

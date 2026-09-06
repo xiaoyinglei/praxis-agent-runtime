@@ -1116,7 +1116,7 @@ def agent_chat(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="主生成模型别名，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
     ] = None,
     max_tokens_total: Annotated[
         int | None,
@@ -1231,7 +1231,7 @@ def agent_run(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", "-m", help="主生成模型别名，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", "-m", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
     ] = None,
     knowledge_config: Annotated[
         Path | None,
