@@ -285,9 +285,14 @@ def validate_baseline(
     for model_id, raw_entry in models.items():
         if not isinstance(model_id, str) or not isinstance(raw_entry, Mapping):
             raise ValueError("model quality baseline model entries are invalid")
+        provider = raw_entry.get("provider")
         trial_count = raw_entry.get("trial_count")
         raw_trials = raw_entry.get("trial_metrics")
         thresholds = raw_entry.get("thresholds")
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(
+                f"baseline model {model_id} has invalid provider"
+            )
         if not isinstance(trial_count, int) or trial_count < MIN_CALIBRATION_TRIALS:
             raise ValueError(f"baseline model {model_id} has invalid trial_count")
         if not isinstance(raw_trials, Sequence) or isinstance(raw_trials, (str, bytes)):
@@ -313,9 +318,15 @@ def validate_baseline(
 def evaluate_model_gate(
     *,
     model_id: str,
+    provider: str,
     trial_metrics: Sequence[Mapping[str, float]],
     baseline: Mapping[str, object],
 ) -> dict[str, object]:
+    baseline_provider = baseline.get("provider")
+    if not isinstance(baseline_provider, str) or not baseline_provider.strip():
+        raise ValueError(f"baseline model {model_id} has invalid provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError(f"live model {model_id} has invalid provider")
     trial_count = baseline.get("trial_count")
     if not isinstance(trial_count, int):
         raise ValueError(f"baseline model {model_id} has invalid trial_count")
@@ -327,6 +338,11 @@ def evaluate_model_gate(
 
     observed: dict[str, float] = {}
     failures: list[str] = []
+    if provider != baseline_provider:
+        failures.append(
+            "provider route mismatch: "
+            f"baseline={baseline_provider!r}, live={provider!r}"
+        )
     for name, direction in GATED_METRIC_DIRECTIONS.items():
         values = [float(metrics[name]) for metrics in trial_metrics]
         value = min(values) if direction == "min" else max(values)
@@ -803,6 +819,7 @@ async def _gate(args: argparse.Namespace) -> int:
         results.append(
             evaluate_model_gate(
                 model_id=model,
+                provider=cast(str, report["provider"]),
                 trial_metrics=current_metrics,
                 baseline=raw_model_baseline,
             )

@@ -1038,6 +1038,67 @@ def test_artifact_secret_values_match_sensitive_name_tokens_without_substrings(
 
 
 @pytest.mark.anyio
+async def test_gate_fails_closed_when_live_provider_differs_from_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    suite = _quality_suite()
+    metrics = _trial_metrics()
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(
+        json.dumps(
+            {
+                "models": {
+                    "openai/gpt-oss-120b": {
+                        "provider": "deepseek",
+                        "trial_count": 1,
+                        "thresholds": module.derive_thresholds([metrics] * 3),
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    report_path = tmp_path / "report.json"
+
+    monkeypatch.setattr(
+        module,
+        "source_repository_fingerprint",
+        lambda _repository: module.RepositoryFingerprint(
+            source_commit="a" * 40,
+            source_tree="b" * 40,
+            dirty=False,
+        ),
+    )
+    monkeypatch.setattr(module, "load_suite", lambda _path: suite)
+    monkeypatch.setattr(module, "validate_baseline", lambda *_args, **_kwargs: None)
+
+    async def run_trials(**_kwargs: object) -> dict[str, object]:
+        return _passing_model_report()
+
+    monkeypatch.setattr(module, "run_model_trials", run_trials)
+    args = SimpleNamespace(
+        repository=tmp_path / "repository",
+        fixture=tmp_path / "cases.json",
+        baseline=baseline,
+        env_file=tmp_path / ".env",
+        models=["openai/gpt-oss-120b"],
+        report=report_path,
+    )
+
+    exit_code = await module._gate(args)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["status"] == "failed"
+    assert report["passed"] is False
+    assert report["models"][0]["failures"] == [
+        "provider route mismatch: baseline='deepseek', live='groq'"
+    ]
+
+
+@pytest.mark.anyio
 async def test_calibration_preflight_runs_before_model_calls(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1867,6 +1928,7 @@ def test_baseline_validation_recomputes_and_rejects_edited_thresholds() -> None:
         "threshold_method": module.THRESHOLD_METHOD,
         "models": {
             "mlx-community/Qwen3.5-9B-4bit": {
+                "provider": "local_mlx_chat_8080",
                 "trial_count": 3,
                 "trial_metrics": trials,
                 "thresholds": module.derive_thresholds(trials),
@@ -1890,6 +1952,21 @@ def test_committed_live_baseline_recomputes_from_raw_observations() -> None:
     assert all(entry["trial_count"] == 3 for entry in baseline["models"].values())
 
 
+@pytest.mark.parametrize("provider", [None, "", "   "])
+def test_baseline_requires_a_non_empty_provider_route(provider: object) -> None:
+    module = _load_gate_module()
+    suite = module.load_suite(FIXTURE_PATH)
+    baseline = json.loads(BASELINE_PATH.read_text(encoding="utf-8"))
+    model_id = str(suite["models"][0])
+    if provider is None:
+        baseline["models"][model_id].pop("provider")
+    else:
+        baseline["models"][model_id]["provider"] = provider
+
+    with pytest.raises(ValueError, match="provider"):
+        module.validate_baseline(baseline, suite=suite)
+
+
 def test_raw_baseline_tampering_is_detected_before_thresholds() -> None:
     module = _load_gate_module()
     suite = module.load_suite(FIXTURE_PATH)
@@ -1906,6 +1983,7 @@ def test_gate_uses_worst_current_trial_and_reports_regressions() -> None:
     module = _load_gate_module()
     baseline_trials = [_trial_metrics() for _ in range(3)]
     model_baseline = {
+        "provider": "groq",
         "trial_count": 3,
         "trial_metrics": baseline_trials,
         "thresholds": module.derive_thresholds(baseline_trials),
@@ -1918,6 +1996,7 @@ def test_gate_uses_worst_current_trial_and_reports_regressions() -> None:
 
     result = module.evaluate_model_gate(
         model_id="openai/gpt-oss-120b",
+        provider="groq",
         trial_metrics=current_trials,
         baseline=model_baseline,
     )
@@ -1925,6 +2004,25 @@ def test_gate_uses_worst_current_trial_and_reports_regressions() -> None:
     assert result["passed"] is False
     assert result["observed"]["repeated_failure_control_rate"] == 0.0
     assert result["failures"] == ["repeated_failure_control_rate: observed 0.0 < baseline floor 1.0"]
+
+
+def test_gate_keeps_matching_provider_route_green() -> None:
+    module = _load_gate_module()
+    trials = [_trial_metrics() for _ in range(3)]
+
+    result = module.evaluate_model_gate(
+        model_id="openai/gpt-oss-120b",
+        provider="groq",
+        trial_metrics=trials,
+        baseline={
+            "provider": "groq",
+            "trial_count": 3,
+            "thresholds": module.derive_thresholds(trials),
+        },
+    )
+
+    assert result["passed"] is True
+    assert result["failures"] == []
 
 
 def test_live_gate_excludes_runtime_determinism_from_threshold_metrics() -> None:
