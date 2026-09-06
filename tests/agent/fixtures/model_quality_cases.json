@@ -2,7 +2,7 @@
   "schema_version": 1,
   "suite_id": "agent-model-tool-quality-v1",
   "models": [
-    "deepseek_v4_flash"
+    "deepseek-v4-flash"
   ],
   "cases": [
     {

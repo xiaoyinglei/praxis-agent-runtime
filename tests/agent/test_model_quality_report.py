@@ -71,6 +71,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "output_tokens": 20,
         "latency_ms": 125.0,
         "tool_schema_bytes": 400,
+        "runtime_input_namespace": "turn-123",
         "approval_pause_observed": True,
         "approval_kind": "tool_approval",
         "approval_resumes": 1,
@@ -90,6 +91,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "output_tokens": 10,
         "latency_ms": 75.0,
         "tool_schema_bytes": 400,
+        "runtime_input_namespace": "turn-123",
         "approval_pause_observed": False,
         "approval_kind": None,
         "approval_resumes": 0,
@@ -100,7 +102,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         "error": "",
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "failed",
         "passed": False,
         "source_commit": "a" * 40,
@@ -116,7 +118,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         },
         "suite_id": "agent-model-tool-quality-v1",
         "suite_revision": "suite_1234567890abcdef1234",
-        "evaluator_version": "agent_model_quality_gate_v1",
+        "evaluator_version": "agent_model_quality_gate_v4",
         "measured_at": "2026-08-05T00:00:00+00:00",
         "baseline_path": str(tmp_path / "private" / "baseline.json"),
         "environment": {"OPENAI_API_KEY": "super-secret-value"},
@@ -143,8 +145,7 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         ],
         "models": [
             {
-                "model_alias": "groq_gpt_oss_120b",
-                "provider_model": "openai/gpt-oss-120b",
+                "model_id": "openai/gpt-oss-120b",
                 "passed": False,
                 "observed": {"task_success_rate": 0.8},
                 "thresholds": {
@@ -157,10 +158,9 @@ def _report_payload(tmp_path: Path) -> dict[str, object]:
         ],
         "runs": [
             {
-                "model_alias": "groq_gpt_oss_120b",
+                "model_id": "openai/gpt-oss-120b",
                 "status": "completed",
                 "provider": "groq",
-                "provider_model": "openai/gpt-oss-120b",
                 "trial_count": 1,
                 "trial_metrics": [{"task_success_rate": 0.8}],
                 "trials": [
@@ -502,16 +502,16 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
     assert "| `python_version` | `3.12.11` |" in benchmark
     assert "| `python_implementation` | `CPython` |" in benchmark
     assert "suite_1234567890abcdef1234" in benchmark
-    assert "agent_model_quality_gate_v1" in benchmark
+    assert "agent_model_quality_gate_v4" in benchmark
     assert "task_success_rate" in benchmark
     assert "0.8" in benchmark
     assert "task_success_rate: observed 0.8 < baseline floor 1.0" in benchmark
     assert "provider_down" in benchmark
     assert "- Provider: `groq`" in benchmark
-    assert "- Provider model: `openai/gpt-oss-120b`" in benchmark
+    assert "- Model ID: `openai/gpt-oss-120b`" in benchmark
     assert "- Infrastructure status: **CONCLUSIVE**" in benchmark
     assert "## Per-case usage" in benchmark
-    assert "| `groq_gpt_oss_120b` | `1` | `approval_continue` | `2` | `3` | `125.0` | `100` | `20` |" in benchmark
+    assert "| `openai/gpt-oss-120b` | `1` | `approval_continue` | `2` | `3` | `125.0` | `100` | `20` |" in benchmark
     assert "## 30-task coding-agent protocol" in benchmark
     assert "Manifest status: **validated only**" in benchmark
     assert "not run as this release gate" in benchmark
@@ -520,7 +520,7 @@ def test_renderer_writes_only_reported_metrics_and_expanded_approval_evidence(
 
     assert "Change before_gate to after_gate." in run_record
     assert "## Model identity and infrastructure" in run_record
-    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
+    assert "| `openai/gpt-oss-120b` | `groq` | **CONCLUSIVE** |" in run_record
     assert "read_file" in run_record
     assert "apply_patch" in run_record
     assert "Arguments:" in run_record
@@ -668,7 +668,9 @@ def test_completed_passing_run_is_conclusive_not_inconclusive(
     assert "Overall verdict: **PASSED**" in benchmark
     assert "Overall verdict: **PASSED**" in run_record
     assert "Infrastructure status: **CONCLUSIVE**" in benchmark
-    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
+    assert (
+        "| `openai/gpt-oss-120b` | `groq` | **CONCLUSIVE** |"
+    ) in run_record
     assert "Infrastructure status: **INCONCLUSIVE**" not in run_record
 
 
@@ -678,12 +680,10 @@ def test_run_record_lists_every_reported_model_identity_and_infrastructure_statu
     module = _load_report_module()
     payload = _report_payload(tmp_path)
     second_model = copy.deepcopy(payload["models"][0])
-    second_model["model_alias"] = "qwen3_5_9b_mlx_4bit"
-    second_model["provider_model"] = "mlx-community/Qwen3.5-9B-4bit"
+    second_model["model_id"] = "mlx-community/Qwen3.5-9B-4bit"
     second_run = copy.deepcopy(payload["runs"][0])
-    second_run["model_alias"] = "qwen3_5_9b_mlx_4bit"
+    second_run["model_id"] = "mlx-community/Qwen3.5-9B-4bit"
     second_run["provider"] = "local_mlx_chat_8080"
-    second_run["provider_model"] = "mlx-community/Qwen3.5-9B-4bit"
     payload["models"].append(second_model)
     payload["runs"].append(second_run)
 
@@ -694,9 +694,9 @@ def test_run_record_lists_every_reported_model_identity_and_infrastructure_statu
         name="multiple-model-identities",
     )
 
-    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **CONCLUSIVE** |") in run_record
+    assert "| `openai/gpt-oss-120b` | `groq` | **CONCLUSIVE** |" in run_record
     assert (
-        "| `qwen3_5_9b_mlx_4bit` | `local_mlx_chat_8080` | `mlx-community/Qwen3.5-9B-4bit` | **CONCLUSIVE** |"
+        "| `mlx-community/Qwen3.5-9B-4bit` | `local_mlx_chat_8080` | **CONCLUSIVE** |"
     ) in run_record
 
 
@@ -796,7 +796,7 @@ def test_generated_pages_preserve_the_pending_evidence_contract(
         "Redacted raw report",
         "### Environment",
         "### Raw model metrics",
-        "Provider model",
+        "Model ID",
         "Infrastructure status: **CONCLUSIVE**",
         "Trials: `1`",
         "task_success_rate",
@@ -831,13 +831,12 @@ def test_generated_pages_preserve_the_pending_evidence_contract(
         "measured_at",
         "Redacted raw report",
         "## Model identity and infrastructure",
-        "groq_gpt_oss_120b",
         "groq",
         "openai/gpt-oss-120b",
         "CONCLUSIVE",
         "## Task",
         "Change before_gate to after_gate.",
-        "## `groq_gpt_oss_120b` trial 1",
+        "## `openai/gpt-oss-120b` trial 1",
         "### Tool trace",
         "Arguments:",
         "Result:",
@@ -1044,6 +1043,7 @@ def test_renderer_rejects_namespaced_evaluator_case_without_runtime_input_namesp
     cases = payload["runs"][0]["trials"][0]["cases"]
     cases[1]["observation"]["runtime_input_namespace"] = "turn-123"
     approval_case = cases[0]
+    approval_case["observation"].pop("runtime_input_namespace")
     approval_case["observation"]["approval_resumes"] = approval_resumes
     approval_case["score"].update(
         passed=True,
@@ -1297,7 +1297,7 @@ def test_renderer_does_not_turn_partial_approval_infrastructure_evidence_into_su
     benchmark = benchmark_path.read_text(encoding="utf-8")
     assert "- Infrastructure status: **INCONCLUSIVE**" in benchmark
     assert "## Model identity and infrastructure" in run_record
-    assert ("| `groq_gpt_oss_120b` | `groq` | `openai/gpt-oss-120b` | **INCONCLUSIVE** |") in run_record
+    assert "| `openai/gpt-oss-120b` | `groq` | **INCONCLUSIVE** |" in run_record
     assert "read_file" in run_record
     assert "Approval was not reached." in run_record
     assert "Approval pause observed: `false`" in run_record
@@ -1482,7 +1482,7 @@ def test_renderer_rejects_internally_inconsistent_reports_before_writing(
         run["status"] = "inconclusive"
         run["infrastructure_failure"] = infrastructure_failure
     else:
-        payload["runs"][0]["model_alias"] = "different_alias"
+        payload["runs"][0]["model_id"] = "different-model-id"
     report_path = tmp_path / "inconsistent.json"
     report_path.write_text(json.dumps(payload), encoding="utf-8")
     benchmark_path = tmp_path / "benchmark.md"

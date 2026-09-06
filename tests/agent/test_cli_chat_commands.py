@@ -8,7 +8,7 @@ import pytest
 from pytest import MonkeyPatch
 
 from agent_runtime import cli
-from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore
 from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
@@ -292,7 +292,7 @@ async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_tur
 
         def switch_model(self, model_id: str) -> ModelSpec:
             switch_attempts.append(model_id)
-            raise UnknownModelAliasError(f"Model alias {model_id!r} not found in catalog")
+            raise UnknownModelIdError(f"Model ID {model_id!r} not found in catalog")
 
         async def run(self, message: str, **kwargs: object) -> AgentResult:
             del kwargs

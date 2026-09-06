@@ -411,6 +411,49 @@ def test_model_add_skip_probe_update_noop_and_remove_lifecycle(tmp_path: Path) -
     assert "registry_revision: 2" in removed.output
 
 
+def test_documented_single_model_id_commands_execute_with_fake_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_probe(
+        _self: ModelProbe,
+        _definition: object,
+        *,
+        level: ProbeLevel,
+    ) -> ModelProbeEvidence:
+        return ModelProbeEvidence(level, True, 1, True, True, True)
+
+    monkeypatch.setenv("DOC_MODEL_TOKEN", "placeholder-token-value")
+    monkeypatch.setattr(ModelProbe, "run", fake_probe)
+    runner = CliRunner()
+    session = ["--session-path", str(tmp_path / "session.json")]
+    add = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "provider-model-id",
+            "--provider",
+            "openai_compatible",
+            "--context-window-tokens",
+            "4096",
+            "--base-url",
+            "http://127.0.0.1:9918/v1",
+            "--api-key-env",
+            "DOC_MODEL_TOKEN",
+            "--location",
+            "local",
+            *session,
+        ],
+    )
+    show = runner.invoke(agent_app, ["model", "show", "provider-model-id", *session])
+    probe = runner.invoke(agent_app, ["model", "probe", "provider-model-id", *session])
+    switch = runner.invoke(agent_app, ["model", "switch", "provider-model-id", *session])
+
+    for result in (add, show, probe, switch):
+        assert result.exit_code == 0, result.output
+
+
 def test_model_add_from_imports_exactly_one_definition(tmp_path: Path) -> None:
     definition_path = tmp_path / "one-model.yaml"
     definition_path.write_text(

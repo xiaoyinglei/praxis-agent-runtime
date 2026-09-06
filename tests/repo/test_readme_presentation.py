@@ -151,6 +151,9 @@ def test_model_integration_docs_cover_requirements_registration_and_switching_on
         assert "MODEL_ALIAS" not in section
         assert "PROVIDER_MODEL_ID" not in section
         assert "--provider-model" not in section
+        assert "--context-window-tokens" in section
+        assert section.index("agent model add") < section.index("agent model show")
+        assert section.index("agent model show") < section.index("agent model probe")
 
 
 def test_readme_describes_a_source_only_distribution_without_unearned_claims() -> None:
@@ -313,8 +316,9 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
         assert failure in benchmark
     assert "Manifest status: **validated only**" in benchmark
 
-    for identity in (run["model_alias"], run["provider"], run["provider_model"]):
+    for identity in (run["provider"], run["provider_model"]):
         assert identity in run_record
+    assert run["model_alias"] not in run_record
     assert f"Overall verdict: **{verdict}**" in run_record
     assert f"source_commit: `{report['source_commit']}`" in run_record
     assert run_record.count("Workspace assertions passed: `true`") >= len(approval_cases)

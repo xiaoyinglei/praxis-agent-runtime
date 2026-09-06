@@ -128,13 +128,15 @@ uv run agent model current
 export MODEL_ID=provider-model-id
 export PROVIDER_BASE_URL=https://provider.example/v1
 export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
+export MY_PROVIDER_TOKEN=replace-with-provider-token
 
-uv run agent model show "$MODEL_ID"
 uv run agent model add "$MODEL_ID" \
   --provider openai_compatible \
+  --context-window-tokens 131072 \
   --base-url "$PROVIDER_BASE_URL" \
   --api-key-env "$PROVIDER_CREDENTIAL_ENV"
 
+uv run agent model show "$MODEL_ID"
 uv run agent model probe "$MODEL_ID" --level full
 uv run agent model update "$MODEL_ID" --timeout-seconds 90
 uv run agent model switch "$MODEL_ID"

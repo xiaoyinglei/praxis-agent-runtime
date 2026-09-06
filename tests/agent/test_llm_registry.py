@@ -14,7 +14,7 @@ from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, Mode
 from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
-    UnknownModelAliasError,
+    UnknownModelIdError,
     _chat_provider_config,
 )
 from agent_runtime.model_definition import canonical_definition_json
@@ -60,6 +60,11 @@ def test_model_execution_definition_has_canonical_capabilities() -> None:
     assert definition.definition_revision.startswith("sha256:")
 
 
+def test_public_unknown_model_error_has_only_model_id_name() -> None:
+    assert issubclass(llm_registry_module.UnknownModelIdError, KeyError)
+    assert not hasattr(llm_registry_module, "UnknownModelAliasError")
+
+
 @pytest.mark.parametrize(
     "method_name",
     ["get_model_spec", "origin", "get_model_definition", "resolve"],
@@ -69,7 +74,7 @@ def test_public_registry_identity_parameter_and_unknown_choices(method_name: str
     method = getattr(registry, method_name)
 
     assert tuple(inspect.signature(method).parameters)[0] == "model_id"
-    with pytest.raises(UnknownModelAliasError) as captured:
+    with pytest.raises(UnknownModelIdError) as captured:
         method("missing")
 
     message = str(captured.value)
@@ -708,7 +713,7 @@ class TestModelRegistryProperties:
 class TestModelRegistryResolve:
     def test_unknown_alias_raises(self) -> None:
         reg = ModelRegistry(_make_config())
-        with pytest.raises(UnknownModelAliasError):
+        with pytest.raises(UnknownModelIdError):
             reg.resolve("nonexistent")
 
     def test_resolve_definition_uses_complete_frozen_values_without_alias_lookup(
@@ -1087,7 +1092,7 @@ class TestModelRegistryResolveOrFallback:
 
     def test_does_not_infinite_loop_when_fallback_also_missing(self) -> None:
         reg = ModelRegistry(_make_config())
-        with pytest.raises(UnknownModelAliasError):
+        with pytest.raises(UnknownModelIdError):
             reg.resolve_or_fallback("missing")
 
 

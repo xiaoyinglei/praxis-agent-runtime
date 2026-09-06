@@ -17,7 +17,7 @@ import yaml
 from pydantic import ValidationError
 
 from agent_runtime.core.llm_config import ModelProvider
-from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.model_admin import (
@@ -371,7 +371,7 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
         KeyError,
         ModelNotAvailableError,
         ModelPolicyError,
-        UnknownModelAliasError,
+        UnknownModelIdError,
         ValueError,
     ) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -635,7 +635,7 @@ def _handle_model_slash_command(
             spec = agent.switch_model(action)
             print(f"已切换模型: {spec.id}")
             return
-    except (ModelPolicyError, UnknownModelAliasError) as exc:
+    except (ModelPolicyError, UnknownModelIdError) as exc:
         print(f"模型切换失败: {exc}")
         _print_model_menu(agent)
         return

@@ -1,12 +1,11 @@
 {
   "dirty": false,
-  "evaluator_version": "agent_model_quality_gate_v3",
+  "evaluator_version": "agent_model_quality_gate_v4",
   "git_commit": "5d92302891c654c0aa083bd82d8ca6891d2f9e58",
   "measured_at": "2026-08-06T00:57:09.102783+00:00",
   "models": {
-    "deepseek_v4_flash": {
+    "deepseek-v4-flash": {
       "provider": "deepseek",
-      "provider_model": "deepseek-v4-flash",
       "thresholds": {
         "approval_continuation_rate": {
           "direction": "min",
@@ -1539,10 +1538,10 @@
       ]
     }
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "source_commit": "5d92302891c654c0aa083bd82d8ca6891d2f9e58",
   "source_tree": "5de9c7c2ebebb6c3df4979cf3479cf40c6896052",
   "suite_id": "agent-model-tool-quality-v1",
-  "suite_revision": "suite_064a22c3535430e148e8",
+  "suite_revision": "suite_c4e6f3f5028f6b2518b9",
   "threshold_method": "empirical_worst_trial_v1"
 }

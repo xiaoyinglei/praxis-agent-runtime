@@ -15,7 +15,7 @@ from agent_runtime.cli import agent_app
 from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
     ModelRegistry,
-    UnknownModelAliasError,
+    UnknownModelIdError,
 )
 from agent_runtime.local_runtime import (
     EndpointConflictError,
@@ -1458,7 +1458,7 @@ def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
         session_path=session_path,
     )
 
-    with pytest.raises(UnknownModelAliasError, match="missing") as captured:
+    with pytest.raises(UnknownModelIdError, match="missing") as captured:
         control.switch_model("missing", requested_by="user")
 
     assert "mimo-v2.5-pro" in str(captured.value)
@@ -1468,6 +1468,18 @@ def test_invalid_user_switch_keeps_state_and_never_resolves_a_provider(
     assert not session_path.exists()
 
 
+def test_control_plane_resolve_accepts_public_model_id_keyword(tmp_path: Path) -> None:
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    control = ModelControlPlane.from_config_file(
+        config_path,
+        initial_model_id="mimo-v2.5-pro",
+    )
+
+    assert control.resolve(model_id="mimo-v2.5-pro").model_id == "mimo-v2.5-pro"
+    assert control.resolve_or_fallback(model_id="mimo-v2.5-pro").model_id == "mimo-v2.5-pro"
+
+
 def test_unknown_explicit_initial_model_lists_available_ids_without_session_mutation(
     tmp_path: Path,
 ) -> None:
@@ -1475,7 +1487,7 @@ def test_unknown_explicit_initial_model_lists_available_ids_without_session_muta
     session_path = tmp_path / "model-session.json"
     _write_models_config(config_path)
 
-    with pytest.raises(UnknownModelAliasError) as captured:
+    with pytest.raises(UnknownModelIdError) as captured:
         ModelControlPlane.from_config_file(
             config_path,
             initial_model_id="missing",

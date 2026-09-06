@@ -72,7 +72,7 @@ def _quality_suite() -> dict[str, object]:
     return {
         "schema_version": 1,
         "suite_id": "agent-model-tool-quality-v1",
-        "models": ["groq_gpt_oss_120b"],
+        "models": ["openai/gpt-oss-120b"],
         "cases": [
             {
                 "id": "approval_continue",
@@ -91,9 +91,8 @@ def _passing_model_report() -> dict[str, object]:
     metrics = _trial_metrics()
     return {
         "status": "completed",
-        "model_alias": "groq_gpt_oss_120b",
+        "model_id": "openai/gpt-oss-120b",
         "provider": "groq",
-        "provider_model": "openai/gpt-oss-120b",
         "trial_count": 1,
         "trial_metrics": [metrics],
         "trials": [],
@@ -105,9 +104,8 @@ def _inconclusive_model_report(
     *,
     case_id: str = "approval_continue",
     capability: str = "approval_continuation",
-    model_alias: str = "groq_gpt_oss_120b",
+    model_id: str = "openai/gpt-oss-120b",
     provider: str = "groq",
-    provider_model: str = "openai/gpt-oss-120b",
 ) -> dict[str, object]:
     observation = module.CaseObservation(
         case_id=case_id,
@@ -131,9 +129,8 @@ def _inconclusive_model_report(
     )
     return {
         "status": "inconclusive",
-        "model_alias": model_alias,
+        "model_id": model_id,
         "provider": provider,
-        "provider_model": provider_model,
         "trial_count": 3,
         "trial_metrics": [],
         "trials": [
@@ -167,7 +164,7 @@ def _inconclusive_model_report(
 def test_evaluator_version_tracks_namespaced_least_authority_contract() -> None:
     module = _load_gate_module()
 
-    assert module.EVALUATOR_VERSION == "agent_model_quality_gate_v3"
+    assert module.EVALUATOR_VERSION == "agent_model_quality_gate_v4"
 
 
 def test_repository_fingerprint_binds_clean_commit_and_tree(tmp_path: Path) -> None:
@@ -362,8 +359,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
         module,
         "evaluate_model_gate",
         lambda **_kwargs: {
-            "model_alias": "groq_gpt_oss_120b",
-            "provider_model": "openai/gpt-oss-120b",
+            "model_id": "openai/gpt-oss-120b",
             "passed": True,
             "observed": _trial_metrics(),
             "thresholds": {},
@@ -376,7 +372,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
         json.dumps(
             {
                 "models": {
-                    "groq_gpt_oss_120b": {
+                    "openai/gpt-oss-120b": {
                         "trial_count": 1,
                     }
                 }
@@ -390,7 +386,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
         fixture=tmp_path / "private" / "cases.json",
         baseline=baseline,
         env_file=tmp_path / "private" / ".env",
-        models=["groq_gpt_oss_120b"],
+        models=["openai/gpt-oss-120b"],
         report=report,
     )
 
@@ -685,7 +681,7 @@ async def test_run_live_case_leaves_workspace_change_checks_to_the_evaluator(
 
     monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
     await module.run_live_case(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         control_plane=object(),
         case={
             "id": "workspace-contract",
@@ -815,7 +811,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
 
     monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
     observation = await module.run_live_case(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         control_plane=object(),
         case={
             "id": "approval_continue",
@@ -930,7 +926,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
 
     monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
     observation = await module.run_live_case(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         control_plane=object(),
         case={
             "id": "approval_continue",
@@ -1098,7 +1094,7 @@ def test_cli_rechecks_source_after_model_trials_before_writing_artifact(
         json.dumps(
             {
                 "models": {
-                    "groq_gpt_oss_120b": {
+                    "openai/gpt-oss-120b": {
                         "trial_count": 1,
                     }
                 }
@@ -1138,8 +1134,7 @@ def test_cli_rechecks_source_after_model_trials_before_writing_artifact(
         module,
         "evaluate_model_gate",
         lambda **_kwargs: {
-            "model_alias": "groq_gpt_oss_120b",
-            "provider_model": "openai/gpt-oss-120b",
+            "model_id": "openai/gpt-oss-120b",
             "passed": True,
             "observed": _trial_metrics(),
             "thresholds": {},
@@ -1167,7 +1162,7 @@ def test_cli_rechecks_source_after_model_trials_before_writing_artifact(
                 "--baseline",
                 str(baseline_path),
                 "--model",
-                "groq_gpt_oss_120b",
+                "openai/gpt-oss-120b",
                 "--report",
                 str(output_path),
             ]
@@ -1203,7 +1198,7 @@ async def test_gate_rejects_a_clean_repository_that_is_not_the_running_source(
         fixture=FIXTURE_PATH,
         baseline=BASELINE_PATH,
         env_file=tmp_path / ".env",
-        models=["groq_gpt_oss_120b"],
+        models=["openai/gpt-oss-120b"],
         report=tmp_path / "report.json",
     )
 
@@ -1239,7 +1234,7 @@ async def test_gate_rejects_runtime_import_resolving_outside_source_repository(
         fixture=FIXTURE_PATH,
         baseline=BASELINE_PATH,
         env_file=tmp_path / ".env",
-        models=["groq_gpt_oss_120b"],
+        models=["openai/gpt-oss-120b"],
         report=tmp_path / "report.json",
     )
 
@@ -1271,9 +1266,15 @@ async def test_run_model_trials_returns_inconclusive_partial_evidence(
             return cls()
 
         def current_model(self) -> object:
-            return SimpleNamespace(
+            from agent_runtime.models import ModelSpec
+
+            return ModelSpec(
+                id="openai/gpt-oss-120b",
                 provider="groq",
-                provider_model="openai/gpt-oss-120b",
+                context_window=131_072,
+                supports_tools=True,
+                supports_structured_output=True,
+                location="cloud",
             )
 
     async def run_case(**_kwargs: object) -> object:
@@ -1285,17 +1286,64 @@ async def test_run_model_trials_returns_inconclusive_partial_evidence(
     monkeypatch.setattr(module, "run_live_case", run_case)
 
     report = await module.run_model_trials(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         cases=suite["cases"],
         trials=3,
         env_file=tmp_path / ".env",
     )
 
     assert report["status"] == "inconclusive"
+    assert report["model_id"] == "openai/gpt-oss-120b"
+    assert "model_alias" not in report
+    assert "provider_model" not in report
     assert report["trial_metrics"] == []
     raw_case = report["trials"][0]["cases"][0]
     assert raw_case["observation"]["infrastructure_failure"] is True
     assert raw_case["score"]["passed"] is None
+
+
+@pytest.mark.anyio
+async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    suite = module.load_suite(FIXTURE_PATH)
+    model_id = str(suite["models"][0])
+    first_case = suite["cases"][0]
+    inconclusive = _inconclusive_model_report(
+        module,
+        case_id=str(first_case["id"]),
+        capability=str(first_case["capability"]),
+        model_id=model_id,
+        provider="deepseek",
+    )
+    observation = module._observation_from_payload(
+        inconclusive["trials"][0]["cases"][0]["observation"]
+    )
+    received_model_ids: list[str] = []
+
+    async def run_case(**kwargs: object) -> object:
+        received_model_ids.append(str(kwargs["model_id"]))
+        return observation
+
+    monkeypatch.setenv(
+        "PRAXIS_MODEL_REGISTRY_PATH",
+        str(tmp_path / "models.yaml"),
+    )
+    monkeypatch.setattr(module, "run_live_case", run_case)
+
+    report = await module.run_model_trials(
+        model_id=model_id,
+        cases=suite["cases"],
+        trials=1,
+        env_file=tmp_path / "missing.env",
+    )
+
+    assert received_model_ids == ["deepseek-v4-flash"]
+    assert report["model_id"] == "deepseek-v4-flash"
+    assert report["provider"] == "deepseek"
+    assert report["infrastructure_failure"]["case_id"] == str(first_case["id"])
 
 
 @pytest.mark.parametrize("failure_stage", ["from_env", "current_model"])
@@ -1342,7 +1390,7 @@ async def test_gate_records_control_plane_initialization_failure_before_cases(
         fixture=FIXTURE_PATH,
         baseline=BASELINE_PATH,
         env_file=tmp_path / ".env",
-        models=["deepseek_v4_flash"],
+        models=["deepseek-v4-flash"],
         report=report_path,
     )
 
@@ -1437,7 +1485,7 @@ def test_cli_returns_two_and_writes_report_for_control_plane_initialization_fail
             "--env-file",
             str(tmp_path / ".env"),
             "--model",
-            "deepseek_v4_flash",
+            "deepseek-v4-flash",
             "--report",
             str(report_path),
         ],
@@ -1470,7 +1518,7 @@ async def test_model_trial_initialization_does_not_swallow_programming_errors(
 
     with pytest.raises(TypeError, match="programming defect"):
         await module.run_model_trials(
-            model_alias="groq_gpt_oss_120b",
+            model_id="openai/gpt-oss-120b",
             cases=module.load_suite(FIXTURE_PATH)["cases"],
             trials=3,
             env_file=tmp_path / ".env",
@@ -1549,9 +1597,8 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
             module,
             case_id="exact_file_read",
             capability="file_tool_selection",
-            model_alias="deepseek_v4_flash",
+            model_id="deepseek-v4-flash",
             provider="deepseek",
-            provider_model="deepseek-v4-flash",
         )
 
     monkeypatch.setattr(module, "run_model_trials", run_trials)
@@ -1560,7 +1607,7 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
         json.dumps(
             {
                 "models": {
-                    "deepseek_v4_flash": {
+                    "deepseek-v4-flash": {
                         "trial_count": 3,
                         "thresholds": {},
                     }
@@ -1575,7 +1622,7 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
         fixture=tmp_path / "cases.json",
         baseline=baseline,
         env_file=tmp_path / ".env",
-        models=["deepseek_v4_flash"],
+        models=["deepseek-v4-flash"],
         report=report_path,
     )
 
@@ -1663,9 +1710,15 @@ async def test_gate_approval_infrastructure_report_renders_only_partial_evidence
             return cls()
 
         def current_model(self) -> object:
-            return SimpleNamespace(
+            from agent_runtime.models import ModelSpec
+
+            return ModelSpec(
+                id="openai/gpt-oss-120b",
                 provider="groq",
-                provider_model="openai/gpt-oss-120b",
+                context_window=131_072,
+                supports_tools=True,
+                supports_structured_output=True,
+                location="cloud",
             )
 
     async def run_case(**_kwargs: object) -> object:
@@ -1691,7 +1744,7 @@ async def test_gate_approval_infrastructure_report_renders_only_partial_evidence
         json.dumps(
             {
                 "models": {
-                    "groq_gpt_oss_120b": {
+                    "openai/gpt-oss-120b": {
                         "trial_count": 3,
                         "thresholds": {},
                     }
@@ -1707,7 +1760,7 @@ async def test_gate_approval_infrastructure_report_renders_only_partial_evidence
             fixture=tmp_path / "cases.json",
             baseline=baseline,
             env_file=tmp_path / ".env",
-            models=["groq_gpt_oss_120b"],
+            models=["openai/gpt-oss-120b"],
             report=report_path,
         )
     )
@@ -1748,7 +1801,7 @@ def test_fixture_locks_models_and_quality_capabilities() -> None:
     payload = json.loads(FIXTURE_PATH.read_text(encoding="utf-8"))
 
     assert payload["schema_version"] == 1
-    assert payload["models"] == ["deepseek_v4_flash"]
+    assert payload["models"] == ["deepseek-v4-flash"]
     assert {case["capability"] for case in payload["cases"]} == {
         "file_tool_selection",
         "failure_recovery",
@@ -1809,19 +1862,18 @@ def test_baseline_validation_recomputes_and_rejects_edited_thresholds() -> None:
     module = _load_gate_module()
     trials = [_trial_metrics() for _ in range(3)]
     baseline = {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite_revision": "suite_123",
         "threshold_method": module.THRESHOLD_METHOD,
         "models": {
-            "qwen3_5_9b_mlx_4bit": {
-                "provider_model": "mlx-community/Qwen3.5-9B-4bit",
+            "mlx-community/Qwen3.5-9B-4bit": {
                 "trial_count": 3,
                 "trial_metrics": trials,
                 "thresholds": module.derive_thresholds(trials),
             }
         },
     }
-    baseline["models"]["qwen3_5_9b_mlx_4bit"]["thresholds"]["task_success_rate"]["value"] = 0.5
+    baseline["models"]["mlx-community/Qwen3.5-9B-4bit"]["thresholds"]["task_success_rate"]["value"] = 0.5
 
     with pytest.raises(ValueError, match="do not match measured trials"):
         module.validate_baseline(baseline)
@@ -1854,7 +1906,6 @@ def test_gate_uses_worst_current_trial_and_reports_regressions() -> None:
     module = _load_gate_module()
     baseline_trials = [_trial_metrics() for _ in range(3)]
     model_baseline = {
-        "provider_model": "openai/gpt-oss-120b",
         "trial_count": 3,
         "trial_metrics": baseline_trials,
         "thresholds": module.derive_thresholds(baseline_trials),
@@ -1866,8 +1917,7 @@ def test_gate_uses_worst_current_trial_and_reports_regressions() -> None:
     ]
 
     result = module.evaluate_model_gate(
-        model_alias="groq_gpt_oss_120b",
-        provider_model="openai/gpt-oss-120b",
+        model_id="openai/gpt-oss-120b",
         trial_metrics=current_trials,
         baseline=model_baseline,
     )

@@ -38,8 +38,8 @@ from agent_runtime.modeling.contracts import (
 )
 
 
-class UnknownModelAliasError(KeyError):
-    """别名在 models 中不存在。"""
+class UnknownModelIdError(KeyError):
+    """模型 ID 在 models 中不存在。"""
 
 
 class ModelNotAvailableError(RuntimeError):
@@ -199,7 +199,7 @@ class ModelRegistry:
         if default_model is not None:
             if default_model not in config.models:
                 available = ", ".join(sorted(config.models))
-                raise UnknownModelAliasError(
+                raise UnknownModelIdError(
                     f"Model ID {default_model!r} not found in config. "
                     f"Available IDs: {available}"
                 )
@@ -394,9 +394,9 @@ class ModelRegistry:
         self._cache[model_id] = resolved
         return resolved
 
-    def _unknown_model_id(self, model_id: str) -> UnknownModelAliasError:
+    def _unknown_model_id(self, model_id: str) -> UnknownModelIdError:
         available = ", ".join(sorted(self._config.models))
-        return UnknownModelAliasError(
+        return UnknownModelIdError(
             f"Model ID {model_id!r} not found in config. Available IDs: {available}"
         )
 
@@ -509,7 +509,7 @@ class ModelRegistry:
         """尝试解析模型 ID，失败时降级到 fallback_model。"""
         try:
             return self.resolve(model_id)
-        except (UnknownModelAliasError, ModelNotAvailableError):
+        except (UnknownModelIdError, ModelNotAvailableError):
             if self._config.fallback_model and model_id != self._config.fallback_model:
                 return self.resolve(self._config.fallback_model)
             raise

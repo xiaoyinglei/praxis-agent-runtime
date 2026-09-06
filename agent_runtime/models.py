@@ -22,7 +22,7 @@ from agent_runtime.core.llm_registry import (
     ModelRegistry,
     ModelResolver,
     ResolvedModel,
-    UnknownModelAliasError,
+    UnknownModelIdError,
     user_model_registry_path,
 )
 from agent_runtime.core.messages import canonical_json_text
@@ -114,7 +114,7 @@ class ModelCatalog:
         if not specs:
             raise ValueError("model catalog must not be empty")
         if default_model_id not in specs:
-            raise UnknownModelAliasError(f"Default model {default_model_id!r} not found in catalog")
+            raise UnknownModelIdError(f"Default model {default_model_id!r} not found in catalog")
         if origins is not None and set(origins) != set(specs):
             raise ValueError("model catalog origins must cover exactly the model specs")
         if definitions is not None and set(definitions) != set(specs):
@@ -156,7 +156,7 @@ class ModelCatalog:
             return self._specs[model_id]
         except KeyError as exc:
             available = ", ".join(sorted(self._specs))
-            raise UnknownModelAliasError(
+            raise UnknownModelIdError(
                 f"Model ID {model_id!r} not found in catalog. Available IDs: {available}"
             ) from exc
 
@@ -492,7 +492,7 @@ class ModelControlPlane:
         definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> None:
         if not catalog.has(state.current_model_id):
-            raise UnknownModelAliasError(
+            raise UnknownModelIdError(
                 f"Model ID {state.current_model_id!r} "
                 "not found in catalog"
             )
@@ -1004,18 +1004,18 @@ class ModelControlPlane:
 
     def resolve(
         self,
-        alias: str,
+        model_id: str,
     ) -> ResolvedModel:
         if self._registry is None:
             raise RuntimeError(
                 "Model resolver is not configured"
             )
-        spec = self.catalog.get(alias)
+        spec = self.catalog.get(model_id)
         self._ensure_model_credentials(spec)
-        return self._registry.resolve(alias)
+        return self._registry.resolve(model_id)
 
-    def resolve_or_fallback(self, alias: str) -> ResolvedModel:
-        return self.resolve(alias)
+    def resolve_or_fallback(self, model_id: str) -> ResolvedModel:
+        return self.resolve(model_id)
 
     def resolve_for_node(
         self,
@@ -1078,7 +1078,7 @@ def _load_session_state(
         return state, ()
     if initial_model_id is not None or store is None:
         available = ", ".join(sorted(spec.id for spec in catalog.list_models()))
-        raise UnknownModelAliasError(
+        raise UnknownModelIdError(
             f"Model ID {state.current_model_id!r} not found in catalog. "
             f"Available IDs: {available}"
         )
