@@ -29,6 +29,28 @@ def test_delivery_cases_target_the_public_replacement_harness() -> None:
     )
 
 
+def test_fake_delivery_binding_uses_only_model_id() -> None:
+    module = _load_smoke_module()
+    case = module.build_cases()[0]
+    model = module._SmokeModel(case)
+
+    binding = model.snapshot(thread_id="thread-smoke", turn_id="turn-smoke")
+
+    assert binding["model_id"] == f"smoke-{case.name}"
+    assert "model_alias" not in binding
+    with pytest.raises(RuntimeError, match="legacy model_alias"):
+        model.ensure_available(
+            {
+                **binding,
+                "model_alias": f"smoke-{case.name}",
+                "thread_id": "thread-smoke",
+                "turn_id": "turn-smoke",
+            },
+            thread_id="thread-smoke",
+            turn_id="turn-smoke",
+        )
+
+
 @pytest.mark.anyio
 async def test_fake_delivery_matrix_runs_public_sdk_and_approval_resume() -> None:
     module = _load_smoke_module()

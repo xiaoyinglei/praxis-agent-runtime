@@ -1288,7 +1288,7 @@
         "pytest",
         "-q",
         "tests/agent/test_model_control_plane.py::test_invalid_user_switch_keeps_state_and_never_resolves_a_provider",
-        "tests/agent/test_cli_chat_commands.py::test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_turn"
+        "tests/agent/test_cli_chat_commands.py::test_invalid_model_id_keeps_current_lists_ids_and_starts_no_turn"
       ],
       "expected_evidence": {
         "kind": "model_control_public_test",

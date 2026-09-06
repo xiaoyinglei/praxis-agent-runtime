@@ -15,6 +15,7 @@ from pathlib import Path
 from agent_runtime import Agent
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
+    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
@@ -71,7 +72,7 @@ class _SmokeModel:
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": f"smoke-{self.case.name}",
+            "model_id": f"smoke-{self.case.name}",
             "model_revision": "public-harness-smoke-v1",
         }
 
@@ -84,8 +85,10 @@ class _SmokeModel:
     ) -> None:
         if binding.get("thread_id") != thread_id or binding.get("turn_id") != turn_id:
             raise RuntimeError("smoke binding belongs to a different Turn")
-        if binding.get("model_alias") != f"smoke-{self.case.name}":
-            raise RuntimeError("smoke model alias changed")
+        if "model_alias" in binding:
+            raise RuntimeError("legacy model_alias is unsupported")
+        if binding.get("model_id") != f"smoke-{self.case.name}":
+            raise RuntimeError("smoke model ID changed")
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(
@@ -106,7 +109,13 @@ class _SmokeModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(
+        self,
+        prepared: PreparedModelCall,
+        *,
+        delta_sink: HarnessModelDeltaSink | None = None,
+    ) -> HarnessModelResponse:
+        del delta_sink
         step = int(prepared.request_ref["step"])
         if self.case.name == "direct_answer":
             return _response(text="4", step=step)
@@ -163,7 +172,7 @@ async def _run_case(case: SmokeCase) -> SmokeResult:
             workspace_path=workspace,
         )
         model = _SmokeModel(case)
-        agent._harness_model = lambda: model
+        agent.__dict__["_harness_model"] = lambda: model
         result = await agent.run(
             case.task,
             allow_write_tools=True,

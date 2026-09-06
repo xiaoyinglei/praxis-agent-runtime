@@ -29,6 +29,7 @@ def test_cli_projection_smoke_covers_the_delivery_surface() -> None:
         "command_surface",
         "diff",
         "interactive_commands",
+        "model_binding",
         "plan",
         "recovery",
         "recovery_commands",

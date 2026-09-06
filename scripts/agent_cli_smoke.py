@@ -53,10 +53,10 @@ async def _render_canonical_events() -> str:
                 data={
                     "plan": {
                         "revision": 2,
-                        "steps": [
+                        "steps": (
                             {"title": "Inspect source", "status": "completed"},
                             {"title": "Verify CLI", "status": "in_progress"},
-                        ],
+                        ),
                     }
                 },
             )
@@ -124,11 +124,15 @@ def run_smoke() -> CLISmokeResult:
             turn = store.start_turn(
                 thread_id=thread.thread_id,
                 user_message="verify CLI projection",
-                binding_manifest={"model_alias": "smoke-model"},
+                binding_manifest={"model_id": "smoke-model"},
             )
             turn = store.complete_turn(
                 turn_id=turn.turn_id,
                 answer="CLI smoke fixture",
+            )
+            checks["model_binding"] = (
+                turn.binding_manifest.get("model_id") == "smoke-model"
+                and "model_alias" not in turn.binding_manifest
             )
 
         rendered = asyncio.run(_render_canonical_events())
