@@ -388,19 +388,31 @@ def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
     assert spec.context_window == 262_144
 
 
-def test_bundled_local_qwen8_runtime_is_available_for_local_testing() -> None:
+def test_bundled_local_qwen8_uses_mlx_without_process_launcher() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
     spec = catalog.get("mlx-community/Qwen3-8B-4bit")
 
-    assert spec.provider == "local_mlx_chat_8080"
+    assert spec.provider == "mlx"
     assert spec.id == "mlx-community/Qwen3-8B-4bit"
     assert spec.location == "local"
-    assert spec.runtime is not None
-    assert spec.runtime.health_url == "http://127.0.0.1:8080/v1/models"
-    assert spec.runtime.expected_model_contains == "Qwen3-8B-4bit"
-    assert "{model}" not in spec.runtime.launch_command
-    assert "mlx-community/Qwen3-8B-4bit" in spec.runtime.launch_command
+    assert spec.base_url == "http://127.0.0.1:8080/v1"
+    assert spec.runtime is None
+
+
+def test_bundled_catalog_has_no_process_launcher_configuration() -> None:
+    payload = yaml.safe_load(Path("configs/models.yaml").read_text(encoding="utf-8"))
+
+    assert set(payload["providers"]) == {
+        "deepseek",
+        "groq",
+        "kimi",
+        "mimo",
+        "mlx",
+        "sentence_transformers",
+    }
+    assert all("runtime" not in provider for provider in payload["providers"].values())
+    assert all("runtime" not in model for model in payload["models"].values())
 
 
 def test_bundled_tool_decision_budget_supports_coding_turns() -> None:
@@ -1606,18 +1618,19 @@ async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
         )
 
 @pytest.mark.anyio
-async def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
+async def test_bundled_qwen14_probe_uses_model_base_url() -> None:
     spec = ModelCatalog.from_config_file(
         Path("configs/models.yaml")
     ).get("mlx-community/Qwen3-14B-4bit")
 
-    assert spec.runtime is not None
+    assert spec.runtime is None
+    requested: list[tuple[str, float]] = []
 
     async def request_json(
         url: str,
         timeout: float,
     ) -> object:
-        del url, timeout
+        requested.append((url, timeout))
 
         return {
             "data": [
@@ -1635,3 +1648,4 @@ async def test_bundled_qwen14_runtime_accepts_mlx_canonical_model_id() -> None:
         )
 
     await probe.ensure_ready(spec)
+    assert requested == [("http://127.0.0.1:8080/v1/models", 5.0)]

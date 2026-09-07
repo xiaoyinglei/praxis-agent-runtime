@@ -55,10 +55,14 @@ class LocalProviderProbe:
             if runtime is not None
             else None
         )
+        if not health_url:
+            base_url = getattr(spec, "base_url", None)
+            if base_url:
+                health_url = f"{str(base_url).rstrip('/')}/models"
 
         if not health_url:
             raise LocalRuntimeError(
-                f"Local model {spec.id!r} has no runtime.health_url"
+                f"Local model {spec.id!r} has no base_url"
             )
 
         expected = (

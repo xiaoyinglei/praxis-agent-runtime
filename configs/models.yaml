@@ -12,31 +12,8 @@
 # Providers: connection-level configuration.
 # ---------------------------------------------------------------------------
 providers:
-  local_mlx_chat_8080:
-    protocol: openai_compatible
+  mlx:
     location: local
-    base_url: http://127.0.0.1:8080/v1
-    runtime:
-      server: mlx_lm.server
-      host: 127.0.0.1
-      port: 8080
-      health_url: http://127.0.0.1:8080/v1/models
-      startup_timeout_seconds: 120
-      poll_interval_seconds: 1
-      launch_command_template:
-        - uv
-        - run
-        - python
-        - -m
-        - mlx_lm.server
-        - --model
-        - "{model}"
-        - --host
-        - 127.0.0.1
-        - --port
-        - "8080"
-        - --chat-template-args
-        - '{"enable_thinking": false}'
 
   deepseek:
     protocol: openai_compatible
@@ -62,11 +39,7 @@ providers:
     base_url: https://token-plan-cn.xiaomimimo.com/v1
     api_key_env: MIMO_API_KEY
 
-  local_mlx_embedding:
-    protocol: mlx_embedding
-    location: local
-
-  local_sentence_transformers:
+  sentence_transformers:
     protocol: sentence_transformers
     location: local
 
@@ -80,31 +53,31 @@ models:
   # -------------------------------------------------------------------------
   mlx-community/Qwen3-0.6B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-0.6B-4bit
 
   mlx-community/Qwen3-8B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-8B-4bit
 
   mlx-community/Qwen3-14B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-14B-4bit
 
   mlx-community/Qwen3.5-9B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 262144
-    runtime:
-      expected_model_contains: Qwen3.5-9B-4bit
 
   # -------------------------------------------------------------------------
   # Chat models: DeepSeek.
@@ -164,12 +137,14 @@ models:
   # -------------------------------------------------------------------------
   mlx-community/Qwen3-Embedding-8B-4bit-DWQ:
     capability: embedding
-    provider: local_mlx_embedding
+    provider: mlx
+    protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-8B-4bit-DWQ
 
   mlx-community/Qwen3-Embedding-4B-4bit-DWQ:
     capability: embedding
-    provider: local_mlx_embedding
+    provider: mlx
+    protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-4B-4bit-DWQ
 
   # -------------------------------------------------------------------------
@@ -177,11 +152,11 @@ models:
   # -------------------------------------------------------------------------
   BAAI/bge-reranker-v2-m3:
     capability: reranker
-    provider: local_sentence_transformers
+    provider: sentence_transformers
 
   Qwen/Qwen3-Reranker-4B:
     capability: reranker
-    provider: local_sentence_transformers
+    provider: sentence_transformers
 
 
 # ---------------------------------------------------------------------------

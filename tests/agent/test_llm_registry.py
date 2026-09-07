@@ -572,12 +572,11 @@ def test_repository_catalog_declares_local_qwen35_9b() -> None:
 
     spec = config.models["mlx-community/Qwen3.5-9B-4bit"]
     assert spec.provider is ModelProvider.OPENAI_COMPATIBLE
-    assert spec.provider_name == "local_mlx_chat_8080"
+    assert spec.provider_name == "mlx"
     assert spec.context_window_tokens == 262_144
     assert spec.location == "local"
-    assert spec.runtime is not None
-    assert spec.runtime.health_url == "http://127.0.0.1:8080/v1/models"
-    assert spec.runtime.expected_model_contains == "Qwen3.5-9B-4bit"
+    assert spec.base_url == "http://127.0.0.1:8080/v1"
+    assert spec.runtime is None
 
 
 def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None:
