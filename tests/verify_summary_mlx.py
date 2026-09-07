@@ -3,7 +3,6 @@
 不手写 model / base_url / max_tokens，全由 generation.summary 驱动。
 使用 RecordingLLM 捕获真实调用参数，确认 max_tokens 透传正确。
 """
-
 from __future__ import annotations
 
 import os
@@ -28,7 +27,6 @@ pytestmark = pytest.mark.skipif(
 
 # ── adapter factory ────────────────────────────────────────────
 
-
 def _make_chat_adapter(model_spec):
     """从 ModelSpec 构建 _ChatGeneratorAdapter（不手写 model/base_url）"""
     generator = _OpenAICompatibleChatGenerator(
@@ -42,7 +40,6 @@ def _make_chat_adapter(model_spec):
 
 
 # ── RecordingLLM wrapper ───────────────────────────────────────
-
 
 class RecordingLLM:
     """只捕获内部真实 LLM 调用，不做额外调用。"""
@@ -61,31 +58,26 @@ class RecordingLLM:
 
     def generate_text(self, *, prompt: str, **kwargs):
         output = self.inner.generate_text(prompt=prompt, **kwargs)
-        self.calls.append(
-            {
-                "method": "generate_text",
-                "prompt": prompt,
-                "kwargs": kwargs,
-                "output": output,
-            }
-        )
+        self.calls.append({
+            "method": "generate_text",
+            "prompt": prompt,
+            "kwargs": kwargs,
+            "output": output,
+        })
         return output
 
     def chat(self, prompt: str, **kwargs):
         output = self.inner.chat(prompt, **kwargs)
-        self.calls.append(
-            {
-                "method": "chat",
-                "prompt": prompt,
-                "kwargs": kwargs,
-                "output": output,
-            }
-        )
+        self.calls.append({
+            "method": "chat",
+            "prompt": prompt,
+            "kwargs": kwargs,
+            "output": output,
+        })
         return output
 
 
 # ── helpers ────────────────────────────────────────────────────
-
 
 def _print_recording(recording: RecordingLLM, label: str):
     if not recording.calls:
@@ -112,7 +104,7 @@ def _evaluate(summary: str, original: str):
     for line in lines:
         for prefix in ("Semantic Core:", "Fact Anchors:", "Retrieval Keywords:"):
             if line.startswith(prefix):
-                fields[prefix.rstrip(":")] = line[len(prefix) :].strip()
+                fields[prefix.rstrip(":")] = line[len(prefix):].strip()
 
     issues = []
 
@@ -160,7 +152,6 @@ def _evaluate(summary: str, original: str):
 
 # ── pytest fixtures ─────────────────────────────────────────────
 
-
 @pytest.fixture(scope="module")
 def catalog():
     return ModelCatalog.from_yaml()
@@ -177,7 +168,6 @@ def model_spec(catalog, gen_config):
 
 
 # ── tests ──────────────────────────────────────────────────────
-
 
 def test_section_summary(model_spec, gen_config, catalog):
     adapter = _make_chat_adapter(model_spec)
@@ -233,7 +223,9 @@ def test_section_summary(model_spec, gen_config, catalog):
 
     # 验证 max_tokens 透传
     if recording.calls:
-        assert "max_tokens" in recording.calls[-1]["kwargs"], "max_tokens should be in kwargs!"
+        assert "max_tokens" in recording.calls[-1]["kwargs"], (
+            "max_tokens should be in kwargs!"
+        )
         expected = gen_config.summary.max_tokens or 4096
         actual = recording.calls[-1]["kwargs"]["max_tokens"]
         assert actual == expected, f"Expected max_tokens={expected}, got {actual}"
@@ -313,7 +305,6 @@ def test_doc_summary(model_spec, gen_config, catalog):
 
 # ── model switching test ───────────────────────────────────────
 
-
 def test_switch_summary_model(catalog):
     """验证只改 generation.summary.model 即可切换模型，不改业务代码"""
     task_config = catalog.generation.summary
@@ -324,10 +315,7 @@ def test_switch_summary_model(catalog):
     print(f"\n[Switch] 当前 summary model: {spec1.id}")
 
     # 切换到小型 Qwen（不改业务逻辑，只解析不同的 task config）
-    small_task = type(task_config)(
-        model="mlx-community/Qwen3-0.6B-4bit",
-        max_tokens=task_config.max_tokens,
-    )
+    small_task = type(task_config)(model="mlx-community/Qwen3-0.6B-4bit", max_tokens=task_config.max_tokens)
     spec2 = resolve_task_model(small_task, catalog)
     print(f"[Switch] 切换后 summary model: {spec2.id}")
     assert spec2.id == "mlx-community/Qwen3-0.6B-4bit"

@@ -179,10 +179,10 @@ def test_model_call_record_binds_usage_to_exact_request_evidence() -> None:
 
 
 def test_cache_pricing_is_optional_and_never_invented() -> None:
-    default = ModelSpec(provider=ModelProvider.MLX, context_window_tokens=32_768)
+    default = ModelSpec(provider=ModelProvider.MLX, model="local-model")
     priced = ModelSpec(
         provider=ModelProvider.OPENAI_COMPATIBLE,
-        context_window_tokens=32_768,
+        model="cloud-model",
         cache_read_cost_per_1m=0.1,
         cache_write_cost_per_1m=0.25,
     )
@@ -195,6 +195,6 @@ def test_cache_pricing_is_optional_and_never_invented() -> None:
     with pytest.raises(ValidationError):
         ModelSpec(
             provider=ModelProvider.OPENAI_COMPATIBLE,
-            context_window_tokens=32_768,
+            model="invalid-price",
             cache_read_cost_per_1m=-0.1,
         )
