@@ -19,14 +19,14 @@ _PROVIDER_KIND_MAP: dict[str, str] = {
 
 
 def resolve_task_model(task_config: GenerationTaskConfig, catalog: ModelCatalog) -> ModelSpec:
-    """Resolve a generation task's model alias to a ModelSpec.
+    """Resolve a generation task's model ID to a ModelSpec.
 
     If task_config.model is set, uses it directly.
     Otherwise falls back to catalog's defaults.primary_model.
     """
-    alias = task_config.model
-    if alias:
-        return catalog.get_model(alias)
+    model_id = task_config.model
+    if model_id:
+        return catalog.get_model(model_id)
     return catalog.get_default_primary()
 
 
@@ -64,7 +64,7 @@ def to_assembly_overrides(config: ModelRuntimeConfig) -> AssemblyOverrides:
 def _to_chat_provider_config(spec: ModelSpec) -> ProviderConfig:
     return ProviderConfig(
         provider_kind=_map_kind(spec.provider),
-        chat_model=spec.model,
+        chat_model=spec.id,
         base_url=spec.base_url,
         api_key=_resolve_api_key(spec),
     )
@@ -73,8 +73,8 @@ def _to_chat_provider_config(spec: ModelSpec) -> ProviderConfig:
 def _to_embedding_provider_config(spec: ModelSpec) -> ProviderConfig:
     return ProviderConfig(
         provider_kind=_map_kind(spec.provider),
-        embedding_model=spec.model,
-        embedding_space=spec.embedding_space or spec.model,
+        embedding_model=spec.id,
+        embedding_space=spec.embedding_space or spec.id,
         base_url=spec.base_url,
     )
 
@@ -84,7 +84,7 @@ def _to_reranker_provider_config(spec: ModelSpec | None) -> ProviderConfig | Non
         return None
     return ProviderConfig(
         provider_kind=_map_kind(spec.provider),
-        rerank_model=spec.model,
+        rerank_model=spec.id,
     )
 
 

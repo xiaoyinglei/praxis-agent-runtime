@@ -63,34 +63,21 @@ class ModelCatalog:
 
         models: dict[str, ModelSpec] = {}
         for model_id, entry in raw_models.items():
-            if (
-                type(model_id) is not str
-                or not model_id
-                or model_id != model_id.strip()
-            ):
-                raise ValueError(
-                    "model catalog keys must be non-empty trimmed IDs"
-                )
+            if type(model_id) is not str or not model_id or model_id != model_id.strip():
+                raise ValueError("model catalog keys must be non-empty trimmed IDs")
             if not isinstance(entry, dict):
                 raise ValueError(f"Model entry {model_id!r} must be a dict, got {type(entry).__name__}")
             capability = ModelCapability(entry["capability"])
-            if capability is ModelCapability.CHAT:
-                redundant = sorted(
-                    field
-                    for field in ("model", "max_context_window_tokens")
-                    if field in entry
-                )
-                if redundant:
-                    raise ValueError(
-                        f"Chat model {model_id!r} contains redundant fields: "
-                        + ", ".join(redundant)
-                    )
+            redundant = ["model"] if "model" in entry else []
+            if capability is ModelCapability.CHAT and "max_context_window_tokens" in entry:
+                redundant.append("max_context_window_tokens")
+            if redundant:
+                raise ValueError(f"Model {model_id!r} contains redundant fields: " + ", ".join(sorted(redundant)))
             merged = _merge_provider_model_entry(entry, providers)
             models[model_id] = ModelSpec(
-                alias=model_id,
+                id=model_id,
                 capability=capability,
                 provider=str(merged.get("protocol") or merged.get("provider") or entry["provider"]),
-                model=(model_id if capability is ModelCapability.CHAT else entry["model"]),
                 base_url=_optional_str(merged.get("base_url")),
                 api_key_env=_optional_str(merged.get("api_key_env")),
                 embedding_space=entry.get("embedding_space"),
@@ -150,30 +137,30 @@ class ModelCatalog:
     def llm_stage_budgets(self) -> dict[LLMCallStage, LLMStageBudget]:
         return {stage: budget.model_copy() for stage, budget in self._llm_stage_budgets.items()}
 
-    def get_model(self, alias: str) -> ModelSpec:
-        spec = self._models.get(alias)
+    def get_model(self, model_id: str) -> ModelSpec:
+        spec = self._models.get(model_id)
         if spec is None:
             available = ", ".join(sorted(self._models))
-            raise KeyError(f"Unknown model alias: {alias!r}. Available: {available}")
+            raise KeyError(f"Unknown model ID: {model_id!r}. Available: {available}")
         return spec
 
     def get_default_primary(self) -> ModelSpec:
-        alias = self._defaults["primary_model"]
-        if not alias:
+        model_id = self._defaults["primary_model"]
+        if not model_id:
             raise ValueError("No default primary_model configured")
-        return self.get_model(alias)
+        return self.get_model(model_id)
 
     def get_default_embedding(self) -> ModelSpec:
-        alias = self._defaults["embedding_model"]
-        if not alias:
+        model_id = self._defaults["embedding_model"]
+        if not model_id:
             raise ValueError("No default embedding_model configured")
-        return self.get_model(alias)
+        return self.get_model(model_id)
 
     def get_default_reranker(self) -> ModelSpec | None:
-        alias = self._defaults["reranker_model"]
-        if not alias:
+        model_id = self._defaults["reranker_model"]
+        if not model_id:
             return None
-        return self.get_model(alias)
+        return self.get_model(model_id)
 
     @staticmethod
     def _parse_tokenizer(raw: object) -> TokenizerModelConfig:
@@ -192,7 +179,7 @@ class ModelCatalog:
         models = list(self._models.values())
         if capability is not None:
             models = [m for m in models if m.capability == capability]
-        return sorted(models, key=lambda m: m.alias)
+        return sorted(models, key=lambda m: m.id)
 
 
 def _merge_provider_model_entry(

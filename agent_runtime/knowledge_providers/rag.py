@@ -132,9 +132,9 @@ def _build_optional_rag_runtime(
 
         runtime_config = resolve_runtime_config(
             RuntimeOverrides(
-                model_alias=model_id,
-                embedding_model_alias=config.embedding_model,
-                reranker_model_alias=config.reranker_model or "none",
+                model_id=model_id,
+                embedding_model_id=config.embedding_model,
+                reranker_model_id=config.reranker_model or "none",
             )
         )
         storage = runtime_storage_config(

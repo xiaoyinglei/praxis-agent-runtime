@@ -5,20 +5,20 @@ from dataclasses import dataclass
 from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 from rag.models.catalog import ModelCatalog
 
-_DISABLED_RERANKER_ALIASES = {"", "none", "null", "off", "false"}
+_DISABLED_RERANKER_IDS = {"", "none", "null", "off", "false"}
 
 
 @dataclass(frozen=True, slots=True)
 class RuntimeOverrides:
     """CLI overrides for model selection.
 
-    Each alias must exist in configs/models.yaml with the matching capability.
-    Set reranker_model_alias to "none", "null", "off", or "false" to disable reranking.
+    Each model ID must exist in configs/models.yaml with the matching capability.
+    Set reranker_model_id to "none", "null", "off", or "false" to disable reranking.
     """
 
-    model_alias: str | None = None
-    embedding_model_alias: str | None = None
-    reranker_model_alias: str | None = None
+    model_id: str | None = None
+    embedding_model_id: str | None = None
+    reranker_model_id: str | None = None
 
 
 def resolve_runtime_config(
@@ -35,9 +35,9 @@ def resolve_runtime_config(
     overrides = overrides or RuntimeOverrides()
     catalog = catalog or ModelCatalog.from_yaml(catalog_path)
 
-    primary_model = _resolve_chat(overrides.model_alias, catalog)
-    embedding_model = _resolve_embedding(overrides.embedding_model_alias, catalog)
-    reranker_model = _resolve_reranker(overrides.reranker_model_alias, catalog)
+    primary_model = _resolve_chat(overrides.model_id, catalog)
+    embedding_model = _resolve_embedding(overrides.embedding_model_id, catalog)
+    reranker_model = _resolve_reranker(overrides.reranker_model_id, catalog)
 
     return ModelRuntimeConfig(
         primary_model=primary_model,
@@ -49,45 +49,45 @@ def resolve_runtime_config(
     )
 
 
-def _resolve_chat(alias: str | None, catalog: ModelCatalog) -> ModelSpec:
-    spec = catalog.get_default_primary() if alias is None else catalog.get_model(alias)
+def _resolve_chat(model_id: str | None, catalog: ModelCatalog) -> ModelSpec:
+    spec = catalog.get_default_primary() if model_id is None else catalog.get_model(model_id)
     if spec.capability != ModelCapability.CHAT:
         raise ValueError(
-            f"--model {alias!r} has capability {spec.capability.value!r}, "
+            f"--model {model_id!r} has capability {spec.capability.value!r}, "
             f"expected {ModelCapability.CHAT.value!r}. "
-            f"Available chat models: {_list_aliases(catalog, ModelCapability.CHAT)}"
+            f"Available chat models: {_list_model_ids(catalog, ModelCapability.CHAT)}"
         )
     return spec
 
 
-def _resolve_embedding(alias: str | None, catalog: ModelCatalog) -> ModelSpec:
-    spec = catalog.get_default_embedding() if alias is None else catalog.get_model(alias)
+def _resolve_embedding(model_id: str | None, catalog: ModelCatalog) -> ModelSpec:
+    spec = catalog.get_default_embedding() if model_id is None else catalog.get_model(model_id)
     if spec.capability != ModelCapability.EMBEDDING:
         raise ValueError(
-            f"--embedding-model {alias!r} has capability {spec.capability.value!r}, "
+            f"--embedding-model {model_id!r} has capability {spec.capability.value!r}, "
             f"expected {ModelCapability.EMBEDDING.value!r}. "
-            f"Available embedding models: {_list_aliases(catalog, ModelCapability.EMBEDDING)}"
+            f"Available embedding models: {_list_model_ids(catalog, ModelCapability.EMBEDDING)}"
         )
     return spec
 
 
-def _resolve_reranker(alias: str | None, catalog: ModelCatalog) -> ModelSpec | None:
-    if alias is not None and alias.strip().lower() in _DISABLED_RERANKER_ALIASES:
+def _resolve_reranker(model_id: str | None, catalog: ModelCatalog) -> ModelSpec | None:
+    if model_id is not None and model_id.strip().lower() in _DISABLED_RERANKER_IDS:
         return None
 
-    spec = catalog.get_default_reranker() if alias is None else catalog.get_model(alias)
+    spec = catalog.get_default_reranker() if model_id is None else catalog.get_model(model_id)
     if spec is None:
         return None
 
     if spec.capability != ModelCapability.RERANKER:
         raise ValueError(
-            f"--reranker-model {alias!r} has capability {spec.capability.value!r}, "
+            f"--reranker-model {model_id!r} has capability {spec.capability.value!r}, "
             f"expected {ModelCapability.RERANKER.value!r}. "
-            f"Available reranker models: {_list_aliases(catalog, ModelCapability.RERANKER)}"
+            f"Available reranker models: {_list_model_ids(catalog, ModelCapability.RERANKER)}"
         )
     return spec
 
 
-def _list_aliases(catalog: ModelCatalog, capability: ModelCapability) -> str:
-    aliases = [m.alias for m in catalog.list_models(capability)]
-    return ", ".join(aliases) or "<none>"
+def _list_model_ids(catalog: ModelCatalog, capability: ModelCapability) -> str:
+    model_ids = [m.id for m in catalog.list_models(capability)]
+    return ", ".join(model_ids) or "<none>"

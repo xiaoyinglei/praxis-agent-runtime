@@ -57,12 +57,8 @@ def test_embedding_service_url_env_sets_embedding_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(
-            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
-        ),
-        embedding_model=ModelSpec(
-            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
-        ),
+        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
     )
     overrides = to_assembly_overrides(runtime_config)
     assert overrides.embedding_provider is None  # YAML doesn't set runtime providers
@@ -79,17 +75,12 @@ def test_rerank_service_url_env_sets_rerank_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(
-            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
-        ),
-        embedding_model=ModelSpec(
-            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
-        ),
+        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
-            alias="test_rerank",
+            id="bge-reranker",
             capability=ModelCapability.RERANKER,
             provider="sentence_transformers",
-            model="bge-reranker",
         ),
     )
     overrides = to_assembly_overrides(runtime_config)
@@ -109,17 +100,12 @@ def test_require_rerank_false_strips_reranker_and_runtime_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(
-            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
-        ),
-        embedding_model=ModelSpec(
-            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
-        ),
+        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
-            alias="test_rerank",
+            id="bge-reranker",
             capability=ModelCapability.RERANKER,
             provider="sentence_transformers",
-            model="bge-reranker",
         ),
     )
     overrides = to_assembly_overrides(runtime_config)
@@ -143,17 +129,12 @@ def test_require_rerank_true_preserves_reranker() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(
-            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
-        ),
-        embedding_model=ModelSpec(
-            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
-        ),
+        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
-            alias="test_rerank",
+            id="bge-reranker",
             capability=ModelCapability.RERANKER,
             provider="sentence_transformers",
-            model="bge-reranker",
         ),
     )
     overrides = to_assembly_overrides(runtime_config)
@@ -192,12 +173,8 @@ def test_no_service_url_env_uses_yaml_default() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(
-            alias="test", capability=ModelCapability.CHAT, provider="openai_compatible", model="gpt-4"
-        ),
-        embedding_model=ModelSpec(
-            alias="test_emb", capability=ModelCapability.EMBEDDING, provider="mlx_embedding", model="mlx-model"
-        ),
+        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
     )
     overrides = to_assembly_overrides(runtime_config)
 

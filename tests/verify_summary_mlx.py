@@ -3,6 +3,7 @@
 不手写 model / base_url / max_tokens，全由 generation.summary 驱动。
 使用 RecordingLLM 捕获真实调用参数，确认 max_tokens 透传正确。
 """
+
 from __future__ import annotations
 
 import os
@@ -27,19 +28,21 @@ pytestmark = pytest.mark.skipif(
 
 # ── adapter factory ────────────────────────────────────────────
 
+
 def _make_chat_adapter(model_spec):
     """从 ModelSpec 构建 _ChatGeneratorAdapter（不手写 model/base_url）"""
     generator = _OpenAICompatibleChatGenerator(
-        model=model_spec.model,
+        model=model_spec.id,
         base_url=model_spec.base_url or "http://127.0.0.1:8080/v1",
         api_key="not-needed",
     )
-    composite = _CompositeProvider(provider_name=model_spec.alias, generator=generator)
+    composite = _CompositeProvider(provider_name=model_spec.id, generator=generator)
     binding = ChatCapabilityBinding(backend=composite, location="local")
     return _ChatGeneratorAdapter(binding)
 
 
 # ── RecordingLLM wrapper ───────────────────────────────────────
+
 
 class RecordingLLM:
     """只捕获内部真实 LLM 调用，不做额外调用。"""
@@ -58,26 +61,31 @@ class RecordingLLM:
 
     def generate_text(self, *, prompt: str, **kwargs):
         output = self.inner.generate_text(prompt=prompt, **kwargs)
-        self.calls.append({
-            "method": "generate_text",
-            "prompt": prompt,
-            "kwargs": kwargs,
-            "output": output,
-        })
+        self.calls.append(
+            {
+                "method": "generate_text",
+                "prompt": prompt,
+                "kwargs": kwargs,
+                "output": output,
+            }
+        )
         return output
 
     def chat(self, prompt: str, **kwargs):
         output = self.inner.chat(prompt, **kwargs)
-        self.calls.append({
-            "method": "chat",
-            "prompt": prompt,
-            "kwargs": kwargs,
-            "output": output,
-        })
+        self.calls.append(
+            {
+                "method": "chat",
+                "prompt": prompt,
+                "kwargs": kwargs,
+                "output": output,
+            }
+        )
         return output
 
 
 # ── helpers ────────────────────────────────────────────────────
+
 
 def _print_recording(recording: RecordingLLM, label: str):
     if not recording.calls:
@@ -104,7 +112,7 @@ def _evaluate(summary: str, original: str):
     for line in lines:
         for prefix in ("Semantic Core:", "Fact Anchors:", "Retrieval Keywords:"):
             if line.startswith(prefix):
-                fields[prefix.rstrip(":")] = line[len(prefix):].strip()
+                fields[prefix.rstrip(":")] = line[len(prefix) :].strip()
 
     issues = []
 
@@ -152,6 +160,7 @@ def _evaluate(summary: str, original: str):
 
 # ── pytest fixtures ─────────────────────────────────────────────
 
+
 @pytest.fixture(scope="module")
 def catalog():
     return ModelCatalog.from_yaml()
@@ -168,6 +177,7 @@ def model_spec(catalog, gen_config):
 
 
 # ── tests ──────────────────────────────────────────────────────
+
 
 def test_section_summary(model_spec, gen_config, catalog):
     adapter = _make_chat_adapter(model_spec)
@@ -223,9 +233,7 @@ def test_section_summary(model_spec, gen_config, catalog):
 
     # 验证 max_tokens 透传
     if recording.calls:
-        assert "max_tokens" in recording.calls[-1]["kwargs"], (
-            "max_tokens should be in kwargs!"
-        )
+        assert "max_tokens" in recording.calls[-1]["kwargs"], "max_tokens should be in kwargs!"
         expected = gen_config.summary.max_tokens or 4096
         actual = recording.calls[-1]["kwargs"]["max_tokens"]
         assert actual == expected, f"Expected max_tokens={expected}, got {actual}"
@@ -305,6 +313,7 @@ def test_doc_summary(model_spec, gen_config, catalog):
 
 # ── model switching test ───────────────────────────────────────
 
+
 def test_switch_summary_model(catalog):
     """验证只改 generation.summary.model 即可切换模型，不改业务代码"""
     task_config = catalog.generation.summary
@@ -312,16 +321,18 @@ def test_switch_summary_model(catalog):
 
     # 默认模型
     spec1 = resolve_task_model(task_config, catalog)
-    print(f"\n[Switch] 当前 summary model: {spec1.alias} -> {spec1.model}")
+    print(f"\n[Switch] 当前 summary model: {spec1.id}")
 
-    # 切换到 qwen_local_small（不改业务逻辑，只解析不同的 task config）
-    small_task = type(task_config)(model="qwen_local_small", max_tokens=task_config.max_tokens)
+    # 切换到小型 Qwen（不改业务逻辑，只解析不同的 task config）
+    small_task = type(task_config)(
+        model="mlx-community/Qwen3-0.6B-4bit",
+        max_tokens=task_config.max_tokens,
+    )
     spec2 = resolve_task_model(small_task, catalog)
-    print(f"[Switch] 切换后 summary model: {spec2.alias} -> {spec2.model}")
-    assert spec2.alias == "qwen_local_small", f"Expected qwen_local_small, got {spec2.alias}"
-    assert spec2.model == "mlx-community/Qwen3-0.6B-4bit"
+    print(f"[Switch] 切换后 summary model: {spec2.id}")
+    assert spec2.id == "mlx-community/Qwen3-0.6B-4bit"
 
-    print("[Switch] ✅ 只改 model alias 即可切换，业务代码零改动")
+    print("[Switch] ✅ 只改 model ID 即可切换，业务代码零改动")
 
 
 if __name__ == "__main__":
@@ -335,7 +346,7 @@ if __name__ == "__main__":
 
     print("=" * 60)
     print("摘要生成验证")
-    print(f"  模型: {summary_model_spec.alias} -> {summary_model_spec.model}")
+    print(f"  模型: {summary_model_spec.id}")
     print(f"  地址: {summary_model_spec.base_url}")
     print(f"  summary.max_tokens: {gen_config.summary.max_tokens}")
     print(f"  summary.temperature: {gen_config.summary.temperature}")

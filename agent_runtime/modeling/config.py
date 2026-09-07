@@ -14,10 +14,9 @@ class ModelCapability(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
-    alias: str
+    id: str
     capability: ModelCapability
     provider: str
-    model: str
     base_url: str | None = None
     api_key_env: str | None = None
     embedding_space: str | None = None
@@ -32,7 +31,7 @@ class ModelSpec:
 class GenerationTaskConfig:
     """Per-task generation parameters.
 
-    model       — model alias in models.yaml; None = fallback to defaults.primary_model
+    model       — exact model ID in models.yaml; None = fallback to defaults.primary_model
     max_tokens  — max completion tokens; None = not configured, consumer decides fallback
     temperature — None = don't pass to LLM (use model default)
     """

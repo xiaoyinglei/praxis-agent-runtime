@@ -162,30 +162,26 @@ models:
   # -------------------------------------------------------------------------
   # Embedding models.
   # -------------------------------------------------------------------------
-  qwen3_embedding_8b_4bit_dwq:
+  mlx-community/Qwen3-Embedding-8B-4bit-DWQ:
     capability: embedding
     provider: local_mlx_embedding
-    model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
     embedding_space: mlx/Qwen3-Embedding-8B-4bit-DWQ
 
-  qwen3_embedding_4b_4bit_dwq:
+  mlx-community/Qwen3-Embedding-4B-4bit-DWQ:
     capability: embedding
     provider: local_mlx_embedding
-    model: mlx-community/Qwen3-Embedding-4B-4bit-DWQ
     embedding_space: mlx/Qwen3-Embedding-4B-4bit-DWQ
 
   # -------------------------------------------------------------------------
   # Reranker models.
   # -------------------------------------------------------------------------
-  bge_reranker_v2_m3:
+  BAAI/bge-reranker-v2-m3:
     capability: reranker
     provider: local_sentence_transformers
-    model: BAAI/bge-reranker-v2-m3
 
-  qwen3_reranker_4b:
+  Qwen/Qwen3-Reranker-4B:
     capability: reranker
     provider: local_sentence_transformers
-    model: Qwen/Qwen3-Reranker-4B
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +192,8 @@ defaults:
   # MLX server. Benchmark release lanes remain explicit in their manifest.
   primary_model: openai/gpt-oss-120b
 
-  embedding_model: qwen3_embedding_8b_4bit_dwq
-  reranker_model: qwen3_reranker_4b
+  embedding_model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
+  reranker_model: Qwen/Qwen3-Reranker-4B
 
 
 # ---------------------------------------------------------------------------
@@ -294,7 +290,7 @@ llm_budgets:
 
 # ---------------------------------------------------------------------------
 # Tokenizer/chunking defaults.
-# Model context window should come from models.<alias>.context_window_tokens.
+# Model context window should come from models.<model_id>.context_window_tokens.
 # ---------------------------------------------------------------------------
 tokenizer:
   tokenizer_backend: auto
