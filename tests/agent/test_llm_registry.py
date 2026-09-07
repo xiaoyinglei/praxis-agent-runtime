@@ -81,6 +81,7 @@ def test_public_registry_identity_parameter_and_unknown_choices(method_name: str
     assert "Model ID 'missing'" in message
     assert "Available IDs: fast, main" in message
 
+
 def test_model_definition_digest_changes_only_for_selected_request_definition() -> None:
     baseline = _make_config()
     changed = baseline.model_copy(deep=True)
@@ -119,39 +120,24 @@ def test_model_definition_digest_covers_generation_defaults_and_stage_budgets() 
     defaults_changed = baseline.model_copy(deep=True)
     defaults_changed.models["main"].defaults = {"temperature": 0.25}
 
-    assert (
-        ModelRegistry(generation_changed).get_model_definition("main").definition_revision
-        != baseline_digest
-    )
-    assert (
-        ModelRegistry(budget_changed).get_model_definition("main").definition_revision
-        != baseline_digest
-    )
-    assert (
-        ModelRegistry(defaults_changed).get_model_definition("main").definition_revision
-        != baseline_digest
-    )
+    assert ModelRegistry(generation_changed).get_model_definition("main").definition_revision != baseline_digest
+    assert ModelRegistry(budget_changed).get_model_definition("main").definition_revision != baseline_digest
+    assert ModelRegistry(defaults_changed).get_model_definition("main").definition_revision != baseline_digest
+
 
 def test_model_capability_does_not_change_stage_budget() -> None:
     config = _make_config()
 
-    baseline = ModelRegistry(
-        config
-    ).get_model_definition("main")
+    baseline = ModelRegistry(config).get_model_definition("main")
 
     changed = config.model_copy(deep=True)
     changed.models["main"].max_output_tokens = 1_024
 
-    with_capability = ModelRegistry(
-        changed
-    ).get_model_definition("main")
+    with_capability = ModelRegistry(changed).get_model_definition("main")
 
     assert with_capability.max_output_tokens == 1_024
 
-    assert (
-        with_capability.llm_stage_budgets
-        == baseline.llm_stage_budgets
-    )
+    assert with_capability.llm_stage_budgets == baseline.llm_stage_budgets
 
 
 def test_model_definition_snapshot_is_not_mutated_by_callers() -> None:
@@ -159,9 +145,9 @@ def test_model_definition_snapshot_is_not_mutated_by_callers() -> None:
     first = registry.get_model_definition("main")
     revision = first.definition_revision
 
-    first.llm_stage_budgets["agent_step"] = first.llm_stage_budgets[
-        "agent_step"
-    ].model_copy(update={"max_input_tokens": 1})
+    first.llm_stage_budgets["agent_step"] = first.llm_stage_budgets["agent_step"].model_copy(
+        update={"max_input_tokens": 1}
+    )
 
     assert registry.get_model_definition("main").definition_revision == revision
 
@@ -222,11 +208,7 @@ def test_whole_catalog_override_rejects_transport_or_secret_defaults(
     [
         {"base_url": "https://example.com/v1?api_key=plaintext-secret"},
         {"api_key_env": "sk-plaintext-secret"},
-        {
-            "runtime": {
-                "health_url": "http://127.0.0.1/health?token=plaintext-secret"
-            }
-        },
+        {"runtime": {"health_url": "http://127.0.0.1/health?token=plaintext-secret"}},
     ],
 )
 def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
@@ -235,10 +217,10 @@ def test_whole_catalog_override_rejects_secrets_in_endpoint_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = {
-    "provider": "ollama",
-    "context_window_tokens": 32_768,
-    **unsafe_fields,
-}
+        "provider": "ollama",
+        "context_window_tokens": 32_768,
+        **unsafe_fields,
+    }
     monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
     monkeypatch.setenv(
         "RAG_AGENT_MODELS",
@@ -392,19 +374,11 @@ def test_resolved_request_defaults_do_not_mutate_cached_definition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _make_config()
-    config.models["main"].defaults = {
-        "provider_options": {
-            "thinking": {"type": "enabled"}
-        }
-    }
+    config.models["main"].defaults = {"provider_options": {"thinking": {"type": "enabled"}}}
 
     registry = ModelRegistry(config)
 
-    original_revision = (
-        registry
-        .get_model_definition("main")
-        .definition_revision
-    )
+    original_revision = registry.get_model_definition("main").definition_revision
 
     monkeypatch.setattr(
         "agent_runtime.core.llm_registry._build_chat_generator",
@@ -419,12 +393,9 @@ def test_resolved_request_defaults_do_not_mutate_cached_definition(
     assert provider_options.thinking is not None
     assert provider_options.thinking.type == "enabled"
 
-    assert (
-        registry
-        .get_model_definition("main")
-        .definition_revision
-        == original_revision
-    )
+    assert registry.get_model_definition("main").definition_revision == original_revision
+
+
 def test_load_configs_models_maps_openai_compatible_protocol(tmp_path: Path) -> None:
     config_path = tmp_path / "models.yaml"
     config_path.write_text(
@@ -633,7 +604,6 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
                 "defaults": {"primary_model": "main-model"},
                 "generation": {
                     "factcheck": {
-                        "model": "mimo-v2-flash",
                         "max_tokens": 2048,
                         "temperature": 0.3,
                     }
@@ -645,9 +615,36 @@ def test_load_configs_models_preserves_generation_config(tmp_path: Path) -> None
 
     config = ModelRegistry._load_yaml_file(config_path)
 
-    assert config.generation.factcheck.model == "mimo-v2-flash"
+    assert not hasattr(config.generation.factcheck, "model")
     assert config.generation.factcheck.max_tokens == 2048
     assert config.generation.factcheck.temperature == 0.3
+
+
+def test_load_configs_models_rejects_generation_model_selector(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "models.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "models": {
+                    "main-model": {
+                        "capability": "chat",
+                        "provider": "qwen",
+                        "protocol": "openai_compatible",
+                        "context_window_tokens": 32_768,
+                        "base_url": "http://127.0.0.1:8080/v1",
+                    }
+                },
+                "defaults": {"primary_model": "main-model"},
+                "generation": {"summary": {"model": "main-model"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="generation.summary.*model"):
+        ModelRegistry._load_yaml_file(config_path)
 
 
 def test_from_env_loads_dotenv_before_resolving_model_config(
@@ -755,7 +752,6 @@ class TestModelRegistryResolve:
         source_config.generation = replace(
             source_config.generation,
             answer=GenerationTaskConfig(
-                model="main",
                 max_tokens=701,
                 temperature=0.15,
             ),
@@ -770,9 +766,7 @@ class TestModelRegistryResolve:
             for index, stage in enumerate(LLMCallStage)
         }
 
-        definition = ModelRegistry(
-            source_config
-        ).get_model_definition("main")
+        definition = ModelRegistry(source_config).get_model_definition("main")
 
         target = ModelRegistry(_make_config())
 
@@ -811,47 +805,28 @@ class TestModelRegistryResolve:
         assert resolved.model_id == "main"
         assert resolved.provider == "frozen-provider"
 
-        assert (
-            resolved.capabilities.context_window_tokens
-            == 777
-        )
+        assert resolved.capabilities.context_window_tokens == 777
         assert resolved.capabilities.max_output_tokens is None
         assert resolved.capabilities.supports_native_tools is False
-        assert (
-            resolved.capabilities.supports_structured_output
-            is False
-        )
+        assert resolved.capabilities.supports_structured_output is False
 
         assert resolved.request_defaults.temperature == 0.25
         assert resolved.request_defaults.top_p == 0.8
-        assert (
-            resolved.request_defaults.parallel_tool_calls
-            is False
-        )
+        assert resolved.request_defaults.parallel_tool_calls is False
         assert resolved.request_defaults.seed == 9
 
-        assert (
-            resolved.definition_revision
-            == definition.definition_revision
-        )
+        assert resolved.definition_revision == definition.definition_revision
 
-        assert resolved.generation_config.answer.model == "main"
+        assert not hasattr(resolved.generation_config.answer, "model")
         assert resolved.generation_config.answer.max_tokens == 701
-        assert (
-            resolved.generation_config.answer.temperature
-            == 0.15
-        )
+        assert resolved.generation_config.answer.temperature == 0.15
 
         for stage in LLMCallStage:
-            expected = definition.llm_stage_budgets[
-                stage.value
-            ]
+            expected = definition.llm_stage_budgets[stage.value]
             actual = resolved.gateway.stage_budget(stage)
 
-            assert (
-                actual.model_dump()
-                == expected.model_dump()
-            )
+            assert actual.model_dump() == expected.model_dump()
+
     def test_resolve_definition_applies_timeout_and_structured_capability_to_real_provider(
         self,
     ) -> None:
@@ -868,7 +843,7 @@ class TestModelRegistryResolve:
 
         resolved = ModelRegistry(_make_config()).resolve_definition(definition)
 
-        assert (resolved.capabilities.supports_structured_output is False)
+        assert resolved.capabilities.supports_structured_output is False
         client = cast(Any, resolved.generator)._client
         assert client.timeout == 1.25
 
@@ -945,10 +920,7 @@ class TestModelRegistryResolve:
         reg = ModelRegistry(_make_config())
         resolved = reg.resolve("main")
         assert resolved.generator is not None
-        assert (
-    resolved.capabilities.context_window_tokens
-    == 32_768
-)
+        assert resolved.capabilities.context_window_tokens == 32_768
         assert resolved.gateway is not None
         assert resolved.token_accounting is resolved.gateway.token_accounting
 
@@ -1004,10 +976,7 @@ class TestModelRegistryResolve:
         stored = registry.get_model_spec("capped")
 
         assert stored.context_window_tokens == 8_000
-        assert (
-            resolved.capabilities.context_window_tokens
-            == 8_000
-        )
+        assert resolved.capabilities.context_window_tokens == 8_000
 
         assert (
             resolved.gateway.effective_stage_budget(
@@ -1016,6 +985,7 @@ class TestModelRegistryResolve:
             ).max_input_tokens
             == 5_440
         )
+
     def test_explicit_tokenizer_model_avoids_provider_id_fallback_counting(
         self,
     ) -> None:
@@ -1058,30 +1028,19 @@ class TestModelRegistryResolve:
 
         resolved = registry.resolve("long")
 
-        configured_budget = resolved.gateway.stage_budget(
-            LLMCallStage.TOOL_DECISION
-        )
+        configured_budget = resolved.gateway.stage_budget(LLMCallStage.TOOL_DECISION)
 
         effective_budget = resolved.gateway.effective_stage_budget(
             LLMCallStage.TOOL_DECISION,
-            kwargs={
-                "max_tokens": (
-                    resolved.capabilities.max_output_tokens
-                )
-            },
+            kwargs={"max_tokens": (resolved.capabilities.max_output_tokens)},
         )
 
         assert resolved.capabilities.max_output_tokens == 32_768
 
-        assert (
-            effective_budget.max_output_tokens
-            == configured_budget.max_output_tokens
-        )
+        assert effective_budget.max_output_tokens == configured_budget.max_output_tokens
 
-        assert (
-            effective_budget.max_input_tokens
-            == configured_budget.max_input_tokens
-        )
+        assert effective_budget.max_input_tokens == configured_budget.max_input_tokens
+
 
 class TestModelRegistryResolveOrFallback:
     def test_falls_back_when_alias_unknown(self) -> None:

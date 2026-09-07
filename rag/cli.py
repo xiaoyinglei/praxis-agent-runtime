@@ -88,6 +88,9 @@ def _runtime(
             reranker_model_id=reranker_model,
         )
     )
+    context_window_tokens = runtime_config.primary_model.context_window_tokens
+    if context_window_tokens is None:
+        raise ValueError(f"Chat model {runtime_config.primary_model.id!r} requires context_window_tokens")
     overrides = to_assembly_overrides(runtime_config)
 
     # ── service URL env → pre-built HTTP providers (env > YAML) ──
@@ -124,7 +127,7 @@ def _runtime(
     request = CapabilityRequirements(
         require_chat=require_chat,
         require_rerank=require_rerank,
-        default_context_tokens=QueryOptions().max_context_tokens,
+        default_context_tokens=context_window_tokens,
     )
     return RAGRuntime.from_request(
         storage=_default_storage_config(
@@ -139,7 +142,7 @@ def _runtime(
             overrides=overrides,
         ),
         generation_config=runtime_config.generation,
-        chat_context_window_tokens=(runtime_config.primary_model.context_window_tokens or 32_768),
+        chat_context_window_tokens=context_window_tokens,
         llm_stage_budgets=runtime_config.llm_stage_budgets,
     )
 

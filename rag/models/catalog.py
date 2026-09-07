@@ -73,6 +73,8 @@ class ModelCatalog:
                 redundant.append("max_context_window_tokens")
             if redundant:
                 raise ValueError(f"Model {model_id!r} contains redundant fields: " + ", ".join(sorted(redundant)))
+            if capability is ModelCapability.CHAT and "context_window_tokens" not in entry:
+                raise ValueError(f"Chat model {model_id!r} requires context_window_tokens")
             merged = _merge_provider_model_entry(entry, providers)
             models[model_id] = ModelSpec(
                 id=model_id,
@@ -92,7 +94,7 @@ class ModelCatalog:
             "reranker_model": raw_defaults.get("reranker_model", ""),
         }
 
-        generation = cls._parse_generation(data.get("generation"), defaults)
+        generation = cls._parse_generation(data.get("generation"))
         tokenizer = cls._parse_tokenizer(data.get("tokenizer"))
         return cls(
             models=models,
@@ -103,7 +105,7 @@ class ModelCatalog:
         )
 
     @staticmethod
-    def _parse_generation(raw: object, defaults: dict[str, str]) -> GenerationConfig:
+    def _parse_generation(raw: object) -> GenerationConfig:
         if not isinstance(raw, dict):
             return GenerationConfig()
 
@@ -111,8 +113,10 @@ class ModelCatalog:
             entry = raw.get(name)
             if not isinstance(entry, dict):
                 return GenerationTaskConfig()
+            unsupported = sorted(set(entry) - {"max_tokens", "temperature"})
+            if unsupported:
+                raise ValueError(f"generation.{name} contains unsupported fields: " + ", ".join(unsupported))
             return GenerationTaskConfig(
-                model=entry.get("model"),
                 max_tokens=int(entry["max_tokens"]) if "max_tokens" in entry else None,
                 temperature=float(entry["temperature"]) if "temperature" in entry else None,
             )
@@ -166,11 +170,14 @@ class ModelCatalog:
     def _parse_tokenizer(raw: object) -> TokenizerModelConfig:
         if not isinstance(raw, dict):
             return TokenizerModelConfig()
+        if "max_context_tokens" in raw:
+            raise ValueError(
+                "tokenizer.max_context_tokens is unsupported; configure context_window_tokens on each chat model"
+            )
         return TokenizerModelConfig(
             tokenizer_backend=raw.get("tokenizer_backend"),
             chunk_token_size=int(raw["chunk_token_size"]) if "chunk_token_size" in raw else None,
             chunk_overlap_tokens=int(raw["chunk_overlap_tokens"]) if "chunk_overlap_tokens" in raw else None,
-            max_context_tokens=int(raw["max_context_tokens"]) if "max_context_tokens" in raw else None,
             prompt_reserved_tokens=int(raw["prompt_reserved_tokens"]) if "prompt_reserved_tokens" in raw else None,
             local_files_only=bool(raw["local_files_only"]) if "local_files_only" in raw else None,
         )

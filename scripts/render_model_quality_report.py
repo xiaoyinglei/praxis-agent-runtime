@@ -26,9 +26,7 @@ _MAX_APPROVAL_RESUMES_BY_EVALUATOR = {
     "agent_model_quality_gate_v4": 1,
 }
 _POSIX_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])/(?:[^\s`'\"<>]+)")
-_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(
-    r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+"
-)
+_WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"(?<![\w.])(?:[A-Za-z]:[\\/]|\\\\)[^\s`'\"<>;,]+")
 _SENSITIVE_KEY_TOKENS = frozenset(
     {
         "apikey",
@@ -91,10 +89,12 @@ def render_model_quality_report(
     benchmark_path: Path,
     run_record_path: Path,
 ) -> None:
-    report = _normalize_report_schema(_mapping(
-        json.loads(report_path.read_text(encoding="utf-8")),
-        label="gate report",
-    ))
+    report = _normalize_report_schema(
+        _mapping(
+            json.loads(report_path.read_text(encoding="utf-8")),
+            label="gate report",
+        )
+    )
     _validate_report(report)
     benchmark = _render_benchmark(
         report,
@@ -148,18 +148,14 @@ def _validate_report(report: Mapping[str, object]) -> None:
         "python_implementation",
     }
     if set(runtime_platform) != platform_fields:
-        raise ValueError(
-            "model quality report runtime_platform must contain only safe platform fields"
-        )
+        raise ValueError("model quality report runtime_platform must contain only safe platform fields")
     for field in sorted(platform_fields):
         _required_text(runtime_platform, field)
     _required_text(report, "suite_id")
     _required_text(report, "suite_revision")
     evaluator_version = _required_text(report, "evaluator_version")
     if evaluator_version not in _MAX_APPROVAL_RESUMES_BY_EVALUATOR:
-        raise ValueError(
-            "model quality report evaluator_version is unsupported"
-        )
+        raise ValueError("model quality report evaluator_version is unsupported")
     status = _required_text(report, "status")
     expected_passed = {
         "passed": True,
@@ -167,9 +163,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
         "inconclusive": None,
     }
     if status not in expected_passed:
-        raise ValueError(
-            "model quality report status must be passed, failed, or inconclusive"
-        )
+        raise ValueError("model quality report status must be passed, failed, or inconclusive")
     if report.get("passed") is not expected_passed[status]:
         raise ValueError("model quality report status and passed are inconsistent")
     raw_models = _sequence(report.get("models"), label="models")
@@ -189,11 +183,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
         if case_id in metadata_by_id:
             raise ValueError(f"model quality report duplicate case metadata id: {case_id}")
         metadata_by_id[case_id] = item
-    approval_cases = [
-        item
-        for item in metadata_by_id.values()
-        if item.get("capability") == "approval_continuation"
-    ]
+    approval_cases = [item for item in metadata_by_id.values() if item.get("capability") == "approval_continuation"]
     if not approval_cases:
         raise ValueError("model quality report has no approval-continuation metadata")
     has_inconclusive = False
@@ -212,9 +202,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
                 or isinstance(run_infrastructure, Mapping)
                 or model.get("status") == "inconclusive"
             ):
-                raise ValueError(
-                    f"model quality report completed result for {model_id} is inconsistent"
-                )
+                raise ValueError(f"model quality report completed result for {model_id} is inconsistent")
             _validate_run_cases(
                 run,
                 model_id=model_id,
@@ -231,9 +219,7 @@ def _validate_report(report: Mapping[str, object]) -> None:
                 or not isinstance(run_infrastructure, Mapping)
                 or model_infrastructure != run_infrastructure
             ):
-                raise ValueError(
-                    f"model quality report inconclusive result for {model_id} is inconsistent"
-                )
+                raise ValueError(f"model quality report inconclusive result for {model_id} is inconsistent")
             _validate_run_cases(
                 run,
                 model_id=model_id,
@@ -243,14 +229,8 @@ def _validate_report(report: Mapping[str, object]) -> None:
             )
             has_inconclusive = True
         else:
-            raise ValueError(
-                f"model quality report run status for {model_id} is inconsistent"
-            )
-    derived_status = (
-        "inconclusive"
-        if has_inconclusive
-        else ("passed" if all(model_passes) else "failed")
-    )
+            raise ValueError(f"model quality report run status for {model_id} is inconsistent")
+    derived_status = "inconclusive" if has_inconclusive else ("passed" if all(model_passes) else "failed")
     if status != derived_status:
         raise ValueError("model quality report overall verdict is inconsistent")
 
@@ -262,8 +242,7 @@ def _render_benchmark(
 ) -> str:
     verdict = _verdict(report)
     metadata = [
-        _mapping(item, label="case metadata")
-        for item in _sequence(report.get("case_metadata"), label="case_metadata")
+        _mapping(item, label="case metadata") for item in _sequence(report.get("case_metadata"), label="case_metadata")
     ]
     rendered_cases = _iter_cases(report)
     runtime_platform = _mapping(
@@ -297,9 +276,7 @@ def _render_benchmark(
         model_id = _required_text(model, "model_id")
         run = runs[model_id]
         trial_count = _integer(run.get("trial_count"), label="trial_count")
-        model_cases = [
-            case for case in rendered_cases if case.model_id == model_id
-        ]
+        model_cases = [case for case in rendered_cases if case.model_id == model_id]
         expected_executions = len(metadata) * trial_count
         lines.append(
             "| "
@@ -320,9 +297,7 @@ def _render_benchmark(
             "| --- | --- | --- | ---: |",
         ]
     )
-    expected_per_scenario = sum(
-        _integer(run.get("trial_count"), label="trial_count") for run in runs.values()
-    )
+    expected_per_scenario = sum(_integer(run.get("trial_count"), label="trial_count") for run in runs.values())
     for item in metadata:
         case_id = _required_text(item, "case_id")
         capability = _required_text(item, "capability")
@@ -385,9 +360,7 @@ def _render_benchmark(
         model_id = _required_text(model, "model_id")
         run = runs[model_id]
         model_verdict = _boolean_verdict(model.get("passed"))
-        infrastructure_status = (
-            "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
-        )
+        infrastructure_status = "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
         lines.extend(
             [
                 f"#### `{model_id}`",
@@ -410,24 +383,16 @@ def _render_benchmark(
                     "",
                 ]
             )
-        observed = _mapping(
-            model.get("observed"), label=f"{model_id} observed metrics"
-        )
-        thresholds = _mapping(
-            model.get("thresholds"), label=f"{model_id} thresholds"
-        )
+        observed = _mapping(model.get("observed"), label=f"{model_id} observed metrics")
+        thresholds = _mapping(model.get("thresholds"), label=f"{model_id} thresholds")
         if observed:
             lines.extend(["| Metric | Observed | Threshold |", "| --- | ---: | --- |"])
             for metric, value in observed.items():
                 raw_threshold = thresholds.get(metric)
                 threshold = _threshold_text(raw_threshold)
-                lines.append(
-                    f"| `{_cell(metric)}` | `{_scalar(value)}` | {threshold} |"
-                )
+                lines.append(f"| `{_cell(metric)}` | `{_scalar(value)}` | {threshold} |")
             lines.append("")
-        failures = _string_sequence(
-            model.get("failures", ()), label=f"{model_id} failures"
-        )
+        failures = _string_sequence(model.get("failures", ()), label=f"{model_id} failures")
         if failures:
             lines.append("Reported failures:")
             lines.append("")
@@ -533,9 +498,7 @@ def _render_approval_record(
     ]
     for raw_run in runs:
         run = _mapping(raw_run, label="model run")
-        infrastructure_status = (
-            "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
-        )
+        infrastructure_status = "CONCLUSIVE" if run.get("status") == "completed" else "INCONCLUSIVE"
         lines.append(
             f"| `{_cell(_required_text(run, 'model_id'))}` | "
             f"`{_cell(_required_text(run, 'provider'))}` | "
@@ -575,8 +538,7 @@ def _render_approval_record(
                 [
                     f"- Earlier infrastructure-failed case: `{earlier_failure.case_id}`",
                     f"- Stop reason: `{_scalar(earlier_failure.observation.get('stop_reason'))}`",
-                    "- Diagnostic error types: "
-                    f"`{_scalar(earlier_failure.observation.get('diagnostic_error_types'))}`",
+                    f"- Diagnostic error types: `{_scalar(earlier_failure.observation.get('diagnostic_error_types'))}`",
                     "",
                 ]
             )
@@ -587,8 +549,7 @@ def _render_approval_record(
                     [
                         f"- Infrastructure stage: `{_scalar(infrastructure.get('stage'))}`",
                         f"- Stop reason: `{_scalar(infrastructure.get('stop_reason'))}`",
-                        "- Diagnostic error types: "
-                        f"`{_scalar(infrastructure.get('diagnostic_error_types'))}`",
+                        f"- Diagnostic error types: `{_scalar(infrastructure.get('diagnostic_error_types'))}`",
                         "",
                     ]
                 )
@@ -669,25 +630,17 @@ def _render_approval_record(
                 [
                     "### Final pause",
                     "",
-                    "- Request kind: "
-                    f"`{_scalar(None if request_kind is None else _safe_text(str(request_kind)))}`",
-                    "- Reason: "
-                    f"`{_scalar(None if reason is None else _safe_text(str(reason)))}`",
-                    "- Pending tools: "
-                    f"`{_scalar([_safe_text(str(item)) for item in pending_tools])}`",
+                    f"- Request kind: `{_scalar(None if request_kind is None else _safe_text(str(request_kind)))}`",
+                    f"- Reason: `{_scalar(None if reason is None else _safe_text(str(reason)))}`",
+                    f"- Pending tools: `{_scalar([_safe_text(str(item)) for item in pending_tools])}`",
                     "",
                 ]
             )
         approval_pause_observed = (
-            observation.get("approval_pause_observed") is True
-            and observation.get("approval_kind") == "tool_approval"
+            observation.get("approval_pause_observed") is True and observation.get("approval_kind") == "tool_approval"
         )
         resumes = observation.get("approval_resumes")
-        approval_resumed = (
-            isinstance(resumes, int)
-            and not isinstance(resumes, bool)
-            and resumes >= 1
-        )
+        approval_resumed = isinstance(resumes, int) and not isinstance(resumes, bool) and resumes >= 1
         infrastructure_failure = observation.get("infrastructure_failure") is True
         if not approval_pause_observed:
             lines.extend(
@@ -699,8 +652,7 @@ def _render_approval_record(
                     "No workspace diff assertion or final answer evidence was reported.",
                     "",
                     f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
-                    "- Diagnostic error types: "
-                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    f"- Diagnostic error types: `{_scalar(observation.get('diagnostic_error_types'))}`",
                     "",
                     "### Evaluator verdict",
                     "",
@@ -719,8 +671,7 @@ def _render_approval_record(
                     "No workspace diff assertion or final answer evidence was reported.",
                     "",
                     f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
-                    "- Diagnostic error types: "
-                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    f"- Diagnostic error types: `{_scalar(observation.get('diagnostic_error_types'))}`",
                     "",
                     "### Evaluator verdict",
                     "",
@@ -738,9 +689,7 @@ def _render_approval_record(
                     "",
                 ]
             )
-            workspace_assertions_passed = observation.get(
-                "workspace_assertions_passed"
-            )
+            workspace_assertions_passed = observation.get("workspace_assertions_passed")
             if workspace_assertions_passed is True:
                 lines.extend(
                     [
@@ -796,8 +745,7 @@ def _render_approval_record(
             lines.extend(
                 [
                     f"- Stop reason: `{_scalar(observation.get('stop_reason'))}`",
-                    "- Diagnostic error types: "
-                    f"`{_scalar(observation.get('diagnostic_error_types'))}`",
+                    f"- Diagnostic error types: `{_scalar(observation.get('diagnostic_error_types'))}`",
                     "",
                     "### Evaluator verdict",
                     "",
@@ -806,16 +754,13 @@ def _render_approval_record(
                 ]
             )
             continue
-        workspace_assertions_passed = observation.get(
-            "workspace_assertions_passed"
-        )
+        workspace_assertions_passed = observation.get("workspace_assertions_passed")
         if workspace_assertions_passed is True:
             lines.extend(
                 [
                     "### Fixture workspace assertion contract",
                     "",
-                    "This is the validated fixture before/after assertion contract, "
-                    "not a captured filesystem diff.",
+                    "This is the validated fixture before/after assertion contract, not a captured filesystem diff.",
                     "",
                     "```diff",
                     *_workspace_diff(before, after),
@@ -856,11 +801,7 @@ def _render_approval_record(
                     ]
                 )
         else:
-            answer_heading = (
-                "### Final answer"
-                if workspace_assertions_passed is True
-                else "### Observed final answer"
-            )
+            answer_heading = "### Final answer" if workspace_assertions_passed is True else "### Observed final answer"
             lines.extend(
                 [
                     answer_heading,
@@ -969,9 +910,7 @@ def _case_presentation(
 
 def _execution_summary(cases: Sequence[_RenderedCase], expected: int) -> str:
     if expected <= 0:
-        raise ValueError(
-            "model quality report expected execution count must be positive"
-        )
+        raise ValueError("model quality report expected execution count must be positive")
     reached = len(cases)
     if reached > expected:
         raise ValueError("model quality report has more case executions than expected")
@@ -998,6 +937,9 @@ def _items_by_model_id(
     result: dict[str, Mapping[str, object]] = {}
     for raw_item in items:
         item = _mapping(raw_item, label=label)
+        for legacy_field in ("model_alias", "provider_model"):
+            if legacy_field in item:
+                raise ValueError(f"model quality report {label}.{legacy_field} is unsupported")
         model_id = _required_text(item, "model_id")
         if model_id in result:
             raise ValueError(f"model quality report duplicate {label} model ID: {model_id}")
@@ -1026,17 +968,12 @@ def _validate_run_cases(
             score = _mapping(case.get("score"), label=f"{model_id} case score")
             case_id = _required_text(observation, "case_id")
             capability = _required_text(observation, "capability")
-            runtime_input_namespace = observation.get(
-                "runtime_input_namespace"
-            )
+            runtime_input_namespace = observation.get("runtime_input_namespace")
             if runtime_input_namespace is not None and (
-                not isinstance(runtime_input_namespace, str)
-                or not runtime_input_namespace
+                not isinstance(runtime_input_namespace, str) or not runtime_input_namespace
             ):
                 raise ValueError(
-                    "model quality report "
-                    f"{model_id}.{case_id}.runtime_input_namespace "
-                    "must be non-empty text or null"
+                    f"model quality report {model_id}.{case_id}.runtime_input_namespace must be non-empty text or null"
                 )
             if (
                 evaluator_version
@@ -1055,9 +992,7 @@ def _validate_run_cases(
                 )
             observation_status = _required_text(observation, "status")
             if observation_status not in {"done", "paused", "failed", "error"}:
-                raise ValueError(
-                    f"model quality report {model_id}.{case_id}.status is invalid"
-                )
+                raise ValueError(f"model quality report {model_id}.{case_id}.status is invalid")
             _validate_final_pause_evidence(
                 observation,
                 label=f"{model_id}.{case_id}",
@@ -1065,34 +1000,23 @@ def _validate_run_cases(
             )
             approval_pause_observed = observation.get("approval_pause_observed")
             if not isinstance(approval_pause_observed, bool):
-                raise ValueError(
-                    "model quality report "
-                    f"{model_id}.{case_id}.approval_pause_observed must be boolean"
-                )
+                raise ValueError(f"model quality report {model_id}.{case_id}.approval_pause_observed must be boolean")
             approval_kind = observation.get("approval_kind")
             if approval_kind is not None and not isinstance(approval_kind, str):
-                raise ValueError(
-                    f"model quality report {model_id}.{case_id}.approval_kind "
-                    "must be text or null"
-                )
+                raise ValueError(f"model quality report {model_id}.{case_id}.approval_kind must be text or null")
             approval_resumes = _nonnegative_integer(
                 observation.get("approval_resumes"),
                 label=f"{model_id}.{case_id}.approval_resumes",
             )
             if (
                 capability == "approval_continuation"
-                and approval_resumes
-                > _MAX_APPROVAL_RESUMES_BY_EVALUATOR[evaluator_version]
+                and approval_resumes > _MAX_APPROVAL_RESUMES_BY_EVALUATOR[evaluator_version]
             ):
                 raise ValueError(
-                    "model quality report approval case for "
-                    f"{model_id}.{case_id} contradicts approval evidence"
+                    f"model quality report approval case for {model_id}.{case_id} contradicts approval evidence"
                 )
             if not isinstance(observation.get("infrastructure_failure"), bool):
-                raise ValueError(
-                    "model quality report "
-                    f"{model_id}.{case_id}.infrastructure_failure must be boolean"
-                )
+                raise ValueError(f"model quality report {model_id}.{case_id}.infrastructure_failure must be boolean")
             tool_calls = _sequence(
                 observation.get("tool_calls"),
                 label=f"{model_id}.{case_id} tool_calls",
@@ -1116,28 +1040,16 @@ def _validate_run_cases(
                     "latency_ms",
                 ):
                     if field not in call:
-                        raise ValueError(
-                            f"model quality report {model_id}.{case_id}.{field} "
-                            "must be reported"
-                        )
+                        raise ValueError(f"model quality report {model_id}.{case_id}.{field} must be reported")
                 for field in ("error_code", "error_message"):
                     value = call.get(field)
                     if value is not None and not isinstance(value, str):
-                        raise ValueError(
-                            f"model quality report {model_id}.{case_id}.{field} "
-                            "must be text or null"
-                        )
+                        raise ValueError(f"model quality report {model_id}.{case_id}.{field} must be text or null")
                 if not isinstance(call.get("is_error"), bool):
-                    raise ValueError(
-                        f"model quality report {model_id}.{case_id}.is_error "
-                        "must be boolean"
-                    )
+                    raise ValueError(f"model quality report {model_id}.{case_id}.is_error must be boolean")
                 for field in ("retryable", "truncated"):
                     if not isinstance(call.get(field), bool):
-                        raise ValueError(
-                            f"model quality report {model_id}.{case_id}.{field} "
-                            "must be boolean"
-                        )
+                        raise ValueError(f"model quality report {model_id}.{case_id}.{field} must be boolean")
                 tool_latency_ms = call.get("latency_ms")
                 if tool_latency_ms is not None:
                     _nonnegative_number(
@@ -1160,8 +1072,7 @@ def _validate_run_cases(
             )
             if not isinstance(observation.get("workspace_assertions_passed"), bool):
                 raise ValueError(
-                    "model quality report "
-                    f"{model_id}.{case_id}.workspace_assertions_passed must be boolean"
+                    f"model quality report {model_id}.{case_id}.workspace_assertions_passed must be boolean"
                 )
             metadata = metadata_by_id.get(case_id)
             if (
@@ -1170,63 +1081,40 @@ def _validate_run_cases(
                 or score.get("case_id") != case_id
                 or score.get("capability") != capability
             ):
-                raise ValueError(
-                    f"model quality report case evidence for {model_id}.{case_id} is inconsistent"
-                )
-            observation_infrastructure = (
-                observation.get("infrastructure_failure") is True
-            )
+                raise ValueError(f"model quality report case evidence for {model_id}.{case_id} is inconsistent")
+            observation_infrastructure = observation.get("infrastructure_failure") is True
             score_passed = score.get("passed")
             core_success = score.get("core_success")
             capability_passed = score.get("capability_passed")
             if run_status == "completed" and observation_infrastructure:
-                raise ValueError(
-                    f"model quality report completed case for {model_id}.{case_id} is inconsistent"
-                )
+                raise ValueError(f"model quality report completed case for {model_id}.{case_id} is inconsistent")
             if observation_infrastructure:
-                if any(
-                    value is not None
-                    for value in (score_passed, core_success, capability_passed)
-                ):
+                if any(value is not None for value in (score_passed, core_success, capability_passed)):
                     raise ValueError(
                         f"model quality report infrastructure case for {model_id}.{case_id} is inconsistent"
                     )
                 infrastructure_observed = True
             else:
-                if not all(
-                    isinstance(value, bool)
-                    for value in (score_passed, core_success, capability_passed)
-                ):
+                if not all(isinstance(value, bool) for value in (score_passed, core_success, capability_passed)):
                     raise ValueError(
                         f"model quality report non-infrastructure case for {model_id}.{case_id} is inconsistent"
                     )
                 if score_passed is not (core_success and capability_passed):
-                    raise ValueError(
-                        "model quality report score for "
-                        f"{model_id}.{case_id} is inconsistent"
-                    )
+                    raise ValueError(f"model quality report score for {model_id}.{case_id} is inconsistent")
             if score_passed is True:
-                if (
-                    observation_status != "done"
-                    or observation.get("workspace_assertions_passed") is not True
-                ):
+                if observation_status != "done" or observation.get("workspace_assertions_passed") is not True:
                     raise ValueError(
-                        "model quality report passed case for "
-                        f"{model_id}.{case_id} contradicts runtime evidence"
+                        f"model quality report passed case for {model_id}.{case_id} contradicts runtime evidence"
                     )
                 if capability == "approval_continuation" and (
-                    approval_pause_observed is not True
-                    or approval_kind != "tool_approval"
-                    or approval_resumes < 1
+                    approval_pause_observed is not True or approval_kind != "tool_approval" or approval_resumes < 1
                 ):
                     raise ValueError(
                         "model quality report passed approval case for "
                         f"{model_id}.{case_id} contradicts approval evidence"
                     )
     if run_status == "inconclusive" and trials and not infrastructure_observed:
-        raise ValueError(
-            f"model quality report inconclusive run for {model_id} has inconsistent case evidence"
-        )
+        raise ValueError(f"model quality report inconclusive run for {model_id} has inconsistent case evidence")
 
 
 def _validate_final_pause_evidence(
@@ -1237,21 +1125,14 @@ def _validate_final_pause_evidence(
 ) -> None:
     request_kind = observation.get("final_pause_request_kind")
     if request_kind is not None and not isinstance(request_kind, str):
-        raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_request_kind must be text or null"
-        )
+        raise ValueError(f"model quality report {label}.final_pause_request_kind must be text or null")
 
     reason = observation.get("final_pause_reason")
     if reason is not None and not isinstance(reason, str):
-        raise ValueError(
-            f"model quality report {label}.final_pause_reason must be text or null"
-        )
+        raise ValueError(f"model quality report {label}.final_pause_reason must be text or null")
     if isinstance(reason, str) and len(reason) > _MAX_FINAL_PAUSE_REASON_CHARS:
         raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_reason exceeds "
-            f"{_MAX_FINAL_PAUSE_REASON_CHARS} characters"
+            f"model quality report {label}.final_pause_reason exceeds {_MAX_FINAL_PAUSE_REASON_CHARS} characters"
         )
 
     raw_tool_names = observation.get("final_pause_tool_names", ())
@@ -1259,32 +1140,19 @@ def _validate_final_pause_evidence(
         raw_tool_names,
         (str, bytes),
     ):
-        raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_tool_names must be a sequence"
-        )
+        raise ValueError(f"model quality report {label}.final_pause_tool_names must be a sequence")
     if not all(isinstance(item, str) for item in raw_tool_names):
-        raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_tool_names entries must be text"
-        )
+        raise ValueError(f"model quality report {label}.final_pause_tool_names entries must be text")
     if len(raw_tool_names) > _MAX_FINAL_PAUSE_TOOL_NAMES:
         raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_tool_names exceeds "
-            f"{_MAX_FINAL_PAUSE_TOOL_NAMES} entries"
+            f"model quality report {label}.final_pause_tool_names exceeds {_MAX_FINAL_PAUSE_TOOL_NAMES} entries"
         )
     if raw_tool_names and not request_kind:
-        raise ValueError(
-            "model quality report "
-            f"{label}.final_pause_tool_names require a request kind"
-        )
+        raise ValueError(f"model quality report {label}.final_pause_tool_names require a request kind")
 
     has_final_pause_evidence = bool(request_kind or reason or raw_tool_names)
     if has_final_pause_evidence and observation_status != "paused":
-        raise ValueError(
-            f"model quality report {label} final pause evidence requires paused status"
-        )
+        raise ValueError(f"model quality report {label} final pause evidence requires paused status")
 
 
 def _workspace_diff(before: Mapping[str, str], after: Mapping[str, str]) -> list[str]:
@@ -1353,9 +1221,7 @@ def _safe_json_value(value: object) -> str:
 def _safe_nullable_text(value: object) -> str:
     if value is None:
         return "null"
-    return _bounded_report_text(
-        json.dumps(_safe_text(str(value)), ensure_ascii=False)
-    )
+    return _bounded_report_text(json.dumps(_safe_text(str(value)), ensure_ascii=False))
 
 
 def _bounded_report_text(value: str) -> str:
@@ -1381,11 +1247,7 @@ def _redacted_mapping(value: Mapping[str, object]) -> dict[str, object]:
 def _is_sensitive_key(key: str) -> bool:
     camel_split = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", key)
     normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", camel_split)
-    tokens = {
-        token.casefold()
-        for token in re.split(r"[^A-Za-z0-9]+", normalized)
-        if token
-    }
+    tokens = {token.casefold() for token in re.split(r"[^A-Za-z0-9]+", normalized) if token}
     return bool(tokens & _SENSITIVE_KEY_TOKENS)
 
 

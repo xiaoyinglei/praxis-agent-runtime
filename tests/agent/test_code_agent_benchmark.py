@@ -14,9 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "agent_code_benchmark.py"
-REAL_MANIFEST_PATH = (
-    Path(__file__).parents[2] / "evals" / "code_agent" / "benchmark_v1.json"
-)
+REAL_MANIFEST_PATH = Path(__file__).parents[2] / "evals" / "code_agent" / "benchmark_v1.json"
 
 
 def _load_benchmark_module():
@@ -450,21 +448,13 @@ def test_task_replacement_requires_new_benchmark_version(tmp_path: Path) -> None
 
 def _release_tasks() -> list[dict[str, object]]:
     tasks: list[dict[str, object]] = []
-    regression_categories = (
-        ["local"] * 9
-        + ["medium"] * 8
-        + ["cross_layer"] * 8
-    )
+    regression_categories = ["local"] * 9 + ["medium"] * 8 + ["cross_layer"] * 8
     control_counts = {"local": 0, "medium": 0, "cross_layer": 0}
     for index, category in enumerate(regression_categories, start=1):
         control = control_counts[category] < 2
         if control:
             control_counts[category] += 1
-        layers = (
-            ["service", "loop"]
-            if category == "cross_layer"
-            else ["tool"]
-        )
+        layers = ["service", "loop"] if category == "cross_layer" else ["tool"]
         tasks.append(
             _task_payload(
                 f"regression-{index:02d}",
@@ -475,11 +465,7 @@ def _release_tasks() -> list[dict[str, object]]:
         )
     holdout_categories = ["local", "medium", "medium", "cross_layer", "cross_layer"]
     for index, category in enumerate(holdout_categories, start=1):
-        layers = (
-            ["public_api_cli", "service"]
-            if category == "cross_layer"
-            else ["tool"]
-        )
+        layers = ["public_api_cli", "service"] if category == "cross_layer" else ["tool"]
         tasks.append(
             _task_payload(
                 f"holdout-{index:02d}",
@@ -591,15 +577,8 @@ def _release_result(
 
 
 def _complete_release_results(manifest) -> list[dict[str, object]]:
-    results = [
-        _release_result(manifest, task, manifest.primary_model)
-        for task in manifest.tasks
-    ]
-    results.extend(
-        _release_result(manifest, task, manifest.control_model)
-        for task in manifest.tasks
-        if task.control
-    )
+    results = [_release_result(manifest, task, manifest.primary_model) for task in manifest.tasks]
+    results.extend(_release_result(manifest, task, manifest.control_model) for task in manifest.tasks if task.control)
     return results
 
 
@@ -748,9 +727,7 @@ def test_release_evidence_loader_rejects_mixed_evidence_and_result_versions(
                 "results": [
                     {
                         "path": result_path.relative_to(artifacts).as_posix(),
-                        "sha256": module.hashlib.sha256(
-                            result_path.read_bytes()
-                        ).hexdigest(),
+                        "sha256": module.hashlib.sha256(result_path.read_bytes()).hexdigest(),
                     }
                 ],
             }
@@ -777,6 +754,20 @@ def test_release_gate_rejects_legacy_model_alias_in_active_results(
     result["model_alias"] = result.pop("model_id")
 
     with pytest.raises(ValueError, match="result.model_alias is unsupported"):
+        module.evaluate_release_results(manifest, [result])
+
+
+def test_release_gate_rejects_legacy_provider_model_in_active_results(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    result = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    result["provider_model"] = result["model_id"]
+
+    with pytest.raises(ValueError, match="result.provider_model is unsupported"):
         module.evaluate_release_results(manifest, [result])
 
 
@@ -811,11 +802,7 @@ def test_release_gate_blocks_false_completion_from_control_run(
     _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
     manifest = module.load_manifest(path)
     results = _complete_release_results(manifest)
-    control = next(
-        result
-        for result in results
-        if result["model_id"] == manifest.control_model
-    )
+    control = next(result for result in results if result["model_id"] == manifest.control_model)
     control.update(
         _release_result(
             manifest,
@@ -864,12 +851,8 @@ def test_release_gate_requires_complete_unique_runs_and_failure_diagnoses(
     summary = module.evaluate_release_results(manifest, results)
 
     assert summary["release_ready"] is False
-    assert f"missing_result:{missing['task_id']}:{missing['model_id']}" in summary[
-        "reasons"
-    ]
-    assert f"unknown_diagnosis:{failed['task_id']}:{failed['model_id']}" in summary[
-        "reasons"
-    ]
+    assert f"missing_result:{missing['task_id']}:{missing['model_id']}" in summary["reasons"]
+    assert f"unknown_diagnosis:{failed['task_id']}:{failed['model_id']}" in summary["reasons"]
 
     with pytest.raises(ValueError, match="duplicate result"):
         module.evaluate_release_results(manifest, [*results, results[0]])
@@ -1136,10 +1119,7 @@ def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
     diagnosis = module.diagnose_run(
         facts,
         outcome,
-        agent_stdout=(
-            "Exploration limit reached after 20 consecutive inspection calls.\n"
-            "停止原因: delivery_stalled\n"
-        ),
+        agent_stdout=("Exploration limit reached after 20 consecutive inspection calls.\n停止原因: delivery_stalled\n"),
         acceptance_stdout="4 failed, 30 passed",
         acceptance_stderr="",
     )
@@ -1330,8 +1310,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
     source_commit = _git(repo, "rev-parse", "HEAD")
 
     (repo / "hidden_test.py").write_text(
-        "from pathlib import Path\n"
-        "assert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
+        "from pathlib import Path\nassert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
         encoding="utf-8",
     )
     _git(repo, "add", "hidden_test.py")
@@ -1387,9 +1366,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
     assert (record.artifact_dir / "result.json").is_file()
     assert (record.artifact_dir / "agent.stdout").is_file()
     assert (record.artifact_dir / "acceptance.stdout").is_file()
-    payload = json.loads(
-        (record.artifact_dir / "result.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((record.artifact_dir / "result.json").read_text(encoding="utf-8"))
     diff = (record.artifact_dir / "agent.diff").read_text(encoding="utf-8")
     assert payload["schema_version"] == 2
     assert payload["model_id"] == "kimi-k2.6"
@@ -1414,8 +1391,7 @@ def test_run_task_retries_only_a_durable_unknown_model_operation(
     _git(repo, "commit", "-qm", "fixture source")
     source_commit = _git(repo, "rev-parse", "HEAD")
     (repo / "hidden_test.py").write_text(
-        "from pathlib import Path\n"
-        "assert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
+        "from pathlib import Path\nassert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
         encoding="utf-8",
     )
     _git(repo, "add", "hidden_test.py")
@@ -1541,10 +1517,7 @@ def test_run_command_streams_output_before_process_exit(
     )
     worker.start()
     deadline = time.monotonic() + 3
-    while (
-        not stdout_path.is_file()
-        or "first" not in stdout_path.read_text(encoding="utf-8")
-    ):
+    while not stdout_path.is_file() or "first" not in stdout_path.read_text(encoding="utf-8"):
         assert time.monotonic() < deadline
         time.sleep(0.01)
 
@@ -1683,16 +1656,9 @@ def test_setup_failure_is_benchmark_invalid_not_runtime_failure(
     )
 
     assert record.outcome is module.RunOutcome.BENCHMARK_INVALID
-    assert (
-        record.diagnosis.primary
-        is module.DiagnosisCause.BENCHMARK_ENVIRONMENT
-    )
-    result = json.loads(
-        (record.artifact_dir / "result.json").read_text(encoding="utf-8")
-    )
-    assert result["diagnosis"]["evidence"] == [
-        "benchmark_invalid:benchmark_setup_failed"
-    ]
+    assert record.diagnosis.primary is module.DiagnosisCause.BENCHMARK_ENVIRONMENT
+    result = json.loads((record.artifact_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["diagnosis"]["evidence"] == ["benchmark_invalid:benchmark_setup_failed"]
 
 
 def test_secret_written_to_workspace_blocks_run_and_is_redacted_from_artifacts(
@@ -1763,9 +1729,7 @@ def test_benchmark_redacts_provider_credential_identifier() -> None:
     module = _load_benchmark_module()
     credential_id = "ak-provider-credential-123456"
 
-    redacted = module._redact_secrets(
-        f"rate limit for <{credential_id}>"
-    )
+    redacted = module._redact_secrets(f"rate limit for <{credential_id}>")
 
     assert credential_id not in redacted
     assert redacted == "rate limit for <[REDACTED]>"

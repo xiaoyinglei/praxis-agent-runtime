@@ -57,7 +57,12 @@ def test_embedding_service_url_env_sets_embedding_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        primary_model=ModelSpec(
+            id="gpt-4",
+            capability=ModelCapability.CHAT,
+            provider="openai_compatible",
+            context_window_tokens=128_000,
+        ),
         embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
     )
     overrides = to_assembly_overrides(runtime_config)
@@ -75,7 +80,12 @@ def test_rerank_service_url_env_sets_rerank_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        primary_model=ModelSpec(
+            id="gpt-4",
+            capability=ModelCapability.CHAT,
+            provider="openai_compatible",
+            context_window_tokens=128_000,
+        ),
         embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
             id="bge-reranker",
@@ -100,7 +110,12 @@ def test_require_rerank_false_strips_reranker_and_runtime_provider() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        primary_model=ModelSpec(
+            id="gpt-4",
+            capability=ModelCapability.CHAT,
+            provider="openai_compatible",
+            context_window_tokens=128_000,
+        ),
         embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
             id="bge-reranker",
@@ -129,7 +144,12 @@ def test_require_rerank_true_preserves_reranker() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        primary_model=ModelSpec(
+            id="gpt-4",
+            capability=ModelCapability.CHAT,
+            provider="openai_compatible",
+            context_window_tokens=128_000,
+        ),
         embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
         reranker_model=ModelSpec(
             id="bge-reranker",
@@ -173,7 +193,12 @@ def test_no_service_url_env_uses_yaml_default() -> None:
     from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig, ModelSpec
 
     runtime_config = ModelRuntimeConfig(
-        primary_model=ModelSpec(id="gpt-4", capability=ModelCapability.CHAT, provider="openai_compatible"),
+        primary_model=ModelSpec(
+            id="gpt-4",
+            capability=ModelCapability.CHAT,
+            provider="openai_compatible",
+            context_window_tokens=128_000,
+        ),
         embedding_model=ModelSpec(id="mlx-model", capability=ModelCapability.EMBEDDING, provider="mlx_embedding"),
     )
     overrides = to_assembly_overrides(runtime_config)

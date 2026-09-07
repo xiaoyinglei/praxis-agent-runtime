@@ -7,11 +7,11 @@ import pytest
 import yaml
 from pydantic import BaseModel
 
-from agent_runtime.modeling.config import GenerationTaskConfig, ModelCapability, ModelRuntimeConfig
+from agent_runtime.modeling.config import ModelCapability, ModelRuntimeConfig
 from agent_runtime.modeling.contracts import LLMCallStage
 from rag.assembly.models import ProviderConfig
 from rag.assembly.support import _OpenAICompatibleChatGenerator, build_provider
-from rag.models.assembly_adapter import resolve_task_model, to_assembly_overrides
+from rag.models.assembly_adapter import to_assembly_overrides
 from rag.models.catalog import ModelCatalog
 from rag.models.guard import EmbeddingSpaceMismatchError, assert_embedding_space_compatible
 from rag.models.runtime import RuntimeOverrides, resolve_runtime_config
@@ -35,6 +35,7 @@ models:
     provider: openai_compatible
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
+    context_window_tokens: 65536
 
   mlx-community/Qwen3-Embedding-8B-4bit-DWQ:
     capability: embedding
@@ -142,6 +143,8 @@ defaults:
     assert overrides.embedding.provider_kind == "mlx-embedding"
     assert overrides.rerank is not None
     assert overrides.rerank.provider_kind == "local-bge"
+    assert overrides.tokenizer is not None
+    assert overrides.tokenizer.max_context_tokens == 131_072
 
 
 def test_catalog_loads_llm_stage_budgets(catalog: ModelCatalog) -> None:
@@ -369,6 +372,8 @@ def test_assembly_adapter_produces_chat_provider_config(catalog: ModelCatalog) -
     assert overrides.chat.chat_model == "mlx-community/Qwen3-14B-4bit"
     assert overrides.chat.base_url == "http://127.0.0.1:8080/v1"
     assert overrides.chat.api_key is None
+    assert overrides.tokenizer is not None
+    assert overrides.tokenizer.max_context_tokens == 32_768
 
 
 def test_assembly_adapter_embedding_provider_config(catalog: ModelCatalog) -> None:
@@ -827,25 +832,20 @@ _GENERATION_CATALOG_YAML = (
     + """
 generation:
   summary:
-    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 8192
     temperature: 0.3
 
   answer:
-    model: deepseek-chat
     max_tokens: 4096
 
   planner:
-    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 4096
     temperature: 0.3
 
   synthesize:
-    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 8192
 
   factcheck:
-    model: mlx-community/Qwen3-14B-4bit
     max_tokens: 2048
     temperature: 0.1
 """
@@ -868,11 +868,9 @@ def test_generation_config_parsing(gen_catalog: ModelCatalog) -> None:
     """models.yaml 中 generation.summary 能正确解析"""
     gen = gen_catalog.generation
 
-    assert gen.summary.model == "mlx-community/Qwen3-14B-4bit"
     assert gen.summary.max_tokens == 8192
     assert gen.summary.temperature == 0.3
 
-    assert gen.answer.model == "deepseek-chat"
     assert gen.answer.max_tokens == 4096
     assert gen.answer.temperature is None  # YAML 未配置 temperature
 
@@ -885,30 +883,28 @@ def test_generation_config_parsing(gen_catalog: ModelCatalog) -> None:
 def test_generation_config_defaults_when_missing(catalog: ModelCatalog) -> None:
     """无 generation section 时全部字段为 None"""
     gen = catalog.generation
-    assert gen.summary.model is None
     assert gen.summary.max_tokens is None
     assert gen.summary.temperature is None
-    assert gen.answer.model is None
+    assert not hasattr(gen.answer, "model")
 
 
 def test_resolve_runtime_config_includes_generation(gen_catalog: ModelCatalog) -> None:
     """resolve_runtime_config 返回的 ModelRuntimeConfig 包含 generation"""
     config = resolve_runtime_config(catalog=gen_catalog)
-    assert config.generation.summary.model == "mlx-community/Qwen3-14B-4bit"
     assert config.generation.summary.max_tokens == 8192
 
 
-def test_resolve_task_model_uses_explicit_model(gen_catalog: ModelCatalog) -> None:
-    """task_config.model 有值时直接使用"""
-    spec = resolve_task_model(gen_catalog.generation.answer, gen_catalog)
-    assert spec.id == "deepseek-chat"
-
-
-def test_resolve_task_model_falls_back_to_default(gen_catalog: ModelCatalog) -> None:
-    """task_config.model 为 None 时 fallback 到 defaults.primary_model"""
-    task = GenerationTaskConfig(max_tokens=4096)  # model=None
-    spec = resolve_task_model(task, gen_catalog)
-    assert spec.id == "mlx-community/Qwen3-14B-4bit"
+def test_generation_task_rejects_nested_model_selector(tmp_path: Path) -> None:
+    path = tmp_path / "nested-model.yaml"
+    path.write_text(
+        _GENERATION_CATALOG_YAML.replace(
+            "summary:\n    max_tokens:",
+            "summary:\n    model: deepseek-chat\n    max_tokens:",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="generation.summary.*model"):
+        ModelCatalog.from_yaml(str(path))
 
 
 def test_summarizer_receives_max_tokens(gen_catalog: ModelCatalog) -> None:
@@ -926,18 +922,21 @@ def test_summarizer_receives_max_tokens(gen_catalog: ModelCatalog) -> None:
     assert config.temperature == 0.3
 
 
-def test_switch_summary_model(gen_catalog: ModelCatalog) -> None:
-    """只改 generation.summary.model，不改业务代码即可切换到其他模型"""
-    # 用 mlx-community/Qwen3-14B-4bit（默认）
-    spec1 = resolve_task_model(gen_catalog.generation.summary, gen_catalog)
-    assert spec1.id == "mlx-community/Qwen3-14B-4bit"
-
-    # 构造一个新的 task config，切换到 deepseek-chat（模型池中存在）
-    switched = GenerationTaskConfig(
-        model="deepseek-chat",
-        max_tokens=gen_catalog.generation.summary.max_tokens,
+def test_chat_model_requires_context_window_tokens(tmp_path: Path) -> None:
+    path = tmp_path / "missing-context.yaml"
+    path.write_text(
+        CATALOG_YAML.replace("    context_window_tokens: 65536\n", ""),
+        encoding="utf-8",
     )
-    spec2 = resolve_task_model(switched, gen_catalog)
-    assert spec2.id == "deepseek-chat"
-    assert spec2.base_url == "https://api.deepseek.com/v1"
-    # 业务逻辑不变：只需 resolve_task_model(task_config, catalog)
+    with pytest.raises(ValueError, match="deepseek-chat.*context_window_tokens"):
+        ModelCatalog.from_yaml(str(path))
+
+
+def test_tokenizer_cannot_override_model_context_window(tmp_path: Path) -> None:
+    path = tmp_path / "global-context.yaml"
+    path.write_text(
+        CATALOG_YAML + "\ntokenizer:\n  max_context_tokens: 999\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="tokenizer.max_context_tokens is unsupported"):
+        ModelCatalog.from_yaml(str(path))

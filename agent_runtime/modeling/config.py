@@ -31,12 +31,10 @@ class ModelSpec:
 class GenerationTaskConfig:
     """Per-task generation parameters.
 
-    model       — exact model ID in models.yaml; None = fallback to defaults.primary_model
     max_tokens  — max completion tokens; None = not configured, consumer decides fallback
     temperature — None = don't pass to LLM (use model default)
     """
 
-    model: str | None = None
     max_tokens: int | None = None
     temperature: float | None = None
 
@@ -60,7 +58,6 @@ class TokenizerModelConfig:
     tokenizer_backend: str | None = None
     chunk_token_size: int | None = None
     chunk_overlap_tokens: int | None = None
-    max_context_tokens: int | None = None
     prompt_reserved_tokens: int | None = None
     local_files_only: bool | None = None
 

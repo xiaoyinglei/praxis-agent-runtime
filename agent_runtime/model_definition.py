@@ -27,7 +27,6 @@ from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 class GenerationTaskDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    model: str | None
     max_tokens: int | None = Field(gt=0, strict=True)
     temperature: float | None = Field(ge=0.0, le=2.0, allow_inf_nan=False)
 
@@ -113,41 +112,27 @@ class RequestDefaultsDefinition(BaseModel):
 
     provider_options: ProviderOptionsDefinition | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class ModelCapabilities:
     """Resolved provider/model capabilities used by runtime execution."""
+
     context_window_tokens: int
     max_output_tokens: int | None
     supports_native_tools: bool
     supports_structured_output: bool
 
     def __post_init__(self) -> None:
-        if (
-            isinstance(self.context_window_tokens, bool)
-            or self.context_window_tokens <= 0
-        ):
-            raise ValueError(
-                "context_window_tokens must be positive"
-            )
+        if isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0:
+            raise ValueError("context_window_tokens must be positive")
 
         if self.max_output_tokens is not None:
-            if (
-                isinstance(self.max_output_tokens, bool)
-                or self.max_output_tokens <= 0
-            ):
-                raise ValueError(
-                    "max_output_tokens must be "
-                    "positive or None"
-                )
+            if isinstance(self.max_output_tokens, bool) or self.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be positive or None")
 
-            if (
-                self.max_output_tokens
-                > self.context_window_tokens
-            ):
-                raise ValueError(
-                    "max_output_tokens must not exceed "
-                    "context_window_tokens"
-                )
+            if self.max_output_tokens > self.context_window_tokens:
+                raise ValueError("max_output_tokens must not exceed context_window_tokens")
+
 
 class ModelExecutionDefinition(BaseModel):
     model_config = ConfigDict(
@@ -230,15 +215,8 @@ class ModelExecutionDefinition(BaseModel):
     def validate_capabilities(
         self,
     ) -> ModelExecutionDefinition:
-        if (
-            self.max_output_tokens is not None
-            and self.max_output_tokens
-            > self.context_window_tokens
-        ):
-            raise ValueError(
-                "max_output_tokens must not exceed "
-                "context_window_tokens"
-            )
+        if self.max_output_tokens is not None and self.max_output_tokens > self.context_window_tokens:
+            raise ValueError("max_output_tokens must not exceed context_window_tokens")
 
         _ = normalize_model_endpoint(
             provider=self.provider,
@@ -251,23 +229,16 @@ class ModelExecutionDefinition(BaseModel):
     @property
     def capabilities(self) -> ModelCapabilities:
         return ModelCapabilities(
-            context_window_tokens=(
-                self.context_window_tokens
-            ),
-            max_output_tokens=(
-                self.max_output_tokens
-            ),
-            supports_native_tools=(
-                self.supports_tools
-            ),
-            supports_structured_output=(
-                self.supports_structured_output
-            ),
+            context_window_tokens=(self.context_window_tokens),
+            max_output_tokens=(self.max_output_tokens),
+            supports_native_tools=(self.supports_tools),
+            supports_structured_output=(self.supports_structured_output),
         )
 
     @property
     def definition_revision(self) -> str:
         return definition_revision(self)
+
 
 def build_model_execution_definition(
     *,
@@ -288,69 +259,40 @@ def build_model_execution_definition(
         provider_name=spec.provider_name,
         protocol=spec.protocol,
         model_id=model_id,
-        tokenizer_model=(
-            spec.tokenizer_model
-            or model_id
-        ),
-        context_window_tokens=(
-            spec.context_window_tokens
-        ),
-        max_output_tokens=(
-            spec.max_output_tokens
-        ),
+        tokenizer_model=(spec.tokenizer_model or model_id),
+        context_window_tokens=(spec.context_window_tokens),
+        max_output_tokens=(spec.max_output_tokens),
         timeout_seconds=spec.timeout_seconds,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
-        defaults=(
-            RequestDefaultsDefinition.model_validate(
-                deepcopy(spec.defaults)
-            )
-        ),
+        defaults=(RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults))),
         supports_tools=spec.supports_tools,
-        supports_structured_output=(
-            spec.supports_structured_output
-        ),
+        supports_structured_output=(spec.supports_structured_output),
         location=endpoint.location,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
-        cache_read_cost_per_1m=(
-            spec.cache_read_cost_per_1m
-        ),
-        cache_write_cost_per_1m=(
-            spec.cache_write_cost_per_1m
-        ),
+        cache_read_cost_per_1m=(spec.cache_read_cost_per_1m),
+        cache_write_cost_per_1m=(spec.cache_write_cost_per_1m),
         runtime=(
             RuntimeDefinition(
                 health_url=runtime.health_url,
                 launch_command=runtime.launch_command,
-                expected_model_contains=(
-                    runtime.expected_model_contains
-                ),
-                startup_timeout_seconds=(
-                    runtime.startup_timeout_seconds
-                ),
-                poll_interval_seconds=(
-                    runtime.poll_interval_seconds
-                ),
+                expected_model_contains=(runtime.expected_model_contains),
+                startup_timeout_seconds=(runtime.startup_timeout_seconds),
+                poll_interval_seconds=(runtime.poll_interval_seconds),
             )
             if runtime is not None
             else None
         ),
-        generation=_generation_definition(
-            config.generation
-        ),
+        generation=_generation_definition(config.generation),
         llm_stage_budgets={
-            stage.value: (
-                StageBudgetDefinition.model_validate(
-                    budget.model_dump()
-                )
-            )
-            for stage, budget
-            in effective_stage_budgets(
+            stage.value: (StageBudgetDefinition.model_validate(budget.model_dump()))
+            for stage, budget in effective_stage_budgets(
                 config=config,
             ).items()
         },
     )
+
 
 def canonical_definition_json(definition: ModelExecutionDefinition) -> bytes:
     """Return the exact canonical bytes used by archives and Turn bindings."""
@@ -386,26 +328,19 @@ def _validate_canonical_value(value: object) -> None:
         for item in value:
             _validate_canonical_value(item)
     else:
-        raise ValueError(
-            f"model execution definition contains a non-JSON value: {type(value).__name__}"
-        )
+        raise ValueError(f"model execution definition contains a non-JSON value: {type(value).__name__}")
 
 
 def effective_stage_budgets(
     *,
     config: AgentModelsConfig,
 ) -> dict[LLMCallStage, LLMStageBudget]:
-    return {
-        stage: budget.model_copy()
-        for stage, budget
-        in config.llm_stage_budgets.items()
-    }
+    return {stage: budget.model_copy() for stage, budget in config.llm_stage_budgets.items()}
 
 
 def _generation_definition(config: GenerationConfig) -> GenerationDefinition:
     def task(value: GenerationTaskConfig) -> GenerationTaskDefinition:
         return GenerationTaskDefinition(
-            model=value.model,
             max_tokens=value.max_tokens,
             temperature=value.temperature,
         )
@@ -417,6 +352,7 @@ def _generation_definition(config: GenerationConfig) -> GenerationDefinition:
         synthesize=task(config.synthesize),
         factcheck=task(config.factcheck),
     )
+
 
 __all__ = [
     "ModelCapabilities",

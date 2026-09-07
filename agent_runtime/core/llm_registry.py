@@ -60,6 +60,7 @@ class ResolvedModel:
     pricing_micros_per_1m: Mapping[str, int | None] = field(default_factory=dict)
     pricing_revision: str | None = None
 
+
 @dataclass(frozen=True, slots=True)
 class ChatProviderConfig:
     base_url: str
@@ -109,8 +110,7 @@ class ModelRegistry:
             raise ValueError("model origins must cover exactly the configured models")
         default_origin: Literal["builtin", "user", "override"] = "override"
         self._origins = {
-            model_id: origins[model_id] if origins is not None else default_origin
-            for model_id in self._config.models
+            model_id: origins[model_id] if origins is not None else default_origin for model_id in self._config.models
         }
         self._definitions = {
             model_id: build_model_execution_definition(
@@ -124,7 +124,10 @@ class ModelRegistry:
             # Validate canonical JSON at the catalog boundary so unsupported
             # values fail before a model can be selected or dispatched.
             _ = definition.definition_revision
-        self._cache: dict[str,ResolvedModel,] = {}
+        self._cache: dict[
+            str,
+            ResolvedModel,
+        ] = {}
 
     @property
     def default_model(self) -> str:
@@ -188,9 +191,7 @@ class ModelRegistry:
         _load_env_file(Path(env_path))
         resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
         resolved_worktree = (
-            discover_git_worktree(resolved_workspace)
-            if worktree is None
-            else worktree.expanduser().resolve()
+            discover_git_worktree(resolved_workspace) if worktree is None else worktree.expanduser().resolve()
         )
         config, origins = cls._load_effective_config(
             workspace=resolved_workspace,
@@ -199,10 +200,7 @@ class ModelRegistry:
         if default_model is not None:
             if default_model not in config.models:
                 available = ", ".join(sorted(config.models))
-                raise UnknownModelIdError(
-                    f"Model ID {default_model!r} not found in config. "
-                    f"Available IDs: {available}"
-                )
+                raise UnknownModelIdError(f"Model ID {default_model!r} not found in config. Available IDs: {available}")
             config = config.model_copy(
                 update={
                     "default_model": default_model,
@@ -234,9 +232,7 @@ class ModelRegistry:
         user_snapshot = store.read()
         collisions = sorted(set(built_in.models).intersection(user_snapshot.document.models))
         if collisions:
-            raise ValueError(
-                "User model registry collides with built-in model IDs: " + ", ".join(collisions)
-            )
+            raise ValueError("User model registry collides with built-in model IDs: " + ", ".join(collisions))
         models = dict(built_in.models)
         models.update(
             {
@@ -313,15 +309,9 @@ class ModelRegistry:
                 "provider": _agent_provider_kind(merged),
                 "provider_name": entry.get("provider"),
                 "protocol": merged.get("protocol"),
-                "tokenizer_model": entry.get(
-                    "tokenizer_model"
-                ),
-                "context_window_tokens": entry.get(
-                    "context_window_tokens"
-                ),
-                "max_output_tokens": entry.get(
-                    "max_output_tokens"
-                ),
+                "tokenizer_model": entry.get("tokenizer_model"),
+                "context_window_tokens": entry.get("context_window_tokens"),
+                "max_output_tokens": entry.get("max_output_tokens"),
                 "timeout_seconds": entry.get(
                     "timeout_seconds",
                     120.0,
@@ -347,18 +337,10 @@ class ModelRegistry:
                     ),
                 ),
                 "location": merged.get("location"),
-                "input_cost_per_1m": cost.get(
-                    "input_per_1m"
-                ),
-                "output_cost_per_1m": cost.get(
-                    "output_per_1m"
-                ),
-                "cache_read_cost_per_1m": cost.get(
-                    "cache_read_per_1m"
-                ),
-                "cache_write_cost_per_1m": cost.get(
-                    "cache_write_per_1m"
-                ),
+                "input_cost_per_1m": cost.get("input_per_1m"),
+                "output_cost_per_1m": cost.get("output_per_1m"),
+                "cache_read_cost_per_1m": cost.get("cache_read_per_1m"),
+                "cache_write_cost_per_1m": cost.get("cache_write_per_1m"),
                 "runtime": merged.get("runtime"),
             }
         default_model = defaults.get("primary_model", "")
@@ -396,16 +378,12 @@ class ModelRegistry:
 
     def _unknown_model_id(self, model_id: str) -> UnknownModelIdError:
         available = ", ".join(sorted(self._config.models))
-        return UnknownModelIdError(
-            f"Model ID {model_id!r} not found in config. Available IDs: {available}"
-        )
+        return UnknownModelIdError(f"Model ID {model_id!r} not found in config. Available IDs: {available}")
 
     def resolve_definition(self, definition: ModelExecutionDefinition) -> ResolvedModel:
         """Resolve one complete frozen definition without a catalog alias lookup."""
 
-        normalized = ModelExecutionDefinition.model_validate(
-            definition.model_dump(mode="python", exclude_none=False)
-        )
+        normalized = ModelExecutionDefinition.model_validate(definition.model_dump(mode="python", exclude_none=False))
         revision = normalized.definition_revision
         return self._resolve_definition(
             definition=normalized,
@@ -439,23 +417,15 @@ class ModelRegistry:
             pass
 
         if generator is None:
-            raise ModelNotAvailableError(
-                f"Failed to build provider for {subject}"
-            )
+            raise ModelNotAvailableError(f"Failed to build provider for {subject}")
 
         capabilities = definition.capabilities
 
         token_accounting = TokenAccountingService(
             TokenizerContract(
                 embedding_model_name=definition.model_id,
-                tokenizer_model_name=(
-                    definition.tokenizer_model
-                    or definition.model_id
-                ),
-                chunking_tokenizer_model_name=(
-                    definition.tokenizer_model
-                    or definition.model_id
-                ),
+                tokenizer_model_name=(definition.tokenizer_model or definition.model_id),
+                chunking_tokenizer_model_name=(definition.tokenizer_model or definition.model_id),
                 tokenizer_backend="auto",
                 max_context_tokens=capabilities.context_window_tokens,
                 prompt_reserved_tokens=512,
@@ -464,9 +434,7 @@ class ModelRegistry:
         )
 
         stage_budgets = {
-            LLMCallStage(stage): LLMStageBudget.model_validate(
-                budget.model_dump()
-            )
+            LLMCallStage(stage): LLMStageBudget.model_validate(budget.model_dump())
             for stage, budget in definition.llm_stage_budgets.items()
         }
 
@@ -491,9 +459,7 @@ class ModelRegistry:
             capabilities=capabilities,
             token_accounting=token_accounting,
             request_defaults=definition.defaults,
-            generation_config=_generation_config_from_definition(
-                definition
-            ),
+            generation_config=_generation_config_from_definition(definition),
             definition_revision=definition.definition_revision,
             pricing_micros_per_1m=pricing,
             pricing_revision=pricing_revision(
@@ -533,66 +499,27 @@ def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSp
     return ModelSpec.model_validate(
         {
             "provider": definition.provider,
-            "provider_name": (
-                definition.provider_name
-            ),
+            "provider_name": (definition.provider_name),
             "protocol": definition.protocol,
-
-            "tokenizer_model": (
-                definition.tokenizer_model
-            ),
-
-            "context_window_tokens": (
-                definition.context_window_tokens
-            ),
-
-            "max_output_tokens": (
-                definition.max_output_tokens
-            ),
-
-            "timeout_seconds": (
-                definition.timeout_seconds
-            ),
-
+            "tokenizer_model": (definition.tokenizer_model),
+            "context_window_tokens": (definition.context_window_tokens),
+            "max_output_tokens": (definition.max_output_tokens),
+            "timeout_seconds": (definition.timeout_seconds),
             "base_url": definition.base_url,
-
-            "api_key_env": (
-                definition.api_key_env
-            ),
-
+            "api_key_env": (definition.api_key_env),
             "defaults": (
                 definition.defaults.model_dump(
                     mode="python",
                     exclude_none=True,
                 )
             ),
-
-            "supports_tools": (
-                definition.supports_tools
-            ),
-
-            "supports_structured_output": (
-                definition.supports_structured_output
-            ),
-
+            "supports_tools": (definition.supports_tools),
+            "supports_structured_output": (definition.supports_structured_output),
             "location": definition.location,
-
-            "input_cost_per_1m": (
-                definition.input_cost_per_1m
-            ),
-
-            "output_cost_per_1m": (
-                definition.output_cost_per_1m
-            ),
-
-            "cache_read_cost_per_1m": (
-                definition.cache_read_cost_per_1m
-            ),
-
-            "cache_write_cost_per_1m": (
-                definition.cache_write_cost_per_1m
-            ),
-
+            "input_cost_per_1m": (definition.input_cost_per_1m),
+            "output_cost_per_1m": (definition.output_cost_per_1m),
+            "cache_read_cost_per_1m": (definition.cache_read_cost_per_1m),
+            "cache_write_cost_per_1m": (definition.cache_write_cost_per_1m),
             "runtime": (
                 definition.runtime.model_dump(
                     mode="python",
@@ -611,7 +538,6 @@ def _generation_config_from_definition(
     def task(name: str) -> GenerationTaskConfig:
         value = getattr(definition.generation, name)
         return GenerationTaskConfig(
-            model=value.model,
             max_tokens=value.max_tokens,
             temperature=value.temperature,
         )
@@ -786,8 +712,12 @@ def _parse_generation_config(raw: object) -> GenerationConfig:
         entry = raw.get(name)
         if not isinstance(entry, dict):
             return GenerationTaskConfig()
+        _reject_unknown_keys(
+            entry,
+            {"max_tokens", "temperature"},
+            where=f"generation.{name}",
+        )
         return GenerationTaskConfig(
-            model=entry.get("model"),
             max_tokens=int(entry["max_tokens"]) if "max_tokens" in entry else None,
             temperature=float(entry["temperature"]) if "temperature" in entry else None,
         )
@@ -823,14 +753,8 @@ def _validate_raw_catalog(data: object) -> None:
     if not isinstance(raw_models, dict) or not isinstance(raw_providers, dict):
         raise ValueError("model catalog models/providers must be mappings")
     for model_id, raw_entry in raw_models.items():
-        if (
-            type(model_id) is not str
-            or not model_id
-            or model_id != model_id.strip()
-        ):
-            raise ValueError(
-                "model catalog keys must be non-empty trimmed IDs"
-            )
+        if type(model_id) is not str or not model_id or model_id != model_id.strip():
+            raise ValueError("model catalog keys must be non-empty trimmed IDs")
         if not isinstance(raw_entry, dict) or raw_entry.get("capability") != "chat":
             continue
         _reject_unknown_keys(
@@ -840,21 +764,16 @@ def _validate_raw_catalog(data: object) -> None:
                 "provider",
                 "protocol",
                 "tokenizer_model",
-
                 "context_window_tokens",
                 "max_output_tokens",
-
                 "timeout_seconds",
                 "defaults",
                 "base_url",
                 "api_key_env",
-
                 "tools",
                 "supports_tools",
-
                 "structured_output",
                 "supports_structured_output",
-
                 "location",
                 "cost",
                 "runtime",
@@ -863,10 +782,7 @@ def _validate_raw_catalog(data: object) -> None:
             where=f"chat model {model_id!r}",
         )
         if "context_window_tokens" not in raw_entry:
-            raise ValueError(
-                f"chat model {model_id!r} requires "
-                "context_window_tokens"
-            )
+            raise ValueError(f"chat model {model_id!r} requires context_window_tokens")
         cost = raw_entry.get("cost")
         if cost is not None:
             if not isinstance(cost, dict):
@@ -962,67 +878,27 @@ def _user_definition_to_model_spec(
     return ModelSpec.model_validate(
         {
             "provider": definition.provider,
-            "tokenizer_model": (
-                definition.tokenizer_model
-            ),
-
-            "provider_name": (
-                definition.provider_name
-            ),
-
+            "tokenizer_model": (definition.tokenizer_model),
+            "provider_name": (definition.provider_name),
             "protocol": definition.protocol,
-
-            "context_window_tokens": (
-                definition.context_window_tokens
-            ),
-
-            "max_output_tokens": (
-                definition.max_output_tokens
-            ),
-
-            "timeout_seconds": (
-                definition.timeout_seconds
-            ),
-
+            "context_window_tokens": (definition.context_window_tokens),
+            "max_output_tokens": (definition.max_output_tokens),
+            "timeout_seconds": (definition.timeout_seconds),
             "base_url": definition.base_url,
-
-            "api_key_env": (
-                definition.api_key_env
-            ),
-
+            "api_key_env": (definition.api_key_env),
             "defaults": (
                 definition.defaults.model_dump(
                     mode="json",
                     exclude_none=True,
                 )
             ),
-
-            "supports_tools": (
-                definition.supports_tools
-            ),
-
-            "supports_structured_output": (
-                definition.supports_structured_output
-            ),
-
+            "supports_tools": (definition.supports_tools),
+            "supports_structured_output": (definition.supports_structured_output),
             "location": definition.location,
-
-            "input_cost_per_1m": (
-                definition.input_cost_per_1m
-            ),
-
-            "output_cost_per_1m": (
-                definition.output_cost_per_1m
-            ),
-
-            "cache_read_cost_per_1m": (
-                definition.cache_read_cost_per_1m
-            ),
-
-            "cache_write_cost_per_1m": (
-                definition.cache_write_cost_per_1m
-            ),
-
+            "input_cost_per_1m": (definition.input_cost_per_1m),
+            "output_cost_per_1m": (definition.output_cost_per_1m),
+            "cache_read_cost_per_1m": (definition.cache_read_cost_per_1m),
+            "cache_write_cost_per_1m": (definition.cache_write_cost_per_1m),
             "runtime": runtime,
         }
     )

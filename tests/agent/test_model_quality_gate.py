@@ -79,9 +79,7 @@ def _quality_suite() -> dict[str, object]:
                 "capability": "approval_continuation",
                 "task": "Change before_gate to after_gate.",
                 "workspace_files": {"approval.txt": "before_gate\n"},
-                "workspace_assertions": {
-                    "input_files/approval.txt": "after_gate\n"
-                },
+                "workspace_assertions": {"input_files/approval.txt": "after_gate\n"},
             }
         ],
     }
@@ -250,9 +248,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
         f"Change before_gate to after_gate using {absolute_path} token {secret} "
         f"auth {auth_secret} cookie {cookie_secret} credential {credential_secret}."
     )
-    raw_case["workspace_files"] = {
-        "approval.txt": f"before_gate\n{secret}\n"
-    }
+    raw_case["workspace_files"] = {"approval.txt": f"before_gate\n{secret}\n"}
     fingerprint = SimpleNamespace(
         source_commit="a" * 40,
         source_tree="b" * 40,
@@ -407,10 +403,7 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
         "python_version",
         "python_implementation",
     }
-    assert all(
-        isinstance(value, str) and value
-        for value in payload["runtime_platform"].values()
-    )
+    assert all(isinstance(value, str) and value for value in payload["runtime_platform"].values())
     assert payload["suite_revision"] == module.suite_revision(suite)
     assert payload["evaluator_version"] == module.EVALUATOR_VERSION
     assert payload["case_metadata"] == [
@@ -422,12 +415,8 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
                 "[REDACTED_ABSOLUTE_PATH] token [REDACTED] auth [REDACTED] "
                 "cookie [REDACTED] credential [REDACTED]."
             ),
-            "workspace_before": {
-                "input_files/approval.txt": "before_gate\n[REDACTED]\n"
-            },
-            "workspace_after": {
-                "input_files/approval.txt": "after_gate\n"
-            },
+            "workspace_before": {"input_files/approval.txt": "before_gate\n[REDACTED]\n"},
+            "workspace_after": {"input_files/approval.txt": "after_gate\n"},
         }
     ]
     assert str(tmp_path) not in serialized
@@ -494,6 +483,28 @@ async def test_gate_preflight_runs_before_model_calls_and_shapes_redacted_report
     assert secret not in rendered
 
 
+@pytest.mark.parametrize("legacy_field", ["model_alias", "provider_model"])
+def test_current_quality_report_rejects_legacy_model_identity_fields(
+    legacy_field: str,
+) -> None:
+    renderer_path = SCRIPT_PATH.with_name("render_model_quality_report.py")
+    spec = importlib.util.spec_from_file_location(
+        f"render_model_quality_report_reject_{legacy_field}",
+        renderer_path,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    renderer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = renderer
+    spec.loader.exec_module(renderer)
+
+    with pytest.raises(ValueError, match=rf"{legacy_field} is unsupported"):
+        renderer._items_by_model_id(
+            [{"model_id": "current-model", legacy_field: "legacy-model"}],
+            label="model result",
+        )
+
+
 def test_artifact_sanitizer_redacts_final_pause_reason(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -504,18 +515,10 @@ def test_artifact_sanitizer_redacts_final_pause_reason(
     monkeypatch.setenv("GROQ_API_KEY", secret)
 
     sanitized = module._sanitize_artifact(
-        {
-            "final_pause_reason": (
-                f"Allow verification at {absolute_path} using {secret}."
-            )
-        }
+        {"final_pause_reason": (f"Allow verification at {absolute_path} using {secret}.")}
     )
 
-    assert sanitized == {
-        "final_pause_reason": (
-            "Allow verification at [REDACTED_ABSOLUTE_PATH] using [REDACTED]."
-        )
-    }
+    assert sanitized == {"final_pause_reason": ("Allow verification at [REDACTED_ABSOLUTE_PATH] using [REDACTED].")}
 
 
 def test_tool_call_evidence_projects_the_public_bounded_result_contract() -> None:
@@ -559,9 +562,7 @@ def test_final_pause_evidence_is_bounded_and_status_aware() -> None:
     module = _load_gate_module()
     typed_pause = SimpleNamespace(
         kind="tool_approval",
-        tool_calls=tuple(
-            SimpleNamespace(tool_name=f"tool_{index}") for index in range(33)
-        ),
+        tool_calls=tuple(SimpleNamespace(tool_name=f"tool_{index}") for index in range(33)),
     )
 
     kind, reason, tool_names = module._final_pause_evidence(
@@ -716,10 +717,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
         def __init__(self, *, workspace_path: Path, **_kwargs: object) -> None:
             self._turn_store = None
             self.workspace = workspace_path
-            self.runtime_file = (
-                workspace_path
-                / ".praxis/runtime/input_files/turn-123/approval.txt"
-            )
+            self.runtime_file = workspace_path / ".praxis/runtime/input_files/turn-123/approval.txt"
             self.runtime_file.parent.mkdir(parents=True)
             self.runtime_file.write_text("before_gate\n", encoding="utf-8")
             self.calls: tuple[AgentToolCall, ...] = (
@@ -757,11 +755,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
                             "approval_scope": "tool",
                             "network_requested": False,
                             "workspace_write": workspace_write,
-                            "workspace_path": (
-                                str(self.runtime_file)
-                                if workspace_path is None
-                                else workspace_path
-                            ),
+                            "workspace_path": (str(self.runtime_file) if workspace_path is None else workspace_path),
                         },
                     )
                     if status == "paused"
@@ -782,9 +776,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
                         "patch",
                         "apply_patch",
                         {
-                            "file_path": (
-                                ".praxis/runtime/input_files/turn-123/approval.txt"
-                            ),
+                            "file_path": (".praxis/runtime/input_files/turn-123/approval.txt"),
                             "old_string": "before_gate",
                             "new_string": "after_gate",
                         },
@@ -818,9 +810,7 @@ async def test_run_live_case_approves_only_the_declared_write_and_refuses_follow
             "capability": "approval_continuation",
             "task": "Change before_gate to after_gate and verify it.",
             "workspace_files": {"approval.txt": "before_gate\n"},
-            "workspace_assertions": {
-                "input_files/approval.txt": "after_gate\n"
-            },
+            "workspace_assertions": {"input_files/approval.txt": "after_gate\n"},
             "expected_tool_calls": [
                 {
                     "tool_name": "apply_patch",
@@ -864,10 +854,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
     class FakeAgent:
         def __init__(self, *, workspace_path: Path, **_kwargs: object) -> None:
             self._turn_store = None
-            self.runtime_file = (
-                workspace_path
-                / ".praxis/runtime/input_files/turn-123/approval.txt"
-            )
+            self.runtime_file = workspace_path / ".praxis/runtime/input_files/turn-123/approval.txt"
             self.runtime_file.parent.mkdir(parents=True)
             self.runtime_file.write_text("before_gate\n", encoding="utf-8")
             self.calls: tuple[AgentToolCall, ...] = ()
@@ -902,9 +889,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
                     "patch",
                     "apply_patch",
                     {
-                        "file_path": (
-                            ".praxis/runtime/input_files/turn-123/approval.txt"
-                        ),
+                        "file_path": (".praxis/runtime/input_files/turn-123/approval.txt"),
                         "old_string": "before_gate",
                         "new_string": "after_gate",
                     },
@@ -933,9 +918,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
             "capability": "approval_continuation",
             "task": "Change before_gate to after_gate.",
             "workspace_files": {"approval.txt": "before_gate\n"},
-            "workspace_assertions": {
-                "input_files/approval.txt": "after_gate\n"
-            },
+            "workspace_assertions": {"input_files/approval.txt": "after_gate\n"},
             "expected_tool_calls": [
                 {
                     "tool_name": "apply_patch",
@@ -955,9 +938,7 @@ async def test_run_live_case_records_untyped_pause_after_declared_resume(
     assert observation.approval_resumes == 1
     assert observation.workspace_assertions_passed is True
     assert observation.final_pause_request_kind is None
-    assert observation.final_pause_reason == (
-        "Choose whether to run another verification step."
-    )
+    assert observation.final_pause_reason == ("Choose whether to run another verification step.")
     assert observation.final_pause_tool_names == ()
 
 
@@ -1093,9 +1074,7 @@ async def test_gate_fails_closed_when_live_provider_differs_from_baseline(
     assert exit_code == 1
     assert report["status"] == "failed"
     assert report["passed"] is False
-    assert report["models"][0]["failures"] == [
-        "provider route mismatch: baseline='deepseek', live='groq'"
-    ]
+    assert report["models"][0]["failures"] == ["provider route mismatch: baseline='deepseek', live='groq'"]
 
 
 @pytest.mark.anyio
@@ -1379,9 +1358,7 @@ async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
         model_id=model_id,
         provider="deepseek",
     )
-    observation = module._observation_from_payload(
-        inconclusive["trials"][0]["cases"][0]["observation"]
-    )
+    observation = module._observation_from_payload(inconclusive["trials"][0]["cases"][0]["observation"])
     received_model_ids: list[str] = []
 
     async def run_case(**kwargs: object) -> object:
@@ -1492,9 +1469,7 @@ async def test_gate_records_control_plane_initialization_failure_before_cases(
         run_record_path=run_record,
     )
 
-    assert "Overall verdict: **INCONCLUSIVE**" in benchmark.read_text(
-        encoding="utf-8"
-    )
+    assert "Overall verdict: **INCONCLUSIVE**" in benchmark.read_text(encoding="utf-8")
     rendered_run = run_record.read_text(encoding="utf-8")
     assert "Approval-continuation case was not reached." in rendered_run
     assert "model_control_plane_initialization_failed" in rendered_run
@@ -1718,15 +1693,9 @@ async def test_gate_writes_provenance_complete_inconclusive_report(
         run_record_path=run_record,
     )
 
-    assert "Overall verdict: **INCONCLUSIVE**" in benchmark.read_text(
-        encoding="utf-8"
-    )
-    assert "Evaluator verdict: **INCONCLUSIVE**" in run_record.read_text(
-        encoding="utf-8"
-    )
-    assert "Approval-continuation case was not reached." in run_record.read_text(
-        encoding="utf-8"
-    )
+    assert "Overall verdict: **INCONCLUSIVE**" in benchmark.read_text(encoding="utf-8")
+    assert "Evaluator verdict: **INCONCLUSIVE**" in run_record.read_text(encoding="utf-8")
+    assert "Approval-continuation case was not reached." in run_record.read_text(encoding="utf-8")
 
 
 @pytest.mark.anyio
@@ -2097,9 +2066,7 @@ def test_approval_quality_allows_a_second_resume_for_post_write_verification() -
             "patch",
             "apply_patch",
             {
-                "file_path": (
-                    ".praxis/runtime/input_files/turn-123/approval.txt"
-                ),
+                "file_path": (".praxis/runtime/input_files/turn-123/approval.txt"),
                 "old_string": "before_gate",
                 "new_string": "after_gate",
             },
@@ -2201,11 +2168,7 @@ def test_file_selection_rejects_an_attachment_path_from_another_turn() -> None:
             module.ToolCallEvidence(
                 "read",
                 "read_file",
-                {
-                    "path": (
-                        ".praxis/runtime/input_files/wrong-turn/exact.txt"
-                    )
-                },
+                {"path": (".praxis/runtime/input_files/wrong-turn/exact.txt")},
                 False,
                 None,
             ),
@@ -2246,11 +2209,7 @@ def test_file_selection_rejects_a_failed_expected_read() -> None:
             module.ToolCallEvidence(
                 "read",
                 "read_file",
-                {
-                    "path": (
-                        ".praxis/runtime/input_files/turn-123/exact.txt"
-                    )
-                },
+                {"path": (".praxis/runtime/input_files/turn-123/exact.txt")},
                 True,
                 "runner_failed",
             ),

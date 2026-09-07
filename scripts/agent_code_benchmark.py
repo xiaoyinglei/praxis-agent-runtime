@@ -27,8 +27,7 @@ _CONTROL_MODEL = "openai/gpt-oss-120b"
 _DIAGNOSTIC_MODEL = "kimi-k2.6"
 _CLOUD_BENCHMARK_MODELS = frozenset({_CONTROL_MODEL, _DIAGNOSTIC_MODEL})
 _IMPLEMENTATION_INSTRUCTION_PREFIX = (
-    "This is an implementation task in the current repository. "
-    "Modify the code and run focused tests. "
+    "This is an implementation task in the current repository. Modify the code and run focused tests. "
 )
 _ARCHITECTURE_LAYERS = frozenset(
     {
@@ -196,15 +195,8 @@ def load_manifest(path: Path) -> BenchmarkManifest:
         models.get("diagnostic"),
         field="models.diagnostic",
     )
-    if (
-        primary_model != _PRIMARY_MODEL
-        or control_model != _CONTROL_MODEL
-        or diagnostic_model != _DIAGNOSTIC_MODEL
-    ):
-        raise ValueError(
-            "benchmark model policy requires local Qwen primary, Groq control, "
-            "and Kimi diagnostic"
-        )
+    if primary_model != _PRIMARY_MODEL or control_model != _CONTROL_MODEL or diagnostic_model != _DIAGNOSTIC_MODEL:
+        raise ValueError("benchmark model policy requires local Qwen primary, Groq control, and Kimi diagnostic")
 
     raw_tasks = payload.get("tasks")
     if not isinstance(raw_tasks, Sequence) or isinstance(raw_tasks, (str, bytes)):
@@ -242,9 +234,7 @@ def validate_manifest_evolution(
         previous.benchmark_version == current.benchmark_version
         and previous.content_fingerprint != current.content_fingerprint
     ):
-        raise ValueError(
-            "benchmark content changed without a new benchmark_version"
-        )
+        raise ValueError("benchmark content changed without a new benchmark_version")
 
 
 def validate_release_shape(manifest: BenchmarkManifest) -> None:
@@ -254,34 +244,24 @@ def validate_release_shape(manifest: BenchmarkManifest) -> None:
         raise ValueError("release benchmark requires at least 25 regression tasks")
     if len(holdout) < 5:
         raise ValueError("release benchmark requires at least 5 holdout tasks")
-    cross_layer = tuple(
-        task for task in manifest.tasks if task.category == "cross_layer"
-    )
+    cross_layer = tuple(task for task in manifest.tasks if task.category == "cross_layer")
     if len(cross_layer) < 10:
         raise ValueError("release benchmark requires at least 10 cross-layer tasks")
     if sum(task.category == "cross_layer" for task in holdout) < 2:
         raise ValueError("release benchmark requires at least 2 cross-layer holdout tasks")
     if any(task.control for task in holdout):
         raise ValueError("holdout tasks cannot be controls")
-    if any(
-        not task.instruction.startswith(_IMPLEMENTATION_INSTRUCTION_PREFIX)
-        for task in manifest.tasks
-    ):
-        raise ValueError(
-            "release benchmark instructions must identify an implementation task"
-        )
+    if any(not task.instruction.startswith(_IMPLEMENTATION_INSTRUCTION_PREFIX) for task in manifest.tasks):
+        raise ValueError("release benchmark instructions must identify an implementation task")
 
     controls = tuple(task for task in regression if task.control)
     if len(controls) != 6:
         raise ValueError("release benchmark requires exactly 6 regression controls")
     control_categories = {
-        category: sum(task.category == category for task in controls)
-        for category in ("local", "medium", "cross_layer")
+        category: sum(task.category == category for task in controls) for category in ("local", "medium", "cross_layer")
     }
     if set(control_categories.values()) != {2}:
-        raise ValueError(
-            "release benchmark controls require 2 local, 2 medium, and 2 cross-layer tasks"
-        )
+        raise ValueError("release benchmark controls require 2 local, 2 medium, and 2 cross-layer tasks")
 
 
 def release_run_matrix(
@@ -321,15 +301,8 @@ def evaluate_release_results(
             field="expected_runtime_fingerprint",
         )
     tasks_by_id = {task.task_id: task for task in manifest.tasks}
-    expected_primary = tuple(
-        (task.task_id, manifest.primary_model)
-        for task in manifest.tasks
-    )
-    expected_control = tuple(
-        (task.task_id, manifest.control_model)
-        for task in manifest.tasks
-        if task.control
-    )
+    expected_primary = tuple((task.task_id, manifest.primary_model) for task in manifest.tasks)
+    expected_control = tuple((task.task_id, manifest.control_model) for task in manifest.tasks if task.control)
     expected = {*expected_primary, *expected_control}
     indexed: dict[
         tuple[str, str],
@@ -339,11 +312,10 @@ def evaluate_release_results(
     for raw in results:
         payload = _mapping(raw, field="result")
         if payload.get("schema_version") != _RESULT_SCHEMA_VERSION:
-            raise ValueError(
-                f"result schema_version must be {_RESULT_SCHEMA_VERSION}"
-            )
-        if "model_alias" in payload:
-            raise ValueError("result.model_alias is unsupported")
+            raise ValueError(f"result schema_version must be {_RESULT_SCHEMA_VERSION}")
+        for legacy_field in ("model_alias", "provider_model"):
+            if legacy_field in payload:
+                raise ValueError(f"result.{legacy_field} is unsupported")
         if payload.get("benchmark_version") != manifest.benchmark_version:
             raise ValueError("result benchmark_version does not match manifest")
         if payload.get("manifest_fingerprint") != manifest.fingerprint:
@@ -372,13 +344,9 @@ def evaluate_release_results(
         )
         key = (task_id, model_id)
         if key not in expected:
-            raise ValueError(
-                f"result is outside required release lanes: {task_id}:{model_id}"
-            )
+            raise ValueError(f"result is outside required release lanes: {task_id}:{model_id}")
         if key in indexed:
-            raise ValueError(
-                f"duplicate result for {task_id}:{model_id}"
-            )
+            raise ValueError(f"duplicate result for {task_id}:{model_id}")
         try:
             outcome = RunOutcome(
                 _non_empty_string(
@@ -387,18 +355,13 @@ def evaluate_release_results(
                 )
             )
         except ValueError as exc:
-            raise ValueError(
-                f"result outcome is unsupported: {payload.get('outcome')}"
-            ) from exc
+            raise ValueError(f"result outcome is unsupported: {payload.get('outcome')}") from exc
         indexed[key] = (outcome, payload)
 
     reasons: list[str] = []
     if len(runtime_fingerprints) > 1:
         reasons.append("mixed_runtime_fingerprints")
-    if (
-        expected_runtime_fingerprint is not None
-        and runtime_fingerprints != {expected_runtime_fingerprint}
-    ):
+    if expected_runtime_fingerprint is not None and runtime_fingerprints != {expected_runtime_fingerprint}:
         reasons.append("runtime_fingerprint_mismatch")
     for task_id, model_id in (*expected_primary, *expected_control):
         if (task_id, model_id) not in indexed:
@@ -411,53 +374,34 @@ def evaluate_release_results(
             false_completions += 1
         raw_safety = payload.get("safety_violations", ())
         has_safety_evidence = (
-            isinstance(raw_safety, Sequence)
-            and not isinstance(raw_safety, (str, bytes))
-            and bool(raw_safety)
+            isinstance(raw_safety, Sequence) and not isinstance(raw_safety, (str, bytes)) and bool(raw_safety)
         )
         if outcome is RunOutcome.SAFETY_VIOLATION or has_safety_evidence:
             safety_violations += 1
         if outcome is RunOutcome.PASSED:
             continue
         diagnosis = payload.get("diagnosis")
-        diagnosis_payload = (
-            diagnosis if isinstance(diagnosis, Mapping) else {}
-        )
+        diagnosis_payload = diagnosis if isinstance(diagnosis, Mapping) else {}
         primary = diagnosis_payload.get("primary")
         evidence = diagnosis_payload.get("evidence")
         has_evidence = (
             isinstance(evidence, Sequence)
             and not isinstance(evidence, (str, bytes))
             and bool(evidence)
-            and all(
-                isinstance(item, str) and bool(item.strip())
-                for item in evidence
-            )
+            and all(isinstance(item, str) and bool(item.strip()) for item in evidence)
         )
         if primary in {None, "", DiagnosisCause.UNKNOWN.value} or not has_evidence:
             reasons.append(f"unknown_diagnosis:{task_id}:{model_id}")
-        if (
-            model_id == manifest.control_model
-            and outcome is RunOutcome.PROVIDER_LIMITED
-        ):
+        if model_id == manifest.control_model and outcome is RunOutcome.PROVIDER_LIMITED:
             reasons.append(f"control_provider_limited:{task_id}")
 
     primary_outcomes = {
-        task_id: indexed.get((task_id, manifest.primary_model))
-        for task_id, _model_id in expected_primary
+        task_id: indexed.get((task_id, manifest.primary_model)) for task_id, _model_id in expected_primary
     }
-    primary_passed = sum(
-        value is not None and value[0] is RunOutcome.PASSED
-        for value in primary_outcomes.values()
-    )
-    cross_tasks = tuple(
-        task for task in manifest.tasks if task.category == "cross_layer"
-    )
+    primary_passed = sum(value is not None and value[0] is RunOutcome.PASSED for value in primary_outcomes.values())
+    cross_tasks = tuple(task for task in manifest.tasks if task.category == "cross_layer")
     cross_passed = sum(
-        (
-            value := primary_outcomes.get(task.task_id)
-        ) is not None
-        and value[0] is RunOutcome.PASSED
+        (value := primary_outcomes.get(task.task_id)) is not None and value[0] is RunOutcome.PASSED
         for task in cross_tasks
     )
     overall_rate = primary_passed / len(manifest.tasks)
@@ -475,21 +419,13 @@ def evaluate_release_results(
     return {
         "benchmark_version": manifest.benchmark_version,
         "manifest_fingerprint": manifest.fingerprint,
-        "runtime_fingerprint": (
-            next(iter(runtime_fingerprints))
-            if len(runtime_fingerprints) == 1
-            else None
-        ),
+        "runtime_fingerprint": (next(iter(runtime_fingerprints)) if len(runtime_fingerprints) == 1 else None),
         "expected_runtime_fingerprint": expected_runtime_fingerprint,
         "release_ready": not reasons,
         "overall_first_pass_rate": overall_rate,
         "cross_layer_first_pass_rate": cross_rate,
-        "primary_result_count": sum(
-            key in indexed for key in expected_primary
-        ),
-        "control_result_count": sum(
-            key in indexed for key in expected_control
-        ),
+        "primary_result_count": sum(key in indexed for key in expected_primary),
+        "control_result_count": sum(key in indexed for key in expected_control),
         "false_completion_count": false_completions,
         "safety_violation_count": safety_violations,
         "reasons": reasons,
@@ -534,12 +470,10 @@ def evaluate_kernel_comparison(
     ):
         raise RuntimeError("release evaluator returned an invalid comparison shape")
     candidate_reason_strings = tuple(
-        _non_empty_string(reason, field="candidate release reason")
-        for reason in candidate_reasons
+        _non_empty_string(reason, field="candidate release reason") for reason in candidate_reasons
     )
     baseline_reason_strings = tuple(
-        _non_empty_string(reason, field="baseline release reason")
-        for reason in baseline_reasons
+        _non_empty_string(reason, field="baseline release reason") for reason in baseline_reasons
     )
     reasons = [
         *(f"candidate_corpus:{reason}" for reason in candidate_reason_strings if reason not in threshold_reasons),
@@ -574,13 +508,9 @@ def load_result_record(
     )
     payload = _normalize_result_record(raw_payload)
     if payload.get("benchmark_version") != manifest.benchmark_version:
-        raise ValueError(
-            f"result benchmark_version does not match manifest: {result_path}"
-        )
+        raise ValueError(f"result benchmark_version does not match manifest: {result_path}")
     if payload.get("manifest_fingerprint") != manifest.fingerprint:
-        raise ValueError(
-            f"result manifest_fingerprint does not match manifest: {result_path}"
-        )
+        raise ValueError(f"result manifest_fingerprint does not match manifest: {result_path}")
     evidence = _mapping(payload.get("evidence"), field="result.evidence")
     for field in (
         "agent_stdout",
@@ -603,9 +533,7 @@ def load_result_record(
             field=f"result.evidence.{field}_sha256",
         )
         if _sha256(value) != expected:
-            raise ValueError(
-                f"evidence hash mismatch for {field}: {result_path}"
-            )
+            raise ValueError(f"evidence hash mismatch for {field}: {result_path}")
     return payload
 
 
@@ -616,8 +544,9 @@ def _normalize_result_record(
 
     schema_version = payload.get("schema_version")
     if schema_version == _RESULT_SCHEMA_VERSION:
-        if "model_alias" in payload:
-            raise ValueError("result.model_alias is unsupported")
+        for legacy_field in ("model_alias", "provider_model"):
+            if legacy_field in payload:
+                raise ValueError(f"result.{legacy_field} is unsupported")
         _non_empty_string(payload.get("model_id"), field="result.model_id")
         return payload
     if schema_version != _LEGACY_RESULT_SCHEMA_VERSION:
@@ -652,9 +581,7 @@ def validate_repository_bindings(
         if not parent_line or parent_line[0] != task.target_commit:
             raise ValueError(f"{task.task_id} target commit does not exist")
         if len(parent_line) < 2 or parent_line[1] != task.source_commit:
-            raise ValueError(
-                f"{task.task_id} source commit must be the target commit's first parent"
-            )
+            raise ValueError(f"{task.task_id} source commit must be the target commit's first parent")
         _git_text(repository, "cat-file", "-e", f"{task.source_commit}^{{commit}}")
 
         changed_paths = tuple(
@@ -674,16 +601,11 @@ def validate_repository_bindings(
             missing = set(task.layers) - observed_layers
             if missing:
                 missing_text = ", ".join(sorted(missing))
-                raise ValueError(
-                    f"{task.task_id} target commit does not touch declared layers: "
-                    f"{missing_text}"
-                )
+                raise ValueError(f"{task.task_id} target commit does not touch declared layers: {missing_text}")
 
         for relative in task.acceptance_files:
             if not relative.startswith("tests/"):
-                raise ValueError(
-                    f"{task.task_id} acceptance files must stay under tests/"
-                )
+                raise ValueError(f"{task.task_id} acceptance files must stay under tests/")
             _git_text(
                 repository,
                 "cat-file",
@@ -698,10 +620,11 @@ def classify_outcome(facts: RunFacts) -> RunOutcome:
     if facts.benchmark_invalid_reason is not None:
         return RunOutcome.BENCHMARK_INVALID
     if facts.provider_error_code is not None:
-        if (
-            facts.model_id in _CLOUD_BENCHMARK_MODELS
-            and facts.provider_error_code in {"rate_limit", "quota_exceeded", "http_429"}
-        ):
+        if facts.model_id in _CLOUD_BENCHMARK_MODELS and facts.provider_error_code in {
+            "rate_limit",
+            "quota_exceeded",
+            "http_429",
+        }:
             return RunOutcome.PROVIDER_LIMITED
         return RunOutcome.RUNTIME_FAILED
     if facts.runtime_error is not None:
@@ -736,19 +659,14 @@ def diagnose_run(
             primary=DiagnosisCause.SAFETY_BOUNDARY,
             secondary=(),
             confidence=1.0,
-            evidence=tuple(
-                f"safety_violation:{violation}"
-                for violation in facts.safety_violations
-            ),
+            evidence=tuple(f"safety_violation:{violation}" for violation in facts.safety_violations),
         )
     if outcome is RunOutcome.BENCHMARK_INVALID:
         return Diagnosis(
             primary=DiagnosisCause.BENCHMARK_ENVIRONMENT,
             secondary=(),
             confidence=1.0,
-            evidence=(
-                f"benchmark_invalid:{facts.benchmark_invalid_reason or 'unknown'}",
-            ),
+            evidence=(f"benchmark_invalid:{facts.benchmark_invalid_reason or 'unknown'}",),
         )
     if outcome is RunOutcome.PROVIDER_LIMITED:
         secondary, prior_evidence = _pre_provider_limit_diagnosis(
@@ -778,10 +696,7 @@ def diagnose_run(
             confidence=0.95,
             evidence=("runtime_error:context_overflow",),
         )
-    if (
-        "model_response_incomplete" in combined
-        and "max_output_tokens" in combined
-    ):
+    if "model_response_incomplete" in combined and "max_output_tokens" in combined:
         evidence = ["model_response:incomplete:max_output_tokens"]
         if "inspection_budget_exhausted" in combined:
             evidence.append("tool_policy:inspection_budget_exhausted")
@@ -796,11 +711,7 @@ def diagnose_run(
         inspection_calls = _inspection_call_count(agent_stdout)
         if inspection_calls is not None:
             evidence.append(f"inspection_calls:{inspection_calls}")
-        secondary = (
-            (DiagnosisCause.PROVIDER_ADAPTER,)
-            if "request timed out" in combined
-            else ()
-        )
+        secondary = (DiagnosisCause.PROVIDER_ADAPTER,) if "request timed out" in combined else ()
         if "request timed out" in combined:
             evidence.append("provider_error:request_timeout")
         return Diagnosis(
@@ -833,9 +744,7 @@ def diagnose_run(
             primary=DiagnosisCause.PROVIDER_ADAPTER,
             secondary=(),
             confidence=0.8,
-            evidence=(
-                f"provider_error:{facts.provider_error_code or 'model_provider_failed'}",
-            ),
+            evidence=(f"provider_error:{facts.provider_error_code or 'model_provider_failed'}",),
         )
     if facts.runtime_error is not None:
         return Diagnosis(
@@ -926,13 +835,7 @@ def run_task(
     runtime_fingerprint = repository_state_fingerprint(repository)
     artifacts_root = artifacts_root.expanduser().resolve()
     run_id = uuid4().hex
-    artifact_dir = (
-        artifacts_root
-        / manifest.benchmark_version
-        / task.task_id
-        / model_id
-        / run_id
-    )
+    artifact_dir = artifacts_root / manifest.benchmark_version / task.task_id / model_id / run_id
     artifact_dir.mkdir(parents=True, exist_ok=False)
 
     with tempfile.TemporaryDirectory(prefix="workspace-", dir=artifact_dir) as raw_workspace:
@@ -1047,16 +950,12 @@ def run_task(
             encoding="utf-8",
         )
         safety_violations = [
-            f"path_outside_allowlist:{path}"
-            for path in changed_paths
-            if not _path_allowed(path, task.allowed_paths)
+            f"path_outside_allowlist:{path}" for path in changed_paths if not _path_allowed(path, task.allowed_paths)
         ]
         if archived_diff != diff:
             safety_violations.append("secret_leak:agent.diff")
         new_runtime_files = _runtime_files(workspace) - baseline_runtime_files
-        safety_violations.extend(
-            f"runtime_residue:{path}" for path in sorted(new_runtime_files)
-        )
+        safety_violations.extend(f"runtime_residue:{path}" for path in sorted(new_runtime_files))
         if agent.leftover_processes:
             safety_violations.append("leftover_process")
 
@@ -1096,9 +995,7 @@ def run_task(
         elif acceptance_error is not None:
             benchmark_invalid_reason = "acceptance_materialization_failed"
 
-        hidden_acceptance_passed = (
-            acceptance.returncode == 0 and not acceptance.timed_out
-        )
+        hidden_acceptance_passed = acceptance.returncode == 0 and not acceptance.timed_out
         provider_error_code = _provider_error_code(agent.stdout, agent.stderr)
         stop_reason = _output_field(agent.stdout, "停止原因")
         safety = tuple(sorted(set(safety_violations)))
@@ -1165,9 +1062,7 @@ def run_release(
             artifacts_root=artifacts_root,
         )
         result_paths.append(record.artifact_dir / "result.json")
-    result_payloads = tuple(
-        load_result_record(path, manifest=manifest) for path in result_paths
-    )
+    result_payloads = tuple(load_result_record(path, manifest=manifest) for path in result_paths)
     summary = evaluate_release_results(
         manifest,
         result_payloads,
@@ -1200,9 +1095,7 @@ def _write_release_evidence(
             field="release result",
         )
         if result_payload.get("schema_version") != _RESULT_SCHEMA_VERSION:
-            raise ValueError(
-                "release evidence requires current result schema_version"
-            )
+            raise ValueError("release evidence requires current result schema_version")
         if "model_alias" in result_payload:
             raise ValueError("release result.model_alias is unsupported")
         _non_empty_string(
@@ -1605,9 +1498,7 @@ def _stream_command(
             with output_lock:
                 log.write(redacted)
                 log.flush()
-                terminal_line = (
-                    f"[benchmark:{progress_label}:{stream_name}] {redacted}"
-                )
+                terminal_line = f"[benchmark:{progress_label}:{stream_name}] {redacted}"
                 if not terminal_line.endswith("\n"):
                     terminal_line += "\n"
                 sys.stderr.write(terminal_line)
@@ -1660,9 +1551,7 @@ def _stream_command(
             except subprocess.TimeoutExpired:
                 now = time.monotonic()
                 if now >= next_heartbeat:
-                    emit_status(
-                        f"still running elapsed={int(now - started)}s"
-                    )
+                    emit_status(f"still running elapsed={int(now - started)}s")
                     while next_heartbeat <= now:
                         next_heartbeat += heartbeat_seconds
         if not timed_out:
@@ -1679,9 +1568,7 @@ def _stream_command(
         stderr_log.close()
 
     returncode = 124 if timed_out else int(process.returncode or 0)
-    emit_status(
-        f"finished returncode={returncode} elapsed={int(time.monotonic() - started)}s"
-    )
+    emit_status(f"finished returncode={returncode} elapsed={int(time.monotonic() - started)}s")
     return _CommandResult(
         returncode=returncode,
         stdout="".join(stdout_parts),
@@ -1753,12 +1640,7 @@ def _changed_paths(workspace: Path) -> tuple[str, ...]:
         check=True,
         capture_output=True,
     ).stdout
-    paths = {
-        item.decode("utf-8")
-        for payload in (tracked, untracked)
-        for item in payload.split(b"\0")
-        if item
-    }
+    paths = {item.decode("utf-8") for payload in (tracked, untracked) for item in payload.split(b"\0") if item}
     return tuple(sorted(paths))
 
 
@@ -1846,11 +1728,7 @@ def _runtime_files(workspace: Path) -> set[str]:
     runtime_root = workspace / ".rag"
     if not runtime_root.exists():
         return set()
-    return {
-        path.relative_to(workspace).as_posix()
-        for path in runtime_root.rglob("*")
-        if path.is_file()
-    }
+    return {path.relative_to(workspace).as_posix() for path in runtime_root.rglob("*") if path.is_file()}
 
 
 def _output_field(output: str, label: str) -> str | None:
@@ -1872,8 +1750,7 @@ def _has_single_unknown_model_operation(
     try:
         with sqlite3.connect(checkpoint_path) as connection:
             row = connection.execute(
-                "SELECT COUNT(*) FROM model_operations "
-                "WHERE turn_id = ? AND status = 'unknown'",
+                "SELECT COUNT(*) FROM model_operations WHERE turn_id = ? AND status = 'unknown'",
                 (turn_id,),
             ).fetchone()
     except sqlite3.Error:
@@ -1893,9 +1770,7 @@ def _merge_command_results(
         stdout=previous.stdout + marker + current.stdout,
         stderr=previous.stderr + marker + current.stderr,
         timed_out=previous.timed_out or current.timed_out,
-        leftover_processes=(
-            previous.leftover_processes or current.leftover_processes
-        ),
+        leftover_processes=(previous.leftover_processes or current.leftover_processes),
     )
 
 
@@ -1964,11 +1839,7 @@ def _redact_secrets(value: str) -> str:
     redacted = value
     for name, secret in os.environ.items():
         upper = name.upper()
-        if (
-            secret
-            and len(secret) >= 4
-            and any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD"))
-        ):
+        if secret and len(secret) >= 4 and any(marker in upper for marker in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
             redacted = redacted.replace(secret, "[REDACTED]")
     redacted = re.sub(
         r"(?<![A-Za-z0-9])(?:gsk_|sk-|ak[-_])[A-Za-z0-9_-]{8,}",
@@ -2009,9 +1880,7 @@ def _write_result(
         "safety_violations": list(record.safety_violations),
         "diagnosis": {
             "primary": record.diagnosis.primary.value,
-            "secondary": [
-                cause.value for cause in record.diagnosis.secondary
-            ],
+            "secondary": [cause.value for cause in record.diagnosis.secondary],
             "confidence": record.diagnosis.confidence,
             "evidence": list(record.diagnosis.evidence),
         },
@@ -2021,17 +1890,11 @@ def _write_result(
             "agent_diff": "agent.diff",
             "acceptance_stdout": "acceptance.stdout",
             "acceptance_stderr": "acceptance.stderr",
-            "agent_diff_sha256": _sha256(
-                _redact_secrets(record.diff)
-            ),
+            "agent_diff_sha256": _sha256(_redact_secrets(record.diff)),
             "agent_stdout_sha256": _sha256(_redact_secrets(agent.stdout)),
             "agent_stderr_sha256": _sha256(_redact_secrets(agent.stderr)),
-            "acceptance_stdout_sha256": _sha256(
-                _redact_secrets(acceptance.stdout)
-            ),
-            "acceptance_stderr_sha256": _sha256(
-                _redact_secrets(acceptance.stderr)
-            ),
+            "acceptance_stdout_sha256": _sha256(_redact_secrets(acceptance.stdout)),
+            "acceptance_stderr_sha256": _sha256(_redact_secrets(acceptance.stderr)),
         },
     }
     (record.artifact_dir / "result.json").write_text(
@@ -2057,9 +1920,7 @@ def _parse_task(raw: object) -> BenchmarkTask:
     if unknown_layers:
         raise ValueError(f"{task_id}.layers contains unsupported architecture layers")
     if category == "cross_layer" and len(set(layers)) < 2:
-        raise ValueError(
-            f"{task_id} cross-layer task requires at least two architecture layers"
-        )
+        raise ValueError(f"{task_id} cross-layer task requires at least two architecture layers")
 
     source_commit = _commit(payload.get("source_commit"), field=f"{task_id}.source_commit")
     target_commit = _commit(payload.get("target_commit"), field=f"{task_id}.target_commit")
@@ -2241,9 +2102,7 @@ def repository_state_fingerprint(repository: Path) -> str:
     digest.update(head.encode("ascii"))
     digest.update(b"\0status\0")
     digest.update(status)
-    for raw_relative in sorted(
-        value for value in listed.split(b"\0") if value
-    ):
+    for raw_relative in sorted(value for value in listed.split(b"\0") if value):
         relative = os.fsdecode(raw_relative)
         path = root / relative
         digest.update(b"\0path\0")
@@ -2289,34 +2148,26 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
             )
         ):
             layers.add("service")
-        if (
-            any(path.startswith(f"{root}/loop/") for root in runtime_roots)
-            or path
-            in {
-                "agent_runtime/harness/session.py",
-                "agent_runtime/harness/context.py",
-                "agent_runtime/harness/completion.py",
-            }
-        ):
+        if any(path.startswith(f"{root}/loop/") for root in runtime_roots) or path in {
+            "agent_runtime/harness/session.py",
+            "agent_runtime/harness/context.py",
+            "agent_runtime/harness/completion.py",
+        }:
             layers.add("loop")
-        if (
-            any(
-                path.startswith(
-                    (
-                        f"{root}/tools/",
-                        f"{root}/tooling/",
-                        f"{root}/builtin/",
-                    )
+        if any(
+            path.startswith(
+                (
+                    f"{root}/tools/",
+                    f"{root}/tooling/",
+                    f"{root}/builtin/",
                 )
-                or path == f"{root}/planning.py"
-                for root in runtime_roots
             )
-            or path
-            in {
-                "agent_runtime/harness/tool_orchestrator.py",
-                "agent_runtime/harness/tool_router.py",
-            }
-        ):
+            or path == f"{root}/planning.py"
+            for root in runtime_roots
+        ) or path in {
+            "agent_runtime/harness/tool_orchestrator.py",
+            "agent_runtime/harness/tool_router.py",
+        }:
             layers.add("tool")
         if any(
             path
@@ -2333,11 +2184,10 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
             "agent_runtime/harness/migration.py",
         }:
             layers.add("turn_checkpoint")
-        if any(
-            path == f"{root}/result.py"
-            or path.startswith(f"{root}/streaming/")
-            for root in runtime_roots
-        ) or path == "agent_runtime/harness/events.py":
+        if (
+            any(path == f"{root}/result.py" or path.startswith(f"{root}/streaming/") for root in runtime_roots)
+            or path == "agent_runtime/harness/events.py"
+        ):
             layers.add("result_events")
     return layers
 
@@ -2449,10 +2299,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if artifacts_root is None:
                 configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 if not configured_root:
-                    raise ValueError(
-                        "run-release requires --artifacts-root or "
-                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
-                    )
+                    raise ValueError("run-release requires --artifacts-root or PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 artifacts_root = Path(configured_root)
             summary, result_paths = run_release(
                 repository=args.repository,
@@ -2476,10 +2323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if artifacts_root is None:
                 configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 if not configured_root:
-                    raise ValueError(
-                        "compare-release requires --artifacts-root or "
-                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
-                    )
+                    raise ValueError("compare-release requires --artifacts-root or PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 artifacts_root = Path(configured_root)
             candidate_fingerprint, candidate_results = load_release_evidence(
                 args.candidate_evidence,
@@ -2514,10 +2358,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             if artifacts_root is None:
                 configured_root = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 if not configured_root:
-                    raise ValueError(
-                        "compare-kernels requires --artifacts-root or "
-                        "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
-                    )
+                    raise ValueError("compare-kernels requires --artifacts-root or PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
                 artifacts_root = Path(configured_root)
             comparison = run_kernel_comparison(
                 repository=args.repository,
@@ -2530,16 +2371,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not comparison["comparison_ready"]:
                 exit_code = 1
         else:
-            result_payloads = [
-                load_result_record(path, manifest=manifest)
-                for path in args.results
-            ]
+            result_payloads = [load_result_record(path, manifest=manifest) for path in args.results]
             payload = evaluate_release_results(
                 manifest,
                 result_payloads,
-                expected_runtime_fingerprint=repository_state_fingerprint(
-                    args.repository
-                ),
+                expected_runtime_fingerprint=repository_state_fingerprint(args.repository),
             )
             if not payload["release_ready"]:
                 exit_code = 1

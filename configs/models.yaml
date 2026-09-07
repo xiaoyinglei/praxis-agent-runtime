@@ -197,8 +197,8 @@ defaults:
 
 
 # ---------------------------------------------------------------------------
-# Generation profiles: how each task uses the selected chat model.
-# Do not bind a model here unless a task truly requires a special model.
+# Generation profiles: parameters for the one selected chat model.
+# Model selection happens only through the top-level model ID.
 # ---------------------------------------------------------------------------
 generation:
   summary:

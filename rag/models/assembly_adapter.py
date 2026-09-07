@@ -1,14 +1,9 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
 
-from agent_runtime.modeling.config import GenerationTaskConfig, ModelRuntimeConfig, ModelSpec
+from agent_runtime.modeling.config import ModelRuntimeConfig, ModelSpec
 from rag.assembly.models import AssemblyOverrides, ProviderConfig, TokenizerConfig
-
-if TYPE_CHECKING:
-    from rag.models.catalog import ModelCatalog
-
 
 _PROVIDER_KIND_MAP: dict[str, str] = {
     "openai_compatible": "openai-compatible",
@@ -18,18 +13,6 @@ _PROVIDER_KIND_MAP: dict[str, str] = {
 }
 
 
-def resolve_task_model(task_config: GenerationTaskConfig, catalog: ModelCatalog) -> ModelSpec:
-    """Resolve a generation task's model ID to a ModelSpec.
-
-    If task_config.model is set, uses it directly.
-    Otherwise falls back to catalog's defaults.primary_model.
-    """
-    model_id = task_config.model
-    if model_id:
-        return catalog.get_model(model_id)
-    return catalog.get_default_primary()
-
-
 def to_assembly_overrides(config: ModelRuntimeConfig) -> AssemblyOverrides:
     """Convert ModelRuntimeConfig to AssemblyOverrides.
 
@@ -37,6 +20,9 @@ def to_assembly_overrides(config: ModelRuntimeConfig) -> AssemblyOverrides:
     Provider instantiation stays in rag.assembly.support.build_provider.
     """
     tokenizer_config = config.tokenizer
+    context_window_tokens = config.primary_model.context_window_tokens
+    if context_window_tokens is None:
+        raise ValueError(f"Chat model {config.primary_model.id!r} requires context_window_tokens")
     return AssemblyOverrides(
         chat=_to_chat_provider_config(config.primary_model),
         embedding=_to_embedding_provider_config(config.embedding_model),
@@ -45,19 +31,10 @@ def to_assembly_overrides(config: ModelRuntimeConfig) -> AssemblyOverrides:
             tokenizer_backend=tokenizer_config.tokenizer_backend,
             chunk_token_size=tokenizer_config.chunk_token_size,
             chunk_overlap_tokens=tokenizer_config.chunk_overlap_tokens,
-            max_context_tokens=tokenizer_config.max_context_tokens,
+            max_context_tokens=context_window_tokens,
             prompt_reserved_tokens=tokenizer_config.prompt_reserved_tokens,
             local_files_only=tokenizer_config.local_files_only,
-        )
-        if (
-            tokenizer_config.tokenizer_backend is not None
-            or tokenizer_config.chunk_token_size is not None
-            or tokenizer_config.chunk_overlap_tokens is not None
-            or tokenizer_config.max_context_tokens is not None
-            or tokenizer_config.prompt_reserved_tokens is not None
-            or tokenizer_config.local_files_only is not None
-        )
-        else None,
+        ),
     )
 
 

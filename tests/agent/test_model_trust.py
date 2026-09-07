@@ -255,8 +255,7 @@ def test_trust_rejects_symlink_unsafe_file_mode_and_parent_mode(tmp_path: Path) 
 def test_trust_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     workspace, trust_path, _ = _paths(tmp_path)
     trust_path.write_bytes(
-        b'{"version":1,"version":1,"trust_domain_id":"x",'
-        b'"signing_key_id":"x","hmac_key_base64":"eA=="}'
+        b'{"version":1,"version":1,"trust_domain_id":"x","signing_key_id":"x","hmac_key_base64":"eA=="}'
     )
     os.chmod(trust_path, 0o600)
 
@@ -275,7 +274,7 @@ def test_binding_signature_covers_complete_association(tmp_path: Path) -> None:
     binding = build_model_binding_envelope(
         model_id="main",
         origin="override",
-        definition=_definition(),
+        definition=_definition("main"),
         policy_revision="model-policy:v1",
     )
     association = build_model_binding_association(
@@ -311,7 +310,7 @@ def test_authenticated_binding_hard_cuts_both_legacy_identity_shapes(
     binding = build_model_binding_envelope(
         model_id="main",
         origin="override",
-        definition=_definition(),
+        definition=_definition("main"),
         policy_revision="model-policy:v1",
     )
     association = build_model_binding_association(
@@ -358,6 +357,19 @@ def test_authenticated_binding_hard_cuts_both_legacy_identity_shapes(
         )
 
 
+def test_binding_rejects_model_id_that_differs_from_frozen_definition() -> None:
+    with pytest.raises(
+        BindingAuthenticationError,
+        match="model ID does not match frozen definition",
+    ):
+        build_model_binding_envelope(
+            model_id="allowed-model",
+            origin="override",
+            definition=_definition("different-model"),
+            policy_revision="model-policy:v1",
+        )
+
+
 def test_binding_trust_rejects_incomplete_or_extra_association(tmp_path: Path) -> None:
     workspace, trust_path, _ = _paths(tmp_path)
     domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
@@ -365,7 +377,7 @@ def test_binding_trust_rejects_incomplete_or_extra_association(tmp_path: Path) -
     binding = build_model_binding_envelope(
         model_id="main",
         origin="override",
-        definition=_definition(),
+        definition=_definition("main"),
         policy_revision="model-policy:v1",
     )
     complete = build_model_binding_association(
@@ -399,11 +411,7 @@ def test_interrupted_post_link_install_recovers_exact_stale_temp(
     process.join(timeout=10)
     assert process.exitcode == 0
 
-    installed = (
-        trust_path
-        if kind == "trust"
-        else archive_path / f"{_definition().definition_revision}.json"
-    )
+    installed = trust_path if kind == "trust" else archive_path / f"{_definition().definition_revision}.json"
     assert installed.stat().st_nlink == 2
     if kind == "trust":
         ModelBindingTrustDomain(
