@@ -43,6 +43,11 @@ _ARCHITECTURE_LAYERS = frozenset(
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _PROCESS_CLEANUP_GRACE_SECONDS = 1.0
 _MODEL_UNKNOWN_RETRY_LIMIT = 2
+_RESULT_SCHEMA_VERSION = 2
+_LEGACY_RESULT_SCHEMA_VERSION = 1
+_RELEASE_EVIDENCE_SCHEMA_VERSION = "praxis-code-agent-release-evidence-v2"
+_LEGACY_RELEASE_EVIDENCE_SCHEMA_VERSION = "praxis-code-agent-release-evidence-v1"
+_KERNEL_COMPARISON_SCHEMA_VERSION = "praxis-code-agent-kernel-comparison-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,7 +142,7 @@ class Diagnosis:
 
 @dataclass(frozen=True, slots=True)
 class RunFacts:
-    model_alias: str
+    model_id: str
     turn_status: str
     valid_diff: bool
     hidden_acceptance_passed: bool
@@ -151,7 +156,7 @@ class RunFacts:
 @dataclass(frozen=True, slots=True)
 class TaskRunRecord:
     task_id: str
-    model_alias: str
+    model_id: str
     max_tokens_total: int | None
     runtime_fingerprint: str
     outcome: RunOutcome
@@ -333,8 +338,12 @@ def evaluate_release_results(
     runtime_fingerprints: set[str] = set()
     for raw in results:
         payload = _mapping(raw, field="result")
-        if payload.get("schema_version") != 1:
-            raise ValueError("result schema_version must be 1")
+        if payload.get("schema_version") != _RESULT_SCHEMA_VERSION:
+            raise ValueError(
+                f"result schema_version must be {_RESULT_SCHEMA_VERSION}"
+            )
+        if "model_alias" in payload:
+            raise ValueError("result.model_alias is unsupported")
         if payload.get("benchmark_version") != manifest.benchmark_version:
             raise ValueError("result benchmark_version does not match manifest")
         if payload.get("manifest_fingerprint") != manifest.fingerprint:
@@ -357,18 +366,18 @@ def evaluate_release_results(
                 field="result.runtime_fingerprint",
             )
         )
-        model_alias = _non_empty_string(
-            payload.get("model_alias"),
-            field="result.model_alias",
+        model_id = _non_empty_string(
+            payload.get("model_id"),
+            field="result.model_id",
         )
-        key = (task_id, model_alias)
+        key = (task_id, model_id)
         if key not in expected:
             raise ValueError(
-                f"result is outside required release lanes: {task_id}:{model_alias}"
+                f"result is outside required release lanes: {task_id}:{model_id}"
             )
         if key in indexed:
             raise ValueError(
-                f"duplicate result for {task_id}:{model_alias}"
+                f"duplicate result for {task_id}:{model_id}"
             )
         try:
             outcome = RunOutcome(
@@ -391,13 +400,13 @@ def evaluate_release_results(
         and runtime_fingerprints != {expected_runtime_fingerprint}
     ):
         reasons.append("runtime_fingerprint_mismatch")
-    for task_id, model_alias in (*expected_primary, *expected_control):
-        if (task_id, model_alias) not in indexed:
-            reasons.append(f"missing_result:{task_id}:{model_alias}")
+    for task_id, model_id in (*expected_primary, *expected_control):
+        if (task_id, model_id) not in indexed:
+            reasons.append(f"missing_result:{task_id}:{model_id}")
 
     false_completions = 0
     safety_violations = 0
-    for (task_id, model_alias), (outcome, payload) in indexed.items():
+    for (task_id, model_id), (outcome, payload) in indexed.items():
         if outcome is RunOutcome.FALSE_COMPLETION:
             false_completions += 1
         raw_safety = payload.get("safety_violations", ())
@@ -426,16 +435,16 @@ def evaluate_release_results(
             )
         )
         if primary in {None, "", DiagnosisCause.UNKNOWN.value} or not has_evidence:
-            reasons.append(f"unknown_diagnosis:{task_id}:{model_alias}")
+            reasons.append(f"unknown_diagnosis:{task_id}:{model_id}")
         if (
-            model_alias == manifest.control_model
+            model_id == manifest.control_model
             and outcome is RunOutcome.PROVIDER_LIMITED
         ):
             reasons.append(f"control_provider_limited:{task_id}")
 
     primary_outcomes = {
         task_id: indexed.get((task_id, manifest.primary_model))
-        for task_id, _model_alias in expected_primary
+        for task_id, _model_id in expected_primary
     }
     primary_passed = sum(
         value is not None and value[0] is RunOutcome.PASSED
@@ -559,10 +568,11 @@ def load_result_record(
     manifest: BenchmarkManifest,
 ) -> Mapping[str, object]:
     result_path = path.expanduser().resolve()
-    payload = _mapping(
+    raw_payload = _mapping(
         json.loads(result_path.read_text(encoding="utf-8")),
         field="result",
     )
+    payload = _normalize_result_record(raw_payload)
     if payload.get("benchmark_version") != manifest.benchmark_version:
         raise ValueError(
             f"result benchmark_version does not match manifest: {result_path}"
@@ -597,6 +607,30 @@ def load_result_record(
                 f"evidence hash mismatch for {field}: {result_path}"
             )
     return payload
+
+
+def _normalize_result_record(
+    payload: Mapping[str, object],
+) -> Mapping[str, object]:
+    """Normalize immutable v1 result artifacts at the persistence boundary."""
+
+    schema_version = payload.get("schema_version")
+    if schema_version == _RESULT_SCHEMA_VERSION:
+        if "model_alias" in payload:
+            raise ValueError("result.model_alias is unsupported")
+        _non_empty_string(payload.get("model_id"), field="result.model_id")
+        return payload
+    if schema_version != _LEGACY_RESULT_SCHEMA_VERSION:
+        raise ValueError("result schema_version is unsupported")
+    if "model_id" in payload:
+        raise ValueError("legacy result cannot contain model_id")
+    normalized = dict(payload)
+    normalized["schema_version"] = _RESULT_SCHEMA_VERSION
+    normalized["model_id"] = _non_empty_string(
+        normalized.pop("model_alias", None),
+        field="legacy result.model_alias",
+    )
+    return normalized
 
 
 def validate_repository_bindings(
@@ -665,7 +699,7 @@ def classify_outcome(facts: RunFacts) -> RunOutcome:
         return RunOutcome.BENCHMARK_INVALID
     if facts.provider_error_code is not None:
         if (
-            facts.model_alias in _CLOUD_BENCHMARK_MODELS
+            facts.model_id in _CLOUD_BENCHMARK_MODELS
             and facts.provider_error_code in {"rate_limit", "quota_exceeded", "http_429"}
         ):
             return RunOutcome.PROVIDER_LIMITED
@@ -872,16 +906,16 @@ def run_task(
     repository: Path,
     manifest: BenchmarkManifest,
     task: BenchmarkTask,
-    model_alias: str,
+    model_id: str,
     agent_command: Sequence[str],
     artifacts_root: Path,
 ) -> TaskRunRecord:
-    if model_alias not in {
+    if model_id not in {
         manifest.primary_model,
         manifest.control_model,
         manifest.diagnostic_model,
     }:
-        raise ValueError("model alias is outside the benchmark model policy")
+        raise ValueError("model ID is outside the benchmark model policy")
     if task.permissions.network:
         raise ValueError("phase-one benchmark tasks cannot authorize network tools")
     command_prefix = tuple(agent_command)
@@ -896,7 +930,7 @@ def run_task(
         artifacts_root
         / manifest.benchmark_version
         / task.task_id
-        / model_alias
+        / model_id
         / run_id
     )
     artifact_dir.mkdir(parents=True, exist_ok=False)
@@ -927,7 +961,7 @@ def run_task(
             "run",
             task.instruction,
             "--model",
-            model_alias,
+            model_id,
             "--checkpoint-db",
             str(checkpoint_path),
             "--model-session-path",
@@ -1069,7 +1103,7 @@ def run_task(
         stop_reason = _output_field(agent.stdout, "停止原因")
         safety = tuple(sorted(set(safety_violations)))
         facts = RunFacts(
-            model_alias=model_alias,
+            model_id=model_id,
             turn_status=turn_status,
             valid_diff=bool(diff.strip()) and not safety,
             hidden_acceptance_passed=hidden_acceptance_passed,
@@ -1089,7 +1123,7 @@ def run_task(
         )
         record = TaskRunRecord(
             task_id=task.task_id,
-            model_alias=model_alias,
+            model_id=model_id,
             max_tokens_total=max_tokens_total,
             runtime_fingerprint=runtime_fingerprint,
             outcome=outcome,
@@ -1121,12 +1155,12 @@ def run_release(
     """Execute every frozen release lane and evaluate the resulting corpus."""
 
     result_paths: list[Path] = []
-    for task, model_alias in release_run_matrix(manifest):
+    for task, model_id in release_run_matrix(manifest):
         record = run_task(
             repository=repository,
             manifest=manifest,
             task=task,
-            model_alias=model_alias,
+            model_id=model_id,
             agent_command=agent_command,
             artifacts_root=artifacts_root,
         )
@@ -1161,6 +1195,20 @@ def _write_release_evidence(
         resolved = result_path.resolve()
         if not resolved.is_relative_to(root):
             raise ValueError("release result path escapes artifacts_root")
+        result_payload = _mapping(
+            json.loads(resolved.read_text(encoding="utf-8")),
+            field="release result",
+        )
+        if result_payload.get("schema_version") != _RESULT_SCHEMA_VERSION:
+            raise ValueError(
+                "release evidence requires current result schema_version"
+            )
+        if "model_alias" in result_payload:
+            raise ValueError("release result.model_alias is unsupported")
+        _non_empty_string(
+            result_payload.get("model_id"),
+            field="release result.model_id",
+        )
         records.append(
             {
                 "path": resolved.relative_to(root).as_posix(),
@@ -1168,7 +1216,7 @@ def _write_release_evidence(
             }
         )
     payload = {
-        "schema_version": "praxis-code-agent-release-evidence-v1",
+        "schema_version": _RELEASE_EVIDENCE_SCHEMA_VERSION,
         "benchmark_version": manifest.benchmark_version,
         "manifest_fingerprint": manifest.fingerprint,
         "runtime_fingerprint": repository_state_fingerprint(repository),
@@ -1204,7 +1252,11 @@ def load_release_evidence(
         json.loads(evidence_path.read_text(encoding="utf-8")),
         field="release evidence",
     )
-    if payload.get("schema_version") != "praxis-code-agent-release-evidence-v1":
+    evidence_schema_version = payload.get("schema_version")
+    if evidence_schema_version not in {
+        _RELEASE_EVIDENCE_SCHEMA_VERSION,
+        _LEGACY_RELEASE_EVIDENCE_SCHEMA_VERSION,
+    }:
         raise ValueError("release evidence schema_version is unsupported")
     if payload.get("manifest_fingerprint") != manifest.fingerprint:
         raise ValueError("release evidence manifest_fingerprint does not match")
@@ -1231,6 +1283,17 @@ def load_release_evidence(
         )
         if hashlib.sha256(result_path.read_bytes()).hexdigest() != expected_hash:
             raise ValueError(f"release evidence result sha256 mismatch: {relative}")
+        raw_result = _mapping(
+            json.loads(result_path.read_text(encoding="utf-8")),
+            field="release evidence result payload",
+        )
+        expected_result_schema = (
+            _LEGACY_RESULT_SCHEMA_VERSION
+            if evidence_schema_version == _LEGACY_RELEASE_EVIDENCE_SCHEMA_VERSION
+            else _RESULT_SCHEMA_VERSION
+        )
+        if raw_result.get("schema_version") != expected_result_schema:
+            raise ValueError("release evidence/result schema mismatch")
         results.append(load_result_record(result_path, manifest=manifest))
     return runtime_fingerprint, tuple(results)
 
@@ -1257,7 +1320,7 @@ def _write_comparison_evidence(
     candidate_path = resolve(candidate_evidence)
     baseline_path = resolve(baseline_evidence)
     payload = {
-        "schema_version": "praxis-code-agent-kernel-comparison-v1",
+        "schema_version": _KERNEL_COMPARISON_SCHEMA_VERSION,
         "benchmark_version": manifest.benchmark_version,
         "manifest_fingerprint": manifest.fingerprint,
         "candidate_evidence": {
@@ -1930,14 +1993,14 @@ def _write_result(
     acceptance: _CommandResult,
 ) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": _RESULT_SCHEMA_VERSION,
         "benchmark_version": manifest.benchmark_version,
         "manifest_fingerprint": manifest.fingerprint,
         "task_id": record.task_id,
         "task_source_commit": task.source_commit,
         "task_target_commit": task.target_commit,
         "runtime_fingerprint": record.runtime_fingerprint,
-        "model_alias": record.model_alias,
+        "model_id": record.model_id,
         "max_tokens_total": record.max_tokens_total,
         "outcome": record.outcome.value,
         "turn_id": record.turn_id,
@@ -2364,19 +2427,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
         elif args.command == "run-task":
             task = _task_by_id(manifest, args.task_id)
-            model_alias = args.model
+            model_id = args.model
             command = _resolve_agent_command(args.agent_command)
             record = run_task(
                 repository=args.repository,
                 manifest=manifest,
                 task=task,
-                model_alias=model_alias,
+                model_id=model_id,
                 agent_command=command,
                 artifacts_root=args.artifacts_root,
             )
             payload = {
                 "task_id": record.task_id,
-                "model_alias": record.model_alias,
+                "model_id": record.model_id,
                 "outcome": record.outcome.value,
                 "turn_id": record.turn_id,
                 "artifact_dir": str(record.artifact_dir),

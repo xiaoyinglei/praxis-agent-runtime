@@ -288,7 +288,7 @@ class ModelRegistry:
             data = yaml.safe_load(fh) or {}
         _validate_raw_catalog(data)
 
-        # Support configs/models.yaml: models keyed by alias plus defaults.
+        # Support configs/models.yaml: models keyed by model ID plus defaults.
         raw_models = data.get("models", {})
         defaults = data.get("defaults", {})
         raw_providers = data.get("providers", {})
