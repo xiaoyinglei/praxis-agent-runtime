@@ -23,6 +23,7 @@ from agent_runtime.harness import (
 from agent_runtime.harness import session as harness_session
 from agent_runtime.streaming.events import EventType, StreamEvent, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.builtins import shell
 
 
 class PublicHarnessModel:
@@ -491,6 +492,24 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     workspace.mkdir()
     target = workspace / "value.txt"
     target.write_text("before", encoding="utf-8")
+    executions = []
+
+    async def execute_python(workspace, request, *, termination_grace_seconds):
+        assert workspace.root == target.parent
+        assert request.workspace_write is True
+        assert request.output_paths == ["value.txt"]
+        assert request.code == (
+            "from pathlib import Path\nPath('value.txt').write_text('after')"
+        )
+        executions.append(request)
+        target.write_text("after", encoding="utf-8")
+        return shell.ManagedPythonOutput(
+            stdout="", stderr="", exit_code=0, timed_out=False,
+            truncated=False, duration_ms=0, python_version="3.12.0",
+        )
+
+    # Exercise policy and durable approval independently of macOS Seatbelt.
+    monkeypatch.setattr(shell, "_execute_managed_python", execute_python)
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     monkeypatch.setattr(
@@ -507,6 +526,8 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     )
 
     assert paused.status == "paused"
+    assert executions == []
+    assert target.read_text(encoding="utf-8") == "before"
     with RolloutStore(database) as store:
         policy = store.read_turn(paused.turn_id).binding_manifest["tool_execution_policy"]
         assert policy["allow_write_tools"] is True
@@ -516,6 +537,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
 
     assert resumed.status == "done"
     assert target.read_text(encoding="utf-8") == "after"
+    assert len(executions) == 1
 
 
 @pytest.mark.anyio
