@@ -180,6 +180,16 @@ class TurnEventDispatcher:
     def subscribe_controlling_sink(self, sink: StreamEventSink) -> None:
         self._controlling_sinks.append(sink)
 
+    def unsubscribe_controlling_sink(self, sink: StreamEventSink) -> None:
+        self._controlling_sinks.remove(sink)
+
+    def close(self) -> None:
+        for channel in (*self._controlling, *self._passive):
+            channel.close()
+        self._controlling.clear()
+        self._passive.clear()
+        self._controlling_sinks.clear()
+
     async def emit(self, event: StreamEvent, *, cursor: str | None = None) -> None:
         for channel in tuple(self._controlling):
             await channel.put(event)

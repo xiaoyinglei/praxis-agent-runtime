@@ -11,16 +11,14 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
-    Session,
     StaticToolRouter,
-    ThreadManager,
     ToolOrchestrator,
+    TurnExecutor,
 )
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
@@ -157,6 +155,10 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],
+                "step_snapshot": {
+                    "binding_manifest": {},
+                    "tools": [{"name": name, "revision": tool.execution_revision} for name, tool in tools.items()],
+                },
             },
         )
         attempt = crashed_process.dispatch_model_attempt(operation.operation_id)
@@ -203,7 +205,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
 
     with RolloutStore(database) as recovered_process:
         model = AnswerAfterRecovery()
-        session = Session(
+        session = TurnExecutor(
             thread_id=turn.thread_id,
             store=recovered_process,
             model=model,
@@ -220,15 +222,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             ),
         )
 
-        agent = HarnessAgent(
-            ThreadManager(
-                store=recovered_process,
-                session_factory=lambda _thread_id: session,
-                workspace=workspace,
-                binding_provider=FrozenBinding(),
-            )
-        )
-        result = agent.recover_committed_model_response(turn.turn_id)
+        result = asyncio.run(session.recover_committed_model_response(turn_id=turn.turn_id))
 
         assert result.status == "completed"
         assert calls == ["README.md"], (
@@ -274,6 +268,10 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],
+                "step_snapshot": {
+                    "binding_manifest": {},
+                    "tools": [{"name": name, "revision": tool.execution_revision} for name, tool in tools.items()],
+                },
             },
         )
         attempt = crashed_process.dispatch_model_attempt(model_operation.operation_id)

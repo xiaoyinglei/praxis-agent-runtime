@@ -21,7 +21,7 @@ from agent_runtime.harness.protocol import (
     PreparedModelCall,
 )
 from agent_runtime.harness.rollout import RolloutStore
-from agent_runtime.harness.session import Session
+from agent_runtime.harness.session import TurnExecutor
 
 
 class StaticContext:
@@ -132,7 +132,7 @@ def test_session_switches_to_pressure_before_using_protected_tail(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = PressureModel()
-        session = Session(
+        session = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,

@@ -10,12 +10,11 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
-    RuntimeComposition,
+    Session,
 )
 from agent_runtime.tools.builtins.shell import create_run_command_tool
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -118,14 +117,15 @@ class SandboxWriteModel(SandboxCommandModel):
     not Path("/usr/bin/sandbox-exec").is_file(),
     reason="real macOS Seatbelt is unavailable",
 )
-def test_candidate_sdk_runs_retained_command_tool_in_real_seatbelt(
+@pytest.mark.anyio
+async def test_candidate_sdk_runs_retained_command_tool_in_real_seatbelt(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path / "workspace", create=True)
     registry = ToolRegistry()
     registry.register(create_run_command_tool(workspace))
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace.root,
         model=SandboxCommandModel(),
@@ -137,9 +137,9 @@ def test_candidate_sdk_runs_retained_command_tool_in_real_seatbelt(
             auto_approve_sandboxed=True,
         ),
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("verify Seatbelt")
+        result = await runtime.submit("verify Seatbelt")
 
-        assert result.status == "completed"
+        assert result.status == "done"
         [tool_result] = [
             item
             for item in runtime.store.list_items(result.turn_id)
@@ -159,14 +159,15 @@ def test_candidate_sdk_runs_retained_command_tool_in_real_seatbelt(
     not Path("/usr/bin/sandbox-exec").is_file(),
     reason="real macOS Seatbelt is unavailable",
 )
-def test_real_seatbelt_workspace_write_requires_durable_approval(
+@pytest.mark.anyio
+async def test_real_seatbelt_workspace_write_requires_durable_approval(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path / "workspace", create=True)
     registry = ToolRegistry()
     registry.register(create_run_command_tool(workspace))
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace.root,
         model=SandboxWriteModel(),
@@ -178,16 +179,16 @@ def test_real_seatbelt_workspace_write_requires_durable_approval(
             auto_approve_sandboxed=True,
         ),
     ) as runtime:
-        agent = HarnessAgent(runtime.thread_manager)
-        paused = agent.run("write through Seatbelt")
+        agent = runtime
+        paused = await agent.submit("write through Seatbelt")
 
         assert paused.status == "paused"
         assert not (workspace.root / "approved.txt").exists()
 
-        resumed = agent.resume(paused.turn_id, "approve")
+        resumed = await agent.resume(paused.turn_id, "approve")
 
         assert resumed.turn_id == paused.turn_id
-        assert resumed.status == "completed"
+        assert resumed.status == "done"
         assert (workspace.root / "approved.txt").read_text(encoding="utf-8") == (
             "approved-by-seatbelt"
         )

@@ -4,15 +4,16 @@ import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
-    RuntimeComposition,
+    Session,
 )
 
 
@@ -125,7 +126,8 @@ class AcceptSkillAnswer:
         return CompletionDecision(action="accept", reason="skill workflow completed")
 
 
-def test_skill_activation_is_durable_but_never_grants_write_permission(
+@pytest.mark.anyio
+async def test_skill_activation_is_durable_but_never_grants_write_permission(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -138,18 +140,18 @@ def test_skill_activation_is_durable_but_never_grants_write_permission(
     )
     runtime_skill = FakeSkillRuntime(skill_root)
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=SkillAssetModel(),
         completion_gate=AcceptSkillAnswer(),
         skill_runtime=runtime_skill,
     ) as runtime:
-        agent = HarnessAgent(runtime.thread_manager)
-        paused = agent.run("use the test skill asset")
+        agent = runtime
+        paused = await agent.submit("use the test skill asset")
 
         assert paused.status == "paused"
-        assert paused.interaction_id is not None
+        assert paused.pause.request_id is not None
         destination = (
             workspace
             / ".praxis"
@@ -162,7 +164,7 @@ def test_skill_activation_is_durable_but_never_grants_write_permission(
         )
         assert not destination.exists()
 
-        completed = agent.resume(paused.turn_id, "approve")
+        completed = await agent.resume(paused.turn_id, "approve")
 
         assert completed.answer == "skill asset materialized with explicit approval"
         assert destination.read_text(encoding="utf-8") == "trusted reference"

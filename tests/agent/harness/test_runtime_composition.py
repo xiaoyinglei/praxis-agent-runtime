@@ -10,12 +10,11 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
     RolloutStore,
-    RuntimeComposition,
+    Session,
 )
 
 
@@ -46,19 +45,20 @@ class AcceptAnswer:
         return CompletionDecision(action="accept", reason="accepted by test verifier")
 
 
-def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=database,
         workspace=workspace,
         model=PlainModel(),
     ) as runtime:
-        agent = HarnessAgent(runtime.thread_manager)
+        agent = runtime
 
-        result = agent.run("answer through the public facade")
+        result = await agent.submit("answer through the public facade")
 
         assert result.answer == "composed answer"
         binding = runtime.store.read_turn(result.turn_id).binding_manifest
@@ -86,7 +86,8 @@ def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> Non
         assert runtime.store.verify().valid is True
 
 
-def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
@@ -105,7 +106,7 @@ def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) ->
         )
 
     with pytest.raises(RuntimeError, match="projection integrity"):
-        RuntimeComposition.open(
+        await Session.open(
             database=database,
             workspace=workspace,
             model=PlainModel(),

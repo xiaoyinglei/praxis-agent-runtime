@@ -18,15 +18,15 @@ from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
+    ContextCompactionRequiredError,
     ControlPlaneHarnessModel,
     GatewayHarnessModel,
-    HarnessAgent,
     HarnessMessage,
     HarnessModelDelta,
     HarnessModelRequest,
     RolloutContextManager,
     RolloutStore,
-    RuntimeComposition,
+    Session,
 )
 from agent_runtime.model_definition import (
     ModelCapabilities,
@@ -460,16 +460,16 @@ async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
     )
     dispatcher = TurnEventDispatcher(capacity=1)
     stream = dispatcher.subscribe_controlling()
-    with RuntimeComposition.open(
+    async with await Session.open(
+        event_dispatcher=dispatcher,
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptAnswer(),
     ) as runtime:
         running = asyncio.create_task(
-            runtime.thread_manager.run(
-                user_message="stream native fragments",
-                event_dispatcher=dispatcher,
+            runtime.submit(
+                task="stream native fragments",
             )
         )
 
@@ -518,15 +518,15 @@ async def test_native_reasoning_and_plan_deltas_use_distinct_completed_items(
     )
     dispatcher = TurnEventDispatcher(capacity=32)
     stream = dispatcher.subscribe_controlling()
-    with RuntimeComposition.open(
+    async with await Session.open(
+        event_dispatcher=dispatcher,
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptAnswer(),
     ) as runtime:
-        result = await runtime.thread_manager.run(
-            user_message="stream all native channels",
-            event_dispatcher=dispatcher,
+        result = await runtime.submit(
+            task="stream all native channels",
         )
         events = []
         while not stream.empty:
@@ -595,16 +595,16 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
     )
     dispatcher = TurnEventDispatcher(capacity=1)
     stream = dispatcher.subscribe_controlling()
-    with RuntimeComposition.open(
+    async with await Session.open(
+        event_dispatcher=dispatcher,
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptAnyAnswer(),
     ) as runtime:
         running = asyncio.create_task(
-            runtime.thread_manager.run(
-                user_message="exercise sync provider backpressure",
-                event_dispatcher=dispatcher,
+            runtime.submit(
+                task="exercise sync provider backpressure",
             )
         )
         events = [await asyncio.wait_for(stream.receive(), timeout=0.5)]
@@ -668,7 +668,7 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
     ]
 
 
-def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() -> None:
+def test_gateway_adapter_requests_durable_compaction_before_provider_dispatch() -> None:
     gateway = BudgetAwareCapturingGateway(max_input_tokens=9_000)
     resolved = _resolved_model(
     gateway=gateway,
@@ -694,24 +694,18 @@ def test_gateway_adapter_compacts_transcript_before_durable_provider_dispatch() 
         HarnessMessage(role="assistant", content="latest finding must survive"),
     )
 
-    prepared = model.prepare(
-        HarnessModelRequest(
-            thread_id="thread-1",
-            turn_id="turn-1",
-            messages=messages,
-            binding_manifest={"model_id": "test-model"},
+    with pytest.raises(ContextCompactionRequiredError) as raised:
+        model.prepare(
+            HarnessModelRequest(
+                thread_id="thread-1",
+                turn_id="turn-1",
+                messages=messages,
+                binding_manifest={"model_id": "test-model"},
+            )
         )
-    )
 
-    projection = prepared.request_ref["context_projection"]
-    assert projection["compacted"] is True
-    assert projection["input_tokens"] <= projection["max_input_tokens"]
-    response = asyncio.run(model.dispatch(prepared))
-    assert response.text == "real gateway answer"
-    wire = serialize_openai_request(gateway.requests[0]).serialized_json
-    assert "latest finding must survive" in wire
-    assert "context_compaction" in wire
-    assert len(wire) <= gateway.max_input_tokens
+    assert raised.value.retained_tail_messages >= 0
+    assert gateway.requests == []
 
 
 def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
@@ -1106,7 +1100,8 @@ class AcceptAnyAnswer:
         return CompletionDecision(action="accept", reason="answer accepted")
 
 
-def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
+@pytest.mark.anyio
+async def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -1154,13 +1149,13 @@ def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
         instructions=("Answer the user directly.",),
     )
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptAnswer(),
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("hello through candidate SDK")
+        result = await runtime.submit("hello through candidate SDK")
 
         assert result.answer == "real gateway answer"
         assert len(gateway.requests) == 1

@@ -1,1051 +1,701 @@
-"""Live Harness execution spine: Session -> TurnContext -> StepContext."""
+"""One live conversation: owned resources, persistent Turns, temporary Steps."""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from functools import partial
-from types import MappingProxyType
-from typing import Any
+import copy
+import hashlib
+import os
+from collections.abc import AsyncIterator, Mapping, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
-from agent_runtime.budget import (
-    BudgetLimitExceededError,
-    PricingUnavailableError,
-    budget_pressure_active,
-    normal_token_remaining,
-)
-from agent_runtime.harness.events import RolloutEventReader
-from agent_runtime.harness.protocol import (
-    CompletionGate,
-    CompletionProposal,
-    ContextBudgetExceededError,
-    ContextManager,
-    HarnessMessage,
-    HarnessModel,
-    HarnessModelDelta,
-    HarnessModelRequest,
-    HarnessModelResponse,
-    HarnessToolCall,
-    ModelDispatchCancelledError,
-    ModelDispatchOutcomeUnknownError,
-    ModelDispatchPreflightError,
-    PreparedModelCall,
-    ToolRouter,
-    TurnResult,
-)
-from agent_runtime.harness.rollout import ItemSnapshot, ModelOperationSnapshot, RolloutStore
-from agent_runtime.harness.tool_orchestrator import (
-    ToolApprovalInvalidatedError,
-    ToolApprovalRequiredError,
-    ToolOrchestrator,
-)
-from agent_runtime.streaming.events import (
-    ItemDeltaKind,
-    TurnItemKind,
-    derive_model_public_item_id,
-    item_delta,
-)
-from agent_runtime.streaming.sink import EventChannelClosed, TurnEventDispatcher
-from agent_runtime.tools.tool import Tool, ToolCall, ToolCallOrigin
+from agent_runtime.budget import ResourceUsage
+from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate, ContextManager, ToolRouter, TurnResult
+from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.services import SessionBindingProvider, _tool_execution_policy_snapshot, configure_services
+from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
+from agent_runtime.harness.turn import TurnExecutor
+from agent_runtime.result import AgentResult
+from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.tool import ToolEffect
 
-
-_BUDGET_PRESSURE_MESSAGE = (
-    "Runtime budget pressure is active. Stop broad exploration and converge on "
-    "the best defensible completion from evidence already gathered. Prefer a "
-    "final answer; use additional tools only when strictly required to avoid "
-    "an incorrect or unsafe result."
-)
-
-
-@dataclass(frozen=True, slots=True)
-class TurnContext:
-    """Immutable identity and durable settings for one Turn in this Session."""
-
-    thread_id: str
-    turn_id: str
-    binding_manifest: Mapping[str, Any]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "binding_manifest",
-            MappingProxyType(dict(self.binding_manifest)),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class StepContext:
-    """One immutable model-request view captured inside a Turn."""
-
-    turn: TurnContext
-    step: int
-    messages: tuple[HarnessMessage, ...]
-    tools: tuple[Tool, ...]
-    model_token_budget_remaining: int | None
-    budget_pressure: bool = False
-    budget_pressure: bool = False
-
-    def model_request(self) -> HarnessModelRequest:
-        return HarnessModelRequest(
-            thread_id=self.turn.thread_id,
-            turn_id=self.turn.turn_id,
-            messages=self.messages,
-            binding_manifest=self.turn.binding_manifest,
-            tools=self.tools,
-            step=self.step,
-            model_token_budget_remaining=self.model_token_budget_remaining,
-            budget_pressure=self.budget_pressure,
-        )
+if TYPE_CHECKING:
+    from agent_runtime.agent import Agent, AgentEventSink
+    from agent_runtime.models import ModelControlPlane, ModelSpec
+    from agent_runtime.tools.tool import Tool
 
 
 class Session:
-    """Live owner of one thread and its Turn/Step execution."""
+    """Open once per conversation; submit creates a Turn without reopening services.
 
-    def __init__(
-        self,
+    Use Agent.session() or async with await Session.open(...). close() stops
+    accepting submissions and waits for the active call before releasing resources.
+    A paused Turn must be resumed or aborted before another submission.
+    An explicitly supplied event dispatcher belongs to its caller, which drains
+    and closes it after the Session finishes.
+    """
+
+    tool_execution_context: ToolExecutionContext
+    store: RolloutStore
+    database: Path
+    workspace_path: Path
+    thread_id: str
+    head_turn_id: str | None
+    model: BoundHarnessModel
+    model_control_plane: ModelControlPlane | None
+    context_manager: ContextManager
+    completion_gate: CompletionGate
+    tool_router: ToolRouter | None
+    tool_orchestrator: ToolOrchestrator | None
+    tools: Mapping[str, Tool]
+    worker_id: str
+    max_steps: int
+    binding_provider: SessionBindingProvider
+    event_dispatcher: TurnEventDispatcher
+
+    def __init__(self) -> None:
+        self._stack = AsyncExitStack()
+        self._active_turn_lock = asyncio.Lock()
+        self._active_task: asyncio.Task[Any] | None = None
+        self._child_calls: dict[asyncio.Task[Any], asyncio.Event] = {}
+        self._closed = False
+        self._closing = False
+        self._agent: Agent | None = None
+        self.model_control_plane = None
+        self._ready_model_id: str | None = None
+        self._service_options: dict[str, Any] = {}
+
+    @classmethod
+    async def open(
+        cls,
         *,
-        thread_id: str,
-        store: RolloutStore,
-        model: HarnessModel,
-        context_manager: ContextManager,
-        completion_gate: CompletionGate,
-        tool_router: ToolRouter | None = None,
-        tool_orchestrator: ToolOrchestrator | None = None,
-        max_steps: int = 16,
-        worker_id: str | None = None,
-        model_lease_seconds: float = 300.0,
+        agent: Agent | None = None,
+        database: Path | None = None,
+        workspace: Path | None = None,
+        model: BoundHarnessModel | None = None,
+        previous_turn_id: str | None = None,
+        frozen_turn_id: str | None = None,
+        thread_id: str | None = None,
         event_dispatcher: TurnEventDispatcher | None = None,
-    ) -> None:
-        store.read_thread(thread_id)
-        self.thread_id = thread_id
-        self._store = store
-        self._model = model
-        self._context_manager = context_manager
-        self._completion_gate = completion_gate
-        self._tool_router = tool_router
-        self._tool_orchestrator = tool_orchestrator
-        self._max_steps = max_steps
-        self._worker_id = worker_id or f"worker_{uuid4().hex}"
-        self._model_lease_seconds = model_lease_seconds
-        self._event_dispatcher = event_dispatcher
+        event_sink: AgentEventSink | None = None,
+        **service_options: Any,
+    ) -> Self:
+        self = cls()
+        explicit_tool_context = "tool_execution_context" in service_options
+        agent = copy.copy(agent) if agent is not None else None
+        self._agent = agent
+        self.event_dispatcher = event_dispatcher or TurnEventDispatcher()
+        if event_sink is not None:
+            self.event_dispatcher.subscribe_controlling_sink(event_sink)
+        if event_dispatcher is None:
+            self._stack.callback(self.event_dispatcher.close)
+        try:
+            if agent is not None:
+                database = agent._harness_database()
+                workspace = agent.workspace_path
+            if database is None or workspace is None:
+                raise ValueError("Session requires an Agent or database and workspace")
+            self.database = Path(database)
+            self.workspace_path = Path(workspace).resolve()
+            self.store = self._stack.enter_context(RolloutStore(self.database))
+            integrity = self.store.verify()
+            if not integrity.valid:
+                raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(integrity.errors))
+            if sum(value is not None for value in (previous_turn_id, frozen_turn_id, thread_id)) > 1:
+                raise ValueError("choose one conversation anchor")
+            anchor = frozen_turn_id or previous_turn_id
+            if anchor is not None:
+                turn = self.store.read_turn(anchor)
+                thread = self.store.read_thread(turn.thread_id)
+                if Path(thread.workspace).resolve() != self.workspace_path:
+                    raise RuntimeError("turn belongs to a different workspace security domain")
+                if previous_turn_id is not None:
+                    if turn.status not in {"completed", "failed", "cancelled"}:
+                        raise RuntimeError("non-terminal predecessor must be resumed, cancelled, or abandoned")
+                    if thread.head_turn_id != previous_turn_id:
+                        thread = self.store.fork_thread(from_turn_id=previous_turn_id)
+                thread_id = thread.thread_id
+                if frozen_turn_id is not None:
+                    binding = turn.binding_manifest
+                    if binding.get("legacy_resume_compatible") is False:
+                        raise RuntimeError("incompatible legacy Turn cannot resume; abort the Turn explicitly")
+                    completion = binding.get("completion_policy", {})
+                    service_options.update(
+                        require_workspace_change=completion.get("require_workspace_change") is True,
+                        max_steps=binding.get("model_step_budget") or 16,
+                        max_tokens_total=binding.get("model_token_budget_total"),
+                        max_cost_micros=binding.get("model_cost_budget_total_micros"),
+                    )
+            if thread_id is not None:
+                thread = self.store.read_thread(thread_id)
+                if Path(thread.workspace).resolve() != self.workspace_path:
+                    raise RuntimeError("thread belongs to a different workspace security domain")
+            if agent is not None:
+                model, resource_options = await self._open_agent_resources(
+                    agent,
+                    allow_write_tools=service_options.pop("allow_write_tools", False),
+                    allow_execute_tools=service_options.pop("allow_execute_tools", False),
+                )
+                service_options.update(resource_options)
+            if model is None:
+                raise ValueError("Session requires a bound model")
+            self._service_options = dict(service_options)
+            configure_services(self, workspace=self.workspace_path, model=model, **service_options)
+            self.thread_id = (
+                thread_id
+                if thread_id is not None
+                else self.store.create_thread(workspace=self.workspace_path).thread_id
+            )
+            thread = self.store.read_thread(self.thread_id)
+            self.head_turn_id = thread.head_turn_id
+            settings = thread.settings
+            if settings:
+                policy = dict(settings["tool_execution_policy"])
+                policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
+                if not explicit_tool_context:
+                    self.tool_execution_context = replace(self.tool_execution_context, **policy)
+                if self.model_control_plane is not None and settings.get("model_id"):
+                    self.model_control_plane.state = replace(
+                        self.model_control_plane.state,
+                        current_model_id=settings["model_id"],
+                        selection_requester=settings["model_selection_requester"],
+                    )
+                self._apply_tool_context()
+                if explicit_tool_context:
+                    self._persist_settings()
+            else:
+                self._persist_settings()
+            if agent is not None and agent._followup_model_id is not None:
+                assert self.model_control_plane is not None
+                self.model_control_plane.switch_model(
+                    agent._followup_model_id,
+                    requested_by=agent._selection_requester,
+                    persist=False,
+                )
+                self._persist_settings()
+            if self.model_control_plane is not None and not settings and frozen_turn_id is None:
+                await self._bootstrap_model_provider()
+            return self
+        except BaseException:
+            await self._stack.aclose()
+            self._closed = True
+            raise
 
-    def attach_event_dispatcher(
-        self,
-        event_dispatcher: TurnEventDispatcher,
-    ) -> None:
-        self._event_dispatcher = event_dispatcher
-        if self._tool_orchestrator is not None:
-            self._tool_orchestrator.attach_event_dispatcher(event_dispatcher)
+    async def __aenter__(self) -> Self:
+        self._ensure_open()
+        return self
 
-    async def run(
+    async def __aexit__(self, *_args: object) -> None:
+        await self.close()
+
+    def _ensure_open(self) -> None:
+        if self._closed or self._closing:
+            raise RuntimeError("Session is closed")
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        if self._active_task is asyncio.current_task() or asyncio.current_task() in self._child_calls:
+            raise RuntimeError("cannot close Session from its active Turn")
+        self._closing = True
+        async with self._active_turn_lock:
+            if not self._closed:
+                if self._child_calls:
+                    await asyncio.gather(*(done.wait() for done in tuple(self._child_calls.values())))
+                try:
+                    await self._stack.aclose()
+                finally:
+                    self._closed = True
+
+    @asynccontextmanager
+    async def _active_turn(self, event_sink: AgentEventSink | None = None) -> AsyncIterator[None]:
+        self._ensure_open()
+        if self._active_turn_lock.locked():
+            raise RuntimeError("Session already has an active Turn")
+        async with self._active_turn_lock:
+            self._ensure_open()
+            self._active_task = asyncio.current_task()
+            if event_sink is not None:
+                self.event_dispatcher.subscribe_controlling_sink(event_sink)
+            try:
+                yield
+            finally:
+                if event_sink is not None:
+                    self.event_dispatcher.unsubscribe_controlling_sink(event_sink)
+                if self.tool_orchestrator is not None:
+                    self.tool_orchestrator.release_turn_state()
+                self.head_turn_id = self.store.read_thread(self.thread_id).head_turn_id
+                self._active_task = None
+
+    def _executor(self) -> TurnExecutor:
+        executor = TurnExecutor(
+            thread_id=self.thread_id,
+            store=self.store,
+            model=self.model,
+            context_manager=self.context_manager,
+            completion_gate=self.completion_gate,
+            tool_router=self.tool_router,
+            tool_orchestrator=self.tool_orchestrator,
+            worker_id=self.worker_id,
+            max_steps=self.max_steps,
+            binding_provider=self.binding_provider,
+            prepare_binding=self._prepare_step_binding,
+        )
+        executor.attach_event_dispatcher(self.event_dispatcher)
+        return executor
+
+    async def submit(
         self,
+        task: str,
         *,
-        turn_id: str,
-        user_message: str,
-        binding_manifest: Mapping[str, Any],
-        input_files: tuple[Mapping[str, Any], ...] = (),
-    ) -> TurnResult:
-        turn = await self._commit(
-            lambda: self._store.start_turn(
-                thread_id=self.thread_id,
+        files: Sequence[str] | None = None,
+        event_sink: AgentEventSink | None = None,
+    ) -> AgentResult:
+        async with self._active_turn(event_sink):
+            if self.store.read_thread(self.thread_id).active_turn_id is not None:
+                raise RuntimeError("active Turn must be resumed or aborted before submit")
+            if self.model_control_plane is not None and self.current_model().id != self._ready_model_id:
+                await self._bootstrap_model_provider()
+            input_files: tuple[dict[str, object], ...] = ()
+            if files:
+                if self._agent is None:
+                    raise ValueError("file staging requires an Agent-configured Session")
+                input_files = self._agent._stage_harness_files(files)
+            turn_id = f"turn_{uuid4().hex}"
+            binding = dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
+            binding["budget_root_turn_id"] = turn_id
+            result = await self._executor().run(
                 turn_id=turn_id,
-                user_message=user_message,
-                binding_manifest=binding_manifest,
+                user_message=task,
+                binding_manifest=binding,
                 input_files=input_files,
             )
-        )
-        return await self.run_turn(
-            self.restore_turn_context(turn.turn_id),
-            start_step=1,
-        )
+            return AgentResult._from_harness(result, store=self.store, files=tuple(files or ()))
 
-    async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = self._store.capture_mutation(operation)
-        if self._event_dispatcher is not None:
-            for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
-                await self._event_dispatcher.emit(
-                    replayed.event,
-                    cursor=replayed.cursor,
-                )
-        return mutation.value
+    def current_model(self) -> ModelSpec:
+        if self.model_control_plane is None:
+            raise RuntimeError("Session has no model control plane")
+        return self.model_control_plane.current_model()
 
-    def restore_turn_context(self, turn_id: str) -> TurnContext:
-        turn = self._store.read_turn(turn_id)
-        if turn.thread_id != self.thread_id:
-            raise RuntimeError("Turn belongs to a different Session")
-        return TurnContext(
-            thread_id=self.thread_id,
-            turn_id=turn.turn_id,
-            binding_manifest=turn.binding_manifest,
-        )
+    def models(self) -> list[ModelSpec]:
+        if self.model_control_plane is None:
+            raise RuntimeError("Session has no model control plane")
+        return self.model_control_plane.list_models()
 
-    def capture_step_context(
-        self,
-        turn_context: TurnContext,
-        *,
-        step: int,
-        budget_pressure: bool | None = None,
-    ) -> StepContext:
-        if turn_context.thread_id != self.thread_id:
-            raise RuntimeError("Turn belongs to a different Session")
-        state = self._store.read_budget_state(turn_context.turn_id)
-        if budget_pressure is None:
-            pressure = budget_pressure_active(state)
-        elif type(budget_pressure) is not bool:
-            raise TypeError("budget_pressure must be a bool or None")
-        else:
-            pressure = budget_pressure
-        messages = self._context_manager.build(turn_context.turn_id)
-        if pressure:
-            messages = (
-                *messages,
-                HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
-            )
-        tools = (
-            ()
-            if self._tool_router is None
-            else self._tool_router.select(
-                turn_id=turn_context.turn_id,
-                messages=messages,
-            )
-        )
-        return StepContext(
-            turn=turn_context,
-            step=step,
-            messages=messages,
-            tools=tools,
-            model_token_budget_remaining=state.remaining("tokens"),
-            budget_pressure=pressure,
-        )
-
-    async def resume(self, *, turn_id: str, decision: str) -> TurnResult:
-        if self._tool_orchestrator is None:
-            raise RuntimeError("Turn has no ToolOrchestrator for approval resume")
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
-        approval_interactions = [
-            interaction for interaction in self._store.list_interactions(turn_id) if interaction.kind == "tool_approval"
-        ]
-        if approval_interactions and approval_interactions[-1].status == "resolved":
-            prior_decision = approval_interactions[-1].response.get("decision")
-            if prior_decision != decision:
-                raise RuntimeError(f"decision conflicts with resolved approval: {prior_decision} != {decision}")
-            if turn.status == "completed":
-                answers = [
-                    item.payload.get("text")
-                    for item in self._store.list_items(turn_id)
-                    if item.kind == "agent_message" and isinstance(item.payload.get("text"), str)
-                ]
-                if len(answers) != 1:
-                    raise RuntimeError("completed Turn has no unique canonical answer")
-                return TurnResult(
-                    thread_id=turn.thread_id,
-                    turn_id=turn_id,
-                    answer=answers[0],
-                    status="completed",
-                )
-            if turn.status == "running" and decision == "approve":
-                try:
-                    await self._tool_orchestrator.recover_resolved_approval(turn_id=turn_id)
-                except ToolApprovalInvalidatedError as invalidated:
-                    return TurnResult(
-                        thread_id=turn.thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status="paused",
-                        interaction_id=invalidated.interaction_id,
-                    )
-                return await self.run_turn(
-                    turn_context,
-                    start_step=len(self._store.list_model_operations(turn_id)) + 1,
-                )
-        if turn.status != "paused":
-            raise RuntimeError(f"turn is not paused: {turn_id}")
+    def switch_model(self, model_id: str) -> ModelSpec:
+        self._ensure_open()
+        if self.model_control_plane is None:
+            raise RuntimeError("Session has no model control plane")
+        previous = copy.copy(self.model_control_plane.state)
+        spec = self.model_control_plane.switch_model(model_id, requested_by="user", persist=False)
         try:
-            await self._tool_orchestrator.resume_approval(
-                turn_id=turn_id,
-                decision=decision,
-            )
-        except ToolApprovalInvalidatedError as invalidated:
-            return TurnResult(
-                thread_id=turn.thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="paused",
-                interaction_id=invalidated.interaction_id,
-            )
-        start_step = len(self._store.list_model_operations(turn_id)) + 1
-        return await self.run_turn(
-            turn_context,
-            start_step=start_step,
-        )
-
-    async def retry_unknown_model(self, *, turn_id: str) -> TurnResult:
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
-        if turn.status not in {"paused", "interrupted"}:
-            raise RuntimeError("model retry requires a paused or interrupted Turn")
-        unknown = [
-            operation for operation in self._store.list_model_operations(turn_id) if operation.status == "unknown"
-        ]
-        if len(unknown) != 1:
-            raise RuntimeError("model retry requires one unknown logical operation")
-        operation = unknown[0]
-        step = len(self._store.list_model_operations(turn_id))
-        prior_pressure = operation.request_ref.get("budget_pressure") is True
-        request = self.capture_step_context(
-            turn_context,
-            step=step,
-            budget_pressure=prior_pressure,
-        ).model_request()
-        prepared = self._model.prepare(request)
-        if (
-            prepared.request_hash != operation.request_hash
-            or prepared.context_hash != operation.context_hash
-            or prepared.tool_hash != operation.tool_hash
-            or prepared.wire_hash != operation.wire_hash
-        ):
-            raise RuntimeError("unknown model request cannot be reproduced exactly")
-        await self._commit(lambda: self._store.prepare_model_retry(operation.operation_id))
-        dispatched = await self._dispatch_prepared(
-            thread_id=turn.thread_id,
-            turn_id=turn_id,
-            operation=operation,
-            prepared=prepared,
-            allow_protected_budget=True,
-        )
-        if isinstance(dispatched, TurnResult):
-            return dispatched
-        token_budget = turn.binding_manifest.get("model_token_budget_total")
-        if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-            return await self._fail_turn(
-                thread_id=turn.thread_id,
-                turn_id=turn_id,
-                reason="Turn exceeded its frozen model token budget.",
-            )
-        handled = await self._handle_model_response(
-            thread_id=turn.thread_id,
-            turn_id=turn_id,
-            response=dispatched,
-            prepared=prepared,
-        )
-        if handled is not None:
-            return handled
-        return await self.run_turn(
-            turn_context,
-            start_step=step + 1,
-        )
-
-    async def recover_committed_model_response(self, *, turn_id: str) -> TurnResult:
-        """Continue after a crash between response commit and response handling."""
-
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
-        if turn.status != "running":
-            raise RuntimeError("committed response recovery requires a running Turn")
-        operations = self._store.list_model_operations(turn_id)
-        if not operations:
-            raise RuntimeError("Turn has no committed model response to recover")
-        operation = operations[-1]
-        if operation.status != "completed" or operation.response_item_id is None:
-            raise RuntimeError("latest model operation has no canonical completed response")
-        response_item = self._store.read_item(operation.response_item_id)
-        response = _response_from_committed_item(response_item)
-        if not response.tool_calls:
-            raise RuntimeError("latest committed response has no pending tool calls")
-        tool_operations = {
-            tool_operation.tool_call_id: tool_operation for tool_operation in self._store.list_tool_operations(turn_id)
-        }
-        pending_calls: list[HarnessToolCall] = []
-        for call in response.tool_calls:
-            tool_operation = tool_operations.get(call.id)
-            if tool_operation is None:
-                pending_calls.append(call)
-                continue
-            if tool_operation.result_item_id is None:
-                if tool_operation.status in {"succeeded", "failed"}:
-                    interaction = await self._commit(
-                        partial(
-                            self._store.mark_tool_result_missing,
-                            operation_id=tool_operation.operation_id,
-                        )
-                    )
-                    return TurnResult(
-                        thread_id=turn.thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status="paused",
-                        interaction_id=interaction.request_id,
-                    )
-                raise RuntimeError("committed tool call has an uncertain operation; use tool reconciliation")
-            result_item = self._store.read_item(tool_operation.result_item_id)
-            if (
-                result_item.kind != "tool_result"
-                or result_item.status != "completed"
-                or result_item.payload.get("tool_call_id") != call.id
-            ):
-                raise RuntimeError("committed tool result linkage is malformed")
-        token_budget = turn.binding_manifest.get("model_token_budget_total")
-        if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-            return await self._fail_turn(
-                thread_id=turn.thread_id,
-                turn_id=turn_id,
-                reason="Turn exceeded its frozen model token budget.",
-            )
-        prepared = PreparedModelCall(
-            request_hash=operation.request_hash,
-            context_hash=operation.context_hash,
-            tool_hash=operation.tool_hash,
-            wire_hash=operation.wire_hash,
-            request_ref=operation.request_ref,
-        )
-        if pending_calls:
-            handled = await self._handle_model_response(
-                thread_id=turn.thread_id,
-                turn_id=turn_id,
-                response=HarnessModelResponse(
-                    text=response.text,
-                    provider_response_id=response.provider_response_id,
-                    usage=response.usage,
-                    tool_calls=tuple(pending_calls),
-                ),
-                prepared=prepared,
-            )
-            if handled is not None:
-                return handled
-        return await self.run_turn(
-            turn_context,
-            start_step=len(operations) + 1,
-        )
-
-    async def respond_interaction(
-        self,
-        *,
-        turn_id: str,
-        request_id: str,
-        response: str,
-    ) -> TurnResult:
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
-        interaction = self._store.read_interaction(request_id)
-        if interaction.turn_id != turn_id or interaction.kind not in {
-            "clarification",
-            "choice",
-        }:
-            raise RuntimeError("interaction is not a user-response request for this Turn")
-        if interaction.status == "resolved":
-            response_field = "text" if interaction.kind == "clarification" else "selection"
-            prior_response = interaction.response.get(response_field)
-            if prior_response != response:
-                raise RuntimeError(
-                    f"response conflicts with resolved {interaction.kind}: {prior_response!r} != {response!r}"
-                )
-            if turn.status == "completed":
-                answers = [
-                    item.payload.get("text")
-                    for item in self._store.list_items(turn_id)
-                    if item.kind == "agent_message" and isinstance(item.payload.get("text"), str)
-                ]
-                if len(answers) != 1:
-                    raise RuntimeError("completed Turn has no unique canonical answer")
-                return TurnResult(
-                    thread_id=turn.thread_id,
-                    turn_id=turn_id,
-                    answer=answers[0],
-                    status="completed",
-                )
-            raise RuntimeError(f"resolved {interaction.kind} is already being processed")
-        if interaction.kind == "clarification":
-            await self._commit(
-                lambda: self._store.resolve_clarification(
-                    turn_id=turn_id,
-                    request_id=request_id,
-                    response=response,
-                )
-            )
-        else:
-            await self._commit(
-                lambda: self._store.resolve_choice(
-                    turn_id=turn_id,
-                    request_id=request_id,
-                    selection=response,
-                )
-            )
-        return await self.run_turn(
-            turn_context,
-            start_step=len(self._store.list_model_operations(turn_id)) + 1,
-        )
-
-    async def run_turn(
-        self,
-        turn_context: TurnContext,
-        *,
-        start_step: int,
-    ) -> TurnResult:
-        thread_id = turn_context.thread_id
-        turn_id = turn_context.turn_id
-        binding_manifest = turn_context.binding_manifest
-        step_budget = binding_manifest.get("model_step_budget", self._max_steps)
-        if isinstance(step_budget, bool) or not isinstance(step_budget, int) or step_budget < 1:
-            raise RuntimeError("frozen model step budget is invalid")
-        token_budget = binding_manifest.get("model_token_budget_total")
-        if token_budget is not None and (
-            isinstance(token_budget, bool) or not isinstance(token_budget, int) or token_budget < 1
-        ):
-            raise RuntimeError("frozen model token budget is invalid")
-        effective_step_budget = min(self._max_steps, step_budget)
-        for step in range(start_step, effective_step_budget + 1):
-            remaining_tokens = self._store.read_budget_state(turn_id).remaining("tokens")
-            if remaining_tokens is not None and remaining_tokens < 1:
-                return await self._fail_turn(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    reason="Turn exhausted its frozen model token budget.",
-                )
-            try:
-                step_context = self.capture_step_context(turn_context, step=step)
-                request = step_context.model_request()
-                # Model preparation owns canonical serialization, context
-                # projection and invocation-limit validation. It must complete
-                # before any durable provider reservation/dispatch is created.
-                prepared = self._model.prepare(request)
-                if not step_context.budget_pressure:
-                    normal_remaining = normal_token_remaining(
-                        self._store.read_budget_state(turn_id)
-                    )
-                    if (
-                        normal_remaining is not None
-                        and prepared.resource_request.total_tokens > normal_remaining
-                    ):
-                        step_context = self.capture_step_context(
-                            turn_context,
-                            step=step,
-                            budget_pressure=True,
-                        )
-                        request = step_context.model_request()
-                        prepared = self._model.prepare(request)
-                if not step_context.budget_pressure:
-                    normal_remaining = normal_token_remaining(
-                        self._store.read_budget_state(turn_id)
-                    )
-                    if (
-                        normal_remaining is not None
-                        and prepared.resource_request.total_tokens > normal_remaining
-                    ):
-                        step_context = self.capture_step_context(
-                            turn_context,
-                            step=step,
-                            budget_pressure=True,
-                        )
-                        request = step_context.model_request()
-                        prepared = self._model.prepare(request)
-            except (ContextBudgetExceededError, PricingUnavailableError) as exc:
-                return await self._fail_turn(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    reason=str(exc),
-                )
-            durable_request_ref = {
-                **prepared.request_ref,
-                "request_id": prepared.request_ref.get("request_id") or f"{turn_id}:step:{step}",
-            }
-            operation = await self._commit(
-                partial(
-                    self._store.prepare_model_operation,
-                    turn_id=turn_id,
-                    request_hash=prepared.request_hash,
-                    context_hash=prepared.context_hash,
-                    tool_hash=prepared.tool_hash,
-                    wire_hash=prepared.wire_hash,
-                    request_ref=durable_request_ref,
-                )
-            )
-            dispatched = await self._dispatch_prepared(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                operation=operation,
-                prepared=prepared,
-                allow_protected_budget=step_context.budget_pressure,
-            )
-            if isinstance(dispatched, TurnResult):
-                return dispatched
-            if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
-                return await self._fail_turn(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    reason="Turn exceeded its frozen model token budget.",
-                )
-            handled = await self._handle_model_response(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                response=dispatched,
-                prepared=prepared,
-            )
-            if handled is None:
-                continue
-            return handled
-        return await self._fail_turn(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            reason="Turn exhausted its frozen model step budget.",
-        )
-
-    def _consumed_model_tokens(self, turn_id: str) -> int:
-        # Transitional compatibility for existing callers. The authoritative
-        # accounting view now comes from durable budget reservations.
-        return self._store.read_budget_state(turn_id).used.total_tokens
-
-    async def _fail_turn(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        reason: str,
-    ) -> TurnResult:
-        await self._commit(lambda: self._store.fail_turn(turn_id=turn_id, reason=reason))
-        return TurnResult(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            answer=None,
-            status="failed",
-        )
-
-    async def _dispatch_prepared(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        operation: ModelOperationSnapshot,
-        prepared: PreparedModelCall,
-        allow_protected_budget: bool = False,
-    ) -> HarnessModelResponse | TurnResult:
-        try:
-            attempt = await self._commit(
-                lambda: self._store.dispatch_model_attempt(
-                    operation.operation_id,
-                    worker_id=self._worker_id,
-                    lease_seconds=self._model_lease_seconds,
-                    resource_request=prepared.resource_request,
-                    allow_protected_budget=allow_protected_budget,
-                )
-            )
-        except BudgetLimitExceededError as exc:
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason=str(exc),
-            )
-        streamed_content: dict[str, list[str]] = {
-            "text": [],
-            "reasoning": [],
-            "plan": [],
-        }
-
-        async def publish_delta(delta: HarnessModelDelta) -> None:
-            streamed_content[delta.channel].append(delta.content)
-            channel = {
-                "text": "agent_message",
-                "reasoning": "reasoning",
-                "plan": "plan",
-            }[delta.channel]
-            item_kind = {
-                "text": TurnItemKind.AGENT_MESSAGE,
-                "reasoning": TurnItemKind.REASONING,
-                "plan": TurnItemKind.PLAN,
-            }[delta.channel]
-            delta_kind = {
-                "text": ItemDeltaKind.TEXT,
-                "reasoning": ItemDeltaKind.REASONING,
-                "plan": ItemDeltaKind.PLAN,
-            }[delta.channel]
-            await self._commit(
-                partial(
-                    self._store.start_model_output_channel,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    channel=channel,
-                )
-            )
-            if self._event_dispatcher is not None:
-                await self._event_dispatcher.emit(
-                    item_delta(
-                        turn_id=turn_id,
-                        item_id=derive_model_public_item_id(
-                            turn_id=turn_id,
-                            model_attempt_id=attempt.attempt_id,
-                            channel=channel,
-                        ),
-                        item_kind=item_kind,
-                        delta_kind=delta_kind,
-                        delta=delta.content,
-                    )
-                )
-
-        try:
-            dispatch = self._model.dispatch
-            if "delta_sink" in inspect.signature(dispatch).parameters:
-                response = await dispatch(prepared, delta_sink=publish_delta)
-            else:
-                response = await dispatch(prepared)
-        except ModelDispatchPreflightError as exc:
-            await self._commit(
-                partial(
-                    self._store.reject_model_attempt,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    reason=str(exc),
-                )
-            )
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason=str(exc),
-            )
-        except (ModelDispatchCancelledError, EventChannelClosed) as exc:
-            reason = str(exc).strip() or "provider acknowledged model cancellation"
-            await self._commit(
-                partial(
-                    self._store.request_turn_cancellation,
-                    turn_id=turn_id,
-                    reason=reason,
-                )
-            )
-            await self._commit(
-                partial(
-                    self._store.cancel_model_attempt,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    reason=reason,
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
-                )
-            )
-            return TurnResult(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="cancelled",
-            )
-        except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError) as exc:
-            await self._commit(
-                partial(
-                    self._store.mark_model_attempt_unknown,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    error_type=type(exc).__name__,
-                    error_message=(str(exc).strip() or "model dispatch raised without a message"),
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
-                )
-            )
-            return TurnResult(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="paused",
-            )
-        except asyncio.CancelledError as exc:
-            await asyncio.shield(
-                self._commit(
-                    partial(
-                        self._store.request_turn_cancellation,
-                        turn_id=turn_id,
-                        reason="Turn task cancelled while provider outcome was unknown",
-                    )
-                )
-            )
-            await self._commit(
-                partial(
-                    self._store.mark_model_attempt_unknown,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    error_type=type(exc).__name__,
-                    error_message=("model dispatch was cancelled after provider I/O began"),
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
-                )
-            )
+            self._persist_settings()
+        except BaseException:
+            self.model_control_plane.state = previous
             raise
-        except Exception as exc:
-            # The HarnessModel contract owns provider-outcome classification.
-            # Explicit transport/unknown failures are handled above. A generic
-            # exception is therefore a deterministic operation failure, but it
-            # still does not prove zero provider billing. Fail the Attempt/Turn
-            # while conservatively keeping the reservation as UNKNOWN exposure.
-            message = str(exc).strip() or "model dispatch failed with a known error"
-            await self._commit(
-                partial(
-                    self._store.reject_model_attempt,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    reason=message,
-                    error_type=type(exc).__name__,
-                    error_message=message,
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
-                    budget_outcome="unknown",
-                )
-            )
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason=message,
-            )
-        accepted = await self._commit(
-            lambda: self._store.complete_model_attempt(
-                operation_id=operation.operation_id,
-                attempt_id=attempt.attempt_id,
-                generation=attempt.generation,
-                text=response.text,
-                provider_response_id=response.provider_response_id,
-                usage=response.usage,
-                tool_calls=tuple(
-                    {
-                        "id": call.id,
-                        "name": call.name,
-                        "arguments": dict(call.arguments),
-                    }
-                    for call in response.tool_calls
-                ),
-                response_status=response.status,
-                incomplete_reason=response.incomplete_reason,
-                reasoning_content=(
-                    response.reasoning_content
-                    if response.reasoning_content is not None
-                    else "".join(streamed_content["reasoning"])
-                ),
-                plan_content=(
-                    response.plan_content
-                    if response.plan_content is not None
-                    else "".join(streamed_content["plan"])
-                ),
-            )
-        )
-        if not accepted:
-            raise RuntimeError("current model attempt lost its commit generation")
-        if response.status == "incomplete":
-            return await self._fail_turn(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                reason=(f"Model returned an incomplete agent step: {response.incomplete_reason}."),
-            )
-        return response
+        return spec
 
-    async def _handle_model_response(
+    def _persist_settings(self) -> None:
+        self.store.update_session_settings(
+            self.thread_id,
+            {
+                "model_id": None
+                if self.model_control_plane is None
+                else self.model_control_plane.state.current_model_id,
+                "model_selection_requester": (
+                    None if self.model_control_plane is None else self.model_control_plane.state.selection_requester
+                ),
+                "tool_execution_policy": _tool_execution_policy_snapshot(self.tool_execution_context),
+            },
+        )
+
+    def _apply_tool_context(self) -> None:
+        if self.tool_orchestrator is not None:
+            self.tool_orchestrator.update_execution_context(self.tool_execution_context)
+
+    def update_tool_policy(
         self,
         *,
-        thread_id: str,
-        turn_id: str,
-        response: HarnessModelResponse,
-        prepared: PreparedModelCall,
-    ) -> TurnResult | None:
-        if response.tool_calls:
-            if self._tool_orchestrator is None:
-                raise RuntimeError("model requested tools but no ToolOrchestrator exists")
-            for call in response.tool_calls:
-                try:
-                    await self._tool_orchestrator.execute(
-                        turn_id=turn_id,
-                        call=_aci_tool_call(call, prepared.request_ref),
-                    )
-                except ToolApprovalRequiredError as pause:
-                    return TurnResult(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status="paused",
-                        interaction_id=pause.interaction_id,
-                    )
-                turn = self._store.read_turn(turn_id)
-                if turn.status == "paused":
-                    pending = [
-                        interaction
-                        for interaction in self._store.list_interactions(turn_id)
-                        if interaction.status == "pending"
-                    ]
-                    if len(pending) != 1:
-                        raise RuntimeError("paused tool execution has no unique interaction")
-                    return TurnResult(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status="paused",
-                        interaction_id=pending[0].request_id,
-                    )
-            return None
-        return await self._finish_answer(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            answer=response.text,
+        allow_write_tools: bool | None = None,
+        allow_execute_tools: bool | None = None,
+        require_confirmation_for: frozenset[str] | None = None,
+        denied_tool_names: frozenset[str] | None = None,
+        deny_effects: frozenset[ToolEffect] | None = None,
+        auto_approve_sandboxed: bool | None = None,
+    ) -> None:
+        self._ensure_open()
+        updates: dict[str, Any] = {
+            name: value
+            for name, value in {
+                "allow_write_tools": allow_write_tools,
+                "allow_execute_tools": allow_execute_tools,
+                "require_confirmation_for": require_confirmation_for,
+                "denied_tool_names": denied_tool_names,
+                "deny_effects": deny_effects,
+                "auto_approve_sandboxed": auto_approve_sandboxed,
+            }.items()
+            if value is not None
+        }
+        previous = self.tool_execution_context
+        self.tool_execution_context = replace(previous, **updates)
+        try:
+            self._persist_settings()
+        except BaseException:
+            self.tool_execution_context = previous
+            raise
+        self._apply_tool_context()
+
+    async def _open_agent_resources(
+        self,
+        agent: Agent,
+        *,
+        allow_write_tools: bool,
+        allow_execute_tools: bool,
+    ) -> tuple[BoundHarnessModel, dict[str, Any]]:
+        from agent_runtime.agent import _close_owned_sync_resource
+        from agent_runtime.runtime.mcp import (
+            decide_mcp_config_trust,
+            open_trusted_product_mcp_tools,
+            resolve_product_mcp_config,
+        )
+        from agent_runtime.skills.catalog import SkillCatalog
+        from agent_runtime.skills.loader import scan_and_load_skills
+        from agent_runtime.skills.policy import SkillPolicy
+        from agent_runtime.skills.runtime import SkillRuntime
+        from agent_runtime.tools.builtins import create_resident_coding_tools
+        from agent_runtime.tools.permissions import ToolExecutionContext
+        from agent_runtime.workspace import open_workspace
+
+        workspace = open_workspace(agent._workspace_path(), create=True)
+        self.model_control_plane = agent._get_model_control_plane()
+        self._stack.push_async_callback(
+            _close_owned_sync_resource,
+            self.model_control_plane,
+            label="model control plane",
         )
 
-    async def _finish_answer(
+        def acknowledge_plan_update(_arguments: object) -> dict[str, object]:
+            return {
+                "accepted": True,
+                "revision": 0,
+                "message": "Plan update recorded as a ToolResult.",
+            }
+
+        resident = create_resident_coding_tools(
+            workspace,
+            plan_updater=acknowledge_plan_update,
+        )
+        skill_policy = SkillPolicy()
+        manifests = [
+            manifest
+            for manifest in scan_and_load_skills(
+                workspace.root,
+                repo_root=workspace.root,
+            )
+            if skill_policy.is_skill_enabled(manifest)
+        ]
+        candidate_skill_runtime = SkillRuntime(
+            SkillCatalog(manifests),
+            policy=skill_policy,
+        )
+        skill_runtime = candidate_skill_runtime if candidate_skill_runtime.has_model_invocable_skills else None
+        provider: object | None = None
+        knowledge_revision: str | None = None
+        knowledge_runner: object | None = None
+        if agent.knowledge is not None:
+            from agent_runtime.knowledge_providers.rag import (
+                LazyRAGKnowledgeProvider,
+            )
+
+            provider = LazyRAGKnowledgeProvider(
+                config=agent.knowledge,
+                model_id=agent.model,
+                vector_dsn=os.environ.get("AGENT_VECTOR_DSN"),
+            )
+            self._stack.push_async_callback(_close_owned_sync_resource, provider, label="knowledge provider")
+            knowledge_runner = provider.search_knowledge
+            knowledge_revision = "rag_" + hashlib.sha256(agent.knowledge.model_dump_json().encode()).hexdigest()[:16]
+
+        config_path = resolve_product_mcp_config(workspace.root) if agent.enable_workspace_mcp else None
+        mcp_tools: tuple[Tool, ...] = ()
+        mcp_trust_binding: Mapping[str, object] | None = None
+        if config_path is not None:
+            trust = agent.mcp_config_trust or decide_mcp_config_trust(
+                config_path,
+                workspace_root=workspace.root,
+                trust_workspace=False,
+            )
+            mcp_tools = await self._stack.enter_async_context(open_trusted_product_mcp_tools(config_path, trust=trust))
+            mcp_trust_binding = {
+                "config_path": str(trust.config_path),
+                "config_source": trust.source,
+                "config_sha256": trust.config_sha256,
+            }
+        tools = {tool.definition.name: tool for tool in (*resident, *mcp_tools)}
+
+        from agent_runtime.builtin.generic import GENERIC_SYSTEM_PROMPT
+        from agent_runtime.harness.model_adapter import ControlPlaneHarnessModel
+
+        override = agent.__dict__.get("_harness_model")
+        model = (
+            override()
+            if callable(override)
+            else ControlPlaneHarnessModel(
+                control_plane=self.model_control_plane,
+                instructions=(GENERIC_SYSTEM_PROMPT,),
+            )
+        )
+        return model, dict(
+            tools=tools,
+            tool_execution_context=ToolExecutionContext(
+                workspace_root=workspace.root,
+                cwd=workspace.root,
+                allow_write_tools=allow_write_tools,
+                allow_execute_tools=allow_execute_tools,
+            ),
+            knowledge_runner=knowledge_runner if callable(knowledge_runner) else None,
+            knowledge_revision=knowledge_revision,
+            knowledge_config=None if agent.knowledge is None else agent.knowledge.model_dump(mode="json"),
+            discoverable_tool_names=tuple(tool.definition.name for tool in mcp_tools),
+            workspace_mcp_enabled=agent.enable_workspace_mcp,
+            mcp_config_trust=mcp_trust_binding,
+            enable_subagents=True,
+            skill_runtime=skill_runtime,
+        )
+
+    async def _prepare_step_binding(self, binding: Mapping[str, Any]) -> None:
+        if self.model_control_plane is None or "authentication_schema_version" not in binding:
+            validator = getattr(self.model, "ensure_available", None)
+            if callable(validator):
+                validator(binding, thread_id=binding["thread_id"], turn_id=binding["turn_id"])
+            return
+        from agent_runtime.local_runtime import ensure_local_provider_ready
+
+        spec = self.model_control_plane.model_spec_for_frozen_binding(
+            binding,
+            thread_id=binding["thread_id"],
+            turn_id=binding["turn_id"],
+        )
+        if spec.id != self._ready_model_id:
+            await ensure_local_provider_ready(spec)
+            self._ready_model_id = spec.id
+
+    async def _bootstrap_model_provider(self) -> None:
+        from agent_runtime.local_runtime import ensure_local_provider_ready
+
+        assert self.model_control_plane is not None
+        spec = self.model_control_plane.current_model()
+        await ensure_local_provider_ready(spec)
+        self._ready_model_id = spec.id
+
+    async def resume(
+        self,
+        turn_id: str,
+        action: str,
+        *,
+        user_input: str | None = None,
+        event_sink: AgentEventSink | None = None,
+    ) -> AgentResult:
+        async with self._active_turn(event_sink):
+            turn = self.store.read_turn(turn_id)
+            if turn.thread_id != self.thread_id:
+                raise RuntimeError("Turn belongs to a different Session")
+            executor = self._executor()
+            if action == "abort":
+                cancelled = await executor._commit(lambda: self.store.cancel_turn(turn_id=turn_id))
+                return AgentResult._from_harness(
+                    TurnResult(
+                        thread_id=self.thread_id,
+                        turn_id=turn_id,
+                        answer=None,
+                        status=cancelled.status,
+                    ),
+                    store=self.store,
+                )
+            pending = tuple(item for item in self.store.list_interactions(turn_id) if item.status == "pending")
+            approvals = [item for item in self.store.list_interactions(turn_id) if item.kind == "tool_approval"]
+            if turn.status == "completed" and approvals and action in {"allow_once", "approve", "deny"}:
+                internal = await executor.resume(
+                    turn_id=turn_id,
+                    decision="approve" if action == "allow_once" else action,
+                )
+                return AgentResult._from_harness(internal, store=self.store)
+            model_operations = self.store.list_model_operations(turn_id)
+            unknown_model = tuple(operation for operation in model_operations if operation.status == "unknown")
+            resolved_approved_ready = any(
+                interaction.kind == "tool_approval"
+                and interaction.status == "resolved"
+                and interaction.response.get("decision") == "approve"
+                and interaction.operation_id is not None
+                and self.store.read_tool_operation(interaction.operation_id).status == "ready"
+                for interaction in self.store.list_interactions(turn_id)
+            )
+            recoverable_committed_response = False
+            if (
+                turn.status == "running"
+                and model_operations
+                and model_operations[-1].status == "completed"
+                and model_operations[-1].response_item_id is not None
+            ):
+                response = self.store.read_item(model_operations[-1].response_item_id)
+                calls = response.payload.get("tool_calls")
+                recoverable_committed_response = bool(isinstance(calls, (list, tuple)) and calls)
+            if len(pending) == 1 and pending[0].kind == "tool_approval":
+                decision = {
+                    "allow_once": "approve",
+                    "approve": "approve",
+                    "deny": "deny",
+                }.get(action)
+                if decision is None:
+                    raise ValueError("tool approval action must be allow_once, approve, or deny")
+                internal = await executor.resume(
+                    turn_id=turn_id,
+                    decision=decision,
+                )
+            elif len(pending) == 1 and pending[0].kind in {
+                "clarification",
+                "choice",
+            }:
+                if action != "continue" or user_input is None:
+                    raise ValueError(f"{pending[0].kind} resume requires action=continue and user_input")
+                internal = await executor.respond_interaction(
+                    turn_id=turn_id,
+                    request_id=pending[0].request_id,
+                    response=user_input,
+                )
+            elif (
+                not pending
+                and len(unknown_model) == 1
+                and action
+                in {
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await executor.retry_unknown_model(turn_id=turn_id)
+            elif (
+                not pending
+                and resolved_approved_ready
+                and action
+                in {
+                    "allow_once",
+                    "approve",
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await executor.resume(
+                    turn_id=turn_id,
+                    decision="approve",
+                )
+            elif (
+                not pending
+                and recoverable_committed_response
+                and action
+                in {
+                    "continue",
+                    "retry",
+                }
+            ):
+                internal = await executor.recover_committed_model_response(turn_id=turn_id)
+            else:
+                raise RuntimeError("resume action does not match the Turn's durable pending state")
+            return AgentResult._from_harness(internal, store=self.store)
+
+    async def run_child(
         self,
         *,
-        thread_id: str,
-        turn_id: str,
-        answer: str,
-    ) -> TurnResult | None:
-        proposal_item = await self._commit(
-            lambda: self._store.record_final_proposal(
-                turn_id=turn_id,
-                answer=answer,
-            )
-        )
-        proposal = CompletionProposal(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            item_id=proposal_item.item_id,
-            answer=answer,
-        )
-        decision = self._completion_gate.evaluate(proposal)
-        await self._commit(
-            lambda: self._store.record_completion_decision(
-                turn_id=turn_id,
-                proposal_item_id=proposal.item_id,
-                action=decision.action,
-                reason=decision.reason,
-            )
-        )
-        if decision.action == "continue":
-            await self._commit(
-                lambda: self._store.record_completion_feedback(
+        user_message: str,
+        max_steps: int | None,
+        max_tokens_total: int | None,
+        max_cost_micros: int | None = None,
+        parent_turn_id: str | None = None,
+    ) -> TurnResult:
+        self._ensure_open()
+        task = asyncio.current_task()
+        assert task is not None
+        completed = asyncio.Event()
+        self._child_calls[task] = completed
+        try:
+            thread_id = f"thread_{uuid4().hex}"
+            turn_id = f"turn_{uuid4().hex}"
+            source_binding = current_tool_binding()
+            if source_binding is None:
+                source_binding = self.binding_provider.snapshot(
+                    thread_id=self.thread_id, turn_id=parent_turn_id or turn_id
+                )
+            binding = dict(
+                self.binding_provider.snapshot(
+                    thread_id=thread_id,
                     turn_id=turn_id,
-                    reason=decision.reason,
+                    model_binding=source_binding,
                 )
             )
-            return None
-        if decision.action == "pause":
-            interaction = await self._commit(
-                lambda: self._store.request_clarification(
-                    turn_id=turn_id,
-                    question=decision.reason,
+            policy_value = source_binding["tool_execution_policy"]
+            if not isinstance(policy_value, Mapping):
+                raise RuntimeError("source Step has no tool execution policy")
+            policy = dict(policy_value)
+            binding["tool_execution_policy"] = dict(policy)
+            policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
+            child_options = {
+                **self._service_options,
+                "model_binding": source_binding,
+                "tool_execution_context": replace(self.tool_execution_context, **policy),
+            }
+            # Borrow providers through the source binding, independent of the parent's next selection.
+            await self._prepare_step_binding(source_binding)
+            if max_steps is not None:
+                binding["model_step_budget"] = max_steps
+            binding["completion_policy"] = {"require_workspace_change": False}
+            if parent_turn_id is None:
+                self.store.create_thread(workspace=self.workspace_path, thread_id=thread_id)
+                binding["budget_root_turn_id"] = turn_id
+                if max_tokens_total is not None:
+                    binding["model_token_budget_total"] = max_tokens_total
+                if max_cost_micros is not None:
+                    binding["model_cost_budget_total_micros"] = max_cost_micros
+            else:
+                parent = self.store.read_turn(parent_turn_id)
+                if parent.thread_id != self.thread_id or parent.status != "running":
+                    raise RuntimeError("subagent parent Turn must still be running in this Session")
+                self.store.start_budgeted_child_turn(
+                    parent_turn_id=parent_turn_id,
+                    child_thread_id=thread_id,
+                    child_turn_id=turn_id,
+                    user_message=user_message,
+                    binding_manifest=binding,
+                    requested_tokens=max_tokens_total,
+                    requested_cost_micros=max_cost_micros,
                 )
-            )
-            return TurnResult(
+            # Child services and Store belong to a separate Session. The parent's
+            # live model and installed external tools are borrowed for this awaited call.
+            async with await Session.open(
+                database=self.database,
+                workspace=self.workspace_path,
+                model=self.model,
                 thread_id=thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="paused",
-                interaction_id=interaction.request_id,
-            )
-        if decision.action == "fail":
-            await self._commit(
-                lambda: self._store.fail_turn(
-                    turn_id=turn_id,
-                    reason=decision.reason,
-                )
-            )
-            return TurnResult(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                answer=None,
-                status="failed",
-            )
-        completed = await self._commit(
-            lambda: self._store.complete_turn(
-                turn_id=turn_id,
-                answer=answer,
-            )
-        )
-        return TurnResult(
-            thread_id=thread_id,
-            turn_id=completed.turn_id,
-            answer=answer,
-        )
-
-
-def _aci_tool_call(
-    call: HarnessToolCall,
-    request_ref: Mapping[str, Any],
-) -> ToolCall:
-    request_id = request_ref.get("request_id")
-    toolset_revision = request_ref.get("toolset_revision")
-    exposed = request_ref.get("exposed_tool_names")
-    if (
-        not isinstance(request_id, str)
-        or not isinstance(toolset_revision, str)
-        or not isinstance(exposed, (list, tuple))
-        or any(not isinstance(name, str) for name in exposed)
-    ):
-        raise RuntimeError("prepared model request omitted its tool origin manifest")
-    return ToolCall(
-        tool_call_id=call.id,
-        tool_name=call.name,
-        arguments=call.arguments,
-        origin=ToolCallOrigin(
-            request_id=request_id,
-            toolset_revision=toolset_revision,
-            exposed_tool_names=tuple(exposed),
-        ),
-    )
-
-
-def _response_from_committed_item(item: ItemSnapshot) -> HarnessModelResponse:
-    if item.kind != "model_response" or item.status != "completed":
-        raise RuntimeError("canonical model response Item is malformed")
-    text = item.payload.get("text")
-    provider_response_id = item.payload.get("provider_response_id")
-    usage = item.payload.get("usage")
-    raw_calls = item.payload.get("tool_calls", ())
-    response_status = item.payload.get("response_status", "completed")
-    incomplete_reason = item.payload.get("incomplete_reason")
-    if (
-        not isinstance(text, str)
-        or (provider_response_id is not None and not isinstance(provider_response_id, str))
-        or not isinstance(usage, Mapping)
-        or not isinstance(raw_calls, (list, tuple))
-        or response_status not in {"completed", "incomplete"}
-        or (incomplete_reason is not None and not isinstance(incomplete_reason, str))
-    ):
-        raise RuntimeError("canonical model response payload is malformed")
-    calls: list[HarnessToolCall] = []
-    for raw_call in raw_calls:
-        if not isinstance(raw_call, Mapping):
-            raise RuntimeError("canonical model tool call is malformed")
-        call_id = raw_call.get("id")
-        name = raw_call.get("name")
-        arguments = raw_call.get("arguments")
-        if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
-            raise RuntimeError("canonical model tool call is malformed")
-        calls.append(HarnessToolCall(id=call_id, name=name, arguments=arguments))
-    return HarnessModelResponse(
-        text=text,
-        provider_response_id=provider_response_id,
-        usage=usage,
-        tool_calls=tuple(calls),
-        status=response_status,
-        incomplete_reason=incomplete_reason,
-    )
-
-
-def _remaining_model_tokens(
-    binding_manifest: Mapping[str, Any],
-    *,
-    consumed: int,
-) -> int | None:
-    total = binding_manifest.get("model_token_budget_total")
-    if isinstance(total, bool) or not isinstance(total, int):
-        return None
-    return max(total - consumed, 0)
+                **child_options,
+            ) as child:
+                async with child._active_turn():
+                    executor = child._executor()
+                    if parent_turn_id is None:
+                        result = await executor.run(
+                            turn_id=turn_id,
+                            user_message=user_message,
+                            binding_manifest=binding,
+                        )
+                    else:
+                        result = await executor.run_turn(executor.restore_turn_context(turn_id), start_step=1)
+                if parent_turn_id is not None and result.status in {"completed", "failed", "cancelled"}:
+                    state = self.store.read_budget_state(turn_id)
+                    if state.reserved + state.uncertain + state.child_reserved == ResourceUsage():
+                        self.store.settle_child_budget(child_turn_id=turn_id)
+                return result
+        finally:
+            self._child_calls.pop(task)
+            completed.set()

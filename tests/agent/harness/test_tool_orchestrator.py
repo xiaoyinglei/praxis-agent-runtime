@@ -14,14 +14,13 @@ from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
     GatewayHarnessModel,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
-    RuntimeComposition,
+    Session,
     ToolOrchestrator,
 )
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
@@ -860,22 +859,25 @@ class AcceptToolAnswer:
         return CompletionDecision(action="accept", reason="tool answer is grounded")
 
 
-def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     model = ToolThenAnswerModel()
     registry = ToolRegistry()
     registry.register(_read_tool(workspace=workspace))
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptToolAnswer(),
         tools=registry.freeze(),
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("read README")
+        result = await runtime.submit("read README")
 
+        assert runtime.tool_orchestrator._resolved_scopes == {}
+        assert runtime.tool_orchestrator._claims == {}
         assert result.answer == "README was read"
         assert len(model.requests) == 2
         assert [message.role for message in model.requests[1].messages] == [
@@ -897,7 +899,8 @@ def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -> None
         assert runtime.store.verify().valid is True
 
 
-def test_tool_context_pairing_and_provider_request_hash_survive_restart(
+@pytest.mark.anyio
+async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -905,14 +908,14 @@ def test_tool_context_pairing_and_provider_request_hash_survive_restart(
     database = tmp_path / "rollout.sqlite3"
     registry = ToolRegistry()
     registry.register(_read_tool(workspace=workspace))
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=database,
         workspace=workspace,
         model=ToolThenAnswerModel(),
         completion_gate=AcceptToolAnswer(),
         tools=registry.freeze(),
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("read README")
+        result = await runtime.submit("read README")
         messages_before = RolloutContextManager(runtime.store).build(result.turn_id)
         thread_id = result.thread_id
 

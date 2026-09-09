@@ -4,15 +4,16 @@ import hashlib
 from collections.abc import Mapping
 from pathlib import Path
 
+import pytest
+
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
-    RuntimeComposition,
+    Session,
 )
 from agent_runtime.tools.permissions import ToolExecutionContext
 
@@ -123,11 +124,12 @@ class AcceptBothAnswers:
         return CompletionDecision(action="accept", reason="bounded result accepted")
 
 
-def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     model = ParentChildModel()
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
@@ -138,12 +140,12 @@ def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) -> Non
         ),
         enable_subagents=True,
     ) as runtime:
-        agent = HarnessAgent(runtime.thread_manager)
-        paused = agent.run("delegate this work")
+        agent = runtime
+        paused = await agent.submit("delegate this work")
 
         assert paused.status == "paused"
-        assert paused.interaction_id is not None
-        completed = agent.resume(paused.turn_id, "approve")
+        assert paused.pause.request_id is not None
+        completed = await agent.resume(paused.turn_id, "approve")
 
         assert completed.answer == "parent used child conclusion"
         threads = runtime.store.list_threads()

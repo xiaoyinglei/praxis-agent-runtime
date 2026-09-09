@@ -29,6 +29,7 @@ from agent_runtime.core.model_request import (
 )
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
+    ContextCompactionRequiredError,
     HarnessMessage,
     HarnessModelDelta,
     HarnessModelDeltaSink,
@@ -293,6 +294,11 @@ class ControlPlaneHarnessModel:
         return self._control_plane.freeze_model_binding(
             thread_id=thread_id,
             turn_id=turn_id,
+        )
+
+    def rebind(self, binding: Mapping[str, Any], *, thread_id: str, turn_id: str) -> dict[str, JsonValue]:
+        return self._control_plane.rebind_model_binding(
+            _authenticated_model_binding(binding), thread_id=thread_id, turn_id=turn_id,
         )
 
     def ensure_available(
@@ -615,42 +621,28 @@ def _budgeted_request(
             pair = (tail_start, summary_chars)
             if pair not in candidates:
                 candidates.append(pair)
-    most_compact = (context, canonical, input_tokens)
+    best_token_count = input_tokens
+    best_retained_tail = transcript_count
     for tail_start, summary_chars in candidates:
         projected = context.project_compaction(
             tail_start=tail_start,
             max_summary_chars=summary_chars,
-            project_tool_results=True,
         )
         if projected is context:
             continue
         candidate = build(projected)
         candidate_tokens = measured(candidate)
-        most_compact = (projected, candidate, candidate_tokens)
+        if candidate_tokens < best_token_count:
+            best_token_count = candidate_tokens
+            best_retained_tail = max(0, transcript_count - tail_start)
         if candidate_tokens <= max_input_tokens:
-            return (
-                projected,
-                candidate,
-                {
-                    "compacted": True,
-                    "input_tokens": candidate_tokens,
-                    "max_input_tokens": max_input_tokens,
-                    "parent_context_revision": context.context_revision,
-                    "projected_context_revision": projected.context_revision,
-                    "retained_tail_count": len(projected.transcript) - 1,
-                    "summary_max_chars": summary_chars,
-                },
+            raise ContextCompactionRequiredError(
+                input_tokens=input_tokens,
+                max_input_tokens=max_input_tokens,
+                retained_tail_messages=max(0, transcript_count - tail_start),
             )
-    projected, candidate, candidate_tokens = most_compact
-    return (
-        projected,
-        candidate,
-        {
-            "compacted": projected is not context,
-            "input_tokens": candidate_tokens,
-            "max_input_tokens": max_input_tokens,
-            "parent_context_revision": context.context_revision,
-            "projected_context_revision": projected.context_revision,
-            "retained_tail_count": max(0, len(projected.transcript) - 1),
-        },
+    raise ContextCompactionRequiredError(
+        input_tokens=input_tokens,
+        max_input_tokens=max_input_tokens,
+        retained_tail_messages=best_retained_tail,
     )

@@ -7,7 +7,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, cast
 
 from agent_runtime.knowledge import AgentCitation, AgentEvidence, agent_evidence_from_value
-from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
+from agent_runtime.planning import AgentPlan, PlanEvent
 from agent_runtime.tools.tool import JsonValue
 
 if TYPE_CHECKING:
@@ -366,6 +366,25 @@ class AgentResult:
                     error_type="IncompleteModelResponse",
                 )
             )
+        if (
+            turn.status == "failed"
+            and turn.terminal_reason_code is not None
+            and turn.terminal_message is not None
+            and not any(
+                diagnostic.code == turn.terminal_reason_code
+                for diagnostic in projected_diagnostics
+            )
+        ):
+            projected_diagnostics.insert(
+                0,
+                AgentDiagnostic(
+                    code=turn.terminal_reason_code,
+                    component="runtime",
+                    message=turn.terminal_message,
+                    severity="error",
+                    degraded=True,
+                ),
+            )
         diagnostics = tuple(projected_diagnostics)
         return cls(
             answer=result.answer,
@@ -391,7 +410,7 @@ class AgentResult:
             ),
             diagnostics=diagnostics,
             turn_id=turn.turn_id,
-            stop_reason=turn.status,
+            stop_reason=turn.terminal_reason_code or turn.status,
             pause=pause,
             workspace_path=thread.workspace,
             groundedness=groundedness,
@@ -408,118 +427,94 @@ def _project_harness_plan(
     *,
     turn_status: str,
 ) -> tuple[AgentPlan | None, tuple[PlanEvent, ...]]:
-    objective = next(
-        (
-            item.payload.get("text")
-            for item in items
-            if item.kind == "user_message"
-            and isinstance(item.payload.get("text"), str)
-        ),
-        "Current task",
-    )
-    successful_plan_calls = {
-        item.payload.get("tool_call_id")
-        for item in items
-        if item.kind == "tool_result"
-        and item.payload.get("tool_name") == "update_plan"
-        and item.payload.get("is_error") is not True
-    }
-    updates = [
+    del turn_status
+    plan_items = [
         item
         for item in items
-        if item.kind == "tool_call"
-        and item.payload.get("tool_name") == "update_plan"
-        and item.payload.get("tool_call_id") in successful_plan_calls
+        if item.kind == "plan_state"
+        and item.status == "completed"
+        and isinstance(item.payload.get("plan"), Mapping)
     ]
-    if not updates:
+    if not plan_items:
         return None, ()
+
     events: list[PlanEvent] = []
-    projected_steps: list[PlanStep] = []
-    summary: str | None = None
-    for revision, item in enumerate(updates, start=1):
-        arguments = item.payload.get("arguments")
-        if not isinstance(arguments, Mapping):
-            continue
-        raw_plan = arguments.get("plan")
-        if not isinstance(raw_plan, Sequence) or isinstance(raw_plan, (str, bytes)):
-            continue
-        candidate_steps: list[PlanStep] = []
-        for index, raw_step in enumerate(raw_plan, start=1):
-            if not isinstance(raw_step, Mapping):
-                continue
-            title = raw_step.get("step")
-            status = raw_step.get("status")
-            if not isinstance(title, str) or status not in {
-                "pending",
-                "in_progress",
-                "completed",
-            }:
-                continue
-            step_id = raw_step.get("step_id")
-            candidate_steps.append(
-                PlanStep(
-                    step_id=(
-                        step_id
-                        if isinstance(step_id, str) and step_id
-                        else f"step_{index}"
-                    ),
-                    title=title,
-                    status=status,
-                )
-            )
-        projected_steps = candidate_steps
-        explanation = arguments.get("explanation")
-        summary = explanation if isinstance(explanation, str) else None
-        call_id = str(item.payload.get("tool_call_id"))
-        events.append(
-            PlanEvent(
-                event_id=f"plan_event_{call_id}",
-                event_type="llm_update",
-                plan_revision=revision,
-                message=summary or "Applied update_plan tool update.",
-                related_step_id=next(
-                    (
-                        step.step_id
-                        for step in projected_steps
-                        if step.status == "in_progress"
-                    ),
-                    None,
-                ),
-                tool_call_ids=[call_id],
-            )
-        )
-    if not projected_steps:
-        return None, tuple(events)
-    revision = len(events)
-    if turn_status == "completed":
-        revision += 1
-        projected_steps = [
-            step.model_copy(update={"status": "completed"})
-            for step in projected_steps
+    for item in plan_items:
+        raw_plan = cast(Mapping[str, object], item.payload["plan"])
+        raw_event = item.payload.get("event")
+        event = raw_event if isinstance(raw_event, Mapping) else {}
+        revision = raw_plan.get("revision")
+        if isinstance(revision, bool) or not isinstance(revision, int):
+            raise RuntimeError("canonical plan_state revision is malformed")
+        raw_event_type = event.get("event_type")
+        event_type: Literal[
+            "initialized",
+            "llm_update",
+            "decision_progress",
+            "observation_progress",
+            "needs_replan",
+            "completed",
+            "blocked",
         ]
+        if raw_event_type in {
+            "initialized",
+            "llm_update",
+            "decision_progress",
+            "observation_progress",
+            "needs_replan",
+            "completed",
+            "blocked",
+        }:
+            event_type = cast(
+                Literal[
+                    "initialized",
+                    "llm_update",
+                    "decision_progress",
+                    "observation_progress",
+                    "needs_replan",
+                    "completed",
+                    "blocked",
+                ],
+                raw_event_type,
+            )
+        else:
+            plan_status = raw_plan.get("status")
+            if plan_status == "complete":
+                event_type = "completed"
+            elif plan_status == "blocked":
+                event_type = "blocked"
+            else:
+                event_type = "llm_update"
+        message = event.get("message")
+        related_step_id = event.get("related_step_id")
+        tool_call_ids = event.get("tool_call_ids")
         events.append(
             PlanEvent(
-                event_id=f"plan_event_completed_{revision}",
-                event_type="completed",
+                event_id=f"plan_event_{item.item_id}",
+                event_type=event_type,
                 plan_revision=revision,
-                message="Plan completed with the accepted Turn.",
+                message=(
+                    message
+                    if isinstance(message, str) and message
+                    else "Applied canonical plan transition."
+                ),
+                related_step_id=(
+                    related_step_id if isinstance(related_step_id, str) else None
+                ),
+                tool_call_ids=(
+                    [str(value) for value in tool_call_ids]
+                    if isinstance(tool_call_ids, Sequence)
+                    and not isinstance(tool_call_ids, (str, bytes))
+                    else []
+                ),
             )
         )
-    plan = AgentPlan(
-        objective=str(objective),
-        status="complete" if turn_status == "completed" else "active",
-        revision=revision,
-        active_step_id=next(
-            (
-                step.step_id
-                for step in projected_steps
-                if step.status == "in_progress"
-            ),
-            None,
-        ),
-        steps=projected_steps,
-        summary=summary,
-    )
+
+    canonical = cast(Mapping[str, object], plan_items[-1].payload["plan"])
+    raw_steps = canonical.get("steps")
+    if not isinstance(raw_steps, Sequence) or isinstance(raw_steps, (str, bytes)):
+        raise RuntimeError("canonical plan_state steps are malformed")
+    plan = AgentPlan.model_validate({**dict(canonical), "steps": list(raw_steps)})
     return plan, tuple(events)
 
 

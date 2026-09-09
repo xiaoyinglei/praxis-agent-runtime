@@ -67,6 +67,7 @@ def apply_record(
                 "active_turn_id": None,
                 "head_turn_id": None,
                 "head_version": 0,
+                "settings": {},
                 "applied_thread_sequence": sequence,
                 "reducer_version": reducer_version,
             }
@@ -79,15 +80,21 @@ def apply_record(
                 "active_turn_id": None,
                 "head_turn_id": payload["fork_turn_id"],
                 "head_version": 0,
+                "settings": {},
                 "applied_thread_sequence": sequence,
                 "reducer_version": reducer_version,
             }
+        case "session_settings_updated":
+            state.threads[thread_id]["settings"] = payload["settings"]
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
         case "turn_started":
             turn_id = payload["turn_id"]
             state.turns[turn_id] = {
                 "turn_id": turn_id,
                 "thread_id": thread_id,
                 "status": "running",
+                "terminal_reason_code": None,
+                "terminal_message": None,
                 "predecessor_turn_id": payload["predecessor_turn_id"],
                 "turn_index": payload["turn_index"],
                 "binding_manifest": payload["binding_manifest"],
@@ -518,6 +525,8 @@ def apply_record(
             turn_id = payload["turn_id"]
             turn = state.turns[turn_id]
             turn["status"] = "completed"
+            turn["terminal_reason_code"] = "completed"
+            turn["terminal_message"] = None
             turn["applied_thread_sequence"] = sequence
             thread = state.threads[thread_id]
             thread["active_turn_id"] = None
@@ -526,6 +535,12 @@ def apply_record(
             turn_id = payload["turn_id"]
             turn = state.turns[turn_id]
             turn["status"] = "cancelled" if record.record_type == "turn_cancelled" else "failed"
+            turn["terminal_reason_code"] = (
+                "cancelled"
+                if record.record_type == "turn_cancelled"
+                else payload["reason_code"]
+            )
+            turn["terminal_message"] = payload.get("message")
             turn["applied_thread_sequence"] = sequence
             thread = state.threads[thread_id]
             thread["active_turn_id"] = None

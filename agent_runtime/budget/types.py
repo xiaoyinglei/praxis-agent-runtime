@@ -136,7 +136,7 @@ class BudgetState:
         return self.used + self.reserved + self.uncertain + self.child_reserved
 
     def remaining(self, resource: str) -> int | None:
-        limit = getattr(self.limits, resource)
+        limit: int | None = getattr(self.limits, resource)
         if limit is None:
             return None
         exposed = _resource_value(self.exposure, resource)

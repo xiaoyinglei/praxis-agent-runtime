@@ -509,6 +509,8 @@ class ModelControlPlane:
         )
 
         self._registry = registry
+        self._resolved_bindings: dict[tuple[str, str], ResolvedModel] = {}
+        self._closed = False
         self._session_path = session_path
         self._session_store = (
             ModelSessionStore(session_path)
@@ -775,6 +777,28 @@ class ModelControlPlane:
         association["signature"] = trust.sign(association)
         return association
 
+    def rebind_model_binding(
+        self, binding: Mapping[str, JsonValue], *, thread_id: str, turn_id: str,
+    ) -> dict[str, JsonValue]:
+        source_thread = binding.get("thread_id")
+        source_turn = binding.get("turn_id")
+        if not isinstance(source_thread, str) or not isinstance(source_turn, str):
+            raise RuntimeError("child model binding has no source identity")
+        self._review_frozen_binding(binding, thread_id=source_thread, turn_id=source_turn)
+        _validate_binding_identity(thread_id, field_name="thread_id")
+        _validate_binding_identity(turn_id, field_name="turn_id")
+        trust = self._trust_domain
+        assert trust is not None
+        envelope = binding["binding"]
+        assert isinstance(envelope, Mapping)
+        association = build_model_binding_association(
+            status=trust.status(), thread_id=thread_id, turn_id=turn_id,
+            selection_requester=validate_model_switch_requester(binding["selection_requester"]),
+            binding=envelope,
+        )
+        association["signature"] = trust.sign(association)
+        return association
+
     def resolve_frozen_binding(
         self,
         binding: Mapping[str, JsonValue],
@@ -782,6 +806,8 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ResolvedModel:
+        if self._closed:
+            raise RuntimeError("model control plane is closed")
         model_id, reviewed = (
             self._review_frozen_binding(
                 binding,
@@ -809,10 +835,34 @@ class ModelControlPlane:
         self._ensure_model_credentials(
             spec
         )
-        return cast(
-            ResolvedModel,
-            resolver(reviewed),
-        )
+        revision = reviewed.definition_revision
+        credential = os.environ.get(spec.api_key_env, "").strip() if spec.api_key_env else ""
+        credential_revision = hashlib.sha256(credential.encode()).hexdigest()
+        cache_key = (revision, credential_revision)
+        if cache_key not in self._resolved_bindings:
+            # Retain older clients until close: a concurrent child may still
+            # be dispatching through an earlier credential. Never persist keys.
+            self._resolved_bindings[cache_key] = cast(ResolvedModel, resolver(reviewed))
+        return self._resolved_bindings[cache_key]
+
+    def close(self) -> None:
+        from contextlib import ExitStack
+
+        if self._closed:
+            return
+        self._closed = True
+        resolved = tuple(self._resolved_bindings.values())
+        self._resolved_bindings.clear()
+        with ExitStack() as stack:
+            seen: set[int] = set()
+            for model in resolved:
+                generator = model.generator
+                if id(generator) in seen:
+                    continue
+                seen.add(id(generator))
+                close = getattr(generator, "close", None)
+                if callable(close):
+                    stack.callback(close)
 
 
     def _review_frozen_binding(

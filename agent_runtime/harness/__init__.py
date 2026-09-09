@@ -1,10 +1,8 @@
 """Praxis Harness public runtime protocol."""
 
 from agent_runtime.harness.completion import DeliveryCompletionGate
-from agent_runtime.harness.composition import RuntimeComposition
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.events import ReplayEvent, RolloutEvent, RolloutEventReader
-from agent_runtime.harness.facade import HarnessAgent
 from agent_runtime.harness.migration import (
     LegacyMigrationReport,
     migrate_legacy_turns,
@@ -21,6 +19,7 @@ from agent_runtime.harness.protocol import (
     CompletionGate,
     CompletionProposal,
     ContextBudgetExceededError,
+    ContextCompactionRequiredError,
     ContextManager,
     HarnessMessage,
     HarnessModel,
@@ -49,13 +48,13 @@ from agent_runtime.harness.rollout import (
     TurnSnapshot,
     VerificationReport,
 )
-from agent_runtime.harness.session import Session, StepContext, TurnContext
-from agent_runtime.harness.thread_manager import ThreadManager
+from agent_runtime.harness.session import Session
 from agent_runtime.harness.tool_orchestrator import (
     ToolOrchestrator,
     ToolReconciliationOutcome,
 )
 from agent_runtime.harness.tool_router import DurableToolRouter, StaticToolRouter
+from agent_runtime.harness.turn import StepContext, TurnContext, TurnExecutor
 
 __all__ = [
     "ArtifactSnapshot",
@@ -68,10 +67,10 @@ __all__ = [
     "ControlPlaneHarnessModel",
     "ContextManager",
     "ContextBudgetExceededError",
+    "ContextCompactionRequiredError",
     "DeliveryCompletionGate",
     "DurableToolRouter",
     "HarnessMessage",
-    "HarnessAgent",
     "GatewayHarnessModel",
     "HarnessModel",
     "HarnessModelDelta",
@@ -93,9 +92,7 @@ __all__ = [
     "RolloutEvent",
     "RolloutEventReader",
     "RolloutStore",
-    "RuntimeComposition",
     "ThreadSnapshot",
-    "ThreadManager",
     "StaticToolRouter",
     "ToolOrchestrator",
     "ToolReconciliationOutcome",
@@ -104,6 +101,7 @@ __all__ = [
     "Session",
     "StepContext",
     "TurnContext",
+    "TurnExecutor",
     "TurnSnapshot",
     "ToolOperationSnapshot",
     "VerificationReport",

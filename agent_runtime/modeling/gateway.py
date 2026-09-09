@@ -30,14 +30,14 @@ from agent_runtime.modeling.local_agent_wire import (
     parse_local_agent_response,
     render_local_agent_request,
 )
-from agent_runtime.modeling.quota import (
-    ProviderQuotaGate,
-    acquire_provider_quota,
-)
 from agent_runtime.modeling.openai_wire import (
     parse_openai_response,
     parse_openai_usage,
     serialize_openai_request,
+)
+from agent_runtime.modeling.quota import (
+    ProviderQuotaGate,
+    acquire_provider_quota,
 )
 
 

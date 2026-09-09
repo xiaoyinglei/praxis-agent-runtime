@@ -3,14 +3,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from agent_runtime.agent import Agent
-from agent_runtime.harness import RolloutStore
-from agent_runtime.models import ModelSpec
-from agent_runtime.result import AgentResult
+from agent_runtime.harness import RolloutStore, Session
+from agent_runtime.models import ModelSessionState, ModelSpec
+from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
 
 def _local_spec(model_id: str) -> ModelSpec:
@@ -43,40 +42,18 @@ async def test_run_opens_runtime_without_frozen_turn_binding(
 
     opened_with: list[dict[str, object]] = []
 
-    class FakeThreadManager:
-        async def run(
-            self,
-            **_kwargs: object,
-        ) -> object:
-            return object()
-
-    fake_runtime = SimpleNamespace(
-        thread_manager=FakeThreadManager(),
-        store=object(),
-    )
-
-    @asynccontextmanager
-    async def fake_open_runtime(
-        **kwargs: object,
-    ):
-        opened_with.append(dict(kwargs))
-        yield fake_runtime
-
-    monkeypatch.setattr(
-        agent,
-        "_open_harness_runtime",
-        fake_open_runtime,
-    )
-
     sentinel = object()
 
-    monkeypatch.setattr(
-        AgentResult,
-        "_from_harness",
-        staticmethod(
-            lambda *_args, **_kwargs: sentinel
-        ),
-    )
+    class FakeSession:
+        async def submit(self, *args, **kwargs):
+            return sentinel
+
+    @asynccontextmanager
+    async def fake_session(**kwargs):
+        opened_with.append(dict(kwargs))
+        yield FakeSession()
+
+    monkeypatch.setattr(agent, "session", fake_session)
 
     result = await agent.run(
         "Inspect the repository.",
@@ -89,9 +66,7 @@ async def test_run_opens_runtime_without_frozen_turn_binding(
     # Critical lifecycle contract:
     # run() creates a new Turn, so it must not request
     # frozen-Turn provider bootstrap.
-    assert opened_with[0].get(
-        "frozen_turn_id"
-    ) is None
+    assert opened_with[0].get("frozen_turn_id") is None
 
 
 @pytest.mark.anyio
@@ -99,11 +74,10 @@ async def test_model_bootstrap_uses_current_selected_model_for_new_turn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    current_spec = _local_spec(
-        "current-model"
-    )
+    current_spec = _local_spec("current-model")
 
     class FakeControlPlane:
+        state = ModelSessionState(current_model_id="current-model")
         def current_model(self) -> ModelSpec:
             return current_spec
 
@@ -127,18 +101,19 @@ async def test_model_bootstrap_uses_current_selected_model_for_new_turn(
         ready.append(spec)
 
     monkeypatch.setattr(
-        "agent_runtime.local_runtime."
-        "ensure_local_provider_ready",
+        "agent_runtime.local_runtime.ensure_local_provider_ready",
         fake_ensure_ready,
     )
 
-    await agent._bootstrap_model_provider()
+    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    async with agent.session(require_workspace_change=False):
+        pass
 
     assert ready == [current_spec]
 
 
 @pytest.mark.anyio
-async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
+async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -148,9 +123,10 @@ async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
     database = tmp_path / "rollout.sqlite3"
 
     frozen_binding = {
-    "authentication_schema_version": 2,
-    "model_id": "frozen-model",
-    "test_marker": "frozen-binding",}
+        "authentication_schema_version": 2,
+        "model_id": "frozen-model",
+        "test_marker": "frozen-binding",
+    }
 
     with RolloutStore(database) as store:
         thread = store.create_thread(
@@ -163,20 +139,14 @@ async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
             binding_manifest=frozen_binding,
         )
 
-    frozen_spec = _local_spec(
-        "frozen-model"
-    )
+    frozen_spec = _local_spec("frozen-model")
 
-    reviewed: list[
-        tuple[dict[str, object], str, str]
-    ] = []
+    reviewed: list[tuple[dict[str, object], str, str]] = []
 
     class FakeControlPlane:
+        state = ModelSessionState(current_model_id="current-model")
         def current_model(self) -> ModelSpec:
-            raise AssertionError(
-                "resume bootstrap must not use "
-                "the current selected model"
-            )
+            raise AssertionError("resume bootstrap must not use the current selected model")
 
         def model_spec_for_frozen_binding(
             self,
@@ -217,20 +187,22 @@ async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
         ready.append(spec)
 
     monkeypatch.setattr(
-        "agent_runtime.local_runtime."
-        "ensure_local_provider_ready",
+        "agent_runtime.local_runtime.ensure_local_provider_ready",
         fake_ensure_ready,
     )
 
-    await agent._bootstrap_model_provider(
-        frozen_turn_id=turn.turn_id,
-    )
+    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    operation_binding = {**frozen_binding, "thread_id": thread.thread_id, "turn_id": turn.turn_id}
+    async with await Session.open(agent=agent, frozen_turn_id=turn.turn_id) as session:
+        assert ready == []
+        assert reviewed == []
+        await session._prepare_step_binding(operation_binding)
 
     assert ready == [frozen_spec]
 
     assert reviewed == [
         (
-            frozen_binding,
+            operation_binding,
             thread.thread_id,
             turn.turn_id,
         )
@@ -238,97 +210,37 @@ async def test_model_bootstrap_uses_frozen_turn_model_for_resume(
 
 
 @pytest.mark.anyio
-async def test_provider_bootstrap_completes_before_runtime_composition_opens(
+async def test_provider_bootstrap_uses_session_settings_and_is_reused_across_submissions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """
-    Provider readiness belongs to async bootstrap.
-
-    RuntimeComposition / Session construction must happen only
-    after that bootstrap has completed.
-    """
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    from agent_runtime.harness import session as session_module
 
     agent = Agent(
         checkpoint_db=tmp_path / "rollout.sqlite3",
-        workspace_path=workspace,
+        workspace_path=tmp_path,
         model_session_path=None,
         enable_workspace_mcp=False,
     )
+    lifecycle = []
 
-    lifecycle: list[str] = []
+    async def bootstrap(spec):
+        assert spec.id
+        lifecycle.append("provider_ready")
 
-    async def fake_bootstrap(
-        *,
-        frozen_turn_id: str | None = None,
-    ) -> None:
-        assert frozen_turn_id is None
-        lifecycle.append(
-            "provider_ready"
-        )
+    configure = session_module.configure_services
 
-    monkeypatch.setattr(
-        agent,
-        "_bootstrap_model_provider",
-        fake_bootstrap,
-    )
+    def configure_after_bootstrap(session, **kwargs):
+        assert lifecycle == []
+        configure(session, **kwargs)
+        lifecycle.append("services_created")
 
-    # Avoid constructing the real model adapter.
-    monkeypatch.setattr(
-        agent,
-        "_harness_model",
-        lambda: object(),
-    )
-
-    class FakeRuntime:
-        def close(self) -> None:
-            lifecycle.append(
-                "runtime_closed"
-            )
-
-    def fake_runtime_open(
-        **_kwargs: object,
-    ) -> FakeRuntime:
-        # This is the important assertion:
-        # RuntimeComposition cannot exist yet
-        # if provider bootstrap has not completed.
-        assert lifecycle == [
-            "provider_ready"
-        ]
-
-        lifecycle.append(
-            "runtime_opened"
-        )
-
-        return FakeRuntime()
-
-    from agent_runtime.harness import (
-        RuntimeComposition,
-    )
-
-    monkeypatch.setattr(
-        RuntimeComposition,
-        "open",
-        fake_runtime_open,
-    )
-
-    async with agent._open_harness_runtime(
-        require_workspace_change=False,
-        allow_write_tools=False,
-        allow_execute_tools=False,
-        max_steps=1,
-        max_tokens_total=None,
-        max_cost_micros=None,
-    ):
-        lifecycle.append(
-            "inside_runtime"
-        )
-
-    assert lifecycle == [
-        "provider_ready",
-        "runtime_opened",
-        "inside_runtime",
-        "runtime_closed",
-    ]
+    monkeypatch.setattr("agent_runtime.local_runtime.ensure_local_provider_ready", bootstrap)
+    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(session_module, "configure_services", configure_after_bootstrap)
+    async with agent.session(require_workspace_change=False) as session:
+        assert lifecycle == ["services_created", "provider_ready"]
+        await session.submit("first")
+        await session.submit("second")
+        assert lifecycle == ["services_created", "provider_ready"]
+    assert session._closed

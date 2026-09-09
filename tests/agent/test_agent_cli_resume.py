@@ -151,13 +151,6 @@ def test_schema_v3_resume_reads_only_outer_model_id(
     assert cli._cli_turn(database, turn_id).runtime.model_id == "removed-model-id"
     assert facade_options[0]["model"] is None
 
-    agent = Agent(
-        model="definitely-removed-alias",
-        checkpoint_db=database,
-        workspace_path=workspace,
-    )
-    restored = agent._harness_agent_for_turn(turn_id, followup=False)
-    assert restored.model is None
 
 
 @pytest.mark.parametrize("action", ["continue", "retry"])
@@ -215,7 +208,7 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
 
 
 @pytest.mark.anyio
-async def test_public_legacy_resume_reaches_exact_provider_resume_error(
+async def test_public_resume_rejects_explicit_unavailable_session_model_before_io(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "agent.sqlite"
@@ -243,10 +236,9 @@ async def test_public_legacy_resume_reaches_exact_provider_resume_error(
         enable_workspace_mcp=False,
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="legacy model binding is incomplete and cannot be resumed safely",
-    ):
+    from agent_runtime.core.llm_registry import UnknownModelIdError
+
+    with pytest.raises(UnknownModelIdError, match="definitely-removed-alias"):
         await agent.resume(
             turn.turn_id,
             "continue",

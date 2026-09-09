@@ -89,6 +89,28 @@ class SubagentCitation(BaseModel):
     source_type: str | None = Field(default=None, max_length=200)
 
 
+class SubagentPause(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(min_length=1, max_length=500)
+    kind: Literal[
+        "tool_approval",
+        "tool_reconciliation",
+        "choice",
+        "clarification",
+    ]
+    question: str = Field(min_length=1, max_length=20_000)
+
+
+class SubagentExecutionEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["test", "static_analysis", "assertion", "inspection"]
+    verifier: str = Field(min_length=1, max_length=500)
+    operation_id: str = Field(min_length=1, max_length=500)
+    verified_resources: list[str] = Field(default_factory=list, max_length=50)
+
+
 class SubagentOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -102,6 +124,11 @@ class SubagentOutput(BaseModel):
     status: Literal["done", "failed", "paused"] = "failed"
     child_turn_id: str = Field(default="", max_length=500)
     stop_reason: str | None = Field(default=None, max_length=1000)
+    pause: SubagentPause | None = None
+    execution_evidence: list[SubagentExecutionEvidence] = Field(
+        default_factory=list,
+        max_length=50,
+    )
 
 
 _SUBAGENT_INPUT_SCHEMA, _validate_subagent_input = pydantic_input(SubagentInput)
@@ -159,22 +186,14 @@ def _normalize_subagent_output(raw: object) -> NormalizedToolOutput:
         _SUBAGENT_OUTPUT_SCHEMA,
         validated.model_dump(mode="json"),
     )
-    is_error = validated.status != "done"
-    error_code = (
-        None
-        if not is_error
-        else (
-            "subagent_paused"
-            if validated.status == "paused"
-            else "subagent_failed"
-        )
-    )
+    is_error = validated.status == "failed"
+    error_code = "subagent_failed" if is_error else None
     return NormalizedToolOutput(
         structured_content=structured,
         is_error=is_error,
         error_code=error_code,
         error_message=validated.conclusion[:2000] if is_error else None,
-        retryable=validated.status == "paused",
+        retryable=False,
         metadata={"child_turn_id": validated.child_turn_id},
     )
 
@@ -184,6 +203,8 @@ __all__ = [
     "SubagentEvidenceRef",
     "SubagentInput",
     "SubagentOutput",
+    "SubagentPause",
+    "SubagentExecutionEvidence",
     "SubagentRunner",
     "create_subagent_tool",
 ]

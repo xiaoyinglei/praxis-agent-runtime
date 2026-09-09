@@ -50,11 +50,13 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "completion_feedback",
         "context_compaction",
         "context_message",
+        "verification",
     }
 )
 _SUPPRESSED_RECORD_TYPES = frozenset(
     {
         "thread_created",
+        "session_settings_updated",
         "thread_forked",
         "artifact_committed",
         "budget_reserved",

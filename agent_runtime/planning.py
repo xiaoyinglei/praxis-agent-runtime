@@ -237,10 +237,11 @@ class PlanTracker:
 
 def _valid_active_step_id(active_step_id: str | None, steps: Sequence[PlanStep]) -> str | None:
     step_ids = {step.step_id for step in steps}
-    if active_step_id is not None:
-        safe = _safe_identifier(active_step_id, prefix="step")
-        if safe in step_ids:
-            return safe
+    if active_step_id is None:
+        return None
+    safe = _safe_identifier(active_step_id, prefix="step")
+    if safe in step_ids:
+        return safe
     for status in ("in_progress", "pending"):
         for step in steps:
             if step.status == status:

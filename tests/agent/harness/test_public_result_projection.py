@@ -9,11 +9,11 @@ import pytest
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RuntimeComposition,
+    RolloutStore,
+    Session,
     TurnResult,
 )
 from agent_runtime.result import AgentResult, AgentToolCall
@@ -85,18 +85,19 @@ class AcceptPublicAnswer:
         return CompletionDecision(action="accept", reason="public answer accepted")
 
 
-def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=PublicAnswerModel(),
         completion_gate=AcceptPublicAnswer(),
     ) as runtime:
-        internal = HarnessAgent(runtime.thread_manager).run("answer publicly")
+        internal = await runtime.submit("answer publicly")
 
-        result = AgentResult._from_harness(internal, store=runtime.store)
+        result = internal
 
         assert result.answer == "public harness answer"
         assert result.status == "done"
@@ -113,12 +114,55 @@ def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path: Path)
         assert result.stop_reason == "completed"
 
 
-def test_public_pause_projects_the_frozen_choice_question_and_options(
+@pytest.mark.anyio
+async def test_failed_result_projects_canonical_terminal_reason(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    async with await Session.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=workspace,
+        model=PublicAnswerModel(),
+        completion_gate=AcceptPublicAnswer(),
+    ) as runtime:
+        thread = runtime.store.create_thread(workspace=workspace)
+        turn = runtime.store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="exhaust the step budget",
+            binding_manifest={"model_id": "public-model"},
+        )
+        failed = runtime.store.fail_turn(
+            turn_id=turn.turn_id,
+            reason_code="model_step_budget_exhausted",
+            message="Turn exhausted its frozen model step budget.",
+        )
+
+        result = AgentResult._from_harness(
+            TurnResult(
+                thread_id=thread.thread_id,
+                turn_id=failed.turn_id,
+                answer=None,
+                status="failed",
+            ),
+            store=runtime.store,
+        )
+
+        assert result.status == "failed"
+        assert result.stop_reason == "model_step_budget_exhausted"
+        assert [(diagnostic.code, diagnostic.message) for diagnostic in result.diagnostics] == [
+            (
+                "model_step_budget_exhausted",
+                "Turn exhausted its frozen model step budget.",
+            )
+        ]
+
+
+@pytest.mark.anyio
+async def test_public_pause_projects_the_frozen_choice_question_and_options(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=PublicAnswerModel(),
@@ -154,49 +198,28 @@ def test_public_pause_projects_the_frozen_choice_question_and_options(
         assert result.needs_user_input == "Which target?"
 
 
-def test_completed_result_is_read_after_disconnect_without_rerunning_model_or_gate(
+@pytest.mark.anyio
+async def test_completed_result_is_read_after_disconnect_without_rerunning_model_or_gate(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=database,
         workspace=workspace,
         model=PublicAnswerModel(),
         completion_gate=AcceptPublicAnswer(),
     ) as initial:
-        committed = HarnessAgent(initial.thread_manager).run("commit before disconnect")
+        committed = await initial.submit("commit before disconnect")
 
-    class NeverCalledModel(PublicAnswerModel):
-        def __init__(self) -> None:
-            self.prepare_calls = 0
+    from unittest.mock import patch
 
-        def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-            del request
-            self.prepare_calls += 1
-            raise AssertionError("read_result must not prepare a model call")
+    from agent_runtime import Agent
 
-    class NeverCalledGate:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
-            del proposal
-            self.calls += 1
-            raise AssertionError("read_result must not rerun CompletionGate")
-
-    model = NeverCalledModel()
-    gate = NeverCalledGate()
-    with RuntimeComposition.open(
-        database=database,
-        workspace=workspace,
-        model=model,
-        completion_gate=gate,
-    ) as reconnected:
-        replayed = HarnessAgent(reconnected.thread_manager).read_result(committed.turn_id)
-
-        assert replayed == committed
-        assert model.prepare_calls == 0
-        assert gate.calls == 0
-        assert reconnected.store.verify().valid is True
+    reader = Agent(checkpoint_db=database, workspace_path=workspace)
+    with patch.object(reader, "_harness_model", side_effect=AssertionError("read must not open a model")):
+        replayed = await reader.read_result(committed.turn_id)
+    assert replayed == committed
+    with RolloutStore(database) as store:
+        assert store.verify().valid is True

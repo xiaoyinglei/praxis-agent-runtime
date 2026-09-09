@@ -56,12 +56,17 @@ async def test_subagent_factory_is_an_ordinary_tool_and_normalizes_output() -> N
 
 
 @pytest.mark.anyio
-async def test_subagent_non_done_status_becomes_canonical_error_result() -> None:
+async def test_subagent_pause_is_preserved_without_becoming_a_tool_failure() -> None:
     async def run(_arguments: Mapping[str, JsonValue]) -> object:
         return SubagentOutput(
             conclusion="Needs approval.",
             status="paused",
             child_turn_id="child-paused",
+            pause={
+                "request_id": "approval-1",
+                "kind": "tool_approval",
+                "question": "Allow the child tool?",
+            },
         )
 
     tool = create_subagent_tool(run)
@@ -72,9 +77,14 @@ async def test_subagent_non_done_status_becomes_canonical_error_result() -> None
         ),
     )
 
-    assert execution.result.is_error is True
-    assert execution.result.error_code == "subagent_paused"
-    assert execution.result.retryable is True
+    assert execution.result.is_error is False
+    assert execution.result.error_code is None
+    assert execution.result.retryable is False
+    assert execution.result.structured_content["pause"] == {
+        "request_id": "approval-1",
+        "kind": "tool_approval",
+        "question": "Allow the child tool?",
+    }
 
 
 @pytest.mark.anyio

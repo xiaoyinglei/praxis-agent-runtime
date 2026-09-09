@@ -15,7 +15,7 @@ from agent_runtime.harness import (
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
-    Session,
+    TurnExecutor,
 )
 
 
@@ -153,7 +153,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = NeverCalledModel()
-        result = await Session(
+        result = await TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -229,6 +229,45 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
 
         store.rebuild_projections()
         assert manager.build(second.turn_id) == projected
+
+
+def test_budget_compaction_is_durable_and_preserves_user_constraints_as_data(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        first = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="Keep the runtime architecture and never write outside workspace.",
+            binding_manifest={"model_id": "model-v1"},
+        )
+        store.complete_turn(turn_id=first.turn_id, answer="acknowledged")
+        second = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="Continue with the current implementation.",
+            binding_manifest={"model_id": "model-v1"},
+        )
+        manager = RolloutContextManager(store)
+
+        compaction = manager.compact_for_budget(
+            turn_id=second.turn_id,
+            retained_tail_messages=1,
+        )
+
+        projected = manager.build(second.turn_id)
+        assert [message.role for message in projected] == ["context", "user"]
+        payload = compaction.payload
+        assert "[truncated]" not in payload["summary"]
+        assert payload["preserved_facts"]["architecture_and_safety_constraints"] == [
+            {
+                "item_id": store.list_context_items(second.turn_id)[0].item_id,
+                "kind": "user_message",
+                "text": "Keep the runtime architecture and never write outside workspace.",
+            }
+        ]
+        assert store.verify().valid is True
 
 
 def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(

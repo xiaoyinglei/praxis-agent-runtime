@@ -41,6 +41,7 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent
+    from agent_runtime.harness.session import Session
     from agent_runtime.result import AgentPause
 
 agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -508,77 +509,88 @@ async def _chat_facade_loop(
     chat_workspace = default_chat_workspace
     model_id = facade.current_model().id
     _print_startup_banner(model_id)
-    while True:
-        try:
-            query = composer.prompt("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见。")
-            return
-        if not query:
-            continue
-        if query == "/exit":
-            return
-        if query == "/help":
-            _print_chat_help()
-            continue
-        if query == "/status":
-            print(f"Previous Turn: {current_turn_id or '(none)'}")
-            print(f"模型: {model_id}")
-            print(f"工作区: {chat_workspace}")
-            print(f"详细输出: {'开' if verbose else '关'}")
-            continue
-        if query in {"/new", "/clear"}:
-            current_turn_id = None
-            chat_workspace = default_chat_workspace
-            model_id = facade.current_model().id
-            print("下一条消息将使用空历史。")
-            continue
-        if query == "/verbose":
-            verbose = not verbose
-            event_display.set_verbose(verbose)
-            print(f"详细输出: {'开' if verbose else '关'}")
-            continue
-        if query == "/model" or query.startswith("/model "):
-            _handle_model_slash_command(
-                query,
-                agent=facade,
-            )
-            model_id = facade.current_model().id
-            continue
-        if query.startswith("/"):
-            print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
-            continue
+    from contextlib import AsyncExitStack
 
-        event_display.begin_turn()
-        result = await facade.run(
-            query,
-            previous_turn_id=current_turn_id,
-            max_turns=max_turns,
-            max_tokens_total=max_tokens_total,
-            require_workspace_change=False,
-            allow_write_tools=allow_write_tools,
+    async with AsyncExitStack() as stack:
+        session = await stack.enter_async_context(facade.session(
+            previous_turn_id=previous_turn_id,
+            max_turns=max_turns, max_tokens_total=max_tokens_total,
+            require_workspace_change=False, allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
-            event_sink=event_display,
-        )
-        current_turn_id = result.turn_id
-        while result.status == "paused":
-            event_display.finish()
-            action = _handle_pause(result)
-            if action is None:
-                print("已取消。")
-                break
+        ))
+        while True:
+            try:
+                query = (await asyncio.to_thread(composer.prompt, "> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见。")
+                return
+            if not query:
+                continue
+            if query == "/exit":
+                return
+            if query == "/help":
+                _print_chat_help()
+                continue
+            if query == "/status":
+                print(f"Previous Turn: {current_turn_id or '(none)'}")
+                print(f"模型: {model_id}")
+                print(f"工作区: {chat_workspace}")
+                print(f"详细输出: {'开' if verbose else '关'}")
+                continue
+            if query in {"/new", "/clear"}:
+                await stack.aclose()
+                facade.model = model_id
+                session = await stack.enter_async_context(facade.session(
+                    max_turns=max_turns, max_tokens_total=max_tokens_total,
+                    require_workspace_change=False, allow_write_tools=allow_write_tools,
+                    allow_execute_tools=allow_execute_tools,
+                ))
+                current_turn_id = None
+                chat_workspace = default_chat_workspace
+                model_id = session.current_model().id
+                print("下一条消息将使用空历史。")
+                continue
+            if query == "/verbose":
+                verbose = not verbose
+                event_display.set_verbose(verbose)
+                print(f"详细输出: {'开' if verbose else '关'}")
+                continue
+            if query == "/model" or query.startswith("/model "):
+                _handle_model_slash_command(
+                    query,
+                    agent=session,
+                )
+                model_id = session.current_model().id
+                continue
+            if query.startswith("/"):
+                print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
+                continue
+
             event_display.begin_turn()
-            result = await facade.resume(
-                result.turn_id,
-                action,
+            result = await session.submit(
+                query,
                 event_sink=event_display,
             )
-        event_display.finish()
-        _display_agent_result(
-            result,
-            verbose=verbose,
-            answer_streamed=event_display.answer_streamed,
-        )
+            current_turn_id = result.turn_id
+            while result.status == "paused":
+                event_display.finish()
+                action = _handle_pause(result)
+                if action is None:
+                    result = await session.resume(result.turn_id, "abort")
+                    print("已取消。")
+                    break
+                event_display.begin_turn()
+                result = await session.resume(
+                    result.turn_id,
+                    action,
+                    event_sink=event_display,
+                )
+            event_display.finish()
+            _display_agent_result(
+                result,
+                verbose=verbose,
+                answer_streamed=event_display.answer_streamed,
+            )
 
 
 def _print_current_model(spec: ModelSpec) -> None:
@@ -588,7 +600,7 @@ def _print_current_model(spec: ModelSpec) -> None:
     print(f"location: {spec.location}")
 
 
-def _print_model_menu(agent: Agent) -> None:
+def _print_model_menu(agent: Agent | Session) -> None:
     current = agent.current_model()
     print(f"当前模型: {current.id}")
     print("可用模型:")
@@ -603,7 +615,7 @@ def _print_model_menu(agent: Agent) -> None:
 def _handle_model_slash_command(
     query: str,
     *,
-    agent: Agent | None,
+    agent: Agent | Session | None,
 ) -> None:
     if agent is None:
         print("模型控制平面不可用。")

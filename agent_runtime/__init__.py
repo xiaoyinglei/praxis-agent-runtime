@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING
 
 from agent_runtime.harness.events import ReplayEvent
+from agent_runtime.harness.session import Session
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
@@ -45,5 +46,6 @@ __all__ = [
     "RAGKnowledgeConfig",
     "ReplayEvent",
     "StreamEvent",
+    "Session",
     "TurnItemKind",
 ]

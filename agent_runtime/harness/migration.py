@@ -346,7 +346,8 @@ def _migrate_in_place(
                     elif status == "failed":
                         snapshot = store.fail_turn(
                             turn_id=turn_id,
-                            reason="Imported terminal failure from legacy runtime.",
+                            reason_code="imported_legacy_failure",
+                            message="Imported terminal failure from legacy runtime.",
                         )
                     elif status == "paused":
                         current = store.read_turn(turn_id)

@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from agent_runtime.budget import (
@@ -25,10 +25,13 @@ from agent_runtime.budget import (
     ResourceUsage,
     ensure_token_headroom,
     normal_token_remaining,
-    reserve as reserve_budget,
     resource_usage_from_model_usage,
 )
+from agent_runtime.budget import (
+    reserve as reserve_budget,
+)
 from agent_runtime.harness.reducer import ProjectionState, apply_record
+from agent_runtime.planning import PlanStep
 from agent_runtime.streaming.events import (
     derive_model_public_item_id,
     derive_operation_public_item_id,
@@ -79,6 +82,7 @@ class ThreadSnapshot:
     active_turn_id: str | None
     head_turn_id: str | None
     head_version: int
+    settings: Mapping[str, Any]
     applied_thread_sequence: int
 
 
@@ -87,6 +91,8 @@ class TurnSnapshot:
     turn_id: str
     thread_id: str
     status: str
+    terminal_reason_code: str | None
+    terminal_message: str | None
     predecessor_turn_id: str | None
     turn_index: int
     binding_manifest: Mapping[str, Any]
@@ -446,6 +452,15 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
+    def update_session_settings(self, thread_id: str, settings: Mapping[str, Any]) -> None:
+        frozen = _json_object(settings, field="settings")
+        with self._transaction():
+            self.read_thread(thread_id)
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=None, record_type="session_settings_updated",
+                producer="runtime", payload={"settings": frozen},
+            )
+
     def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
         thread_id = f"thread_{uuid4().hex}"
         with self._transaction():
@@ -590,6 +605,11 @@ class RolloutStore:
                 producer=producer,
                 payload={"item_id": item_id, "payload": {"text": answer}},
             )
+            self._append_terminal_plan_state(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                status="complete",
+            )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -599,9 +619,17 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
-    def fail_turn(self, *, turn_id: str, reason: str) -> TurnSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Turn failure reason must be non-empty")
+    def fail_turn(
+        self,
+        *,
+        turn_id: str,
+        reason_code: str,
+        message: str,
+    ) -> TurnSnapshot:
+        if not isinstance(reason_code, str) or not reason_code.strip():
+            raise ValueError("Turn failure reason_code must be non-empty")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Turn failure message must be non-empty")
         with self._transaction():
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?",
@@ -617,14 +645,107 @@ class RolloutStore:
             ).fetchone()
             if active is None or active["active_turn_id"] != turn_id:
                 raise RuntimeError("failed Turn does not own the Thread active slot")
+            self._append_terminal_plan_state(
+                thread_id=turn["thread_id"],
+                turn_id=turn_id,
+                status="blocked",
+                message=message.strip(),
+            )
             self._append_and_reduce(
                 thread_id=turn["thread_id"],
                 turn_id=turn_id,
                 record_type="turn_failed",
                 producer="verifier",
-                payload={"turn_id": turn_id, "reason": reason},
+                payload={
+                    "turn_id": turn_id,
+                    "reason_code": reason_code.strip(),
+                    "message": message.strip(),
+                },
             )
         return self.read_turn(turn_id)
+
+    def _append_terminal_plan_state(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        status: str,
+        message: str | None = None,
+    ) -> None:
+        latest = self._connection.execute(
+            """
+            SELECT payload_json FROM items
+            WHERE turn_id = ? AND kind = 'plan_state' AND status = 'completed'
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (turn_id,),
+        ).fetchone()
+        if latest is None:
+            return
+        payload = json.loads(latest["payload_json"])
+        raw_plan = payload.get("plan")
+        if not isinstance(raw_plan, Mapping):
+            raise RuntimeError("canonical plan_state payload is malformed")
+        revision = int(raw_plan["revision"]) + 1
+        step_status = "completed" if status == "complete" else "blocked"
+        steps = [
+            {
+                **dict(step),
+                "status": (
+                    step_status
+                    if step.get("status") in {"pending", "in_progress"}
+                    else step.get("status")
+                ),
+            }
+            for step in raw_plan.get("steps", ())
+            if isinstance(step, Mapping)
+        ]
+        plan = {
+            **dict(raw_plan),
+            "revision": revision,
+            "status": status,
+            "active_step_id": None,
+            "steps": steps,
+        }
+        event_type = "completed" if status == "complete" else "blocked"
+        event = {
+            "event_type": event_type,
+            "message": message or (
+                "Plan completed with the accepted Turn."
+                if status == "complete"
+                else "Plan blocked by the failed Turn."
+            ),
+            "tool_call_ids": [],
+        }
+        item_id = f"item_{uuid4().hex}"
+        public_item_id = derive_plan_public_item_id(
+            turn_id=turn_id,
+            revision=revision,
+        )
+        self._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type="item_started",
+            producer="runtime",
+            payload={
+                "item_id": item_id,
+                "kind": "plan_state",
+                "public_item_id": public_item_id,
+                "revision": revision,
+            },
+        )
+        self._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type="item_completed",
+            producer="runtime",
+            payload={
+                "item_id": item_id,
+                "public_item_id": public_item_id,
+                "revision": revision,
+                "payload": {"plan": plan, "event": event},
+            },
+        )
 
     def pause_turn(
         self,
@@ -2462,7 +2583,11 @@ class RolloutStore:
             if row["status"] == "active":
                 allocated_tokens = row["allocated_tokens"]
                 if allocated_tokens is not None:
-                    if isinstance(allocated_tokens, bool) or not isinstance(allocated_tokens, int) or allocated_tokens < 0:
+                    if (
+                        isinstance(allocated_tokens, bool)
+                        or not isinstance(allocated_tokens, int)
+                        or allocated_tokens < 0
+                    ):
                         raise RuntimeError("durable child token allocation is invalid")
                 child_reserved = child_reserved + ResourceUsage(
                     # Child allocations reserve fungible total-token capacity.
@@ -2507,10 +2632,13 @@ class RolloutStore:
         self,
         attempt_id: str,
     ) -> sqlite3.Row | None:
-        return self._connection.execute(
+        row = self._connection.execute(
             "SELECT * FROM budget_reservations WHERE attempt_id = ?",
             (attempt_id,),
         ).fetchone()
+        if row is not None and not isinstance(row, sqlite3.Row):
+            raise RuntimeError("budget reservation query returned an invalid row")
+        return row
 
     def _append_budget_outcome(
         self,
@@ -3559,6 +3687,7 @@ class RolloutStore:
             public_item_id: str | None = None
             plan_public_item_id: str | None = None
             plan_snapshot: Mapping[str, Any] | None = None
+            plan_event: Mapping[str, Any] | None = None
             plan_item_id: str | None = None
             if operation_id is not None:
                 attempt_generation = int(operation["claim_generation"])
@@ -3612,17 +3741,21 @@ class RolloutStore:
                             if not isinstance(raw_step, Mapping):
                                 continue
                             status = raw_step.get("status")
-                            normalized_status = (
-                                "pending" if status == "completed" else status
+                            normalized_status: Literal["pending", "in_progress"]
+                            if status in {"pending", "completed"}:
+                                normalized_status = "pending"
+                            elif status == "in_progress":
+                                normalized_status = "in_progress"
+                            else:
+                                continue
+                            step = PlanStep(
+                                step_id=str(
+                                    raw_step.get("step_id") or f"step_{index}"
+                                ),
+                                title=str(raw_step.get("step", "")),
+                                status=normalized_status,
                             )
-                            steps.append(
-                                {
-                                    "step_id": raw_step.get("step_id")
-                                    or f"step_{index}",
-                                    "title": raw_step.get("step", ""),
-                                    "status": normalized_status,
-                                }
-                            )
+                            steps.append(step.model_dump())
                     objective_row = self._connection.execute(
                         """
                         SELECT payload_json FROM items
@@ -3657,6 +3790,16 @@ class RolloutStore:
                         ),
                         "steps": steps,
                         "summary": arguments.get("explanation"),
+                    }
+                    plan_event = {
+                        "event_type": "llm_update",
+                        "message": (
+                            arguments.get("explanation")
+                            if isinstance(arguments.get("explanation"), str)
+                            else "Applied update_plan tool update."
+                        ),
+                        "related_step_id": plan_snapshot["active_step_id"],
+                        "tool_call_ids": [operation["tool_call_id"]],
                     }
             started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
             if public_item_id is not None:
@@ -3707,6 +3850,7 @@ class RolloutStore:
                 plan_item_id is not None
                 and plan_public_item_id is not None
                 and plan_snapshot is not None
+                and plan_event is not None
             ):
                 self._append_and_reduce(
                     thread_id=thread_id,
@@ -3729,7 +3873,10 @@ class RolloutStore:
                         "item_id": plan_item_id,
                         "public_item_id": plan_public_item_id,
                         "revision": plan_snapshot["revision"],
-                        "payload": {"plan": plan_snapshot},
+                        "payload": {
+                            "plan": plan_snapshot,
+                            "event": plan_event,
+                        },
                     },
                 )
             if operation_id is not None:
@@ -3752,6 +3899,67 @@ class RolloutStore:
         if row is None:
             raise KeyError(f"unknown tool operation: {operation_id}")
         return _tool_operation_snapshot(row)
+
+    def record_verification(
+        self,
+        *,
+        turn_id: str,
+        operation_id: str,
+        kind: str,
+        verifier: str,
+        verified_resources: tuple[str, ...] = (),
+    ) -> ItemSnapshot:
+        if kind not in {"test", "static_analysis", "assertion", "inspection"}:
+            raise ValueError(f"unsupported verification kind: {kind}")
+        if not isinstance(verifier, str) or not verifier.strip():
+            raise ValueError("verification verifier must be non-empty")
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT * FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
+                (operation_id, turn_id),
+            ).fetchone()
+            if operation is None:
+                raise KeyError(f"unknown tool operation: {operation_id}")
+            if operation["status"] != "succeeded" or operation["result_item_id"] is None:
+                raise RuntimeError("verification requires a committed successful ToolResult")
+            existing_rows = self._connection.execute(
+                """
+                SELECT * FROM items
+                WHERE turn_id = ? AND kind = 'verification' AND status = 'completed'
+                ORDER BY sequence
+                """,
+                (turn_id,),
+            ).fetchall()
+            for row in existing_rows:
+                payload = json.loads(row["payload_json"])
+                if payload.get("operation_id") == operation_id:
+                    return _item_snapshot(row)
+
+            item_id = f"item_{uuid4().hex}"
+            payload = {
+                "operation_id": operation_id,
+                "tool_call_id": operation["tool_call_id"],
+                "arguments_digest": operation["arguments_digest"],
+                "source_result_item_id": operation["result_item_id"],
+                "verification_kind": kind,
+                "verifier": verifier.strip(),
+                "verified_resources": list(verified_resources),
+            }
+            self._append_and_reduce(
+                thread_id=operation["thread_id"],
+                turn_id=turn_id,
+                record_type="item_started",
+                producer="runtime",
+                payload={"item_id": item_id, "kind": "verification"},
+            )
+            self._append_and_reduce(
+                thread_id=operation["thread_id"],
+                turn_id=turn_id,
+                record_type="item_completed",
+                producer="runtime",
+                payload={"item_id": item_id, "payload": payload},
+            )
+        return self.read_item(item_id)
 
     def list_tool_operations(self, turn_id: str | None = None) -> tuple[ToolOperationSnapshot, ...]:
         if turn_id is None:
@@ -4333,9 +4541,9 @@ class RolloutStore:
                 """
                 INSERT INTO threads (
                     thread_id, workspace, parent_thread_id, fork_turn_id,
-                    active_turn_id, head_turn_id, head_version,
+                    active_turn_id, head_turn_id, head_version, settings_json,
                     applied_thread_sequence, reducer_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     workspace = excluded.workspace,
                     parent_thread_id = excluded.parent_thread_id,
@@ -4343,6 +4551,7 @@ class RolloutStore:
                     active_turn_id = excluded.active_turn_id,
                     head_turn_id = excluded.head_turn_id,
                     head_version = excluded.head_version,
+                    settings_json = excluded.settings_json,
                     applied_thread_sequence = excluded.applied_thread_sequence,
                     reducer_version = excluded.reducer_version
                 """,
@@ -4354,6 +4563,7 @@ class RolloutStore:
                     thread["active_turn_id"],
                     thread["head_turn_id"],
                     thread["head_version"],
+                    _canonical_json(thread["settings"]),
                     thread["applied_thread_sequence"],
                     thread["reducer_version"],
                 ),
@@ -4362,11 +4572,14 @@ class RolloutStore:
             self._connection.execute(
                 """
                 INSERT INTO turns (
-                    turn_id, thread_id, status, predecessor_turn_id, turn_index,
+                    turn_id, thread_id, status, terminal_reason_code,
+                    terminal_message, predecessor_turn_id, turn_index,
                     binding_manifest_json, applied_thread_sequence, reducer_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
                     status = excluded.status,
+                    terminal_reason_code = excluded.terminal_reason_code,
+                    terminal_message = excluded.terminal_message,
                     predecessor_turn_id = excluded.predecessor_turn_id,
                     turn_index = excluded.turn_index,
                     binding_manifest_json = excluded.binding_manifest_json,
@@ -4377,6 +4590,8 @@ class RolloutStore:
                     turn["turn_id"],
                     turn["thread_id"],
                     turn["status"],
+                    turn["terminal_reason_code"],
+                    turn["terminal_message"],
                     turn["predecessor_turn_id"],
                     turn["turn_index"],
                     _canonical_json(turn["binding_manifest"]),
@@ -4723,6 +4938,7 @@ class RolloutStore:
                 active_turn_id TEXT,
                 head_turn_id TEXT,
                 head_version INTEGER NOT NULL,
+                settings_json TEXT NOT NULL,
                 applied_thread_sequence INTEGER NOT NULL,
                 reducer_version INTEGER NOT NULL
             );
@@ -4730,6 +4946,8 @@ class RolloutStore:
                 turn_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),
                 status TEXT NOT NULL,
+                terminal_reason_code TEXT,
+                terminal_message TEXT,
                 predecessor_turn_id TEXT,
                 turn_index INTEGER NOT NULL,
                 binding_manifest_json TEXT NOT NULL,
@@ -5073,6 +5291,7 @@ def _thread_snapshot(row: sqlite3.Row) -> ThreadSnapshot:
         active_turn_id=row["active_turn_id"],
         head_turn_id=row["head_turn_id"],
         head_version=row["head_version"],
+        settings=MappingProxyType(json.loads(row["settings_json"])),
         applied_thread_sequence=row["applied_thread_sequence"],
     )
 
@@ -5082,6 +5301,8 @@ def _turn_snapshot(row: sqlite3.Row) -> TurnSnapshot:
         turn_id=row["turn_id"],
         thread_id=row["thread_id"],
         status=row["status"],
+        terminal_reason_code=row["terminal_reason_code"],
+        terminal_message=row["terminal_message"],
         predecessor_turn_id=row["predecessor_turn_id"],
         turn_index=row["turn_index"],
         binding_manifest=_immutable_object(row["binding_manifest_json"]),
@@ -5237,6 +5458,7 @@ def _thread_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "active_turn_id": row["active_turn_id"],
         "head_turn_id": row["head_turn_id"],
         "head_version": row["head_version"],
+        "settings": json.loads(row["settings_json"]),
         "applied_thread_sequence": row["applied_thread_sequence"],
         "reducer_version": row["reducer_version"],
     }
@@ -5247,6 +5469,8 @@ def _turn_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "turn_id": row["turn_id"],
         "thread_id": row["thread_id"],
         "status": row["status"],
+        "terminal_reason_code": row["terminal_reason_code"],
+        "terminal_message": row["terminal_message"],
         "predecessor_turn_id": row["predecessor_turn_id"],
         "turn_index": row["turn_index"],
         "binding_manifest": json.loads(row["binding_manifest_json"]),

@@ -70,13 +70,13 @@ def test_agent_runtime_internal_contracts_use_explicit_modules() -> None:
         RolloutStore,
         Session,
         StepContext,
-        ThreadManager,
         TurnContext,
+        TurnExecutor,
     )
     from agent_runtime.tools import Tool, ToolRegistry, ToolResult
 
     assert RolloutStore is not None
-    assert ThreadManager is not None
+    assert TurnExecutor is not None
     assert Session is not None
     assert TurnContext is not None
     assert StepContext is not None
