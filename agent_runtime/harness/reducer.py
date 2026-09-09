@@ -37,6 +37,8 @@ class ProjectionState:
     items: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     model_attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    budget_reservations: dict[str, dict[str, Any]] = field(default_factory=dict)
+    child_budget_allocations: dict[str, dict[str, Any]] = field(default_factory=dict)
     tool_operations: dict[str, dict[str, Any]] = field(default_factory=dict)
     interactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -65,6 +67,7 @@ def apply_record(
                 "active_turn_id": None,
                 "head_turn_id": None,
                 "head_version": 0,
+                "settings": {},
                 "applied_thread_sequence": sequence,
                 "reducer_version": reducer_version,
             }
@@ -77,15 +80,21 @@ def apply_record(
                 "active_turn_id": None,
                 "head_turn_id": payload["fork_turn_id"],
                 "head_version": 0,
+                "settings": {},
                 "applied_thread_sequence": sequence,
                 "reducer_version": reducer_version,
             }
+        case "session_settings_updated":
+            state.threads[thread_id]["settings"] = payload["settings"]
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
         case "turn_started":
             turn_id = payload["turn_id"]
             state.turns[turn_id] = {
                 "turn_id": turn_id,
                 "thread_id": thread_id,
                 "status": "running",
+                "terminal_reason_code": None,
+                "terminal_message": None,
                 "predecessor_turn_id": payload["predecessor_turn_id"],
                 "turn_index": payload["turn_index"],
                 "binding_manifest": payload["binding_manifest"],
@@ -199,6 +208,79 @@ def apply_record(
             attempt["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
         case "model_attempt_late_response":
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_reserved":
+            reservation_id = payload["reservation_id"]
+            if reservation_id in state.budget_reservations:
+                raise RuntimeError("duplicate budget reservation identity")
+            turn_id = _turn_id(record)
+            state.budget_reservations[reservation_id] = {
+                "reservation_id": reservation_id,
+                "thread_id": thread_id,
+                "turn_id": turn_id,
+                "scope_id": payload["scope_id"],
+                "operation_id": payload["operation_id"],
+                "attempt_id": payload["attempt_id"],
+                "reserved": payload["reserved"],
+                "actual": {},
+                "status": "reserved",
+                "applied_thread_sequence": sequence,
+                "reducer_version": reducer_version,
+            }
+            _advance(state, thread_id, turn_id, sequence)
+        case "budget_dispatched":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] != "reserved":
+                raise RuntimeError("only a reserved budget can be dispatched")
+            reservation["status"] = "dispatched"
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_settled":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] not in {"reserved", "dispatched", "unknown"}:
+                raise RuntimeError("budget reservation cannot be settled from its current state")
+            reservation["status"] = "settled"
+            reservation["actual"] = payload["actual"]
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_released":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] not in {"reserved", "dispatched", "unknown"}:
+                raise RuntimeError("budget reservation cannot be released from its current state")
+            reservation["status"] = "released"
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_unknown":
+            reservation = state.budget_reservations[payload["reservation_id"]]
+            if reservation["status"] != "dispatched":
+                raise RuntimeError("only a dispatched budget can become unknown")
+            reservation["status"] = "unknown"
+            reservation["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
+        case "budget_child_allocated":
+            allocation_id = payload["allocation_id"]
+            if allocation_id in state.child_budget_allocations:
+                raise RuntimeError("duplicate child budget allocation identity")
+            state.child_budget_allocations[allocation_id] = {
+                "allocation_id": allocation_id,
+                "thread_id": thread_id,
+                "parent_turn_id": payload["parent_turn_id"],
+                "child_turn_id": payload["child_turn_id"],
+                "allocated_tokens": payload["allocated_tokens"],
+                "allocated_cost_micros": payload.get("allocated_cost_micros"),
+                "actual": {},
+                "status": "active",
+                "applied_thread_sequence": sequence,
+                "reducer_version": reducer_version,
+            }
+            state.threads[thread_id]["applied_thread_sequence"] = sequence
+        case "budget_child_settled":
+            allocation = state.child_budget_allocations[payload["allocation_id"]]
+            if allocation["status"] != "active":
+                raise RuntimeError("only an active child allocation can be settled")
+            allocation["status"] = "settled"
+            allocation["actual"] = payload["actual"]
+            allocation["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
         case "tool_operation_prepared":
             operation_id = payload["operation_id"]
@@ -443,6 +525,8 @@ def apply_record(
             turn_id = payload["turn_id"]
             turn = state.turns[turn_id]
             turn["status"] = "completed"
+            turn["terminal_reason_code"] = "completed"
+            turn["terminal_message"] = None
             turn["applied_thread_sequence"] = sequence
             thread = state.threads[thread_id]
             thread["active_turn_id"] = None
@@ -451,6 +535,12 @@ def apply_record(
             turn_id = payload["turn_id"]
             turn = state.turns[turn_id]
             turn["status"] = "cancelled" if record.record_type == "turn_cancelled" else "failed"
+            turn["terminal_reason_code"] = (
+                "cancelled"
+                if record.record_type == "turn_cancelled"
+                else payload["reason_code"]
+            )
+            turn["terminal_message"] = payload.get("message")
             turn["applied_thread_sequence"] = sequence
             thread = state.threads[thread_id]
             thread["active_turn_id"] = None

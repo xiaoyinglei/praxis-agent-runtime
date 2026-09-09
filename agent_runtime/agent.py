@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import os
-from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from uuid import uuid4
@@ -25,8 +24,8 @@ from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
-    from agent_runtime.harness import BoundHarnessModel, RuntimeComposition
-    from agent_runtime.tools.tool import Tool
+    from agent_runtime.harness import BoundHarnessModel, Session
+    from agent_runtime.runtime.mcp import MCPConfigTrustDecision
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
@@ -48,12 +47,18 @@ class Agent:
         model_session_path: Path | None = DEFAULT_MODEL_SESSION_PATH,
         knowledge: RAGKnowledgeConfig | None = None,
         enable_workspace_mcp: bool = True,
+        mcp_config_trust: MCPConfigTrustDecision | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
+        if mcp_config_trust is not None:
+            from agent_runtime.runtime.mcp import MCPConfigTrustDecision
+
+            if not isinstance(mcp_config_trust, MCPConfigTrustDecision):
+                raise TypeError("mcp_config_trust must be MCPConfigTrustDecision or None")
         selection_requester = validate_model_switch_requester(_selection_requester)
         self.model = model
         self.checkpoint_db = checkpoint_db
@@ -63,8 +68,8 @@ class Agent:
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self.enable_workspace_mcp = enable_workspace_mcp
+        self.mcp_config_trust = mcp_config_trust
         self._selection_requester = selection_requester
-        self._model_control_plane: ModelControlPlane | None = None
         self._followup_model_id: str | None = None
 
     def models(self) -> list[ModelSpec]:
@@ -81,12 +86,14 @@ class Agent:
         )
         self.model = spec.id
         self._followup_model_id = spec.id
+        self._selection_requester = "user"
         return spec
 
     def _request_model_switch(self, model_id: str) -> ModelSpec:
         spec = self._get_model_control_plane().request_model_switch(model_id)
         self.model = spec.id
         self._followup_model_id = spec.id
+        self._selection_requester = "agent"
         return spec
 
     async def run(
@@ -97,37 +104,47 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AgentResult:
-        runtime_agent = (
-            self if previous_turn_id is None else self._harness_agent_for_turn(previous_turn_id, followup=True)
-        )
-        input_file_items = runtime_agent._stage_harness_files(files or ())
-        dispatcher = _event_dispatcher or TurnEventDispatcher()
-        if event_sink is not None:
-            dispatcher.subscribe_controlling_sink(event_sink)
-        async with runtime_agent._open_harness_runtime(
+        async with self.session(
+            previous_turn_id=previous_turn_id,
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
-            max_steps=max_turns,
-            max_tokens_total=max_tokens_total,
-            event_dispatcher=dispatcher,
-        ) as runtime:
-            internal = await runtime.thread_manager.run(
-                user_message=task,
-                previous_turn_id=previous_turn_id,
-                input_files=input_file_items,
-            )
-            return AgentResult._from_harness(
-                internal,
-                store=runtime.store,
-                files=tuple(files or ()),
-            )
+            max_turns=max_turns, max_tokens_total=max_tokens_total,
+            max_cost_micros=max_cost_micros,
+            event_sink=event_sink, _event_dispatcher=_event_dispatcher,
+        ) as session:
+            return await session.submit(task, files=files)
+
+    @asynccontextmanager
+    async def session(
+        self, *, previous_turn_id: str | None = None,
+        require_workspace_change: bool = True,
+        allow_write_tools: bool = False, allow_execute_tools: bool = False,
+        max_turns: int | None = None, max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
+        event_sink: AgentEventSink | None = None,
+        _event_dispatcher: TurnEventDispatcher | None = None,
+        _frozen_turn_id: str | None = None,
+    ) -> AsyncIterator[Session]:
+        from agent_runtime.harness.session import Session
+
+        session = await Session.open(
+            agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id,
+            require_workspace_change=require_workspace_change,
+            allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
+            max_steps=16 if max_turns is None else max_turns,
+            max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
+            event_sink=event_sink, event_dispatcher=_event_dispatcher,
+        )
+        async with session:
+            yield session
 
     async def resume(
         self,
@@ -139,50 +156,6 @@ class Agent:
     ) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
-        runtime_agent = self._harness_agent_for_turn(turn_id, followup=False)
-        with RolloutStore(self._harness_database()) as store:
-            turn = store.read_turn(turn_id)
-            pending = tuple(item for item in store.list_interactions(turn_id) if item.status == "pending")
-            completion_policy = turn.binding_manifest.get("completion_policy")
-            require_change = (
-                isinstance(completion_policy, Mapping) and completion_policy.get("require_workspace_change") is True
-            )
-            tool_execution_policy = turn.binding_manifest.get("tool_execution_policy")
-            allow_write_tools = (
-                isinstance(tool_execution_policy, Mapping) and tool_execution_policy.get("allow_write_tools") is True
-            )
-            allow_execute_tools = (
-                isinstance(tool_execution_policy, Mapping) and tool_execution_policy.get("allow_execute_tools") is True
-            )
-            step_budget = _positive_integer(turn.binding_manifest.get("model_step_budget"))
-            token_budget = _positive_integer(turn.binding_manifest.get("model_token_budget_total"))
-            unknown_model = tuple(
-                operation for operation in store.list_model_operations(turn_id) if operation.status == "unknown"
-            )
-            model_operations = store.list_model_operations(turn_id)
-            resolved_approved_ready = any(
-                interaction.kind == "tool_approval"
-                and interaction.status == "resolved"
-                and interaction.response.get("decision") == "approve"
-                and interaction.operation_id is not None
-                and store.read_tool_operation(interaction.operation_id).status == "ready"
-                for interaction in store.list_interactions(turn_id)
-            )
-            recoverable_committed_response = False
-            if (
-                turn.status == "running"
-                and model_operations
-                and model_operations[-1].status == "completed"
-                and model_operations[-1].response_item_id is not None
-            ):
-                response_item = store.read_item(model_operations[-1].response_item_id)
-                calls = response_item.payload.get("tool_calls")
-                recoverable_committed_response = bool(isinstance(calls, (list, tuple)) and calls)
-        if action != "abort" and turn.binding_manifest.get("legacy_resume_compatible") is False:
-            raise RuntimeError(
-                "incompatible legacy Turn cannot resume; its approvals were "
-                "invalidated during migration, so abort the Turn explicitly"
-            )
         if action == "abort":
             from agent_runtime.harness import RolloutEventReader
 
@@ -208,79 +181,8 @@ class Agent:
                     for replayed in RolloutEventReader(store).project_committed_batch(mutation.records):
                         await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
-        dispatcher = TurnEventDispatcher()
-        if event_sink is not None:
-            dispatcher.subscribe_controlling_sink(event_sink)
-        async with runtime_agent._open_harness_runtime(
-            require_workspace_change=require_change,
-            allow_write_tools=allow_write_tools,
-            allow_execute_tools=allow_execute_tools,
-            max_steps=step_budget,
-            max_tokens_total=token_budget,
-            event_dispatcher=dispatcher,
-            frozen_turn_id=turn_id,
-        ) as runtime:
-            if len(pending) == 1 and pending[0].kind == "tool_approval":
-                decision = {
-                    "allow_once": "approve",
-                    "approve": "approve",
-                    "deny": "deny",
-                }.get(action)
-                if decision is None:
-                    raise ValueError("tool approval action must be allow_once, approve, or deny")
-                internal = await runtime.thread_manager.resume(
-                    turn_id=turn_id,
-                    decision=decision,
-                )
-            elif len(pending) == 1 and pending[0].kind in {
-                "clarification",
-                "choice",
-            }:
-                if action != "continue" or user_input is None:
-                    raise ValueError(f"{pending[0].kind} resume requires action=continue and user_input")
-                internal = await runtime.thread_manager.respond_interaction(
-                    turn_id=turn_id,
-                    request_id=pending[0].request_id,
-                    response=user_input,
-                )
-            elif (
-                not pending
-                and len(unknown_model) == 1
-                and action
-                in {
-                    "continue",
-                    "retry",
-                }
-            ):
-                internal = await runtime.thread_manager.retry_unknown_model(turn_id=turn_id)
-            elif (
-                not pending
-                and resolved_approved_ready
-                and action
-                in {
-                    "allow_once",
-                    "approve",
-                    "continue",
-                    "retry",
-                }
-            ):
-                internal = await runtime.thread_manager.resume(
-                    turn_id=turn_id,
-                    decision="approve",
-                )
-            elif (
-                not pending
-                and recoverable_committed_response
-                and action
-                in {
-                    "continue",
-                    "retry",
-                }
-            ):
-                internal = await runtime.thread_manager.recover_committed_model_response(turn_id=turn_id)
-            else:
-                raise RuntimeError("resume action does not match the Turn's durable pending state")
-            return AgentResult._from_harness(internal, store=runtime.store)
+        async with self.session(_frozen_turn_id=turn_id, event_sink=event_sink) as session:
+            return await session.resume(turn_id, action, user_input=user_input)
 
     async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
@@ -329,6 +231,7 @@ class Agent:
         files: Sequence[str] | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
+        max_cost_micros: int | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
@@ -344,6 +247,7 @@ class Agent:
                 files=files,
                 max_turns=max_turns,
                 max_tokens_total=max_tokens_total,
+                max_cost_micros=max_cost_micros,
                 require_workspace_change=require_workspace_change,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
@@ -372,6 +276,7 @@ class Agent:
             if not run_task.done():
                 run_task.cancel()
                 await asyncio.gather(run_task, return_exceptions=True)
+            dispatcher.close()
 
     async def pending_input(self, turn_id: str) -> AgentPause | None:
         from agent_runtime.harness import RolloutStore, TurnResult
@@ -402,44 +307,6 @@ class Agent:
             control_plane=self._get_model_control_plane(),
             instructions=(GENERIC_SYSTEM_PROMPT,),
         )
-
-    def _harness_agent_for_turn(self, turn_id: str, *, followup: bool) -> Agent:
-        from agent_runtime.harness import RolloutStore
-
-        with RolloutStore(self._harness_database()) as store:
-            turn = store.read_turn(turn_id)
-            thread = store.read_thread(turn.thread_id)
-            if Path(thread.workspace).expanduser().resolve() != self._workspace_path():
-                raise RuntimeError("turn belongs to a different workspace security domain")
-            
-            knowledge_value = turn.binding_manifest.get("knowledge_config")
-            mcp_policy = turn.binding_manifest.get("mcp_policy")
-        frozen_knowledge = (
-            RAGKnowledgeConfig.model_validate(knowledge_value) if isinstance(knowledge_value, Mapping) else None
-        )
-        if not followup:
-            model = None
-        elif self._followup_model_id is not None:
-            model = self._followup_model_id
-        else:
-            model = self.model
-        restored = Agent(
-            model=model,
-            checkpoint_db=self.checkpoint_db,
-            workspace_path=thread.workspace,
-            model_session_path=self.model_session_path,
-            knowledge=frozen_knowledge,
-            enable_workspace_mcp=(
-                bool(mcp_policy.get("workspace_discovery_enabled"))
-                if isinstance(mcp_policy, Mapping) and isinstance(mcp_policy.get("workspace_discovery_enabled"), bool)
-                else self.enable_workspace_mcp
-            ),
-            _selection_requester=self._selection_requester,
-        )
-        override = self.__dict__.get("_harness_model")
-        if callable(override):
-            restored.__dict__["_harness_model"] = override
-        return restored
 
     def _harness_database(self) -> Path:
         if self.checkpoint_db is not None:
@@ -479,216 +346,19 @@ class Agent:
             )
         return tuple(values)
     
-    @asynccontextmanager
-    async def _open_harness_runtime(
-        self,
-        *,
-        require_workspace_change: bool,
-        allow_write_tools: bool,
-        allow_execute_tools: bool,
-        max_steps: int | None,
-        max_tokens_total: int | None,
-        event_dispatcher: (
-            TurnEventDispatcher | None
-        ) = None,
-        frozen_turn_id: str | None = None,
-    ) -> AsyncIterator[RuntimeComposition]:
-        from agent_runtime.harness import RuntimeComposition
-        from agent_runtime.runtime.mcp import (
-            decide_mcp_config_trust,
-            open_trusted_product_mcp_tools,
-            resolve_product_mcp_config,
-        )
-        from agent_runtime.skills.catalog import SkillCatalog
-        from agent_runtime.skills.loader import scan_and_load_skills
-        from agent_runtime.skills.policy import SkillPolicy
-        from agent_runtime.skills.runtime import SkillRuntime
-        from agent_runtime.tools.builtins import create_resident_coding_tools
-        from agent_runtime.tools.permissions import ToolExecutionContext
-        from agent_runtime.workspace import open_workspace
-
-        workspace = open_workspace(self._workspace_path(), create=True)
-        await self._bootstrap_model_provider(frozen_turn_id=frozen_turn_id,)
-
-        def acknowledge_plan_update(_arguments: object) -> dict[str, object]:
-            return {
-                "accepted": True,
-                "revision": 0,
-                "message": "Plan update recorded as a ToolResult.",
-            }
-
-        resident = create_resident_coding_tools(
-            workspace,
-            plan_updater=acknowledge_plan_update,
-        )
-        skill_policy = SkillPolicy()
-        manifests = [
-            manifest
-            for manifest in scan_and_load_skills(
-                workspace.root,
-                repo_root=workspace.root,
-            )
-            if skill_policy.is_skill_enabled(manifest)
-        ]
-        candidate_skill_runtime = SkillRuntime(
-            SkillCatalog(manifests),
-            policy=skill_policy,
-        )
-        skill_runtime = candidate_skill_runtime if candidate_skill_runtime.has_model_invocable_skills else None
-        provider: object | None = None
-        knowledge_revision: str | None = None
-        knowledge_runner: object | None = None
-        if self.knowledge is not None:
-            from agent_runtime.knowledge_providers.rag import (
-                LazyRAGKnowledgeProvider,
-            )
-
-            provider = LazyRAGKnowledgeProvider(
-                config=self.knowledge,
-                model_alias=self.model,
-                vector_dsn=os.environ.get("AGENT_VECTOR_DSN"),
-            )
-            knowledge_runner = provider.search_knowledge
-            knowledge_revision = "rag_" + hashlib.sha256(self.knowledge.model_dump_json().encode()).hexdigest()[:16]
-
-        async with AsyncExitStack() as stack:
-            config_path = resolve_product_mcp_config(workspace.root) if self.enable_workspace_mcp else None
-            mcp_tools: tuple[Tool, ...] = ()
-            if config_path is not None:
-                trust = decide_mcp_config_trust(
-                    config_path,
-                    workspace_root=workspace.root,
-                    trust_workspace=False,
-                )
-                mcp_tools = await stack.enter_async_context(open_trusted_product_mcp_tools(config_path, trust=trust))
-            tools = {tool.definition.name: tool for tool in (*resident, *mcp_tools)}
-            runtime = RuntimeComposition.open(
-                database=self._harness_database(),
-                workspace=workspace.root,
-                model=self._harness_model(),
-                tools=tools,
-                tool_execution_context=ToolExecutionContext(
-                    workspace_root=workspace.root,
-                    cwd=workspace.root,
-                    allow_write_tools=allow_write_tools,
-                    allow_execute_tools=allow_execute_tools,
-                ),
-                knowledge_runner=(knowledge_runner if callable(knowledge_runner) else None),
-                knowledge_revision=knowledge_revision,
-                knowledge_config=(None if self.knowledge is None else self.knowledge.model_dump(mode="json")),
-                discoverable_tool_names=tuple(tool.definition.name for tool in mcp_tools),
-                workspace_mcp_enabled=self.enable_workspace_mcp,
-                require_workspace_change=require_workspace_change,
-                enable_subagents=True,
-                skill_runtime=skill_runtime,
-                max_steps=16 if max_steps is None else max_steps,
-                max_tokens_total=max_tokens_total,
-                event_dispatcher=event_dispatcher,
-            )
-            try:
-                yield runtime
-            finally:
-                runtime.close()
-                if provider is not None:
-                    await _close_owned_sync_resource(
-                        provider,
-                        label="knowledge provider",
-                    )
-                await self._close_model_control_plane()
-
-    async def _bootstrap_model_provider(
-        self,
-        *,
-        frozen_turn_id: str | None = None,
-    ) -> None:
-        from agent_runtime.local_runtime import (
-            ensure_local_provider_ready,
-        )
-
-        if frozen_turn_id is None:
-            control_plane = self._get_model_control_plane()
-            spec = control_plane.current_model()
-
-        else:
-            from agent_runtime.harness import RolloutStore
-
-            with RolloutStore(
-                self._harness_database()
-            ) as store:
-                turn = store.read_turn(
-                    frozen_turn_id
-                )
-                thread = store.read_thread(
-                    turn.thread_id
-                )
-
-                if (
-                    Path(thread.workspace)
-                    .expanduser()
-                    .resolve()
-                    != self._workspace_path()
-                ):
-                    raise RuntimeError(
-                        "turn belongs to a different "
-                        "workspace security domain"
-                    )
-
-                # Legacy / injected Harness bindings cannot be
-                # authenticated by ModelControlPlane. Do not perform
-                # provider bootstrap for them; the Harness model adapter
-                # remains responsible for failing closed before dispatch.
-                if (
-                    "authentication_schema_version"
-                    not in turn.binding_manifest
-                ):
-                    return
-
-                control_plane = (
-                    self._get_model_control_plane()
-                )
-
-                spec = (
-                    control_plane
-                    .model_spec_for_frozen_binding(
-                        turn.binding_manifest,
-                        thread_id=turn.thread_id,
-                        turn_id=turn.turn_id,
-                    )
-                )
-
-        await ensure_local_provider_ready(
-            spec
-        )
-
-
     def _get_model_control_plane(self) -> ModelControlPlane:
-        if self._model_control_plane is None:
-            from agent_runtime.model_config_io import discover_git_worktree
+        from agent_runtime.model_config_io import discover_git_worktree
 
-            workspace = self._workspace_path()
-            session_path = self.model_session_path
-
-            if session_path is not None and not session_path.is_absolute():
-                session_path = workspace / session_path
-
-            self._model_control_plane = ModelControlPlane.from_env(
-                initial_model_id=self.model,
-                initial_selection_requester=self._selection_requester,
-                session_path=session_path,
-                workspace=workspace,
-                worktree=discover_git_worktree(workspace),
-            )
-
-        return self._model_control_plane
-
-    async def _close_model_control_plane(self) -> None:
-        control_plane = self._model_control_plane
-        self._model_control_plane = None
-        if control_plane is not None:
-            await _close_owned_sync_resource(
-                control_plane,
-                label="model control plane",
-            )
+        workspace = self._workspace_path()
+        session_path = self.model_session_path
+        if session_path is not None and not session_path.is_absolute():
+            session_path = workspace / session_path
+        return ModelControlPlane.from_env(
+            initial_model_id=self.model,
+            initial_selection_requester=self._selection_requester,
+            session_path=session_path, workspace=workspace,
+            worktree=discover_git_worktree(workspace),
+        )
 
 
 def _positive_integer(value: object) -> int | None:

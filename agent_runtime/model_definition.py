@@ -7,6 +7,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -26,7 +27,6 @@ from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 class GenerationTaskDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    model: str | None
     max_tokens: int | None = Field(gt=0, strict=True)
     temperature: float | None = Field(ge=0.0, le=2.0, allow_inf_nan=False)
 
@@ -79,73 +79,161 @@ class ProviderOptionsDefinition(BaseModel):
 class RequestDefaultsDefinition(BaseModel):
     """Safe request defaults; transport and authentication fields are absent."""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
 
-    temperature: float | None = Field(default=None, ge=0.0, le=2.0, allow_inf_nan=False)
-    top_p: float | None = Field(default=None, gt=0.0, le=1.0, allow_inf_nan=False)
-    parallel_tool_calls: bool | None = Field(default=None, strict=True)
-    seed: int | None = Field(default=None, ge=-(2**63), le=2**63 - 1, strict=True)
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=2.0,
+        allow_inf_nan=False,
+    )
+
+    top_p: float | None = Field(
+        default=None,
+        gt=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+
+    parallel_tool_calls: bool | None = Field(
+        default=None,
+        strict=True,
+    )
+
+    seed: int | None = Field(
+        default=None,
+        ge=-(2**63),
+        le=2**63 - 1,
+        strict=True,
+    )
+
     provider_options: ProviderOptionsDefinition | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ModelCapabilities:
+    """Resolved provider/model capabilities used by runtime execution."""
+
+    context_window_tokens: int
+    max_output_tokens: int | None
+    supports_native_tools: bool
+    supports_structured_output: bool
+
+    def __post_init__(self) -> None:
+        if isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0:
+            raise ValueError("context_window_tokens must be positive")
+
+        if self.max_output_tokens is not None:
+            if isinstance(self.max_output_tokens, bool) or self.max_output_tokens <= 0:
+                raise ValueError("max_output_tokens must be positive or None")
+
+            if self.max_output_tokens > self.context_window_tokens:
+                raise ValueError("max_output_tokens must not exceed context_window_tokens")
+
+
 class ModelExecutionDefinition(BaseModel):
-    """Every request-affecting value needed to execute one selected model.
-
-    Alias, catalog origin, registry/file revisions, policy state, and resolved
-    credential values deliberately do not belong to this content-addressed
-    definition.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
 
     provider: ModelProvider
     provider_name: str | None
     protocol: str | None
-    model: str = Field(min_length=1)
+
+    model_id: str = Field(min_length=1)
     tokenizer_model: str | None
-    max_tokens: int = Field(gt=0, strict=True)
-    timeout_seconds: float = Field(gt=0, allow_inf_nan=False)
+
+    context_window_tokens: int = Field(
+        gt=0,
+        strict=True,
+    )
+    max_output_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        strict=True,
+    )
+
+    timeout_seconds: float = Field(
+        gt=0,
+        allow_inf_nan=False,
+    )
+
     base_url: str | None
     api_key_env: str | None
     defaults: RequestDefaultsDefinition
-    context_window_tokens: int = Field(gt=0, strict=True)
-    request_context_tokens: int | None = Field(gt=0, strict=True)
+
     supports_tools: bool
     supports_structured_output: bool
+
     location: Literal["local", "cloud"] | None
-    input_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
-    output_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
-    cache_read_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
-    cache_write_cost_per_1m: float | None = Field(ge=0, allow_inf_nan=False)
+
+    input_cost_per_1m: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    output_cost_per_1m: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    cache_read_cost_per_1m: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+    cache_write_cost_per_1m: float | None = Field(
+        ge=0,
+        allow_inf_nan=False,
+    )
+
     runtime: RuntimeDefinition | None
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
 
     @field_validator("base_url")
     @classmethod
-    def validate_base_url(cls, value: str | None) -> str | None:
-        return validate_http_url(value, field_name="base_url")
+    def validate_base_url(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return validate_http_url(
+            value,
+            field_name="base_url",
+        )
 
     @field_validator("api_key_env")
     @classmethod
-    def validate_api_key_environment_name(cls, value: str | None) -> str | None:
+    def validate_api_key_environment_name(
+        cls,
+        value: str | None,
+    ) -> str | None:
         return validate_api_key_env_name(value)
 
     @model_validator(mode="after")
-    def validate_normalized_execution_values(self) -> ModelExecutionDefinition:
-        endpoint = normalize_model_endpoint(
+    def validate_capabilities(
+        self,
+    ) -> ModelExecutionDefinition:
+        if self.max_output_tokens is not None and self.max_output_tokens > self.context_window_tokens:
+            raise ValueError("max_output_tokens must not exceed context_window_tokens")
+
+        _ = normalize_model_endpoint(
             provider=self.provider,
             base_url=self.base_url,
             location=self.location,
         )
-        if self.base_url != endpoint.base_url or self.location != endpoint.location:
-            raise ValueError("model execution endpoint and location must be normalized")
-        request_limit = self.request_context_tokens or self.context_window_tokens
-        if request_limit > self.context_window_tokens:
-            raise ValueError("request_context_tokens must not exceed context_window_tokens")
-        if self.max_tokens > request_limit:
-            raise ValueError("max_tokens must not exceed the effective request context limit")
+
         return self
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(
+            context_window_tokens=(self.context_window_tokens),
+            max_output_tokens=(self.max_output_tokens),
+            supports_native_tools=(self.supports_tools),
+            supports_structured_output=(self.supports_structured_output),
+        )
 
     @property
     def definition_revision(self) -> str:
@@ -154,52 +242,54 @@ class ModelExecutionDefinition(BaseModel):
 
 def build_model_execution_definition(
     *,
+    model_id: str,
     spec: ModelSpec,
     config: AgentModelsConfig,
 ) -> ModelExecutionDefinition:
-    """Normalize one internal declaration and its catalog-wide runtime policy."""
-
     runtime = spec.runtime
+
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,
         location=spec.location,
     )
+
     return ModelExecutionDefinition(
         provider=spec.provider,
         provider_name=spec.provider_name,
         protocol=spec.protocol,
-        model=spec.model,
-        tokenizer_model=spec.tokenizer_model or spec.model,
-        max_tokens=spec.max_tokens,
+        model_id=model_id,
+        tokenizer_model=(spec.tokenizer_model or model_id),
+        context_window_tokens=(spec.context_window_tokens),
+        max_output_tokens=(spec.max_output_tokens),
         timeout_seconds=spec.timeout_seconds,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
-        defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),
-        context_window_tokens=spec.context_window_tokens,
-        request_context_tokens=spec.request_context_tokens,
+        defaults=(RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults))),
         supports_tools=spec.supports_tools,
-        supports_structured_output=spec.supports_structured_output,
+        supports_structured_output=(spec.supports_structured_output),
         location=endpoint.location,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
-        cache_read_cost_per_1m=spec.cache_read_cost_per_1m,
-        cache_write_cost_per_1m=spec.cache_write_cost_per_1m,
+        cache_read_cost_per_1m=(spec.cache_read_cost_per_1m),
+        cache_write_cost_per_1m=(spec.cache_write_cost_per_1m),
         runtime=(
             RuntimeDefinition(
                 health_url=runtime.health_url,
                 launch_command=runtime.launch_command,
-                expected_model_contains=runtime.expected_model_contains,
-                startup_timeout_seconds=runtime.startup_timeout_seconds,
-                poll_interval_seconds=runtime.poll_interval_seconds,
+                expected_model_contains=(runtime.expected_model_contains),
+                startup_timeout_seconds=(runtime.startup_timeout_seconds),
+                poll_interval_seconds=(runtime.poll_interval_seconds),
             )
             if runtime is not None
             else None
         ),
         generation=_generation_definition(config.generation),
         llm_stage_budgets={
-            stage.value: StageBudgetDefinition.model_validate(budget.model_dump())
-            for stage, budget in _effective_stage_budgets(config, spec).items()
+            stage.value: (StageBudgetDefinition.model_validate(budget.model_dump()))
+            for stage, budget in effective_stage_budgets(
+                config=config,
+            ).items()
         },
     )
 
@@ -238,36 +328,19 @@ def _validate_canonical_value(value: object) -> None:
         for item in value:
             _validate_canonical_value(item)
     else:
-        raise ValueError(
-            f"model execution definition contains a non-JSON value: {type(value).__name__}"
-        )
+        raise ValueError(f"model execution definition contains a non-JSON value: {type(value).__name__}")
 
 
 def effective_stage_budgets(
     *,
     config: AgentModelsConfig,
-    spec: ModelSpec,
 ) -> dict[LLMCallStage, LLMStageBudget]:
-    return _effective_stage_budgets(config, spec)
-
-
-def _effective_stage_budgets(
-    config: AgentModelsConfig,
-    spec: ModelSpec,
-) -> dict[LLMCallStage, LLMStageBudget]:
-    budgets = {stage: budget.model_copy() for stage, budget in config.llm_stage_budgets.items()}
-    tool_decision = budgets[LLMCallStage.TOOL_DECISION]
-    if spec.max_tokens > tool_decision.max_output_tokens:
-        budgets[LLMCallStage.TOOL_DECISION] = tool_decision.model_copy(
-            update={"max_output_tokens": spec.max_tokens}
-        )
-    return budgets
+    return {stage: budget.model_copy() for stage, budget in config.llm_stage_budgets.items()}
 
 
 def _generation_definition(config: GenerationConfig) -> GenerationDefinition:
     def task(value: GenerationTaskConfig) -> GenerationTaskDefinition:
         return GenerationTaskDefinition(
-            model=value.model,
             max_tokens=value.max_tokens,
             temperature=value.temperature,
         )
@@ -282,6 +355,7 @@ def _generation_definition(config: GenerationConfig) -> GenerationDefinition:
 
 
 __all__ = [
+    "ModelCapabilities",
     "ModelExecutionDefinition",
     "build_model_execution_definition",
     "canonical_definition_json",

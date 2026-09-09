@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.tools.tool import JsonValue, Tool
 
 
@@ -33,6 +34,7 @@ class HarnessModelRequest:
     tools: tuple[Tool, ...] = ()
     step: int = 1
     model_token_budget_remaining: int | None = None
+    budget_pressure: bool = False
 
 
 class ModelDispatchPreflightError(RuntimeError):
@@ -54,6 +56,7 @@ class PreparedModelCall:
     tool_hash: str
     wire_hash: str
     request_ref: Mapping[str, Any]
+    resource_request: ResourceUsage = ResourceUsage()
     dispatch_payload: object = field(default=None, repr=False, compare=False)
 
 
@@ -125,9 +128,35 @@ class CompletionGate(Protocol):
 class ContextManager(Protocol):
     def build(self, turn_id: str) -> tuple[HarnessMessage, ...]: ...
 
+    def compact_for_budget(
+        self,
+        *,
+        turn_id: str,
+        retained_tail_messages: int,
+    ) -> object: ...
+
 
 class ContextBudgetExceededError(RuntimeError):
     """Committed context cannot fit inside the configured provider boundary."""
+
+
+class ContextCompactionRequiredError(ContextBudgetExceededError):
+    """Provider preparation requires a durable Runtime-owned compaction."""
+
+    def __init__(
+        self,
+        *,
+        input_tokens: int,
+        max_input_tokens: int,
+        retained_tail_messages: int,
+    ) -> None:
+        self.input_tokens = input_tokens
+        self.max_input_tokens = max_input_tokens
+        self.retained_tail_messages = retained_tail_messages
+        super().__init__(
+            "Committed context requires durable compaction before provider dispatch: "
+            f"{input_tokens} > {max_input_tokens} input tokens."
+        )
 
 
 class ToolRouter(Protocol):
@@ -140,7 +169,7 @@ class ToolRouter(Protocol):
 
 
 class BindingProvider(Protocol):
-    """Trusted owner of the immutable runtime binding captured for each Turn."""
+    """Trusted owner of settings captured for a new model request."""
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> Mapping[str, Any]: ...
 

@@ -13,6 +13,7 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
+    ContextCompactionRequiredError,
     GatewayHarnessModel,
     HarnessMessage,
     HarnessModelDelta,
@@ -25,9 +26,11 @@ from agent_runtime.harness import (
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
-    RuntimeComposition,
     Session,
+    TurnExecutor,
 )
+from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
+from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway, StreamChunk
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
@@ -72,6 +75,28 @@ class InspectingModel:
             text="model answer",
             provider_response_id="response-1",
             usage={"input_tokens": 5, "output_tokens": 2},
+        )
+
+
+class CompactionRequestingModel(InspectingModel):
+    def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
+        self.prepared_requests.append(request)
+        if not any(
+            message.role == "context"
+            and message.content.startswith("Context compaction:\n")
+            for message in request.messages
+        ):
+            raise ContextCompactionRequiredError(
+                input_tokens=1_000,
+                max_input_tokens=500,
+                retained_tail_messages=1,
+            )
+        return PreparedModelCall(
+            request_hash="compacted-request-hash",
+            context_hash="compacted-context-hash",
+            tool_hash="compacted-tool-hash",
+            wire_hash="compacted-wire-hash",
+            request_ref={"message_count": len(request.messages)},
         )
 
 
@@ -351,7 +376,7 @@ class ZeroDeltaToolThenAnswerModel:
         self.dispatch_count = 0
 
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "test-model"}
+        return {"model_id": "test-model"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         toolset_revision = toolset_revision_for_tools(request.tools)
@@ -436,6 +461,47 @@ def _read_file_tool() -> Tool:
     )
 
 
+def test_session_commits_required_compaction_before_model_dispatch(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        previous = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="Preserve the architecture boundary.",
+            binding_manifest={"model_id": "test-model"},
+        )
+        store.complete_turn(turn_id=previous.turn_id, answer="previous answer")
+        model = CompactionRequestingModel(store)
+        runner = TurnExecutor(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=RolloutContextManager(store),
+            completion_gate=InspectingCompletionGate(store),
+            worker_id="turn-worker-a",
+        )
+
+        result = asyncio.run(
+            runner.run(
+                turn_id="turn-durable-compaction",
+                user_message="Continue implementation.",
+                binding_manifest={"model_id": "test-model", "model_step_budget": 1},
+            )
+        )
+
+        assert result.status == "completed"
+        assert len(model.prepared_requests) == 2
+        assert any(
+            item.kind == "context_compaction"
+            for item in store.list_items(result.turn_id)
+        )
+        assert len(store.list_model_operations(result.turn_id)) == 1
+        assert store.verify().valid is True
+
+
 @pytest.mark.anyio
 async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
     tmp_path: Path,
@@ -456,13 +522,21 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
         },
     )
     model = GatewayHarnessModel(
-        model_alias="test-model",
+        model_id="test-model",
         resolved=ResolvedModel(
             generator=provider,
-            kwargs={"max_tokens": 256},
             gateway=gateway,
             provider="openai-compatible",
-            model="provider-model",
+            model_id="provider-model",
+            capabilities=ModelCapabilities(
+                context_window_tokens=8_192,
+                max_output_tokens=256,
+                supports_native_tools=True,
+                supports_structured_output=True,
+            ),
+            token_accounting=CharacterAccounting(),
+            request_defaults=RequestDefaultsDefinition(temperature=0.0),
+            generation_config=GenerationConfig(),
         ),
         instructions=("Answer the user directly.",),
     )
@@ -471,7 +545,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
     try:
         with RolloutStore(tmp_path / "rollout.sqlite3") as store:
             thread = store.create_thread(workspace=workspace)
-            runner = Session(
+            runner = TurnExecutor(
                 thread_id=thread.thread_id,
                 store=store,
                 model=model,
@@ -483,7 +557,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
                 runner.run(
                     turn_id="turn-cancel-blocked-provider",
                     user_message="cancel a blocked sync provider",
-                    binding_manifest={"model_alias": "test-model"},
+                    binding_manifest={"model_id": "test-model"},
                 )
             )
             initial_events = [
@@ -542,16 +616,16 @@ async def test_zero_text_tool_only_response_starts_then_completes_without_delta(
     dispatcher = TurnEventDispatcher(capacity=64)
     stream = dispatcher.subscribe_controlling()
     tool = _read_file_tool()
-    with RuntimeComposition.open(
+    async with await Session.open(
+        event_dispatcher=dispatcher,
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
         completion_gate=AcceptToolCompleted(),
         tools={tool.definition.name: tool},
     ) as runtime:
-        result = await runtime.thread_manager.run(
-            user_message="use one tool",
-            event_dispatcher=dispatcher,
+        result = await runtime.submit(
+            task="use one tool",
         )
         events = []
         while not stream.empty:
@@ -587,7 +661,7 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
         thread = store.create_thread(workspace=workspace)
         model = InspectingModel(store)
         completion_gate = InspectingCompletionGate(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -600,7 +674,7 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
             runner.run(
                 turn_id="turn-answer-plainly",
                 user_message="answer plainly",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -634,7 +708,7 @@ def test_single_final_response_over_frozen_token_budget_fails_the_turn(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         completion_gate = InspectingCompletionGate(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=OverBudgetAnswerModel(store),
@@ -647,7 +721,7 @@ def test_single_final_response_over_frozen_token_budget_fails_the_turn(
                 turn_id="turn-over-token-budget",
                 user_message="stay within budget",
                 binding_manifest={
-                    "model_alias": "test-model",
+                    "model_id": "test-model",
                     "model_token_budget_total": 10,
                 },
             )
@@ -675,7 +749,7 @@ def test_model_preflight_rejection_fails_without_an_unknown_outcome(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = PreflightRejectedModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -688,7 +762,7 @@ def test_model_preflight_rejection_fails_without_an_unknown_outcome(
                 turn_id="turn-preflight-budget",
                 user_message="do not call above budget",
                 binding_manifest={
-                    "model_alias": "test-model",
+                    "model_id": "test-model",
                     "model_token_budget_total": 10,
                 },
             )
@@ -712,7 +786,7 @@ def test_incomplete_model_response_is_durable_failure_not_unknown(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         completion_gate = InspectingCompletionGate(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=IncompleteResponseModel(store),
@@ -724,7 +798,7 @@ def test_incomplete_model_response_is_durable_failure_not_unknown(
             runner.run(
                 turn_id="turn-incomplete-response",
                 user_message="return a complete response",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -751,7 +825,7 @@ def test_late_model_attempt_cannot_commit_a_second_response(tmp_path: Path) -> N
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="one answer only",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation = store.prepare_model_operation(
             turn_id=turn.turn_id,
@@ -809,7 +883,7 @@ def test_model_completion_faults_are_atomic_at_every_substep(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="commit all model channels atomically",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation = store.prepare_model_operation(
             turn_id=turn.turn_id,
@@ -860,7 +934,7 @@ def test_stale_model_generation_appends_nothing(tmp_path: Path) -> None:
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="fence stale generation",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         operation = store.prepare_model_operation(
             turn_id=turn.turn_id,
@@ -904,7 +978,7 @@ def test_provider_failure_leaves_durable_unknown_attempt_for_reconciliation(
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=FailingDispatchModel(store),
@@ -916,7 +990,7 @@ def test_provider_failure_leaves_durable_unknown_attempt_for_reconciliation(
             runner.run(
                 turn_id="turn-provider-unknown",
                 user_message="provider may fail",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -942,7 +1016,7 @@ def test_known_model_rejection_fails_without_unknown_or_retry_state(
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=RejectedDispatchModel(store),
@@ -954,7 +1028,7 @@ def test_known_model_rejection_fails_without_unknown_or_retry_state(
             runner.run(
                 turn_id="turn-provider-rejected",
                 user_message="do not retry a deterministic rejection",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -982,7 +1056,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
     stream = dispatcher.subscribe_controlling()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=PartialFailureModel(store),
@@ -994,7 +1068,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
         result = await runner.run(
             turn_id="turn-partial-failure",
             user_message="fail after partial channels",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         events = []
         while not stream.empty:
@@ -1039,7 +1113,7 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
     stream = dispatcher.subscribe_controlling()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=AcknowledgedCancellationModel(store),
@@ -1051,7 +1125,7 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
         result = await runner.run(
             turn_id="turn-cancel-acknowledged",
             user_message="cancel definitively",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         events = []
         while not stream.empty:
@@ -1090,7 +1164,7 @@ def test_model_retry_uses_a_new_attempt_on_the_same_logical_operation(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = RetryThenAnswerModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1101,7 +1175,7 @@ def test_model_retry_uses_a_new_attempt_on_the_same_logical_operation(
             runner.run(
                 turn_id="turn-retry-provider",
                 user_message="recover provider",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -1133,7 +1207,7 @@ async def test_model_retry_uses_new_attempt_and_public_item_ids(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = StreamingRetryThenAnswerModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1145,7 +1219,7 @@ async def test_model_retry_uses_new_attempt_and_public_item_ids(
         paused = await runner.run(
             turn_id="turn-retry-streaming",
             user_message="retry uncertain streaming output",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         resumed = await runner.retry_unknown_model(turn_id=paused.turn_id)
         events = []
@@ -1196,7 +1270,7 @@ def test_completion_gate_continue_feeds_the_gap_back_into_the_same_turn(
         thread = store.create_thread(workspace=workspace)
         model = ReviseAfterFeedbackModel(store)
         gate = ContinueThenAcceptGate()
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1208,7 +1282,7 @@ def test_completion_gate_continue_feeds_the_gap_back_into_the_same_turn(
             runner.run(
                 turn_id="turn-completion-feedback",
                 user_message="finish with evidence",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -1229,7 +1303,7 @@ def test_completion_gate_pause_creates_a_durable_clarification(tmp_path: Path) -
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=InspectingModel(store),
@@ -1245,7 +1319,7 @@ def test_completion_gate_pause_creates_a_durable_clarification(tmp_path: Path) -
             runner.run(
                 turn_id="turn-clarification-pause",
                 user_message="ambiguous task",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -1266,7 +1340,7 @@ def test_completion_gate_fail_releases_the_thread_without_an_agent_answer(
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=InspectingModel(store),
@@ -1279,7 +1353,7 @@ def test_completion_gate_fail_releases_the_thread_without_an_agent_answer(
             runner.run(
                 turn_id="turn-completion-fail",
                 user_message="unsafe completion",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
 
@@ -1299,7 +1373,7 @@ def test_clarification_response_resumes_the_same_turn_without_granting_permissio
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = AnswerAfterClarificationModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1311,7 +1385,7 @@ def test_clarification_response_resumes_the_same_turn_without_granting_permissio
             runner.run(
                 turn_id="turn-clarification-resume",
                 user_message="answer the ambiguous task",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
         assert paused.interaction_id is not None
@@ -1346,7 +1420,7 @@ def test_repeated_identical_clarification_response_returns_the_completed_turn(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = AnswerAfterClarificationModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1358,7 +1432,7 @@ def test_repeated_identical_clarification_response_returns_the_completed_turn(
             runner.run(
                 turn_id="turn-clarification-idempotent",
                 user_message="answer the ambiguous task",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
         assert paused.interaction_id is not None
@@ -1392,7 +1466,7 @@ def test_conflicting_or_wrong_clarification_response_fails_before_model_io(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = AnswerAfterClarificationModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1404,7 +1478,7 @@ def test_conflicting_or_wrong_clarification_response_fails_before_model_io(
             runner.run(
                 turn_id="turn-clarification-conflict",
                 user_message="answer the ambiguous task",
-                binding_manifest={"model_alias": "test-model"},
+                binding_manifest={"model_id": "test-model"},
             )
         )
         assert paused.interaction_id is not None
@@ -1451,7 +1525,7 @@ def test_choice_uses_the_durable_interaction_lifecycle_without_granting_permissi
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="pick a deployment target",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         choice = store.request_choice(
             turn_id=turn.turn_id,
@@ -1459,7 +1533,7 @@ def test_choice_uses_the_durable_interaction_lifecycle_without_granting_permissi
             options=("staging", "production"),
         )
         model = InspectingModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -1496,7 +1570,7 @@ def test_choice_response_is_idempotent_and_rejects_invalid_or_conflicting_input(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="pick a deployment target",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         choice = store.request_choice(
             turn_id=turn.turn_id,
@@ -1504,7 +1578,7 @@ def test_choice_response_is_idempotent_and_rejects_invalid_or_conflicting_input(
             options=("staging", "production"),
         )
         model = InspectingModel(store)
-        runner = Session(
+        runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,

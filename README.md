@@ -115,37 +115,38 @@ must provide:
 - valid structured output when `supports_structured_output` is enabled; and
 - bounded timeouts and cancellable streaming.
 
-Built-in aliases remain read-only. User registrations live in the versioned
+Built-in model IDs remain read-only. User registrations live in the versioned
 user registry; initialize the local binding trust domain once, then inspect or
-register aliases through the CLI:
+register exact model IDs through the CLI. `--provider` selects the provider
+adapter and transport; the same `MODEL_ID` is sent to that provider:
 
 ```bash
 uv run agent model trust init
 uv run agent model trust status
 uv run agent model list --source
 uv run agent model current
-export MODEL_ALIAS=my-model-alias
-export PROVIDER_MODEL_ID=provider-model-id
+export MODEL_ID=provider-model-id
 export PROVIDER_BASE_URL=https://provider.example/v1
 export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
+export MY_PROVIDER_TOKEN=replace-with-provider-token
 
-uv run agent model show "$MODEL_ALIAS"
-uv run agent model add "$MODEL_ALIAS" \
+uv run agent model add "$MODEL_ID" \
   --provider openai_compatible \
-  --provider-model "$PROVIDER_MODEL_ID" \
+  --context-window-tokens 131072 \
   --base-url "$PROVIDER_BASE_URL" \
   --api-key-env "$PROVIDER_CREDENTIAL_ENV"
 
-uv run agent model probe "$MODEL_ALIAS" --level full
-uv run agent model update "$MODEL_ALIAS" --timeout-seconds 90
-uv run agent model switch "$MODEL_ALIAS"
-uv run agent model remove "$MODEL_ALIAS"
+uv run agent model show "$MODEL_ID"
+uv run agent model probe "$MODEL_ID" --level full
+uv run agent model update "$MODEL_ID" --timeout-seconds 90
+uv run agent model switch "$MODEL_ID"
+uv run agent model remove "$MODEL_ID"
 ```
 
 `agent model add` and `update` run the full probe before their compare-and-swap
 registry commit. Probe failure or cancellation writes nothing. Advanced typed
 definitions can use `--from <one-model.yaml>`; `--skip-probe` is an explicit
-offline escape hatch and reports the alias as unverified. Registry files store
+offline escape hatch and reports the model ID as unverified. Registry files store
 only the environment variable name, never its resolved value.
 
 The session selection is mutable, both outside and inside interactive chat:
@@ -153,13 +154,13 @@ The session selection is mutable, both outside and inside interactive chat:
 ```text
 $ uv run agent chat
 > /model
-当前模型: current-alias
+当前模型: current-model-id
 可用模型:
-* current-alias  ...
-  another-alias  ...
-切换: /model <alias>
-> /model another-alias
-已切换模型: another-alias
+* current-model-id  ...
+  another-model-id  ...
+切换: /model <model_id>
+> /model another-model-id
+已切换模型: another-model-id
 ```
 
 Interactive chat uses a Unicode-aware line editor, so Backspace/Delete and
@@ -172,11 +173,11 @@ to show complete subsequent tool results. A separate warning identifies output
 already truncated by the tool or ACI; UI folding never changes durable history.
 
 The next message keeps the current conversation history and creates a new Turn
-bound to the selected alias; no restart or `/new` is required. An invalid alias
-prints the available aliases, keeps the previous model, and does not contact a
+bound to the selected model ID; no restart or `/new` is required. An invalid ID
+prints the available IDs, keeps the previous model, and does not contact a
 provider. Each completed or paused Turn retains an authenticated, immutable
 definition in durable history. `agent resume` therefore continues that Turn's
-original model even after the alias is updated, removed, or selected differently
+original model even after the model ID is updated, removed, or selected differently
 for later Turns.
 
 ### Run a task
@@ -215,7 +216,7 @@ from agent_runtime import Agent
 
 async def main() -> None:
     agent = Agent(
-        model="<model-alias>",
+        model="<model-id>",
         workspace_path=Path("."),
     )
     result = await agent.run(

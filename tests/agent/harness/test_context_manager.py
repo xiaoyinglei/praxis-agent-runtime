@@ -15,7 +15,7 @@ from agent_runtime.harness import (
     PreparedModelCall,
     RolloutContextManager,
     RolloutStore,
-    Session,
+    TurnExecutor,
 )
 
 
@@ -27,13 +27,13 @@ def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> 
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="first question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="first answer")
         second = store.start_turn(
             thread_id=thread.thread_id,
             user_message="follow up",
-            binding_manifest={"model_alias": "model-v2"},
+            binding_manifest={"model_id": "model-v2"},
         )
 
         messages = RolloutContextManager(store).build(second.turn_id)
@@ -56,7 +56,7 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="x" * 200,
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
 
         with pytest.raises(ContextBudgetExceededError, match="single Item"):
@@ -71,7 +71,7 @@ def test_context_manager_enforces_total_bytes_and_message_count(tmp_path: Path) 
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="a" * 80,
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.record_migrated_context_item(
             turn_id=turn.turn_id,
@@ -99,7 +99,7 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="inspect",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.record_migrated_context_item(
             turn_id=turn.turn_id,
@@ -153,7 +153,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = NeverCalledModel()
-        result = await Session(
+        result = await TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=model,
@@ -188,13 +188,13 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="old question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.complete_turn(turn_id=first.turn_id, answer="old answer")
         second = store.start_turn(
             thread_id=thread.thread_id,
             user_message="current question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         manager = RolloutContextManager(store)
         original_items = store.list_context_items(second.turn_id)
@@ -231,6 +231,45 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         assert manager.build(second.turn_id) == projected
 
 
+def test_budget_compaction_is_durable_and_preserves_user_constraints_as_data(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        first = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="Keep the runtime architecture and never write outside workspace.",
+            binding_manifest={"model_id": "model-v1"},
+        )
+        store.complete_turn(turn_id=first.turn_id, answer="acknowledged")
+        second = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="Continue with the current implementation.",
+            binding_manifest={"model_id": "model-v1"},
+        )
+        manager = RolloutContextManager(store)
+
+        compaction = manager.compact_for_budget(
+            turn_id=second.turn_id,
+            retained_tail_messages=1,
+        )
+
+        projected = manager.build(second.turn_id)
+        assert [message.role for message in projected] == ["context", "user"]
+        payload = compaction.payload
+        assert "[truncated]" not in payload["summary"]
+        assert payload["preserved_facts"]["architecture_and_safety_constraints"] == [
+            {
+                "item_id": store.list_context_items(second.turn_id)[0].item_id,
+                "kind": "user_message",
+                "text": "Keep the runtime architecture and never write outside workspace.",
+            }
+        ]
+        assert store.verify().valid is True
+
+
 def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
     tmp_path: Path,
 ) -> None:
@@ -241,7 +280,7 @@ def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="current question",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
             input_files=({"workspace_path": "input.txt", "sha256": "b" * 64},),
         )
         items = store.list_context_items(turn.turn_id)

@@ -3,8 +3,15 @@ from __future__ import annotations
 from pathlib import Path
 
 from agent_runtime.harness import CompletionProposal, RolloutStore
-from agent_runtime.harness import completion as completion_module
 from agent_runtime.harness.completion import DeliveryCompletionGate
+from agent_runtime.harness.verification import classify_tool_verification
+
+_FORGED_VERIFICATION_COMMANDS = (
+    "echo pytest",
+    "printf mypy",
+    "true # cargo test",
+    "pytest --help",
+)
 
 
 def _commit_tool_result(
@@ -81,6 +88,20 @@ def _commit_tool_result(
             "model_content": str(result),
         },
     )
+    evidence = classify_tool_verification(
+        tool_name=tool_name,
+        arguments=arguments,
+        structured_content=result,
+        resources=resources,
+    )
+    if evidence is not None:
+        store.record_verification(
+            turn_id=turn_id,
+            operation_id=operation_id,
+            kind=evidence.kind,
+            verifier=evidence.verifier,
+            verified_resources=evidence.verified_resources,
+        )
 
 
 def _proposal(store: RolloutStore, turn_id: str) -> CompletionProposal:
@@ -189,6 +210,60 @@ def test_verification_must_happen_after_the_latest_workspace_change(
 
         assert fresh.action == "accept"
         assert store.verify().valid is True
+
+
+def test_command_text_markers_cannot_forge_verification_evidence(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        turn = store.start_turn(
+            thread_id=store.create_thread(workspace=workspace).thread_id,
+            user_message="change and verify",
+            binding_manifest={
+                "completion_policy": {"require_workspace_change": True}
+            },
+        )
+        _commit_tool_result(
+            store,
+            turn_id=turn.turn_id,
+            call_id="change",
+            tool_name="apply_patch",
+            arguments={"file_path": "module.py"},
+            result={
+                "replaced": True,
+                "metadata": {
+                    "runtime_workspace_write": True,
+                    "workspace_tree_changed": True,
+                },
+            },
+            resources=(
+                {
+                    "kind": "filesystem",
+                    "identity": str(target.resolve()),
+                    "access": "write",
+                },
+            ),
+        )
+        for index, command in enumerate(_FORGED_VERIFICATION_COMMANDS):
+            _commit_tool_result(
+                store,
+                turn_id=turn.turn_id,
+                call_id=f"fake-{index}",
+                tool_name="run_command",
+                arguments={"command": command},
+                result={"exit_code": 0},
+            )
+
+        decision = DeliveryCompletionGate(store).evaluate(
+            _proposal(store, turn.turn_id)
+        )
+
+        assert decision.action == "continue"
+        assert "verification" in decision.reason
 
 
 def test_targeted_read_can_verify_the_same_file_but_not_an_unrelated_file(
@@ -378,9 +453,15 @@ def test_valid_data_inspection_verifies_the_changed_artifact(tmp_path: Path) -> 
 
 
 def test_inline_python_assert_is_verification_but_assert_text_is_not() -> None:
-    assert completion_module._looks_like_verification(
-        "python3 -c \"from calculator import add; assert add(2, 3) == 5\""
-    )
-    assert not completion_module._looks_like_verification(
-        "python3 -c \"print('assert add(2, 3) == 5')\""
-    )
+    assert classify_tool_verification(
+        tool_name="run_command",
+        arguments={
+            "command": "python3 -c \"from calculator import add; assert add(2, 3) == 5\""
+        },
+        structured_content={"exit_code": 0},
+    ) is not None
+    assert classify_tool_verification(
+        tool_name="run_command",
+        arguments={"command": "python3 -c \"print('assert add(2, 3) == 5')\""},
+        structured_content={"exit_code": 0},
+    ) is None

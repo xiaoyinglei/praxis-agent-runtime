@@ -14,9 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "agent_code_benchmark.py"
-REAL_MANIFEST_PATH = (
-    Path(__file__).parents[2] / "evals" / "code_agent" / "benchmark_v1.json"
-)
+REAL_MANIFEST_PATH = Path(__file__).parents[2] / "evals" / "code_agent" / "benchmark_v1.json"
 
 
 def _load_benchmark_module():
@@ -104,9 +102,11 @@ def test_release_evidence_binds_every_raw_result_and_gate_summary(
     _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
     manifest = module.load_manifest(path)
     artifacts = tmp_path / "artifacts"
-    result = artifacts / "raw" / "result.json"
-    result.parent.mkdir(parents=True)
-    result.write_text('{"outcome":"success"}\n', encoding="utf-8")
+    result = _write_result_artifact(
+        module,
+        artifacts / "raw",
+        _release_result(manifest, manifest.tasks[0], manifest.primary_model),
+    )
     evidence = artifacts / "release" / "evidence.json"
     monkeypatch.setattr(
         module,
@@ -124,7 +124,7 @@ def test_release_evidence_binds_every_raw_result_and_gate_summary(
     )
 
     payload = json.loads(evidence.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "praxis-code-agent-release-evidence-v1"
+    assert payload["schema_version"] == "praxis-code-agent-release-evidence-v2"
     assert payload["runtime_fingerprint"] == "a" * 64
     assert payload["gate"] == {"release_ready": True}
     assert payload["results"] == [
@@ -144,9 +144,11 @@ def test_release_evidence_loader_rejects_tampered_raw_result(
     _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
     manifest = module.load_manifest(path)
     artifacts = tmp_path / "artifacts"
-    result = artifacts / "raw" / "result.json"
-    result.parent.mkdir(parents=True)
-    result.write_text("original\n", encoding="utf-8")
+    result = _write_result_artifact(
+        module,
+        artifacts / "raw",
+        _release_result(manifest, manifest.tasks[0], manifest.primary_model),
+    )
     evidence = artifacts / "release" / "evidence.json"
     monkeypatch.setattr(
         module,
@@ -169,6 +171,30 @@ def test_release_evidence_loader_rejects_tampered_raw_result(
             artifacts_root=artifacts,
             manifest=manifest,
         )
+
+
+def test_kernel_comparison_evidence_uses_current_schema(tmp_path: Path) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    candidate = tmp_path / "candidate.json"
+    baseline = tmp_path / "baseline.json"
+    candidate.write_text("candidate\n", encoding="utf-8")
+    baseline.write_text("baseline\n", encoding="utf-8")
+    evidence_path = tmp_path / "comparison.json"
+
+    module._write_comparison_evidence(
+        path=evidence_path,
+        artifacts_root=tmp_path,
+        manifest=manifest,
+        comparison={"comparison_ready": True},
+        candidate_evidence=candidate,
+        baseline_evidence=baseline,
+    )
+
+    payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert payload["schema_version"] == "praxis-code-agent-kernel-comparison-v2"
 
 
 def test_run_release_cli_requires_external_artifact_and_explicit_agent_command() -> None:
@@ -209,6 +235,7 @@ def test_current_runtime_agent_command_is_absolute_and_not_task_workspace_relati
 def test_run_task_cli_resolves_current_runtime_like_run_release(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     module = _load_benchmark_module()
     manifest = SimpleNamespace(tasks=(SimpleNamespace(task_id="task-1"),))
@@ -229,7 +256,7 @@ def test_run_task_cli_resolves_current_runtime_like_run_release(
         captured.update(kwargs)
         return SimpleNamespace(
             task_id="task-1",
-            model_alias="model-1",
+            model_id="model-1",
             outcome=SimpleNamespace(value="passed"),
             turn_id="turn-1",
             artifact_dir=tmp_path / "artifact",
@@ -256,6 +283,10 @@ def test_run_task_cli_resolves_current_runtime_like_run_release(
         "/trusted/current/agent",
         "current-runtime",
     )
+    assert captured["model_id"] == "model-1"
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["model_id"] == "model-1"
+    assert "model_alias" not in payload
 
 
 def test_compare_kernels_cli_freezes_the_old_kernel_commit() -> None:
@@ -322,9 +353,9 @@ def _task_payload(
 def _manifest_payload(
     *,
     benchmark_version: str = "code-agent-v1",
-    primary_model: str = "qwen3_5_9b_mlx_4bit",
-    control_model: str = "groq_gpt_oss_120b",
-    diagnostic_model: str = "kimi_cloud",
+    primary_model: str = "mlx-community/Qwen3.5-9B-4bit",
+    control_model: str = "openai/gpt-oss-120b",
+    diagnostic_model: str = "kimi-k2.6",
     tasks: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return {
@@ -353,9 +384,9 @@ def test_manifest_locks_qwen_primary_and_groq_control(tmp_path: Path) -> None:
 
     manifest = module.load_manifest(path)
 
-    assert manifest.primary_model == "qwen3_5_9b_mlx_4bit"
-    assert manifest.control_model == "groq_gpt_oss_120b"
-    assert manifest.diagnostic_model == "kimi_cloud"
+    assert manifest.primary_model == "mlx-community/Qwen3.5-9B-4bit"
+    assert manifest.control_model == "openai/gpt-oss-120b"
+    assert manifest.diagnostic_model == "kimi-k2.6"
     assert manifest.benchmark_version == "code-agent-v1"
     assert len(manifest.fingerprint) == 64
 
@@ -363,9 +394,9 @@ def test_manifest_locks_qwen_primary_and_groq_control(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("field", "model"),
     [
-        ("primary_model", "deepseek_chat"),
-        ("control_model", "deepseek_reasoner"),
-        ("diagnostic_model", "deepseek_chat"),
+        ("primary_model", "deepseek-chat"),
+        ("control_model", "deepseek-reasoner"),
+        ("diagnostic_model", "deepseek-chat"),
     ],
 )
 def test_manifest_rejects_deepseek_models(
@@ -417,21 +448,13 @@ def test_task_replacement_requires_new_benchmark_version(tmp_path: Path) -> None
 
 def _release_tasks() -> list[dict[str, object]]:
     tasks: list[dict[str, object]] = []
-    regression_categories = (
-        ["local"] * 9
-        + ["medium"] * 8
-        + ["cross_layer"] * 8
-    )
+    regression_categories = ["local"] * 9 + ["medium"] * 8 + ["cross_layer"] * 8
     control_counts = {"local": 0, "medium": 0, "cross_layer": 0}
     for index, category in enumerate(regression_categories, start=1):
         control = control_counts[category] < 2
         if control:
             control_counts[category] += 1
-        layers = (
-            ["service", "loop"]
-            if category == "cross_layer"
-            else ["tool"]
-        )
+        layers = ["service", "loop"] if category == "cross_layer" else ["tool"]
         tasks.append(
             _task_payload(
                 f"regression-{index:02d}",
@@ -442,11 +465,7 @@ def _release_tasks() -> list[dict[str, object]]:
         )
     holdout_categories = ["local", "medium", "medium", "cross_layer", "cross_layer"]
     for index, category in enumerate(holdout_categories, start=1):
-        layers = (
-            ["public_api_cli", "service"]
-            if category == "cross_layer"
-            else ["tool"]
-        )
+        layers = ["public_api_cli", "service"] if category == "cross_layer" else ["tool"]
         tasks.append(
             _task_payload(
                 f"holdout-{index:02d}",
@@ -532,21 +551,21 @@ def test_real_v1_manifest_is_release_shaped_and_bound_to_git_history() -> None:
 def _release_result(
     manifest,
     task,
-    model_alias: str,
+    model_id: str,
     *,
     outcome: str = "passed",
     diagnosis_primary: str = "unknown",
     diagnosis_evidence: list[str] | None = None,
 ) -> dict[str, object]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "benchmark_version": manifest.benchmark_version,
         "manifest_fingerprint": manifest.fingerprint,
         "task_id": task.task_id,
         "task_source_commit": task.source_commit,
         "task_target_commit": task.target_commit,
         "runtime_fingerprint": "a" * 64,
-        "model_alias": model_alias,
+        "model_id": model_id,
         "outcome": outcome,
         "diagnosis": {
             "primary": diagnosis_primary,
@@ -558,15 +577,8 @@ def _release_result(
 
 
 def _complete_release_results(manifest) -> list[dict[str, object]]:
-    results = [
-        _release_result(manifest, task, manifest.primary_model)
-        for task in manifest.tasks
-    ]
-    results.extend(
-        _release_result(manifest, task, manifest.control_model)
-        for task in manifest.tasks
-        if task.control
-    )
+    results = [_release_result(manifest, task, manifest.primary_model) for task in manifest.tasks]
+    results.extend(_release_result(manifest, task, manifest.control_model) for task in manifest.tasks if task.control)
     return results
 
 
@@ -595,6 +607,168 @@ def _write_result_artifact(
         encoding="utf-8",
     )
     return result_path
+
+
+def test_result_loader_normalizes_immutable_v1_model_alias_at_boundary(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    historical = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    historical["schema_version"] = 1
+    historical["model_alias"] = historical.pop("model_id")
+    result_path = _write_result_artifact(
+        module,
+        tmp_path / "historical-result",
+        historical,
+    )
+
+    normalized = module.load_result_record(result_path, manifest=manifest)
+
+    assert normalized["schema_version"] == 2
+    assert normalized["model_id"] == manifest.primary_model
+    assert "model_alias" not in normalized
+
+
+def test_release_evidence_loader_normalizes_immutable_v1_results(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    artifacts = tmp_path / "artifacts"
+    historical = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    historical["schema_version"] = 1
+    historical["model_alias"] = historical.pop("model_id")
+    result_path = _write_result_artifact(module, artifacts / "raw", historical)
+    evidence_path = artifacts / "release" / "evidence.json"
+    evidence = {
+        "schema_version": "praxis-code-agent-release-evidence-v1",
+        "manifest_fingerprint": manifest.fingerprint,
+        "runtime_fingerprint": "a" * 64,
+        "results": [
+            {
+                "path": result_path.relative_to(artifacts).as_posix(),
+                "sha256": module.hashlib.sha256(result_path.read_bytes()).hexdigest(),
+            }
+        ],
+    }
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    runtime_fingerprint, results = module.load_release_evidence(
+        evidence_path,
+        artifacts_root=artifacts,
+        manifest=manifest,
+    )
+
+    assert runtime_fingerprint == "a" * 64
+    assert results[0]["model_id"] == manifest.primary_model
+    assert "model_alias" not in results[0]
+
+
+def test_release_evidence_writer_rejects_historical_v1_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    artifacts = tmp_path / "artifacts"
+    historical = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    historical["schema_version"] = 1
+    historical["model_alias"] = historical.pop("model_id")
+    result_path = _write_result_artifact(module, artifacts / "raw", historical)
+    monkeypatch.setattr(
+        module,
+        "repository_state_fingerprint",
+        lambda _repository: "a" * 64,
+    )
+
+    with pytest.raises(ValueError, match="current result schema_version"):
+        module._write_release_evidence(
+            path=Path("release/evidence.json"),
+            artifacts_root=artifacts,
+            manifest=manifest,
+            repository=tmp_path,
+            summary={"release_ready": False},
+            result_paths=(result_path,),
+        )
+
+
+def test_release_evidence_loader_rejects_mixed_evidence_and_result_versions(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    artifacts = tmp_path / "artifacts"
+    result_path = _write_result_artifact(
+        module,
+        artifacts / "raw",
+        _release_result(manifest, manifest.tasks[0], manifest.primary_model),
+    )
+    evidence_path = artifacts / "release" / "evidence.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "praxis-code-agent-release-evidence-v1",
+                "manifest_fingerprint": manifest.fingerprint,
+                "runtime_fingerprint": "a" * 64,
+                "results": [
+                    {
+                        "path": result_path.relative_to(artifacts).as_posix(),
+                        "sha256": module.hashlib.sha256(result_path.read_bytes()).hexdigest(),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="evidence/result schema mismatch"):
+        module.load_release_evidence(
+            evidence_path,
+            artifacts_root=artifacts,
+            manifest=manifest,
+        )
+
+
+def test_release_gate_rejects_legacy_model_alias_in_active_results(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    result = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    result["model_alias"] = result.pop("model_id")
+
+    with pytest.raises(ValueError, match="result.model_alias is unsupported"):
+        module.evaluate_release_results(manifest, [result])
+
+
+def test_release_gate_rejects_legacy_provider_model_in_active_results(
+    tmp_path: Path,
+) -> None:
+    module = _load_benchmark_module()
+    manifest_path = tmp_path / "benchmark.json"
+    _write_manifest(manifest_path, _manifest_payload(tasks=_release_tasks()))
+    manifest = module.load_manifest(manifest_path)
+    result = _release_result(manifest, manifest.tasks[0], manifest.primary_model)
+    result["provider_model"] = result["model_id"]
+
+    with pytest.raises(ValueError, match="result.provider_model is unsupported"):
+        module.evaluate_release_results(manifest, [result])
 
 
 def test_release_gate_computes_primary_and_cross_layer_first_pass_rates(
@@ -628,11 +802,7 @@ def test_release_gate_blocks_false_completion_from_control_run(
     _write_manifest(path, _manifest_payload(tasks=_release_tasks()))
     manifest = module.load_manifest(path)
     results = _complete_release_results(manifest)
-    control = next(
-        result
-        for result in results
-        if result["model_alias"] == manifest.control_model
-    )
+    control = next(result for result in results if result["model_id"] == manifest.control_model)
     control.update(
         _release_result(
             manifest,
@@ -681,12 +851,8 @@ def test_release_gate_requires_complete_unique_runs_and_failure_diagnoses(
     summary = module.evaluate_release_results(manifest, results)
 
     assert summary["release_ready"] is False
-    assert f"missing_result:{missing['task_id']}:{missing['model_alias']}" in summary[
-        "reasons"
-    ]
-    assert f"unknown_diagnosis:{failed['task_id']}:{failed['model_alias']}" in summary[
-        "reasons"
-    ]
+    assert f"missing_result:{missing['task_id']}:{missing['model_id']}" in summary["reasons"]
+    assert f"unknown_diagnosis:{failed['task_id']}:{failed['model_id']}" in summary["reasons"]
 
     with pytest.raises(ValueError, match="duplicate result"):
         module.evaluate_release_results(manifest, [*results, results[0]])
@@ -909,7 +1075,7 @@ def test_provider_error_parser_keeps_pre_runtime_failures_out_of_execution_closu
 def test_provider_limit_diagnosis_preserves_causes_observed_before_limit() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -942,7 +1108,7 @@ def test_provider_limit_diagnosis_preserves_causes_observed_before_limit() -> No
 def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -953,10 +1119,7 @@ def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
     diagnosis = module.diagnose_run(
         facts,
         outcome,
-        agent_stdout=(
-            "Exploration limit reached after 20 consecutive inspection calls.\n"
-            "停止原因: delivery_stalled\n"
-        ),
+        agent_stdout=("Exploration limit reached after 20 consecutive inspection calls.\n停止原因: delivery_stalled\n"),
         acceptance_stdout="4 failed, 30 passed",
         acceptance_stderr="",
     )
@@ -972,7 +1135,7 @@ def test_delivery_stall_diagnosis_is_separate_from_bounded_outcome() -> None:
 def test_incomplete_model_response_is_diagnosed_from_public_harness_evidence() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="deepseek_v4_flash",
+        model_id="deepseek-v4-flash",
         turn_status="failed",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -1001,7 +1164,7 @@ def test_incomplete_model_response_is_diagnosed_from_public_harness_evidence() -
 def test_false_completion_diagnosis_names_execution_closure() -> None:
     module = _load_benchmark_module()
     facts = module.RunFacts(
-        model_alias="groq_gpt_oss_120b",
+        model_id="openai/gpt-oss-120b",
         turn_status="done",
         valid_diff=False,
         hidden_acceptance_passed=False,
@@ -1028,7 +1191,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
     [
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": True,
@@ -1037,7 +1200,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": False,
@@ -1046,7 +1209,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "groq_gpt_oss_120b",
+                "model_id": "openai/gpt-oss-120b",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1056,7 +1219,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "kimi_cloud",
+                "model_id": "kimi-k2.6",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1066,7 +1229,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "failed",
                 "valid_diff": False,
                 "hidden_acceptance_passed": False,
@@ -1076,7 +1239,7 @@ def test_false_completion_diagnosis_names_execution_closure() -> None:
         ),
         (
             {
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "turn_status": "done",
                 "valid_diff": True,
                 "hidden_acceptance_passed": True,
@@ -1147,8 +1310,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
     source_commit = _git(repo, "rev-parse", "HEAD")
 
     (repo / "hidden_test.py").write_text(
-        "from pathlib import Path\n"
-        "assert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
+        "from pathlib import Path\nassert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
         encoding="utf-8",
     )
     _git(repo, "add", "hidden_test.py")
@@ -1163,7 +1325,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
         "required.add('--require-workspace-change')\n"
         "required.add('--disable-workspace-mcp')\n"
         "assert required <= set(sys.argv)\n"
-        "assert sys.argv[sys.argv.index('--model') + 1] == 'kimi_cloud'\n"
+        "assert sys.argv[sys.argv.index('--model') + 1] == 'kimi-k2.6'\n"
         "assert '--max-tokens-total' not in sys.argv\n"
         "Path('app.py').write_text(\"VALUE = 'fixed'\\n\", encoding='utf-8')\n"
         "print('Turn: fake-turn')\n"
@@ -1191,7 +1353,7 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="kimi_cloud",
+        model_id="kimi-k2.6",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1204,10 +1366,11 @@ def test_run_task_uses_public_cli_and_archives_reproducible_evidence(
     assert (record.artifact_dir / "result.json").is_file()
     assert (record.artifact_dir / "agent.stdout").is_file()
     assert (record.artifact_dir / "acceptance.stdout").is_file()
-    payload = json.loads(
-        (record.artifact_dir / "result.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((record.artifact_dir / "result.json").read_text(encoding="utf-8"))
     diff = (record.artifact_dir / "agent.diff").read_text(encoding="utf-8")
+    assert payload["schema_version"] == 2
+    assert payload["model_id"] == "kimi-k2.6"
+    assert "model_alias" not in payload
     assert payload["evidence"]["agent_diff_sha256"] == module._sha256(diff)
     assert payload["max_tokens_total"] is None
     assert payload["runtime_fingerprint"] == record.runtime_fingerprint
@@ -1228,8 +1391,7 @@ def test_run_task_retries_only_a_durable_unknown_model_operation(
     _git(repo, "commit", "-qm", "fixture source")
     source_commit = _git(repo, "rev-parse", "HEAD")
     (repo / "hidden_test.py").write_text(
-        "from pathlib import Path\n"
-        "assert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
+        "from pathlib import Path\nassert \"VALUE = 'fixed'\" in Path('app.py').read_text()\n",
         encoding="utf-8",
     )
     _git(repo, "add", "hidden_test.py")
@@ -1278,7 +1440,7 @@ def test_run_task_retries_only_a_durable_unknown_model_operation(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="kimi_cloud",
+        model_id="kimi-k2.6",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1355,10 +1517,7 @@ def test_run_command_streams_output_before_process_exit(
     )
     worker.start()
     deadline = time.monotonic() + 3
-    while (
-        not stdout_path.is_file()
-        or "first" not in stdout_path.read_text(encoding="utf-8")
-    ):
+    while not stdout_path.is_file() or "first" not in stdout_path.read_text(encoding="utf-8"):
         assert time.monotonic() < deadline
         time.sleep(0.01)
 
@@ -1491,22 +1650,15 @@ def test_setup_failure_is_benchmark_invalid_not_runtime_failure(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="qwen3_5_9b_mlx_4bit",
+        model_id="mlx-community/Qwen3.5-9B-4bit",
         agent_command=(sys.executable, "-c", "raise AssertionError('must not run')"),
         artifacts_root=tmp_path / "artifacts",
     )
 
     assert record.outcome is module.RunOutcome.BENCHMARK_INVALID
-    assert (
-        record.diagnosis.primary
-        is module.DiagnosisCause.BENCHMARK_ENVIRONMENT
-    )
-    result = json.loads(
-        (record.artifact_dir / "result.json").read_text(encoding="utf-8")
-    )
-    assert result["diagnosis"]["evidence"] == [
-        "benchmark_invalid:benchmark_setup_failed"
-    ]
+    assert record.diagnosis.primary is module.DiagnosisCause.BENCHMARK_ENVIRONMENT
+    result = json.loads((record.artifact_dir / "result.json").read_text(encoding="utf-8"))
+    assert result["diagnosis"]["evidence"] == ["benchmark_invalid:benchmark_setup_failed"]
 
 
 def test_secret_written_to_workspace_blocks_run_and_is_redacted_from_artifacts(
@@ -1559,7 +1711,7 @@ def test_secret_written_to_workspace_blocks_run_and_is_redacted_from_artifacts(
         repository=repo,
         manifest=manifest,
         task=manifest.tasks[0],
-        model_alias="qwen3_5_9b_mlx_4bit",
+        model_id="mlx-community/Qwen3.5-9B-4bit",
         agent_command=(sys.executable, str(fake_agent)),
         artifacts_root=tmp_path / "artifacts",
     )
@@ -1577,9 +1729,7 @@ def test_benchmark_redacts_provider_credential_identifier() -> None:
     module = _load_benchmark_module()
     credential_id = "ak-provider-credential-123456"
 
-    redacted = module._redact_secrets(
-        f"rate limit for <{credential_id}>"
-    )
+    redacted = module._redact_secrets(f"rate limit for <{credential_id}>")
 
     assert credential_id not in redacted
     assert redacted == "rate limit for <[REDACTED]>"

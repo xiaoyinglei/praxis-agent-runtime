@@ -190,12 +190,13 @@ class ApplyPatchInput(BaseModel):
     file_path: str = Field(
         min_length=1,
         max_length=4096,
-        description="Workspace-relative path of the existing file to edit.",
+        description="Workspace-relative path of the file to create or edit.",
     )
-    old_string: str = Field(
+    old_string: str | None = Field(
+        default=None,
         min_length=1,
         max_length=1_000_000,
-        description="Exact text that must already exist.",
+        description="Exact text that must already exist; omit only when creating a file.",
     )
     new_string: str = Field(
         max_length=1_000_000,
@@ -206,12 +207,19 @@ class ApplyPatchInput(BaseModel):
         description="Replace every occurrence instead of requiring uniqueness.",
     )
 
+    @model_validator(mode="after")
+    def validate_operation(self) -> ApplyPatchInput:
+        if self.old_string is None and self.replace_all:
+            raise ValueError("replace_all requires old_string")
+        return self
+
 
 class ApplyPatchOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     file_path: str
     replaced: bool
+    created: bool = False
     occurrences: int = Field(ge=0)
     message: str
 
@@ -230,6 +238,8 @@ _READ_OUTPUT_SCHEMA, _unused_read_output_validator = pydantic_input(ReadFileOutp
 _PATCH_INPUT_SCHEMA, _validate_patch_input = pydantic_input(ApplyPatchInput)
 _PATCH_OUTPUT_SCHEMA, _unused_patch_output_validator = pydantic_input(ApplyPatchOutput)
 _PATCH_ERROR_CODES = {
+    "file exists": "file_exists",
+    "parent directory not found": "parent_directory_not_found",
     "file not found": "file_not_found",
     "old_string not found": "old_string_not_found",
     "old_string is not unique; set replace_all=true": "old_string_not_unique",
@@ -323,9 +333,10 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
         definition=ToolDefinition(
             name="apply_patch",
             description=(
-                "Edit an existing UTF-8 workspace file by exact text replacement. "
+                "Create a UTF-8 workspace file, or edit an existing file by exact "
+                "text replacement. Omit old_string only when creating a new file. "
                 "Without replace_all, the old text must occur exactly once. The write "
-                "is atomically installed and does not create new files. Verification "
+                "is atomically installed and creation fails if the path exists. Verification "
                 "toolchains under .venv and node_modules are read-only. After a "
                 "successful literal edit, use at most one targeted read_file or "
                 "search_text call, never both, then return a final answer when it proves the requested "
@@ -359,7 +370,7 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 }
             ),
         ),
-        execution_revision="builtin-apply-patch-v2-protected-toolchain",
+        execution_revision="builtin-apply-patch-v3-create-or-replace",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -616,6 +627,61 @@ def _apply_patch(
         raise PermissionError(
             "apply_patch cannot modify the verification toolchain"
         )
+    if not target.exists():
+        if request.old_string is not None:
+            return _ApplyPatchRunResult(
+                ApplyPatchOutput(
+                    file_path=request.file_path,
+                    replaced=False,
+                    occurrences=0,
+                    message="file not found",
+                )
+            )
+        if not target.parent.is_dir():
+            return _ApplyPatchRunResult(
+                ApplyPatchOutput(
+                    file_path=request.file_path,
+                    replaced=False,
+                    occurrences=0,
+                    message="parent directory not found",
+                )
+            )
+        diff, diff_truncated = _patch_diff(
+            "",
+            request.new_string,
+            file_path=request.file_path,
+        )
+        try:
+            _atomic_create_text(target, request.new_string)
+        except FileExistsError:
+            return _ApplyPatchRunResult(
+                ApplyPatchOutput(
+                    file_path=request.file_path,
+                    replaced=False,
+                    occurrences=0,
+                    message="file exists",
+                )
+            )
+        return _ApplyPatchRunResult(
+            ApplyPatchOutput(
+                file_path=request.file_path,
+                replaced=False,
+                created=True,
+                occurrences=0,
+                message="file created",
+            ),
+            diff=diff,
+            diff_truncated=diff_truncated,
+        )
+    if request.old_string is None:
+        return _ApplyPatchRunResult(
+            ApplyPatchOutput(
+                file_path=request.file_path,
+                replaced=False,
+                occurrences=0,
+                message="file exists",
+            )
+        )
     if not target.is_file():
         return _ApplyPatchRunResult(
             ApplyPatchOutput(
@@ -725,6 +791,27 @@ def _atomic_write_text(path: Path, content: str) -> None:
             Path(temporary_name).unlink(missing_ok=True)
 
 
+def _atomic_create_text(path: Path, content: str) -> None:
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_name = stream.name
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.link(temporary_name, path)
+    finally:
+        if temporary_name is not None:
+            Path(temporary_name).unlink(missing_ok=True)
+
+
 def _workspace_use(
     workspace: WorkspaceRuntime,
     value: str,
@@ -771,7 +858,7 @@ def _normalize_apply_patch(raw: object) -> NormalizedToolOutput:
         _PATCH_OUTPUT_SCHEMA,
         validated.model_dump(mode="json"),
     )
-    if validated.replaced:
+    if validated.replaced or validated.created:
         return NormalizedToolOutput(
             structured_content=structured,
             metadata={

@@ -216,7 +216,7 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="read",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         stored = store.record_tool_result(
             turn_id=turn.turn_id,

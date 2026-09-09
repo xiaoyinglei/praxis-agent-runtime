@@ -59,8 +59,6 @@ class RolloutContextManager:
         )
 
     def build(self, turn_id: str) -> tuple[HarnessMessage, ...]:
-        context_items = self._store.list_context_items(turn_id)
-        replacements, suppressed_item_ids = _compaction_projection(context_items)
         messages: list[HarnessMessage] = []
         total_bytes = 0
 
@@ -85,57 +83,231 @@ class RolloutContextManager:
             messages.append(message)
             total_bytes += item_bytes
 
+        for _item_id, message in self._projected_messages(turn_id):
+            append(message)
+        return tuple(messages)
+
+    def compact_for_budget(
+        self,
+        *,
+        turn_id: str,
+        retained_tail_messages: int,
+    ) -> ItemSnapshot:
+        if (
+            isinstance(retained_tail_messages, bool)
+            or not isinstance(retained_tail_messages, int)
+            or retained_tail_messages < 0
+        ):
+            raise ValueError("retained_tail_messages must be a non-negative integer")
+        context_items = tuple(
+            item
+            for item in self._store.list_context_items(turn_id)
+            if item.status == "completed"
+        )
+        projected = self._projected_messages(turn_id)
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(projected) - 1, -1, -1)
+                if projected[index][1].role == "user"
+            ),
+            None,
+        )
+        if latest_user_index is None:
+            raise ContextBudgetExceededError(
+                "Durable compaction cannot remove the final model-visible user message."
+            )
+        retained = max(retained_tail_messages, len(projected) - latest_user_index)
+        first_retained_index = max(0, len(projected) - retained)
+        if first_retained_index == 0:
+            raise ContextBudgetExceededError(
+                "No older model-visible context is available for durable compaction."
+            )
+        first_retained_item_id = projected[first_retained_index][0]
+        raw_index = next(
+            (
+                index
+                for index, item in enumerate(context_items)
+                if item.item_id == first_retained_item_id
+            ),
+            None,
+        )
+        if raw_index is None or raw_index == 0:
+            raise RuntimeError("durable compaction projection lost its Item boundary")
+        covered_items = context_items[:raw_index]
+        versions: list[int] = []
+        for item in context_items:
+            raw_version = item.payload.get("context_version")
+            if (
+                item.kind == "context_compaction"
+                and isinstance(raw_version, int)
+                and not isinstance(raw_version, bool)
+            ):
+                versions.append(raw_version)
+        return self.compact(
+            turn_id=turn_id,
+            covered_item_ids=tuple(item.item_id for item in covered_items),
+            summary=(
+                f"Runtime compacted {len(covered_items)} canonical rollout items. "
+                "Use preserved facts and re-read referenced workspace resources when needed."
+            ),
+            preserved_facts=_runtime_preserved_facts(
+                self._store,
+                turn_id=turn_id,
+                covered_items=covered_items,
+            ),
+            context_version=max(versions, default=0) + 1,
+        )
+
+    def _projected_messages(
+        self,
+        turn_id: str,
+    ) -> tuple[tuple[str, HarnessMessage], ...]:
+        context_items = self._store.list_context_items(turn_id)
+        replacements, suppressed_item_ids = _compaction_projection(context_items)
+        projected: list[tuple[str, HarnessMessage]] = []
         for item in context_items:
             if item.status != "completed":
                 continue
             replacement = replacements.get(item.item_id)
             if replacement is not None:
-                append(replacement)
+                projected.append((item.item_id, replacement))
             if item.item_id in suppressed_item_ids:
                 continue
-            text = item.payload.get("text")
-            if item.kind == "user_message" and isinstance(text, str):
-                append(HarnessMessage(role="user", content=text))
-            elif item.kind == "agent_message" and isinstance(text, str):
-                append(HarnessMessage(role="assistant", content=text))
-            elif item.kind == "model_response" and isinstance(text, str):
-                calls = item.payload.get("tool_calls")
-                if isinstance(calls, (list, tuple)) and calls:
-                    append(
-                        HarnessMessage(
-                            role="assistant",
-                            content=text,
-                            tool_calls=tuple(_tool_call(call) for call in calls if isinstance(call, Mapping)),
-                        )
-                    )
-            elif item.kind == "tool_result":
-                model_content = item.payload.get("model_content")
-                tool_call_id = item.payload.get("tool_call_id")
-                if isinstance(model_content, str) and isinstance(tool_call_id, str):
-                    append(
-                        HarnessMessage(
-                            role="tool",
-                            content=model_content,
-                            tool_call_id=tool_call_id,
-                        )
-                    )
-            elif item.kind == "completion_feedback" and isinstance(text, str):
-                append(HarnessMessage(role="context", content=text))
-            elif item.kind == "context_message" and isinstance(text, str):
-                append(HarnessMessage(role="context", content=text))
-            elif item.kind == "input_file":
-                workspace_path = item.payload.get("workspace_path")
-                sha256 = item.payload.get("sha256")
-                if isinstance(workspace_path, str) and isinstance(sha256, str):
-                    append(
-                        HarnessMessage(
-                            role="context",
-                            content=(
-                                f"Attached input file available in the workspace: {workspace_path} (sha256={sha256})."
-                            ),
-                        )
-                    )
-        return tuple(messages)
+            message = _item_message(item)
+            if message is not None:
+                projected.append((item.item_id, message))
+        return tuple(projected)
+
+
+def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
+    text = item.payload.get("text")
+    if item.kind == "user_message" and isinstance(text, str):
+        return HarnessMessage(role="user", content=text)
+    if item.kind == "agent_message" and isinstance(text, str):
+        return HarnessMessage(role="assistant", content=text)
+    if item.kind == "model_response" and isinstance(text, str):
+        calls = item.payload.get("tool_calls")
+        if isinstance(calls, (list, tuple)) and calls:
+            return HarnessMessage(
+                role="assistant",
+                content=text,
+                tool_calls=tuple(
+                    _tool_call(call) for call in calls if isinstance(call, Mapping)
+                ),
+            )
+    if item.kind == "tool_result":
+        model_content = item.payload.get("model_content")
+        tool_call_id = item.payload.get("tool_call_id")
+        if isinstance(model_content, str) and isinstance(tool_call_id, str):
+            return HarnessMessage(
+                role="tool",
+                content=model_content,
+                tool_call_id=tool_call_id,
+            )
+    if item.kind in {"completion_feedback", "context_message"} and isinstance(
+        text, str
+    ):
+        return HarnessMessage(role="context", content=text)
+    if item.kind == "input_file":
+        workspace_path = item.payload.get("workspace_path")
+        sha256 = item.payload.get("sha256")
+        if isinstance(workspace_path, str) and isinstance(sha256, str):
+            return HarnessMessage(
+                role="context",
+                content=(
+                    "Attached input file available in the workspace: "
+                    f"{workspace_path} (sha256={sha256})."
+                ),
+            )
+    return None
+
+
+def _runtime_preserved_facts(
+    store: RolloutStore,
+    *,
+    turn_id: str,
+    covered_items: tuple[ItemSnapshot, ...],
+) -> dict[str, Any]:
+    covered_ids = {item.item_id for item in covered_items}
+    turn_ids = {item.turn_id for item in covered_items}
+    operations = tuple(
+        operation
+        for source_turn_id in turn_ids
+        for operation in store.list_tool_operations(source_turn_id)
+    )
+    operation_by_result = {
+        operation.result_item_id: operation
+        for operation in operations
+        if operation.result_item_id is not None
+    }
+    constraints = [
+        {
+            "item_id": item.item_id,
+            "kind": item.kind,
+            "text": item.payload["text"],
+        }
+        for item in covered_items
+        if item.kind in {"user_message", "context_message", "completion_feedback"}
+        and isinstance(item.payload.get("text"), str)
+    ]
+    file_changes = [
+        {
+            "operation_id": operation.operation_id,
+            "tool_name": operation.tool_name,
+            "resources": [dict(resource) for resource in operation.resources],
+        }
+        for item in covered_items
+        if (operation := operation_by_result.get(item.item_id)) is not None
+        and "write_workspace" in operation.effects
+        and operation.status == "succeeded"
+    ]
+    verification_results = [
+        dict(item.payload)
+        for item in covered_items
+        if item.kind == "verification" and item.producer == "runtime"
+    ]
+    plan_items = [
+        item
+        for item in store.list_context_items(turn_id)
+        if item.kind == "plan_state"
+        and item.status == "completed"
+        and isinstance(item.payload.get("plan"), Mapping)
+    ]
+    unresolved_work = (
+        []
+        if not plan_items
+        else [dict(plan_items[-1].payload["plan"])]
+    )
+    uncertain_side_effects = [
+        {
+            "operation_id": operation.operation_id,
+            "tool_name": operation.tool_name,
+            "status": operation.status,
+            "resources": [dict(resource) for resource in operation.resources],
+        }
+        for operation in operations
+        if operation.status == "unknown" or operation.requires_reconciliation
+    ]
+    inspectable_sources = [
+        {
+            "operation_id": operation.operation_id,
+            "tool_name": operation.tool_name,
+            "resources": [dict(resource) for resource in operation.resources],
+        }
+        for operation in operations
+        if operation.result_item_id in covered_ids
+        and operation.status == "succeeded"
+        and "read_workspace" in operation.effects
+    ]
+    return {
+        "architecture_and_safety_constraints": constraints,
+        "file_changes": file_changes,
+        "verification_results": verification_results,
+        "unresolved_work": unresolved_work,
+        "uncertain_side_effects": uncertain_side_effects,
+        "inspectable_sources": inspectable_sources,
+    }
 
 
 def _tool_call(payload: Mapping[str, object]) -> HarnessToolCall:

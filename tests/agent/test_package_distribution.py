@@ -40,11 +40,11 @@ def test_built_wheel_loads_bundled_qwen35_model_outside_repo(
         import agent_runtime.core.llm_registry as registry_module
         from agent_runtime import Agent
 
-        spec = Agent(model="qwen3_5_9b_mlx_4bit").current_model()
+        spec = Agent(model="mlx-community/Qwen3.5-9B-4bit").current_model()
         print(json.dumps({
             "agent_runtime_file": agent_runtime.__file__,
             "registry_file": registry_module.__file__,
-            "model": spec.provider_model,
+            "model": spec.id,
         }))
         """
     )
@@ -72,13 +72,12 @@ def test_built_wheel_loads_bundled_qwen35_model_outside_repo(
         textwrap.dedent(
             """
             models:
-              decoy:
+              decoy/model:
                 capability: chat
                 provider: decoy
                 protocol: openai_compatible
-                model: decoy/model
             defaults:
-              primary_model: decoy
+              primary_model: decoy/model
             """
         ),
         encoding="utf-8",

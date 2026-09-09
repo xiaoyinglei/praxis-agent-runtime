@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -8,11 +9,26 @@ import pytest
 from pytest import MonkeyPatch
 
 from agent_runtime import cli
-from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore
 from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.streaming.events import ItemStatus, TurnItemKind, item_completed
+
+
+class _SessionFactory:
+    opened = 0
+    closed = 0
+
+    @asynccontextmanager
+    async def session(self, **options):
+        self.opened += 1
+        self.options = options
+        try:
+            yield self
+        finally:
+            self.closed += 1
+
 
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
@@ -40,7 +56,6 @@ def _model_spec(model_id: str) -> ModelSpec:
     return ModelSpec(
         id=model_id,
         provider=f"provider-{model_id}",
-        provider_model=f"provider/{model_id}",
         context_window=32_768,
         supports_tools=True,
         supports_structured_output=True,
@@ -62,7 +77,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
         previous = store.start_turn(
             thread_id=thread.thread_id,
             user_message="first",
-            binding_manifest={"model_alias": "fake-model"},
+            binding_manifest={"model_id": "fake-model"},
         )
         previous = store.complete_turn(
             turn_id=previous.turn_id,
@@ -70,14 +85,14 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
         )
     turn_calls: list[object] = []
 
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = database
         workspace_path = workspace
 
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def run(self, *args: object, **kwargs: object) -> AgentResult:
+        async def submit(self, *args: object, **kwargs: object) -> AgentResult:
             turn_calls.append((args, kwargs))
             raise AssertionError("slash commands must not reach the agent")
 
@@ -100,7 +115,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
 
 
 @pytest.mark.anyio
-async def test_chat_loop_carries_the_previous_turn_automatically(
+async def test_chat_loop_reuses_one_session_for_all_submissions(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
 ) -> None:
@@ -109,14 +124,14 @@ async def test_chat_loop_carries_the_previous_turn_automatically(
     calls: list[tuple[str, dict[str, object]]] = []
     result_ids = [str(uuid4()), str(uuid4())]
 
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = tmp_path / "agent.sqlite"
         workspace_path = workspace
 
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def run(
+        async def submit(
             self,
             message: str,
             **kwargs: object,
@@ -127,17 +142,14 @@ async def test_chat_loop_carries_the_previous_turn_automatically(
     commands = iter(["hello", "continue", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
 
-    await cli._chat_facade_loop(
-        _Facade(),
-        max_tokens_total=None,
-        max_turns=3,
-    )
+    facade = _Facade()
+    await cli._chat_facade_loop(facade, max_tokens_total=None, max_turns=3)
 
     assert [message for message, _kwargs in calls] == ["hello", "continue"]
-    assert calls[0][1]["previous_turn_id"] is None
-    assert calls[1][1]["previous_turn_id"] == result_ids[0]
-    assert calls[0][1]["max_turns"] == 3
-    assert calls[0][1]["require_workspace_change"] is False
+    assert facade.opened == facade.closed == 1
+    assert all("previous_turn_id" not in kwargs for _, kwargs in calls)
+    assert facade.options["max_turns"] == 3
+    assert facade.options["require_workspace_change"] is False
     assert isinstance(calls[0][1]["event_sink"], cli._CLIToolEventDisplay)
 
 
@@ -147,14 +159,14 @@ async def test_verbose_command_expands_subsequent_turn_tool_results(
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = tmp_path / "agent.sqlite"
         workspace_path = tmp_path
 
         def current_model(self) -> SimpleNamespace:
             return SimpleNamespace(id="fake-model")
 
-        async def run(self, message: str, **kwargs: object) -> AgentResult:
+        async def submit(self, message: str, **kwargs: object) -> AgentResult:
             assert message == "inspect"
             sink = kwargs["event_sink"]
             await sink.emit(  # type: ignore[union-attr]
@@ -195,7 +207,7 @@ async def test_bare_model_command_shows_current_available_and_switch_usage(
 ) -> None:
     models = (_model_spec("model-a"), _model_spec("model-b"))
 
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = tmp_path / "agent.sqlite"
         workspace_path = tmp_path
 
@@ -217,7 +229,7 @@ async def test_bare_model_command_shows_current_available_and_switch_usage(
     assert "当前模型: model-a" in output
     assert "* model-a" in output
     assert "  model-b" in output
-    assert "切换: /model <alias>" in output
+    assert "切换: /model <model_id>" in output
 
 
 @pytest.mark.anyio
@@ -233,7 +245,7 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
     calls: list[tuple[str, str, object]] = []
     result_ids = [str(uuid4()), str(uuid4())]
 
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = tmp_path / "agent.sqlite"
         workspace_path = tmp_path
 
@@ -248,12 +260,12 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
             selected = model_id
             return models[model_id]
 
-        async def run(
+        async def submit(
             self,
             message: str,
             **kwargs: object,
         ) -> AgentResult:
-            calls.append((message, selected, kwargs["previous_turn_id"]))
+            calls.append((message, selected, self))
             return _result(turn_id=result_ids[len(calls) - 1])
 
     commands = iter(["remember cobalt", "/model model-b", "what did I say?", "/exit"])
@@ -264,14 +276,14 @@ async def test_model_switch_after_completed_turn_keeps_history_and_changes_next_
         max_tokens_total=None,
     )
 
-    assert calls == [
-        ("remember cobalt", "model-a", None),
-        ("what did I say?", "model-b", result_ids[0]),
+    assert [(message, model) for message, model, _ in calls] == [
+        ("remember cobalt", "model-a"), ("what did I say?", "model-b"),
     ]
+    assert calls[0][2] is calls[1][2]
 
 
 @pytest.mark.anyio
-async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_turn(
+async def test_invalid_model_id_keeps_current_lists_ids_and_starts_no_turn(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -281,7 +293,7 @@ async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_tur
     switch_attempts: list[str] = []
     turn_calls: list[str] = []
 
-    class _Facade:
+    class _Facade(_SessionFactory):
         checkpoint_db = tmp_path / "agent.sqlite"
         workspace_path = tmp_path
 
@@ -293,9 +305,9 @@ async def test_invalid_model_alias_keeps_current_lists_aliases_and_starts_no_tur
 
         def switch_model(self, model_id: str) -> ModelSpec:
             switch_attempts.append(model_id)
-            raise UnknownModelAliasError(f"Model alias {model_id!r} not found in catalog")
+            raise UnknownModelIdError(f"Model ID {model_id!r} not found in catalog")
 
-        async def run(self, message: str, **kwargs: object) -> AgentResult:
+        async def submit(self, message: str, **kwargs: object) -> AgentResult:
             del kwargs
             turn_calls.append(message)
             return _result()

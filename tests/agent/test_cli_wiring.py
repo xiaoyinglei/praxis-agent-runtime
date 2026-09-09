@@ -95,8 +95,8 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
 
 def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
     agent = Agent(
-    model="qwen3_5_9b_mlx_4bit",
-    model_session_path=None,
+        model="mlx-community/Qwen3.5-9B-4bit",
+        model_session_path=None,
     )
 
     current = agent.current_model()
@@ -288,6 +288,15 @@ def test_model_management_help_exposes_complete_public_aci() -> None:
         assert command in result.output
 
 
+@pytest.mark.parametrize("command", ["run", "chat"])
+def test_model_option_help_uses_public_model_id(command: str) -> None:
+    result = CliRunner().invoke(agent_app, [command, "--help"], env={"COLUMNS": "240"})
+
+    assert result.exit_code == 0, result.output
+    assert "主生成模型 ID" in result.output
+    assert "模型别名" not in result.output
+
+
 def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -306,13 +315,25 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     )
     shown = runner.invoke(
         agent_app,
-        ["model", "show", "qwen3_5_9b_mlx_4bit", "--session-path", session],
+        [
+            "model",
+            "show",
+            "mlx-community/Qwen3.5-9B-4bit",
+            "--session-path",
+            session,
+        ],
         env={"COLUMNS": "240"},
     )
 
     assert listed.exit_code == 0, listed.output
     assert "source=builtin" in listed.output
+    assert " -> " not in listed.output
+    assert "model=" not in listed.output
+    assert "provider=" in listed.output
     assert shown.exit_code == 0, shown.output
+    assert "model_id: mlx-community/Qwen3.5-9B-4bit" in shown.output
+    assert "alias:" not in shown.output
+    assert "\nmodel:" not in shown.output
     assert "source: builtin" in shown.output
 
 
@@ -331,6 +352,8 @@ def test_model_current_surfaces_stale_session_repair_diagnostic(tmp_path: Path) 
     assert result.exit_code == 0, result.output
     assert "model session diagnostic:" in result.output
     assert "removed-model" in result.output
+    assert "provider:" in result.output
+    assert "provider_model:" not in result.output
 
 
 def test_model_trust_init_and_status_are_idempotent_and_redacted(tmp_path: Path) -> None:
@@ -356,8 +379,8 @@ def test_model_add_skip_probe_update_noop_and_remove_lifecycle(tmp_path: Path) -
     common = [
         "--provider",
         "openai_compatible",
-        "--provider-model",
-        "local-test",
+        "--context-window-tokens",
+        "4096",
         "--base-url",
         "http://127.0.0.1:9911/v1",
         "--location",
@@ -374,8 +397,6 @@ def test_model_add_skip_probe_update_noop_and_remove_lifecycle(tmp_path: Path) -
             "model",
             "update",
             "local-test",
-            "--provider-model",
-            "local-test",
             *session_options,
         ],
     )
@@ -390,13 +411,56 @@ def test_model_add_skip_probe_update_noop_and_remove_lifecycle(tmp_path: Path) -
     assert "registry_revision: 2" in removed.output
 
 
+def test_documented_single_model_id_commands_execute_with_fake_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_probe(
+        _self: ModelProbe,
+        _definition: object,
+        *,
+        level: ProbeLevel,
+    ) -> ModelProbeEvidence:
+        return ModelProbeEvidence(level, True, 1, True, True, True)
+
+    monkeypatch.setenv("DOC_MODEL_TOKEN", "placeholder-token-value")
+    monkeypatch.setattr(ModelProbe, "run", fake_probe)
+    runner = CliRunner()
+    session = ["--session-path", str(tmp_path / "session.json")]
+    add = runner.invoke(
+        agent_app,
+        [
+            "model",
+            "add",
+            "provider-model-id",
+            "--provider",
+            "openai_compatible",
+            "--context-window-tokens",
+            "4096",
+            "--base-url",
+            "http://127.0.0.1:9918/v1",
+            "--api-key-env",
+            "DOC_MODEL_TOKEN",
+            "--location",
+            "local",
+            *session,
+        ],
+    )
+    show = runner.invoke(agent_app, ["model", "show", "provider-model-id", *session])
+    probe = runner.invoke(agent_app, ["model", "probe", "provider-model-id", *session])
+    switch = runner.invoke(agent_app, ["model", "switch", "provider-model-id", *session])
+
+    for result in (add, show, probe, switch):
+        assert result.exit_code == 0, result.output
+
+
 def test_model_add_from_imports_exactly_one_definition(tmp_path: Path) -> None:
     definition_path = tmp_path / "one-model.yaml"
     definition_path.write_text(
         "\n".join(
             (
                 "provider: openai_compatible",
-                "model: imported-model",
+                "context_window_tokens: 4096",
                 "base_url: http://127.0.0.1:9912/v1",
                 "location: local",
                 "supports_tools: false",
@@ -421,7 +485,7 @@ def test_model_add_from_imports_exactly_one_definition(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "alias: imported-model" in result.output
+    assert "model_id: imported-model" in result.output
     assert "probe: skipped (unverified)" in result.output
 
 
@@ -436,8 +500,8 @@ def test_model_update_supports_unset_and_complete_replacement(tmp_path: Path) ->
             "mutable-model",
             "--provider",
             "openai_compatible",
-            "--provider-model",
-            "model-v1",
+            "--context-window-tokens",
+            "4096",
             "--provider-name",
             "display-provider",
             "--base-url",
@@ -465,7 +529,7 @@ def test_model_update_supports_unset_and_complete_replacement(tmp_path: Path) ->
         "\n".join(
             (
                 "provider: openai_compatible",
-                "model: model-v2",
+                "context_window_tokens: 4096",
                 "base_url: http://127.0.0.1:9916/v1",
                 "location: local",
             )
@@ -491,7 +555,8 @@ def test_model_update_supports_unset_and_complete_replacement(tmp_path: Path) ->
     registry_path = Path(os.environ["PRAXIS_MODEL_REGISTRY_PATH"])
     registry_text = registry_path.read_text(encoding="utf-8")
     assert "provider_name" not in registry_text
-    assert "model: model-v2" in registry_text
+    assert "base_url: http://127.0.0.1:9916/v1" in registry_text
+    assert "\n    model:" not in registry_text
 
 
 def test_model_probe_failure_writes_nothing_and_redacts_secret(
@@ -510,8 +575,8 @@ def test_model_probe_failure_writes_nothing_and_redacts_secret(
             "offline-model",
             "--provider",
             "openai_compatible",
-            "--provider-model",
-            "offline-model",
+            "--context-window-tokens",
+            "4096",
             "--base-url",
             "http://127.0.0.1:1/v1",
             "--location",
@@ -564,8 +629,8 @@ def test_model_add_probes_before_registry_commit(
             "probed-model",
             "--provider",
             "openai_compatible",
-            "--provider-model",
-            "probed-model",
+            "--context-window-tokens",
+            "4096",
             "--base-url",
             "http://127.0.0.1:9914/v1",
             "--location",
@@ -605,8 +670,8 @@ def test_model_add_cancellation_writes_nothing(
                 "cancelled-model",
                 "--provider",
                 "openai_compatible",
-                "--provider-model",
-                "cancelled-model",
+                "--context-window-tokens",
+                "4096",
                 "--base-url",
                 "http://127.0.0.1:9917/v1",
                 "--location",
@@ -628,7 +693,7 @@ def test_model_add_rejects_whole_catalog_override_before_probe(
         "models": {
             "override-model": {
                 "provider": "openai_compatible",
-                "model": "override-model",
+                "context_window_tokens": 4096,
                 "base_url": "http://127.0.0.1:9920/v1",
                 "location": "local",
             }
@@ -649,8 +714,8 @@ def test_model_add_rejects_whole_catalog_override_before_probe(
             "blocked-model",
             "--provider",
             "openai_compatible",
-            "--provider-model",
-            "blocked-model",
+            "--context-window-tokens",
+            "4096",
             "--base-url",
             "http://127.0.0.1:9921/v1",
             "--location",
@@ -669,7 +734,7 @@ def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> 
     session_options = ["--session-path", str(tmp_path / "session.json")]
     builtin = runner.invoke(
         agent_app,
-        ["model", "remove", "qwen3_5_9b_mlx_4bit", *session_options],
+        ["model", "remove", "mlx-community/Qwen3.5-9B-4bit", *session_options],
     )
     added = runner.invoke(
         agent_app,
@@ -679,8 +744,8 @@ def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> 
             "selected-model",
             "--provider",
             "openai_compatible",
-            "--provider-model",
-            "selected-model",
+            "--context-window-tokens",
+            "4096",
             "--base-url",
             "http://127.0.0.1:9913/v1",
             "--location",
@@ -759,7 +824,7 @@ def test_agent_run_can_store_model_session_outside_workspace(
 
     cli_module.agent_run(
         task="Inspect the repository.",
-        model="qwen3_5_9b_mlx_4bit",
+        model="mlx-community/Qwen3.5-9B-4bit",
         checkpoint_db=tmp_path / "artifacts" / "checkpoints.sqlite",
         model_session_path=model_session_path,
         non_interactive=True,
@@ -796,7 +861,7 @@ def test_agent_run_can_disable_workspace_mcp_discovery(
     assert facade_options[0]["enable_workspace_mcp"] is False
 
 
-def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
+def test_agent_chat_followup_restores_workspace_but_uses_current_session_model(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -815,7 +880,7 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
             thread_id=thread.thread_id,
             user_message="remember cobalt",
             binding_manifest={
-                "model_alias": "qwen3_5_9b_mlx_4bit",
+                "model_id": "mlx-community/Qwen3.5-9B-4bit",
                 "knowledge_config": knowledge.model_dump(mode="json"),
             },
         )
@@ -844,7 +909,7 @@ def test_agent_chat_restores_the_previous_turn_runtime_before_model_switching(
 
     assert facade_options == [
         {
-            "model": "qwen3_5_9b_mlx_4bit",
+            "model": None,
             "checkpoint_db": database,
             "workspace_path": str(turn_workspace.resolve()),
             "model_session_path": cli_module.DEFAULT_MODEL_SESSION_PATH,

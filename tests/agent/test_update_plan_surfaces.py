@@ -36,7 +36,7 @@ _PLAN_ARGUMENTS = {
 
 class _UpdatePlanThenAnswerModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "plan-test", "model_revision": "v1"}
+        return {"model_id": "plan-test", "model_revision": "v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(
@@ -141,15 +141,47 @@ async def test_harness_update_plan_projects_public_result_and_rollout_truth(
 
 
 @pytest.mark.anyio
-async def test_harness_update_plan_emits_one_persisted_plan_revision_item(
+async def test_harness_update_plan_persists_each_canonical_plan_transition(
     tmp_path: Path,
 ) -> None:
     result, items = await _run_plan_turn(tmp_path)
     plan_items = [item for item in items if item.kind == "plan_state"]
 
     assert result.plan is not None
-    assert len(plan_items) == 1
-    assert plan_items[0].payload["plan"]["revision"] == 1
-    assert plan_items[0].payload["plan"]["objective"] == result.plan.objective
+    assert len(plan_items) == 2
+    assert [item.payload["plan"]["revision"] for item in plan_items] == [1, 2]
     assert plan_items[0].payload["plan"]["status"] == "active"
-    assert plan_items[0].payload["plan"]["summary"] == _PLAN_ARGUMENTS["explanation"]
+    assert plan_items[-1].payload["plan"] == result.plan.model_dump()
+
+
+@pytest.mark.anyio
+async def test_failed_turn_projects_the_canonical_plan_not_raw_tool_claims(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    agent = Agent(
+        checkpoint_db=database,
+        workspace_path=workspace,
+        enable_workspace_mcp=False,
+    )
+    agent._harness_model = lambda: _UpdatePlanThenAnswerModel()
+
+    result = await agent.run(
+        "Make update_plan canonical.",
+        max_turns=1,
+        require_workspace_change=False,
+    )
+    with RolloutStore(database) as store:
+        plan_item = [
+            item for item in store.list_items(result.turn_id) if item.kind == "plan_state"
+        ][-1]
+
+    assert result.status == "failed"
+    assert result.plan is not None
+    assert result.plan.status == "blocked"
+    assert [(step.step_id, step.status) for step in result.plan.steps] == [
+        (step["step_id"], step["status"])
+        for step in plan_item.payload["plan"]["steps"]
+    ]

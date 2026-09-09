@@ -37,9 +37,9 @@ RETRIEVAL_PROFILE_OPTION = typer.Option(
 JSON_OPTION = typer.Option("--json")
 DOC_ID_OPTION = typer.Option("--doc-id")
 SOURCE_ID_OPTION = typer.Option("--source-id")
-MODEL_OPTION = typer.Option("--model", help="Chat model alias from configs/models.yaml.")
-EMBEDDING_MODEL_OPTION = typer.Option("--embedding-model", help="Embedding model alias from configs/models.yaml.")
-RERANKER_MODEL_OPTION = typer.Option("--reranker-model", help="Reranker model alias from configs/models.yaml.")
+MODEL_OPTION = typer.Option("--model", help="Chat model ID from configs/models.yaml.")
+EMBEDDING_MODEL_OPTION = typer.Option("--embedding-model", help="Embedding model ID from configs/models.yaml.")
+RERANKER_MODEL_OPTION = typer.Option("--reranker-model", help="Reranker model ID from configs/models.yaml.")
 DATASET_OPTION = typer.Option("--dataset", help="Public benchmark dataset.")
 VECTOR_BACKEND_OPTION = typer.Option("--vector-backend", help="Vector backend: milvus or sqlite.")
 VECTOR_DSN_OPTION = typer.Option("--vector-dsn", help="Vector backend DSN, for example Milvus URI.")
@@ -83,11 +83,14 @@ def _runtime(
     load_env_file()
     runtime_config = resolve_runtime_config(
         RuntimeOverrides(
-            model_alias=model,
-            embedding_model_alias=embedding_model,
-            reranker_model_alias=reranker_model,
+            model_id=model,
+            embedding_model_id=embedding_model,
+            reranker_model_id=reranker_model,
         )
     )
+    context_window_tokens = runtime_config.primary_model.context_window_tokens
+    if context_window_tokens is None:
+        raise ValueError(f"Chat model {runtime_config.primary_model.id!r} requires context_window_tokens")
     overrides = to_assembly_overrides(runtime_config)
 
     # ── service URL env → pre-built HTTP providers (env > YAML) ──
@@ -124,7 +127,7 @@ def _runtime(
     request = CapabilityRequirements(
         require_chat=require_chat,
         require_rerank=require_rerank,
-        default_context_tokens=QueryOptions().max_context_tokens,
+        default_context_tokens=context_window_tokens,
     )
     return RAGRuntime.from_request(
         storage=_default_storage_config(
@@ -139,7 +142,7 @@ def _runtime(
             overrides=overrides,
         ),
         generation_config=runtime_config.generation,
-        chat_context_window_tokens=(runtime_config.primary_model.context_window_tokens or 32_768),
+        chat_context_window_tokens=context_window_tokens,
         llm_stage_budgets=runtime_config.llm_stage_budgets,
     )
 

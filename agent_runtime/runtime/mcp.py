@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -195,7 +196,11 @@ async def open_product_mcp_tools(
                             idempotent_hint=bool(
                                 getattr(annotations, "idempotentHint", False)
                             ),
-                            execution_revision=f"{config.name}:{version}",
+                            execution_revision="mcp_" + hashlib.sha256(json.dumps({
+                                "server": config.name, "command": config.command, "args": config.args,
+                                "env": dict(config.env), "cwd": None if config.cwd is None else str(config.cwd),
+                                "version": version, "tool": item.model_dump(mode="json"),
+                            }, sort_keys=True).encode()).hexdigest(),
                         )
                     )
             except Exception as exc:
@@ -391,4 +396,10 @@ def _environment(value: object, *, server_name: str) -> Mapping[str, str]:
     return expanded
 
 
-__all__ = ["open_product_mcp_tools", "resolve_product_mcp_config"]
+__all__ = [
+    "MCPConfigTrustDecision",
+    "decide_mcp_config_trust",
+    "open_product_mcp_tools",
+    "open_trusted_product_mcp_tools",
+    "resolve_product_mcp_config",
+]

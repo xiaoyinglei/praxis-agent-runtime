@@ -270,6 +270,7 @@ async def test_filesystem_tools_list_read_patch_and_expose_changes_immediately(
     assert set(patched.result.structured_content) == {
         "file_path",
         "replaced",
+        "created",
         "occurrences",
         "message",
     }
@@ -458,6 +459,42 @@ async def test_apply_patch_rejects_replacement_with_identical_content(
     assert execution.result.error_code == "patch_no_change"
     assert execution.result.metadata.get("workspace_changed") is not True
     assert target.read_text(encoding="utf-8") == "same"
+
+
+@pytest.mark.anyio
+async def test_apply_patch_creates_a_new_file_without_process_execution(
+    tmp_path: Path,
+) -> None:
+    workspace = open_workspace(tmp_path, create=True)
+    tool = _tools_by_name(workspace)["apply_patch"]
+
+    created = await _execute(
+        tool,
+        {
+            "file_path": "new_module.py",
+            "new_string": "VALUE = 1\n",
+        },
+        workspace=workspace,
+    )
+    repeated = await _execute(
+        tool,
+        {
+            "file_path": "new_module.py",
+            "new_string": "VALUE = 2\n",
+        },
+        workspace=workspace,
+    )
+
+    assert created.result.is_error is False
+    assert created.result.structured_content == {
+        "file_path": "new_module.py",
+        "replaced": False,
+        "created": True,
+        "occurrences": 0,
+        "message": "file created",
+    }
+    assert repeated.result.error_code == "file_exists"
+    assert (workspace.root / "new_module.py").read_text(encoding="utf-8") == "VALUE = 1\n"
 
 
 @pytest.mark.anyio

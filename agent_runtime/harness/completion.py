@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import ast
-import shlex
 from collections.abc import Mapping
-from typing import Any
 
 from agent_runtime.harness.protocol import CompletionDecision, CompletionProposal
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, ToolOperationSnapshot
@@ -31,7 +28,7 @@ class DeliveryCompletionGate:
         trusted = self._trusted_results(proposal.turn_id)
         changes = [
             (item, operation)
-            for item, operation, _arguments in trusted
+            for item, operation in trusted
             if _is_workspace_change(item, operation)
         ]
         if not changes:
@@ -52,21 +49,20 @@ class DeliveryCompletionGate:
         }
         verified_after_change = any(
             item.sequence > latest_change_sequence
-            and _is_successful_verification(
+            and _verification_matches_change(
                 item,
-                operation,
-                arguments,
                 changed_resources=latest_change_resources,
             )
-            for item, operation, arguments in trusted
+            for item in self._trusted_verifications(proposal.turn_id)
         )
         if not verified_after_change:
             return CompletionDecision(
                 action="continue",
                 reason=(
-                    "Run a recognized test runner (for example `uv run pytest -q ...`) "
-                    "successfully after the latest workspace change; running a pytest "
-                    "file with `python` does not execute its tests."
+                    "Post-change verification is still required. Run a recognized test "
+                    "runner (for example `uv run pytest -q ...`) successfully after the "
+                    "latest workspace change; running a pytest file with `python` does "
+                    "not execute its tests."
                 ),
             )
         return CompletionDecision(
@@ -76,9 +72,7 @@ class DeliveryCompletionGate:
 
     def _trusted_results(
         self, turn_id: str
-    ) -> tuple[
-        tuple[ItemSnapshot, ToolOperationSnapshot, Mapping[str, Any]], ...
-    ]:
+    ) -> tuple[tuple[ItemSnapshot, ToolOperationSnapshot], ...]:
         items = self._store.list_items(turn_id)
         items_by_id = {item.item_id: item for item in items}
         calls_by_id = {
@@ -89,9 +83,7 @@ class DeliveryCompletionGate:
             and item.producer == "model"
             and isinstance(item.payload.get("tool_call_id"), str)
         }
-        trusted: list[
-            tuple[ItemSnapshot, ToolOperationSnapshot, Mapping[str, Any]]
-        ] = []
+        trusted: list[tuple[ItemSnapshot, ToolOperationSnapshot]] = []
         for operation in self._store.list_tool_operations(turn_id):
             if operation.status != "succeeded" or operation.result_item_id is None:
                 continue
@@ -106,10 +98,33 @@ class DeliveryCompletionGate:
                 or call.payload.get("tool_name") != operation.tool_name
             ):
                 continue
-            arguments = call.payload.get("arguments")
-            if not isinstance(arguments, Mapping):
+            trusted.append((result, operation))
+        return tuple(trusted)
+
+    def _trusted_verifications(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
+        operations = {
+            operation.operation_id: operation
+            for operation in self._store.list_tool_operations(turn_id)
+        }
+        trusted: list[ItemSnapshot] = []
+        for item in self._store.list_items(turn_id):
+            if (
+                item.kind != "verification"
+                or item.status != "completed"
+                or item.producer != "runtime"
+            ):
                 continue
-            trusted.append((result, operation, arguments))
+            operation_id = item.payload.get("operation_id")
+            operation = operations.get(operation_id) if isinstance(operation_id, str) else None
+            if (
+                operation is None
+                or operation.status != "succeeded"
+                or operation.result_item_id is None
+                or item.payload.get("source_result_item_id") != operation.result_item_id
+                or item.payload.get("arguments_digest") != operation.arguments_digest
+            ):
+                continue
+            trusted.append(item)
         return tuple(trusted)
 
 
@@ -130,75 +145,17 @@ def _is_workspace_change(
     )
 
 
-def _is_successful_verification(
+def _verification_matches_change(
     item: ItemSnapshot,
-    operation: ToolOperationSnapshot,
-    arguments: Mapping[str, Any],
     *,
     changed_resources: set[str],
 ) -> bool:
-    if operation.tool_name in {"read_file", "inspect_data_file"}:
-        structured = item.payload.get("structured_content")
-        if not isinstance(structured, Mapping):
-            return False
-        read_resources = {
-            str(resource.get("identity"))
-            for resource in operation.resources
-            if resource.get("kind") == "filesystem"
-            and resource.get("access") == "read"
-            and isinstance(resource.get("identity"), str)
-        }
-        if not read_resources & changed_resources:
-            return False
-        return (
-            structured.get("valid") is True
-            if operation.tool_name == "inspect_data_file"
-            else True
-        )
-    if operation.tool_name not in {"run_command", "execute_python"}:
+    kind = item.payload.get("verification_kind")
+    if kind in {"test", "static_analysis", "assertion"}:
+        return True
+    if kind != "inspection":
         return False
-    structured = item.payload.get("structured_content")
-    if not isinstance(structured, Mapping):
+    resources = item.payload.get("verified_resources")
+    if not isinstance(resources, (list, tuple)):
         return False
-    exit_code = structured.get("exit_code")
-    if isinstance(exit_code, bool) or exit_code != 0:
-        return False
-    source = arguments.get("command")
-    if operation.tool_name == "execute_python":
-        source = arguments.get("code")
-    return isinstance(source, str) and _looks_like_verification(source)
-
-
-def _looks_like_verification(source: str) -> bool:
-    try:
-        words = shlex.split(source)
-    except ValueError:
-        return False
-    if not words:
-        return False
-    executable = words[0].rsplit("/", maxsplit=1)[-1]
-    if executable in {"python", "python3"} and "-c" in words:
-        source_index = words.index("-c") + 1
-        if source_index < len(words):
-            try:
-                tree = ast.parse(words[source_index])
-            except SyntaxError:
-                pass
-            else:
-                if any(isinstance(statement, ast.Assert) for statement in tree.body):
-                    return True
-    normalized = " ".join(words).lower()
-    markers = (
-        "pytest",
-        "unittest",
-        "ruff check",
-        "mypy",
-        "npm test",
-        "npm run test",
-        "pnpm test",
-        "pnpm run test",
-        "yarn test",
-        "cargo test",
-        "go test",
-    )
-    return any(marker in normalized for marker in markers)
+    return bool(changed_resources & {str(resource) for resource in resources})

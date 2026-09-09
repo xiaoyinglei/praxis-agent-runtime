@@ -12,31 +12,8 @@
 # Providers: connection-level configuration.
 # ---------------------------------------------------------------------------
 providers:
-  local_mlx_chat_8080:
-    protocol: openai_compatible
+  mlx:
     location: local
-    base_url: http://127.0.0.1:8080/v1
-    runtime:
-      server: mlx_lm.server
-      host: 127.0.0.1
-      port: 8080
-      health_url: http://127.0.0.1:8080/v1/models
-      startup_timeout_seconds: 120
-      poll_interval_seconds: 1
-      launch_command_template:
-        - uv
-        - run
-        - python
-        - -m
-        - mlx_lm.server
-        - --model
-        - "{model}"
-        - --host
-        - 127.0.0.1
-        - --port
-        - "8080"
-        - --chat-template-args
-        - '{"enable_thinking": false}'
 
   deepseek:
     protocol: openai_compatible
@@ -62,11 +39,7 @@ providers:
     base_url: https://token-plan-cn.xiaomimimo.com/v1
     api_key_env: MIMO_API_KEY
 
-  local_mlx_embedding:
-    protocol: mlx_embedding
-    location: local
-
-  local_sentence_transformers:
+  sentence_transformers:
     protocol: sentence_transformers
     location: local
 
@@ -78,92 +51,79 @@ models:
   # -------------------------------------------------------------------------
   # Chat models: local MLX.
   # -------------------------------------------------------------------------
-  qwen3_0_6b_mlx_4bit:
+  mlx-community/Qwen3-0.6B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-0.6B-4bit
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-0.6B-4bit
 
-  qwen3_8b_mlx_4bit:
+  mlx-community/Qwen3-8B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-8B-4bit
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-8B-4bit
 
-  qwen3_14b_mlx_4bit:
+  mlx-community/Qwen3-14B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3-14B-4bit
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 32768
-    runtime:
-      expected_model_contains: Qwen3-14B-4bit
 
-  qwen3_5_9b_mlx_4bit:
+  mlx-community/Qwen3.5-9B-4bit:
     capability: chat
-    provider: local_mlx_chat_8080
-    model: mlx-community/Qwen3.5-9B-4bit
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 262144
-    runtime:
-      expected_model_contains: Qwen3.5-9B-4bit
 
   # -------------------------------------------------------------------------
   # Chat models: DeepSeek.
   # -------------------------------------------------------------------------
-  deepseek_chat:
+  deepseek-chat:
     capability: chat
     provider: deepseek
-    model: deepseek-chat
     context_window_tokens: 128000
 
-  deepseek_reasoner:
+  deepseek-reasoner:
     capability: chat
     provider: deepseek
-    model: deepseek-reasoner
     context_window_tokens: 128000
 
   # Keep only if your DeepSeek account actually supports this model.
-  deepseek_v4_flash:
+  deepseek-v4-flash:
     capability: chat
     provider: deepseek
-    model: deepseek-v4-flash
     context_window_tokens: 128000
     experimental: true
 
   # -------------------------------------------------------------------------
   # Chat models: Groq.
   # -------------------------------------------------------------------------
-  groq_gpt_oss_120b:
+  openai/gpt-oss-120b:
     capability: chat
     provider: groq
-    model: openai/gpt-oss-120b
     tokenizer_model: gpt-oss-120b
     context_window_tokens: 131072
-    request_context_tokens: 8000
 
-  groq_llama_3_3_70b:
+  llama-3.3-70b-versatile:
     capability: chat
     provider: groq
-    model: llama-3.3-70b-versatile
     context_window_tokens: 32768
 
   # -------------------------------------------------------------------------
   # Chat models: MiMo.
   # -------------------------------------------------------------------------
-  mimo_cloud:
+  mimo-v2.5-pro:
     capability: chat
     provider: mimo
-    model: mimo-v2.5-pro
     context_window_tokens: 256000
 
-  kimi_cloud:
+  kimi-k2.6:
     capability: chat
     provider: kimi
-    model: kimi-k2.6
-    max_tokens: 32768
     context_window_tokens: 262144
     defaults:
       temperature: 1.0
@@ -175,30 +135,28 @@ models:
   # -------------------------------------------------------------------------
   # Embedding models.
   # -------------------------------------------------------------------------
-  qwen3_embedding_8b_4bit_dwq:
+  mlx-community/Qwen3-Embedding-8B-4bit-DWQ:
     capability: embedding
-    provider: local_mlx_embedding
-    model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
+    provider: mlx
+    protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-8B-4bit-DWQ
 
-  qwen3_embedding_4b_4bit_dwq:
+  mlx-community/Qwen3-Embedding-4B-4bit-DWQ:
     capability: embedding
-    provider: local_mlx_embedding
-    model: mlx-community/Qwen3-Embedding-4B-4bit-DWQ
+    provider: mlx
+    protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-4B-4bit-DWQ
 
   # -------------------------------------------------------------------------
   # Reranker models.
   # -------------------------------------------------------------------------
-  bge_reranker_v2_m3:
+  BAAI/bge-reranker-v2-m3:
     capability: reranker
-    provider: local_sentence_transformers
-    model: BAAI/bge-reranker-v2-m3
+    provider: sentence_transformers
 
-  qwen3_reranker_4b:
+  Qwen/Qwen3-Reranker-4B:
     capability: reranker
-    provider: local_sentence_transformers
-    model: Qwen/Qwen3-Reranker-4B
+    provider: sentence_transformers
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +165,15 @@ models:
 defaults:
   # Product runs default to Groq so an omitted --model never starts a local
   # MLX server. Benchmark release lanes remain explicit in their manifest.
-  primary_model: groq_gpt_oss_120b
+  primary_model: openai/gpt-oss-120b
 
-  embedding_model: qwen3_embedding_8b_4bit_dwq
-  reranker_model: qwen3_reranker_4b
+  embedding_model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
+  reranker_model: Qwen/Qwen3-Reranker-4B
 
 
 # ---------------------------------------------------------------------------
-# Generation profiles: how each task uses the selected chat model.
-# Do not bind a model here unless a task truly requires a special model.
+# Generation profiles: parameters for the one selected chat model.
+# Model selection happens only through the top-level model ID.
 # ---------------------------------------------------------------------------
 generation:
   summary:
@@ -307,7 +265,7 @@ llm_budgets:
 
 # ---------------------------------------------------------------------------
 # Tokenizer/chunking defaults.
-# Model context window should come from models.<alias>.context_window_tokens.
+# Model context window should come from models.<model_id>.context_window_tokens.
 # ---------------------------------------------------------------------------
 tokenizer:
   tokenizer_backend: auto

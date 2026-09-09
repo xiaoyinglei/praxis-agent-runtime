@@ -10,18 +10,17 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
     RolloutStore,
-    RuntimeComposition,
+    Session,
 )
 
 
 class PlainModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "test-model", "model_revision": "test-model-v1"}
+        return {"model_id": "test-model", "model_revision": "test-model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(request.messages[-1].content.encode()).hexdigest()
@@ -46,23 +45,24 @@ class AcceptAnswer:
         return CompletionDecision(action="accept", reason="accepted by test verifier")
 
 
-def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=database,
         workspace=workspace,
         model=PlainModel(),
     ) as runtime:
-        agent = HarnessAgent(runtime.thread_manager)
+        agent = runtime
 
-        result = agent.run("answer through the public facade")
+        result = await agent.submit("answer through the public facade")
 
         assert result.answer == "composed answer"
         binding = runtime.store.read_turn(result.turn_id).binding_manifest
-        assert binding["model_alias"] == "test-model"
+        assert binding["model_id"] == "test-model"
         assert binding["model_revision"] == "test-model-v1"
         assert binding["toolset_revision"] == toolset_revision_for_tools(())
         assert binding["tool_execution_revisions"] == {}
@@ -86,7 +86,8 @@ def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) -> Non
         assert runtime.store.verify().valid is True
 
 
-def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) -> None:
+@pytest.mark.anyio
+async def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
@@ -95,7 +96,7 @@ def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) ->
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="canonical",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         item = store.list_items(turn.turn_id)[0]
     with sqlite3.connect(database) as connection:
@@ -105,7 +106,7 @@ def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) ->
         )
 
     with pytest.raises(RuntimeError, match="projection integrity"):
-        RuntimeComposition.open(
+        await Session.open(
             database=database,
             workspace=workspace,
             model=PlainModel(),

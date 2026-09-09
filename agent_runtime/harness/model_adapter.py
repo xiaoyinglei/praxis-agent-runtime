@@ -9,6 +9,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
+from agent_runtime.budget import ResourceUsage
+from agent_runtime.budget.pricing import (
+    PricingUnavailableError,
+    actual_model_cost_micros,
+    estimated_model_cost_micros,
+)
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import ModelMessage, StopReason
 from agent_runtime.core.messages import ToolCall as ModelToolCall
@@ -22,6 +28,8 @@ from agent_runtime.core.model_request import (
     canonical_model_request_json,
 )
 from agent_runtime.harness.protocol import (
+    ContextBudgetExceededError,
+    ContextCompactionRequiredError,
     HarnessMessage,
     HarnessModelDelta,
     HarnessModelDeltaSink,
@@ -33,16 +41,15 @@ from agent_runtime.harness.protocol import (
     ModelDispatchPreflightError,
     PreparedModelCall,
 )
-from agent_runtime.modeling.budget import LLMBudgetLedger
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import (
-    LLMBudgetExceededError,
     LLMContextOverflowError,
     ProviderDelta,
     model_request_input_text,
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request
+from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.tools.tool import JsonValue
 
@@ -52,7 +59,6 @@ class _GatewayDispatch:
     request: ModelRequest
     wire_hash: str
     resolved: ResolvedModel
-    model_token_budget_remaining: int | None
 
 
 class GatewayHarnessModel:
@@ -61,17 +67,17 @@ class GatewayHarnessModel:
     def __init__(
         self,
         *,
-        model_alias: str,
+        model_id: str,
         resolved: ResolvedModel,
         instructions: tuple[str, ...],
     ) -> None:
-        if not model_alias:
-            raise ValueError("model_alias must be non-empty")
+        if not model_id:
+            raise ValueError("model_id must be non-empty")
         if not instructions:
             raise ValueError("instructions must be non-empty")
         if resolved.gateway is None:
             raise ValueError("resolved model must provide an LLMGateway")
-        self._model_alias = model_alias
+        self._model_id = model_id
         self._resolved = resolved
         self._instructions = instructions
 
@@ -110,7 +116,7 @@ class GatewayHarnessModel:
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
         tool_hash = hashlib.sha256(canonical_request.toolset_revision.encode()).hexdigest()
-        if self._resolved.provider in {"mlx", "ollama"} and not self._resolved.supports_native_tools:
+        if (self._resolved.provider in {"mlx", "ollama"} and not self._resolved.capabilities.supports_native_tools):
             local_wire = render_local_agent_request(
                 canonical_request,
                 provider=self._resolved.provider,
@@ -121,13 +127,22 @@ class GatewayHarnessModel:
             openai_wire = serialize_openai_request(canonical_request)
             wire_hash = openai_wire.provider_wire_hash
             serializer_revision = openai_wire.serializer_revision
+        resource_request, pricing_known = _model_resource_request(
+            request=canonical_request,
+            settings=settings,
+            resolved=self._resolved,
+            require_pricing=(
+                request.binding_manifest.get("model_cost_budget_total_micros")
+                is not None
+            ),
+        )
         return PreparedModelCall(
             request_hash=request_hash,
             context_hash=context_hash,
             tool_hash=tool_hash,
             wire_hash=wire_hash,
             request_ref={
-                "model_alias": self._model_alias,
+                "model_id": self._model_id,
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
                 "toolset_revision": canonical_request.toolset_revision,
@@ -135,13 +150,17 @@ class GatewayHarnessModel:
                 "message_count": len(canonical_request.messages),
                 "exposed_tool_names": canonical_request.exposed_tool_names,
                 "model_token_budget_remaining": remaining,
+                "budget_pressure": request.budget_pressure,
+                "pricing_revision": self._resolved.pricing_revision,
+                "pricing_known": pricing_known,
+                "reserved_cost_micros": resource_request.cost_micros,
                 **({"context_projection": context_projection} if context_projection is not None else {}),
             },
+            resource_request=resource_request,
             dispatch_payload=_GatewayDispatch(
                 request=canonical_request,
                 wire_hash=wire_hash,
                 resolved=self._resolved,
-                model_token_budget_remaining=remaining,
             ),
         )
 
@@ -158,11 +177,6 @@ class GatewayHarnessModel:
         gateway = resolved.gateway
         if gateway is None:
             raise RuntimeError("resolved model gateway disappeared before dispatch")
-        ledger = (
-            None
-            if payload.model_token_budget_remaining is None
-            else LLMBudgetLedger(total=payload.model_token_budget_remaining)
-        )
         streamed_content: dict[str, list[str]] = {
             "text": [],
             "reasoning": [],
@@ -187,14 +201,15 @@ class GatewayHarnessModel:
                 stage=LLMCallStage.AGENT_STEP,
                 request=payload.request,
                 provider=resolved.provider,
-                supports_native_tools=resolved.supports_native_tools,
+                supports_native_tools=resolved.capabilities.supports_native_tools,
                 stream=delta_sink is not None,
                 delta_sink=forward_delta if delta_sink is not None else None,
-                ledger=ledger,
+                ledger=None,
                 lease_id=f"{payload.request.request_id}:provider",
+                inherit_budget_ledger=False,
             )
-        except LLMBudgetExceededError as exc:
-            raise ModelDispatchPreflightError("Provider call exceeds the Turn's remaining model token budget.") from exc
+        except ProviderQuotaPreflightError as exc:
+            raise ModelDispatchPreflightError(str(exc)) from exc
         except LLMContextOverflowError as exc:
             raise ModelDispatchPreflightError(
                 f"Model context exceeds the effective stage input budget: {exc.input_tokens} > {exc.max_input_tokens}."
@@ -216,7 +231,7 @@ class GatewayHarnessModel:
             return HarnessModelResponse(
                 text=response.turn.text,
                 provider_response_id=None,
-                usage=response.usage.model_dump(mode="json"),
+                usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
                 tool_calls=tuple(
                     HarnessToolCall(
                         id=call.id,
@@ -243,7 +258,7 @@ class GatewayHarnessModel:
         return HarnessModelResponse(
             text=response.turn.text,
             provider_response_id=None,
-            usage=response.usage.model_dump(mode="json"),
+            usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
             tool_calls=tuple(
                 HarnessToolCall(
                     id=call.id,
@@ -281,6 +296,11 @@ class ControlPlaneHarnessModel:
             turn_id=turn_id,
         )
 
+    def rebind(self, binding: Mapping[str, Any], *, thread_id: str, turn_id: str) -> dict[str, JsonValue]:
+        return self._control_plane.rebind_model_binding(
+            _authenticated_model_binding(binding), thread_id=thread_id, turn_id=turn_id,
+        )
+
     def ensure_available(
         self,
         binding: Mapping[str, Any],
@@ -305,11 +325,11 @@ class ControlPlaneHarnessModel:
         envelope = binding["binding"]
         if not isinstance(envelope, Mapping):
             raise RuntimeError("validated model binding envelope changed type")
-        alias = envelope["alias"]
-        if not isinstance(alias, str):
-            raise RuntimeError("validated model alias changed type")
+        model_id = envelope["model_id"]
+        if not isinstance(model_id, str):
+            raise RuntimeError("validated model ID changed type")
         return GatewayHarnessModel(
-            model_alias=alias,
+            model_id=model_id,
             resolved=resolved,
             instructions=self._instructions,
         ).prepare(request)
@@ -337,7 +357,7 @@ class ControlPlaneHarnessModel:
         if not isinstance(payload, _GatewayDispatch):
             raise TypeError("prepared call does not belong to ControlPlaneHarnessModel")
         return await GatewayHarnessModel(
-            model_alias=str(prepared.request_ref["model_alias"]),
+            model_id=str(prepared.request_ref["model_id"]),
             resolved=payload.resolved,
             instructions=self._instructions,
         ).dispatch(prepared, delta_sink=delta_sink)
@@ -346,6 +366,7 @@ class ControlPlaneHarnessModel:
 _AUTHENTICATED_MODEL_BINDING_FIELDS = frozenset(
     {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -364,10 +385,14 @@ def _authenticated_model_binding(
         raise RuntimeError(
             "legacy model binding is incomplete and cannot be resumed safely"
         )
-    missing = _AUTHENTICATED_MODEL_BINDING_FIELDS.difference(manifest)
+    if "model_alias" in manifest:
+        raise ValueError("legacy outer model_alias is unsupported")
+    observed = set(manifest)
+    missing = _AUTHENTICATED_MODEL_BINDING_FIELDS.difference(observed)
     if missing:
         raise ValueError(
-            "Turn binding is missing authenticated model fields: " + ", ".join(sorted(missing))
+            "Turn binding is missing authenticated model fields: "
+            + ", ".join(sorted(missing))
         )
     return cast(
         dict[str, JsonValue],
@@ -419,16 +444,119 @@ def _model_messages(messages: tuple[HarnessMessage, ...]) -> tuple[ModelMessage,
 
 
 def _model_settings(resolved: ResolvedModel) -> ModelSettings:
-    max_output_tokens = resolved.kwargs.get("max_tokens", 2_048)
-    temperature = resolved.kwargs.get("temperature", 0.0)
-    top_p = resolved.kwargs.get("top_p", 1.0)
-    return ModelSettings(
-        model=resolved.model,
-        max_output_tokens=int(max_output_tokens),
-        temperature=float(temperature),
-        top_p=None if top_p is None else float(top_p),
-        parallel_tool_calls=False,
+    defaults = resolved.request_defaults
+
+    provider_options = (
+        defaults.provider_options.model_dump(
+            mode="python",
+            exclude_none=True,
+        )
+        if defaults.provider_options is not None
+        else {}
     )
+
+    return ModelSettings(
+        model=resolved.model_id,
+        max_output_tokens=resolved.capabilities.max_output_tokens,
+        temperature=(
+            defaults.temperature
+            if defaults.temperature is not None
+            else 0.0
+        ),
+        top_p=(
+            defaults.top_p
+            if defaults.top_p is not None
+            else 1.0
+        ),
+        parallel_tool_calls=(
+            defaults.parallel_tool_calls
+            if defaults.parallel_tool_calls is not None
+            else False
+        ),
+        seed=defaults.seed,
+        provider_options=provider_options,
+    )
+
+
+
+def _model_resource_request(
+    *,
+    request: ModelRequest,
+    settings: ModelSettings,
+    resolved: ResolvedModel,
+    require_pricing: bool,
+) -> tuple[ResourceUsage, bool]:
+    """Compute exact token reservation plus conservative monetary exposure."""
+    if type(require_pricing) is not bool:
+        raise TypeError("require_pricing must be a bool")
+    input_tokens = 0
+    count = getattr(resolved.token_accounting, "count", None)
+    if callable(count):
+        measured = count(
+            model_request_input_text(
+                request,
+                provider=resolved.provider,
+                supports_native_tools=resolved.capabilities.supports_native_tools,
+            )
+        )
+        if isinstance(measured, bool) or not isinstance(measured, int) or measured < 0:
+            raise RuntimeError("token accounting returned an invalid input count")
+        input_tokens = measured
+
+    max_output_tokens: int | None = settings.max_output_tokens or 0
+    max_input_tokens: int | None = None
+    gateway = resolved.gateway
+    effective_budget = getattr(gateway, "effective_stage_budget", None)
+    if callable(effective_budget):
+        invocation = effective_budget(
+            LLMCallStage.AGENT_STEP,
+            kwargs={"max_tokens": settings.max_output_tokens},
+        )
+        max_input_tokens = getattr(invocation, "max_input_tokens", None)
+        max_output_tokens = getattr(invocation, "max_output_tokens", None)
+        if isinstance(max_input_tokens, bool) or not isinstance(max_input_tokens, int) or max_input_tokens < 1:
+            raise RuntimeError("gateway returned an invalid effective input budget")
+        if isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 1:
+            raise RuntimeError("gateway returned an invalid effective output budget")
+    elif isinstance(max_output_tokens, bool) or not isinstance(max_output_tokens, int) or max_output_tokens < 0:
+        raise RuntimeError("model max_output_tokens is invalid")
+
+    if max_input_tokens is not None and input_tokens > max_input_tokens:
+        raise ContextBudgetExceededError(
+            "Committed model context cannot fit inside the effective provider "
+            f"boundary: {input_tokens} > {max_input_tokens} input tokens."
+        )
+    estimated_cost = estimated_model_cost_micros(
+        input_tokens=input_tokens,
+        max_output_tokens=max_output_tokens,
+        pricing=resolved.pricing_micros_per_1m,
+    )
+    pricing_known = estimated_cost is not None
+    if require_pricing and not pricing_known:
+        raise PricingUnavailableError(
+            "Turn has a monetary budget but the frozen model lacks complete input/output pricing."
+        )
+    return (
+        ResourceUsage(
+            input_tokens=input_tokens,
+            output_tokens=max_output_tokens,
+            cost_micros=estimated_cost or 0,
+            model_calls=1,
+        ),
+        pricing_known,
+    )
+
+
+def _priced_usage_payload(
+    usage: Mapping[str, Any],
+    resolved: ResolvedModel,
+) -> dict[str, Any]:
+    payload = dict(usage)
+    payload["cost_micros"] = actual_model_cost_micros(
+        payload, pricing=resolved.pricing_micros_per_1m
+    )
+    payload["pricing_revision"] = resolved.pricing_revision
+    return payload
 
 
 def _budgeted_request(
@@ -468,7 +596,7 @@ def _budgeted_request(
                 model_request_input_text(
                     candidate,
                     provider=resolved.provider,
-                    supports_native_tools=resolved.supports_native_tools,
+                    supports_native_tools=(resolved.capabilities.supports_native_tools),
                 )
             )
         )
@@ -493,42 +621,28 @@ def _budgeted_request(
             pair = (tail_start, summary_chars)
             if pair not in candidates:
                 candidates.append(pair)
-    most_compact = (context, canonical, input_tokens)
+    best_token_count = input_tokens
+    best_retained_tail = transcript_count
     for tail_start, summary_chars in candidates:
         projected = context.project_compaction(
             tail_start=tail_start,
             max_summary_chars=summary_chars,
-            project_tool_results=True,
         )
         if projected is context:
             continue
         candidate = build(projected)
         candidate_tokens = measured(candidate)
-        most_compact = (projected, candidate, candidate_tokens)
+        if candidate_tokens < best_token_count:
+            best_token_count = candidate_tokens
+            best_retained_tail = max(0, transcript_count - tail_start)
         if candidate_tokens <= max_input_tokens:
-            return (
-                projected,
-                candidate,
-                {
-                    "compacted": True,
-                    "input_tokens": candidate_tokens,
-                    "max_input_tokens": max_input_tokens,
-                    "parent_context_revision": context.context_revision,
-                    "projected_context_revision": projected.context_revision,
-                    "retained_tail_count": len(projected.transcript) - 1,
-                    "summary_max_chars": summary_chars,
-                },
+            raise ContextCompactionRequiredError(
+                input_tokens=input_tokens,
+                max_input_tokens=max_input_tokens,
+                retained_tail_messages=max(0, transcript_count - tail_start),
             )
-    projected, candidate, candidate_tokens = most_compact
-    return (
-        projected,
-        candidate,
-        {
-            "compacted": projected is not context,
-            "input_tokens": candidate_tokens,
-            "max_input_tokens": max_input_tokens,
-            "parent_context_revision": context.context_revision,
-            "projected_context_revision": projected.context_revision,
-            "retained_tail_count": max(0, len(projected.transcript) - 1),
-        },
+    raise ContextCompactionRequiredError(
+        input_tokens=input_tokens,
+        max_input_tokens=max_input_tokens,
+        retained_tail_messages=best_retained_tail,
     )

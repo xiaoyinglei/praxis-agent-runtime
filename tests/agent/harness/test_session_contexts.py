@@ -7,9 +7,9 @@ from agent_runtime.harness import (
     HarnessMessage,
     RolloutContextManager,
     RolloutStore,
-    Session,
     StepContext,
     TurnContext,
+    TurnExecutor,
 )
 
 
@@ -45,13 +45,13 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path) ->
             thread_id=thread.thread_id,
             user_message="inspect the workspace",
             binding_manifest={
-                "model_alias": "test-model",
+                "model_id": "test-model",
                 "model_step_budget": 3,
                 "model_token_budget_total": 100,
             },
         )
         router = _ChangingRouter()
-        session = Session(
+        session = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
             model=_UnusedModel(),
@@ -76,7 +76,8 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path) ->
         assert request.step == 1
         assert request.messages is step_context.messages
         assert request.tools is step_context.tools
-        assert request.binding_manifest is turn_context.binding_manifest
+        assert request.binding_manifest == turn_context.binding_manifest
+        assert request.binding_manifest is step_context.binding_manifest
 
 
 def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
@@ -88,9 +89,9 @@ def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
         foreign_turn = store.start_turn(
             thread_id=second.thread_id,
             user_message="foreign",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
-        session = Session(
+        session = TurnExecutor(
             thread_id=first.thread_id,
             store=store,
             model=_UnusedModel(),
@@ -103,4 +104,4 @@ def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
         except RuntimeError as exc:
             assert "different Session" in str(exc)
         else:
-            raise AssertionError("Session accepted a Turn owned by another thread")
+            raise AssertionError("TurnExecutor accepted a Turn owned by another thread")

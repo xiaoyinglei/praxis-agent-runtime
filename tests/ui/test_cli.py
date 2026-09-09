@@ -255,12 +255,12 @@ def test_chat_model_switch_is_not_blocked_by_turn_lineage(capsys) -> None:
             return SimpleNamespace(id=model_id)
 
     agent_cli._handle_model_slash_command(
-        "/model switch qwen3_5_9b_mlx_4bit",
+        "/model switch mlx-community/Qwen3.5-9B-4bit",
         agent=Agent(),  # type: ignore[arg-type]
     )
 
-    assert switched == ["qwen3_5_9b_mlx_4bit"]
-    assert "已切换模型: qwen3_5_9b_mlx_4bit" in capsys.readouterr().out
+    assert switched == ["mlx-community/Qwen3.5-9B-4bit"]
+    assert "已切换模型: mlx-community/Qwen3.5-9B-4bit" in capsys.readouterr().out
 
 
 def test_rag_cli_no_longer_exposes_agent_or_analyze_task() -> None:

@@ -31,7 +31,7 @@ def _persist_cli_turn(
             thread_id=thread.thread_id,
             user_message="CLI resume fixture",
             binding_manifest=(
-                {"model_alias": None}
+                {"model_id": None}
                 if binding_manifest is None
                 else binding_manifest
             ),
@@ -114,7 +114,7 @@ def test_agent_resume_uses_public_facade_and_stable_result(
     ]
 
 
-def test_schema_v2_resume_ignores_unsigned_top_level_model_alias(
+def test_schema_v3_resume_reads_only_outer_model_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -124,10 +124,10 @@ def test_schema_v2_resume_ignores_unsigned_top_level_model_alias(
         database,
         workspace,
         binding_manifest={
-            "authentication_schema_version": 1,
+            "authentication_schema_version": 2,
+            "model_id": "removed-model-id",
             "selection_requester": "user",
-            "binding": {"schema_version": 2, "alias": "removed-alias"},
-            "model_alias": "forged-top-level-alias",
+            "binding": {"schema_version": 3, "model_id": "removed-model-id"},
         },
     )
     facade_options: list[dict[str, object]] = []
@@ -148,19 +148,67 @@ def test_schema_v2_resume_ignores_unsigned_top_level_model_alias(
         action="continue",
     )
 
+    assert cli._cli_turn(database, turn_id).runtime.model_id == "removed-model-id"
     assert facade_options[0]["model"] is None
 
-    agent = Agent(
-        model="definitely-removed-alias",
-        checkpoint_db=database,
-        workspace_path=workspace,
+
+
+@pytest.mark.parametrize("action", ["continue", "retry"])
+def test_cli_resume_rejects_legacy_outer_model_alias_for_provider_actions(
+    tmp_path: Path,
+    action: str,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    workspace = tmp_path / "workspace"
+    turn_id = _persist_cli_turn(
+        database,
+        workspace,
+        binding_manifest={"model_alias": "legacy-model"},
     )
-    restored = agent._harness_agent_for_turn(turn_id, followup=False)
-    assert restored.model is None
+
+    with pytest.raises(RuntimeError, match="legacy model_alias binding is unsupported"):
+        cli.agent_resume(
+            turn_id=turn_id,
+            checkpoint_db=database,
+            action=action,
+        )
+
+
+@pytest.mark.parametrize("use_last", [False, True])
+def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_last: bool,
+) -> None:
+    database = tmp_path / "agent.sqlite"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="legacy paused turn",
+            binding_manifest={"model_alias": "removed-legacy-model"},
+        )
+        store.pause_turn(turn_id=turn.turn_id, reason="legacy turn needs cancellation")
+    monkeypatch.chdir(workspace)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.agent_resume(
+            turn_id=None if use_last else turn.turn_id,
+            last=use_last,
+            checkpoint_db=database,
+            action="abort",
+        )
+
+    assert exc_info.value.exit_code == 1
+    with RolloutStore(database) as store:
+        assert store.read_turn(turn.turn_id).status == "cancelled"
+        assert store.read_thread(thread.thread_id).active_turn_id is None
 
 
 @pytest.mark.anyio
-async def test_public_legacy_resume_reaches_exact_provider_resume_error(
+async def test_public_resume_rejects_explicit_unavailable_session_model_before_io(
     tmp_path: Path,
 ) -> None:
     database = tmp_path / "agent.sqlite"
@@ -188,10 +236,9 @@ async def test_public_legacy_resume_reaches_exact_provider_resume_error(
         enable_workspace_mcp=False,
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="legacy model binding is incomplete and cannot be resumed safely",
-    ):
+    from agent_runtime.core.llm_registry import UnknownModelIdError
+
+    with pytest.raises(UnknownModelIdError, match="definitely-removed-alias"):
         await agent.resume(
             turn.turn_id,
             "continue",

@@ -18,17 +18,18 @@ from agent_runtime.harness import (
     PreparedModelCall,
     RolloutEventReader,
     RolloutStore,
-    RuntimeComposition,
+    Session,
 )
-from agent_runtime.harness import composition as harness_composition
+from agent_runtime.harness import session as harness_session
 from agent_runtime.streaming.events import EventType, StreamEvent, TurnItemKind
 from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.builtins import shell
 
 
 class PublicHarnessModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": "public-harness-model",
+            "model_id": "public-harness-model",
             "model_revision": "public-harness-v1",
         }
 
@@ -191,7 +192,7 @@ async def test_public_agent_can_explicitly_disable_workspace_mcp_discovery_and_f
 
 
 @pytest.mark.anyio
-async def test_public_followup_restores_disabled_workspace_mcp_from_runtime_binding(
+async def test_public_followup_uses_current_mcp_configuration_and_requires_current_trust(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -221,23 +222,16 @@ async def test_public_followup_restores_disabled_workspace_mcp_from_runtime_bind
         lambda: PublicHarnessModel(),
     )
 
-    followup = await fresh_process_agent.run(
-        "follow up",
-        previous_turn_id=first.turn_id,
-        require_workspace_change=False,
-    )
-
-    assert followup.status == "done"
-    with RolloutStore(database) as store:
-        assert store.read_turn(followup.turn_id).binding_manifest["mcp_policy"] == {
-            "workspace_discovery_enabled": False
-        }
+    with pytest.raises(PermissionError, match="workspace MCP config is not trusted"):
+        await fresh_process_agent.run(
+            "follow up", previous_turn_id=first.turn_id, require_workspace_change=False,
+        )
 
 
 class PatchThenAnswerModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
         return {
-            "model_alias": "patch-model",
+            "model_id": "patch-model",
             "model_revision": "patch-model-v1",
         }
 
@@ -498,6 +492,24 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     workspace.mkdir()
     target = workspace / "value.txt"
     target.write_text("before", encoding="utf-8")
+    executions = []
+
+    async def execute_python(workspace, request, *, termination_grace_seconds):
+        assert workspace.root == target.parent
+        assert request.workspace_write is True
+        assert request.output_paths == ["value.txt"]
+        assert request.code == (
+            "from pathlib import Path\nPath('value.txt').write_text('after')"
+        )
+        executions.append(request)
+        target.write_text("after", encoding="utf-8")
+        return shell.ManagedPythonOutput(
+            stdout="", stderr="", exit_code=0, timed_out=False,
+            truncated=False, duration_ms=0, python_version="3.12.0",
+        )
+
+    # Exercise policy and durable approval independently of macOS Seatbelt.
+    monkeypatch.setattr(shell, "_execute_managed_python", execute_python)
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     monkeypatch.setattr(
@@ -514,6 +526,8 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     )
 
     assert paused.status == "paused"
+    assert executions == []
+    assert target.read_text(encoding="utf-8") == "before"
     with RolloutStore(database) as store:
         policy = store.read_turn(paused.turn_id).binding_manifest["tool_execution_policy"]
         assert policy["allow_write_tools"] is True
@@ -523,6 +537,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
 
     assert resumed.status == "done"
     assert target.read_text(encoding="utf-8") == "after"
+    assert len(executions) == 1
 
 
 @pytest.mark.anyio
@@ -597,6 +612,43 @@ async def test_public_agent_rejects_untrusted_workspace_mcp_before_start(
 
     with pytest.raises(PermissionError, match="workspace MCP config is not trusted"):
         await agent.run("do not start MCP", require_workspace_change=False)
+
+
+@pytest.mark.anyio
+async def test_public_agent_binds_explicit_workspace_mcp_trust_to_the_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_runtime.runtime.mcp import decide_mcp_config_trust
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = workspace / "mcp.yaml"
+    config.write_text("servers: []\n", encoding="utf-8")
+    monkeypatch.setenv("AGENT_MCP_CONFIG", str(config))
+    trust = decide_mcp_config_trust(
+        config,
+        workspace_root=workspace,
+        trust_workspace=True,
+    )
+    database = tmp_path / "praxis.sqlite3"
+    agent = Agent(
+        checkpoint_db=database,
+        workspace_path=workspace,
+        mcp_config_trust=trust,
+    )
+    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+
+    result = await agent.run("use the exact trusted config", require_workspace_change=False)
+
+    with RolloutStore(database) as store:
+        policy = store.read_turn(result.turn_id).binding_manifest["mcp_policy"]
+    assert policy == {
+        "workspace_discovery_enabled": True,
+        "config_path": str(config.resolve()),
+        "config_source": "workspace",
+        "config_sha256": trust.config_sha256,
+    }
 
 
 @pytest.mark.anyio
@@ -842,7 +894,7 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
         original_init(self, *args, **kwargs)
 
     monkeypatch.setattr(RolloutStore, "__init__", reject_record_listener)
-    monkeypatch.setattr(harness_composition, "RolloutStore", RolloutStore)
+    monkeypatch.setattr(harness_session, "RolloutStore", RolloutStore)
     monkeypatch.setattr(agent, "_harness_model", lambda: model)
     running = asyncio.create_task(
         agent.run(
@@ -877,21 +929,19 @@ async def test_interleaved_threads_publish_only_their_transaction_batches(
     second_dispatcher = TurnEventDispatcher()
     first_stream = first_dispatcher.subscribe_controlling()
     second_stream = second_dispatcher.subscribe_controlling()
-    with RuntimeComposition.open(
-        database=tmp_path / "praxis.sqlite3",
-        workspace=workspace,
-        model=PublicHarnessModel(),
-        require_workspace_change=False,
-    ) as runtime:
+    async with (
+        await Session.open(
+            database=tmp_path / "praxis.sqlite3", workspace=workspace,
+            model=PublicHarnessModel(), event_dispatcher=first_dispatcher,
+        ) as first_session,
+        await Session.open(
+            database=tmp_path / "praxis.sqlite3", workspace=workspace,
+            model=PublicHarnessModel(), event_dispatcher=second_dispatcher,
+        ) as second_session,
+    ):
         first, second = await asyncio.gather(
-            runtime.thread_manager.run(
-                user_message="first interleaved thread",
-                event_dispatcher=first_dispatcher,
-            ),
-            runtime.thread_manager.run(
-                user_message="second interleaved thread",
-                event_dispatcher=second_dispatcher,
-            ),
+            first_session.submit("first interleaved thread"),
+            second_session.submit("second interleaved thread"),
         )
 
         first_events = []

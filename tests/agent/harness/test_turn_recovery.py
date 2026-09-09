@@ -32,7 +32,7 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="reconcile an uncertain write",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         values = {
             "turn_id": turn.turn_id,
@@ -141,7 +141,7 @@ def test_fresh_process_interrupts_a_pre_dispatch_orphan_only_after_maintenance(
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
             user_message="crash after Turn creation",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
 
     with RolloutStore(database) as recovery_process:
@@ -177,7 +177,7 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="operation already prepared",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
         store.prepare_model_operation(
             turn_id=turn.turn_id,
@@ -209,7 +209,7 @@ def test_recovery_cli_records_an_interrupted_turn_in_a_fresh_process(
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
             user_message="crash before provider I/O",
-            binding_manifest={"model_alias": "model-v1"},
+            binding_manifest={"model_id": "model-v1"},
         )
 
     completed = subprocess.run(

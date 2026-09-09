@@ -5,6 +5,7 @@ import pty
 import select
 import signal
 import sys
+import termios
 import time
 from pathlib import Path
 
@@ -104,6 +105,7 @@ def _pty_exchange(
     output = bytearray()
     deadline = time.monotonic() + 5.0
     child_reaped = False
+    ready = False
 
     def read_chunk() -> bytes | None:
         try:
@@ -128,13 +130,22 @@ def _pty_exchange(
                     output.extend(chunk)
 
             if wait_for_raw_mode:
-                if (
-                    b"\x1b[?2004h" in output
-                    and b">" in output
-                ):
+                try:
+                    local_flags = termios.tcgetattr(master)[3]
+                except termios.error:
+                    local_flags = termios.ICANON
+                if not (local_flags & termios.ICANON) and b">" in output:
+                    ready = True
                     break
             elif b"> " in output:
+                ready = True
                 break
+
+        if not ready:
+            raise AssertionError(
+                "child terminal did not become ready: "
+                + output.decode("utf-8", errors="backslashreplace")
+            )
 
         os.write(
             master,
@@ -148,6 +159,7 @@ def _pty_exchange(
             else (b"\x7f" * backspaces) + b"\r",
         )
 
+        deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
             readable, _, _ = select.select(
                 [master],

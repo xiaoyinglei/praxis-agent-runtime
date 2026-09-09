@@ -13,10 +13,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
+from agent_runtime.budget import (
+    BudgetLimitExceededError,
+    BudgetLimits,
+    BudgetReservation,
+    BudgetState,
+    ReservationStatus,
+    ResourceUsage,
+    ensure_token_headroom,
+    normal_token_remaining,
+    resource_usage_from_model_usage,
+)
+from agent_runtime.budget import (
+    reserve as reserve_budget,
+)
 from agent_runtime.harness.reducer import ProjectionState, apply_record
+from agent_runtime.planning import PlanStep
 from agent_runtime.streaming.events import (
     derive_model_public_item_id,
     derive_operation_public_item_id,
@@ -67,6 +82,7 @@ class ThreadSnapshot:
     active_turn_id: str | None
     head_turn_id: str | None
     head_version: int
+    settings: Mapping[str, Any]
     applied_thread_sequence: int
 
 
@@ -75,6 +91,8 @@ class TurnSnapshot:
     turn_id: str
     thread_id: str
     status: str
+    terminal_reason_code: str | None
+    terminal_message: str | None
     predecessor_turn_id: str | None
     turn_index: int
     binding_manifest: Mapping[str, Any]
@@ -412,11 +430,18 @@ class RolloutStore:
                 (str(version),),
             )
 
-    def create_thread(self, *, workspace: Path) -> ThreadSnapshot:
+    def create_thread(
+        self,
+        *,
+        workspace: Path,
+        thread_id: str | None = None,
+    ) -> ThreadSnapshot:
         resolved_workspace = Path(workspace).resolve()
         if not resolved_workspace.is_dir():
             raise ValueError("workspace must be an existing directory")
-        thread_id = f"thread_{uuid4().hex}"
+        if thread_id is not None and (not isinstance(thread_id, str) or not thread_id.strip()):
+            raise ValueError("thread_id must be non-empty when provided")
+        thread_id = thread_id or f"thread_{uuid4().hex}"
         with self._transaction():
             self._append_and_reduce(
                 thread_id=thread_id,
@@ -426,6 +451,15 @@ class RolloutStore:
                 payload={"workspace": str(resolved_workspace)},
             )
         return self.read_thread(thread_id)
+
+    def update_session_settings(self, thread_id: str, settings: Mapping[str, Any]) -> None:
+        frozen = _json_object(settings, field="settings")
+        with self._transaction():
+            self.read_thread(thread_id)
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=None, record_type="session_settings_updated",
+                producer="runtime", payload={"settings": frozen},
+            )
 
     def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
         thread_id = f"thread_{uuid4().hex}"
@@ -571,6 +605,11 @@ class RolloutStore:
                 producer=producer,
                 payload={"item_id": item_id, "payload": {"text": answer}},
             )
+            self._append_terminal_plan_state(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                status="complete",
+            )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -580,9 +619,17 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
-    def fail_turn(self, *, turn_id: str, reason: str) -> TurnSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Turn failure reason must be non-empty")
+    def fail_turn(
+        self,
+        *,
+        turn_id: str,
+        reason_code: str,
+        message: str,
+    ) -> TurnSnapshot:
+        if not isinstance(reason_code, str) or not reason_code.strip():
+            raise ValueError("Turn failure reason_code must be non-empty")
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError("Turn failure message must be non-empty")
         with self._transaction():
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?",
@@ -598,14 +645,107 @@ class RolloutStore:
             ).fetchone()
             if active is None or active["active_turn_id"] != turn_id:
                 raise RuntimeError("failed Turn does not own the Thread active slot")
+            self._append_terminal_plan_state(
+                thread_id=turn["thread_id"],
+                turn_id=turn_id,
+                status="blocked",
+                message=message.strip(),
+            )
             self._append_and_reduce(
                 thread_id=turn["thread_id"],
                 turn_id=turn_id,
                 record_type="turn_failed",
                 producer="verifier",
-                payload={"turn_id": turn_id, "reason": reason},
+                payload={
+                    "turn_id": turn_id,
+                    "reason_code": reason_code.strip(),
+                    "message": message.strip(),
+                },
             )
         return self.read_turn(turn_id)
+
+    def _append_terminal_plan_state(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        status: str,
+        message: str | None = None,
+    ) -> None:
+        latest = self._connection.execute(
+            """
+            SELECT payload_json FROM items
+            WHERE turn_id = ? AND kind = 'plan_state' AND status = 'completed'
+            ORDER BY sequence DESC LIMIT 1
+            """,
+            (turn_id,),
+        ).fetchone()
+        if latest is None:
+            return
+        payload = json.loads(latest["payload_json"])
+        raw_plan = payload.get("plan")
+        if not isinstance(raw_plan, Mapping):
+            raise RuntimeError("canonical plan_state payload is malformed")
+        revision = int(raw_plan["revision"]) + 1
+        step_status = "completed" if status == "complete" else "blocked"
+        steps = [
+            {
+                **dict(step),
+                "status": (
+                    step_status
+                    if step.get("status") in {"pending", "in_progress"}
+                    else step.get("status")
+                ),
+            }
+            for step in raw_plan.get("steps", ())
+            if isinstance(step, Mapping)
+        ]
+        plan = {
+            **dict(raw_plan),
+            "revision": revision,
+            "status": status,
+            "active_step_id": None,
+            "steps": steps,
+        }
+        event_type = "completed" if status == "complete" else "blocked"
+        event = {
+            "event_type": event_type,
+            "message": message or (
+                "Plan completed with the accepted Turn."
+                if status == "complete"
+                else "Plan blocked by the failed Turn."
+            ),
+            "tool_call_ids": [],
+        }
+        item_id = f"item_{uuid4().hex}"
+        public_item_id = derive_plan_public_item_id(
+            turn_id=turn_id,
+            revision=revision,
+        )
+        self._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type="item_started",
+            producer="runtime",
+            payload={
+                "item_id": item_id,
+                "kind": "plan_state",
+                "public_item_id": public_item_id,
+                "revision": revision,
+            },
+        )
+        self._append_and_reduce(
+            thread_id=thread_id,
+            turn_id=turn_id,
+            record_type="item_completed",
+            producer="runtime",
+            payload={
+                "item_id": item_id,
+                "public_item_id": public_item_id,
+                "revision": revision,
+                "payload": {"plan": plan, "event": event},
+            },
+        )
 
     def pause_turn(
         self,
@@ -1458,11 +1598,17 @@ class RolloutStore:
         worker_id: str = "direct-model-worker",
         lease_seconds: float = 300.0,
         now: float | None = None,
+        resource_request: ResourceUsage | None = None,
+        allow_protected_budget: bool = False,
     ) -> ModelAttemptSnapshot:
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise ValueError("model worker_id must be non-empty")
         if lease_seconds <= 0:
             raise ValueError("model lease_seconds must be positive")
+        if resource_request is not None and not isinstance(resource_request, ResourceUsage):
+            raise TypeError("resource_request must be ResourceUsage or None")
+        if type(allow_protected_budget) is not bool:
+            raise TypeError("allow_protected_budget must be a bool")
         self._assert_artifact_integrity()
         dispatched_at = time.time() if now is None else float(now)
         with self._transaction():
@@ -1474,6 +1620,36 @@ class RolloutStore:
                 raise KeyError(f"unknown model operation: {operation_id}")
             if operation["status"] != "prepared":
                 raise RuntimeError(f"model operation is not prepared: {operation_id}")
+            reservation_id: str | None = None
+            if resource_request is not None:
+                attempt_id = str(operation["active_attempt_id"])
+                reservation_id = f"reservation_{attempt_id}"
+                budget_state = self.read_budget_state(str(operation["turn_id"]))
+                ensure_token_headroom(
+                    budget_state,
+                    requested_tokens=resource_request.total_tokens,
+                    allow_protected=allow_protected_budget,
+                )
+                mutation = reserve_budget(
+                    budget_state,
+                    reservation_id=reservation_id,
+                    operation_id=operation_id,
+                    attempt_id=attempt_id,
+                    amount=resource_request,
+                )
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="budget_reserved",
+                    producer="runtime",
+                    payload={
+                        "reservation_id": reservation_id,
+                        "scope_id": mutation.reservation.scope_id,
+                        "operation_id": operation_id,
+                        "attempt_id": attempt_id,
+                        "reserved": resource_request.to_dict(),
+                    },
+                )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -1487,6 +1663,14 @@ class RolloutStore:
                     "lease_expires_at": dispatched_at + lease_seconds,
                 },
             )
+            if reservation_id is not None:
+                self._append_and_reduce(
+                    thread_id=operation["thread_id"],
+                    turn_id=operation["turn_id"],
+                    record_type="budget_dispatched",
+                    producer="runtime",
+                    payload={"reservation_id": reservation_id},
+                )
         return self.list_model_attempts(operation_id)[-1]
 
     def expire_model_attempt_dispatch(
@@ -1526,6 +1710,12 @@ class RolloutStore:
                     "reason": "dispatch lease expired",
                     "observed_at": observed_at,
                 },
+            )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=str(attempt["attempt_id"]),
+                outcome="unknown",
+                producer="recovery",
             )
             turn = self._connection.execute(
                 "SELECT status FROM turns WHERE turn_id = ?",
@@ -1660,6 +1850,11 @@ class RolloutStore:
                 producer="runtime",
                 payload=payload,
             )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="unknown",
+            )
             self._close_started_model_output_channels(
                 operation=operation,
                 attempt_id=attempt_id,
@@ -1698,9 +1893,12 @@ class RolloutStore:
         error_type: str | None = None,
         error_message: str | None = None,
         channel_content: Mapping[str, str] | None = None,
+        budget_outcome: str = "released",
     ) -> ModelAttemptSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("model rejection reason must be non-empty")
+        if budget_outcome not in {"released", "unknown"}:
+            raise ValueError("model rejection budget_outcome is unsupported")
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model rejection error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
@@ -1735,6 +1933,11 @@ class RolloutStore:
                 record_type="model_attempt_rejected",
                 producer="runtime",
                 payload=payload,
+            )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome=budget_outcome,
             )
             self._close_started_model_output_channels(
                 operation=operation,
@@ -1861,6 +2064,13 @@ class RolloutStore:
                     "generation": generation,
                     "reason": reason.strip()[:2_000],
                 },
+            )
+            # Provider-side cancellation does not prove zero billing. Keep the
+            # reservation as uncertain exposure unless usage is later reconciled.
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="unknown",
             )
             self._close_started_model_output_channels(
                 operation=operation,
@@ -2039,6 +2249,12 @@ class RolloutStore:
                     "public_item_id": public_item_id,
                 },
             )
+            self._append_budget_outcome(
+                operation=operation,
+                attempt_id=attempt_id,
+                outcome="settled",
+                usage=frozen_usage,
+            )
             if started_response is None:
                 self._append_and_reduce(
                     thread_id=operation["thread_id"],
@@ -2116,6 +2332,377 @@ class RolloutStore:
             (operation_id,),
         ).fetchall()
         return tuple(_model_attempt_snapshot(row) for row in rows)
+
+
+
+    def start_budgeted_child_turn(
+        self,
+        *,
+        parent_turn_id: str,
+        child_thread_id: str,
+        child_turn_id: str,
+        user_message: str,
+        binding_manifest: Mapping[str, Any],
+        requested_tokens: int | None,
+        requested_cost_micros: int | None,
+    ) -> TurnSnapshot:
+        """Atomically carve a child budget from the parent and start its Turn.
+
+        The allocation record and child Turn live on the child Thread so this
+        mutation remains one canonical Thread batch while SQLite's write lock
+        serializes competing allocations from the same parent.
+        """
+
+        if not isinstance(parent_turn_id, str) or not parent_turn_id.strip():
+            raise ValueError("parent_turn_id must be non-empty")
+        if not isinstance(child_thread_id, str) or not child_thread_id.strip():
+            raise ValueError("child_thread_id must be non-empty")
+        if not isinstance(child_turn_id, str) or not child_turn_id.strip():
+            raise ValueError("child_turn_id must be non-empty")
+        if requested_tokens is not None and (
+            isinstance(requested_tokens, bool)
+            or not isinstance(requested_tokens, int)
+            or requested_tokens < 1
+        ):
+            raise ValueError("requested child token budget must be positive or None")
+        if requested_cost_micros is not None and (
+            isinstance(requested_cost_micros, bool)
+            or not isinstance(requested_cost_micros, int)
+            or requested_cost_micros < 1
+        ):
+            raise ValueError("requested child cost budget must be positive or None")
+        frozen_binding = _json_object(binding_manifest, field="binding_manifest")
+        allocation_id = f"child_budget_{child_turn_id}"
+
+        with self._transaction():
+            parent = self._connection.execute(
+                """
+                SELECT turns.*, threads.workspace
+                FROM turns
+                JOIN threads ON threads.thread_id = turns.thread_id
+                WHERE turns.turn_id = ?
+                """,
+                (parent_turn_id,),
+            ).fetchone()
+            if parent is None:
+                raise KeyError(f"unknown parent Turn: {parent_turn_id}")
+            if parent["status"] != "running":
+                raise RuntimeError("child budget can only be allocated from a running parent Turn")
+
+            parent_state = self.read_budget_state(parent_turn_id)
+            remaining = normal_token_remaining(parent_state)
+            if remaining is not None:
+                if requested_tokens is None:
+                    if remaining < 1:
+                        limit = parent_state.limits.tokens
+                        if limit is None:
+                            raise RuntimeError("parent token limit disappeared")
+                        raise BudgetLimitExceededError(
+                            resource="tokens",
+                            limit=limit,
+                            current_exposure=limit,
+                            requested=1,
+                        )
+                    granted_tokens: int | None = remaining
+                else:
+                    if requested_tokens > remaining:
+                        limit = parent_state.limits.tokens
+                        if limit is None:
+                            raise RuntimeError("parent token limit disappeared")
+                        raise BudgetLimitExceededError(
+                            resource="tokens",
+                            limit=limit,
+                            current_exposure=limit - remaining,
+                            requested=requested_tokens,
+                        )
+                    granted_tokens = requested_tokens
+            else:
+                granted_tokens = requested_tokens
+
+            remaining_cost = parent_state.remaining("cost_micros")
+            if remaining_cost is not None:
+                if requested_cost_micros is None:
+                    raise ValueError("child cost budget is required when the parent Turn has a cost cap")
+                if requested_cost_micros > remaining_cost:
+                    limit = parent_state.limits.cost_micros
+                    if limit is None:
+                        raise RuntimeError("parent cost limit disappeared")
+                    raise BudgetLimitExceededError(
+                        resource="cost_micros",
+                        limit=limit,
+                        current_exposure=limit - remaining_cost,
+                        requested=requested_cost_micros,
+                    )
+                granted_cost_micros: int | None = requested_cost_micros
+            else:
+                granted_cost_micros = requested_cost_micros
+
+            self.create_thread(
+                workspace=Path(str(parent["workspace"])),
+                thread_id=child_thread_id,
+            )
+            root_turn_id = parent_turn_id
+            parent_binding = json.loads(parent["binding_manifest_json"])
+            inherited_root = parent_binding.get("budget_root_turn_id")
+            if isinstance(inherited_root, str) and inherited_root:
+                root_turn_id = inherited_root
+            child_binding = dict(frozen_binding)
+            child_binding["budget_root_turn_id"] = root_turn_id
+            child_binding["budget_parent_turn_id"] = parent_turn_id
+            child_binding["budget_allocation_id"] = allocation_id
+            child_binding["model_token_budget_total"] = granted_tokens
+            child_binding["model_cost_budget_total_micros"] = granted_cost_micros
+
+            self._append_and_reduce(
+                thread_id=child_thread_id,
+                turn_id=None,
+                record_type="budget_child_allocated",
+                producer="runtime",
+                payload={
+                    "allocation_id": allocation_id,
+                    "parent_turn_id": parent_turn_id,
+                    "child_turn_id": child_turn_id,
+                    "allocated_tokens": granted_tokens,
+                    "allocated_cost_micros": granted_cost_micros,
+                },
+            )
+            self.start_turn(
+                thread_id=child_thread_id,
+                turn_id=child_turn_id,
+                user_message=user_message,
+                binding_manifest=child_binding,
+            )
+        return self.read_turn(child_turn_id)
+
+    def settle_child_budget(self, *, child_turn_id: str) -> Mapping[str, Any]:
+        """Convert one terminal child's allocation into its actual subtree usage."""
+
+        with self._transaction():
+            row = self._connection.execute(
+                "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
+                (child_turn_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"child Turn has no parent budget allocation: {child_turn_id}")
+            if row["status"] == "settled":
+                return self.read_child_budget_allocation(child_turn_id)
+            if row["status"] != "active":
+                raise RuntimeError("child budget allocation is not active")
+            turn = self.read_turn(child_turn_id)
+            if turn.status not in {"completed", "failed", "cancelled"}:
+                raise RuntimeError("child budget can only settle after a terminal Turn")
+            state = self.read_budget_state(child_turn_id)
+            zero = ResourceUsage()
+            if state.reserved != zero or state.uncertain != zero or state.child_reserved != zero:
+                raise RuntimeError("child budget still has unresolved exposure")
+            actual = state.used + ResourceUsage(subagents=1)
+            self._append_and_reduce(
+                thread_id=str(row["thread_id"]),
+                turn_id=child_turn_id,
+                record_type="budget_child_settled",
+                producer="runtime",
+                payload={
+                    "allocation_id": str(row["allocation_id"]),
+                    "actual": actual.to_dict(),
+                },
+            )
+        return self.read_child_budget_allocation(child_turn_id)
+
+    def read_child_budget_allocation(self, child_turn_id: str) -> Mapping[str, Any]:
+        row = self._connection.execute(
+            "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
+            (child_turn_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"child Turn has no parent budget allocation: {child_turn_id}")
+        return MappingProxyType(
+            {
+                "allocation_id": str(row["allocation_id"]),
+                "parent_turn_id": str(row["parent_turn_id"]),
+                "child_turn_id": str(row["child_turn_id"]),
+                "allocated_tokens": row["allocated_tokens"],
+                "allocated_cost_micros": row["allocated_cost_micros"],
+                "actual": ResourceUsage.from_dict(json.loads(row["actual_json"])),
+                "status": str(row["status"]),
+            }
+        )
+
+    def read_budget_state(self, turn_id: str) -> BudgetState:
+        """Derive the Turn budget from durable reservation projections."""
+
+        turn = self.read_turn(turn_id)
+        raw_limit = turn.binding_manifest.get("model_token_budget_total")
+        if raw_limit is None:
+            token_limit: int | None = None
+        elif isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 0:
+            raise RuntimeError("frozen model token budget is invalid")
+        else:
+            token_limit = raw_limit
+
+        raw_cost_limit = turn.binding_manifest.get("model_cost_budget_total_micros")
+        if raw_cost_limit is None:
+            cost_limit: int | None = None
+        elif isinstance(raw_cost_limit, bool) or not isinstance(raw_cost_limit, int) or raw_cost_limit < 0:
+            raise RuntimeError("frozen model cost budget is invalid")
+        else:
+            cost_limit = raw_cost_limit
+
+        used = ResourceUsage()
+        reserved = ResourceUsage()
+        uncertain = ResourceUsage()
+        child_reserved = ResourceUsage()
+        tracked_attempt_ids: set[str] = set()
+        rows = self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE turn_id = ? ORDER BY rowid",
+            (turn_id,),
+        ).fetchall()
+        for row in rows:
+            tracked_attempt_ids.add(str(row["attempt_id"]))
+            reserved_usage = ResourceUsage.from_dict(json.loads(row["reserved_json"]))
+            status = ReservationStatus(str(row["status"]))
+            if status in {ReservationStatus.RESERVED, ReservationStatus.DISPATCHED}:
+                reserved = reserved + reserved_usage
+            elif status is ReservationStatus.UNKNOWN:
+                uncertain = uncertain + reserved_usage
+            elif status is ReservationStatus.SETTLED:
+                used = used + ResourceUsage.from_dict(json.loads(row["actual_json"]))
+
+        # Compatibility for Turns created before durable reservations existed.
+        # Once an attempt is tracked by a reservation, its usage is sourced only
+        # from that reservation projection to avoid double-counting.
+        for operation in self.list_model_operations(turn_id):
+            for attempt in self.list_model_attempts(operation.operation_id):
+                if attempt.attempt_id in tracked_attempt_ids or attempt.status != "completed":
+                    continue
+                used = used + resource_usage_from_model_usage(attempt.usage)
+
+        for row in self._connection.execute(
+            "SELECT * FROM child_budget_allocations WHERE parent_turn_id = ? ORDER BY rowid",
+            (turn_id,),
+        ):
+            if row["status"] == "active":
+                allocated_tokens = row["allocated_tokens"]
+                if allocated_tokens is not None:
+                    if (
+                        isinstance(allocated_tokens, bool)
+                        or not isinstance(allocated_tokens, int)
+                        or allocated_tokens < 0
+                    ):
+                        raise RuntimeError("durable child token allocation is invalid")
+                child_reserved = child_reserved + ResourceUsage(
+                    # Child allocations reserve fungible total-token capacity.
+                    # input_tokens is only the carrier so ResourceUsage.total_tokens
+                    # can participate in the existing BudgetState arithmetic.
+                    input_tokens=allocated_tokens or 0,
+                    cost_micros=(row["allocated_cost_micros"] or 0),
+                    subagents=1,
+                )
+            elif row["status"] == "settled":
+                used = used + ResourceUsage.from_dict(json.loads(row["actual_json"]))
+            else:
+                raise RuntimeError("durable child budget status is unsupported")
+
+        parent_scope_id = turn.binding_manifest.get("budget_parent_turn_id")
+        if not isinstance(parent_scope_id, str) or not parent_scope_id:
+            parent_scope_id = None
+        return BudgetState(
+            scope_id=turn_id,
+            parent_scope_id=parent_scope_id,
+            limits=BudgetLimits(tokens=token_limit, cost_micros=cost_limit),
+            used=used,
+            reserved=reserved,
+            uncertain=uncertain,
+            child_reserved=child_reserved,
+        )
+
+    def read_budget_reservation(self, attempt_id: str) -> BudgetReservation:
+        row = self._budget_reservation_row_for_attempt(attempt_id)
+        if row is None:
+            raise KeyError(f"model attempt has no budget reservation: {attempt_id}")
+        return BudgetReservation(
+            reservation_id=str(row["reservation_id"]),
+            scope_id=str(row["scope_id"]),
+            operation_id=str(row["operation_id"]),
+            attempt_id=str(row["attempt_id"]),
+            reserved=ResourceUsage.from_dict(json.loads(row["reserved_json"])),
+            status=ReservationStatus(str(row["status"])),
+        )
+
+    def _budget_reservation_row_for_attempt(
+        self,
+        attempt_id: str,
+    ) -> sqlite3.Row | None:
+        row = self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if row is not None and not isinstance(row, sqlite3.Row):
+            raise RuntimeError("budget reservation query returned an invalid row")
+        return row
+
+    def _append_budget_outcome(
+        self,
+        *,
+        operation: sqlite3.Row,
+        attempt_id: str,
+        outcome: str,
+        usage: Mapping[str, Any] | None = None,
+        producer: str = "runtime",
+    ) -> None:
+        row = self._budget_reservation_row_for_attempt(attempt_id)
+        if row is None:
+            return
+        reservation_id = str(row["reservation_id"])
+        status = ReservationStatus(str(row["status"]))
+        if outcome == "settled":
+            if status not in {
+                ReservationStatus.RESERVED,
+                ReservationStatus.DISPATCHED,
+                ReservationStatus.UNKNOWN,
+            }:
+                raise RuntimeError("budget reservation cannot be settled")
+            if usage is None:
+                raise RuntimeError("settled budget requires provider usage")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_settled",
+                producer=producer,
+                payload={
+                    "reservation_id": reservation_id,
+                    "actual": resource_usage_from_model_usage(usage).to_dict(),
+                },
+            )
+            return
+        if outcome == "released":
+            if status not in {
+                ReservationStatus.RESERVED,
+                ReservationStatus.DISPATCHED,
+                ReservationStatus.UNKNOWN,
+            }:
+                raise RuntimeError("budget reservation cannot be released")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_released",
+                producer=producer,
+                payload={"reservation_id": reservation_id},
+            )
+            return
+        if outcome == "unknown":
+            if status is ReservationStatus.UNKNOWN:
+                return
+            if status is not ReservationStatus.DISPATCHED:
+                raise RuntimeError("only a dispatched budget can become unknown")
+            self._append_and_reduce(
+                thread_id=str(operation["thread_id"]),
+                turn_id=str(operation["turn_id"]),
+                record_type="budget_unknown",
+                producer=producer,
+                payload={"reservation_id": reservation_id},
+            )
+            return
+        raise ValueError(f"unsupported budget outcome: {outcome}")
 
     def record_tool_call(
         self,
@@ -3100,6 +3687,7 @@ class RolloutStore:
             public_item_id: str | None = None
             plan_public_item_id: str | None = None
             plan_snapshot: Mapping[str, Any] | None = None
+            plan_event: Mapping[str, Any] | None = None
             plan_item_id: str | None = None
             if operation_id is not None:
                 attempt_generation = int(operation["claim_generation"])
@@ -3153,17 +3741,21 @@ class RolloutStore:
                             if not isinstance(raw_step, Mapping):
                                 continue
                             status = raw_step.get("status")
-                            normalized_status = (
-                                "pending" if status == "completed" else status
+                            normalized_status: Literal["pending", "in_progress"]
+                            if status in {"pending", "completed"}:
+                                normalized_status = "pending"
+                            elif status == "in_progress":
+                                normalized_status = "in_progress"
+                            else:
+                                continue
+                            step = PlanStep(
+                                step_id=str(
+                                    raw_step.get("step_id") or f"step_{index}"
+                                ),
+                                title=str(raw_step.get("step", "")),
+                                status=normalized_status,
                             )
-                            steps.append(
-                                {
-                                    "step_id": raw_step.get("step_id")
-                                    or f"step_{index}",
-                                    "title": raw_step.get("step", ""),
-                                    "status": normalized_status,
-                                }
-                            )
+                            steps.append(step.model_dump())
                     objective_row = self._connection.execute(
                         """
                         SELECT payload_json FROM items
@@ -3198,6 +3790,16 @@ class RolloutStore:
                         ),
                         "steps": steps,
                         "summary": arguments.get("explanation"),
+                    }
+                    plan_event = {
+                        "event_type": "llm_update",
+                        "message": (
+                            arguments.get("explanation")
+                            if isinstance(arguments.get("explanation"), str)
+                            else "Applied update_plan tool update."
+                        ),
+                        "related_step_id": plan_snapshot["active_step_id"],
+                        "tool_call_ids": [operation["tool_call_id"]],
                     }
             started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
             if public_item_id is not None:
@@ -3248,6 +3850,7 @@ class RolloutStore:
                 plan_item_id is not None
                 and plan_public_item_id is not None
                 and plan_snapshot is not None
+                and plan_event is not None
             ):
                 self._append_and_reduce(
                     thread_id=thread_id,
@@ -3270,7 +3873,10 @@ class RolloutStore:
                         "item_id": plan_item_id,
                         "public_item_id": plan_public_item_id,
                         "revision": plan_snapshot["revision"],
-                        "payload": {"plan": plan_snapshot},
+                        "payload": {
+                            "plan": plan_snapshot,
+                            "event": plan_event,
+                        },
                     },
                 )
             if operation_id is not None:
@@ -3293,6 +3899,67 @@ class RolloutStore:
         if row is None:
             raise KeyError(f"unknown tool operation: {operation_id}")
         return _tool_operation_snapshot(row)
+
+    def record_verification(
+        self,
+        *,
+        turn_id: str,
+        operation_id: str,
+        kind: str,
+        verifier: str,
+        verified_resources: tuple[str, ...] = (),
+    ) -> ItemSnapshot:
+        if kind not in {"test", "static_analysis", "assertion", "inspection"}:
+            raise ValueError(f"unsupported verification kind: {kind}")
+        if not isinstance(verifier, str) or not verifier.strip():
+            raise ValueError("verification verifier must be non-empty")
+        with self._transaction():
+            operation = self._connection.execute(
+                "SELECT * FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
+                (operation_id, turn_id),
+            ).fetchone()
+            if operation is None:
+                raise KeyError(f"unknown tool operation: {operation_id}")
+            if operation["status"] != "succeeded" or operation["result_item_id"] is None:
+                raise RuntimeError("verification requires a committed successful ToolResult")
+            existing_rows = self._connection.execute(
+                """
+                SELECT * FROM items
+                WHERE turn_id = ? AND kind = 'verification' AND status = 'completed'
+                ORDER BY sequence
+                """,
+                (turn_id,),
+            ).fetchall()
+            for row in existing_rows:
+                payload = json.loads(row["payload_json"])
+                if payload.get("operation_id") == operation_id:
+                    return _item_snapshot(row)
+
+            item_id = f"item_{uuid4().hex}"
+            payload = {
+                "operation_id": operation_id,
+                "tool_call_id": operation["tool_call_id"],
+                "arguments_digest": operation["arguments_digest"],
+                "source_result_item_id": operation["result_item_id"],
+                "verification_kind": kind,
+                "verifier": verifier.strip(),
+                "verified_resources": list(verified_resources),
+            }
+            self._append_and_reduce(
+                thread_id=operation["thread_id"],
+                turn_id=turn_id,
+                record_type="item_started",
+                producer="runtime",
+                payload={"item_id": item_id, "kind": "verification"},
+            )
+            self._append_and_reduce(
+                thread_id=operation["thread_id"],
+                turn_id=turn_id,
+                record_type="item_completed",
+                producer="runtime",
+                payload={"item_id": item_id, "payload": payload},
+            )
+        return self.read_item(item_id)
 
     def list_tool_operations(self, turn_id: str | None = None) -> tuple[ToolOperationSnapshot, ...]:
         if turn_id is None:
@@ -3573,6 +4240,14 @@ class RolloutStore:
             row["attempt_id"]: _model_attempt_row_payload(row)
             for row in self._connection.execute("SELECT * FROM model_attempts")
         }
+        actual_budget_reservations = {
+            row["reservation_id"]: _budget_reservation_row_payload(row)
+            for row in self._connection.execute("SELECT * FROM budget_reservations")
+        }
+        actual_child_budget_allocations = {
+            row["allocation_id"]: _child_budget_allocation_row_payload(row)
+            for row in self._connection.execute("SELECT * FROM child_budget_allocations")
+        }
         actual_tool_operations = {
             row["operation_id"]: _tool_operation_row_payload(row)
             for row in self._connection.execute("SELECT * FROM tool_operations")
@@ -3594,6 +4269,8 @@ class RolloutStore:
             ("items", expected.items, actual_items),
             ("model_operations", expected.model_operations, actual_model_operations),
             ("model_attempts", expected.model_attempts, actual_model_attempts),
+            ("budget_reservations", expected.budget_reservations, actual_budget_reservations),
+            ("child_budget_allocations", expected.child_budget_allocations, actual_child_budget_allocations),
             ("tool_operations", expected.tool_operations, actual_tool_operations),
             ("interactions", expected.interactions, actual_interactions),
             ("approvals", expected.approvals, actual_approvals),
@@ -3725,6 +4402,8 @@ class RolloutStore:
                     reducer_version=_REDUCER_VERSION,
                 )
             self._connection.execute("DELETE FROM projection_meta")
+            self._connection.execute("DELETE FROM child_budget_allocations")
+            self._connection.execute("DELETE FROM budget_reservations")
             self._connection.execute("DELETE FROM model_attempts")
             self._connection.execute("DELETE FROM model_operations")
             self._connection.execute("DELETE FROM approvals")
@@ -3836,6 +4515,16 @@ class RolloutStore:
             (thread_id,),
         ):
             state.model_attempts[row["attempt_id"]] = _model_attempt_row_payload(row)
+        for row in self._connection.execute(
+            "SELECT * FROM budget_reservations WHERE thread_id = ?",
+            (thread_id,),
+        ):
+            state.budget_reservations[row["reservation_id"]] = _budget_reservation_row_payload(row)
+        for row in self._connection.execute(
+            "SELECT * FROM child_budget_allocations WHERE thread_id = ?",
+            (thread_id,),
+        ):
+            state.child_budget_allocations[row["allocation_id"]] = _child_budget_allocation_row_payload(row)
         for row in self._connection.execute("SELECT * FROM tool_operations WHERE thread_id = ?", (thread_id,)):
             state.tool_operations[row["operation_id"]] = _tool_operation_row_payload(row)
         for row in self._connection.execute("SELECT * FROM interactions WHERE thread_id = ?", (thread_id,)):
@@ -3852,9 +4541,9 @@ class RolloutStore:
                 """
                 INSERT INTO threads (
                     thread_id, workspace, parent_thread_id, fork_turn_id,
-                    active_turn_id, head_turn_id, head_version,
+                    active_turn_id, head_turn_id, head_version, settings_json,
                     applied_thread_sequence, reducer_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     workspace = excluded.workspace,
                     parent_thread_id = excluded.parent_thread_id,
@@ -3862,6 +4551,7 @@ class RolloutStore:
                     active_turn_id = excluded.active_turn_id,
                     head_turn_id = excluded.head_turn_id,
                     head_version = excluded.head_version,
+                    settings_json = excluded.settings_json,
                     applied_thread_sequence = excluded.applied_thread_sequence,
                     reducer_version = excluded.reducer_version
                 """,
@@ -3873,6 +4563,7 @@ class RolloutStore:
                     thread["active_turn_id"],
                     thread["head_turn_id"],
                     thread["head_version"],
+                    _canonical_json(thread["settings"]),
                     thread["applied_thread_sequence"],
                     thread["reducer_version"],
                 ),
@@ -3881,11 +4572,14 @@ class RolloutStore:
             self._connection.execute(
                 """
                 INSERT INTO turns (
-                    turn_id, thread_id, status, predecessor_turn_id, turn_index,
+                    turn_id, thread_id, status, terminal_reason_code,
+                    terminal_message, predecessor_turn_id, turn_index,
                     binding_manifest_json, applied_thread_sequence, reducer_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(turn_id) DO UPDATE SET
                     status = excluded.status,
+                    terminal_reason_code = excluded.terminal_reason_code,
+                    terminal_message = excluded.terminal_message,
                     predecessor_turn_id = excluded.predecessor_turn_id,
                     turn_index = excluded.turn_index,
                     binding_manifest_json = excluded.binding_manifest_json,
@@ -3896,6 +4590,8 @@ class RolloutStore:
                     turn["turn_id"],
                     turn["thread_id"],
                     turn["status"],
+                    turn["terminal_reason_code"],
+                    turn["terminal_message"],
                     turn["predecessor_turn_id"],
                     turn["turn_index"],
                     _canonical_json(turn["binding_manifest"]),
@@ -4018,6 +4714,61 @@ class RolloutStore:
                     attempt["lease_expires_at"],
                     attempt["applied_thread_sequence"],
                     attempt["reducer_version"],
+                ),
+            )
+        for reservation in state.budget_reservations.values():
+            self._connection.execute(
+                """
+                INSERT INTO budget_reservations (
+                    reservation_id, thread_id, turn_id, scope_id, operation_id,
+                    attempt_id, reserved_json, actual_json, status,
+                    applied_thread_sequence, reducer_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(reservation_id) DO UPDATE SET
+                    actual_json = excluded.actual_json,
+                    status = excluded.status,
+                    applied_thread_sequence = excluded.applied_thread_sequence,
+                    reducer_version = excluded.reducer_version
+                """,
+                (
+                    reservation["reservation_id"],
+                    reservation["thread_id"],
+                    reservation["turn_id"],
+                    reservation["scope_id"],
+                    reservation["operation_id"],
+                    reservation["attempt_id"],
+                    _canonical_json(reservation["reserved"]),
+                    _canonical_json(reservation["actual"]),
+                    reservation["status"],
+                    reservation["applied_thread_sequence"],
+                    reservation["reducer_version"],
+                ),
+            )
+        for allocation in state.child_budget_allocations.values():
+            self._connection.execute(
+                """
+                INSERT INTO child_budget_allocations (
+                    allocation_id, thread_id, parent_turn_id, child_turn_id,
+                    allocated_tokens, allocated_cost_micros, actual_json, status,
+                    applied_thread_sequence, reducer_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(allocation_id) DO UPDATE SET
+                    actual_json = excluded.actual_json,
+                    status = excluded.status,
+                    applied_thread_sequence = excluded.applied_thread_sequence,
+                    reducer_version = excluded.reducer_version
+                """,
+                (
+                    allocation["allocation_id"],
+                    allocation["thread_id"],
+                    allocation["parent_turn_id"],
+                    allocation["child_turn_id"],
+                    allocation["allocated_tokens"],
+                    allocation["allocated_cost_micros"],
+                    _canonical_json(allocation["actual"]),
+                    allocation["status"],
+                    allocation["applied_thread_sequence"],
+                    allocation["reducer_version"],
                 ),
             )
         for operation in state.tool_operations.values():
@@ -4187,6 +4938,7 @@ class RolloutStore:
                 active_turn_id TEXT,
                 head_turn_id TEXT,
                 head_version INTEGER NOT NULL,
+                settings_json TEXT NOT NULL,
                 applied_thread_sequence INTEGER NOT NULL,
                 reducer_version INTEGER NOT NULL
             );
@@ -4194,6 +4946,8 @@ class RolloutStore:
                 turn_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),
                 status TEXT NOT NULL,
+                terminal_reason_code TEXT,
+                terminal_message TEXT,
                 predecessor_turn_id TEXT,
                 turn_index INTEGER NOT NULL,
                 binding_manifest_json TEXT NOT NULL,
@@ -4253,6 +5007,32 @@ class RolloutStore:
                 applied_thread_sequence INTEGER NOT NULL,
                 reducer_version INTEGER NOT NULL,
                 UNIQUE(operation_id, generation)
+            );
+            CREATE TABLE IF NOT EXISTS budget_reservations (
+                reservation_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+                turn_id TEXT NOT NULL REFERENCES turns(turn_id),
+                scope_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL REFERENCES model_operations(operation_id),
+                attempt_id TEXT NOT NULL REFERENCES model_attempts(attempt_id),
+                reserved_json TEXT NOT NULL,
+                actual_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL,
+                applied_thread_sequence INTEGER NOT NULL,
+                reducer_version INTEGER NOT NULL,
+                UNIQUE(attempt_id)
+            );
+            CREATE TABLE IF NOT EXISTS child_budget_allocations (
+                allocation_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL REFERENCES threads(thread_id),
+                parent_turn_id TEXT NOT NULL,
+                child_turn_id TEXT NOT NULL UNIQUE,
+                allocated_tokens INTEGER,
+                allocated_cost_micros INTEGER,
+                actual_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL,
+                applied_thread_sequence INTEGER NOT NULL,
+                reducer_version INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS tool_operations (
                 operation_id TEXT PRIMARY KEY,
@@ -4326,6 +5106,14 @@ class RolloutStore:
             self._connection.execute("ALTER TABLE threads ADD COLUMN parent_thread_id TEXT")
         if "fork_turn_id" not in thread_columns:
             self._connection.execute("ALTER TABLE threads ADD COLUMN fork_turn_id TEXT")
+        child_budget_columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(child_budget_allocations)")
+        }
+        if child_budget_columns and "allocated_cost_micros" not in child_budget_columns:
+            self._connection.execute(
+                "ALTER TABLE child_budget_allocations ADD COLUMN allocated_cost_micros INTEGER"
+            )
         tool_operation_columns = {
             str(row["name"]) for row in self._connection.execute("PRAGMA table_info(tool_operations)")
         }
@@ -4351,6 +5139,20 @@ def _projection_hash(state: ProjectionState, thread_id: str) -> str:
         "interactions": {key: value for key, value in state.interactions.items() if value["thread_id"] == thread_id},
         "approvals": {key: value for key, value in state.approvals.items() if value["thread_id"] == thread_id},
     }
+    budget_reservations = {
+        key: value
+        for key, value in state.budget_reservations.items()
+        if value["thread_id"] == thread_id
+    }
+    if budget_reservations:
+        payload["budget_reservations"] = budget_reservations
+    child_budget_allocations = {
+        key: value
+        for key, value in state.child_budget_allocations.items()
+        if value["thread_id"] == thread_id
+    }
+    if child_budget_allocations:
+        payload["child_budget_allocations"] = child_budget_allocations
     artifacts = {key: value for key, value in state.artifacts.items() if value["thread_id"] == thread_id}
     if artifacts:
         payload["artifacts"] = artifacts
@@ -4489,6 +5291,7 @@ def _thread_snapshot(row: sqlite3.Row) -> ThreadSnapshot:
         active_turn_id=row["active_turn_id"],
         head_turn_id=row["head_turn_id"],
         head_version=row["head_version"],
+        settings=MappingProxyType(json.loads(row["settings_json"])),
         applied_thread_sequence=row["applied_thread_sequence"],
     )
 
@@ -4498,6 +5301,8 @@ def _turn_snapshot(row: sqlite3.Row) -> TurnSnapshot:
         turn_id=row["turn_id"],
         thread_id=row["thread_id"],
         status=row["status"],
+        terminal_reason_code=row["terminal_reason_code"],
+        terminal_message=row["terminal_message"],
         predecessor_turn_id=row["predecessor_turn_id"],
         turn_index=row["turn_index"],
         binding_manifest=_immutable_object(row["binding_manifest_json"]),
@@ -4653,6 +5458,7 @@ def _thread_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "active_turn_id": row["active_turn_id"],
         "head_turn_id": row["head_turn_id"],
         "head_version": row["head_version"],
+        "settings": json.loads(row["settings_json"]),
         "applied_thread_sequence": row["applied_thread_sequence"],
         "reducer_version": row["reducer_version"],
     }
@@ -4663,6 +5469,8 @@ def _turn_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "turn_id": row["turn_id"],
         "thread_id": row["thread_id"],
         "status": row["status"],
+        "terminal_reason_code": row["terminal_reason_code"],
+        "terminal_message": row["terminal_message"],
         "predecessor_turn_id": row["predecessor_turn_id"],
         "turn_index": row["turn_index"],
         "binding_manifest": json.loads(row["binding_manifest_json"]),
@@ -4759,6 +5567,37 @@ def _model_attempt_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "reducer_version": row["reducer_version"],
     }
 
+
+
+def _budget_reservation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "reservation_id": row["reservation_id"],
+        "thread_id": row["thread_id"],
+        "turn_id": row["turn_id"],
+        "scope_id": row["scope_id"],
+        "operation_id": row["operation_id"],
+        "attempt_id": row["attempt_id"],
+        "reserved": json.loads(row["reserved_json"]),
+        "actual": json.loads(row["actual_json"]),
+        "status": row["status"],
+        "applied_thread_sequence": row["applied_thread_sequence"],
+        "reducer_version": row["reducer_version"],
+    }
+
+
+def _child_budget_allocation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "allocation_id": row["allocation_id"],
+        "thread_id": row["thread_id"],
+        "parent_turn_id": row["parent_turn_id"],
+        "child_turn_id": row["child_turn_id"],
+        "allocated_tokens": row["allocated_tokens"],
+        "allocated_cost_micros": row["allocated_cost_micros"],
+        "actual": json.loads(row["actual_json"]),
+        "status": row["status"],
+        "applied_thread_sequence": row["applied_thread_sequence"],
+        "reducer_version": row["reducer_version"],
+    }
 
 def _tool_operation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {

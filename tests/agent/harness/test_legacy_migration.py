@@ -55,7 +55,7 @@ def _insert_legacy_turn(
     created_at: float,
 ) -> None:
     runtime = {
-        "model_alias": "legacy-model",
+        "model_id": "legacy-model",
         "workspace_path": str(workspace),
     }
     with sqlite3.connect(database) as connection:
@@ -152,6 +152,48 @@ def _insert_legacy_checkpoint(
             "INSERT INTO checkpoints VALUES (?, 'agent_loop', ?, NULL, ?, ?, NULL)",
             (turn_id, checkpoint_id, encoding, encoded),
         )
+
+
+def test_legacy_import_rejects_model_alias_without_mapping_it_to_model_id(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "praxis.sqlite3"
+    _create_legacy_database(database)
+    _insert_legacy_turn(
+        database,
+        turn_id="legacy-alias-turn",
+        workspace=workspace,
+        status="completed",
+        user_message="legacy",
+        answer="answer",
+        created_at=1.0,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE agent_turns SET runtime_json = ? WHERE turn_id = ?",
+            (
+                json.dumps(
+                    {
+                        "model_alias": "legacy-model",
+                        "workspace_path": str(workspace),
+                    }
+                ),
+                "legacy-alias-turn",
+            ),
+        )
+
+    report = migrate_legacy_turns(database)
+
+    assert report.migrated_turn_ids == ()
+    assert report.blocked == {
+        "legacy-alias-turn": (
+            "legacy runtime binding requires model_id; model_alias is unsupported"
+        )
+    }
+    with RolloutStore(database) as store:
+        assert store.list_turns() == ()
 
 
 @pytest.mark.parametrize("checkpoint_encoding", ["json", "msgpack"])

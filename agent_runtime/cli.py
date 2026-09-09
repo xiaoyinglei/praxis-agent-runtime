@@ -17,7 +17,7 @@ import yaml
 from pydantic import ValidationError
 
 from agent_runtime.core.llm_config import ModelProvider
-from agent_runtime.core.llm_registry import UnknownModelAliasError
+from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.model_admin import (
@@ -41,6 +41,7 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent
+    from agent_runtime.harness.session import Session
     from agent_runtime.result import AgentPause
 
 agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class _CLIRuntimeBinding:
-    model_alias: str | None
+    model_id: str | None
     workspace_path: str
     knowledge: RAGKnowledgeConfig | None
 
@@ -371,7 +372,7 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
         KeyError,
         ModelNotAvailableError,
         ModelPolicyError,
-        UnknownModelAliasError,
+        UnknownModelIdError,
         ValueError,
     ) as exc:
         raise click.ClickException(str(exc)) from exc
@@ -475,8 +476,8 @@ async def _pending_resume_request(
         display.finish()
 
 
-def _print_startup_banner(model_alias: str) -> None:
-    print(f"Agent 就绪 (模型: {model_alias})")
+def _print_startup_banner(model_id: str) -> None:
+    print(f"Agent 就绪 (模型: {model_id})")
     print("输入查询，或输入 /help 查看交互命令。")
     print()
 
@@ -506,90 +507,100 @@ async def _chat_facade_loop(
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
     chat_workspace = default_chat_workspace
-    model_alias = facade.current_model().id
-    _print_startup_banner(model_alias)
-    while True:
-        try:
-            query = composer.prompt("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见。")
-            return
-        if not query:
-            continue
-        if query == "/exit":
-            return
-        if query == "/help":
-            _print_chat_help()
-            continue
-        if query == "/status":
-            print(f"Previous Turn: {current_turn_id or '(none)'}")
-            print(f"模型: {model_alias}")
-            print(f"工作区: {chat_workspace}")
-            print(f"详细输出: {'开' if verbose else '关'}")
-            continue
-        if query in {"/new", "/clear"}:
-            current_turn_id = None
-            chat_workspace = default_chat_workspace
-            model_alias = facade.current_model().id
-            print("下一条消息将使用空历史。")
-            continue
-        if query == "/verbose":
-            verbose = not verbose
-            event_display.set_verbose(verbose)
-            print(f"详细输出: {'开' if verbose else '关'}")
-            continue
-        if query == "/model" or query.startswith("/model "):
-            _handle_model_slash_command(
-                query,
-                agent=facade,
-            )
-            model_alias = facade.current_model().id
-            continue
-        if query.startswith("/"):
-            print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
-            continue
+    model_id = facade.current_model().id
+    _print_startup_banner(model_id)
+    from contextlib import AsyncExitStack
 
-        event_display.begin_turn()
-        result = await facade.run(
-            query,
-            previous_turn_id=current_turn_id,
-            max_turns=max_turns,
-            max_tokens_total=max_tokens_total,
-            require_workspace_change=False,
-            allow_write_tools=allow_write_tools,
+    async with AsyncExitStack() as stack:
+        session = await stack.enter_async_context(facade.session(
+            previous_turn_id=previous_turn_id,
+            max_turns=max_turns, max_tokens_total=max_tokens_total,
+            require_workspace_change=False, allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
-            event_sink=event_display,
-        )
-        current_turn_id = result.turn_id
-        while result.status == "paused":
-            event_display.finish()
-            action = _handle_pause(result)
-            if action is None:
-                print("已取消。")
-                break
+        ))
+        while True:
+            try:
+                query = (await asyncio.to_thread(composer.prompt, "> ")).strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见。")
+                return
+            if not query:
+                continue
+            if query == "/exit":
+                return
+            if query == "/help":
+                _print_chat_help()
+                continue
+            if query == "/status":
+                print(f"Previous Turn: {current_turn_id or '(none)'}")
+                print(f"模型: {model_id}")
+                print(f"工作区: {chat_workspace}")
+                print(f"详细输出: {'开' if verbose else '关'}")
+                continue
+            if query in {"/new", "/clear"}:
+                await stack.aclose()
+                facade.model = model_id
+                session = await stack.enter_async_context(facade.session(
+                    max_turns=max_turns, max_tokens_total=max_tokens_total,
+                    require_workspace_change=False, allow_write_tools=allow_write_tools,
+                    allow_execute_tools=allow_execute_tools,
+                ))
+                current_turn_id = None
+                chat_workspace = default_chat_workspace
+                model_id = session.current_model().id
+                print("下一条消息将使用空历史。")
+                continue
+            if query == "/verbose":
+                verbose = not verbose
+                event_display.set_verbose(verbose)
+                print(f"详细输出: {'开' if verbose else '关'}")
+                continue
+            if query == "/model" or query.startswith("/model "):
+                _handle_model_slash_command(
+                    query,
+                    agent=session,
+                )
+                model_id = session.current_model().id
+                continue
+            if query.startswith("/"):
+                print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
+                continue
+
             event_display.begin_turn()
-            result = await facade.resume(
-                result.turn_id,
-                action,
+            result = await session.submit(
+                query,
                 event_sink=event_display,
             )
-        event_display.finish()
-        _display_agent_result(
-            result,
-            verbose=verbose,
-            answer_streamed=event_display.answer_streamed,
-        )
+            current_turn_id = result.turn_id
+            while result.status == "paused":
+                event_display.finish()
+                action = _handle_pause(result)
+                if action is None:
+                    result = await session.resume(result.turn_id, "abort")
+                    print("已取消。")
+                    break
+                event_display.begin_turn()
+                result = await session.resume(
+                    result.turn_id,
+                    action,
+                    event_sink=event_display,
+                )
+            event_display.finish()
+            _display_agent_result(
+                result,
+                verbose=verbose,
+                answer_streamed=event_display.answer_streamed,
+            )
 
 
 def _print_current_model(spec: ModelSpec) -> None:
     print(f"{spec.id}")
     print(f"provider: {spec.provider}")
-    print(f"provider_model: {spec.provider_model}")
     print(f"context_window: {spec.context_window}")
     print(f"location: {spec.location}")
 
 
-def _print_model_menu(agent: Agent) -> None:
+def _print_model_menu(agent: Agent | Session) -> None:
     current = agent.current_model()
     print(f"当前模型: {current.id}")
     print("可用模型:")
@@ -598,13 +609,13 @@ def _print_model_menu(agent: Agent) -> None:
         current_model_id=current.id,
     ):
         print(line)
-    print("切换: /model <alias>")
+    print("切换: /model <model_id>")
 
 
 def _handle_model_slash_command(
     query: str,
     *,
-    agent: Agent | None,
+    agent: Agent | Session | None,
 ) -> None:
     if agent is None:
         print("模型控制平面不可用。")
@@ -636,7 +647,7 @@ def _handle_model_slash_command(
             spec = agent.switch_model(action)
             print(f"已切换模型: {spec.id}")
             return
-    except (ModelPolicyError, UnknownModelAliasError) as exc:
+    except (ModelPolicyError, UnknownModelIdError) as exc:
         print(f"模型切换失败: {exc}")
         _print_model_menu(agent)
         return
@@ -663,37 +674,40 @@ def model_list(
     _print_model_session_diagnostics(selection.diagnostics)
     current_id = selection.spec.id
     for entry in _model_admin_call(service.list_models):
-        marker = "*" if entry.alias == current_id else " "
+        marker = "*" if entry.model_id == current_id else " "
         suffix = f" source={entry.origin}" if source else ""
-        print(f"{marker} {entry.alias} -> {entry.spec.provider_model}{suffix}")
+        print(f"{marker} {entry.model_id} provider={entry.spec.provider}{suffix}")
 
 
 @model_app.command(name="show")
 def model_show(
-    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="模型 id")],
     session_path: Annotated[
         Path,
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """显示一个模型的规范化定义摘要，不解析凭据值。"""
-    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(alias))
-    print(f"alias: {entry.alias}")
+    entry = _model_admin_call(lambda: _model_admin_service(session_path).show(model_id))
+    print(f"model_id: {entry.model_id}")
     print(f"source: {entry.origin}")
     print(f"provider: {entry.definition.provider.value}")
     print(f"provider_name: {entry.definition.provider_name or '<none>'}")
-    print(f"model: {entry.spec.provider_model}")
     print(f"protocol: {entry.spec.protocol or '<none>'}")
     print(f"location: {entry.spec.location}")
     print(f"base_url: {entry.spec.base_url or '<default>'}")
     print(f"api_key_env: {entry.spec.api_key_env or '<none>'}")
     print(f"tokenizer_model: {entry.definition.tokenizer_model or '<default>'}")
-    print(f"context_window_tokens: {entry.definition.context_window_tokens}")
     print(
-        "request_context_tokens: "
-        f"{entry.definition.request_context_tokens or entry.definition.context_window_tokens}"
+        f"context_window_tokens: "
+        f"{entry.definition.context_window_tokens}"
     )
-    print(f"max_output_tokens: {entry.definition.max_tokens}")
+
+
+    print(
+        f"max_output_tokens: "
+        f"{entry.definition.max_output_tokens}"
+    )
     print(f"timeout_seconds: {entry.definition.timeout_seconds}")
     print(f"supports_tools: {str(entry.spec.supports_tools).lower()}")
     print(
@@ -731,7 +745,7 @@ def model_switch(
 
 @model_app.command(name="probe")
 def model_probe(
-    alias: Annotated[str, typer.Argument(help="模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="模型 id")],
     level: Annotated[
         ProbeLevel,
         typer.Option("--level", help="connectivity、stream 或 full"),
@@ -743,29 +757,27 @@ def model_probe(
 ) -> None:
     """探测已注册模型，不修改注册表或 session。"""
     service = _model_admin_service(session_path)
-    evidence = _model_admin_call(lambda: _run_cli_async(service.probe(alias, level=level)))
+    evidence = _model_admin_call(lambda: _run_cli_async(service.probe(model_id, level=level)))
     _print_probe_evidence(evidence)
 
 
 @model_app.command(name="add")
 def model_add(
-    alias: Annotated[str, typer.Argument(help="新模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="新模型 id")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
-    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
     provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
-    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
     timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
     context_window_tokens: Annotated[
         int | None,
         typer.Option("--context-window-tokens"),
     ] = None,
-    request_context_tokens: Annotated[
+    max_output_tokens: Annotated[
         int | None,
-        typer.Option("--request-context-tokens"),
+        typer.Option("--max-output-tokens"),
     ] = None,
     supports_tools: Annotated[
         bool | None,
@@ -790,16 +802,14 @@ def model_add(
     service = _model_admin_service(session_path)
     arguments = _model_definition_arguments(
         provider=provider,
-        provider_model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        request_context_tokens=request_context_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,
@@ -807,7 +817,7 @@ def model_add(
     outcome = _model_admin_call(
         lambda: _run_cli_async(
             service.add(
-                alias,
+                model_id,
                 arguments=arguments,
                 from_path=from_path,
                 skip_probe=skip_probe,
@@ -819,23 +829,22 @@ def model_add(
 
 @model_app.command(name="update")
 def model_update(
-    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="用户模型 id")],
     provider: Annotated[ModelProvider | None, typer.Option("--provider")] = None,
-    provider_model: Annotated[str | None, typer.Option("--provider-model")] = None,
     base_url: Annotated[str | None, typer.Option("--base-url")] = None,
     api_key_env: Annotated[str | None, typer.Option("--api-key-env")] = None,
     tokenizer_model: Annotated[str | None, typer.Option("--tokenizer-model")] = None,
     provider_name: Annotated[str | None, typer.Option("--provider-name")] = None,
     protocol: Annotated[str | None, typer.Option("--protocol")] = None,
-    max_tokens: Annotated[int | None, typer.Option("--max-tokens")] = None,
     timeout_seconds: Annotated[float | None, typer.Option("--timeout-seconds")] = None,
     context_window_tokens: Annotated[
         int | None,
         typer.Option("--context-window-tokens"),
     ] = None,
-    request_context_tokens: Annotated[
+
+    max_output_tokens: Annotated[
         int | None,
-        typer.Option("--request-context-tokens"),
+        typer.Option("--max-output-tokens"),
     ] = None,
     supports_tools: Annotated[
         bool | None,
@@ -858,16 +867,14 @@ def model_update(
     service = _model_admin_service(session_path)
     arguments = _model_definition_arguments(
         provider=provider,
-        provider_model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        request_context_tokens=request_context_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,
@@ -875,7 +882,7 @@ def model_update(
     outcome = _model_admin_call(
         lambda: _run_cli_async(
             service.update(
-                alias,
+                model_id,
                 arguments=arguments,
                 from_path=from_path,
                 unset_paths=tuple(unset or ()),
@@ -888,15 +895,15 @@ def model_update(
 
 @model_app.command(name="remove")
 def model_remove(
-    alias: Annotated[str, typer.Argument(help="用户模型 alias")],
+    model_id: Annotated[str, typer.Argument(help="用户模型 id")],
     session_path: Annotated[
         Path,
         typer.Option("--session-path", help="模型 session state 文件"),
     ] = DEFAULT_MODEL_SESSION_PATH,
 ) -> None:
     """删除非当前会话选中的用户模型。"""
-    result = _model_admin_call(lambda: _model_admin_service(session_path).remove(alias))
-    print(f"removed: {alias}")
+    result = _model_admin_call(lambda: _model_admin_service(session_path).remove(model_id))
+    print(f"removed: {model_id}")
     print(f"registry_revision: {result.snapshot.document.revision}")
 
 
@@ -946,32 +953,28 @@ def _model_admin_call[T](operation: Callable[[], T]) -> T:
 def _model_definition_arguments(
     *,
     provider: ModelProvider | None,
-    provider_model: str | None,
     base_url: str | None,
     api_key_env: str | None,
     tokenizer_model: str | None,
     provider_name: str | None,
     protocol: str | None,
-    max_tokens: int | None,
     timeout_seconds: float | None,
     context_window_tokens: int | None,
-    request_context_tokens: int | None,
+    max_output_tokens: int | None,
     supports_tools: bool | None,
     supports_structured_output: bool | None,
     location: Literal["local", "cloud"] | None,
 ) -> ModelDefinitionArguments:
     return ModelDefinitionArguments(
         provider=provider,
-        model=provider_model,
         base_url=base_url,
         api_key_env=api_key_env,
         tokenizer_model=tokenizer_model,
         provider_name=provider_name,
         protocol=protocol,
-        max_tokens=max_tokens,
         timeout_seconds=timeout_seconds,
         context_window_tokens=context_window_tokens,
-        request_context_tokens=request_context_tokens,
+        max_output_tokens=max_output_tokens,
         supports_tools=supports_tools,
         supports_structured_output=supports_structured_output,
         location=location,
@@ -988,7 +991,7 @@ def _print_probe_evidence(evidence: ModelProbeEvidence) -> None:
 
 
 def _print_model_mutation(outcome: ModelMutationOutcome) -> None:
-    print(f"alias: {outcome.alias}")
+    print(f"model_id: {outcome.model_id}")
     print("source: user")
     print(f"changed: {str(outcome.changed).lower()}")
     print(f"definition_revision: {outcome.definition_revision}")
@@ -1024,11 +1027,26 @@ def _latest_cli_turn(
     workspace_path: Path | None,
 ) -> _CLITurn | None:
     with RolloutStore(checkpoint_db) as store:
-        return _latest_harness_turn(
+        turn = _latest_harness_turn(
             store,
             statuses={"paused"},
             workspace_path=workspace_path,
         )
+        return None if turn is None else _project_cli_turn(store, turn)
+
+
+def _latest_abortable_cli_turn(
+    checkpoint_db: Path,
+    *,
+    workspace_path: Path | None,
+) -> _CLITurn | None:
+    with RolloutStore(checkpoint_db) as store:
+        turn = _latest_harness_turn(
+            store,
+            statuses={"paused"},
+            workspace_path=workspace_path,
+        )
+        return None if turn is None else _project_abortable_cli_turn(store, turn)
 
 
 def _latest_completed_cli_turn(
@@ -1037,11 +1055,12 @@ def _latest_completed_cli_turn(
     workspace_path: Path | None,
 ) -> _CLITurn | None:
     with RolloutStore(checkpoint_db) as store:
-        return _latest_harness_turn(
+        turn = _latest_harness_turn(
             store,
             statuses={"completed", "failed", "cancelled"},
             workspace_path=workspace_path,
         )
+        return None if turn is None else _project_cli_turn(store, turn)
 
 
 def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
@@ -1053,12 +1072,21 @@ def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
         return _project_cli_turn(store, turn)
 
 
+def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
+    with RolloutStore(checkpoint_db) as store:
+        try:
+            turn = store.read_turn(turn_id)
+        except KeyError as exc:
+            raise KeyError(f"Turn not found: {turn_id}") from exc
+        return _project_abortable_cli_turn(store, turn)
+
+
 def _latest_harness_turn(
     store: RolloutStore,
     *,
     statuses: set[str],
     workspace_path: Path | None,
-) -> _CLITurn | None:
+) -> TurnSnapshot | None:
     expected_workspace = (
         None if workspace_path is None else workspace_path.expanduser().resolve()
     )
@@ -1071,17 +1099,15 @@ def _latest_harness_turn(
             and Path(thread.workspace).resolve() != expected_workspace
         ):
             continue
-        return _project_cli_turn(store, turn)
+        return turn
     return None
 
 
 def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
-    alias = (
-        None
-        if "authentication_schema_version" in turn.binding_manifest
-        else turn.binding_manifest.get("model_alias")
-    )
+    if "model_alias" in turn.binding_manifest:
+        raise RuntimeError("legacy model_alias binding is unsupported")
+    model_id = turn.binding_manifest.get("model_id")
     knowledge_value = turn.binding_manifest.get("knowledge_config")
     knowledge = (
         RAGKnowledgeConfig.model_validate(knowledge_value)
@@ -1092,9 +1118,25 @@ def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
         turn_id=turn.turn_id,
         status=turn.status,
         runtime=_CLIRuntimeBinding(
-            model_alias=alias if isinstance(alias, str) else None,
+            model_id=model_id if isinstance(model_id, str) else None,
             workspace_path=thread.workspace,
             knowledge=knowledge,
+        ),
+    )
+
+
+def _project_abortable_cli_turn(
+    store: RolloutStore,
+    turn: TurnSnapshot,
+) -> _CLITurn:
+    thread = store.read_thread(turn.thread_id)
+    return _CLITurn(
+        turn_id=turn.turn_id,
+        status=turn.status,
+        runtime=_CLIRuntimeBinding(
+            model_id=None,
+            workspace_path=thread.workspace,
+            knowledge=None,
         ),
     )
 
@@ -1125,7 +1167,7 @@ def agent_chat(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", help="主生成模型别名，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
     ] = None,
     max_tokens_total: Annotated[
         int | None,
@@ -1166,7 +1208,8 @@ def agent_chat(
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
         raise typer.BadParameter(
-            "继续已有 Turn 时不能传 --model；模型已由前一个 Turn 绑定"
+            "--previous-turn-id 仅继承上下文；新 Turn 使用当前 session 模型。"
+            "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     if effective_previous_turn_id is not None and continued_turn is None:
         continued_turn = _cli_turn(checkpoint_db, effective_previous_turn_id)
@@ -1176,7 +1219,7 @@ def agent_chat(
         facade_knowledge = _load_knowledge_config(knowledge_config)
     else:
         binding = continued_turn.runtime
-        facade_model = binding.model_alias
+        facade_model = None
         facade_workspace = binding.workspace_path or Path.cwd()
         facade_knowledge = binding.knowledge
     facade = _create_agent_facade(
@@ -1240,7 +1283,7 @@ def agent_run(
     ] = None,
     model: Annotated[
         str | None,
-        typer.Option("--model", "-m", help="主生成模型别名，对应 configs/models.yaml 中 capability=chat 的条目"),
+        typer.Option("--model", "-m", help="主生成模型 ID，对应 configs/models.yaml 中 capability=chat 的条目"),
     ] = None,
     knowledge_config: Annotated[
         Path | None,
@@ -1299,7 +1342,8 @@ def agent_run(
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
         raise typer.BadParameter(
-            "继续已有 Turn 时不能传 --model；模型已由前一个 Turn 绑定"
+            "--previous-turn-id 仅继承上下文；新 Turn 使用当前 session 模型。"
+            "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     facade = _create_agent_facade(
         model=model,
@@ -1392,9 +1436,16 @@ def agent_resume(
         raise typer.BadParameter("--all 只能与 --last 一起使用")
     effective_turn_id = turn_id
     if last:
-        latest = _latest_cli_turn(
-            checkpoint_db,
-            workspace_path=None if all_workspaces else Path.cwd(),
+        latest = (
+            _latest_abortable_cli_turn(
+                checkpoint_db,
+                workspace_path=None if all_workspaces else Path.cwd(),
+            )
+            if action == "abort"
+            else _latest_cli_turn(
+                checkpoint_db,
+                workspace_path=None if all_workspaces else Path.cwd(),
+            )
         )
         if latest is None:
             scope = "所有工作区" if all_workspaces else "当前工作区"
@@ -1405,7 +1456,11 @@ def agent_resume(
         raise typer.Exit(code=2)
     if action is None and user_input is not None:
         raise typer.BadParameter("--input 需要同时指定 --action")
-    turn_metadata = _cli_turn(checkpoint_db, effective_turn_id)
+    turn_metadata = (
+        _abortable_cli_turn(checkpoint_db, effective_turn_id)
+        if action == "abort"
+        else _cli_turn(checkpoint_db, effective_turn_id)
+    )
     facade = _create_agent_facade(
         model=None,
         checkpoint_db=checkpoint_db,

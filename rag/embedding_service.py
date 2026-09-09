@@ -92,8 +92,8 @@ def embedding_space_for_model(model_name_or_path: str) -> str:
     except Exception:
         return model_name_or_path
     for spec in catalog.list_models(ModelCapability.EMBEDDING):
-        if spec.model == model_name_or_path:
-            return spec.embedding_space or spec.model
+        if spec.id == model_name_or_path:
+            return spec.embedding_space or spec.id
     return model_name_or_path
 
 

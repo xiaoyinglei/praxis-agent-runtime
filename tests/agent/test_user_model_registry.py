@@ -28,11 +28,10 @@ from agent_runtime.model_registry import (
 def _definition(**updates: object) -> UserModelDefinition:
     values: dict[str, object] = {
         "provider": "openai_compatible",
-        "model": "Qwen/Qwen3.5-9B",
         "location": "local",
         "base_url": "http://127.0.0.1:8080/v1",
         "context_window_tokens": 32_768,
-        "max_tokens": 2_048,
+        "max_output_tokens": 2_048,
     }
     values.update(updates)
     return UserModelDefinition.model_validate(values)
@@ -47,7 +46,7 @@ def _store(tmp_path: Path, **updates: object) -> UserModelRegistryStore:
         "path": config / "models.yaml",
         "workspace": workspace,
         "worktree": workspace,
-        "built_in_aliases": {"builtin"},
+        "built_in_model_ids": {"builtin"},
         "whole_catalog_override_active": False,
     }
     values.update(updates)
@@ -55,35 +54,23 @@ def _store(tmp_path: Path, **updates: object) -> UserModelRegistryStore:
 
 
 @pytest.mark.parametrize(
-    "alias",
+    "model_id",
     [
-        "A",
-        "two words",
-        "-leading",
-        "trailing_",
-        "a" * 65,
-        "list",
-        "current",
-        "switch",
-        "use",
-        "add",
-        "update",
-        "probe",
-        "remove",
-        "show",
-        "trust",
-        "default",
+        "",
+        " padded",
+        "padded ",
+        "\t",
     ],
 )
-def test_schema_rejects_invalid_or_reserved_alias(alias: str) -> None:
+def test_schema_rejects_empty_or_padded_model_id(model_id: str) -> None:
     with pytest.raises(ValidationError):
-        UserModelRegistryDocument(revision=0, models={alias: _definition()})
+        UserModelRegistryDocument(revision=0, models={model_id: _definition()})
 
 
-@pytest.mark.parametrize("alias", ["a", "a.b-c_d9", "a" * 64])
-def test_schema_accepts_exact_alias_grammar(alias: str) -> None:
-    document = UserModelRegistryDocument(revision=0, models={alias: _definition()})
-    assert tuple(document.models) == (alias,)
+@pytest.mark.parametrize("model_id", ["a", "Qwen/Qwen3.5-9B", "list", "a" * 65])
+def test_schema_accepts_trimmed_model_ids(model_id: str) -> None:
+    document = UserModelRegistryDocument(revision=0, models={model_id: _definition()})
+    assert tuple(document.models) == (model_id,)
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "custom"])
@@ -210,6 +197,34 @@ def test_schema_normalized_mapping_omits_absent_values() -> None:
     assert "runtime" not in payload
 
 
+def test_registry_identity_is_only_the_models_mapping_key(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = UserModelRegistryStore(
+        path=tmp_path / "config" / "models.yaml",
+        workspace=workspace,
+        worktree=workspace,
+        built_in_model_ids=(),
+        whole_catalog_override_active=False,
+    )
+    result = store.add("org/model", _definition(), expected=store.read().version)
+
+    persisted = yaml.safe_load(store.path.read_text(encoding="utf-8"))
+    assert tuple(result.snapshot.document.models) == ("org/model",)
+    assert tuple(persisted["models"]) == ("org/model",)
+    assert "model" not in persisted["models"]["org/model"]
+
+
+def test_schema_rejects_nested_model_identity() -> None:
+    with pytest.raises(ValidationError):
+        UserModelDefinition.model_validate(
+            {
+                **_definition().to_persisted_mapping(),
+                "model": "second-identity",
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -222,33 +237,36 @@ def test_schema_rejects_unknown_fields(payload: dict[str, object]) -> None:
     with pytest.raises(ValidationError):
         _definition(**payload)
 
-
 @pytest.mark.parametrize(
     "updates",
     [
-        {"max_tokens": 0},
+        {"max_output_tokens": 0},
         {"timeout_seconds": 0},
         {"context_window_tokens": 0},
-        {"request_context_tokens": 0},
-        {"max_tokens": 4097, "context_window_tokens": 4096},
-        {"max_tokens": 2048, "request_context_tokens": 1024},
-        {"request_context_tokens": 4097, "context_window_tokens": 4096},
+        {
+            "context_window_tokens": 4_096,
+            "max_output_tokens": 4_097,
+        },
         {"input_cost_per_1m": -1},
     ],
 )
-def test_schema_rejects_invalid_budgets(updates: dict[str, object]) -> None:
+def test_schema_rejects_invalid_capabilities(
+    updates: dict[str, object],
+) -> None:
     with pytest.raises(ValidationError):
         _definition(**updates)
-
 
 def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.path.write_text(
-        "version: 1\nrevision: 0\nmodels:\n"
-        "  mine:\n    provider: mlx\n    model: m\n"
-        "    defaults:\n      temperature: null\n",
-        encoding="utf-8",
-    )
+    "version: 1\nrevision: 0\nmodels:\n"
+    "  mine:\n"
+    "    provider: mlx\n"
+    "    context_window_tokens: 32768\n"
+    "    defaults:\n"
+    "      temperature: null\n",
+    encoding="utf-8",
+)
     with pytest.raises(ValidationError, match="null"):
         store.read()
 
@@ -258,18 +276,18 @@ def test_read_rejects_explicit_yaml_null_in_defaults(tmp_path: Path) -> None:
     [
         (
             "version: 1\nrevision: 0\nmodels:\n"
-            "  mine: {provider: mlx, model: first}\n"
-            "  mine: {provider: mlx, model: second}\n",
+            "  mine: {provider: mlx}\n"
+            "  mine: {provider: mlx}\n",
             "mine",
         ),
         (
             "version: 1\nrevision: 0\nmodels:\n  mine:\n"
-            "    provider: mlx\n    provider: ollama\n    model: m\n",
+            "    provider: mlx\n    provider: ollama\n",
             "provider",
         ),
         (
             "version: 1\nrevision: 0\nmodels:\n  mine:\n"
-            "    provider: mlx\n    model: m\n    defaults:\n"
+            "    provider: mlx\n    defaults:\n"
             "      temperature: 0.1\n      temperature: 0.2\n",
             "temperature",
         ),
@@ -292,7 +310,7 @@ def test_add_rejects_user_and_builtin_collisions(tmp_path: Path) -> None:
     initial = store.read().version
     committed = store.add("mine", _definition(), expected=initial)
     with pytest.raises(RegistryCollisionError, match="already exists"):
-        store.add("mine", _definition(model="other"), expected=committed.snapshot.version)
+        store.add("mine", _definition(), expected=committed.snapshot.version)
     with pytest.raises(RegistryCollisionError, match="built-in"):
         store.add("builtin", _definition(), expected=committed.snapshot.version)
 
@@ -301,8 +319,7 @@ def test_add_revalidates_adversarial_constructed_definition_under_lock(tmp_path:
     store = _store(tmp_path)
     bypass = UserModelDefinition.model_construct(
         provider="anthropic",
-        model="",
-        max_tokens=0,
+        max_output_tokens=0,
         context_window_tokens=0,
     )
 
@@ -318,17 +335,19 @@ def test_patch_update_and_complete_replacement(tmp_path: Path) -> None:
     patched = store.update(
         "mine",
         ModelDefinitionPatch(
-            changes={"max_tokens": 1024, "defaults": {"temperature": 0.5}},
+            changes={
+    "max_output_tokens": 1024,
+    "defaults": {"temperature": 0.5},
+},
         ),
         expected=added.snapshot.version,
     )
     updated = patched.snapshot.document.models["mine"]
-    assert updated.model == "Qwen/Qwen3.5-9B"
     assert updated.tokenizer_model == "old"
-    assert updated.max_tokens == 1024
+    assert updated.max_output_tokens == 1024
     assert updated.defaults.temperature == 0.5
 
-    replacement = _definition(provider="ollama", model="qwen:latest", base_url=None)
+    replacement = _definition(provider="ollama", base_url=None)
     replaced = store.update(
         "mine",
         ModelDefinitionPatch(replacement=replacement),
@@ -343,8 +362,7 @@ def test_replacement_revalidates_adversarial_constructed_definition_under_lock(t
     before = store.path.read_bytes()
     bypass = UserModelDefinition.model_construct(
         provider="anthropic",
-        model="",
-        max_tokens=0,
+        max_output_tokens=0,
         context_window_tokens=0,
     )
 
@@ -395,7 +413,7 @@ def test_store_rejects_constructed_patch_with_none_deletion(tmp_path: Path) -> N
     [
         ({"protocol": None}, ("tokenizer_model",)),
         ({}, ("runtime.launch_command",)),
-        ({"max_tokens": 1024}, ("tokenizer_model",)),
+        ({"max_output_tokens": 1024}, ("tokenizer_model",)),
     ],
 )
 def test_store_revalidates_constructed_replacement_patch_shape_under_lock(
@@ -407,7 +425,7 @@ def test_store_revalidates_constructed_replacement_patch_shape_under_lock(
     added = store.add("mine", _definition(), expected=store.read().version)
     before = store.path.read_bytes()
     bypass = ModelDefinitionPatch.model_construct(
-        replacement=_definition(model="replacement"),
+        replacement=_definition(),
         changes=changes,
         unset_paths=unset_paths,
     )
@@ -423,7 +441,10 @@ _UNSET_CASES: tuple[tuple[str, Callable[[UserModelDefinition], object]], ...] = 
     ("provider_name", lambda value: value.provider_name),
     ("base_url", lambda value: value.base_url),
     ("api_key_env", lambda value: value.api_key_env),
-    ("request_context_tokens", lambda value: value.request_context_tokens),
+    (
+        "max_output_tokens",
+        lambda value: value.max_output_tokens,
+    ),
     ("input_cost_per_1m", lambda value: value.input_cost_per_1m),
     ("output_cost_per_1m", lambda value: value.output_cost_per_1m),
     ("cache_read_cost_per_1m", lambda value: value.cache_read_cost_per_1m),
@@ -448,16 +469,25 @@ def test_update_supports_every_allowed_unset_path(
         tokenizer_model="tokenizer",
         provider_name="provider",
         api_key_env="MODEL_API_KEY",
-        request_context_tokens=8192,
+        max_output_tokens=8_192,
         input_cost_per_1m=1,
         output_cost_per_1m=2,
         cache_read_cost_per_1m=0.1,
         cache_write_cost_per_1m=0.2,
-        defaults={"temperature": 0.4, "top_p": 0.9, "parallel_tool_calls": True, "seed": 7},
+        defaults={
+            "temperature": 0.4,
+            "top_p": 0.9,
+            "parallel_tool_calls": True,
+            "seed": 7,
+        },
         runtime={
             "health_url": "http://127.0.0.1:8080/health",
             "expected_model_contains": "Qwen",
-            "launch_command": ["uv", "run", "server"],
+            "launch_command": [
+                "uv",
+                "run",
+                "server",
+            ],
         },
     )
     added = store.add("mine", complete, expected=store.read().version)
@@ -503,7 +533,7 @@ def test_identical_normalized_update_is_noop(tmp_path: Path) -> None:
     before = store.path.read_bytes()
     result = store.update(
         "mine",
-        ModelDefinitionPatch(changes={"max_tokens": 2048}),
+        ModelDefinitionPatch(changes={"max_output_tokens": 2048}),
         expected=added.snapshot.version,
     )
     assert result.changed is False
@@ -544,7 +574,7 @@ def _concurrent_add(
     path: str,
     workspace: str,
     expected: FileVersion,
-    alias: str,
+    model_id: str,
     start: multiprocessing.synchronize.Event,
     output: multiprocessing.queues.Queue,
 ) -> None:
@@ -552,12 +582,12 @@ def _concurrent_add(
         path=Path(path),
         workspace=Path(workspace),
         worktree=Path(workspace),
-        built_in_aliases=(),
+        built_in_model_ids=(),
         whole_catalog_override_active=False,
     )
     start.wait(timeout=10)
     try:
-        store.add(alias, _definition(), expected=expected)
+        store.add(model_id, _definition(), expected=expected)
     except ConfigVersionConflict:
         output.put("conflict")
     else:
@@ -565,7 +595,7 @@ def _concurrent_add(
 
 
 def test_two_processes_cannot_lose_an_update(tmp_path: Path) -> None:
-    store = _store(tmp_path, built_in_aliases=())
+    store = _store(tmp_path, built_in_model_ids=())
     expected = store.read().version
     context = multiprocessing.get_context("spawn")
     start = context.Event()
@@ -573,9 +603,9 @@ def test_two_processes_cannot_lose_an_update(tmp_path: Path) -> None:
     processes = [
         context.Process(
             target=_concurrent_add,
-            args=(str(store.path), str(tmp_path / "workspace"), expected, alias, start, output),
+            args=(str(store.path), str(tmp_path / "workspace"), expected, model_id, start, output),
         )
-        for alias in ("one", "two")
+        for model_id in ("one", "two")
     ]
     for process in processes:
         process.start()

@@ -41,7 +41,7 @@ DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_ca
 DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
-EVALUATOR_VERSION = "agent_model_quality_gate_v3"
+EVALUATOR_VERSION = "agent_model_quality_gate_v4"
 _RUNTIME_INPUT_FILE_PREFIX = ".praxis/runtime/input_files/"
 _MAX_FINAL_PAUSE_REASON_CHARS = 2000
 _MAX_FINAL_PAUSE_TOOL_NAMES = 32
@@ -264,8 +264,8 @@ def validate_baseline(
     *,
     suite: Mapping[str, object] | None = None,
 ) -> None:
-    if baseline.get("schema_version") != 1:
-        raise ValueError("model quality baseline schema_version must be 1")
+    if baseline.get("schema_version") != 2:
+        raise ValueError("model quality baseline schema_version must be 2")
     if baseline.get("threshold_method") != THRESHOLD_METHOD:
         raise ValueError(f"model quality baseline must use {THRESHOLD_METHOD}")
     models = baseline.get("models")
@@ -282,28 +282,33 @@ def validate_baseline(
         if not isinstance(raw_cases, Sequence) or isinstance(raw_cases, (str, bytes)):
             raise ValueError("model quality suite cases are invalid")
         suite_cases = [_mapping(item) for item in raw_cases]
-    for alias, raw_entry in models.items():
-        if not isinstance(alias, str) or not isinstance(raw_entry, Mapping):
+    for model_id, raw_entry in models.items():
+        if not isinstance(model_id, str) or not isinstance(raw_entry, Mapping):
             raise ValueError("model quality baseline model entries are invalid")
-        provider_model = raw_entry.get("provider_model")
+        provider = raw_entry.get("provider")
         trial_count = raw_entry.get("trial_count")
         raw_trials = raw_entry.get("trial_metrics")
         thresholds = raw_entry.get("thresholds")
-        if not isinstance(provider_model, str) or not provider_model:
-            raise ValueError(f"baseline model {alias} has no provider_model")
+        if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(
+                f"baseline model {model_id} has invalid provider"
+            )
         if not isinstance(trial_count, int) or trial_count < MIN_CALIBRATION_TRIALS:
-            raise ValueError(f"baseline model {alias} has invalid trial_count")
+            raise ValueError(f"baseline model {model_id} has invalid trial_count")
         if not isinstance(raw_trials, Sequence) or isinstance(raw_trials, (str, bytes)):
-            raise ValueError(f"baseline model {alias} has no trial_metrics")
+            raise ValueError(f"baseline model {model_id} has no trial_metrics")
         if len(raw_trials) != trial_count:
-            raise ValueError(f"baseline model {alias} trial_count does not match trials")
-        trial_metrics = [_float_metric_mapping(item, label=f"baseline model {alias} trial") for item in raw_trials]
+            raise ValueError(f"baseline model {model_id} trial_count does not match trials")
+        trial_metrics = [
+            _float_metric_mapping(item, label=f"baseline model {model_id} trial")
+            for item in raw_trials
+        ]
         expected = derive_thresholds(trial_metrics)
         if thresholds != expected:
-            raise ValueError(f"baseline model {alias} thresholds do not match measured trials")
+            raise ValueError(f"baseline model {model_id} thresholds do not match measured trials")
         if suite_cases is not None:
             _validate_raw_model_trials(
-                alias=alias,
+                model_id=model_id,
                 model_entry=raw_entry,
                 suite_cases=suite_cases,
                 trial_metrics=trial_metrics,
@@ -312,43 +317,46 @@ def validate_baseline(
 
 def evaluate_model_gate(
     *,
-    model_alias: str,
-    provider_model: str,
+    model_id: str,
+    provider: str,
     trial_metrics: Sequence[Mapping[str, float]],
     baseline: Mapping[str, object],
 ) -> dict[str, object]:
-    expected_provider_model = baseline.get("provider_model")
-    if provider_model != expected_provider_model:
-        raise ValueError(
-            f"model {model_alias} provider identity changed: "
-            f"baseline={expected_provider_model!r}, current={provider_model!r}"
-        )
+    baseline_provider = baseline.get("provider")
+    if not isinstance(baseline_provider, str) or not baseline_provider.strip():
+        raise ValueError(f"baseline model {model_id} has invalid provider")
+    if not isinstance(provider, str) or not provider.strip():
+        raise ValueError(f"live model {model_id} has invalid provider")
     trial_count = baseline.get("trial_count")
     if not isinstance(trial_count, int):
-        raise ValueError(f"baseline model {model_alias} has invalid trial_count")
+        raise ValueError(f"baseline model {model_id} has invalid trial_count")
     if len(trial_metrics) != trial_count:
-        raise ValueError(f"model {model_alias} gate requires {trial_count} trials, got {len(trial_metrics)}")
+        raise ValueError(f"model {model_id} gate requires {trial_count} trials, got {len(trial_metrics)}")
     thresholds = baseline.get("thresholds")
     if not isinstance(thresholds, Mapping):
-        raise ValueError(f"baseline model {model_alias} has no thresholds")
+        raise ValueError(f"baseline model {model_id} has no thresholds")
 
     observed: dict[str, float] = {}
     failures: list[str] = []
+    if provider != baseline_provider:
+        failures.append(
+            "provider route mismatch: "
+            f"baseline={baseline_provider!r}, live={provider!r}"
+        )
     for name, direction in GATED_METRIC_DIRECTIONS.items():
         values = [float(metrics[name]) for metrics in trial_metrics]
         value = min(values) if direction == "min" else max(values)
         observed[name] = value
         raw_threshold = thresholds.get(name)
         if not isinstance(raw_threshold, Mapping):
-            raise ValueError(f"baseline threshold missing: {model_alias}.{name}")
+            raise ValueError(f"baseline threshold missing: {model_id}.{name}")
         threshold = float(raw_threshold["value"])
         if direction == "min" and value + 1e-12 < threshold:
             failures.append(f"{name}: observed {value} < baseline floor {threshold}")
         elif direction == "max" and value - 1e-12 > threshold:
             failures.append(f"{name}: observed {value} > baseline ceiling {threshold}")
     return {
-        "model_alias": model_alias,
-        "provider_model": provider_model,
+        "model_id": model_id,
         "passed": not failures,
         "observed": observed,
         "thresholds": thresholds,
@@ -410,7 +418,7 @@ def informational_metrics(
 
 async def run_model_trials(
     *,
-    model_alias: str,
+    model_id: str,
     cases: Sequence[Mapping[str, object]],
     trials: int,
     env_file: Path,
@@ -423,12 +431,12 @@ async def run_model_trials(
     try:
         control_plane = ModelControlPlane.from_env(
             env_path=str(env_file),
-            initial_model_id=model_alias,
+            initial_model_id=model_id,
         )
         spec = control_plane.current_model()
     except (FileNotFoundError, KeyError, RuntimeError, ValueError) as exc:
         return _initialization_inconclusive_report(
-            model_alias=model_alias,
+            model_id=model_id,
             trials=trials,
             error_type=type(exc).__name__,
         )
@@ -439,12 +447,12 @@ async def run_model_trials(
         for case_index, case in enumerate(cases, start=1):
             case_id = str(case["id"])
             print(
-                f"[{model_alias}] trial {trial_index}/{trials} case {case_index}/{len(cases)} {case_id}",
+                f"[{model_id}] trial {trial_index}/{trials} case {case_index}/{len(cases)} {case_id}",
                 file=sys.stderr,
                 flush=True,
             )
             observation = await run_live_case(
-                model_alias=model_alias,
+                model_id=model_id,
                 control_plane=control_plane,
                 case=case,
             )
@@ -452,9 +460,8 @@ async def run_model_trials(
             if observation.infrastructure_failure:
                 return {
                     "status": "inconclusive",
-                    "model_alias": model_alias,
+                    "model_id": spec.id,
                     "provider": spec.provider,
-                    "provider_model": spec.provider_model,
                     "trial_count": trials,
                     "trial_metrics": trial_metrics,
                     "trials": [
@@ -493,9 +500,8 @@ async def run_model_trials(
         )
     return {
         "status": "completed",
-        "model_alias": model_alias,
+        "model_id": spec.id,
         "provider": spec.provider,
-        "provider_model": spec.provider_model,
         "trial_count": trials,
         "trial_metrics": trial_metrics,
         "trials": trial_payloads,
@@ -504,7 +510,7 @@ async def run_model_trials(
 
 async def run_live_case(
     *,
-    model_alias: str,
+    model_id: str,
     control_plane: object,
     case: Mapping[str, object],
 ) -> CaseObservation:
@@ -522,7 +528,7 @@ async def run_live_case(
         files = _write_source_files(source, _mapping(case.get("workspace_files", {})))
         workspace_assertions = _mapping(case.get("workspace_assertions", {}))
         agent = Agent(
-            model=model_alias,
+            model=model_id,
             checkpoint_db=root / "checkpoint.sqlite3",
             workspace_path=workspace,
         )
@@ -700,21 +706,20 @@ def build_baseline(
 ) -> dict[str, object]:
     models: dict[str, object] = {}
     for report in model_reports:
-        alias = str(report["model_alias"])
+        model_id = str(report["model_id"])
         trial_metrics = [
-            _float_metric_mapping(item, label=f"model {alias} trial")
+            _float_metric_mapping(item, label=f"model {model_id} trial")
             for item in cast(Sequence[object], report["trial_metrics"])
         ]
-        models[alias] = {
+        models[model_id] = {
             "provider": report["provider"],
-            "provider_model": report["provider_model"],
             "trial_count": report["trial_count"],
             "trial_metrics": trial_metrics,
             "thresholds": derive_thresholds(trial_metrics),
             "trials": report["trials"],
         }
     baseline = {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite_id": suite["suite_id"],
         "suite_revision": suite_revision(suite),
         "measured_at": datetime.now(UTC).isoformat(),
@@ -741,7 +746,7 @@ async def _calibrate(args: argparse.Namespace) -> int:
     infrastructure_failure: Mapping[str, object] | None = None
     for model in models:
         report = await run_model_trials(
-            model_alias=model,
+            model_id=model,
             cases=cases,
             trials=args.trials,
             env_file=args.env_file,
@@ -763,8 +768,8 @@ async def _calibrate(args: argparse.Namespace) -> int:
     args.baseline.parent.mkdir(parents=True, exist_ok=True)
     args.baseline.write_text(_pretty_json(baseline), encoding="utf-8")
     print(f"wrote measured baseline: {args.baseline}")
-    for alias, entry in cast(Mapping[str, Mapping[str, object]], baseline["models"]).items():
-        print(f"{alias}: {json.dumps(entry['thresholds'], sort_keys=True)}")
+    for model_id, entry in cast(Mapping[str, Mapping[str, object]], baseline["models"]).items():
+        print(f"{model_id}: {json.dumps(entry['thresholds'], sort_keys=True)}")
     return 0
 
 
@@ -787,7 +792,7 @@ async def _gate(args: argparse.Namespace) -> int:
             raise KeyError(f"model quality baseline missing model: {model}")
         trial_count = int(raw_model_baseline["trial_count"])
         report = await run_model_trials(
-            model_alias=model,
+            model_id=model,
             cases=cases,
             trials=trial_count,
             env_file=args.env_file,
@@ -796,8 +801,7 @@ async def _gate(args: argparse.Namespace) -> int:
         if report.get("status") == "inconclusive":
             results.append(
                 {
-                    "model_alias": model,
-                    "provider_model": report["provider_model"],
+                    "model_id": model,
                     "status": "inconclusive",
                     "passed": None,
                     "observed": {},
@@ -814,8 +818,8 @@ async def _gate(args: argparse.Namespace) -> int:
         ]
         results.append(
             evaluate_model_gate(
-                model_alias=model,
-                provider_model=str(report["provider_model"]),
+                model_id=model,
+                provider=cast(str, report["provider"]),
                 trial_metrics=current_metrics,
                 baseline=raw_model_baseline,
             )
@@ -824,7 +828,7 @@ async def _gate(args: argparse.Namespace) -> int:
     passed = None if inconclusive else all(bool(item["passed"]) for item in results)
     status = "inconclusive" if inconclusive else ("passed" if passed else "failed")
     gate_report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": status,
         "source_commit": fingerprint.source_commit,
         "source_tree": fingerprint.source_tree,
@@ -857,7 +861,7 @@ async def _gate(args: argparse.Namespace) -> int:
             if result["passed"] is None
             else ("PASS" if result["passed"] else "FAIL")
         )
-        print(f"{marker} {result['model_alias']}")
+        print(f"{marker} {result['model_id']}")
         for failure in cast(Sequence[str], result["failures"]):
             print(f"  {failure}")
     if inconclusive:
@@ -994,7 +998,7 @@ def is_infrastructure_failure(
 def _raise_for_infrastructure(
     observations: Sequence[CaseObservation],
     *,
-    model_alias: str = "model",
+    model_id: str = "model",
 ) -> None:
     unavailable = [item for item in observations if item.infrastructure_failure]
     if not unavailable:
@@ -1004,7 +1008,7 @@ def _raise_for_infrastructure(
         error_types = ",".join(item.diagnostic_error_types) or "unknown"
         details.append(f"{item.case_id}(stop_reason={item.stop_reason or 'unknown'}, error_types={error_types})")
     raise InfrastructureUnavailableError(
-        f"{model_alias} live quality sample is infrastructure-inconclusive: " + "; ".join(details)
+        f"{model_id} live quality sample is infrastructure-inconclusive: " + "; ".join(details)
     )
 
 
@@ -1037,7 +1041,7 @@ def _partial_case_payloads(
 
 def _initialization_inconclusive_report(
     *,
-    model_alias: str,
+    model_id: str,
     trials: int,
     error_type: str,
 ) -> dict[str, object]:
@@ -1049,9 +1053,8 @@ def _initialization_inconclusive_report(
     }
     return {
         "status": "inconclusive",
-        "model_alias": model_alias,
+        "model_id": model_id,
         "provider": "unavailable",
-        "provider_model": "unavailable",
         "trial_count": trials,
         "trial_metrics": [],
         "trials": [],
@@ -1077,7 +1080,7 @@ def _infrastructure_message(report: Mapping[str, object]) -> str:
     ) or "unknown"
     location = failure.get("case_id") or failure.get("stage") or "unknown"
     return (
-        f"{report.get('model_alias', 'model')} live quality sample is infrastructure-inconclusive: "
+        f"{report.get('model_id', 'model')} live quality sample is infrastructure-inconclusive: "
         f"{location}"
         f"(stop_reason={failure.get('stop_reason') or 'unknown'}, error_types={error_types})"
     )
@@ -1355,16 +1358,16 @@ def _float_metric_mapping(value: object, *, label: str) -> dict[str, float]:
 
 def _validate_raw_model_trials(
     *,
-    alias: str,
+    model_id: str,
     model_entry: Mapping[str, object],
     suite_cases: Sequence[Mapping[str, object]],
     trial_metrics: Sequence[Mapping[str, float]],
 ) -> None:
     raw_trials = model_entry.get("trials")
     if not isinstance(raw_trials, Sequence) or isinstance(raw_trials, (str, bytes)):
-        raise ValueError(f"baseline model {alias} has no raw trials")
+        raise ValueError(f"baseline model {model_id} has no raw trials")
     if len(raw_trials) != len(trial_metrics):
-        raise ValueError(f"baseline model {alias} raw trial count does not match")
+        raise ValueError(f"baseline model {model_id} raw trial count does not match")
     for index, (raw_trial, stored_metrics) in enumerate(
         zip(raw_trials, trial_metrics, strict=True),
         start=1,
@@ -1372,7 +1375,7 @@ def _validate_raw_model_trials(
         trial = _mapping(raw_trial)
         raw_cases = trial.get("cases")
         if not isinstance(raw_cases, Sequence) or isinstance(raw_cases, (str, bytes)):
-            raise ValueError(f"baseline model {alias} trial {index} has no raw cases")
+            raise ValueError(f"baseline model {model_id} trial {index} has no raw cases")
         observations: list[CaseObservation] = []
         stored_scores: list[Mapping[str, object]] = []
         for raw_case in raw_cases:
@@ -1385,14 +1388,16 @@ def _validate_raw_model_trials(
         )
         trial_payload_metrics = _float_metric_mapping(
             trial.get("metrics"),
-            label=f"baseline model {alias} trial {index}",
+            label=f"baseline model {model_id} trial {index}",
         )
         if (
             recomputed_metrics != stored_metrics
             or trial_payload_metrics != stored_metrics
             or recomputed_scores != stored_scores
         ):
-            raise ValueError(f"baseline model {alias} trial {index} metrics does not match raw observations")
+            raise ValueError(
+                f"baseline model {model_id} trial {index} metrics does not match raw observations"
+            )
 
 
 def _observation_from_payload(value: object) -> CaseObservation:
@@ -1742,7 +1747,7 @@ def _parser() -> argparse.ArgumentParser:
         "--model",
         action="append",
         dest="models",
-        help="Run one declared model alias; repeat for multiple models.",
+        help="Run one declared model ID; repeat for multiple models.",
     )
     gate.add_argument(
         "--report",

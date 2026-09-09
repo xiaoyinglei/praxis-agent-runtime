@@ -27,7 +27,7 @@ def _start_turn(store: RolloutStore, workspace: Path, message: str) -> tuple[str
     turn = store.start_turn(
         thread_id=thread.thread_id,
         user_message=message,
-        binding_manifest={"model_alias": "event-model"},
+        binding_manifest={"model_id": "event-model"},
     )
     return thread.thread_id, turn.turn_id
 

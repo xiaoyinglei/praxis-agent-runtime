@@ -27,19 +27,18 @@ from agent_runtime.model_trust import (
 )
 
 
-def _definition(model: str = "main-model"):
+def _definition(model_id: str = "main-model"):
     config = AgentModelsConfig(
         models={
-            "main": ModelSpec(
+            model_id: ModelSpec(
                 provider=ModelProvider.OLLAMA,
-                model=model,
                 base_url="http://localhost:11434",
                 context_window_tokens=32_768,
             )
         },
-        default_model="main",
+        default_model=model_id,
     )
-    return ModelRegistry(config).get_model_definition("main")
+    return ModelRegistry(config).get_model_definition(model_id)
 
 
 def _paths(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -256,8 +255,7 @@ def test_trust_rejects_symlink_unsafe_file_mode_and_parent_mode(tmp_path: Path) 
 def test_trust_rejects_duplicate_json_keys(tmp_path: Path) -> None:
     workspace, trust_path, _ = _paths(tmp_path)
     trust_path.write_bytes(
-        b'{"version":1,"version":1,"trust_domain_id":"x",'
-        b'"signing_key_id":"x","hmac_key_base64":"eA=="}'
+        b'{"version":1,"version":1,"trust_domain_id":"x","signing_key_id":"x","hmac_key_base64":"eA=="}'
     )
     os.chmod(trust_path, 0o600)
 
@@ -274,9 +272,9 @@ def test_binding_signature_covers_complete_association(tmp_path: Path) -> None:
     domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
     status = domain.initialize()
     binding = build_model_binding_envelope(
-        alias="main",
+        model_id="main",
         origin="override",
-        definition=_definition(),
+        definition=_definition("main"),
         policy_revision="model-policy:v1",
     )
     association = build_model_binding_association(
@@ -296,10 +294,80 @@ def test_binding_signature_covers_complete_association(tmp_path: Path) -> None:
         {**association, "selection_requester": "system"},
         {**association, "trust_domain_id": "d8ec2a14-31fd-4d7b-96e5-452296c361b0"},
         {**association, "signing_key_id": "sha256:" + "0" * 64},
-        {**association, "binding": {**binding, "alias": "other"}},
+        {**association, "model_id": "other"},
+        {**association, "binding": {**binding, "model_id": "other"}},
     ):
         with pytest.raises(BindingAuthenticationError):
             domain.verify(changed, signature)
+
+
+def test_authenticated_binding_hard_cuts_both_legacy_identity_shapes(
+    tmp_path: Path,
+) -> None:
+    workspace, trust_path, _ = _paths(tmp_path)
+    domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
+    status = domain.initialize()
+    binding = build_model_binding_envelope(
+        model_id="main",
+        origin="override",
+        definition=_definition("main"),
+        policy_revision="model-policy:v1",
+    )
+    association = build_model_binding_association(
+        status=status,
+        thread_id="thread-1",
+        turn_id="turn-1",
+        selection_requester="user",
+        binding=binding,
+    )
+
+    assert association["authentication_schema_version"] == 2
+    assert association["model_id"] == "main"
+    assert "model_alias" not in association
+    assert binding["schema_version"] == 3
+    assert binding["model_id"] == "main"
+    assert "alias" not in binding
+
+    with pytest.raises(BindingAuthenticationError, match="unsupported"):
+        domain.sign({**association, "authentication_schema_version": 1})
+
+    with pytest.raises(BindingAuthenticationError, match="unsupported"):
+        build_model_binding_association(
+            status=status,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            selection_requester="user",
+            binding={**binding, "schema_version": 2},
+        )
+
+    legacy_outer = {**association, "model_alias": association["model_id"]}
+    legacy_outer.pop("model_id")
+    with pytest.raises(BindingAuthenticationError, match="unexpected or missing"):
+        domain.sign(legacy_outer)
+
+    legacy_inner = {**binding, "alias": binding["model_id"]}
+    legacy_inner.pop("model_id")
+    with pytest.raises(BindingAuthenticationError, match="unexpected or missing"):
+        build_model_binding_association(
+            status=status,
+            thread_id="thread-1",
+            turn_id="turn-1",
+            selection_requester="user",
+            binding=legacy_inner,
+        )
+
+
+def test_binding_rejects_model_id_that_differs_from_frozen_definition() -> None:
+    with pytest.raises(
+        BindingAuthenticationError,
+        match="model ID does not match frozen definition",
+    ):
+        build_model_binding_envelope(
+            model_id="allowed-model",
+            origin="override",
+            definition=_definition("different-model"),
+            policy_revision="model-policy:v1",
+        )
 
 
 def test_binding_trust_rejects_incomplete_or_extra_association(tmp_path: Path) -> None:
@@ -307,9 +375,9 @@ def test_binding_trust_rejects_incomplete_or_extra_association(tmp_path: Path) -
     domain = ModelBindingTrustDomain(trust_path, workspace=workspace, worktree=workspace)
     status = domain.initialize()
     binding = build_model_binding_envelope(
-        alias="main",
+        model_id="main",
         origin="override",
-        definition=_definition(),
+        definition=_definition("main"),
         policy_revision="model-policy:v1",
     )
     complete = build_model_binding_association(
@@ -343,11 +411,7 @@ def test_interrupted_post_link_install_recovers_exact_stale_temp(
     process.join(timeout=10)
     assert process.exitcode == 0
 
-    installed = (
-        trust_path
-        if kind == "trust"
-        else archive_path / f"{_definition().definition_revision}.json"
-    )
+    installed = trust_path if kind == "trust" else archive_path / f"{_definition().definition_revision}.json"
     assert installed.stat().st_nlink == 2
     if kind == "trust":
         ModelBindingTrustDomain(

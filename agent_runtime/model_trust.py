@@ -43,8 +43,8 @@ _TRUST_FILE_LIMIT = 4096
 _DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 _REVISION_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SIGNATURE_PATTERN = re.compile(r"^hmac-sha256:[0-9a-f]{64}$")
-_BINDING_SCHEMA_VERSION = 2
-_AUTHENTICATION_SCHEMA_VERSION = 1
+_BINDING_SCHEMA_VERSION = 3
+_AUTHENTICATION_SCHEMA_VERSION = 2
 
 
 class TrustDomainNotInitializedError(RuntimeError):
@@ -134,11 +134,13 @@ class ModelBindingTrustDomain:
             hashlib.sha256,
         ).hexdigest()
         provided = signature.removeprefix("hmac-sha256:") if isinstance(signature, str) else ""
-        if type(signature) is not str or _SIGNATURE_PATTERN.fullmatch(
-            signature
-        ) is None or not hmac.compare_digest(
-            expected,
-            provided,
+        if (
+            type(signature) is not str
+            or _SIGNATURE_PATTERN.fullmatch(signature) is None
+            or not hmac.compare_digest(
+                expected,
+                provided,
+            )
         ):
             raise BindingAuthenticationError("model binding authentication failed")
 
@@ -237,14 +239,10 @@ class TrustedModelDefinitionArchive:
                 subject="archived model definition",
             )
         except FileNotFoundError as error:
-            raise TrustedDefinitionNotFoundError(
-                f"trusted model definition {revision!r} is not installed"
-            ) from error
+            raise TrustedDefinitionNotFoundError(f"trusted model definition {revision!r} is not installed") from error
         definition = _parse_archived_definition(payload)
         if definition.definition_revision != revision:
-            raise TrustedDefinitionValidationError(
-                "archived model definition digest does not match its filename"
-            )
+            raise TrustedDefinitionValidationError("archived model definition digest does not match its filename")
         return definition
 
 
@@ -325,13 +323,9 @@ def _parse_archived_definition(payload: bytes) -> ModelExecutionDefinition:
     try:
         definition = ModelExecutionDefinition.model_validate(document)
     except ValidationError as error:
-        raise TrustedDefinitionValidationError(
-            "archived model definition does not match the strict schema"
-        ) from error
+        raise TrustedDefinitionValidationError("archived model definition does not match the strict schema") from error
     if canonical_definition_json(definition) != payload:
-        raise TrustedDefinitionValidationError(
-            "archived model definition bytes are not canonical"
-        )
+        raise TrustedDefinitionValidationError("archived model definition bytes are not canonical")
     return definition
 
 
@@ -339,16 +333,14 @@ def _normalize_definition(definition: ModelExecutionDefinition) -> ModelExecutio
     if not isinstance(definition, ModelExecutionDefinition):
         raise TypeError("definition must be a ModelExecutionDefinition")
     try:
-        return ModelExecutionDefinition.model_validate(
-            definition.model_dump(mode="python", exclude_none=False)
-        )
+        return ModelExecutionDefinition.model_validate(definition.model_dump(mode="python", exclude_none=False))
     except ValidationError as error:
         raise TrustedDefinitionValidationError("model definition is invalid") from error
 
 
 def build_model_binding_envelope(
     *,
-    alias: str,
+    model_id: str,
     origin: str,
     definition: ModelExecutionDefinition,
     policy_revision: str,
@@ -358,7 +350,7 @@ def build_model_binding_envelope(
     normalized = _normalize_definition(definition)
     envelope: dict[str, JsonValue] = {
         "schema_version": _BINDING_SCHEMA_VERSION,
-        "alias": alias,
+        "model_id": model_id,
         "origin": origin,
         "definition_revision": normalized.definition_revision,
         "definition": cast(
@@ -382,8 +374,13 @@ def build_model_binding_association(
 ) -> dict[str, JsonValue]:
     """Build the exact identity association accepted by the trust domain."""
 
+    _validate_binding_envelope(binding)
+    model_id = binding["model_id"]
+    if type(model_id) is not str:
+        raise BindingAuthenticationError("model binding model ID is invalid")
     association: dict[str, JsonValue] = {
         "authentication_schema_version": _AUTHENTICATION_SCHEMA_VERSION,
+        "model_id": model_id,
         "trust_domain_id": status.trust_domain_id,
         "signing_key_id": status.signing_key_id,
         "thread_id": thread_id,
@@ -428,6 +425,7 @@ def _validated_association_bytes(
     document = dict(association)
     required = {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -436,9 +434,7 @@ def _validated_association_bytes(
         "binding",
     }
     if set(document) != required:
-        raise BindingAuthenticationError(
-            "model binding association has unexpected or missing fields"
-        )
+        raise BindingAuthenticationError("model binding association has unexpected or missing fields")
     if (
         type(document["authentication_schema_version"]) is not int
         or document["authentication_schema_version"] != _AUTHENTICATION_SCHEMA_VERSION
@@ -456,9 +452,7 @@ def _validated_association_bytes(
     for field_name in ("thread_id", "turn_id"):
         value = document[field_name]
         if type(value) is not str or not value or value != value.strip():
-            raise BindingAuthenticationError(
-                f"model binding {field_name} must be a non-empty trimmed string"
-            )
+            raise BindingAuthenticationError(f"model binding {field_name} must be a non-empty trimmed string")
     requester = document["selection_requester"]
     if type(requester) is not str or requester not in ("user", "agent", "system"):
         raise BindingAuthenticationError("model binding selection requester is invalid")
@@ -466,19 +460,22 @@ def _validated_association_bytes(
     if not isinstance(binding, Mapping):
         raise BindingAuthenticationError("model binding envelope must be a mapping")
     _validate_binding_envelope(binding)
+    model_id = document["model_id"]
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
+        raise BindingAuthenticationError("model binding model ID is invalid")
+    if binding["model_id"] != model_id:
+        raise BindingAuthenticationError("model binding model ID does not match envelope")
     try:
         return canonical_json_text(cast(JsonValue, document)).encode("utf-8")
     except (TypeError, ValueError) as error:
-        raise BindingAuthenticationError(
-            "model binding association must contain canonical JSON values"
-        ) from error
+        raise BindingAuthenticationError("model binding association must contain canonical JSON values") from error
 
 
 def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
     document = dict(binding)
     required = {
         "schema_version",
-        "alias",
+        "model_id",
         "origin",
         "definition_revision",
         "definition",
@@ -487,13 +484,11 @@ def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
     }
     if set(document) != required:
         raise BindingAuthenticationError("model binding envelope has unexpected or missing fields")
-    if type(document["schema_version"]) is not int or document[
-        "schema_version"
-    ] != _BINDING_SCHEMA_VERSION:
+    if type(document["schema_version"]) is not int or document["schema_version"] != _BINDING_SCHEMA_VERSION:
         raise BindingAuthenticationError("model binding schema is unsupported")
-    alias = document["alias"]
-    if type(alias) is not str or not alias or alias != alias.strip():
-        raise BindingAuthenticationError("model binding alias is invalid")
+    model_id = document["model_id"]
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
+        raise BindingAuthenticationError("model binding model ID is invalid")
     origin = document["origin"]
     if type(origin) is not str or origin not in ("builtin", "user", "override"):
         raise BindingAuthenticationError("model binding origin is invalid")
@@ -501,11 +496,7 @@ def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
     if type(revision) is not str or _REVISION_PATTERN.fullmatch(revision) is None:
         raise BindingAuthenticationError("model binding definition revision is malformed")
     policy_revision = document["policy_revision"]
-    if (
-        type(policy_revision) is not str
-        or not policy_revision
-        or policy_revision != policy_revision.strip()
-    ):
+    if type(policy_revision) is not str or not policy_revision or policy_revision != policy_revision.strip():
         raise BindingAuthenticationError("model binding policy revision is invalid")
     raw_definition = document["definition"]
     if not isinstance(raw_definition, Mapping):
@@ -514,6 +505,8 @@ def _validate_binding_envelope(binding: Mapping[str, object]) -> None:
         definition = ModelExecutionDefinition.model_validate(dict(raw_definition))
     except ValidationError as error:
         raise BindingAuthenticationError("model binding definition is invalid") from error
+    if definition.model_id != model_id:
+        raise BindingAuthenticationError("model binding model ID does not match frozen definition")
     if definition.definition_revision != revision:
         raise BindingAuthenticationError("model binding definition digest does not match")
     binding_digest = document["binding_digest"]

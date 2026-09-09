@@ -14,44 +14,23 @@ def test_rollout_reducer_and_tool_runtime_each_have_one_behavior_owner() -> None
     assert _sources_containing("self._append_and_reduce(") == {Path("agent_runtime/harness/rollout.py")}
     assert _sources_containing("ToolExecutor(tools)") == {Path("agent_runtime/harness/tool_orchestrator.py")}
     assert _sources_containing("tool.run(arguments)") == {Path("agent_runtime/tools/executor.py")}
-    assert _sources_containing("return Session(") == {Path("agent_runtime/harness/composition.py")}
-    assert _sources_containing("thread_manager = ThreadManager(") == {Path("agent_runtime/harness/composition.py")}
+    assert _sources_containing("executor = TurnExecutor(") == {Path("agent_runtime/harness/session.py")}
 
 
-def test_live_execution_spine_is_session_turn_context_step_context() -> None:
-    public = (RUNTIME / "harness" / "__init__.py").read_text(encoding="utf-8")
-    assert '"Session"' in public
-    assert '"TurnContext"' in public
-    assert '"StepContext"' in public
-    assert '"TurnRunner"' not in public
-
-    session = (RUNTIME / "harness" / "session.py").read_text(encoding="utf-8")
+def test_session_owns_resources_and_turn_executor_borrows_them() -> None:
+    session = (RUNTIME / "harness" / "session.py").read_text()
+    turn = (RUNTIME / "harness" / "turn.py").read_text()
     assert "class Session:" in session
-    assert "class TurnContext:" in session
-    assert "class StepContext:" in session
-    assert "class TurnRunner:" not in session
-
-
-def test_composition_and_thread_manager_do_not_steal_transition_or_runtime_owners() -> None:
-    composition = (RUNTIME / "harness" / "composition.py").read_text(encoding="utf-8")
-    manager = (RUNTIME / "harness" / "thread_manager.py").read_text(encoding="utf-8")
-    for transition in (
-        "._append_and_reduce(",
-        ".start_turn(",
-        ".complete_turn(",
-        ".fail_turn(",
-        ".pause_turn(",
-    ):
-        assert transition not in composition
-    for forbidden in (
-        "sqlite3",
-        "GatewayHarnessModel",
-        "ToolExecutor",
-        "ToolRegistry",
-        "MCPServerRuntime",
-        "CompletionDecision",
-    ):
-        assert forbidden not in manager
+    assert "class TurnExecutor:" in turn
+    assert "class TurnContext:" in turn
+    assert "class StepContext:" in turn
+    assert "self._stack = AsyncExitStack()" in session
+    assert "self._active_turn_lock = asyncio.Lock()" in session
+    assert "RolloutStore(" not in turn
+    assert "AsyncExitStack" not in turn
+    for removed in ("composition.py", "thread_manager.py", "facade.py"):
+        assert not (RUNTIME / "harness" / removed).exists()
+    assert not _sources_containing("_open_harness_runtime")
 
 
 def test_deleted_legacy_orchestration_cannot_be_imported_by_public_runtime() -> None:
@@ -69,6 +48,9 @@ def test_deleted_legacy_orchestration_cannot_be_imported_by_public_runtime() -> 
 
 
 def test_provider_wire_and_model_dispatch_ownership_is_explicit() -> None:
+    model_adapter = (RUNTIME / "harness" / "model_adapter.py").read_text(encoding="utf-8")
+    assert "LLMBudgetLedger" not in model_adapter
+    assert "inherit_budget_ledger=False" in model_adapter
     assert _sources_containing("def serialize_openai_request(") == {Path("agent_runtime/modeling/openai_wire.py")}
     assert _sources_containing("def render_local_agent_request(") == {
         Path("agent_runtime/modeling/local_agent_wire.py")
@@ -78,5 +60,5 @@ def test_provider_wire_and_model_dispatch_ownership_is_explicit() -> None:
         assert "serialize_openai_request" not in source
         assert "render_local_agent_request" not in source
     assert _sources_containing("dispatch = self._model.dispatch") == {
-        Path("agent_runtime/harness/session.py")
+        Path("agent_runtime/harness/turn.py")
     }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,33 +28,18 @@ from agent_runtime.model_config_io import (
     validate_user_config_path,
 )
 
-_ALIAS_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
-_RESERVED_ALIASES = frozenset(
-    {
-        "list",
-        "current",
-        "switch",
-        "use",
-        "add",
-        "update",
-        "probe",
-        "remove",
-        "show",
-        "trust",
-        "default",
-    }
-)
 _UNSET_PATHS = frozenset(
     {
         "tokenizer_model",
         "provider_name",
         "base_url",
         "api_key_env",
-        "request_context_tokens",
+        "max_output_tokens",
         "input_cost_per_1m",
         "output_cost_per_1m",
         "cache_read_cost_per_1m",
         "cache_write_cost_per_1m",
+        
         "runtime.health_url",
         "runtime.expected_model_contains",
         "defaults.temperature",
@@ -68,11 +52,11 @@ _SINGLE_DEFINITION_FILE_LIMIT = 4 * 1024 * 1024
 
 
 class RegistryCollisionError(ValueError):
-    """An alias is already owned by the user or built-in catalog."""
+    """A model ID is already owned by the user or built-in catalog."""
 
 
 class RegistryEntryNotFound(KeyError):  # noqa: N818
-    """A registry mutation referred to an absent user alias."""
+    """A registry mutation referred to an absent user model ID."""
 
 
 class InvalidUnsetPath(ValueError):  # noqa: N818
@@ -154,17 +138,15 @@ class UserModelDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: ModelProvider
-    model: str = Field(min_length=1)
     tokenizer_model: str | None = Field(default=None, min_length=1)
     provider_name: str | None = Field(default=None, min_length=1)
     protocol: str | None = Field(default=None, min_length=1)
-    max_tokens: int = Field(default=2048, gt=0, strict=True)
     timeout_seconds: float = Field(default=120.0, gt=0, allow_inf_nan=False)
     base_url: str | None = None
     api_key_env: str | None = None
     defaults: ModelGenerationDefaults = Field(default_factory=ModelGenerationDefaults)
-    context_window_tokens: int = Field(default=32_768, gt=0, strict=True)
-    request_context_tokens: int | None = Field(default=None, gt=0, strict=True)
+    context_window_tokens: int = Field(gt=0,strict=True,)
+    max_output_tokens: int | None = Field(default=None,gt=0,strict=True,)
     supports_tools: bool = Field(default=True, strict=True)
     supports_structured_output: bool = Field(default=True, strict=True)
     location: Literal["local", "cloud"] | None = None
@@ -174,7 +156,7 @@ class UserModelDefinition(BaseModel):
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     runtime: ModelRuntimeDeclaration | None = None
 
-    @field_validator("model", "tokenizer_model", "provider_name", "protocol")
+    @field_validator("tokenizer_model", "provider_name", "protocol")
     @classmethod
     def reject_blank_or_padded_text(cls, value: str | None) -> str | None:
         return _reject_blank_or_padded_text(value)
@@ -190,20 +172,27 @@ class UserModelDefinition(BaseModel):
         return validate_api_key_env_name(value)
 
     @model_validator(mode="after")
-    def validate_budget_and_endpoint_consistency(self) -> Self:
-        request_limit = self.request_context_tokens or self.context_window_tokens
-        if request_limit > self.context_window_tokens:
-            raise ValueError("request_context_tokens must not exceed context_window_tokens")
-        if self.max_tokens > request_limit:
-            raise ValueError("max_tokens must not exceed the effective request context limit")
+    def validate_capabilities_and_endpoint(self) -> Self:
+        if (
+            self.max_output_tokens is not None
+            and self.max_output_tokens > self.context_window_tokens
+        ):
+            raise ValueError(
+                "max_output_tokens must not exceed "
+                "context_window_tokens"
+            )
 
         if self.location == "cloud" and self.base_url is None:
-            raise ValueError("cloud model requires base_url")
+            raise ValueError(
+                "cloud model requires base_url"
+            )
+
         _ = normalize_model_endpoint(
             provider=self.provider,
             base_url=self.base_url,
             location=self.location,
         )
+
         return self
 
     def to_persisted_mapping(self) -> dict[str, object]:
@@ -223,9 +212,9 @@ class UserModelRegistryDocument(BaseModel):
 
     @field_validator("models")
     @classmethod
-    def validate_aliases(cls, value: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-        for alias in value:
-            _validate_alias(alias)
+    def validate_model_ids(cls, value: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
+        for model_id in value:
+            _validate_model_id(model_id)
         return value
 
     def to_persisted_mapping(self) -> dict[str, object]:
@@ -233,8 +222,8 @@ class UserModelRegistryDocument(BaseModel):
             "version": self.version,
             "revision": self.revision,
             "models": {
-                alias: definition.to_persisted_mapping()
-                for alias, definition in sorted(self.models.items())
+                model_id: definition.to_persisted_mapping()
+                for model_id, definition in sorted(self.models.items())
             },
         }
 
@@ -302,11 +291,11 @@ class UserModelRegistryStore:
         path: Path,
         workspace: Path,
         worktree: Path,
-        built_in_aliases: Collection[str],
+        built_in_model_ids: Collection[str],
         whole_catalog_override_active: bool | None = None,
     ) -> None:
         self.path = validate_user_config_path(path, workspace=workspace, worktree=worktree)
-        self._built_in_aliases = frozenset(built_in_aliases)
+        self._built_in_model_ids = frozenset(built_in_model_ids)
         self._whole_catalog_override_active = (
             bool(os.environ.get("RAG_AGENT_MODELS_PATH") or os.environ.get("RAG_AGENT_MODELS"))
             if whole_catalog_override_active is None
@@ -318,7 +307,7 @@ class UserModelRegistryStore:
 
     def preview_add(
         self,
-        alias: str,
+        model_id: str,
         definition: UserModelDefinition,
         *,
         snapshot: RegistrySnapshot,
@@ -326,18 +315,18 @@ class UserModelRegistryStore:
         """Validate one candidate against an observed snapshot without writing."""
 
         self._reject_override_mode()
-        _validate_alias(alias)
-        if alias in self._built_in_aliases:
-            raise RegistryCollisionError(f"Model alias {alias!r} is owned by the built-in catalog")
-        if alias in snapshot.document.models:
-            raise RegistryCollisionError(f"User model alias {alias!r} already exists")
+        _validate_model_id(model_id)
+        if model_id in self._built_in_model_ids:
+            raise RegistryCollisionError(f"Model ID {model_id!r} is owned by the built-in catalog")
+        if model_id in snapshot.document.models:
+            raise RegistryCollisionError(f"User model ID {model_id!r} already exists")
         return UserModelDefinition.model_validate(
             definition.model_dump(mode="python", exclude_none=True, warnings=False)
         )
 
     def preview_update(
         self,
-        alias: str,
+        model_id: str,
         mutation: ModelDefinitionPatch,
         *,
         snapshot: RegistrySnapshot,
@@ -345,57 +334,57 @@ class UserModelRegistryStore:
         """Return the exact candidate that update would commit for this snapshot."""
 
         self._reject_override_mode()
-        _validate_alias(alias)
-        current = snapshot.document.models.get(alias)
+        _validate_model_id(model_id)
+        current = snapshot.document.models.get(model_id)
         if current is None:
-            raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
+            raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
         return _apply_patch(current, _revalidate_patch(mutation))
 
     def add(
         self,
-        alias: str,
+        model_id: str,
         definition: UserModelDefinition,
         *,
         expected: FileVersion,
     ) -> RegistryMutationResult:
-        _validate_alias(alias)
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-            if alias in self._built_in_aliases:
-                raise RegistryCollisionError(f"Model alias {alias!r} is owned by the built-in catalog")
-            if alias in models:
-                raise RegistryCollisionError(f"User model alias {alias!r} already exists")
-            models[alias] = definition
+            if model_id in self._built_in_model_ids:
+                raise RegistryCollisionError(f"Model ID {model_id!r} is owned by the built-in catalog")
+            if model_id in models:
+                raise RegistryCollisionError(f"User model ID {model_id!r} already exists")
+            models[model_id] = definition
             return models
 
         return self._mutate(expected=expected, apply=apply)
 
     def update(
         self,
-        alias: str,
+        model_id: str,
         mutation: ModelDefinitionPatch,
         *,
         expected: FileVersion,
     ) -> RegistryMutationResult:
-        _validate_alias(alias)
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
             validated_mutation = _revalidate_patch(mutation)
-            current = models.get(alias)
+            current = models.get(model_id)
             if current is None:
-                raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
-            models[alias] = _apply_patch(current, validated_mutation)
+                raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
+            models[model_id] = _apply_patch(current, validated_mutation)
             return models
 
         return self._mutate(expected=expected, apply=apply)
 
-    def remove(self, alias: str, *, expected: FileVersion) -> RegistryMutationResult:
-        _validate_alias(alias)
+    def remove(self, model_id: str, *, expected: FileVersion) -> RegistryMutationResult:
+        _validate_model_id(model_id)
 
         def apply(models: dict[str, UserModelDefinition]) -> dict[str, UserModelDefinition]:
-            if alias not in models:
-                raise RegistryEntryNotFound(f"User model alias {alias!r} does not exist")
-            del models[alias]
+            if model_id not in models:
+                raise RegistryEntryNotFound(f"User model ID {model_id!r} does not exist")
+            del models[model_id]
             return models
 
         return self._mutate(expected=expected, apply=apply)
@@ -432,7 +421,7 @@ class UserModelRegistryStore:
                 models=models,
             )
             models = validated.models
-            self._validate_effective_aliases(models)
+            self._validate_effective_model_ids(models)
             unchanged = _normalized_models(models) == _normalized_models(current.document.models)
             if unchanged:
                 receipt = MutationReceipt(
@@ -472,11 +461,11 @@ class UserModelRegistryStore:
         document = UserModelRegistryDocument.model_validate(parsed)
         return RegistrySnapshot(document=document, fingerprint=file_fingerprint(payload))
 
-    def _validate_effective_aliases(self, models: Mapping[str, UserModelDefinition]) -> None:
-        collisions = sorted(self._built_in_aliases.intersection(models))
+    def _validate_effective_model_ids(self, models: Mapping[str, UserModelDefinition]) -> None:
+        collisions = sorted(self._built_in_model_ids.intersection(models))
         if collisions:
             raise RegistryCollisionError(
-                f"User registry collides with built-in aliases: {', '.join(collisions)}"
+                f"User registry collides with built-in model IDs: {', '.join(collisions)}"
             )
 
     def _reject_override_mode(self) -> None:
@@ -487,14 +476,11 @@ class UserModelRegistryStore:
             )
 
 
-def _validate_alias(alias: str) -> None:
-    if _ALIAS_PATTERN.fullmatch(alias) is None:
+def _validate_model_id(model_id: str) -> None:
+    if type(model_id) is not str or not model_id or model_id != model_id.strip():
         raise ValueError(
-            "Model alias must be 1-64 lowercase letters, digits, dots, underscores, or hyphens, "
-            "and must start and end with a letter or digit"
+            "Model ID must be a non-empty trimmed string"
         )
-    if alias in _RESERVED_ALIASES:
-        raise ValueError(f"Model alias {alias!r} is reserved")
 
 
 def _reject_blank_or_padded_text(value: str | None) -> str | None:
@@ -537,7 +523,10 @@ def _unset_path(payload: dict[str, Any], path: str) -> None:
 
 
 def _normalized_models(models: Mapping[str, UserModelDefinition]) -> dict[str, dict[str, object]]:
-    return {alias: definition.to_persisted_mapping() for alias, definition in sorted(models.items())}
+    return {
+        model_id: definition.to_persisted_mapping()
+        for model_id, definition in sorted(models.items())
+    }
 
 
 def _revalidate_document(
@@ -548,8 +537,8 @@ def _revalidate_document(
     """Cross the mutation trust boundary using plain data, never model identity."""
 
     plain_models = {
-        alias: definition.model_dump(mode="python", exclude_none=True, warnings=False)
-        for alias, definition in models.items()
+        model_id: definition.model_dump(mode="python", exclude_none=True, warnings=False)
+        for model_id, definition in models.items()
     }
     return UserModelRegistryDocument.model_validate(
         {

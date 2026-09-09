@@ -1,6 +1,6 @@
 {
   "schema_version": "praxis-public-path-scenarios-v1",
-  "model": "qwen3_5_9b_mlx_4bit",
+  "model": "mlx-community/Qwen3.5-9B-4bit",
   "repetitions": 3,
   "scenarios": [
     {

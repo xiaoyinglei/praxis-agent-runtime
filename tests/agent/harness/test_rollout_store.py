@@ -44,7 +44,7 @@ def test_start_turn_persists_records_and_rebuildable_projections(tmp_path: Path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="inspect this workspace",
-            binding_manifest={"model_alias": "test-model", "revision": "model-v1"},
+            binding_manifest={"model_id": "test-model", "revision": "model-v1"},
         )
 
         assert turn.thread_id == thread.thread_id
@@ -79,7 +79,7 @@ def test_projection_corruption_is_detected_and_rebuilt_from_records(tmp_path: Pa
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="preserve canonical history",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         item = store.list_items(turn.turn_id)[0]
         with sqlite3.connect(database) as corruptor:
@@ -110,7 +110,7 @@ def test_projection_metadata_binds_hash_reducer_and_record_position(
         store.start_turn(
             thread_id=thread.thread_id,
             user_message="bind projections",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         with sqlite3.connect(database) as connection:
             connection.row_factory = sqlite3.Row
@@ -148,7 +148,7 @@ def test_two_fresh_processes_rebuild_identical_prefix_to_identical_hash(
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="deterministic prefix",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
         store.complete_turn(turn_id=turn.turn_id, answer="stable answer")
     first = tmp_path / "first.sqlite3"
@@ -213,7 +213,7 @@ def test_complete_turn_commits_answer_before_releasing_thread(tmp_path: Path) ->
         first = store.start_turn(
             thread_id=thread.thread_id,
             user_message="hello",
-            binding_manifest={"model_alias": "test-model"},
+            binding_manifest={"model_id": "test-model"},
         )
 
         completed = store.complete_turn(turn_id=first.turn_id, answer="world")
@@ -229,7 +229,7 @@ def test_complete_turn_commits_answer_before_releasing_thread(tmp_path: Path) ->
         followup = store.start_turn(
             thread_id=thread.thread_id,
             user_message="again",
-            binding_manifest={"model_alias": "test-model-v2"},
+            binding_manifest={"model_id": "test-model-v2"},
         )
         assert followup.turn_id != first.turn_id
 
@@ -249,7 +249,7 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
                 return store.start_turn(
                     thread_id=thread_id,
                     user_message=message,
-                    binding_manifest={"model_alias": "test-model"},
+                    binding_manifest={"model_id": "test-model"},
                 ).turn_id
             except RuntimeError:
                 return "busy"

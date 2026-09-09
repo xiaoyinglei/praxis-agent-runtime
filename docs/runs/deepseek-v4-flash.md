@@ -14,15 +14,15 @@ Overall verdict: **PASSED**
 
 ## Model identity and infrastructure
 
-| Alias | Provider | Provider model | Infrastructure status |
-| --- | --- | --- | --- |
-| `deepseek_v4_flash` | `deepseek` | `deepseek-v4-flash` | **CONCLUSIVE** |
+| Model ID | Provider | Infrastructure status |
+| --- | --- | --- |
+| `deepseek-v4-flash` | `deepseek` | **CONCLUSIVE** |
 
 ## Task
 
 Change the unique text before_gate to after_gate in the attached approval.txt using apply_patch, then confirm completion.
 
-## `deepseek_v4_flash` trial 1
+## `deepseek-v4-flash` trial 1
 
 ### Tool trace
 
@@ -85,7 +85,7 @@ Evaluator verdict: **PASSED**
 - Core success: `true`
 - Capability passed: `true`
 
-## `deepseek_v4_flash` trial 2
+## `deepseek-v4-flash` trial 2
 
 ### Tool trace
 
@@ -148,7 +148,7 @@ Evaluator verdict: **PASSED**
 - Core success: `true`
 - Capability passed: `true`
 
-## `deepseek_v4_flash` trial 3
+## `deepseek-v4-flash` trial 3
 
 ### Tool trace
 

@@ -67,12 +67,15 @@ def serialize_openai_request(
         raise TypeError("request must be a ModelRequest")
     supported = _supported_parameter_names(supported_cache_parameters)
     payload: dict[str, JsonValue] = {
-        "model": request.settings.model,
-        "messages": _message_payloads(request.messages),
-        "max_completion_tokens": request.settings.max_output_tokens,
-        "temperature": float(request.settings.temperature),
-        "parallel_tool_calls": request.settings.parallel_tool_calls,
-    }
+    "model": request.settings.model,
+    "messages": _message_payloads(request.messages),
+    "temperature": float(request.settings.temperature),
+    "parallel_tool_calls": request.settings.parallel_tool_calls,}
+
+    if request.settings.max_output_tokens is not None:
+        payload["max_completion_tokens"] = (
+            request.settings.max_output_tokens
+        )
     if request.settings.top_p is not None:
         payload["top_p"] = float(request.settings.top_p)
     if request.settings.seed is not None:

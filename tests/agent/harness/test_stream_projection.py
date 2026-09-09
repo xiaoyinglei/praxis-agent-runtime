@@ -17,7 +17,7 @@ def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
     turn = store.start_turn(
         thread_id=thread.thread_id,
         user_message="project this turn",
-        binding_manifest={"model_alias": "projection-test"},
+        binding_manifest={"model_id": "projection-test"},
     )
     return thread.thread_id, turn.turn_id
 
@@ -299,7 +299,7 @@ def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> 
             turn_id="legacy-turn",
             turn_producer="migration",
             user_message="legacy question",
-            binding_manifest={"model_alias": "legacy"},
+            binding_manifest={"model_id": "legacy"},
         )
         store.complete_turn(
             turn_id=turn.turn_id,

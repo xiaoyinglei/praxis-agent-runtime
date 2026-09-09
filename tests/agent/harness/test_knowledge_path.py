@@ -3,16 +3,17 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessAgent,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
     PreparedModelCall,
-    RuntimeComposition,
+    Session,
 )
 from agent_runtime.result import AgentResult
 from agent_runtime.tools.integrations.knowledge import (
@@ -24,7 +25,7 @@ from agent_runtime.tools.permissions import ToolExecutionContext
 
 class KnowledgeModel:
     def snapshot(self, *, thread_id: str, turn_id: str) -> dict[str, str]:
-        return {"model_alias": "knowledge-model", "model_revision": "model-v1"}
+        return {"model_id": "knowledge-model", "model_revision": "model-v1"}
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"step:{request.step}".encode()).hexdigest()
@@ -110,7 +111,8 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
         )
 
 
-def test_configured_knowledge_uses_the_durable_harness_tool_path(
+@pytest.mark.anyio
+async def test_configured_knowledge_uses_the_durable_harness_tool_path(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -143,7 +145,7 @@ def test_configured_knowledge_uses_the_durable_harness_tool_path(
             }
         )
 
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=KnowledgeModel(),
@@ -152,9 +154,9 @@ def test_configured_knowledge_uses_the_durable_harness_tool_path(
         knowledge_revision="rag-corpus-v7",
         knowledge_config={"corpus": "fixture-v7"},
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("answer from knowledge")
+        result = await runtime.submit("answer from knowledge")
 
-        assert result.status == "completed"
+        assert result.status == "done"
         assert [(call.query, call.top_k, root) for call, root in calls] == [
             ("What is the retained fact?", 3, workspace.resolve())
         ]
@@ -190,7 +192,8 @@ def test_configured_knowledge_uses_the_durable_harness_tool_path(
         assert runtime.store.verify().valid is True
 
 
-def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_committed(
+@pytest.mark.anyio
+async def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_committed(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -208,7 +211,7 @@ def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_committed(
         )
 
     model = DiscoveringKnowledgeModel()
-    with RuntimeComposition.open(
+    async with await Session.open(
         database=tmp_path / "rollout.sqlite3",
         workspace=workspace,
         model=model,
@@ -218,9 +221,9 @@ def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_committed(
         knowledge_config={"corpus": "fixture-v7"},
         discoverable_tool_names=("search_knowledge",),
     ) as runtime:
-        result = HarnessAgent(runtime.thread_manager).run("discover knowledge")
+        result = await runtime.submit("discover knowledge")
 
-        assert result.status == "completed"
+        assert result.status == "done"
         assert model.visible_tools == [
             ("find_tools",),
             ("find_tools", "search_knowledge"),

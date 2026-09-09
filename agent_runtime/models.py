@@ -22,7 +22,7 @@ from agent_runtime.core.llm_registry import (
     ModelRegistry,
     ModelResolver,
     ResolvedModel,
-    UnknownModelAliasError,
+    UnknownModelIdError,
     user_model_registry_path,
 )
 from agent_runtime.core.messages import canonical_json_text
@@ -58,6 +58,7 @@ _MISSING_SESSION_FINGERPRINT = "missing"
 _MODEL_BINDING_FIELDS = frozenset(
     {
         "authentication_schema_version",
+        "model_id",
         "trust_domain_id",
         "signing_key_id",
         "thread_id",
@@ -87,7 +88,6 @@ class ModelRuntimeSpec:
 class ModelSpec:
     id: str
     provider: str
-    provider_model: str
     context_window: int
     supports_tools: bool
     supports_structured_output: bool
@@ -95,7 +95,7 @@ class ModelSpec:
     protocol: str | None = None
     base_url: str | None = None
     api_key_env: str | None = None
-    max_output_tokens: int = 2048
+    max_output_tokens: int | None = None
     input_cost_per_1m: float | None = None
     output_cost_per_1m: float | None = None
     runtime: ModelRuntimeSpec | None = None
@@ -115,7 +115,7 @@ class ModelCatalog:
         if not specs:
             raise ValueError("model catalog must not be empty")
         if default_model_id not in specs:
-            raise UnknownModelAliasError(f"Default model {default_model_id!r} not found in catalog")
+            raise UnknownModelIdError(f"Default model {default_model_id!r} not found in catalog")
         if origins is not None and set(origins) != set(specs):
             raise ValueError("model catalog origins must cover exactly the model specs")
         if definitions is not None and set(definitions) != set(specs):
@@ -156,7 +156,10 @@ class ModelCatalog:
         try:
             return self._specs[model_id]
         except KeyError as exc:
-            raise UnknownModelAliasError(f"Model alias {model_id!r} not found in catalog") from exc
+            available = ", ".join(sorted(self._specs))
+            raise UnknownModelIdError(
+                f"Model ID {model_id!r} not found in catalog. Available IDs: {available}"
+            ) from exc
 
     def has(self, model_id: str) -> bool:
         return model_id in self._specs
@@ -230,7 +233,7 @@ class SessionCommitOutcomeUnknown(CommitOutcomeUnknown):  # noqa: N818
 
 
 class ModelSessionStore:
-    """Crash-safe, compare-and-swap storage for one selected model alias."""
+    """Crash-safe, compare-and-swap storage for one selected model ID."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -417,16 +420,16 @@ class ModelPolicy:
     def review_binding(
         self,
         *,
-        alias: str,
+        model_id: str,
         definition: ModelExecutionDefinition,
         requested_by: ModelSwitchRequester,
     ) -> ModelExecutionDefinition:
         requested_by = validate_model_switch_requester(requested_by)
-        if type(alias) is not str or not alias or alias != alias.strip():
-            raise ModelPolicyError("Frozen model alias is invalid")
+        if type(model_id) is not str or not model_id or model_id != model_id.strip():
+            raise ModelPolicyError("Frozen model ID is invalid")
         allowed = self._allowed_ids_for(requested_by)
-        if allowed is not None and alias not in allowed:
-            raise ModelPolicyError(f"Model {alias!r} is not allowed for {requested_by} requests")
+        if allowed is not None and model_id not in allowed:
+            raise ModelPolicyError(f"Model {model_id!r} is not allowed for {requested_by} requests")
         try:
             normalized = ModelExecutionDefinition.model_validate(
                 definition.model_dump(mode="python", exclude_none=False)
@@ -490,8 +493,8 @@ class ModelControlPlane:
         definition_archive: TrustedModelDefinitionArchive | None = None,
     ) -> None:
         if not catalog.has(state.current_model_id):
-            raise UnknownModelAliasError(
-                f"Model alias {state.current_model_id!r} "
+            raise UnknownModelIdError(
+                f"Model ID {state.current_model_id!r} "
                 "not found in catalog"
             )
 
@@ -506,6 +509,8 @@ class ModelControlPlane:
         )
 
         self._registry = registry
+        self._resolved_bindings: dict[tuple[str, str], ResolvedModel] = {}
+        self._closed = False
         self._session_path = session_path
         self._session_store = (
             ModelSessionStore(session_path)
@@ -745,11 +750,11 @@ class ModelControlPlane:
         archive = self._definition_archive
         if trust is None or archive is None:
             raise RuntimeError("model binding trust services are not configured")
-        alias = self.state.current_model_id
+        model_id = self.state.current_model_id
         requester = self.state.selection_requester
         definition = self.policy.review_binding(
-            alias=alias,
-            definition=self.catalog.definition(alias),
+            model_id=model_id,
+            definition=self.catalog.definition(model_id),
             requested_by=requester,
         )
         status = trust.status()
@@ -757,8 +762,8 @@ class ModelControlPlane:
         if revision != definition.definition_revision:
             raise RuntimeError("trusted model definition archive returned a mismatched revision")
         envelope = build_model_binding_envelope(
-            alias=alias,
-            origin=self.catalog.origin(alias),
+            model_id=model_id,
+            origin=self.catalog.origin(model_id),
             definition=definition,
             policy_revision=self.policy.revision,
         )
@@ -772,6 +777,28 @@ class ModelControlPlane:
         association["signature"] = trust.sign(association)
         return association
 
+    def rebind_model_binding(
+        self, binding: Mapping[str, JsonValue], *, thread_id: str, turn_id: str,
+    ) -> dict[str, JsonValue]:
+        source_thread = binding.get("thread_id")
+        source_turn = binding.get("turn_id")
+        if not isinstance(source_thread, str) or not isinstance(source_turn, str):
+            raise RuntimeError("child model binding has no source identity")
+        self._review_frozen_binding(binding, thread_id=source_thread, turn_id=source_turn)
+        _validate_binding_identity(thread_id, field_name="thread_id")
+        _validate_binding_identity(turn_id, field_name="turn_id")
+        trust = self._trust_domain
+        assert trust is not None
+        envelope = binding["binding"]
+        assert isinstance(envelope, Mapping)
+        association = build_model_binding_association(
+            status=trust.status(), thread_id=thread_id, turn_id=turn_id,
+            selection_requester=validate_model_switch_requester(binding["selection_requester"]),
+            binding=envelope,
+        )
+        association["signature"] = trust.sign(association)
+        return association
+
     def resolve_frozen_binding(
         self,
         binding: Mapping[str, JsonValue],
@@ -779,7 +806,9 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ResolvedModel:
-        alias, reviewed = (
+        if self._closed:
+            raise RuntimeError("model control plane is closed")
+        model_id, reviewed = (
             self._review_frozen_binding(
                 binding,
                 thread_id=thread_id,
@@ -800,16 +829,40 @@ class ModelControlPlane:
             )
 
         spec = _to_public_definition_spec(
-            alias,
+            model_id,
             reviewed,
         )
         self._ensure_model_credentials(
             spec
         )
-        return cast(
-            ResolvedModel,
-            resolver(reviewed),
-        )
+        revision = reviewed.definition_revision
+        credential = os.environ.get(spec.api_key_env, "").strip() if spec.api_key_env else ""
+        credential_revision = hashlib.sha256(credential.encode()).hexdigest()
+        cache_key = (revision, credential_revision)
+        if cache_key not in self._resolved_bindings:
+            # Retain older clients until close: a concurrent child may still
+            # be dispatching through an earlier credential. Never persist keys.
+            self._resolved_bindings[cache_key] = cast(ResolvedModel, resolver(reviewed))
+        return self._resolved_bindings[cache_key]
+
+    def close(self) -> None:
+        from contextlib import ExitStack
+
+        if self._closed:
+            return
+        self._closed = True
+        resolved = tuple(self._resolved_bindings.values())
+        self._resolved_bindings.clear()
+        with ExitStack() as stack:
+            seen: set[int] = set()
+            for model in resolved:
+                generator = model.generator
+                if id(generator) in seen:
+                    continue
+                seen.add(id(generator))
+                close = getattr(generator, "close", None)
+                if callable(close):
+                    stack.callback(close)
 
 
     def _review_frozen_binding(
@@ -844,6 +897,10 @@ class ModelControlPlane:
             raise BindingAuthenticationError(
                 "frozen model binding must "
                 "be a mapping"
+            )
+        if "model_alias" in binding:
+            raise BindingAuthenticationError(
+                "legacy outer model_alias is unsupported"
             )
 
         missing = (
@@ -959,9 +1016,9 @@ class ModelControlPlane:
                 "does not match the trusted archive"
             )
 
-        alias = cast(
+        model_id = cast(
             str,
-            envelope["alias"],
+            envelope["model_id"],
         )
 
         requester = (
@@ -973,12 +1030,12 @@ class ModelControlPlane:
         )
 
         reviewed = self.policy.review_binding(
-            alias=alias,
+            model_id=model_id,
             definition=archived,
             requested_by=requester,
         )
 
-        return alias, reviewed
+        return model_id, reviewed
 
     def model_spec_for_frozen_binding(
         self,
@@ -987,7 +1044,7 @@ class ModelControlPlane:
         thread_id: str,
         turn_id: str,
     ) -> ModelSpec:
-        alias, reviewed = (
+        model_id, reviewed = (
             self._review_frozen_binding(
                 binding,
                 thread_id=thread_id,
@@ -996,24 +1053,24 @@ class ModelControlPlane:
         )
 
         return _to_public_definition_spec(
-            alias,
+            model_id,
             reviewed,
         )
 
     def resolve(
         self,
-        alias: str,
+        model_id: str,
     ) -> ResolvedModel:
         if self._registry is None:
             raise RuntimeError(
                 "Model resolver is not configured"
             )
-        spec = self.catalog.get(alias)
+        spec = self.catalog.get(model_id)
         self._ensure_model_credentials(spec)
-        return self._registry.resolve(alias)
+        return self._registry.resolve(model_id)
 
-    def resolve_or_fallback(self, alias: str) -> ResolvedModel:
-        return self.resolve(alias)
+    def resolve_or_fallback(self, model_id: str) -> ResolvedModel:
+        return self.resolve(model_id)
 
     def resolve_for_node(
         self,
@@ -1075,7 +1132,11 @@ def _load_session_state(
     if catalog.has(state.current_model_id):
         return state, ()
     if initial_model_id is not None or store is None:
-        raise UnknownModelAliasError(f"Model alias {state.current_model_id!r} not found in catalog")
+        available = ", ".join(sorted(spec.id for spec in catalog.list_models()))
+        raise UnknownModelIdError(
+            f"Model ID {state.current_model_id!r} not found in catalog. "
+            f"Available IDs: {available}"
+        )
     stale_model_id = state.current_model_id
     policy.review_switch(
         catalog=catalog,
@@ -1119,7 +1180,7 @@ def _validate_binding_identity(value: object, *, field_name: str) -> None:
 
 
 def _to_public_definition_spec(
-    alias: str,
+    model_id: str,
     definition: ModelExecutionDefinition,
 ) -> ModelSpec:
     runtime = definition.runtime
@@ -1127,9 +1188,8 @@ def _to_public_definition_spec(
     if location is None:
         raise ValueError("frozen model definition has no normalized location")
     return ModelSpec(
-        id=alias,
+        id=model_id,
         provider=definition.provider_name or definition.provider.value,
-        provider_model=definition.model,
         context_window=definition.context_window_tokens,
         supports_tools=definition.supports_tools,
         supports_structured_output=definition.supports_structured_output,
@@ -1137,7 +1197,7 @@ def _to_public_definition_spec(
         protocol=definition.protocol,
         base_url=definition.base_url,
         api_key_env=definition.api_key_env,
-        max_output_tokens=definition.max_tokens,
+        max_output_tokens=definition.max_output_tokens,
         input_cost_per_1m=definition.input_cost_per_1m,
         output_cost_per_1m=definition.output_cost_per_1m,
         runtime=(
@@ -1159,7 +1219,6 @@ def _to_public_spec(
     spec: InternalModelSpec,
 ) -> ModelSpec:
     provider = str(spec.provider_name or spec.provider)
-    provider_model = str(spec.model)
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,
@@ -1168,7 +1227,6 @@ def _to_public_spec(
     return ModelSpec(
         id=model_id,
         provider=provider,
-        provider_model=provider_model,
         context_window=int(spec.context_window_tokens),
         supports_tools=bool(spec.supports_tools),
         supports_structured_output=bool(spec.supports_structured_output),
@@ -1176,7 +1234,7 @@ def _to_public_spec(
         protocol=spec.protocol,
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
-        max_output_tokens=int(spec.max_tokens),
+        max_output_tokens=spec.max_output_tokens,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
         runtime=_to_public_runtime_spec(spec.runtime),
@@ -1215,7 +1273,7 @@ def format_model_rows(
             cost = f"{spec.input_cost_per_1m or 0:g}/{spec.output_cost_per_1m or 0:g}"
         lines.append(
             f"{marker} {spec.id}  provider={spec.provider}  "
-            f"model={spec.provider_model}  ctx={spec.context_window}  "
+            f"ctx={spec.context_window}  "
             f"{spec.location}  caps={cap_text}  cost={cost}"
         )
     return lines

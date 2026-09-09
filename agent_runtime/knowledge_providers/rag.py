@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 @dataclass
 class LazyRAGKnowledgeProvider:
     config: RAGKnowledgeConfig
-    model_alias: str | None = None
+    model_id: str | None = None
     vector_dsn: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -96,7 +96,7 @@ class LazyRAGKnowledgeProvider:
 
         runtime, diagnostics = _build_optional_rag_runtime(
             config=self.config,
-            model_alias=self.model_alias,
+            model_id=self.model_id,
             vector_dsn=self.vector_dsn,
         )
         self._diagnostics = tuple(diagnostics)
@@ -119,7 +119,7 @@ class LazyRAGKnowledgeProvider:
 def _build_optional_rag_runtime(
     *,
     config: RAGKnowledgeConfig,
-    model_alias: str | None,
+    model_id: str | None,
     vector_dsn: str | None,
 ) -> tuple[RAGRuntime | None, tuple[RuntimeDiagnostic, ...]]:
     try:
@@ -132,11 +132,14 @@ def _build_optional_rag_runtime(
 
         runtime_config = resolve_runtime_config(
             RuntimeOverrides(
-                model_alias=model_alias,
-                embedding_model_alias=config.embedding_model,
-                reranker_model_alias=config.reranker_model or "none",
+                model_id=model_id,
+                embedding_model_id=config.embedding_model,
+                reranker_model_id=config.reranker_model or "none",
             )
         )
+        context_window_tokens = runtime_config.primary_model.context_window_tokens
+        if context_window_tokens is None:
+            raise ValueError(f"Chat model {runtime_config.primary_model.id!r} requires context_window_tokens")
         storage = runtime_storage_config(
             config.storage_root,
             vector_backend=config.vector_backend,
@@ -149,12 +152,12 @@ def _build_optional_rag_runtime(
             request=AssemblyRequest(
                 requirements=CapabilityRequirements(
                     require_chat=True,
-                    default_context_tokens=QueryOptions().max_context_tokens,
+                    default_context_tokens=context_window_tokens,
                 ),
                 overrides=to_assembly_overrides(runtime_config),
             ),
             generation_config=runtime_config.generation,
-            chat_context_window_tokens=runtime_config.primary_model.context_window_tokens or 32_768,
+            chat_context_window_tokens=context_window_tokens,
             llm_stage_budgets=runtime_config.llm_stage_budgets,
         )
         return runtime, ()

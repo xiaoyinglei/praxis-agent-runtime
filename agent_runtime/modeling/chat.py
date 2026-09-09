@@ -17,6 +17,9 @@ _JSON_CODE_FENCE_RE = re.compile(r"^\s*```\s*(?:[A-Za-z0-9_-]+)?\s*(?P<body>.*?)
 class OpenAICompatibleChatGenerator:
     """Lazy OpenAI-compatible chat client used by the agent and RAG assembly."""
 
+    def close(self) -> None:
+        self._client.close()
+
     def __init__(
         self,
         *,
