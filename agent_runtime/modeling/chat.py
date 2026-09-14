@@ -118,6 +118,7 @@ class OpenAICompatibleChatGenerator:
     ) -> Iterator[dict[str, object]]:
         """Translate the OpenAI-compatible SSE stream into gateway chunks."""
 
+        kwargs.setdefault("stream_options", {"include_usage": True})
         stream = self._client.chat.completions.create(
             model=self.chat_model_name,
             messages=messages,
@@ -136,8 +137,13 @@ class OpenAICompatibleChatGenerator:
             self._active_stream = stream
         tool_blocks: dict[int, tuple[str, str]] = {}
         authoritative_stop = False
+        final_reason = "end_turn"
+        reported_usage = None
         try:
             for response_chunk in stream:
+                usage = _openai_response_usage(response_chunk)
+                if usage is not None:
+                    reported_usage = usage
                 choices = response_chunk.choices
                 if not choices:
                     continue
@@ -146,7 +152,7 @@ class OpenAICompatibleChatGenerator:
                 content = getattr(delta, "content", None)
                 if content:
                     yield {"type": "text_delta", "content": str(content)}
-                reasoning = getattr(delta, "reasoning_content", None)
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                 if reasoning:
                     yield {"type": "thinking_delta", "content": str(reasoning)}
                 plan = getattr(delta, "plan", None)
@@ -176,14 +182,11 @@ class OpenAICompatibleChatGenerator:
                     for _index in sorted(tool_blocks):
                         tool_id, _tool_name = tool_blocks[_index]
                         yield {"type": "content_block_stop", "tool_id": tool_id}
-                    yield {
-                        "type": "message_stop",
-                        "stop_reason": _stream_stop_reason(str(finish_reason)),
-                        "usage": _openai_response_usage(response_chunk),
-                    }
+                    final_reason = _stream_stop_reason(str(finish_reason))
                     authoritative_stop = True
             if not authoritative_stop:
-                raise RuntimeError("OpenAI-compatible stream ended without a finish reason")
+                raise ConnectionError("OpenAI-compatible stream ended without a finish reason")
+            yield {"type": "message_stop", "stop_reason": final_reason, "usage": reported_usage}
         finally:
             close = getattr(stream, "close", None)
             if callable(close):
@@ -248,7 +251,7 @@ def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
 
     choice = response.choices[0]  # type: ignore[attr-defined]
     message = choice.message
-    reasoning = getattr(message, "reasoning_content", None)
+    reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
     if reasoning:
         yield {"type": "thinking_delta", "content": str(reasoning)}
     content = getattr(message, "content", None)

@@ -347,3 +347,21 @@ async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
         with RolloutStore(database) as store:
             assert store.read_child_budget_allocation(result.turn_id)["status"] == "settled"
             assert store.read_budget_state(parent.turn_id).used.total_tokens == 5
+
+
+@pytest.mark.anyio
+async def test_session_open_creates_and_reuses_trust_without_manual_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry_path = tmp_path / "user-config" / "models.yaml"
+    monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(registry_path))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    agent = Agent(workspace_path=workspace, checkpoint_db=workspace / "rollout.db", enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    trust_path = registry_path.parent / "binding-trust.json"
+    assert not trust_path.exists()
+    async with agent.session(require_workspace_change=False):
+        original = trust_path.read_bytes()
+    async with agent.session(require_workspace_change=False):
+        assert trust_path.read_bytes() == original

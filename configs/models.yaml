@@ -51,28 +51,20 @@ models:
   # -------------------------------------------------------------------------
   # Chat models: local MLX.
   # -------------------------------------------------------------------------
-  mlx-community/Qwen3-0.6B-4bit:
-    capability: chat
-    provider: mlx
-    protocol: openai_compatible
-    base_url: http://127.0.0.1:8080/v1
-    context_window_tokens: 32768
-
-  mlx-community/Qwen3-8B-4bit:
-    capability: chat
-    provider: mlx
-    protocol: openai_compatible
-    base_url: http://127.0.0.1:8080/v1
-    context_window_tokens: 32768
-
-  mlx-community/Qwen3-14B-4bit:
-    capability: chat
-    provider: mlx
-    protocol: openai_compatible
-    base_url: http://127.0.0.1:8080/v1
-    context_window_tokens: 32768
-
   mlx-community/Qwen3.5-9B-4bit:
+    capability: chat
+    provider: mlx
+    protocol: openai_compatible
+    base_url: http://127.0.0.1:8080/v1
+    context_window_tokens: 262144
+    # MLX buffers a complete tool call before sending its arguments.
+    timeout_seconds: 300
+    defaults:
+      provider_options:
+        chat_template_kwargs:
+          enable_thinking: true
+
+  mlx-community/gemma-4-26b-a4b-it-4bit:
     capability: chat
     provider: mlx
     protocol: openai_compatible

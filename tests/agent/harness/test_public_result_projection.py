@@ -86,6 +86,31 @@ class AcceptPublicAnswer:
 
 
 @pytest.mark.anyio
+async def test_interrupted_model_exposes_public_retry_prompt(tmp_path):
+    class InterruptedModel(PublicAnswerModel):
+        attempts = 0
+
+        async def dispatch(self, prepared):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise ConnectionError("OpenAI-compatible stream ended without a finish reason")
+            return await super().dispatch(prepared)
+
+    model = InterruptedModel()
+    async with await Session.open(database=tmp_path / "retry.sqlite", workspace=tmp_path,
+                                  model=model, completion_gate=AcceptPublicAnswer()) as session:
+        paused = await session.submit("answer")
+        assert paused.status == "paused"
+        assert paused.pause is not None
+        assert paused.pause.kind == "model_retry"
+        assert paused.pause.options == ("retry", "abort")
+        resumed = await session.resume(paused.turn_id, "retry")
+        assert resumed.status == "done"
+        assert model.attempts == 2
+        assert session.store.verify().valid
+
+
+@pytest.mark.anyio
 async def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

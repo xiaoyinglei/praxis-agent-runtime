@@ -797,6 +797,23 @@ class ToolExecutor:
                 prepared=prepared,
             )
             raise
+        except FileNotFoundError:
+            record = replace(
+                prepared.record,
+                status=ExecutionStatus.FAILED,
+                error_code="file_not_found",
+            )
+            return await self._finish(
+                call=prepared.call,
+                result=_error_result(
+                    prepared.call,
+                    code="file_not_found",
+                    message="Requested file or directory does not exist.",
+                    retryable=False,
+                ),
+                record=record,
+                prepared=prepared,
+            )
         except Exception:
             record = replace(
                 prepared.record,

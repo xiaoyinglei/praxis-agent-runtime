@@ -181,6 +181,8 @@ def parse_openai_response(response: object) -> ToolUseResult:
     if not isinstance(content, str):
         content = str(content)
     reasoning_content = _field(message, "reasoning_content", default=None)
+    if not reasoning_content:
+        reasoning_content = _field(message, "reasoning", default=None)
     if reasoning_content is not None and not isinstance(reasoning_content, str):
         reasoning_content = str(reasoning_content)
     return ToolUseResult(

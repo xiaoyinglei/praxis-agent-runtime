@@ -378,6 +378,12 @@ class Session:
             self.model_control_plane,
             label="model control plane",
         )
+        self.model_control_plane.ensure_model_binding_trust(
+            has_existing_bindings=any(
+                "authentication_schema_version" in turn.binding_manifest
+                for turn in self.store.list_turns()
+            ),
+        )
 
         def acknowledge_plan_update(_arguments: object) -> dict[str, object]:
             return {
@@ -438,7 +444,7 @@ class Session:
             }
         tools = {tool.definition.name: tool for tool in (*resident, *mcp_tools)}
 
-        from agent_runtime.builtin.generic import GENERIC_SYSTEM_PROMPT
+        from agent_runtime.builtin.generic import coding_instructions
         from agent_runtime.harness.model_adapter import ControlPlaneHarnessModel
 
         override = agent.__dict__.get("_harness_model")
@@ -447,7 +453,7 @@ class Session:
             if callable(override)
             else ControlPlaneHarnessModel(
                 control_plane=self.model_control_plane,
-                instructions=(GENERIC_SYSTEM_PROMPT,),
+                instructions=coding_instructions(workspace.root),
             )
         )
         return model, dict(

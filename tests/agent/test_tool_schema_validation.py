@@ -1879,3 +1879,16 @@ def test_regression_complete_schema_rejects_before_runner_could_execute() -> Non
         assert arguments
 
     assert runner_called is False
+
+
+@pytest.mark.parametrize("limit, expected", [(20, "less than or equal to 5"), (0, "greater than or equal to 1")])
+def test_find_tools_validation_reports_limit_for_repair(limit: int, expected: str) -> None:
+    from agent_runtime.tools.selection import FindToolsInput
+
+    _, validate = pydantic_input(FindToolsInput)
+    with pytest.raises(ToolValidationError) as error:
+        validate({"query": "所有工具", "limit": limit})
+
+    assert error.value.path == "$.limit"
+    assert expected in error.value.message
+    assert validate({"query": "所有工具", "limit": 5})["limit"] == 5

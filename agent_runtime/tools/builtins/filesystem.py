@@ -104,10 +104,8 @@ class ReadFileInput(BaseModel):
         default=0,
         ge=0,
         description=(
-            "Byte offset to start reading when max_lines is omitted. For "
-            "compatibility with common coding-agent ACIs, offset is treated "
-            "as a one-based source line when max_lines is supplied without "
-            "start_line. "
+            "Zero-based byte offset, including when max_lines is supplied. "
+            "Use start_line for a one-based source line instead. "
             "For the next non-overlapping chunk, pass the previous output's "
             "next_offset value."
         ),
@@ -125,7 +123,7 @@ class ReadFileInput(BaseModel):
         ge=1,
         le=2_000,
         description=(
-            "Maximum source lines to return from start_line. When start_line is "
+            "Maximum lines to read from offset or start_line. When start_line is "
             "set and max_lines is omitted, 200 lines are returned."
         ),
     )
@@ -146,9 +144,6 @@ class ReadFileInput(BaseModel):
             raise ValueError(
                 "offset cannot be combined with start_line"
             )
-        if self.offset and self.max_lines is not None:
-            self.start_line = self.offset
-            self.offset = 0
         return self
 
 
@@ -318,7 +313,7 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
             str(arguments["path"]),
             effects=frozenset({ToolEffect.READ_WORKSPACE}),
         ),
-        execution_revision="builtin-read-file-v3-line-window-compat",
+        execution_revision="builtin-read-file-v4-stable-byte-offset",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -459,7 +454,7 @@ def _read_file(
 
 def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
     size = target.stat().st_size
-    start_line = request.start_line or 1
+    start_line = None if request.offset else (request.start_line or 1)
     max_lines = request.max_lines or 200
     with target.open("rb") as stream:
         prefix = stream.read(8_192)
@@ -485,8 +480,8 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
                 ),
                 encoding=request.encoding,
             )
-        stream.seek(0)
-        for _line_number in range(1, start_line):
+        stream.seek(request.offset)
+        for _line_number in range(1, start_line or 1):
             if not stream.readline():
                 return ReadFileOutput(
                     path=request.path,
@@ -543,10 +538,10 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
             start_line=start_line,
             end_line=(
                 None
-                if displayed_lines == 0
+                if displayed_lines == 0 or start_line is None
                 else start_line + displayed_lines - 1
             ),
-            next_line=(start_line + complete_lines if line_limited else None),
+            next_line=(start_line + complete_lines if line_limited and start_line is not None else None),
             truncated=truncated,
             is_binary=is_binary,
             binary_format="binary" if is_binary else None,

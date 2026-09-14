@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from agent_runtime.agent import Agent
     from agent_runtime.harness.session import Session
     from agent_runtime.result import AgentPause
+    from agent_runtime.terminal_app import TerminalChatApp
 
 agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -93,8 +94,9 @@ def _format_tool_summary(result: AgentResult) -> str:
         status_icon = "✗" if tool_call.is_error else "✓"
         tool_info = f"  {status_icon} {tool_call.tool_name}"
         if tool_call.is_error:
+            error_message = safe_terminal_text(tool_call.error_message or "unknown tool error")
             tool_info += (
-                f" ({tool_call.error_code or 'tool_error'}: {(tool_call.error_message or 'unknown tool error')[:60]})"
+                f" ({tool_call.error_code or 'tool_error'}: {error_message})"
             )
         lines.append(tool_info)
     return "\n".join(lines)
@@ -172,6 +174,7 @@ def _display_agent_result(
     *,
     verbose: bool,
     answer_streamed: bool = False,
+    show_execution: bool = True,
 ) -> None:
     if result.status == "failed":
         _display_failure(
@@ -194,9 +197,9 @@ def _display_agent_result(
         print(f"\n暂停原因: {result.needs_user_input}")
 
     plan_summary = _format_plan_summary(result)
-    if plan_summary:
+    if plan_summary and show_execution:
         print(plan_summary)
-    if result.tool_calls:
+    if result.tool_calls and show_execution:
         print(_format_tool_summary(result))
 
     if verbose:
@@ -228,10 +231,34 @@ def _display_agent_result(
         if result.stop_reason:
             print(f"停止原因: {result.stop_reason}")
 
-    print(f"Turn: {result.turn_id}")
+    if show_execution or verbose:
+        print(f"Turn: {result.turn_id}")
 
     if verbose:
         print(f"状态: {result.status}")
+
+
+async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | None:
+    req = result.pause
+    if req is None:
+        return None
+    print(f"\n⏸ 需要确认: {req.question}")
+    for call in req.tool_calls:
+        print(f"  {call.tool_name}: {call.args_preview}")
+        if call.reason:
+            print(f"  原因: {call.reason}")
+    options = req.options or ("allow_once", "deny", "continue", "abort")
+    print(f"选项: {', '.join(options)}")
+    aliases = {"a": "allow_once", "y": "allow_once", "yes": "allow_once",
+               "n": "deny", "no": "deny", "d": "deny", "c": "continue"}
+    while True:
+        choice = (await ui.prompt(approval=True)).strip()
+        if choice in {"q", "exit", "/exit"}:
+            return None
+        choice = aliases.get(choice, choice)
+        if choice in options:
+            return choice
+        print(f"请输入: {', '.join(options)}；q 取消")
 
 
 def _handle_pause(
@@ -488,7 +515,11 @@ def _print_chat_help() -> None:
     print("  /status            显示当前 Turn、模型和工作区")
     print("  /new, /clear       下一条消息不继承当前上下文")
     print("  /model [current|list|switch <id>]")
+    print("  /model             交互终端内用 ↑↓ 选择模型，Enter 确认，Esc 取消")
     print("  /verbose           切换详细输出")
+    print("  执行记录：点击 ▸ 展开/收起；Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
+    print("  Alt+Enter 换行；PageUp/PageDown 滚动；Ctrl+End 回到底部；Ctrl+C 取消")
+    print("  鼠标拖选复制，右键粘贴到输入框；F2 切换终端原生鼠标选择")
     print("  /exit              退出")
 
 
@@ -500,18 +531,31 @@ async def _chat_facade_loop(
     previous_turn_id: str | None = None,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
+    _ui: TerminalChatApp | None = None,
 ) -> None:
-    event_display = _CLIToolEventDisplay()
-    composer = TerminalComposer()
+    if _ui is None and _is_tty(sys.stdin) and _is_tty(sys.stdout) and os.environ.get("TERM") != "dumb":
+        from agent_runtime.terminal_app import TerminalChatApp
+
+        ui = TerminalChatApp(model=facade.current_model().id, workspace=str(facade.workspace_path or Path.cwd()))
+        await ui.run(lambda: _chat_facade_loop(
+            facade, max_tokens_total=max_tokens_total, max_turns=max_turns,
+            previous_turn_id=previous_turn_id, allow_write_tools=allow_write_tools,
+            allow_execute_tools=allow_execute_tools, _ui=ui,
+        ))
+        return
+    event_display = _ui.display if _ui else _CLIToolEventDisplay(interactive=False)
+    composer = TerminalComposer() if _ui is None else None
     current_turn_id = previous_turn_id
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
     chat_workspace = default_chat_workspace
     model_id = facade.current_model().id
-    _print_startup_banner(model_id)
+    if _ui is None:
+        _print_startup_banner(model_id)
     from contextlib import AsyncExitStack
 
     async with AsyncExitStack() as stack:
+        stack.callback(event_display.finish)
         session = await stack.enter_async_context(facade.session(
             previous_turn_id=previous_turn_id,
             max_turns=max_turns, max_tokens_total=max_tokens_total,
@@ -520,7 +564,11 @@ async def _chat_facade_loop(
         ))
         while True:
             try:
-                query = (await asyncio.to_thread(composer.prompt, "> ")).strip()
+                if _ui:
+                    query = (await _ui.prompt()).strip()
+                else:
+                    assert composer is not None
+                    query = (await asyncio.to_thread(composer.prompt, "> ")).strip()
             except (EOFError, KeyboardInterrupt):
                 print("\n再见。")
                 return
@@ -539,6 +587,7 @@ async def _chat_facade_loop(
                 continue
             if query in {"/new", "/clear"}:
                 await stack.aclose()
+                stack.callback(event_display.finish)
                 facade.model = model_id
                 session = await stack.enter_async_context(facade.session(
                     max_turns=max_turns, max_tokens_total=max_tokens_total,
@@ -548,6 +597,8 @@ async def _chat_facade_loop(
                 current_turn_id = None
                 chat_workspace = default_chat_workspace
                 model_id = session.current_model().id
+                if _ui:
+                    _ui.model = model_id
                 print("下一条消息将使用空历史。")
                 continue
             if query == "/verbose":
@@ -556,40 +607,62 @@ async def _chat_facade_loop(
                 print(f"详细输出: {'开' if verbose else '关'}")
                 continue
             if query == "/model" or query.startswith("/model "):
+                if _ui and query in {"/model", "/model list"}:
+                    selected = await _ui.choose_model(
+                        [spec.id for spec in session.models()], session.current_model().id,
+                    )
+                    if selected is None:
+                        continue
+                    query = f"/model switch {selected}"
                 _handle_model_slash_command(
                     query,
                     agent=session,
                 )
                 model_id = session.current_model().id
+                if _ui:
+                    _ui.model = model_id
                 continue
             if query.startswith("/"):
                 print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
                 continue
 
             event_display.begin_turn()
-            result = await session.submit(
-                query,
-                event_sink=event_display,
-            )
+            try:
+                submission = session.submit(query, event_sink=event_display)
+                result = await _ui.operation(submission) if _ui else await submission
+            except asyncio.CancelledError:
+                if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
+                    raise
+                _ui.display.interrupted()
+                if _ui.display.turn_id:
+                    current_turn_id = _ui.display.turn_id
+                    await session.resume(current_turn_id, "abort", event_sink=event_display)
+                print("已取消当前执行；已发生的文件修改不会回滚。")
+                continue
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
-                action = _handle_pause(result)
+                action = await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result)
                 if action is None:
                     result = await session.resume(result.turn_id, "abort")
                     print("已取消。")
                     break
-                event_display.begin_turn()
-                result = await session.resume(
-                    result.turn_id,
-                    action,
-                    event_sink=event_display,
-                )
+                event_display.begin_turn(reset=False)
+                resumption = session.resume(result.turn_id, action, event_sink=event_display)
+                try:
+                    result = await _ui.operation(resumption) if _ui else await resumption
+                except asyncio.CancelledError:
+                    if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
+                        raise
+                    _ui.display.interrupted()
+                    result = await session.resume(result.turn_id, "abort", event_sink=event_display)
+                    print("已取消当前执行；已发生的文件修改不会回滚。")
             event_display.finish()
             _display_agent_result(
                 result,
                 verbose=verbose,
                 answer_streamed=event_display.answer_streamed,
+                show_execution=_ui is None,
             )
 
 

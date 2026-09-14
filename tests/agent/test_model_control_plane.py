@@ -388,13 +388,13 @@ def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:
     assert spec.context_window == 262_144
 
 
-def test_bundled_local_qwen8_uses_mlx_without_process_launcher() -> None:
+def test_bundled_local_qwen35_uses_mlx_without_process_launcher() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
-    spec = catalog.get("mlx-community/Qwen3-8B-4bit")
+    spec = catalog.get("mlx-community/Qwen3.5-9B-4bit")
 
     assert spec.provider == "mlx"
-    assert spec.id == "mlx-community/Qwen3-8B-4bit"
+    assert spec.id == "mlx-community/Qwen3.5-9B-4bit"
     assert spec.location == "local"
     assert spec.base_url == "http://127.0.0.1:8080/v1"
     assert spec.runtime is None
@@ -1621,10 +1621,10 @@ async def test_local_provider_probe_rejects_endpoint_conflict() -> None:
         )
 
 @pytest.mark.anyio
-async def test_bundled_qwen14_probe_uses_model_base_url() -> None:
+async def test_bundled_qwen35_probe_uses_model_base_url() -> None:
     spec = ModelCatalog.from_config_file(
         Path("configs/models.yaml")
-    ).get("mlx-community/Qwen3-14B-4bit")
+    ).get("mlx-community/Qwen3.5-9B-4bit")
 
     assert spec.runtime is None
     requested: list[tuple[str, float]] = []
@@ -1640,7 +1640,7 @@ async def test_bundled_qwen14_probe_uses_model_base_url() -> None:
                 {
                     "id": (
                         "mlx-community/"
-                        "Qwen3-14B-4bit"
+                        "Qwen3.5-9B-4bit"
                     )
                 }
             ]
@@ -1652,3 +1652,47 @@ async def test_bundled_qwen14_probe_uses_model_base_url() -> None:
 
     await probe.ensure_ready(spec)
     assert requested == [("http://127.0.0.1:8080/v1/models", 5.0)]
+
+
+@pytest.mark.parametrize("history", ["none", "rollout", "archive", "corrupt"])
+def test_startup_initializes_trust_only_for_a_new_install(
+    tmp_path: Path, history: str,
+) -> None:
+    from agent_runtime.model_trust import TrustDomainValidationError
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_path = tmp_path / "models.yaml"
+    _write_models_config(config_path)
+    trust = ModelBindingTrustDomain(
+        tmp_path / "trusted" / "binding-trust.json",
+        workspace=workspace, worktree=workspace,
+    )
+    archive = TrustedModelDefinitionArchive(
+        tmp_path / "trusted" / "definitions",
+        workspace=workspace, worktree=workspace,
+    )
+    control = ModelControlPlane.from_config_file(
+        config_path, initial_model_id="mlx-community/Qwen3-14B-4bit",
+        trust_domain=trust, definition_archive=archive,
+    )
+    if history == "archive":
+        archive.ensure(control.catalog.definition("mlx-community/Qwen3-14B-4bit"))
+    if history == "corrupt":
+        trust.initialize()
+        trust.path.write_text("{}")
+        with pytest.raises(TrustDomainValidationError):
+            control.ensure_model_binding_trust(has_existing_bindings=False)
+        assert trust.path.read_text() == "{}"
+    elif history != "none":
+        with pytest.raises(TrustDomainNotInitializedError, match="existing"):
+            control.ensure_model_binding_trust(has_existing_bindings=history == "rollout")
+        assert not trust.path.exists()
+    else:
+        control.ensure_model_binding_trust(has_existing_bindings=False)
+        original = trust.path.read_bytes()
+        binding = control.freeze_model_binding(thread_id="t", turn_id="u")
+        control.ensure_model_binding_trust(has_existing_bindings=True)
+        assert trust.path.read_bytes() == original
+        signature = binding.pop("signature")
+        trust.verify(binding, signature)

@@ -98,7 +98,10 @@ class GatewayHarnessModel:
         first = messages[first_user_index]
         context = build_stable_context(
             instructions=self._instructions,
-            frozen_run_context=tuple(
+            frozen_run_context=(ContextBlock(
+                name="runtime_model_identity",
+                content=f"Current model ID for this turn: {self._model_id}.",
+            ),) + tuple(
                 ContextBlock(name=f"harness_prefix_{index}", content=message.content)
                 for index, message in enumerate(leading, start=1)
             ),
@@ -429,6 +432,7 @@ def _model_messages(messages: tuple[HarnessMessage, ...]) -> tuple[ModelMessage,
             ModelMessage(
                 role=message.role,  # type: ignore[arg-type]
                 content=message.content,
+                reasoning_content=message.reasoning_content,
                 tool_calls=tuple(
                     ModelToolCall(
                         id=call.id,

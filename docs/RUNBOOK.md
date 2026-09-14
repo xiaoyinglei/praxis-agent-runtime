@@ -34,13 +34,12 @@ compare-and-swap 防止并发覆盖。
 `full` 再按显式 capability flags 检查 tool call 与 structured output。探测证据是当次结果，
 不会反向猜测或改写 capability flags。
 
-### 初始化与注册
+### 注册模型
 
-首次启动新 Turn 前初始化本地 HMAC trust domain；命令只显示 domain/key id，不显示 key material：
+Agent 首次启动自动创建本地 HMAC trust domain，后续启动复用，无需手工初始化。
+如果已有历史绑定或归档却丢失密钥，启动会要求恢复原密钥，不会自动生成替代密钥。
 
 ```bash
-uv run agent model trust init
-uv run agent model trust status
 uv run agent model list --source
 uv run agent model current
 export MODEL_ID=provider-model-id

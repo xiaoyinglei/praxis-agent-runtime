@@ -300,12 +300,12 @@ class Agent:
             return projected.pause
 
     def _harness_model(self) -> BoundHarnessModel:
-        from agent_runtime.builtin.generic import GENERIC_SYSTEM_PROMPT
+        from agent_runtime.builtin.generic import coding_instructions
         from agent_runtime.harness import ControlPlaneHarnessModel
 
         return ControlPlaneHarnessModel(
             control_plane=self._get_model_control_plane(),
-            instructions=(GENERIC_SYSTEM_PROMPT,),
+            instructions=coding_instructions(self._workspace_path()),
         )
 
     def _harness_database(self) -> Path:

@@ -1043,3 +1043,89 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
         assert runner_calls == 1
         await asyncio.wait_for(completed.wait(), timeout=0.3)
         assert store.verify().valid is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("correct_arguments", [False, True])
+@pytest.mark.parametrize("bad_arguments", [{}, {"path": "../outside"}])
+async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path, correct_arguments, bad_arguments):
+    from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
+    class RepeatingModel(ToolThenAnswerModel):
+        async def dispatch(self, prepared):
+            count = len(self.requests)
+            if correct_arguments and count == 4:
+                return HarnessModelResponse(text="README was read", provider_response_id=None, usage={})
+            return HarnessModelResponse(text="\n\n", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
+                id=f"call-{count}", name="read_file",
+                arguments={"path": "README.md"} if correct_arguments and count == 3 else bad_arguments,
+            ),))
+
+    model = RepeatingModel()
+    display = ConversationEventDisplay(Conversation())
+    display.begin_turn()
+    registry = ToolRegistry()
+    registry.register(_read_tool(workspace=tmp_path))
+    async with await Session.open(database=tmp_path / "repeat.sqlite", workspace=tmp_path,
+                                  model=model, tools=registry.freeze(), max_steps=16,
+                                  completion_gate=AcceptToolAnswer()) as session:
+        result = await session.submit("show code", event_sink=display)
+        if correct_arguments:
+            assert result.status == "done"
+            assert len(model.requests) == 4
+        else:
+            assert result.status == "failed"
+            assert result.stop_reason == "repeated_tool_failure"
+            assert len(model.requests) == 3
+            assert display.group is not None and len(display.group.children) == 3
+            assert display._tool_count == 3
+            assert any(child.failed for child in display.group.children)
+        assert session.store.verify().valid
+
+
+@pytest.mark.anyio
+async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
+    class Model(ToolThenAnswerModel):
+        async def dispatch(self, prepared):
+            count = len(self.requests)
+            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
+                id=f"call-{count}", name="read_file",
+                arguments={} if count % 2 else {"path": "README.md"},
+            ),))
+    model = Model()
+    registry = ToolRegistry()
+    registry.register(_read_tool(workspace=tmp_path))
+    async with await Session.open(database=tmp_path / "interleaved.sqlite", workspace=tmp_path,
+                                  model=model, tools=registry.freeze(), max_steps=8,
+                                  completion_gate=AcceptToolAnswer()) as session:
+        result = await session.submit("read the file")
+        assert result.stop_reason == "repeated_tool_failure"
+        assert len(model.requests) == 5
+        assert session.store.verify().valid
+
+
+@pytest.mark.parametrize(
+    "changed,external,expected", [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_failure_streak_respects_real_changes_and_external_effects(changed, external, expected):
+    from types import SimpleNamespace
+
+    from agent_runtime.harness.turn import TurnExecutor
+
+    items, operations = [], []
+    for index in range(5):
+        failed = index % 2 == 0
+        name = "run_command" if failed else "execute_python"
+        call_id, result_id = f"call-{index}", f"result-{index}"
+        items.append(SimpleNamespace(kind="tool_call", status="completed", payload={
+            "tool_call_id": call_id, "tool_name": name, "arguments": {"command": "python demo.py"} if failed else {},
+        }))
+        items.append(SimpleNamespace(kind="tool_result", status="completed", item_id=result_id, payload={
+            "tool_call_id": call_id, "tool_name": name, "is_error": failed, "retryable": False,
+            "error_code": "command_failed" if failed else None, "error_message": "TypeError" if failed else None,
+            "metadata": {"workspace_tree_changed": changed if not failed else False},
+        }))
+        operations.append(SimpleNamespace(result_item_id=result_id,
+                                          effects=["network"] if external else ["write_workspace", "execute_process"]))
+    executor = TurnExecutor.__new__(TurnExecutor)
+    executor._store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)
+    assert executor._repeated_tool_failure("turn") is expected

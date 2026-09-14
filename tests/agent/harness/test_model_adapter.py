@@ -1177,3 +1177,17 @@ async def test_candidate_sdk_crosses_control_plane_gateway_and_rollout_store(
                 turn_id=turn.turn_id,
             )
         assert runtime.store.verify().valid is True
+
+
+def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path):
+    from agent_runtime.builtin.generic import coding_instructions
+    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
+                                instructions=coding_instructions(tmp_path))
+    prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
+                             messages=(HarnessMessage(role="user", content="Explain MoE with Python"),),
+                             binding_manifest={"model_id": "test-model"}))
+    wire = serialize_openai_request(prepared.dispatch_payload.request)
+    text = str(wire)
+    assert str(tmp_path) in text
+    assert "working_dir" in text
+    assert "Current model ID for this turn:" in text

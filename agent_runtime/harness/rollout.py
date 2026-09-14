@@ -2286,6 +2286,7 @@ class RolloutStore:
                         "usage": frozen_usage,
                         "response_status": response_status,
                         "incomplete_reason": incomplete_reason,
+                        **({"reasoning_content": reasoning_content} if reasoning_content else {}),
                     },
                 },
             )

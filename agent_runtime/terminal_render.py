@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
+import time
 from collections import OrderedDict, deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import regex
 from wcwidth import wcswidth
+
+if TYPE_CHECKING:
+    from rich.live import Live
 
 from agent_runtime.streaming.events import (
     EventType,
@@ -291,6 +297,7 @@ class _ItemDisplayState:
     name: str
     kind: TurnItemKind
     command: BoundedCommandPreview | None = None
+    command_details: BoundedCommandPreview | None = None
     progress: BoundedProgressPreview | None = None
     command_output_streamed: bool = False
 
@@ -303,6 +310,8 @@ class TerminalToolEventDisplay:
         *,
         width: int | None = None,
         max_lifecycle_keys: int = 256,
+        interactive: bool | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         if max_lifecycle_keys < 1:
             raise ValueError("lifecycle key limit must be positive")
@@ -317,6 +326,64 @@ class TerminalToolEventDisplay:
         self._verbose = False
         self._line_open = False
         self.answer_streamed = False
+        self._answer_has_text = False
+        self._pending_answer_whitespace = ""
+        self._interactive = sys.stdout.isatty() if interactive is None else interactive
+        self._clock = clock
+        self._started_at: float | None = None
+        self._elapsed_seconds = 0.0
+        self._activity_status = "准备中"
+        self._tool_count = 0
+        self._changed_files: dict[str, str] = {}
+        self._detail_lines: deque[str] = deque(maxlen=2000)
+        self._details_omitted = 0
+        self._live: Live | None = None
+
+    def activity_text(self) -> str:
+        elapsed = self._elapsed_seconds + (0.0 if self._started_at is None else self._clock() - self._started_at)
+        files = " · ".join(self._changed_files)
+        suffix = f"\n修改文件：{files}" if files else ""
+        return f"{self._activity_status} · {elapsed:.1f} 秒 · {self._tool_count} 次工具{suffix}"
+
+    def _start_live(self) -> None:
+        if not self._interactive or self._verbose or self._started_at is None or self._live is not None:
+            return
+        if self._line_open:
+            print(flush=True)
+            self._line_open = False
+        from rich.console import Console
+        from rich.live import Live
+        from rich.text import Text
+
+        self._live = Live(
+            console=Console(file=sys.stdout),
+            get_renderable=lambda: Text(self.activity_text()),
+            transient=True,
+            refresh_per_second=4,
+            redirect_stdout=False,
+            redirect_stderr=False,
+        )
+        self._live.start()
+
+    def _stop_live(self) -> None:
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
+    def show_details(self) -> None:
+        if not self._detail_lines:
+            print("暂无执行详情。")
+            return
+        if self._details_omitted:
+            print(f"… 已省略 {self._details_omitted} 行较早的显示记录。")
+        for line in self._detail_lines:
+            print(line)
+
+    def _record_detail(self, value: str) -> None:
+        for row in display_rows(value.rstrip("\n"), width=self._width):
+            if len(self._detail_lines) == self._detail_lines.maxlen:
+                self._details_omitted += 1
+            self._detail_lines.append(row)
 
     @property
     def lifecycle_key_count(self) -> int:
@@ -330,6 +397,12 @@ class TerminalToolEventDisplay:
         self._verbose = verbose
 
     async def emit(self, event: StreamEvent) -> None:
+        if event.type is EventType.THINKING_DELTA or (
+            event.type is EventType.ITEM_DELTA and event.delta_kind is ItemDeltaKind.REASONING
+        ):
+            self._activity_status = "思考中"
+            self._start_live()
+            return
         if event.type is EventType.ITEM_STARTED:
             self._render_item_start(event)
         elif event.type is EventType.ITEM_DELTA:
@@ -355,16 +428,41 @@ class TerminalToolEventDisplay:
                 suffix = f" — {detail}" if isinstance(detail, str) and detail else ""
                 self._write_line(f"↻ 恢复: {strategy}{suffix}")
 
-    def begin_turn(self) -> None:
+    def begin_turn(self, *, reset: bool = True) -> None:
         self.finish()
         self.answer_streamed = False
+        self._answer_has_text = False
+        self._pending_answer_whitespace = ""
+        self._started_at = self._clock()
+        self._activity_status = "等待模型"
+        if reset:
+            self._elapsed_seconds = 0.0
+            self._tool_count = 0
+            self._changed_files.clear()
+            self._detail_lines.clear()
+            self._details_omitted = 0
+        self._start_live()
 
     def finish(self) -> None:
+        self._pending_answer_whitespace = ""
+        self._stop_live()
         if self._line_open:
             print(flush=True)
             self._line_open = False
+        if self._started_at is not None:
+            self._elapsed_seconds += self._clock() - self._started_at
+            if self._interactive:
+                elapsed = self._elapsed_seconds
+                print(f"执行耗时 · {elapsed:.1f} 秒 · {self._tool_count} 次工具")
+                for path, change in self._changed_files.items():
+                    print(f"  修改：{path}{change}")
+            self._started_at = None
 
     def _render_item_start(self, event: StreamEvent) -> None:
+        if event.item_kind is TurnItemKind.AGENT_MESSAGE:
+            self._answer_has_text = False
+            self._pending_answer_whitespace = ""
+            return
         if event.item_kind not in {TurnItemKind.TOOL, TurnItemKind.COMMAND}:
             return
         if event.item_id is None or not self._remember(event, event.item_id):
@@ -406,13 +504,17 @@ class TerminalToolEventDisplay:
                 )
                 self._store_item(key, state)
             state.command_output_streamed = True
+            if state.command_details is None:
+                state.command_details = BoundedCommandPreview(width=self._width, head_rows=2000, tail_rows=0)
+            for line in state.command_details.feed(delta):
+                self._record_detail(line)
             if self._verbose:
                 self._render_text(delta, answer=False)
                 return
             if state.command is None:
                 state.command = BoundedCommandPreview(width=max(1, self._width - 2))
             for line in state.command.feed(delta):
-                self._write_line(f"  {line}")
+                self._write_line(f"  {line}", record=False)
             return
         if event.delta_kind is ItemDeltaKind.TOOL_PROGRESS:
             if state is None:
@@ -438,6 +540,7 @@ class TerminalToolEventDisplay:
             return
         key = (event.turn_id, event.item_id)
         state = self._items.pop(key, None)
+        self._tool_count += 1
         result_value = event.data.get("result")
         result = result_value if isinstance(result_value, Mapping) else {}
         name_value = result.get("tool_name")
@@ -584,6 +687,10 @@ class TerminalToolEventDisplay:
             self._write_line(f"  {symbol} {safe_terminal_text(title)}")
 
     def _render_start_line(self, name: str, preview: object) -> None:
+        self._answer_has_text = False
+        self._pending_answer_whitespace = ""
+        self._activity_status = f"正在执行 {safe_terminal_text(name)}"
+        self._start_live()
         if not isinstance(preview, str) or not preview:
             self._write_line(f"→ {name}")
             return
@@ -601,16 +708,19 @@ class TerminalToolEventDisplay:
         for line in bounded_result_lines(
             value,
             width=max(1, self._width - 2),
-            verbose=self._verbose,
+            verbose=self._verbose or self._interactive,
         ):
             self._write_line(f"  {line}")
 
     def _flush_item_state(self, state: _ItemDisplayState | None) -> None:
         if state is None:
             return
+        if state.command_details is not None:
+            for line in state.command_details.finish():
+                self._record_detail(line)
         if state.command is not None and not self._verbose:
             for line in state.command.finish():
-                self._write_line(f"  {line}")
+                self._write_line(f"  {line}", record=False)
         if state.progress is not None:
             marker = state.progress.finish()
             if marker is not None:
@@ -636,6 +746,18 @@ class TerminalToolEventDisplay:
             return
         diff = metadata.get("diff")
         if isinstance(diff, str) and diff:
+            path = metadata.get("file_path")
+            if isinstance(path, str) and path:
+                added = removed = 0
+                in_hunk = False
+                for line in diff.splitlines():
+                    if line.startswith("@@"):
+                        in_hunk = True
+                    elif in_hunk:
+                        added += line.startswith("+")
+                        removed += line.startswith("-")
+                qualifier = "至少 " if metadata.get("diff_truncated") else ""
+                self._changed_files[safe_terminal_text(path)] = f" (最近一次编辑：{qualifier}+{added} / -{removed})"
             self._write_block(safe_terminal_text(diff))
 
     def _command_suffix(self, result: Mapping[str, object]) -> str:
@@ -675,12 +797,29 @@ class TerminalToolEventDisplay:
         rendered = safe_terminal_text(value)
         if not rendered:
             return
+        if answer and not self._answer_has_text:
+            if not rendered.strip():
+                # Hold leading whitespace until this message has visible text.
+                # Bound malformed whitespace-only streams without erasing code indentation.
+                self._pending_answer_whitespace = (self._pending_answer_whitespace + rendered)[-4096:]
+                return
+            rendered = self._pending_answer_whitespace + rendered
+            self._pending_answer_whitespace = ""
+            self._answer_has_text = True
+        self._stop_live()
         print(rendered, end="", flush=True)
         if answer:
             self.answer_streamed = True
         self._line_open = not rendered.endswith("\n")
 
-    def _write_line(self, value: str) -> None:
+    def _write_line(self, value: str, *, record: bool = True) -> None:
+        if record:
+            self._record_detail(value)
+        if self._interactive and not self._verbose and self._started_at is not None:
+            if value.startswith(("✓", "✗", "→", "↻")):
+                self._activity_status = safe_terminal_text(value)
+            self._start_live()
+            return
         if self._line_open:
             print()
         for row in display_rows(value, width=self._width):
@@ -688,6 +827,9 @@ class TerminalToolEventDisplay:
         self._line_open = False
 
     def _write_block(self, value: str) -> None:
+        self._record_detail(value)
+        if self._interactive and not self._verbose and self._started_at is not None:
+            return
         if self._line_open:
             print()
         for row in display_rows(value.rstrip("\n"), width=self._width):

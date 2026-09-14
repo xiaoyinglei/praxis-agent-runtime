@@ -23,6 +23,7 @@ class HarnessMessage:
     content: str
     tool_calls: tuple[HarnessToolCall, ...] = ()
     tool_call_id: str | None = None
+    reasoning_content: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

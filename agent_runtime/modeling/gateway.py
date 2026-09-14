@@ -1175,7 +1175,7 @@ def _account_messages(
     """Approximate token-countable text from messages + tools."""
     prompt = _render_messages_as_prompt(messages)
     if tools:
-        tool_desc = "\n".join(t.get("function", {}).get("name", "") for t in tools)
+        tool_desc = json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
         prompt += f"\n\n[Tools]\n{tool_desc}"
     return prompt
 

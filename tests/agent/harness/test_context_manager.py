@@ -302,3 +302,30 @@ def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
                 preserved_facts={},
                 context_version=1,
             )
+
+
+def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Path) -> None:
+    from agent_runtime.harness.model_adapter import _model_messages
+
+    db = tmp_path / "reasoning.sqlite"
+    with RolloutStore(db) as store:
+        thread = store.create_thread(workspace=tmp_path)
+        turn = store.start_turn(thread_id=thread.thread_id, user_message="inspect", binding_manifest={})
+        operation = store.prepare_model_operation(
+            turn_id=turn.turn_id, request_hash="request", context_hash="context",
+            tool_hash="tools", wire_hash="wire", request_ref={"request_id": "request"},
+        )
+        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="test", lease_seconds=30)
+        store.complete_model_attempt(
+            operation_id=operation.operation_id, attempt_id=attempt.attempt_id,
+            generation=attempt.generation, text="", provider_response_id=None, usage={},
+            reasoning_content="Inspect the selected file.",
+            tool_calls=({"id": "call", "name": "read_file", "arguments": {"path": "main.py"}},),
+        )
+    with RolloutStore(db) as store:
+        messages = RolloutContextManager(store).build(turn.turn_id)
+        assistant = _model_messages(messages)[-1]
+        assert assistant.reasoning_content == "Inspect the selected file."
+        assert assistant.tool_calls[0].name == "read_file"
+        with pytest.raises(ContextBudgetExceededError):
+            RolloutContextManager(store, max_item_bytes=150).build(turn.turn_id)
