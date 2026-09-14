@@ -599,67 +599,6 @@ class LLMGateway:
             stage=stage,
         )
 
-    async def agenerate_with_tools(
-        self,
-        *,
-        stage: LLMCallStage,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]],
-        ledger: AsyncBudgetLedger | None = None,
-        lease_id: str | None = None,
-        kwargs: Mapping[str, Any] | None = None,
-    ) -> LLMCallResult[Any]:
-        """Native tool calling path with budget accounting.
-
-        ``messages`` and ``tools`` are in OpenAI wire format.  Returns the
-        raw provider response (caller parses via ``OpenAIAdapter``).
-        Falls back to ``generate_text`` when the generator lacks
-        ``generate_with_tools``.
-        """
-        effective_ledger = ledger or current_llm_budget_ledger()
-        accounted_prompt = _account_messages(messages, tools)
-        budget, call_kwargs, input_tokens, reservation = self._prepare_call(
-            stage=stage,
-            prompt=accounted_prompt,
-            kwargs=kwargs,
-        )
-        effective_lease_id = lease_id or f"{stage.value}:tools:{id(messages)}"
-        if effective_ledger is not None:
-            reserved = await effective_ledger.reserve(effective_lease_id, reservation)
-            if not reserved:
-                raise LLMBudgetExceededError(
-                    stage=stage,
-                    required_tokens=reservation,
-                )
-
-        try:
-            provider_result = await asyncio.to_thread(
-                self._invoke_with_tools,
-                messages,
-                tools,
-                call_kwargs,
-            )
-        except asyncio.CancelledError:
-            if effective_ledger is not None:
-                await effective_ledger.refund(effective_lease_id)
-            raise
-        except Exception:
-            if effective_ledger is not None:
-                await effective_ledger.refund(effective_lease_id)
-            raise
-
-        usage = provider_result.usage or LLMUsage(
-            input_tokens=input_tokens,
-            output_tokens=0,  # unknown for raw responses
-            source="tokenizer_estimate",
-        )
-        if effective_ledger is not None:
-            await effective_ledger.commit(effective_lease_id, usage.total_tokens)
-        return LLMCallResult(
-            value=provider_result.value,
-            usage=usage,
-            stage=stage,
-        )
 
     async def astream_with_tools(
         self,

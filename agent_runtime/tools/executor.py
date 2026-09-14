@@ -69,11 +69,6 @@ class ExecutionStatus(StrEnum):
     FAILED = "failed"
     OUTCOME_UNKNOWN = "outcome_unknown"
 
-    # Source compatibility for checkpoints and callers created before the
-    # durable prepared/started boundary was made explicit.
-    RUNNING = "started"
-    UNKNOWN = "outcome_unknown"
-
 
 class ExecutionStartRejectedError(RuntimeError):
     """A durable scheduler rejected execution before the tool runner was called."""

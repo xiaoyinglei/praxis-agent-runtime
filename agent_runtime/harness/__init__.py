@@ -3,11 +3,6 @@
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.events import ReplayEvent, RolloutEvent, RolloutEventReader
-from agent_runtime.harness.migration import (
-    LegacyMigrationReport,
-    migrate_legacy_turns,
-    restore_legacy_backup,
-)
 from agent_runtime.harness.model_adapter import (
     ControlPlaneHarnessModel,
     GatewayHarnessModel,
@@ -79,7 +74,6 @@ __all__ = [
     "HarnessModelResponse",
     "HarnessToolCall",
     "ItemSnapshot",
-    "LegacyMigrationReport",
     "ModelAttemptSnapshot",
     "ModelDispatchOutcomeUnknownError",
     "ModelDispatchCancelledError",
@@ -105,6 +99,4 @@ __all__ = [
     "TurnSnapshot",
     "ToolOperationSnapshot",
     "VerificationReport",
-    "migrate_legacy_turns",
-    "restore_legacy_backup",
 ]

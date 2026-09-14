@@ -10,6 +10,7 @@ import pytest
 
 from agent_runtime.harness import RolloutEventReader, RolloutStore
 from agent_runtime.streaming import events as stream_events
+from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 
 
 def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
@@ -612,7 +613,8 @@ def test_migrated_model_response_projects_one_legacy_message(tmp_path: Path) -> 
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        migrated = store.record_migrated_context_item(
+        migrated = record_migrated_context_item(
+            store,
             turn_id=turn_id,
             kind="model_response",
             payload={"text": "migrated model answer", "tool_calls": []},
@@ -656,7 +658,8 @@ def test_pre_identity_migrated_model_response_upcasts_to_legacy_message(
     database = tmp_path / "rollout.sqlite3"
     with RolloutStore(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        migrated = store.record_migrated_context_item(
+        migrated = record_migrated_context_item(
+            store,
             turn_id=turn_id,
             kind="model_response",
             payload={"text": "pre-identity migrated answer", "tool_calls": []},

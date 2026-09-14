@@ -175,18 +175,6 @@ class BindingProvider(Protocol):
     def snapshot(self, *, thread_id: str, turn_id: str) -> Mapping[str, Any]: ...
 
 
-class BindingValidator(Protocol):
-    """Validate one durable binding against its owning Thread and Turn."""
-
-    def __call__(
-        self,
-        binding: Mapping[str, Any],
-        *,
-        thread_id: str,
-        turn_id: str,
-    ) -> None: ...
-
-
 class BoundHarnessModel(HarnessModel, BindingProvider, Protocol):
     """Model endpoint whose binding snapshot and dispatch share one owner."""
 

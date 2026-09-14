@@ -1395,7 +1395,7 @@ async def test_remote_best_effort_timeout_records_unknown_without_cancelling() -
     assert time.monotonic() - started < 0.12
     assert execution.result.error_code == "timeout_outcome_unknown"
     assert execution.record is not None
-    assert execution.record.status is ExecutionStatus.UNKNOWN
+    assert execution.record.status is ExecutionStatus.OUTCOME_UNKNOWN
     assert execution.record.requires_reconciliation is True
     await asyncio.wait_for(completed.wait(), timeout=0.4)
     _assert_one_trace(executor, "call_1", "timeout_outcome_unknown")
@@ -1428,7 +1428,7 @@ async def test_remote_interrupt_records_unknown_without_cancelling_remote_work()
     assert execution.result.error_code == "cancelled_outcome_unknown"
     assert execution.result.retryable is False
     assert execution.record is not None
-    assert execution.record.status is ExecutionStatus.UNKNOWN
+    assert execution.record.status is ExecutionStatus.OUTCOME_UNKNOWN
     assert execution.record.requires_reconciliation is True
     await asyncio.wait_for(completed.wait(), timeout=0.3)
     _assert_one_trace(executor, "call_1", "cancelled_outcome_unknown")
@@ -1485,7 +1485,7 @@ async def test_non_idempotent_running_record_is_reconciled_before_retry() -> Non
     call = _call()
     record = replace(
         ToolExecutionRecord.prepare(call, tool),
-        status=ExecutionStatus.RUNNING,
+        status=ExecutionStatus.STARTED,
         attempt_count=1,
     )
     executor = ToolExecutor({"demo": tool})
@@ -1494,7 +1494,7 @@ async def test_non_idempotent_running_record_is_reconciled_before_retry() -> Non
 
     assert execution.result.error_code == "tool_reconciliation_required"
     assert execution.record is not None
-    assert execution.record.status is ExecutionStatus.UNKNOWN
+    assert execution.record.status is ExecutionStatus.OUTCOME_UNKNOWN
     assert execution.record.error_code == "interrupted_outcome_unknown"
     assert execution.record.requires_reconciliation is True
     assert runner_calls == 0

@@ -22,10 +22,6 @@ class ModelSpec:
     embedding_space: str | None = None
     context_window_tokens: int | None = None
 
-    @property
-    def requires_api_key(self) -> bool:
-        return self.api_key_env is not None
-
 
 @dataclass(frozen=True, slots=True)
 class GenerationTaskConfig:
