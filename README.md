@@ -118,9 +118,7 @@ must provide:
 Built-in model IDs remain read-only. User registrations live in the versioned
 user registry. Agent startup automatically initializes the local binding trust
 domain on first use and reuses it afterward. Inspect or register exact model IDs
-through the CLI. For explicit setup before first use, run `uv run agent model trust init`;
-inspect the existing trust domain with `uv run agent model trust status`.
-`--provider` selects the provider
+through the CLI. No manual trust initialization is required. `--provider` selects the provider
 adapter and transport; the same `MODEL_ID` is sent to that provider:
 
 ```bash
