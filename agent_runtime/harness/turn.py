@@ -1182,14 +1182,3 @@ def _response_from_committed_item(item: ItemSnapshot) -> HarnessModelResponse:
         status=response_status,
         incomplete_reason=incomplete_reason,
     )
-
-
-def _remaining_model_tokens(
-    binding_manifest: Mapping[str, Any],
-    *,
-    consumed: int,
-) -> int | None:
-    total = binding_manifest.get("model_token_budget_total")
-    if isinstance(total, bool) or not isinstance(total, int):
-        return None
-    return max(total - consumed, 0)

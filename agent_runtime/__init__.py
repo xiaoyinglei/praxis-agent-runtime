@@ -15,7 +15,6 @@ from agent_runtime.streaming.events import (
     StreamEvent,
     TurnItemKind,
 )
-from agent_runtime.streaming.sink import LegacyStreamProjectionSink
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -38,7 +37,6 @@ __all__ = [
     "EventType",
     "ItemDeltaKind",
     "ItemStatus",
-    "LegacyStreamProjectionSink",
     "ModelNotAvailableError",
     "ModelSpec",
     "PlanEvent",

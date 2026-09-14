@@ -658,21 +658,6 @@ def canonical_hash(value: JsonValue) -> str:
     return hashlib.sha256(canonical_json_text(value).encode("utf-8")).hexdigest()
 
 
-def canonical_transcript_revision(
-    transcript: Sequence[ModelMessage],
-) -> str:
-    """Return the deterministic revision owned by a canonical transcript."""
-
-    messages = _snapshot_messages(
-        transcript,
-        field_name="transcript",
-    )
-    return _revision(
-        "transcript",
-        tuple(model_message_payload(message) for message in messages),
-    )
-
-
 def project_transcript_compaction(
     transcript: Sequence[ModelMessage],
     *,
@@ -735,92 +720,6 @@ def project_transcript_compaction(
     if _model_messages_size(candidate) >= _model_messages_size(messages):
         return messages
     return candidate
-
-
-def is_verified_transcript_compaction_rewrite(
-    existing_turn: Sequence[ModelMessage],
-    candidate_turn: Sequence[ModelMessage],
-    *,
-    message_compaction_min_count: int,
-    max_message_tail_count: int,
-    reactive_compact_tail_count: int,
-    max_summary_chars: int,
-) -> bool:
-    """Verify a rewrite against projections allowed by trusted runtime policy."""
-
-    existing = _snapshot_messages(
-        existing_turn,
-        field_name="existing_turn",
-    )
-    candidate = _snapshot_messages(
-        candidate_turn,
-        field_name="candidate_turn",
-    )
-    if (
-        len(existing) < 2
-        or len(candidate) < 2
-        or existing[0].role != "user"
-        or candidate[0] != existing[0]
-        or candidate[1].role != "context"
-        or any(
-            isinstance(value, bool) or not isinstance(value, int)
-            for value in (
-                message_compaction_min_count,
-                max_message_tail_count,
-                reactive_compact_tail_count,
-                max_summary_chars,
-            )
-        )
-        or message_compaction_min_count <= 0
-        or max_message_tail_count < 0
-        or reactive_compact_tail_count <= 0
-        or max_summary_chars <= 0
-    ):
-        return False
-
-    existing_body = existing[1:]
-    parent_revision = canonical_transcript_revision(existing)
-    allowed: list[tuple[ModelMessage, ...]] = []
-    if len(existing) >= message_compaction_min_count:
-        proactive = project_transcript_compaction(
-            existing_body,
-            parent_context_revision=parent_revision,
-            tail_start=max(
-                0,
-                len(existing_body) - max_message_tail_count,
-            ),
-            max_summary_chars=max_summary_chars,
-        )
-        if proactive != existing_body:
-            allowed.append(proactive)
-
-    reactive_tail_start = max(
-        0,
-        len(existing_body) - reactive_compact_tail_count,
-    )
-    if reactive_tail_start == 0:
-        reactive_tail_start = 1
-    reactive = project_transcript_compaction(
-        existing_body,
-        parent_context_revision=parent_revision,
-        tail_start=reactive_tail_start,
-        max_summary_chars=max_summary_chars,
-    )
-    if reactive == existing_body:
-        reactive = project_transcript_compaction(
-            existing_body,
-            parent_context_revision=parent_revision,
-            tail_start=len(existing_body),
-            max_summary_chars=max_summary_chars,
-        )
-    if reactive != existing_body:
-        allowed.append(reactive)
-
-    for projection in allowed:
-        expected_prefix = (existing[0], *projection)
-        if len(candidate) >= len(expected_prefix) and candidate[: len(expected_prefix)] == expected_prefix:
-            return True
-    return False
 
 
 def _extend_tail_for_tool_pair(
@@ -1090,7 +989,6 @@ __all__ = [
     "build_tool_manifest",
     "canonical_hash",
     "canonical_model_request_json",
-    "canonical_transcript_revision",
     "freeze_json_mapping",
     "model_settings_payload",
     "model_call_record_payload",

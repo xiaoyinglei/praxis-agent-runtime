@@ -340,13 +340,6 @@ def load_skill_body(manifest: SkillManifest) -> str:
     return body
 
 
-def load_skill_body_from_file(skill_file: Path) -> str:
-    """Read the body (after frontmatter) directly from a SKILL.md path."""
-    content = skill_file.read_text(encoding="utf-8")
-    _, body = _parse_frontmatter(content, skill_file)
-    return body
-
-
 def scan_and_load_skills(
     cwd: Path,
     repo_root: Path | None = None,

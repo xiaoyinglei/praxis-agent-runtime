@@ -2180,8 +2180,6 @@ def _infer_architecture_layers(paths: Sequence[str]) -> set[str]:
         ) or path in {
             "agent_runtime/harness/rollout.py",
             "agent_runtime/harness/reducer.py",
-            "agent_runtime/harness/thread_manager.py",
-            "agent_runtime/harness/migration.py",
         }:
             layers.add("turn_checkpoint")
         if (

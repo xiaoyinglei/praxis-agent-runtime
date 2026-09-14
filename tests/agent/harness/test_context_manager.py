@@ -17,6 +17,7 @@ from agent_runtime.harness import (
     RolloutStore,
     TurnExecutor,
 )
+from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 
 
 def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> None:
@@ -73,7 +74,8 @@ def test_context_manager_enforces_total_bytes_and_message_count(tmp_path: Path) 
             user_message="a" * 80,
             binding_manifest={"model_id": "model-v1"},
         )
-        store.record_migrated_context_item(
+        record_migrated_context_item(
+            store,
             turn_id=turn.turn_id,
             kind="context_message",
             payload={"text": "b" * 80},
@@ -101,7 +103,8 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
             user_message="inspect",
             binding_manifest={"model_id": "model-v1"},
         )
-        store.record_migrated_context_item(
+        record_migrated_context_item(
+            store,
             turn_id=turn.turn_id,
             kind="model_response",
             payload={

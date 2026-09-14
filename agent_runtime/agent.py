@@ -361,12 +361,6 @@ class Agent:
         )
 
 
-def _positive_integer(value: object) -> int | None:
-    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-        return value
-    return None
-
-
 async def _close_owned_sync_resource(resource: object, *, label: str) -> None:
     close_method = getattr(resource, "close", None)
     if not callable(close_method):
