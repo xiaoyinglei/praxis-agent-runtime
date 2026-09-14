@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 GENERIC_SYSTEM_PROMPT = """\
 You are a concise coding and file agent. Use the tools that are visible in the
 current request when the task requires workspace inspection, editing,
@@ -63,4 +66,14 @@ behavior has been implemented and verified.
 """
 
 
-__all__ = ["GENERIC_SYSTEM_PROMPT"]
+def coding_instructions(workspace: Path) -> tuple[str, ...]:
+    root = json.dumps(str(workspace.resolve()), ensure_ascii=False)
+    return (
+        GENERIC_SYSTEM_PROMPT,
+        f"Current workspace root and default tool working directory: {root}. "
+        "Use paths relative to this root. Omit working_dir or use '.' for the default directory. "
+        "Tool working_dir and declared output_paths must resolve inside this workspace.",
+    )
+
+
+__all__ = ["GENERIC_SYSTEM_PROMPT", "coding_instructions"]

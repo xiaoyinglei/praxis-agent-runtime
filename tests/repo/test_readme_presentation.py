@@ -108,7 +108,7 @@ def test_model_integration_docs_cover_requirements_registration_and_switching_on
     readme = _read(README)
     runbook = _read(RUNBOOK)
     readme_section = readme.split("### Connect and switch models", 1)[1].split(
-        "### Run a task",
+        "\n### ",
         1,
     )[0]
     runbook_section = runbook.split("## 接入和切换 chat 模型", 1)[1].split(

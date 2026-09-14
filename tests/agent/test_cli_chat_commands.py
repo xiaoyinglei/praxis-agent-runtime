@@ -30,6 +30,44 @@ class _SessionFactory:
             self.closed += 1
 
 
+@pytest.mark.anyio
+async def test_chat_model_picker_switches_session_without_provider_request(tmp_path):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+        selected = "first"
+
+        def current_model(self):
+            return _model_spec(self.selected)
+
+        def models(self):
+            return [_model_spec("first"), _model_spec("second")]
+
+        def switch_model(self, model_id):
+            self.selected = model_id
+            return self.current_model()
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("Model selection must not call the provider")
+
+    class UI(TerminalChatApp):
+        commands = iter(["/model", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_model(self, choices, current):
+            assert choices == ["first", "second"]
+            assert current == "first"
+            return "second"
+
+    facade = Facade()
+    ui = UI(model="first", workspace=str(tmp_path))
+    await cli._chat_facade_loop(facade, max_tokens_total=None, _ui=ui)
+    assert facade.selected == ui.model == "second"
+
+
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
     return AgentResult(
@@ -96,7 +134,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
             turn_calls.append((args, kwargs))
             raise AssertionError("slash commands must not reach the agent")
 
-    commands = iter(["/status", "/new", "/status", "/help", "/unknown", "/exit"])
+    commands = iter(["/status", "/new", "/status", "/details", "/help", "/unknown", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
 
     await cli._chat_facade_loop(
@@ -111,6 +149,8 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     assert "Previous Turn: (none)" in output
     assert "/new" in output
     assert "未知命令: /unknown" in output
+    assert "未知命令: /details" in output
+    assert "点击 ▸ 展开/收起" in output
     assert turn_calls == []
 
 
@@ -329,3 +369,152 @@ async def test_invalid_model_id_keeps_current_lists_ids_and_starts_no_turn(
     assert selected == "model-a"
     assert switch_attempts == ["missing"]
     assert turn_calls == []
+
+
+@pytest.mark.anyio
+async def test_new_session_still_cleans_display_after_submit_failure(tmp_path, monkeypatch):
+    class Display:
+        active = False
+
+        def begin_turn(self):
+            self.active = True
+
+        def finish(self):
+            self.active = False
+
+    display = Display()
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return SimpleNamespace(id="fake-model")
+
+        async def submit(self, *args, **kwargs):
+            raise RuntimeError("submit failed")
+
+    commands = iter(["/new", "run"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
+    monkeypatch.setattr(cli, "_CLIToolEventDisplay", lambda **kwargs: display)
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await cli._chat_facade_loop(Facade(), max_tokens_total=None)
+    assert not display.active
+
+
+@pytest.mark.anyio
+async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.streaming.events import item_started
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    calls = []
+    started = asyncio.Event()
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return SimpleNamespace(id="fake-model")
+
+        async def submit(self, message, *, event_sink):
+            calls.append(message)
+            if message == "slow":
+                await event_sink.emit(item_started(turn_id="slow-turn", item_id="cmd",
+                                                  item_kind=TurnItemKind.COMMAND,
+                                                  data={"tool_name": "run_command", "input_preview": "sleep 10"}))
+                started.set()
+                await asyncio.Event().wait()
+            return _result(answer="second answer")
+
+        async def resume(self, turn_id, action, **kwargs):
+            calls.append((turn_id, action))
+            return _result(turn_id=turn_id)
+
+    async def wait_for(predicate):
+        async with asyncio.timeout(3):
+            while not predicate():
+                await asyncio.sleep(.01)
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
+        facade = Facade()
+        task = asyncio.create_task(ui.run(lambda: cli._chat_facade_loop(facade, max_tokens_total=None, _ui=ui)))
+        try:
+            await wait_for(lambda: ui.waiting)
+            pipe.send_text("slow\r")
+            await asyncio.wait_for(started.wait(), 3)
+            pipe.send_text("\x03")
+            await wait_for(lambda: ui.waiting)
+            pipe.send_text("next\r")
+            await wait_for(lambda: "second answer" in ui.view.plain_text())
+            await wait_for(lambda: ui.waiting)
+            pipe.send_text("/exit\r")
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                from contextlib import suppress
+                with suppress(asyncio.CancelledError):
+                    await task
+        assert calls == ["slow", ("slow-turn", "abort"), "next"]
+        assert facade.opened == facade.closed == 1
+        assert "已取消当前执行" in ui.view.plain_text()
+
+
+@pytest.mark.anyio
+async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path):
+    import asyncio
+    from dataclasses import replace
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.result import AgentPause
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    calls = []
+    pause = AgentPause(request_id="approval", kind="approval", question="允许执行命令？", options=("deny",))
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return SimpleNamespace(id="fake-model")
+
+        async def submit(self, message, *, event_sink):
+            return replace(_result(turn_id="paused-turn"), status="paused", pause=pause)
+
+        async def resume(self, turn_id, action, **kwargs):
+            calls.append((turn_id, action))
+            return _result(turn_id=turn_id, answer="已拒绝")
+
+    async def wait_for(predicate):
+        async with asyncio.timeout(3):
+            while not predicate():
+                await asyncio.sleep(.01)
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
+        task = asyncio.create_task(ui.run(lambda: cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=ui)))
+        try:
+            await wait_for(lambda: ui.waiting)
+            pipe.send_text("run\r")
+            await wait_for(lambda: ui.status == "等待确认" and ui.waiting)
+            pipe.send_text("a\r")  # Alias cannot authorize an option that was not offered.
+            await wait_for(lambda: "请输入: deny" in ui.view.plain_text())
+            assert calls == []
+            pipe.send_text("n\r")
+            await wait_for(lambda: "已拒绝" in ui.view.plain_text() and ui.waiting)
+            pipe.send_text("/exit\r")
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                from contextlib import suppress
+                with suppress(asyncio.CancelledError):
+                    await task
+        assert calls == [("paused-turn", "deny")]

@@ -64,6 +64,15 @@ async def _execute(
     )
 
 
+@pytest.mark.anyio
+async def test_missing_file_is_explicit_and_not_retryable_without_changes(tmp_path):
+    workspace = open_workspace(tmp_path, create=True)
+    execution = await _execute(_tools_by_name(workspace)["read_file"], {"path": "missing.txt"}, workspace=workspace)
+    assert execution.result.error_code == "file_not_found"
+    assert execution.result.retryable is False
+    assert "does not exist" in execution.result.error_message
+
+
 def _tools_by_name(
     workspace: WorkspaceRuntime,
     *,
@@ -363,7 +372,7 @@ async def test_read_file_supports_source_line_windows_and_continuation(
 
 
 @pytest.mark.anyio
-async def test_read_file_accepts_common_offset_plus_max_lines_aci(
+async def test_read_file_offset_remains_bytes_with_max_lines(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -381,9 +390,10 @@ async def test_read_file_accepts_common_offset_plus_max_lines_aci(
     assert execution.result.is_error is False
     assert execution.result.structured_content is not None
     output = execution.result.structured_content
-    assert output["content"] == "line_3\nline_4\n"
-    assert output["start_line"] == 3
-    assert output["end_line"] == 4
+    assert output["content"] == "e_1\nline_2\n"
+    assert output["start_line"] is None
+    assert output["end_line"] is None
+    assert output["next_offset"] == 14
 
 
 @pytest.mark.anyio
@@ -1419,3 +1429,21 @@ def test_search_builtin_has_no_embedding_or_retrieval_import_dependency() -> Non
     assert not any(
         module.startswith(forbidden_prefixes) for module in imported_modules
     )
+
+
+@pytest.mark.anyio
+async def test_read_file_byte_cursor_roundtrip_with_line_limit(tmp_path):
+    workspace = open_workspace(tmp_path, create=True)
+    content = "".join(f"第{i}行中文内容\n" for i in range(250))
+    (tmp_path / "lines.txt").write_text(content, encoding="utf-8")
+    tool = _tools_by_name(workspace)["read_file"]
+    chunks = []
+    offset = 0
+    for _ in range(3):
+        execution = await _execute(tool, {"path": "lines.txt", "offset": offset, "max_lines": 100}, workspace=workspace)
+        output = execution.result.structured_content
+        assert output is not None
+        chunks.append(output["content"])
+        offset = output["next_offset"]
+    assert offset is None
+    assert "".join(chunks) == content

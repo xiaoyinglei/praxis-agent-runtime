@@ -78,6 +78,9 @@ async def test_model_bootstrap_uses_current_selected_model_for_new_turn(
 
     class FakeControlPlane:
         state = ModelSessionState(current_model_id="current-model")
+        def ensure_model_binding_trust(self, *, has_existing_bindings: bool) -> None:
+            assert isinstance(has_existing_bindings, bool)
+
         def current_model(self) -> ModelSpec:
             return current_spec
 
@@ -145,6 +148,9 @@ async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
 
     class FakeControlPlane:
         state = ModelSessionState(current_model_id="current-model")
+        def ensure_model_binding_trust(self, *, has_existing_bindings: bool) -> None:
+            assert isinstance(has_existing_bindings, bool)
+
         def current_model(self) -> ModelSpec:
             raise AssertionError("resume bootstrap must not use the current selected model")
 

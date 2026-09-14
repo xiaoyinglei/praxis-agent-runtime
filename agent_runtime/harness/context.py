@@ -192,6 +192,7 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
             return HarnessMessage(
                 role="assistant",
                 content=text,
+                reasoning_content=item.payload.get("reasoning_content"),
                 tool_calls=tuple(
                     _tool_call(call) for call in calls if isinstance(call, Mapping)
                 ),
@@ -377,6 +378,8 @@ def _message_size_bytes(message: HarnessMessage) -> int:
             for call in message.tool_calls
         ],
     }
+    if message.reasoning_content is not None:
+        payload["reasoning_content"] = message.reasoning_content
     encoded = json.dumps(
         payload,
         ensure_ascii=False,

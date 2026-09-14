@@ -70,10 +70,17 @@ class ThinkingOptionsDefinition(BaseModel):
     type: Literal["enabled", "disabled"]
 
 
+class ChatTemplateOptionsDefinition(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enable_thinking: bool = Field(strict=True)
+
+
 class ProviderOptionsDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     thinking: ThinkingOptionsDefinition | None = None
+    chat_template_kwargs: ChatTemplateOptionsDefinition | None = None
 
 
 class RequestDefaultsDefinition(BaseModel):

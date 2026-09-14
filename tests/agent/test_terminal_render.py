@@ -548,3 +548,108 @@ async def test_renderer_verbose_command_does_not_repeat_streamed_output(
     )
 
     assert capsys.readouterr().out.count("unique streamed line") == 1
+
+
+@pytest.mark.anyio
+async def test_interactive_activity_collapses_and_keeps_details(monkeypatch, capsys):
+    clock = [10.0]
+    display = TerminalToolEventDisplay(width=100, interactive=True, clock=lambda: clock[0])
+    monkeypatch.setattr(display, "_start_live", lambda: None)
+    display.begin_turn()
+    await display.emit(item_delta(
+        turn_id="t", item_id="r", item_kind=TurnItemKind.REASONING,
+        delta_kind=ItemDeltaKind.REASONING, delta="private reasoning text",
+    ))
+    assert "思考中" in display.activity_text()
+    await display.emit(item_started(
+        turn_id="t", item_id="edit", item_kind=TurnItemKind.TOOL,
+        data={"tool_name": "apply_patch", "input_preview": "file_path='demo.py'"},
+    ))
+    event = item_completed(
+        turn_id="t", item_id="edit", item_kind=TurnItemKind.TOOL,
+        status=ItemStatus.SUCCESS,
+        data={"result": {"tool_name": "apply_patch", "structured_content": {
+            "file_path": "demo.py", "created": True,
+        }, "metadata": {"file_path": "demo.py", "diff": "--- /dev/null\n+++ demo.py\n@@ -0,0 +1 @@\n+print(1)"}}},
+    )
+    await display.emit(event)
+    await display.emit(event)
+    clock[0] = 12.5
+    display.finish()
+    summary = capsys.readouterr().out
+    assert "2.5 秒" in summary
+    assert "1 次工具" in summary
+    assert "demo.py" in summary
+    assert "private reasoning text" not in summary
+    assert "+print(1)" not in summary
+    display.show_details()
+    details = capsys.readouterr().out
+    assert "+print(1)" in details
+    assert "private reasoning text" not in details
+    display.finish()
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("verbose", [False, True])
+async def test_details_retains_command_middle_in_both_modes(monkeypatch, capsys, verbose):
+    display = TerminalToolEventDisplay(interactive=True)
+    monkeypatch.setattr(display, "_start_live", lambda: None)
+    display.set_verbose(verbose)
+    display.begin_turn()
+    await display.emit(item_started(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
+                                   data={"tool_name": "run_command"}))
+    await display.emit(item_delta(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
+                                 delta_kind=ItemDeltaKind.COMMAND_STDOUT,
+                                 delta="\n".join(f"unique-line-{i:02}" for i in range(20)) + "\n"))
+    await display.emit(item_completed(turn_id="t", item_id="c", item_kind=TurnItemKind.COMMAND,
+                                     status=ItemStatus.SUCCESS, data={"result": {"tool_name": "run_command"}}))
+    display.finish()
+    capsys.readouterr()
+    display.show_details()
+    details = capsys.readouterr().out
+    for i in range(20):
+        assert details.count(f"unique-line-{i:02}") == 1
+
+
+def test_resume_preserves_activity_details_and_active_elapsed(monkeypatch, capsys):
+    now = [0.0]
+    display = TerminalToolEventDisplay(interactive=True, clock=lambda: now[0])
+    monkeypatch.setattr(display, "_start_live", lambda: None)
+    display.begin_turn()
+    display._render_diff({
+        "file_path": "notes.md",
+        "diff": "--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n----\n+++value",
+    })
+    now[0] = 2.0
+    display.finish()
+    first = capsys.readouterr().out
+    assert "+1 / -1" in first
+    now[0] = 100.0  # Approval waiting time is excluded from active execution.
+    display.begin_turn(reset=False)
+    now[0] = 103.0
+    display.finish()
+    summary = capsys.readouterr().out
+    assert "5.0 秒" in summary
+    assert "notes.md" in summary
+    display.show_details()
+    assert "+value" in capsys.readouterr().out
+
+
+@pytest.mark.anyio
+async def test_whitespace_only_model_steps_do_not_print_or_count_as_answer(capsys):
+    display = TerminalToolEventDisplay(interactive=False)
+    display.begin_turn()
+    for i in range(3):
+        await display.emit(item_started(turn_id="t", item_id=f"a{i}", item_kind=TurnItemKind.AGENT_MESSAGE))
+        await display.emit(text_delta("\n"))
+        await display.emit(text_delta("\n"))
+    assert capsys.readouterr().out == ""
+    assert not display.answer_streamed
+    # A new meaningful message preserves indentation split across deltas.
+    await display.emit(item_started(turn_id="t", item_id="final", item_kind=TurnItemKind.AGENT_MESSAGE))
+    await display.emit(text_delta("    "))
+    await display.emit(text_delta("print(1)"))
+    await display.emit(text_delta("\n\n"))
+    assert capsys.readouterr().out == "    print(1)\n\n"
+    assert display.answer_streamed

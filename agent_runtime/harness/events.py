@@ -431,6 +431,26 @@ class RolloutEventReader:
                     error=error,
                 )
                 return (completed,)
+            # Validation and hard-guard rejections have a durable result but no
+            # executable operation. Project that result without inventing one.
+            result = record.payload.get("payload")
+            if (
+                operation_id is None
+                and record.turn_id is not None
+                and isinstance(item_id, str)
+                and isinstance(result, Mapping)
+                and result.get("is_error") is True
+                and isinstance(result.get("tool_name"), str)
+                and isinstance(result.get("tool_call_id"), str)
+            ):
+                return (item_completed(
+                    turn_id=record.turn_id,
+                    item_id=item_id,
+                    item_kind=TurnItemKind.COMMAND if result["tool_name"] == "run_command" else TurnItemKind.TOOL,
+                    status=ItemStatus.FAILED,
+                    error=str(result.get("error_message") or result.get("error_code") or "tool rejected"),
+                    data={"result": dict(result), "execution_started": False},
+                ),)
             return ()
         if record.record_type == "item_completed":
             if not isinstance(item_id, str) or start is None:

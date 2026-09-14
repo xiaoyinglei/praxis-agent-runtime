@@ -259,6 +259,7 @@ class TurnExecutor:
         messages = tuple(
             HarnessMessage(
                 role=item["role"], content=item["content"], tool_call_id=item["tool_call_id"],
+                reasoning_content=item.get("reasoning_content"),
                 tool_calls=tuple(HarnessToolCall(**call) for call in item["tool_calls"]),
             )
             for item in snapshot["messages"]
@@ -947,7 +948,7 @@ class TurnExecutor:
                 raise RuntimeError("model requested tools but no ToolOrchestrator exists")
             for call in response.tool_calls:
                 try:
-                    await self._tool_orchestrator.execute(
+                    result = await self._tool_orchestrator.execute(
                         turn_id=turn_id,
                         call=_aci_tool_call(call, prepared.request_ref),
                     )
@@ -975,12 +976,72 @@ class TurnExecutor:
                         status="paused",
                         interaction_id=pending[0].request_id,
                     )
+                if result.is_error and self._repeated_tool_failure(turn_id):
+                    return await self._fail_turn(
+                        thread_id=thread_id,
+                        turn_id=turn_id,
+                        reason_code="repeated_tool_failure",
+                        message=(f"未观察到有效进展，工具 {call.name} 已 3 次以相同参数失败（{result.error_code}）："
+                                 f"{result.error_message}。已停止重复调用，请修正参数或直接回答。"),
+                    )
             return None
         return await self._finish_answer(
             thread_id=thread_id,
             turn_id=turn_id,
             answer=response.text,
         )
+
+    def _repeated_tool_failure(self, turn_id: str) -> bool:
+        """Use committed results so a process restart cannot reset the failure streak."""
+        items = self._store.list_items(turn_id)
+        calls = {
+            item.payload.get("tool_call_id"): item.payload
+            for item in items if item.kind == "tool_call" and item.status == "completed"
+        }
+        results = [item.payload for item in items if item.kind == "tool_result" and item.status == "completed"]
+        if len(results) < 3:
+            return False
+        operations = {op.result_item_id: op for op in self._store.list_tool_operations(turn_id)}
+        result_items = {item.payload.get("tool_call_id"): item.item_id
+                        for item in items if item.kind == "tool_result" and item.status == "completed"}
+        target = None
+        repeats = 0
+        for result in reversed(results):
+            call = calls.get(result.get("tool_call_id"))
+            if call is None:
+                break
+            metadata = result.get("metadata")
+            metadata = metadata if isinstance(metadata, Mapping) else {}
+            if metadata.get("workspace_tree_changed") is True:
+                break
+            if result.get("is_error") is not True:
+                operation = operations.get(result_items.get(result.get("tool_call_id")))
+                # Inspections and proven no-op writes do not reset a failure streak.
+                # Unknown/external effects remain a conservative progress boundary.
+                if operation is None:
+                    break
+                effects = set(operation.effects)
+                readonly = effects <= {"read_workspace"}
+                noop = (metadata.get("workspace_tree_changed") is False
+                        and effects <= {"read_workspace", "write_workspace", "execute_process", "destructive"})
+                if not (readonly or noop):
+                    break
+                if target and (call.get("tool_name"), call.get("arguments")) == (target[0], target[3]):
+                    break  # The same call succeeded: actual recovery.
+                continue
+            # Argument validation permits a corrected call, not identical retries.
+            deterministic = result.get("retryable") is False or result.get("error_code") == "invalid_arguments"
+            if not deterministic:
+                break
+            signature = (result.get("tool_name"), result.get("error_code"),
+                         result.get("error_message"), call.get("arguments"))
+            if target is None:
+                target = signature
+            if signature == target:
+                repeats += 1
+                if repeats == 3:
+                    return True
+        return False
 
     async def _finish_answer(
         self,

@@ -163,7 +163,10 @@ class FindToolsInput(BaseModel):
         default=MAX_FIND_TOOL_MATCHES,
         ge=1,
         le=MAX_FIND_TOOL_MATCHES,
-        description="Maximum matches to return and propose for activation.",
+        description=(
+            f"Maximum matches to return and propose for activation; "
+            f"must be between 1 and {MAX_FIND_TOOL_MATCHES}. Omit to use the default."
+        ),
     )
 
 

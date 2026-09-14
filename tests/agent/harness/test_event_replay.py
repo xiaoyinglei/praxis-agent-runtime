@@ -438,3 +438,23 @@ def test_post_commit_delivery_crash_does_not_lose_replayable_events(
         assert [event.record_id for event in replayed] == [2, 5, 6, 7]
         assert replayed[-1].event_type == "turn_completed"
         assert restarted.verify().valid is True
+
+
+def test_preexecution_tool_rejection_is_visible_and_replayable(tmp_path):
+    with RolloutStore(tmp_path / "rejected.sqlite") as store:
+        thread_id, turn_id = _start_turn(store, tmp_path, "explain with code")
+        result = store.record_tool_result(turn_id=turn_id, operation_id=None, result={
+            "tool_call_id": "rejected-call", "tool_name": "run_command", "is_error": True,
+            "error_code": "cwd_escape", "error_message": "target escapes cwd", "retryable": False,
+        })
+        first = [item for item in _reader(store).read(thread_id)
+                 if item.event.type is events.EventType.ITEM_COMPLETED
+                 and item.event.item_kind is events.TurnItemKind.COMMAND]
+        assert len(first) == 1
+        assert first[0].event.status is events.ItemStatus.FAILED
+        assert first[0].event.data["execution_started"] is False
+        assert first[0].event.data["result"]["error_code"] == "cwd_escape"
+        assert first[0].event.item_id == result.item_id
+        second = _reader(store).read(thread_id)
+        assert any(item.event.item_id == first[0].event.item_id for item in second)
+        assert _reader(store).read(thread_id, after=first[0].cursor) == ()

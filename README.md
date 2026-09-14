@@ -116,13 +116,14 @@ must provide:
 - bounded timeouts and cancellable streaming.
 
 Built-in model IDs remain read-only. User registrations live in the versioned
-user registry; initialize the local binding trust domain once, then inspect or
-register exact model IDs through the CLI. `--provider` selects the provider
+user registry. Agent startup automatically initializes the local binding trust
+domain on first use and reuses it afterward. Inspect or register exact model IDs
+through the CLI. For explicit setup before first use, run `uv run agent model trust init`;
+inspect the existing trust domain with `uv run agent model trust status`.
+`--provider` selects the provider
 adapter and transport; the same `MODEL_ID` is sent to that provider:
 
 ```bash
-uv run agent model trust init
-uv run agent model trust status
 uv run agent model list --source
 uv run agent model current
 export MODEL_ID=provider-model-id
@@ -163,14 +164,62 @@ $ uv run agent chat
 已切换模型: another-model-id
 ```
 
-Interactive chat uses a Unicode-aware line editor, so Backspace/Delete and
-cursor movement operate on complete Chinese characters and emoji. Tool and
-command events are rendered as correlated lifecycle items. The default view
-keeps a readable head and tail for long output and reports the exact omitted
-row count instead of cutting a result mid-value; very narrow terminals use a
-compact marker that fits the actual column width. Enter `/verbose` between Turns
-to show complete subsequent tool results. A separate warning identifies output
-already truncated by the tool or ACI; UI folding never changes durable history.
+Interactive `agent chat` uses a live conversation viewport with Markdown answers,
+a multiline composer, and a model/status bar. Execution groups and individual
+tools expand and collapse **in place**, including while output is streaming.
+Click the triangle or its row to toggle it; no command is needed. Errors remain
+visible even when their execution group is collapsed.
+
+| Control | Action |
+| --- | --- |
+| `/model` | Open model picker; arrows select, Enter confirms, Esc cancels; clicking a model also selects it |
+| Drag over answer text | Select and copy to the system clipboard on macOS |
+| Right click | Paste into the composer without sending |
+| `F2` | Toggle native terminal mouse selection / interactive folding and scrolling |
+| Click `▸` / `▾` | Expand / collapse the execution group or individual tool |
+| `Ctrl+O` | Toggle the latest execution group without leaving the composer |
+| `Tab`, then arrows and `Enter` / Space | Navigate records and toggle the selected row |
+| `Tab` / `Esc` while navigating records | Return to the composer |
+| Mouse wheel / `PageUp` / `PageDown` | Scroll the conversation viewport |
+| `Ctrl+End` | Follow the latest output again |
+| `Enter` / `Alt+Enter` | Send / insert a newline |
+| `Ctrl+C` | Copy a selection first; otherwise cancel execution, clear input, or exit if empty |
+| `Ctrl+D` at an empty prompt | Exit |
+
+Typing `/` offers command completion. Input editing preserves complete Chinese
+characters and emoji, and bracketed multiline paste stays in the composer until
+you send it. Approval questions use the same composer and show the permitted
+choices. Cancelling waits for execution cleanup; existing file changes are not
+rolled back. Mouse interaction requires a terminal with mouse reporting and
+cursor-position reports; keyboard folding is also available.
+Unchanged history reuses its layout when scrolling or refreshing the status bar.
+Resizing or receiving new content invalidates the layout. Use `F2` for native
+terminal selection and copy shortcuts if the terminal does not support drag reporting.
+
+Tool calls rejected before execution (for example, invalid arguments or an
+out-of-workspace path) also appear in the execution records, marked as not
+executed. Whitespace-only model chunks do not start a visible answer. Three
+tool results with the same tool, arguments, and deterministic error without
+observed progress stop the Turn with `repeated_tool_failure`. Read-only calls
+and proven no-op writes do not hide the streak; actual workspace changes,
+successful recovery of the same call, or unmeasured external effects reset it.
+The check uses committed history, including after a process restart. A missing
+file reports `file_not_found`, rather than a generic retryable runner failure.
+Model context includes the actual workspace and the model ID frozen for that Turn.
+
+OpenAI-compatible streams request and preserve provider usage, including a
+usage-only trailing chunk. Token estimates include full tool descriptions and
+schemas when provider usage is absent. An incomplete stream pauses with
+`model_retry` and offers `retry` / `abort`; retry creates a new model attempt
+without replaying tools from the unfinished response.
+
+The live viewport retains up to 100 conversation blocks and 256 tools per
+execution group, with bounded tool details (2,000 display rows and 131,072
+characters per block; 8,388,608 text characters across the viewport). Display omissions are explicitly marked; folding never
+changes durable history. Tool/ACI truncation is reported separately. `/verbose`
+also opens or closes retained execution details. Redirected input/output and
+`TERM=dumb` retain the plain-text chat path; `agent run` and `agent resume` retain
+their existing command-line output.
 
 The next message keeps the current conversation history and creates a new Turn
 bound to the selected model ID; no restart or `/new` is required. An invalid ID
@@ -179,6 +228,111 @@ provider. Each completed or paused Turn retains an authenticated, immutable
 definition in durable history. `agent resume` therefore continues that Turn's
 original model even after the model ID is updated, removed, or selected differently
 for later Turns.
+
+### 启动本地 MLX 模型与 Agent
+
+以下命令在项目根目录执行。Praxis 不会自动启动或关闭 MLX 服务；
+先启动模型服务，再启动 Agent。下载模型权重不会自动把模型加入 Agent 目录。
+当前内置的本地聊天模型为：
+
+- `mlx-community/Qwen3.5-9B-4bit`
+- `mlx-community/gemma-4-26b-a4b-it-4bit`
+
+#### 双窗口运行
+
+窗口 1：启动 Qwen，保持服务运行。首次加载可能需要等待权重下载或加载完成。
+
+```bash
+uv run python -m mlx_lm.server \
+  --model mlx-community/Qwen3.5-9B-4bit \
+  --host 127.0.0.1 --port 8080
+```
+
+窗口 2：启动 Agent。首次启动自动创建本地 trust 密钥，后续启动复用。
+启动后可用 `uv run agent model trust status` 查看状态；如果已有历史绑定却丢失密钥，
+程序会报错要求恢复原密钥，不会自动生成替代密钥。
+
+```bash
+uv run agent chat --model mlx-community/Qwen3.5-9B-4bit
+```
+
+运行 Gemma 时，先在模型窗口按 Ctrl+C 停止旧服务，再执行：
+
+```bash
+uv run python -m mlx_lm.server \
+  --model mlx-community/gemma-4-26b-a4b-it-4bit \
+  --host 127.0.0.1 --port 8080
+```
+
+在另一个窗口启动对应的 Agent：
+
+```bash
+uv run agent chat --model mlx-community/gemma-4-26b-a4b-it-4bit
+```
+
+#### 单窗口运行
+
+先确保没有其他模型服务占用 `8080`。下面在后台启动模型，等待接口就绪后进入
+Agent；日志写入 `/tmp/praxis-mlx.log`。切换启动模型时，只需修改第一行的模型 ID。
+
+```bash
+praxis_model_id=mlx-community/Qwen3.5-9B-4bit
+
+uv run python -m mlx_lm.server \
+  --model "$praxis_model_id" \
+  --host 127.0.0.1 --port 8080 \
+  > /tmp/praxis-mlx.log 2>&1 &
+praxis_mlx_pid=$!
+
+until curl --max-time 2 -fsS http://127.0.0.1:8080/v1/models >/dev/null 2>&1; do
+  if ! kill -0 "$praxis_mlx_pid" 2>/dev/null; then
+    tail -40 /tmp/praxis-mlx.log
+    break
+  fi
+  sleep 2
+done
+
+if kill -0 "$praxis_mlx_pid" 2>/dev/null; then
+  uv run agent chat --model "$praxis_model_id"
+fi
+```
+
+在聊天中输入 `/exit` 退出 Agent，随后在同一个终端关闭此次后台启动的模型：
+
+```bash
+kill "$praxis_mlx_pid"
+```
+
+需要查看模型启动日志时执行：
+
+```bash
+tail -40 /tmp/praxis-mlx.log
+```
+
+#### 查看与切换模型
+
+在 Agent 聊天输入框中输入（不是终端命令）：
+
+```text
+/model
+/model current
+/model mlx-community/Qwen3.5-9B-4bit
+/model mlx-community/gemma-4-26b-a4b-it-4bit
+```
+
+以上两条切换命令按需选一条。`/model` 只更新 Agent 的模型选择，不负责重启 MLX。
+两个本地模型共用 `8080`，切换前需要先在模型窗口停止旧服务、启动目标模型；
+下一条聊天消息会使用新选择并保留对话历史。
+
+也可以在终端保存模型选择，再进入聊天：
+
+```bash
+uv run agent model list --source
+uv run agent model switch mlx-community/Qwen3.5-9B-4bit
+uv run agent chat
+```
+
+手工修改模型目录后，需要退出并重新启动 Agent 才能刷新列表。
 
 ### Run a task
 

@@ -639,16 +639,30 @@ def _validate_with_json_schema(
 def _tool_error_from_pydantic(error: PydanticValidationError) -> ToolValidationError:
     details = error.errors(
         include_url=False,
-        include_context=False,
+        include_context=True,
         include_input=False,
     )
     if not details:
         return ToolValidationError(path="$", message="input validation failed")
     first = details[0]
     error_type = first.get("type", "validation")
+    message = f"{error_type}: validation failed"
+    # Report numeric schema bounds so the model can repair its arguments.
+    # Never forward validator messages, input values, or arbitrary context.
+    bounds = {
+        "less_than_equal": ("le", "less than or equal to"),
+        "less_than": ("lt", "less than"),
+        "greater_than_equal": ("ge", "greater than or equal to"),
+        "greater_than": ("gt", "greater than"),
+    }
+    if error_type in bounds:
+        key, relation = bounds[error_type]
+        bound = first.get("ctx", {}).get(key)
+        if type(bound) is int or (type(bound) is float and math.isfinite(bound)):
+            message = f"{error_type}: must be {relation} {bound}"
     return ToolValidationError(
         path=_json_path(first.get("loc", ())),
-        message=f"{error_type}: validation failed",
+        message=message,
     )
 
 

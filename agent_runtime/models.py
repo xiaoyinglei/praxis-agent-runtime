@@ -43,6 +43,7 @@ from agent_runtime.model_definition import (
 from agent_runtime.model_trust import (
     BindingAuthenticationError,
     ModelBindingTrustDomain,
+    TrustDomainNotInitializedError,
     TrustedModelDefinitionArchive,
     build_model_binding_association,
     build_model_binding_envelope,
@@ -737,6 +738,22 @@ class ModelControlPlane:
 
     def request_model_switch(self, model_id: str) -> ModelSpec:
         return self.switch_model(model_id, requested_by="agent")
+
+    def ensure_model_binding_trust(self, *, has_existing_bindings: bool) -> None:
+        """Initialize a new installation without replacing a lost signing key."""
+        trust = self._trust_domain
+        archive = self._definition_archive
+        if trust is None or archive is None:
+            raise RuntimeError("model binding trust services are not configured")
+        try:
+            trust.status()
+        except TrustDomainNotInitializedError:
+            if has_existing_bindings or any(archive.path.glob("*.json")):
+                raise TrustDomainNotInitializedError(
+                    "Model binding signing key is missing for existing history. "
+                    "Restore the original trust key; refusing to create a replacement."
+                ) from None
+            trust.initialize()
 
     def freeze_model_binding(
         self,

@@ -20,6 +20,7 @@ type AgentPauseKind = Literal[
     "tool_reconciliation",
     "choice",
     "clarification",
+    "model_retry",
 ]
 type AgentDiagnosticSeverity = Literal["warning", "error"]
 
@@ -303,6 +304,16 @@ class AgentResult:
                 context=cast(Mapping[str, JsonValue], interaction.request),
             )
         plan, plan_events = _project_harness_plan(items, turn_status=turn.status)
+        if pause is None and turn.status in {"paused", "interrupted"}:
+            unknown = [op for op in store.list_model_operations(result.turn_id) if op.status == "unknown"]
+            if len(unknown) == 1:
+                pause = AgentPause(
+                    request_id=unknown[0].operation_id,
+                    kind="model_retry",
+                    question="模型响应中断。可重试本次模型请求，或结束这一轮。",
+                    options=("retry", "abort"),
+                    context={"operation_id": unknown[0].operation_id},
+                )
         unknown_model_diagnostics = tuple(
             record
             for record in store.list_records(thread.thread_id)
