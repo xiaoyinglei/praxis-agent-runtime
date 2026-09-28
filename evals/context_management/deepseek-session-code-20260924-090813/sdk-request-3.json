@@ -1,0 +1,308 @@
+{
+  "model": "deepseek-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise coding and file agent. Use the tools that are visible in the\ncurrent request when the task requires workspace inspection, editing,\nexecution, planning, configured knowledge, or another installed capability.\nTool definitions are the authority for their inputs and effects. Preserve\nevidence identifiers and artifact paths. Never invent file contents or tool\nresults. To complete the task, return a non-empty final answer with zero tool\ncalls. There is no `finish` tool: never emit a tool call named `finish`.\n\nContext compaction is a continuation of this conversation, not a new task.\nUse the continuation memory and current messages to answer the active request.\nUse read_context for a specific missing detail, ambiguity, or genuine conflict;\nit reads immutable conversation records, not the live workspace. A successful\nread remains evidence after compaction: do not repeat it merely to reconfirm\nthe same fact. Explicit later revisions supersede earlier decisions; do not\ntreat those as unresolved contradictions. Do not scan the entire archive to\nlook for hypothetical newer decisions when the current history already gives\nthe revision. Once the request is answered by the available evidence, finish.\n\nFor spreadsheet, PDF, CSV, TSV, and JSON tasks, use inspect_data_file to read\nstructure and bounded content; never pass a binary file to read_file. When the\ntask gives the exact data-file path, inspect it directly without listing or\nsearching the workspace first. Use execute_python for calculations, statistics,\ntransformations, charts, and generated artifacts. Pass Python source directly\ninstead of a shell command or heredoc.\nWhen writing, declare the exact output_paths, inspect each required generated\ndata artifact once, and when that inspection reports valid=true, return a\nnon-empty final answer with zero tool calls. Do not\nreread the original binary, repeat the inspection, rewrite\nthe artifact, or escalate to run_command merely for stronger confirmation.\n\nFor coding tasks, search for exact files or symbols before reading broad source\nfiles. Pass a search_text result's line_number to read_file.start_line, never to\nits byte offset. Continue line chunks with next_line and byte chunks with\nnext_offset; never substitute a line number or file size for offset. For an\nimplementation request, establish or update the plan within the first four\ninspection calls and make the first concrete edit within twelve inspection\ncalls. Never submit more than four tool calls in one model turn. Updating the\nplan after the inspection limit can grant only one eight-call focused extension;\nrepeating the plan does not grant more. Do not map the whole repository before\nacting: extract concrete symbols or behaviors from the task, search for the\nexisting choke point, and make the complete coherent change across every\naffected layer. Make the focused delivery change. Match verification to the\nclaim: for a literal file-content task involving text, a targeted read or search\nafter the write can be sufficient; for a generated data artifact, a successful\ninspect_data_file result verifies file structure and content but does not prove\nunrelated code behavior. When the task already supplies the exact file, old\ntext, and replacement, call apply_patch directly; do not pre-read merely to\nreconfirm those inputs because apply_patch fails closed. After a successful\nliteral edit, choose at most one targeted read_file or search_text call. Never\nbatch both tools, and never pair a positive search with a negative search, just\nto double-confirm the same edit. Once that single result shows the requested\nstate and no distinct requirement remains, the next response must be a\nnon-empty final answer with zero tool calls. For a behavioral code change, run\nthe narrowest relevant\nrecognized test, lint, type-check, or build command. Running a pytest file with\n`python` does not execute its tests. Use `pytest -q` from the workspace virtual\nenvironment; use `uv run pytest -q` only when `uv` is available. If no test\nrunner is available in the sandbox, use `python3 -c` with a real top-level\n`assert` that imports and checks the changed behavior; do not install packages\nor request network access.\nPending runtime\nrequirements override these defaults. Reuse successful evidence from an\nunchanged workspace. Do not repeat an edit or inspection, or request command\nexecution solely to reconfirm file content that the existing result already\nestablishes. Fetch a different range or use another tool only for a specific\nunmet requirement. Do not widen into unrelated files after the requested\nbehavior has been implemented and verified.\n\n\nCurrent workspace root and default tool working directory: \"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260924-090813/workspace\". Use paths relative to this root. Omit working_dir or use '.' for the default directory. Tool working_dir and declared output_paths must resolve inside this workspace.\n\n{\"event_type\":\"frozen_run_context\",\"payload\":{\"content\":\"Current model ID for this turn: deepseek-flash.\",\"name\":\"runtime_model_identity\"}}"
+    },
+    {
+      "role": "user",
+      "content": "Implement reconcile(events) in ledger.py from identity.md, deletion.md and ordering.md. First read those three documents together with three read_file calls in ONE response. Preserve event dictionaries and the input list; do not change specification documents. Add and run verify.py covering the specification, using python3. Finish only after checking the changed file."
+    },
+    {
+      "role": "assistant",
+      "content": "I'll read the three specification documents together first.",
+      "tool_calls": [
+        {
+          "id": "call_00_hIFDkEJl6GzzZpro4dwE8280",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"identity.md\"}"
+          }
+        },
+        {
+          "id": "call_01_GBDWGda3JYtHbG1xRyI33298",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"deletion.md\"}"
+          }
+        },
+        {
+          "id": "call_02_cWhUPYafFKMc8qZDnbRZ3583",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"ordering.md\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_hIFDkEJl6GzzZpro4dwE8280",
+      "content": "Tool output archived. Use read_context(item_id='item_3bbba94afbca47d286d8866407aeb1cd') to recover it."
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_01_GBDWGda3JYtHbG1xRyI33298",
+      "content": "Tool result truncated for context capacity; original: read_context(item_id='item_c985349c2a144ccbb50be906d78c598d').\nThe following is an incomplete prefix, not a summary or the full result:\n{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-17\\\", \\\"seq\\\": 17, \\\"amount\\\": -72057594037927944, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 17; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\","
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_02_cWhUPYafFKMc8qZDnbRZ3583",
+      "content": "Tool result truncated for context capacity; original: read_context(item_id='item_75f8796caeab42689608ed333a17c4c9').\nThe following is an incomplete prefix, not a summary or the full result:\n{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-17\\\", \\\"seq\\\": 17, \\\"amount\\\": -72057594037927944, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 17; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-18"
+    },
+    {
+      "role": "assistant",
+      "content": "I have the three specifications. Let me check the existing ledger.py.",
+      "tool_calls": [
+        {
+          "id": "call_00_tqoLQhS5OzWBPK7eD7in7102",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"ledger.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_tqoLQhS5OzWBPK7eD7in7102",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"\\\"\\\"\\\"Tenant event ledger.\\\"\\\"\\\"\\n\\ndef reconcile(events):\\n    return list(events)\\n\",\"encoding\":\"utf-8\",\"end_line\":null,\"is_binary\":false,\"next_line\":null,\"next_offset\":null,\"offset\":0,\"path\":\"ledger.py\",\"recommended_tool\":null,\"size_bytes\":75,\"start_line\":null,\"truncated\":false},\"truncated\":false}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a bounded byte range from one workspace file. Binary files are reported without embedding their bytes; supported spreadsheets and PDFs explicitly route to inspect_data_file. The 16,000-byte default bounds model context; use offset for later chunks, and never set max_bytes above 1,000,000. A targeted read after a write can confirm literal file content. Reuse a sufficient result while the workspace is unchanged; request another range only for content not yet observed. For one literal edit, choose this tool or search_text once, never both as paired confirmation. Binary metadata and a range starting at or past end-of-file do not verify text content.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "description": "Workspace-relative file path.",
+              "maxLength": 4096,
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "encoding": {
+              "default": "utf-8",
+              "description": "Text encoding used when decoding non-binary bytes.",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Encoding",
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "description": "Zero-based byte offset, including when max_lines is supplied. Use start_line for a one-based source line instead. For the next non-overlapping chunk, pass the previous output's next_offset value.",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "start_line": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "One-based source line to start from. Pass search_text.line_number here, never in offset.",
+              "title": "Start Line"
+            },
+            "max_lines": {
+              "anyOf": [
+                {
+                  "maximum": 2000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Maximum lines to read from offset or start_line. When start_line is set and max_lines is omitted, 200 lines are returned.",
+              "title": "Max Lines"
+            },
+            "max_bytes": {
+              "default": 16000,
+              "description": "Optional byte limit from 1 through 1,000,000; omit it to use the context-safe 16,000-byte default, then advance offset for another chunk.",
+              "maximum": 1000000,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "title": "ReadFileInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "apply_patch",
+        "description": "Create a UTF-8 workspace file, or edit an existing file by exact text replacement. Omit old_string only when creating a new file. Without replace_all, the old text must occur exactly once. The write is atomically installed and creation fails if the path exists. Verification toolchains under .venv and node_modules are read-only. After a successful literal edit, use at most one targeted read_file or search_text call, never both, then return a final answer when it proves the requested state. If the task already supplies the exact file, old text, and new text, call apply_patch directly instead of pre-reading merely to reconfirm them; the replacement checks fail closed. Never reapply the patch merely to reconfirm it.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "file_path": {
+              "description": "Workspace-relative path of the file to create or edit.",
+              "maxLength": 4096,
+              "minLength": 1,
+              "title": "File Path",
+              "type": "string"
+            },
+            "old_string": {
+              "anyOf": [
+                {
+                  "maxLength": 1000000,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exact text that must already exist; omit only when creating a file.",
+              "title": "Old String"
+            },
+            "new_string": {
+              "description": "Replacement text; an empty value deletes the old text.",
+              "maxLength": 1000000,
+              "title": "New String",
+              "type": "string"
+            },
+            "replace_all": {
+              "default": false,
+              "description": "Replace every occurrence instead of requiring uniqueness.",
+              "title": "Replace All",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "file_path",
+            "new_string"
+          ],
+          "title": "ApplyPatchInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_command",
+        "description": "Run one shell command inside a restricted OS sandbox from a workspace-relative directory. The workspace is read-only by default and a private temporary directory is writable. Set workspace_write=true to request destructive workspace write access; .git, .venv, and node_modules remain read-only. Host environment variables and network access are disabled. Set network=true to request a separate network approval. Timeout or cancellation terminates and reaps the complete process group. Commands fail closed before execution when hardlinked workspace files could bypass path containment. For implementation tasks, locate the affected code before execution and prefer focused verification over a full-repository test run. Use recognized read-only commands to verify code behavior; do not execute a process solely to reconfirm unchanged literal file content already established by a read or search.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "description": "Shell command to execute in an isolated process group.",
+              "maxLength": 8000,
+              "minLength": 1,
+              "title": "Command",
+              "type": "string"
+            },
+            "working_dir": {
+              "default": ".",
+              "description": "Workspace-relative working directory.",
+              "maxLength": 4096,
+              "title": "Working Dir",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "default": 120.0,
+              "description": "Per-command timeout in seconds before the whole process group is terminated; use 120, not 120000. Values from 1000 through 600000 are accepted as an unambiguous millisecond form and normalized to seconds. The effective maximum is 600 seconds.",
+              "exclusiveMinimum": 0,
+              "maximum": 600000.0,
+              "title": "Timeout Seconds",
+              "type": "number"
+            },
+            "network": {
+              "default": false,
+              "description": "Request outbound network access. Network is disabled by default and requires a separate approval from command execution.",
+              "title": "Network",
+              "type": "boolean"
+            },
+            "workspace_write": {
+              "default": false,
+              "description": "Request write access to the workspace. The workspace is read-only by default; enabling writes is destructive and requires explicit approval. .git paths always remain read-only, and .git symlink aliases are refused.",
+              "title": "Workspace Write",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "title": "RunCommandInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_context",
+        "description": "Recall original content from a compacted context reference by canonical item_id. Use item_id=history to page through the archived Item ID catalog. With item_id=history AND query, search archived original CONTENT without knowing its ID; returns the first matching item and excerpt. start_index (default 0) is a history index for this search mode; use next_index to continue. Each search examines up to 64 archived items. matched=false only describes searched_from_index through searched_to_index; only search_complete=true means there are no further archived items in this view. For more matches within the same item use matched_item_id and next_match_offset. history_index gives chronological order in this visible history; higher means later. The catalog contains metadata only; search a specific item for its content. For a specific fact, supply query to search the ENTIRE original payload case-insensitively and return a bounded excerpt around the first match; use next_match_offset to find another. Never infer absence from skipped pages. A matched=false search covers searched_from to searched_to. Without query, returns a page of the original Item payload encoded as JSON text. Concatenate text pages before parsing JSON. offset is a Unicode character offset (default 0); max_chars defaults to 2000, maximum 4000. If truncated, continue at next_offset. Only completed Items visible to this Turn, including its fork ancestry, can be read.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_chars": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4000
+            },
+            "start_index": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "item_id"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_tokens": 4096,
+  "stream": true,
+  "extra_body": {
+    "thinking": {
+      "type": "disabled"
+    }
+  },
+  "parallel_tool_calls": true,
+  "temperature": 0.0,
+  "top_p": 1.0
+}

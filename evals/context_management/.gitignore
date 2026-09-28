@@ -1,0 +1,5 @@
+# Retain local execution evidence without adding generated databases/workspaces.
+deepseek-functional-*/*.db*
+deepseek-functional-*/*-workspace/
+# SQLite sidecars belong with the ignored local database, not in Git alone.
+deepseek-session-code-*/*.db*

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -32,6 +32,7 @@ from agent_runtime.tools.executor import (
 )
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import (
+    CancellationMode,
     JsonValue,
     ResolvedToolUse,
     Tool,
@@ -226,21 +227,26 @@ class ToolOrchestrator:
             restored.append(tool)
         return tuple(restored)
 
+    def _pending_record(self, turn_id: str, call: ToolCall) -> ToolExecutionRecord | None:
+        operation = next(
+            (op for op in self._store.list_tool_operations(turn_id) if op.tool_call_id == call.tool_call_id), None
+        )
+        if operation is None:
+            return None
+        if operation.status not in {"prepared", "ready"} or operation.attempt_count:
+            raise RuntimeError("tool call already has an operation; use its durable recovery protocol")
+        return ToolExecutionRecord(
+            tool_call_id=operation.tool_call_id,
+            tool_name=operation.tool_name,
+            operation_id=operation.operation_id,
+            arguments_digest=operation.arguments_digest,
+            idempotent=operation.idempotent,
+            status=ExecutionStatus.PREPARED,
+        )
+
     async def execute(self, *, turn_id: str, call: ToolCall) -> ToolResult:
         execution_context = self._context_for_call(turn_id, call)
-        await self._commit(
-            lambda: self._store.record_tool_call(
-                turn_id=turn_id,
-                tool_call_id=call.tool_call_id,
-                tool_name=call.tool_name,
-                arguments=_json_mapping(call.arguments),
-                origin={
-                    "request_id": call.origin.request_id,
-                    "toolset_revision": call.origin.toolset_revision,
-                    "exposed_tool_names": list(call.origin.exposed_tool_names),
-                },
-            )
-        )
+        await self._record_call(turn_id, call)
         inspection_block = self._inspection_budget_result(
             turn_id=turn_id,
             call=call,
@@ -287,13 +293,41 @@ class ToolOrchestrator:
                 resolved.targets,
             )
 
-        execution = await self._execute_in_turn(turn_id, 
+        execution = await self._execute_in_turn(
+            turn_id,
             call,
             context=execution_context,
+            record=self._pending_record(turn_id, call),
             record_sink=persist,
             preflight_sink=capture_preflight,
             progress_sink=publish_progress,
         )
+        await self._accept_execution(turn_id, call, execution, execution_context)
+        return execution.result
+
+    async def _record_call(self, turn_id: str, call: ToolCall) -> None:
+        await self._commit(
+            lambda: self._store.record_tool_call(
+                turn_id=turn_id,
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments=_json_mapping(call.arguments),
+                origin={
+                    "request_id": call.origin.request_id,
+                    "toolset_revision": call.origin.toolset_revision,
+                    "exposed_tool_names": list(call.origin.exposed_tool_names),
+                },
+            )
+        )
+
+    async def _accept_execution(
+        self,
+        turn_id: str,
+        call: ToolCall,
+        execution: ToolExecution,
+        execution_context: ToolExecutionContext,
+    ) -> None:
+        tool = self._tools.get(call.tool_name)
         if execution.result.error_code == "approval_required":
             if tool is None:
                 raise RuntimeError("unknown tool cannot request approval")
@@ -327,8 +361,129 @@ class ToolOrchestrator:
             call=call,
             execution=execution,
         )
-        return execution.result
 
+    async def execute_batch(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
+        """Preflight before I/O, then run bounded, resource-safe local tools.
+
+        Remote outcomes and state-changing tools retain sequential execution:
+        their pause/activation protocols require a quiescent Turn. Inspection
+        batches beyond the remaining inspection budget retain sequential accounting.
+        All calls are durable before approval can interrupt the batch.
+        """
+        calls = tuple(calls)
+        if not calls:
+            return ()
+        if len({call.tool_call_id for call in calls}) != len(calls):
+            raise ValueError("batch tool call identities must be unique")
+        for call in calls:
+            await self._record_call(turn_id, call)
+        def parallel_local(call: ToolCall) -> bool:
+            tool = self._tools.get(call.tool_name)
+            return bool(
+                tool is not None and tool.concurrency_safe
+                and tool.cancellation_mode in {CancellationMode.COOPERATIVE, CancellationMode.MANAGED_PROCESS}
+            )
+
+        results: list[ToolResult] = []
+        offset = 0
+        while offset < len(calls):
+            end = offset + 1
+            if parallel_local(calls[offset]):
+                while end < len(calls) and parallel_local(calls[end]) and calls[end].origin == calls[offset].origin:
+                    end += 1
+            # State-changing and remote calls are barriers. Resolve the next
+            # segment's context and inspection budget only after this one drains.
+            results.extend(await self._execute_batch_segment(turn_id=turn_id, calls=calls[offset:end]))
+            if self._store.read_turn(turn_id).status != "running":
+                break
+            offset = end
+        return tuple(results)
+
+    async def _execute_batch_segment(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
+        contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
+        tools = tuple(self._tools.get(call.tool_name) for call in calls)
+        inspection_fits = True
+        if _requires_workspace_change(self._store, turn_id) and not _has_committed_workspace_change(
+            self._store, turn_id
+        ):
+            operations = self._store.list_tool_operations(turn_id)
+            budget = (
+                _PLANNED_INSPECTION_BUDGET
+                if any(op.tool_name == "update_plan" and op.status == "succeeded" for op in operations)
+                else _INITIAL_INSPECTION_BUDGET
+            )
+            call_ids = {call.tool_call_id for call in calls}
+            used_or_pending = sum(
+                _operation_consumes_inspection_budget(op)
+                and (
+                    op.status == "succeeded" or (op.tool_call_id not in call_ids and op.status in {"ready", "running"})
+                )
+                for op in operations
+            )
+            demand = sum(tool is not None and tool_consumes_inspection_budget(tool) for tool in tools)
+            inspection_fits = used_or_pending + demand <= budget
+        serial = (
+            not inspection_fits
+            or any(context != contexts[0] for context in contexts[1:])
+            or any(call.origin != calls[0].origin for call in calls[1:])
+            or any(
+                tool is not None
+                and (
+                    not tool.concurrency_safe
+                    or tool.cancellation_mode not in {CancellationMode.COOPERATIVE, CancellationMode.MANAGED_PROCESS}
+                )
+                for tool in tools
+            )
+        )
+        if serial:
+            results = []
+            for call in calls:
+                results.append(await self.execute(turn_id=turn_id, call=call))
+                if self._store.read_turn(turn_id).status != "running":
+                    break
+            return tuple(results)
+
+        by_id = {call.tool_call_id: call for call in calls}
+        active: dict[str, ToolExecutionRecord] = {}
+
+        async def persist(record: ToolExecutionRecord) -> None:
+            await self._persist_execution_record(turn_id=turn_id, tool=self._tools[record.tool_name], record=record)
+            if record.status is ExecutionStatus.STARTED:
+                active[record.tool_call_id] = record
+
+        def preflight(record: ToolExecutionRecord, resolved: ResolvedToolUse) -> None:
+            self._resolved_scopes[record.operation_id] = _durable_tool_scope(resolved.effects, resolved.targets)
+
+        def progress_for(call: ToolCall) -> Callable[[ToolProgress], Awaitable[None]]:
+            async def publish(progress: ToolProgress) -> None:
+                await self._publish_tool_progress(turn_id=turn_id, record=active[call.tool_call_id], progress=progress)
+
+            return publish
+
+        async def accept(execution: ToolExecution) -> None:
+            await self._accept_execution(turn_id, by_id[execution.result.tool_call_id], execution, contexts[0])
+
+        token = _ACTIVE_TOOL_TURN_ID.set(turn_id)
+        snapshot = self._step_snapshot(turn_id, calls[0])
+        binding_token = _ACTIVE_TOOL_BINDING.set(None if snapshot is None else snapshot["binding_manifest"])
+        try:
+            executions = await self._executor.execute_batch(
+                calls,
+                context=contexts[0],
+                records={
+                    call.tool_call_id: record
+                    for call in calls
+                    if (record := self._pending_record(turn_id, call)) is not None
+                },
+                record_sink=persist,
+                preflight_sink=preflight,
+                progress_sinks={call.tool_call_id: progress_for(call) for call in calls},
+                execution_sink=accept,
+            )
+            return tuple(execution.result for execution in executions)
+        finally:
+            _ACTIVE_TOOL_BINDING.reset(binding_token)
+            _ACTIVE_TOOL_TURN_ID.reset(token)
 
     async def _execute_in_turn(
         self,
@@ -373,9 +528,7 @@ class ToolOrchestrator:
                     operation_id=record.operation_id,
                     attempt_generation=claim[0],
                 ),
-                item_kind=(
-                    TurnItemKind.COMMAND if is_command else TurnItemKind.TOOL
-                ),
+                item_kind=(TurnItemKind.COMMAND if is_command else TurnItemKind.TOOL),
                 delta_kind=delta_kind,
                 delta=progress.content,
             )
@@ -402,10 +555,7 @@ class ToolOrchestrator:
         claim = self._claims.pop(record.operation_id, None)
         if claim is None:
             operation = self._store.read_tool_operation(record.operation_id)
-            if (
-                operation.status == "failed"
-                and operation.error_code == record.error_code == "resource_busy"
-            ):
+            if operation.status == "failed" and operation.error_code == record.error_code == "resource_busy":
                 await self._commit(
                     lambda: self._store.record_tool_result(
                         turn_id=turn_id,
@@ -513,7 +663,8 @@ class ToolOrchestrator:
                 denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
                 require_confirmation_for=(execution_context.require_confirmation_for | {call.tool_name}),
             )
-            preflight = await self._execute_in_turn(turn_id, 
+            preflight = await self._execute_in_turn(
+                turn_id,
                 call,
                 context=preflight_context,
             )
@@ -580,7 +731,8 @@ class ToolOrchestrator:
                 progress=progress,
             )
 
-        execution = await self._execute_in_turn(turn_id, 
+        execution = await self._execute_in_turn(
+            turn_id,
             call,
             context=context,
             record=record,
@@ -603,6 +755,8 @@ class ToolOrchestrator:
             if interaction.kind == "tool_approval"
             and interaction.status == "resolved"
             and interaction.response.get("decision") == "approve"
+            and interaction.operation_id is not None
+            and self._store.read_tool_operation(interaction.operation_id).status == "ready"
         ]
         if len(resolved) != 1 or resolved[0].operation_id is None:
             raise RuntimeError("recovery requires one resolved approved operation")
@@ -681,7 +835,8 @@ class ToolOrchestrator:
                 progress=progress,
             )
 
-        execution = await self._execute_in_turn(turn_id, 
+        execution = await self._execute_in_turn(
+            turn_id,
             call,
             context=context,
             record=record,
@@ -762,6 +917,9 @@ class ToolOrchestrator:
         )
         if record.status is ExecutionStatus.PREPARED:
             if existing is not None:
+                if existing.status == "prepared":
+                    await self._write_operation_state(turn_id=turn_id, tool=tool, record=record, status="ready")
+                    return
                 if existing.status != "ready":
                     raise RuntimeError("prepared execution record requires a ready operation")
                 return
@@ -975,14 +1133,17 @@ def _policy_revision(context: ToolExecutionContext, tool: Tool, execution: ToolE
         "cwd": None if context.cwd is None else str(context.cwd),
         "allow_write_tools": context.allow_write_tools if ToolEffect.WRITE_WORKSPACE in effects else None,
         "allow_execute_tools": context.allow_execute_tools if ToolEffect.EXECUTE_PROCESS in effects else None,
-        "active_skill_ids": sorted(target.value for target in targets if target.kind == "active_skill"
-                                   and target.value in context.active_skill_ids),
+        "active_skill_ids": sorted(
+            target.value
+            for target in targets
+            if target.kind == "active_skill" and target.value in context.active_skill_ids
+        ),
         "deny_effects": sorted(effect.value for effect in context.deny_effects & effects),
         "require_confirmation": tool.definition.name in context.require_confirmation_for,
         "denied": tool.definition.name in context.denied_tool_names,
-        "auto_approve_sandboxed": context.auto_approve_sandboxed if any(
-            target.kind == "execution_mode" and target.value == "restricted_sandbox" for target in targets
-        ) else None,
+        "auto_approve_sandboxed": context.auto_approve_sandboxed
+        if any(target.kind == "execution_mode" and target.value == "restricted_sandbox" for target in targets)
+        else None,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()

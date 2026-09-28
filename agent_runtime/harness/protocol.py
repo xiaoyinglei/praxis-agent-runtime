@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import json
+from collections.abc import Awaitable, Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -36,10 +37,19 @@ class HarnessModelRequest:
     step: int = 1
     model_token_budget_remaining: int | None = None
     budget_pressure: bool = False
+    purpose: str = "agent_step"
+    request_id: str | None = None
+    input_token_limit: int | None = None
+    output_token_limit: int | None = None
+    continuation_summary_role: str | None = None
 
 
 class ModelDispatchPreflightError(RuntimeError):
     """The model call was rejected before any provider I/O began."""
+
+
+class ModelContextOverflowError(ModelDispatchPreflightError):
+    """A definite context-limit rejection; eligible for one durable compaction retry."""
 
 
 class ModelDispatchOutcomeUnknownError(RuntimeError):
@@ -129,6 +139,10 @@ class CompletionGate(Protocol):
 class ContextManager(Protocol):
     def build(self, turn_id: str) -> tuple[HarnessMessage, ...]: ...
 
+    def compaction_candidates(self, turn_id: str) -> Iterator[ContextCompactionCandidate]: ...
+
+    def commit_compaction(self, candidate: ContextCompactionCandidate) -> object: ...
+
     def compact_for_budget(
         self,
         *,
@@ -140,6 +154,31 @@ class ContextManager(Protocol):
 class ContextBudgetExceededError(RuntimeError):
     """Committed context cannot fit inside the configured provider boundary."""
 
+    def __init__(self, message: str, *, reason_code: str = "context_budget_exceeded") -> None:
+        self.reason_code = reason_code
+        super().__init__(message)
+
+
+class ContextSourceChangedError(RuntimeError):
+    """A candidate was measured against an obsolete rollout snapshot."""
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactionCandidate:
+    """Canonical JSON owns nested data; callers receive fresh message snapshots."""
+
+    turn_id: str
+    source_revision: str
+    payload_json: str
+    messages_json: str
+
+    @property
+    def messages(self) -> tuple[HarnessMessage, ...]:
+        return tuple(
+            HarnessMessage(**{**m, "tool_calls": tuple(HarnessToolCall(**c) for c in m["tool_calls"])})
+            for m in json.loads(self.messages_json)
+        )
+
 
 class ContextCompactionRequiredError(ContextBudgetExceededError):
     """Provider preparation requires a durable Runtime-owned compaction."""
@@ -149,7 +188,7 @@ class ContextCompactionRequiredError(ContextBudgetExceededError):
         *,
         input_tokens: int,
         max_input_tokens: int,
-        retained_tail_messages: int,
+        retained_tail_messages: int = 0,
     ) -> None:
         self.input_tokens = input_tokens
         self.max_input_tokens = max_input_tokens

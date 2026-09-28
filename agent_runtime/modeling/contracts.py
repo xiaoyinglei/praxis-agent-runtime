@@ -23,6 +23,7 @@ type LLMUsageSource = Literal["provider", "tokenizer_estimate"]
 
 
 class LLMCallStage(StrEnum):
+    CONTEXT_COMPACTION = "context_compaction"
     AGENT_STEP = "agent_step"
     GOAL_CONTRACT = "goal_contract"
     RETRIEVAL_HINT = "retrieval_hint"

@@ -11,6 +11,7 @@ from uuid import uuid4
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
+from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
 from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
@@ -270,6 +271,7 @@ def configure_services(
     )
     registry = build_tool_registry(
         tuple((tools or {}).values()),
+        create_context_recall_tool(store),
         knowledge_tools,
         skill_tools,
         (
@@ -285,6 +287,8 @@ def configure_services(
         *tuple(discoverable_tool_names),
         *(("task",) if enable_subagents else ()),
     )
+    if READ_CONTEXT_NAME in discoverable_names:
+        raise ValueError("read_context is a resident tool owned by the composition root")
     if len(set(discoverable_names)) != len(discoverable_names):
         raise ValueError("discoverable tool names must be unique")
     installed_names = tuple(tool.definition.name for tool in registry.list_all())

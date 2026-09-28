@@ -16,7 +16,17 @@ CODING_REFERENCE = ROOT / "CLAUDE.md"
 _HISTORICAL_EXCEPTIONS = {
     ROOT / "evals/code_agent/benchmark_v1.json",
     ROOT / "tests/agent/test_code_agent_benchmark.py",
+    ROOT / "docs/design/context_parallel_source_audit_2026-09-21.md",
 }
+# Provider transcripts, generated workspaces, and offline replays retain the
+# original paths as evidence. They are not portable runtime contracts. Keep the
+# maintained runners and README in this directory under the ordinary checks.
+_CONTEXT_EVALS = ROOT / "evals/context_management"
+_HISTORICAL_EXCEPTIONS.update(_CONTEXT_EVALS.glob("offline-*.json"))
+_HISTORICAL_EXCEPTIONS.update(_CONTEXT_EVALS.glob("semantic-live-*.json"))
+for _snapshot in _CONTEXT_EVALS.glob("deepseek-*"):
+    if _snapshot.is_dir():
+        _HISTORICAL_EXCEPTIONS.update(path for path in _snapshot.rglob("*") if path.is_file())
 _SCANNED_SUFFIXES = {".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"}
 
 
@@ -41,7 +51,7 @@ def _active_contract_files() -> Iterator[Path]:
     yield ROOT / "CLAUDE.md"
     yield ROOT / "docs/RUNBOOK.md"
     yield ROOT / "pyproject.toml"
-    yield from (ROOT / "docs/design").glob("*.md")
+    yield from (path for path in (ROOT / "docs/design").glob("*.md") if path not in _HISTORICAL_EXCEPTIONS)
 
 
 def test_distribution_and_console_entrypoint_use_praxis_namespace() -> None:
@@ -100,6 +110,13 @@ def test_active_contracts_do_not_expose_a_personal_checkout_path() -> None:
     ]
 
     assert offenders == []
+
+
+def test_context_evaluation_runners_remain_active_contracts() -> None:
+    active = set(_active_contract_files())
+    assert set(_CONTEXT_EVALS.glob("*.py")) <= active
+    assert _CONTEXT_EVALS / "README.md" in active
+    assert ROOT / "docs/RUNBOOK.md" in active
 
 
 def test_coding_reference_tracks_the_current_praxis_runtime() -> None:

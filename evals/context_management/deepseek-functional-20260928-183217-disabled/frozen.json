@@ -1,0 +1,9 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "disabled",
+  "prompt": "production",
+  "synthetic_only": true,
+  "script_sha256": "d2663297c14bbd6b62d71d75da7c8612d67001656d2f06d2004b39a255be5a27",
+  "selected_case": "archived_detail_recall_hidden",
+  "cases": {}
+}

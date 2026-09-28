@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
@@ -81,9 +82,8 @@ class InspectingModel:
 class CompactionRequestingModel(InspectingModel):
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         self.prepared_requests.append(request)
-        if not any(
-            message.role == "context"
-            and message.content.startswith("Context compaction:\n")
+        if request.purpose != "context_summary" and not any(
+            message.role == "context" and message.content.startswith("Context compaction:\n")
             for message in request.messages
         ):
             raise ContextCompactionRequiredError(
@@ -96,7 +96,21 @@ class CompactionRequestingModel(InspectingModel):
             context_hash="compacted-context-hash",
             tool_hash="compacted-tool-hash",
             wire_hash="compacted-wire-hash",
-            request_ref={"message_count": len(request.messages)},
+            request_ref={"message_count": len(request.messages), "context_projection": {"max_input_tokens": 20000}},
+            resource_request=ResourceUsage(
+                input_tokens=100, output_tokens=512, model_calls=1
+            ),
+        )
+
+    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+        operation = self._store.list_model_operations()[-1]
+        assert operation.status == "dispatched"
+        return HarnessModelResponse(
+            text="Summary preserves the architecture boundary."
+            if prepared.request_ref.get("purpose") == "context_summary"
+            else "model answer",
+            provider_response_id="response",
+            usage={"input_tokens": 5, "output_tokens": 2},
         )
 
 
@@ -181,9 +195,7 @@ class AcknowledgedCancellationModel(InspectingModel):
     ) -> HarnessModelResponse:
         del prepared
         assert delta_sink is not None
-        emitted = delta_sink(
-            HarnessModelDelta(channel="text", content="partial before cancel")
-        )
+        emitted = delta_sink(HarnessModelDelta(channel="text", content="partial before cancel"))
         if emitted is not None:
             await emitted
         raise ModelDispatchCancelledError("provider acknowledged cancellation")
@@ -473,7 +485,7 @@ def test_session_commits_required_compaction_before_model_dispatch(
             user_message="Preserve the architecture boundary.",
             binding_manifest={"model_id": "test-model"},
         )
-        store.complete_turn(turn_id=previous.turn_id, answer="previous answer")
+        store.complete_turn(turn_id=previous.turn_id, answer="previous answer " * 1_000)
         model = CompactionRequestingModel(store)
         runner = TurnExecutor(
             thread_id=thread.thread_id,
@@ -493,12 +505,10 @@ def test_session_commits_required_compaction_before_model_dispatch(
         )
 
         assert result.status == "completed"
-        assert len(model.prepared_requests) == 2
-        assert any(
-            item.kind == "context_compaction"
-            for item in store.list_items(result.turn_id)
-        )
-        assert len(store.list_model_operations(result.turn_id)) == 1
+        # Budget planning prepares additional candidates without dispatching them.
+        assert model.prepared_requests[-1].purpose == "agent_step"
+        assert any(item.kind == "context_compaction" for item in store.list_items(result.turn_id))
+        assert len(store.list_model_operations(result.turn_id)) == 2
         assert store.verify().valid is True
 
 
@@ -560,10 +570,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
                     binding_manifest={"model_id": "test-model"},
                 )
             )
-            initial_events = [
-                await asyncio.wait_for(stream.receive(), timeout=0.5)
-                for _index in range(3)
-            ]
+            initial_events = [await asyncio.wait_for(stream.receive(), timeout=0.5) for _index in range(3)]
             await asyncio.wait_for(
                 asyncio.to_thread(provider.blocked.wait),
                 timeout=0.5,
@@ -579,11 +586,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
 
             [operation] = store.list_model_operations()
             [attempt] = store.list_model_attempts(operation.operation_id)
-            [response_item] = [
-                item
-                for item in store.list_items(operation.turn_id)
-                if item.kind == "model_response"
-            ]
+            [response_item] = [item for item in store.list_items(operation.turn_id) if item.kind == "model_response"]
 
             assert [event.type for event in initial_events] == [
                 EventType.TURN_STARTED,
@@ -596,8 +599,7 @@ async def test_harness_cancel_of_blocked_sync_provider_closes_item_without_join(
             completed = [
                 event
                 for event in terminal_events
-                if event.type is EventType.ITEM_COMPLETED
-                and event.item_kind is TurnItemKind.AGENT_MESSAGE
+                if event.type is EventType.ITEM_COMPLETED and event.item_kind is TurnItemKind.AGENT_MESSAGE
             ]
             assert len(completed) == 1
             assert completed[0].status is ItemStatus.OUTCOME_UNKNOWN
@@ -638,9 +640,7 @@ async def test_zero_text_tool_only_response_starts_then_completes_without_delta(
         and event.item_kind is TurnItemKind.AGENT_MESSAGE
         and event.data["tool_calls"]
     )
-    tool_only_lifecycle = [
-        event for event in events if event.item_id == tool_only_completion.item_id
-    ]
+    tool_only_lifecycle = [event for event in events if event.item_id == tool_only_completion.item_id]
 
     assert result.answer == "tool completed"
     assert model.dispatch_count == 2
@@ -920,9 +920,7 @@ def test_model_completion_faults_are_atomic_at_every_substep(
         assert store.list_records(thread.thread_id) == records_before
         assert store.list_items(turn.turn_id) == items_before
         assert store.list_model_operations(turn.turn_id)[0].status == "dispatched"
-        assert store.list_model_attempts(operation.operation_id)[0].status == (
-            "dispatched"
-        )
+        assert store.list_model_attempts(operation.operation_id)[0].status == ("dispatched")
         assert store.verify().valid is True
 
 
@@ -965,9 +963,7 @@ def test_stale_model_generation_appends_nothing(tmp_path: Path) -> None:
 
         assert accepted is False
         assert store.list_records(thread.thread_id) == before
-        assert store.list_model_attempts(operation.operation_id)[-1].attempt_id == (
-            current.attempt_id
-        )
+        assert store.list_model_attempts(operation.operation_id)[-1].attempt_id == (current.attempt_id)
         assert store.verify().valid is True
 
 
@@ -1092,9 +1088,7 @@ async def test_partial_provider_failure_closes_started_channels_failed(
             TurnItemKind.PLAN,
         }
         assert all(event.status is ItemStatus.FAILED for event in completed)
-        assert {
-            event.item_kind: event.data["content"] for event in completed
-        } == {
+        assert {event.item_kind: event.data["content"] for event in completed} == {
             TurnItemKind.AGENT_MESSAGE: "partial answer",
             TurnItemKind.REASONING: "partial reasoning",
             TurnItemKind.PLAN: "partial plan",
@@ -1136,8 +1130,7 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
         [completed] = [
             event
             for event in events
-            if event.type is EventType.ITEM_COMPLETED
-            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+            if event.type is EventType.ITEM_COMPLETED and event.item_kind is TurnItemKind.AGENT_MESSAGE
         ]
         assert result.status == "cancelled"
         assert store.read_turn(result.turn_id).status == "cancelled"
@@ -1146,9 +1139,7 @@ async def test_acknowledged_provider_cancel_closes_started_channels_cancelled(
         assert completed.status is ItemStatus.CANCELLED
         assert completed.data["content"] == "partial before cancel"
         cancellation_index = next(
-            index
-            for index, event in enumerate(events)
-            if event.type is EventType.TURN_CANCELLATION_REQUESTED
+            index for index, event in enumerate(events) if event.type is EventType.TURN_CANCELLATION_REQUESTED
         )
         completion_index = events.index(completed)
         assert cancellation_index < completion_index < len(events) - 1
@@ -1229,14 +1220,12 @@ async def test_model_retry_uses_new_attempt_and_public_item_ids(
         starts = [
             event
             for event in events
-            if event.type is EventType.ITEM_STARTED
-            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+            if event.type is EventType.ITEM_STARTED and event.item_kind is TurnItemKind.AGENT_MESSAGE
         ]
         completed = [
             event
             for event in events
-            if event.type is EventType.ITEM_COMPLETED
-            and event.item_kind is TurnItemKind.AGENT_MESSAGE
+            if event.type is EventType.ITEM_COMPLETED and event.item_kind is TurnItemKind.AGENT_MESSAGE
         ]
         [operation] = store.list_model_operations(paused.turn_id)
         attempts = store.list_model_attempts(operation.operation_id)

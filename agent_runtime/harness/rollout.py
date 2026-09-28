@@ -30,6 +30,7 @@ from agent_runtime.budget import (
 from agent_runtime.budget import (
     reserve as reserve_budget,
 )
+from agent_runtime.harness.protocol import ContextSourceChangedError
 from agent_runtime.harness.reducer import ProjectionState, apply_record
 from agent_runtime.planning import PlanStep
 from agent_runtime.streaming.events import (
@@ -437,8 +438,11 @@ class RolloutStore:
         with self._transaction():
             self.read_thread(thread_id)
             self._append_and_reduce(
-                thread_id=thread_id, turn_id=None, record_type="session_settings_updated",
-                producer="runtime", payload={"settings": frozen},
+                thread_id=thread_id,
+                turn_id=None,
+                record_type="session_settings_updated",
+                producer="runtime",
+                payload={"settings": frozen},
             )
 
     def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
@@ -671,11 +675,7 @@ class RolloutStore:
         steps = [
             {
                 **dict(step),
-                "status": (
-                    step_status
-                    if step.get("status") in {"pending", "in_progress"}
-                    else step.get("status")
-                ),
+                "status": (step_status if step.get("status") in {"pending", "in_progress"} else step.get("status")),
             }
             for step in raw_plan.get("steps", ())
             if isinstance(step, Mapping)
@@ -690,10 +690,9 @@ class RolloutStore:
         event_type = "completed" if status == "complete" else "blocked"
         event = {
             "event_type": event_type,
-            "message": message or (
-                "Plan completed with the accepted Turn."
-                if status == "complete"
-                else "Plan blocked by the failed Turn."
+            "message": message
+            or (
+                "Plan completed with the accepted Turn." if status == "complete" else "Plan blocked by the failed Turn."
             ),
             "tool_call_ids": [],
         }
@@ -762,7 +761,6 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
-
     def interrupt_orphaned_turn(
         self,
         *,
@@ -824,6 +822,18 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    def context_source_revision(self, turn_id: str) -> str:
+        """Version every source Thread, including non-message state transitions."""
+        thread_ids = {item.thread_id for item in self.list_context_items(turn_id)}
+        thread_ids.add(self.read_turn(turn_id).thread_id)
+        versions = [
+            (thread_id, self.read_thread(thread_id).applied_thread_sequence) for thread_id in sorted(thread_ids)
+        ]
+        return hashlib.sha256(_canonical_json(versions).encode()).hexdigest()
+
+    def context_durable_state(self, turn_id: str) -> dict[str, Any]:
+        return _context_durable_state(self, turn_id)
+
     def record_context_compaction(
         self,
         *,
@@ -833,6 +843,11 @@ class RolloutStore:
         preserved_facts: Mapping[str, Any],
         artifact_refs: tuple[Mapping[str, Any], ...] = (),
         context_version: int,
+        preserved_item_ids: tuple[str, ...] = (),
+        expected_source_revision: str | None = None,
+        durable_state: Mapping[str, Any] | None = None,
+        algorithm_revision: str | None = None,
+        tool_result_overrides: Mapping[str, str] | None = None,
     ) -> ItemSnapshot:
         """Append an auditable replacement for one committed context prefix."""
 
@@ -846,6 +861,11 @@ class RolloutStore:
             raise ValueError("context_version must be a positive integer")
 
         with self._transaction():
+            if (
+                expected_source_revision is not None
+                and self.context_source_revision(turn_id) != expected_source_revision
+            ):
+                raise ContextSourceChangedError("Context source changed before compaction commit.")
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?",
                 (turn_id,),
@@ -858,6 +878,48 @@ class RolloutStore:
             visible_ids = tuple(item.item_id for item in visible_items)
             if visible_ids[: len(covered_item_ids)] != covered_item_ids:
                 raise ValueError("compaction must cover a contiguous context prefix in exact order")
+            if len(set(preserved_item_ids)) != len(preserved_item_ids) or any(
+                item_id not in covered_item_ids for item_id in preserved_item_ids
+            ):
+                raise ValueError("preserved Items must belong to the covered prefix")
+            if algorithm_revision == "semantic-compaction-v5":
+                pending: set[tuple[str, str]] = set()
+                replay_results: set[str] = set()
+                for item in visible_items:
+                    if item.item_id not in preserved_item_ids:
+                        continue
+                    if item.kind == "model_response" and item.payload.get("tool_calls"):
+                        if pending:
+                            raise ValueError("preserved tool exchanges must be complete")
+                        pending.update((item.turn_id, call["id"]) for call in item.payload["tool_calls"])
+                    elif item.kind == "tool_result":
+                        key = (item.turn_id, item.payload.get("tool_call_id"))
+                        if key not in pending:
+                            raise ValueError("preserved tool result must have its original call")
+                        pending.remove(key)
+                        replay_results.add(item.item_id)
+                    elif item.kind != "user_message" or pending:
+                        raise ValueError("only user Items and complete tool exchanges can be preserved")
+                if pending or replay_results != set(tool_result_overrides or {}):
+                    raise ValueError("preserved tool exchanges require all paired archived results")
+                for source_turn in {item.turn_id for item in visible_items if item.item_id in replay_results}:
+                    if any(op.result_item_id in replay_results and (op.requires_reconciliation or
+                           op.status not in {"succeeded", "failed", "denied", "cancelled"})
+                           for op in self.list_tool_operations(source_turn)):
+                        raise ValueError("unsettled tool results cannot be archived in semantic replay")
+            elif any(item.kind != "user_message" for item in visible_items if item.item_id in preserved_item_ids):
+                raise ValueError("only user Items can be preserved inside a covered prefix")
+
+            if tool_result_overrides is not None:
+                covered_by_id = {item.item_id: item for item in visible_items[: len(covered_item_ids)]}
+                if not tool_result_overrides or any(
+                    target not in covered_by_id
+                    or covered_by_id[target].kind != "tool_result"
+                    or not isinstance(content, str)
+                    or not content
+                    for target, content in tool_result_overrides.items()
+                ):
+                    raise ValueError("tool result overrides require completed covered tool Items and nonempty text")
 
             frozen_facts = _json_object(
                 preserved_facts,
@@ -897,7 +959,11 @@ class RolloutStore:
                 }
                 for thread_id, sequences in grouped_sequences.items()
             ]
-            durable_state = _context_durable_state(self, turn_id)
+            frozen_state = (
+                _context_durable_state(self, turn_id)
+                if durable_state is None
+                else _json_object(durable_state, field="compaction durable_state")
+            )
             item_id = f"item_{uuid4().hex}"
             payload = {
                 "context_version": context_version,
@@ -907,8 +973,16 @@ class RolloutStore:
                 "summary": summary,
                 "preserved_facts": frozen_facts,
                 "artifact_refs": list(frozen_artifacts),
-                "durable_state": durable_state,
+                "durable_state": frozen_state,
             }
+            if tool_result_overrides is not None:
+                payload["tool_result_overrides"] = dict(tool_result_overrides)
+            if expected_source_revision is not None:
+                payload.update(
+                    source_revision=expected_source_revision,
+                    preserved_item_ids=list(preserved_item_ids),
+                    algorithm_revision=algorithm_revision,
+                )
             self._append_and_reduce(
                 thread_id=str(turn["thread_id"]),
                 turn_id=turn_id,
@@ -1024,9 +1098,7 @@ class RolloutStore:
                 (thread_id,),
             ).fetchone()
             if active is None or active["active_turn_id"] != turn_id:
-                raise RuntimeError(
-                    "cancellation request cannot target a foreign active slot"
-                )
+                raise RuntimeError("cancellation request cannot target a foreign active slot")
             existing = self._connection.execute(
                 """
                 SELECT 1 FROM rollout_records
@@ -1373,15 +1445,65 @@ class RolloutStore:
                 raise KeyError(f"unknown model operation: {operation_id}")
             if operation["status"] != "prepared":
                 raise RuntimeError(f"model operation is not prepared: {operation_id}")
+            request_ref = json.loads(operation["request_ref_json"])
+            plan = request_ref.get("compaction_plan")
+            if request_ref.get("purpose") == "context_summary" and plan is not None:
+                summary_ops = [
+                    op
+                    for op in self.list_model_operations(str(operation["turn_id"]))
+                    if op.request_ref.get("purpose") == "context_summary"
+                ]
+                for limit_key, selected in (
+                    ("max_summary_calls", summary_ops),
+                    (
+                        "planned_summary_calls",
+                        [
+                            op
+                            for op in summary_ops
+                            if op.request_ref.get("compaction_plan", {}).get("plan_id") == plan.get("plan_id")
+                        ],
+                    ),
+                ):
+                    limit = plan.get(limit_key)
+                    if limit is None:  # Legacy prepared records may lack the new call bound.
+                        continue
+                    if type(limit) is not int or limit < 1:
+                        raise ValueError("summary call allowance must be a positive integer")
+                    dispatched = sum(
+                        attempt.status != "prepared"
+                        for op in selected
+                        for attempt in self.list_model_attempts(op.operation_id)
+                    )
+                    if dispatched >= limit:
+                        raise BudgetLimitExceededError(
+                            resource="model_calls", limit=limit, current_exposure=dispatched, requested=1
+                        )
             reservation_id: str | None = None
             if resource_request is not None:
                 attempt_id = str(operation["active_attempt_id"])
                 reservation_id = f"reservation_{attempt_id}"
                 budget_state = self.read_budget_state(str(operation["turn_id"]))
+                continuation_reserve = 0
+                if request_ref.get("purpose") == "context_summary" and plan is not None:
+                    continuation_reserve = plan.get("continuation_token_reserve")
+                    if type(continuation_reserve) is not int or continuation_reserve < 1:
+                        raise ValueError("summary plan must preserve a positive continuation token reserve")
+                    continuation_cost = plan.get("continuation_cost_reserve", 0)
+                    if type(continuation_cost) is not int or continuation_cost < 0:
+                        raise ValueError("summary continuation cost reserve must be non-negative")
+                    cost_limit = budget_state.limits.cost_micros
+                    requested_cost = resource_request.cost_micros + continuation_cost
+                    if cost_limit is not None and budget_state.exposure.cost_micros + requested_cost > cost_limit:
+                        raise BudgetLimitExceededError(
+                            resource="cost_micros",
+                            limit=cost_limit,
+                            current_exposure=budget_state.exposure.cost_micros,
+                            requested=requested_cost,
+                        )
                 ensure_token_headroom(
                     budget_state,
-                    requested_tokens=resource_request.total_tokens,
-                    allow_protected=allow_protected_budget,
+                    requested_tokens=resource_request.total_tokens + continuation_reserve,
+                    allow_protected=allow_protected_budget and not continuation_reserve,
                 )
                 mutation = reserve_budget(
                     budget_state,
@@ -1512,6 +1634,8 @@ class RolloutStore:
             ).fetchone()
             if operation is None:
                 raise KeyError(f"unknown model operation: {operation_id}")
+            if json.loads(operation["request_ref_json"]).get("purpose") == "context_summary":
+                raise RuntimeError("context summary must not publish model output channels")
             if not (
                 operation["status"] == "dispatched"
                 and operation["active_attempt_id"] == attempt_id
@@ -1612,11 +1736,7 @@ class RolloutStore:
                 operation=operation,
                 attempt_id=attempt_id,
                 status="outcome_unknown",
-                error=(
-                    error_message.strip()[:2_000]
-                    if error_message is not None
-                    else "model outcome is unknown"
-                ),
+                error=(error_message.strip()[:2_000] if error_message is not None else "model outcome is unknown"),
                 channel_content=frozen_channel_content,
             )
             turn = self._connection.execute(
@@ -1696,11 +1816,7 @@ class RolloutStore:
                 operation=operation,
                 attempt_id=attempt_id,
                 status="failed",
-                error=(
-                    error_message.strip()[:2_000]
-                    if error_message is not None
-                    else reason.strip()[:2_000]
-                ),
+                error=(error_message.strip()[:2_000] if error_message is not None else reason.strip()[:2_000]),
                 channel_content=frozen_channel_content,
             )
         return self.list_model_attempts(operation_id)[-1]
@@ -1735,9 +1851,7 @@ class RolloutStore:
             start_payload = json.loads(row["payload_json"])
             channel = str(start_payload["channel"])
             if channel in seen_channels:
-                raise RuntimeError(
-                    f"model {channel} channel has duplicate durable starts"
-                )
+                raise RuntimeError(f"model {channel} channel has duplicate durable starts")
             seen_channels.add(channel)
             item_id = str(start_payload["item_id"])
             completed = self._connection.execute(
@@ -1803,9 +1917,7 @@ class RolloutStore:
                 and operation["active_attempt_id"] == attempt_id
                 and operation["generation"] == generation
             ):
-                raise RuntimeError(
-                    "only the active dispatched model attempt can be cancelled"
-                )
+                raise RuntimeError("only the active dispatched model attempt can be cancelled")
             self._append_and_reduce(
                 thread_id=str(operation["thread_id"]),
                 turn_id=str(operation["turn_id"]),
@@ -1954,6 +2066,7 @@ class RolloutStore:
             )
             if not is_current:
                 return False
+            internal_summary = json.loads(operation["request_ref_json"]).get("purpose") == "context_summary"
             started_channels = self._connection.execute(
                 """
                 SELECT payload_json
@@ -1973,10 +2086,10 @@ class RolloutStore:
                 payload = json.loads(row["payload_json"])
                 channel = str(payload["channel"])
                 if channel in started_by_channel:
-                    raise RuntimeError(
-                        f"model {channel} channel has duplicate durable starts"
-                    )
+                    raise RuntimeError(f"model {channel} channel has duplicate durable starts")
                 started_by_channel[channel] = payload
+            if internal_summary and started_by_channel:
+                raise RuntimeError("context summary must not have public output channels")
             started_response = started_by_channel.get("agent_message")
             if started_response is not None:
                 response_item_id = str(started_response["item_id"])
@@ -1986,6 +2099,14 @@ class RolloutStore:
                 turn_id=str(operation["turn_id"]),
                 model_attempt_id=attempt_id,
                 channel="agent_message",
+            )
+            public_metadata = (
+                {}
+                if internal_summary
+                else {
+                    "channel": "agent_message",
+                    "public_item_id": public_item_id,
+                }
             )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
@@ -1999,7 +2120,7 @@ class RolloutStore:
                     "provider_response_id": provider_response_id,
                     "usage": frozen_usage,
                     "response_item_id": response_item_id,
-                    "public_item_id": public_item_id,
+                    **({} if internal_summary else {"public_item_id": public_item_id}),
                 },
             )
             self._append_budget_outcome(
@@ -2016,10 +2137,9 @@ class RolloutStore:
                     producer="model",
                     payload={
                         "item_id": response_item_id,
-                        "kind": "model_response",
+                        "kind": "context_summary_response" if internal_summary else "model_response",
                         "attempt_id": attempt_id,
-                        "channel": "agent_message",
-                        "public_item_id": public_item_id,
+                        **public_metadata,
                     },
                 )
             self._append_and_reduce(
@@ -2030,8 +2150,7 @@ class RolloutStore:
                 payload={
                     "item_id": response_item_id,
                     "attempt_id": attempt_id,
-                    "channel": "agent_message",
-                    "public_item_id": public_item_id,
+                    **public_metadata,
                     "payload": {
                         "text": text,
                         "tool_calls": frozen_tool_calls,
@@ -2087,8 +2206,6 @@ class RolloutStore:
         ).fetchall()
         return tuple(_model_attempt_snapshot(row) for row in rows)
 
-
-
     def start_budgeted_child_turn(
         self,
         *,
@@ -2114,9 +2231,7 @@ class RolloutStore:
         if not isinstance(child_turn_id, str) or not child_turn_id.strip():
             raise ValueError("child_turn_id must be non-empty")
         if requested_tokens is not None and (
-            isinstance(requested_tokens, bool)
-            or not isinstance(requested_tokens, int)
-            or requested_tokens < 1
+            isinstance(requested_tokens, bool) or not isinstance(requested_tokens, int) or requested_tokens < 1
         ):
             raise ValueError("requested child token budget must be positive or None")
         if requested_cost_micros is not None and (
@@ -3503,9 +3618,7 @@ class RolloutStore:
                             else:
                                 continue
                             step = PlanStep(
-                                step_id=str(
-                                    raw_step.get("step_id") or f"step_{index}"
-                                ),
+                                step_id=str(raw_step.get("step_id") or f"step_{index}"),
                                 title=str(raw_step.get("step", "")),
                                 status=normalized_status,
                             )
@@ -3518,27 +3631,15 @@ class RolloutStore:
                         """,
                         (turn_id,),
                     ).fetchone()
-                    objective_payload = (
-                        json.loads(objective_row["payload_json"])
-                        if objective_row is not None
-                        else {}
-                    )
+                    objective_payload = json.loads(objective_row["payload_json"]) if objective_row is not None else {}
                     plan_snapshot = {
                         "revision": revision,
                         "objective": objective_payload.get("text", "Current task"),
                         "status": "active",
                         "active_step_id": next(
-                            (
-                                step["step_id"]
-                                for step in steps
-                                if step["status"] == "in_progress"
-                            ),
+                            (step["step_id"] for step in steps if step["status"] == "in_progress"),
                             next(
-                                (
-                                    step["step_id"]
-                                    for step in steps
-                                    if step["status"] == "pending"
-                                ),
+                                (step["step_id"] for step in steps if step["status"] == "pending"),
                                 None,
                             ),
                         ),
@@ -3590,9 +3691,7 @@ class RolloutStore:
                 }.get(str(operation["status"]), "failed")
                 completed_payload["status"] = public_status
                 if public_status in {"failed", "outcome_unknown"}:
-                    completed_payload["error"] = str(
-                        operation["error_code"] or "tool execution failed"
-                    )
+                    completed_payload["error"] = str(operation["error_code"] or "tool execution failed")
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -4861,13 +4960,10 @@ class RolloutStore:
         if "fork_turn_id" not in thread_columns:
             self._connection.execute("ALTER TABLE threads ADD COLUMN fork_turn_id TEXT")
         child_budget_columns = {
-            str(row["name"])
-            for row in self._connection.execute("PRAGMA table_info(child_budget_allocations)")
+            str(row["name"]) for row in self._connection.execute("PRAGMA table_info(child_budget_allocations)")
         }
         if child_budget_columns and "allocated_cost_micros" not in child_budget_columns:
-            self._connection.execute(
-                "ALTER TABLE child_budget_allocations ADD COLUMN allocated_cost_micros INTEGER"
-            )
+            self._connection.execute("ALTER TABLE child_budget_allocations ADD COLUMN allocated_cost_micros INTEGER")
         tool_operation_columns = {
             str(row["name"]) for row in self._connection.execute("PRAGMA table_info(tool_operations)")
         }
@@ -4894,16 +4990,12 @@ def _projection_hash(state: ProjectionState, thread_id: str) -> str:
         "approvals": {key: value for key, value in state.approvals.items() if value["thread_id"] == thread_id},
     }
     budget_reservations = {
-        key: value
-        for key, value in state.budget_reservations.items()
-        if value["thread_id"] == thread_id
+        key: value for key, value in state.budget_reservations.items() if value["thread_id"] == thread_id
     }
     if budget_reservations:
         payload["budget_reservations"] = budget_reservations
     child_budget_allocations = {
-        key: value
-        for key, value in state.child_budget_allocations.items()
-        if value["thread_id"] == thread_id
+        key: value for key, value in state.child_budget_allocations.items() if value["thread_id"] == thread_id
     }
     if child_budget_allocations:
         payload["child_budget_allocations"] = child_budget_allocations
@@ -4962,7 +5054,7 @@ def _context_durable_state(store: RolloutStore, turn_id: str) -> dict[str, Any]:
                 "error_code": operation.error_code,
             }
             for operation in store.list_tool_operations(turn_id)
-            if operation.status not in {"completed", "failed", "denied", "superseded"}
+            if operation.status not in {"succeeded", "failed", "denied", "cancelled", "superseded"}
             or operation.requires_reconciliation
         ],
     }
@@ -5322,7 +5414,6 @@ def _model_attempt_row_payload(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-
 def _budget_reservation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "reservation_id": row["reservation_id"],
@@ -5352,6 +5443,7 @@ def _child_budget_allocation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "applied_thread_sequence": row["applied_thread_sequence"],
         "reducer_version": row["reducer_version"],
     }
+
 
 def _tool_operation_row_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {

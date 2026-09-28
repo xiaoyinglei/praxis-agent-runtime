@@ -1,0 +1,2863 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "disabled",
+  "byte_limit": 14000,
+  "steps_per_turn": 16,
+  "tokens_per_turn": 100000,
+  "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+  "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+  "spec_hashes": {
+    "identity.md": "cc16abd073e9addefd11161594ea6cebdcc0bf1258353a6a36421ebbdf627da1",
+    "deletion.md": "6e3ac1edc6fc64e3d9874e1a092fa61a6a5918b473c67e8ad2cc6adcfc4d958a",
+    "ordering.md": "343f31ae60aa9d47c04d68bf4a404446af9a95d17dca4a6d7bda31e29fe1224d",
+    "aggregation.md": "0de4cff7495d0b46a50046aafcecd04c0426937a7fcdb7c32be39ea13b2cbdae",
+    "empty.md": "4a65fffca92827b3260c1f4bc773dbe40d202869225470177b512c633485b34e",
+    "amounts.md": "89342585a108310b94673e8f35d0ad3fb3f1bc7508f29be5e34358eda81542c9"
+  },
+  "phases": [
+    {
+      "phase": 1,
+      "checks": {
+        "oracle_passed": true,
+        "completed": true,
+        "semantic_compaction": false,
+        "parallel_reads": true,
+        "specs_unchanged": true,
+        "verified_rollout": true,
+        "model_ran_verification": true
+      },
+      "oracle_stdout": "{\"pass\": true, \"phase\": 1}\n",
+      "oracle_stderr": "",
+      "read_intervals": [
+        {
+          "path": "identity.md",
+          "start": 16183.718362083,
+          "end": 16184.020439125
+        },
+        {
+          "path": "deletion.md",
+          "start": 16183.718366541,
+          "end": 16184.020930833
+        },
+        {
+          "path": "ordering.md",
+          "start": 16183.718368291,
+          "end": 16184.021514375
+        },
+        {
+          "path": "ledger.py",
+          "start": 16185.017369666,
+          "end": 16185.3188145
+        },
+        {
+          "path": "ledger.py",
+          "start": 16195.849571083,
+          "end": 16196.150991333
+        }
+      ],
+      "turn_id": "turn_87926bcd28ce48e899516668b3b21974",
+      "turn_status": "completed",
+      "terminal_reason": "completed",
+      "usage": {
+        "input_tokens": 51514,
+        "cached_input_tokens": 25600,
+        "cache_write_tokens": 0,
+        "output_tokens": 2506,
+        "reasoning_tokens": 0,
+        "cost_micros": 0,
+        "model_calls": 8,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 0,
+      "model_operation_statuses": [
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+        "completed",
+        "completed"
+      ],
+      "tools": [
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "df8fa8281b9bf4be2d1fa890f3af0721bdc89bac06a1463bc9a0cf1672b9b095"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "2d69b5ec293c8b816f16e4d26960aad768551a8e2f54e2aa7b7e7b880fbda86c"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "aca1c38a599d4e70c5e3b43f6891fad05eea1bb4a7fb4cab6ab41dcf61cdfd5b"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "edf49df729057f1545e815ce32d359f5ef01570f457c5503d0a1c49c88f7c255"
+        },
+        {
+          "name": "apply_patch",
+          "status": "succeeded",
+          "arguments_digest": "bf18bd351ad91b4015aae0b23278d94c4c835f0346acc733d80c4bbde612bd9e"
+        },
+        {
+          "name": "apply_patch",
+          "status": "succeeded",
+          "arguments_digest": "4bb155bfab8a78746c5454e712c4f0caa51dc3e86c557d94b44098c8da6bed78"
+        },
+        {
+          "name": "run_command",
+          "status": "failed",
+          "arguments_digest": "6dcad89121bd20c90a2eeb162585a21d0d07248ed2ac97d63b549e61e1e2bd84"
+        },
+        {
+          "name": "apply_patch",
+          "status": "succeeded",
+          "arguments_digest": "2ea1a8e1763c300dae30ead9792316040a920fa24c993b073fbaa62399d09dda"
+        },
+        {
+          "name": "run_command",
+          "status": "succeeded",
+          "arguments_digest": "6dcad89121bd20c90a2eeb162585a21d0d07248ed2ac97d63b549e61e1e2bd84"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "edf49df729057f1545e815ce32d359f5ef01570f457c5503d0a1c49c88f7c255"
+        }
+      ],
+      "compactions": [
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 1,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 48,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "40ef3728b1956b697b8dceaae24c0038a5f817b0ed83727e7e484cab1419f05a",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-17\\\", \\\"seq\\\": 17, \\\"amount\\\": -72057594037927944, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 17; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-18\\\", \\\"seq\\\": 1\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-17\\\", \\\"seq\\\": 17, \\\"amount\\\": -72057594037927944, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 17; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"eve\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-17\\\", \\\"seq\\\": 17, \\\"amount\\\": -72057594037927944, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 17; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 2,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 71,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "a0ee5d78728febcdd9b4aaf03b87cb7a03a66052ed0c0eb39b6e88c8c93c9d3d",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; preserve this field\\\"}\\n\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 16; prese\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -171136785840078867, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 6; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-7\\\", \\\"seq\\\": 7, \\\"amount\\\": -162129586585337874, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 7; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-8\\\", \\\"seq\\\": 8, \\\"amount\\\": -153122387330596881, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 8; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-9\\\", \\\"seq\\\": 9, \\\"amount\\\": -144115188075855888, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 9; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-10\\\", \\\"seq\\\": 10, \\\"amount\\\": -135107988821114895, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 10; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-11\\\", \\\"seq\\\": 11, \\\"amount\\\": -126100789566373902, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 11; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-12\\\", \\\"seq\\\": 12, \\\"amount\\\": -117093590311632909, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 12; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-13\\\", \\\"seq\\\": 13, \\\"amount\\\": -108086391056891916, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 13; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-14\\\", \\\"seq\\\": 14, \\\"amount\\\": -99079191802150923, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 14; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-15\\\", \\\"seq\\\": 15, \\\"amount\\\": -90071992547409930, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 15; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-16\\\", \\\"seq\\\": 16, \\\"amount\\\": -81064793292668937, \\\"deleted\\\": false, \\\"note\\\": \\\"aud\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 3,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 100,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "80a0099de3cb012d3df5dc05e8a5103d9c59307cf74bd198e591db91362201e1",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"amount\\\": -17113678\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-6\\\", \\\"seq\\\": 6, \\\"\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 3; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-4\\\", \\\"id\\\": \\\"event-4\\\", \\\"seq\\\": 4, \\\"amount\\\": -189151184349560853, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 4; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-5\\\", \\\"id\\\": \\\"event-5\\\", \\\"seq\\\": 5, \\\"amount\\\": -180143985094819860, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 5; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-6\\\", \\\"id\\\": \\\"event-\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 4,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e",
+            "item_a56384d4fce6446dadd81f636098f9fe",
+            "item_5ae87cde8f8b45299d7f991cd11576cb",
+            "item_97aec568b0f444bdbe2ec22d5a80a682",
+            "item_a6bf4e8cf0ab415690174156018e4a89",
+            "item_d3c9fce5cd6f406796954f22431da025"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 103,
+              "item_id": "item_a56384d4fce6446dadd81f636098f9fe",
+              "item_sequence": 26,
+              "payload_sha256": "0c00a4950b57834c79a470322453bd6599ed8c07a3b120e1904c90939d92c3f1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 106,
+              "item_id": "item_5ae87cde8f8b45299d7f991cd11576cb",
+              "item_sequence": 27,
+              "payload_sha256": "861daf2142ba103db4b699131cb1d51936f32ee34d4b3979a40b49bc2eb188de",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 113,
+              "item_id": "item_97aec568b0f444bdbe2ec22d5a80a682",
+              "item_sequence": 28,
+              "payload_sha256": "1857c09f93bbb3daa6d1c1d36e7ff5e3a649508068877106163adb62c8528976",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 115,
+              "item_id": "item_a6bf4e8cf0ab415690174156018e4a89",
+              "item_sequence": 29,
+              "payload_sha256": "f86cc3cc97f07603f529320f9be81c0fddee8872af9c966261cc615209b687b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 121,
+              "item_id": "item_d3c9fce5cd6f406796954f22431da025",
+              "item_sequence": 30,
+              "payload_sha256": "d738412d5229e3c2a97c5e0546c085a40f935b5194b9d5d81dc0fe52672a3b9b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 121,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "6bfac98ac90b4af9401fa37553e029b08cede1416363ccc215ebf53e667e233f",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sa\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"deleted\\\": false, \\\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\", \\\"id\\\": \\\"event-2\\\", \\\"seq\\\": 2, \\\"amount\\\": -207165582859042839, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 2; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-3\\\", \\\"id\\\": \\\"event-3\\\", \\\"seq\\\": 3, \\\"amount\\\": -198158383604301846, \\\"\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 5,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e",
+            "item_a56384d4fce6446dadd81f636098f9fe",
+            "item_5ae87cde8f8b45299d7f991cd11576cb",
+            "item_97aec568b0f444bdbe2ec22d5a80a682",
+            "item_a6bf4e8cf0ab415690174156018e4a89",
+            "item_d3c9fce5cd6f406796954f22431da025",
+            "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+            "item_c02450c116d542f4b6a2ad1c6d8875ce",
+            "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+            "item_29266e709b324c82a09fc468a92bc02e",
+            "item_303e3241c2cc48119cc910b7700d2de4"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 103,
+              "item_id": "item_a56384d4fce6446dadd81f636098f9fe",
+              "item_sequence": 26,
+              "payload_sha256": "0c00a4950b57834c79a470322453bd6599ed8c07a3b120e1904c90939d92c3f1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 106,
+              "item_id": "item_5ae87cde8f8b45299d7f991cd11576cb",
+              "item_sequence": 27,
+              "payload_sha256": "861daf2142ba103db4b699131cb1d51936f32ee34d4b3979a40b49bc2eb188de",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 113,
+              "item_id": "item_97aec568b0f444bdbe2ec22d5a80a682",
+              "item_sequence": 28,
+              "payload_sha256": "1857c09f93bbb3daa6d1c1d36e7ff5e3a649508068877106163adb62c8528976",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 115,
+              "item_id": "item_a6bf4e8cf0ab415690174156018e4a89",
+              "item_sequence": 29,
+              "payload_sha256": "f86cc3cc97f07603f529320f9be81c0fddee8872af9c966261cc615209b687b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 121,
+              "item_id": "item_d3c9fce5cd6f406796954f22431da025",
+              "item_sequence": 30,
+              "payload_sha256": "d738412d5229e3c2a97c5e0546c085a40f935b5194b9d5d81dc0fe52672a3b9b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 124,
+              "item_id": "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+              "item_sequence": 31,
+              "payload_sha256": "1ea13a54df5f036a70ab08fddf2f52c3ed030e438b9507504225601359612236",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 127,
+              "item_id": "item_c02450c116d542f4b6a2ad1c6d8875ce",
+              "item_sequence": 32,
+              "payload_sha256": "22b3dc1be69018e6025a33e7025d5447937f372360f46092a30463262f0b84aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 134,
+              "item_id": "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+              "item_sequence": 33,
+              "payload_sha256": "4ac6ad672f50bace98f25d7fb68a6850780f11459911d99706d4c9af4d2728aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 136,
+              "item_id": "item_29266e709b324c82a09fc468a92bc02e",
+              "item_sequence": 34,
+              "payload_sha256": "fd4232a2a48a210d804822856b9f8382c739950d99f814427f86bb6915c26038",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 142,
+              "item_id": "item_303e3241c2cc48119cc910b7700d2de4",
+              "item_sequence": 35,
+              "payload_sha256": "60e56dc57c12dbf5c82f63d77005f8fcb75968f4b07dd0615d33ccda6f0c5bc7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 142,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "78c9a011d233beaf67e0c3a09c19871ba292f61ae8273f1101a133bfe1c65d69",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\",\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tena\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve thi\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 6,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e",
+            "item_a56384d4fce6446dadd81f636098f9fe",
+            "item_5ae87cde8f8b45299d7f991cd11576cb",
+            "item_97aec568b0f444bdbe2ec22d5a80a682",
+            "item_a6bf4e8cf0ab415690174156018e4a89",
+            "item_d3c9fce5cd6f406796954f22431da025",
+            "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+            "item_c02450c116d542f4b6a2ad1c6d8875ce",
+            "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+            "item_29266e709b324c82a09fc468a92bc02e",
+            "item_303e3241c2cc48119cc910b7700d2de4",
+            "item_17e994b4abc44cdfb45d91280e803f6d",
+            "item_524f70b45e804d94af95cbb866956378",
+            "item_4f53f261e0344831ba601d5f830f0372",
+            "item_39274118f23f47a8968e6e3e3d2326fd",
+            "item_9149aed2b8d7479681883ac39d742605"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 103,
+              "item_id": "item_a56384d4fce6446dadd81f636098f9fe",
+              "item_sequence": 26,
+              "payload_sha256": "0c00a4950b57834c79a470322453bd6599ed8c07a3b120e1904c90939d92c3f1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 106,
+              "item_id": "item_5ae87cde8f8b45299d7f991cd11576cb",
+              "item_sequence": 27,
+              "payload_sha256": "861daf2142ba103db4b699131cb1d51936f32ee34d4b3979a40b49bc2eb188de",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 113,
+              "item_id": "item_97aec568b0f444bdbe2ec22d5a80a682",
+              "item_sequence": 28,
+              "payload_sha256": "1857c09f93bbb3daa6d1c1d36e7ff5e3a649508068877106163adb62c8528976",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 115,
+              "item_id": "item_a6bf4e8cf0ab415690174156018e4a89",
+              "item_sequence": 29,
+              "payload_sha256": "f86cc3cc97f07603f529320f9be81c0fddee8872af9c966261cc615209b687b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 121,
+              "item_id": "item_d3c9fce5cd6f406796954f22431da025",
+              "item_sequence": 30,
+              "payload_sha256": "d738412d5229e3c2a97c5e0546c085a40f935b5194b9d5d81dc0fe52672a3b9b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 124,
+              "item_id": "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+              "item_sequence": 31,
+              "payload_sha256": "1ea13a54df5f036a70ab08fddf2f52c3ed030e438b9507504225601359612236",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 127,
+              "item_id": "item_c02450c116d542f4b6a2ad1c6d8875ce",
+              "item_sequence": 32,
+              "payload_sha256": "22b3dc1be69018e6025a33e7025d5447937f372360f46092a30463262f0b84aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 134,
+              "item_id": "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+              "item_sequence": 33,
+              "payload_sha256": "4ac6ad672f50bace98f25d7fb68a6850780f11459911d99706d4c9af4d2728aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 136,
+              "item_id": "item_29266e709b324c82a09fc468a92bc02e",
+              "item_sequence": 34,
+              "payload_sha256": "fd4232a2a48a210d804822856b9f8382c739950d99f814427f86bb6915c26038",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 142,
+              "item_id": "item_303e3241c2cc48119cc910b7700d2de4",
+              "item_sequence": 35,
+              "payload_sha256": "60e56dc57c12dbf5c82f63d77005f8fcb75968f4b07dd0615d33ccda6f0c5bc7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 145,
+              "item_id": "item_17e994b4abc44cdfb45d91280e803f6d",
+              "item_sequence": 36,
+              "payload_sha256": "11a155ef82bbef7ae458f69f9d81fd355b308e1eab5fa26d0af6edf948cfda31",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 148,
+              "item_id": "item_524f70b45e804d94af95cbb866956378",
+              "item_sequence": 37,
+              "payload_sha256": "3c7ebaf6644a5d9c2d9d7888bf8401cc3f0945bb621ca1660abf154582febe82",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 155,
+              "item_id": "item_4f53f261e0344831ba601d5f830f0372",
+              "item_sequence": 38,
+              "payload_sha256": "f15a85ac96748faab7f52c65c65e94cdfd041407ab0277ca897fa3568fd039ef",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 157,
+              "item_id": "item_39274118f23f47a8968e6e3e3d2326fd",
+              "item_sequence": 39,
+              "payload_sha256": "3b1aa59540dbf94439f71321e7276274db9e313ddfa20c230b984f952f512801",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 163,
+              "item_id": "item_9149aed2b8d7479681883ac39d742605",
+              "item_sequence": 40,
+              "payload_sha256": "36a11337888c9713fea2b95708d58ca3ac4f06ae1610ab4b142309e645e4fe1a",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 163,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "fb0452957505599e7bda88c99e196fb4756888cdc5ea3853cd104c1482837a48",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        },
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 7,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e",
+            "item_a56384d4fce6446dadd81f636098f9fe",
+            "item_5ae87cde8f8b45299d7f991cd11576cb",
+            "item_97aec568b0f444bdbe2ec22d5a80a682",
+            "item_a6bf4e8cf0ab415690174156018e4a89",
+            "item_d3c9fce5cd6f406796954f22431da025",
+            "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+            "item_c02450c116d542f4b6a2ad1c6d8875ce",
+            "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+            "item_29266e709b324c82a09fc468a92bc02e",
+            "item_303e3241c2cc48119cc910b7700d2de4",
+            "item_17e994b4abc44cdfb45d91280e803f6d",
+            "item_524f70b45e804d94af95cbb866956378",
+            "item_4f53f261e0344831ba601d5f830f0372",
+            "item_39274118f23f47a8968e6e3e3d2326fd",
+            "item_9149aed2b8d7479681883ac39d742605",
+            "item_aabb49d7302c42539584b3157d2651a1",
+            "item_d113755a9ded4c7186b54ffabf33f2bc",
+            "item_5cf3938de5e3452eae8f91fc5bc7e3fa",
+            "item_1919ed7ca54945aa89e0ac75d2e639b6",
+            "item_0c272558a64f40ccb4706274132364b4",
+            "item_faf614c9e0ae4f339af5a9d187a5ce3d"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 103,
+              "item_id": "item_a56384d4fce6446dadd81f636098f9fe",
+              "item_sequence": 26,
+              "payload_sha256": "0c00a4950b57834c79a470322453bd6599ed8c07a3b120e1904c90939d92c3f1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 106,
+              "item_id": "item_5ae87cde8f8b45299d7f991cd11576cb",
+              "item_sequence": 27,
+              "payload_sha256": "861daf2142ba103db4b699131cb1d51936f32ee34d4b3979a40b49bc2eb188de",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 113,
+              "item_id": "item_97aec568b0f444bdbe2ec22d5a80a682",
+              "item_sequence": 28,
+              "payload_sha256": "1857c09f93bbb3daa6d1c1d36e7ff5e3a649508068877106163adb62c8528976",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 115,
+              "item_id": "item_a6bf4e8cf0ab415690174156018e4a89",
+              "item_sequence": 29,
+              "payload_sha256": "f86cc3cc97f07603f529320f9be81c0fddee8872af9c966261cc615209b687b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 121,
+              "item_id": "item_d3c9fce5cd6f406796954f22431da025",
+              "item_sequence": 30,
+              "payload_sha256": "d738412d5229e3c2a97c5e0546c085a40f935b5194b9d5d81dc0fe52672a3b9b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 124,
+              "item_id": "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+              "item_sequence": 31,
+              "payload_sha256": "1ea13a54df5f036a70ab08fddf2f52c3ed030e438b9507504225601359612236",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 127,
+              "item_id": "item_c02450c116d542f4b6a2ad1c6d8875ce",
+              "item_sequence": 32,
+              "payload_sha256": "22b3dc1be69018e6025a33e7025d5447937f372360f46092a30463262f0b84aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 134,
+              "item_id": "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+              "item_sequence": 33,
+              "payload_sha256": "4ac6ad672f50bace98f25d7fb68a6850780f11459911d99706d4c9af4d2728aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 136,
+              "item_id": "item_29266e709b324c82a09fc468a92bc02e",
+              "item_sequence": 34,
+              "payload_sha256": "fd4232a2a48a210d804822856b9f8382c739950d99f814427f86bb6915c26038",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 142,
+              "item_id": "item_303e3241c2cc48119cc910b7700d2de4",
+              "item_sequence": 35,
+              "payload_sha256": "60e56dc57c12dbf5c82f63d77005f8fcb75968f4b07dd0615d33ccda6f0c5bc7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 145,
+              "item_id": "item_17e994b4abc44cdfb45d91280e803f6d",
+              "item_sequence": 36,
+              "payload_sha256": "11a155ef82bbef7ae458f69f9d81fd355b308e1eab5fa26d0af6edf948cfda31",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 148,
+              "item_id": "item_524f70b45e804d94af95cbb866956378",
+              "item_sequence": 37,
+              "payload_sha256": "3c7ebaf6644a5d9c2d9d7888bf8401cc3f0945bb621ca1660abf154582febe82",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 155,
+              "item_id": "item_4f53f261e0344831ba601d5f830f0372",
+              "item_sequence": 38,
+              "payload_sha256": "f15a85ac96748faab7f52c65c65e94cdfd041407ab0277ca897fa3568fd039ef",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 157,
+              "item_id": "item_39274118f23f47a8968e6e3e3d2326fd",
+              "item_sequence": 39,
+              "payload_sha256": "3b1aa59540dbf94439f71321e7276274db9e313ddfa20c230b984f952f512801",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 163,
+              "item_id": "item_9149aed2b8d7479681883ac39d742605",
+              "item_sequence": 40,
+              "payload_sha256": "36a11337888c9713fea2b95708d58ca3ac4f06ae1610ab4b142309e645e4fe1a",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 166,
+              "item_id": "item_aabb49d7302c42539584b3157d2651a1",
+              "item_sequence": 41,
+              "payload_sha256": "e2d583bb6fb8ee171df566de6c133c7e07cc49a811d1ac2de8432bcd0cf8bc7e",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 169,
+              "item_id": "item_d113755a9ded4c7186b54ffabf33f2bc",
+              "item_sequence": 42,
+              "payload_sha256": "3ed4ec5c4b6c5f888873d821fb690ff448028b5a78457c124b6f17490a3b6a66",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 176,
+              "item_id": "item_5cf3938de5e3452eae8f91fc5bc7e3fa",
+              "item_sequence": 43,
+              "payload_sha256": "d48f6bbcaa05732f163d5a96e9729b9f3a0d3c156d6a106fcb7adb8bee3f4b3f",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 178,
+              "item_id": "item_1919ed7ca54945aa89e0ac75d2e639b6",
+              "item_sequence": 44,
+              "payload_sha256": "4cc87e967260c886812ca43f5cf8cd6229a3eeef7be46b981635a0a68824aa58",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 184,
+              "item_id": "item_0c272558a64f40ccb4706274132364b4",
+              "item_sequence": 45,
+              "payload_sha256": "3c2987ec35e42cabc3f29169608833a2fc9d08256bd38860eb9c089e5288fb1b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 187,
+              "item_id": "item_faf614c9e0ae4f339af5a9d187a5ce3d",
+              "item_sequence": 46,
+              "payload_sha256": "98c0081beb6e326d82d18382ed483f016cef086b9ddd192413c561aa3f28a2c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 187,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "11de18dbe75dbc81043c599b3403c8afde583a0b54656a8e966cc69f5e2b490b",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_9149aed2b8d7479681883ac39d742605": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9149aed2b8d7479681883ac39d742605').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f0e4c69e81d2496082271dd3dffd3e7a').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+          }
+        }
+      ]
+    },
+    {
+      "phase": 2,
+      "checks": {
+        "oracle_passed": false,
+        "completed": false,
+        "semantic_compaction": false,
+        "parallel_reads": true,
+        "specs_unchanged": true,
+        "verified_rollout": true,
+        "model_ran_verification": false
+      },
+      "oracle_stdout": "",
+      "oracle_stderr": "Traceback (most recent call last):\n  File \"/Users/leixiaoying/LLM/RAG\u5b66\u4e60/evals/context_management/deepseek-session-code-20260928-132742/oracle.py\", line 23, in <module>\n    assert m.totals(a)=={\"a\":-2,\"b\":9007199254741000,\"c\":0}, m.totals(a)\n           ^^^^^^^^\nAttributeError: module 'ledger' has no attribute 'totals'\n",
+      "read_intervals": [
+        {
+          "path": "aggregation.md",
+          "start": 16200.113093208,
+          "end": 16200.41496525
+        },
+        {
+          "path": "empty.md",
+          "start": 16200.113097166,
+          "end": 16200.4172795
+        },
+        {
+          "path": "amounts.md",
+          "start": 16200.113099083,
+          "end": 16200.417956541
+        }
+      ],
+      "turn_id": "turn_45616ba9fe4644419504b0621d5abde9",
+      "turn_status": "failed",
+      "terminal_reason": "context_budget_exhausted",
+      "usage": {
+        "input_tokens": 6839,
+        "cached_input_tokens": 3328,
+        "cache_write_tokens": 0,
+        "output_tokens": 107,
+        "reasoning_tokens": 0,
+        "cost_micros": 0,
+        "model_calls": 1,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 0,
+      "model_operation_statuses": [
+        "completed"
+      ],
+      "tools": [
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "8bed075297f13bf857632625f0de7ccb7f12a3a5ee8c5b7c9fa6419cc5635a8e"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "11917724f3c8f126b6ccb1b12cae210c8127647bedb037b80aaa5cd5daf45935"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "df4ffe1810257efb1c6ec2e7f210d8bd7bc320d849d3ad443ace5861d9962011"
+        }
+      ],
+      "compactions": [
+        {
+          "algorithm_revision": "tool-output-elision-v4",
+          "artifact_refs": [],
+          "context_version": 8,
+          "covered_item_ids": [
+            "item_d69f031c1c03436092c530078283a9b6",
+            "item_b7054fcfebc049e4a2096011a1cc6bec",
+            "item_ed69c88e8021483b823a22e072a0c35b",
+            "item_6ba0ff2d711e4a7fbb23872052570bf7",
+            "item_857174d12c0446f0a7b9f936da9ae0aa",
+            "item_ea316e64f6e0470f88db693d7e529f41",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+            "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+            "item_9a67fb906d5343b3b4c76c240202c261",
+            "item_14b02d170c8542beb959acc7bc37a52c",
+            "item_4da06da0d0c74b229de0d047d886ea03",
+            "item_dc7299e404d24aecbb812876813d126d",
+            "item_a8901479d0b64c5a911d3cb6e5d86190",
+            "item_da771a877f18427f813add8fab23549f",
+            "item_e696fca11cdf464cbc848744c0f37684",
+            "item_f93be0cf45304c7cb869bd87da40b868",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a",
+            "item_6c3f348efd7b4e2897fa42ddabd0e471",
+            "item_24daf4869a924562b3c6200313bc5be2",
+            "item_1a6e0e942b7e41688bbe80ec40c6624d",
+            "item_9a0016890ee646f1ba7731522e4a67f0",
+            "item_48d2f7ae252a41c09dc945f2c7a35612",
+            "item_b7378146f57042918c6d6088371cff27",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f",
+            "item_5869b25054254dc19722e6d5eb87a46e",
+            "item_a56384d4fce6446dadd81f636098f9fe",
+            "item_5ae87cde8f8b45299d7f991cd11576cb",
+            "item_97aec568b0f444bdbe2ec22d5a80a682",
+            "item_a6bf4e8cf0ab415690174156018e4a89",
+            "item_d3c9fce5cd6f406796954f22431da025",
+            "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+            "item_c02450c116d542f4b6a2ad1c6d8875ce",
+            "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+            "item_29266e709b324c82a09fc468a92bc02e",
+            "item_303e3241c2cc48119cc910b7700d2de4",
+            "item_17e994b4abc44cdfb45d91280e803f6d",
+            "item_524f70b45e804d94af95cbb866956378",
+            "item_4f53f261e0344831ba601d5f830f0372",
+            "item_39274118f23f47a8968e6e3e3d2326fd",
+            "item_9149aed2b8d7479681883ac39d742605",
+            "item_aabb49d7302c42539584b3157d2651a1",
+            "item_d113755a9ded4c7186b54ffabf33f2bc",
+            "item_5cf3938de5e3452eae8f91fc5bc7e3fa",
+            "item_1919ed7ca54945aa89e0ac75d2e639b6",
+            "item_0c272558a64f40ccb4706274132364b4",
+            "item_faf614c9e0ae4f339af5a9d187a5ce3d",
+            "item_93e20595826a4f72b9f5246a500eb3ad",
+            "item_4bb3357afe184e71a978ef7b30632fb2",
+            "item_bc65834bf5584749a2cba4aa2bcc9b71",
+            "item_2ab70a3869dc4beab40b7d87d9ff3fad",
+            "item_fb0cec5b698a4628ae9162db184ed262",
+            "item_abac49373e2441ce9a94a1f11d4f7b78",
+            "item_32dbd1cecab841f69f396ddf8900a136"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 5,
+              "item_id": "item_d69f031c1c03436092c530078283a9b6",
+              "item_sequence": 1,
+              "payload_sha256": "3bc1139133b46a6daf0a84a18eac6080cb2efd8ab98f965cce53546897832b90",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_b7054fcfebc049e4a2096011a1cc6bec",
+              "item_sequence": 2,
+              "payload_sha256": "d07f381639a0f40f3f7eb1d3c040226d7c6b770392d006e8d25f8b1f4a4377d8",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 15,
+              "item_id": "item_ed69c88e8021483b823a22e072a0c35b",
+              "item_sequence": 3,
+              "payload_sha256": "b9909ce73b8fdbc9a0c15d1abd6b59a291865e1e7ff72c3ab75270e07f1b7732",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 17,
+              "item_id": "item_6ba0ff2d711e4a7fbb23872052570bf7",
+              "item_sequence": 4,
+              "payload_sha256": "ce1617b55831b0b1e4ed0debc6d260f1ed25da0569d8915ced9a94ff09a54303",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 19,
+              "item_id": "item_857174d12c0446f0a7b9f936da9ae0aa",
+              "item_sequence": 5,
+              "payload_sha256": "93d6dca44b4ec28d6039a3fdbec54f0bd00da2179325a57e115a4823d9d59469",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 21,
+              "item_id": "item_ea316e64f6e0470f88db693d7e529f41",
+              "item_sequence": 6,
+              "payload_sha256": "d7e66ccd0636619660d4f283a81f68ec0e3b631d61cd53f4ded319a07c5db7c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_f47ecf3b41ec4a1cbdab84cee6c90bf9",
+              "item_sequence": 7,
+              "payload_sha256": "c46ecd7c1491ddf3d745e257a3525871a86e6761dae560c1e8f5a4dd8c48ab86",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_af3e5f5f04e14d98b910cb3087fc1a4d",
+              "item_sequence": 8,
+              "payload_sha256": "902c66e8c21c975f72ba41310584bb08ed3dab6a247d833aa8b310392e1b91a2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 39,
+              "item_id": "item_9a67fb906d5343b3b4c76c240202c261",
+              "item_sequence": 9,
+              "payload_sha256": "0b12192bb9cfacf3214e6bd91f23257d850a81fd19fe8603515ed9597c01cbfb",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_14b02d170c8542beb959acc7bc37a52c",
+              "item_sequence": 10,
+              "payload_sha256": "48ea25b5352ba2e86938f096202c2a9aa4aab5cea8fade9ce96864102a53198d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 45,
+              "item_id": "item_4da06da0d0c74b229de0d047d886ea03",
+              "item_sequence": 11,
+              "payload_sha256": "ca6e328f9d4701ee0355036a7caedfa802f54e129af397c5e7b5b77e3fd80a95",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 48,
+              "item_id": "item_dc7299e404d24aecbb812876813d126d",
+              "item_sequence": 12,
+              "payload_sha256": "29ffe0d6f9e16325d82dc6d2eb82f118bfce9118b91aa515bd0e5b04d23eb2b9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 50,
+              "item_id": "item_a8901479d0b64c5a911d3cb6e5d86190",
+              "item_sequence": 13,
+              "payload_sha256": "487d0f06a5c621fc7f6064086d53e1601269e24b8bd31d62d51e56ed245faa81",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 53,
+              "item_id": "item_da771a877f18427f813add8fab23549f",
+              "item_sequence": 14,
+              "payload_sha256": "ca56ceeb3669ca19086b9bd73fbefd8ada5fd7b2b146f1c22bd424f42bf32b37",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e696fca11cdf464cbc848744c0f37684",
+              "item_sequence": 15,
+              "payload_sha256": "cea32dbd6cca9fda6487a5a532910ea867e15a759579b6ab235f11caf9c52570",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 62,
+              "item_id": "item_f93be0cf45304c7cb869bd87da40b868",
+              "item_sequence": 16,
+              "payload_sha256": "e48c745f0682d97b0d22da755239ab46e167190121e95e6f97e0f8ac05ca4eb1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 68,
+              "item_id": "item_f0e4c69e81d2496082271dd3dffd3e7a",
+              "item_sequence": 17,
+              "payload_sha256": "8706101989292beee8c9f0c60792bbf1cec5c0acc6c2b73fc0258dbc86f82e9d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 71,
+              "item_id": "item_6c3f348efd7b4e2897fa42ddabd0e471",
+              "item_sequence": 18,
+              "payload_sha256": "92f0b4f9eff18ee3ba4bf7e895f3394a722fed1ece345353f839df792904c87d",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_24daf4869a924562b3c6200313bc5be2",
+              "item_sequence": 19,
+              "payload_sha256": "f066743a0903ab821507d3be37fcf3a76b1681e7720011f0daf1921c63378ea7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 76,
+              "item_id": "item_1a6e0e942b7e41688bbe80ec40c6624d",
+              "item_sequence": 20,
+              "payload_sha256": "7e04506902e09115efba18a01fbe3391d253212d1e1e76118ec8ccb4c271ffd9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 83,
+              "item_id": "item_9a0016890ee646f1ba7731522e4a67f0",
+              "item_sequence": 21,
+              "payload_sha256": "6fbb7ce94cc4c0837dfd58c05dd4ef81239278e6822f02af0383fe8a8544fc50",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 85,
+              "item_id": "item_48d2f7ae252a41c09dc945f2c7a35612",
+              "item_sequence": 22,
+              "payload_sha256": "a0aaf2b12c92e623dc6f7f7b1b379c73c1083540d96ee0b5457d0b5c0b4da7bf",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 87,
+              "item_id": "item_b7378146f57042918c6d6088371cff27",
+              "item_sequence": 23,
+              "payload_sha256": "58e35f6a03690c5ae2cafd4b881fd671ee480a7af41f9dde449bf66b291a0933",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 96,
+              "item_id": "item_fcaba32d4af94d8fb71fe833b5396e2f",
+              "item_sequence": 24,
+              "payload_sha256": "dbeda98a8b318186dadc3509d5e9d12fa2c3d9e9608a022a01d71706d86875dc",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_5869b25054254dc19722e6d5eb87a46e",
+              "item_sequence": 25,
+              "payload_sha256": "332a30f0aaa3750a5ff84e298f1394cc3f80ceba0840539d8fe80c03a8efe100",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 103,
+              "item_id": "item_a56384d4fce6446dadd81f636098f9fe",
+              "item_sequence": 26,
+              "payload_sha256": "0c00a4950b57834c79a470322453bd6599ed8c07a3b120e1904c90939d92c3f1",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 106,
+              "item_id": "item_5ae87cde8f8b45299d7f991cd11576cb",
+              "item_sequence": 27,
+              "payload_sha256": "861daf2142ba103db4b699131cb1d51936f32ee34d4b3979a40b49bc2eb188de",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 113,
+              "item_id": "item_97aec568b0f444bdbe2ec22d5a80a682",
+              "item_sequence": 28,
+              "payload_sha256": "1857c09f93bbb3daa6d1c1d36e7ff5e3a649508068877106163adb62c8528976",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 115,
+              "item_id": "item_a6bf4e8cf0ab415690174156018e4a89",
+              "item_sequence": 29,
+              "payload_sha256": "f86cc3cc97f07603f529320f9be81c0fddee8872af9c966261cc615209b687b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 121,
+              "item_id": "item_d3c9fce5cd6f406796954f22431da025",
+              "item_sequence": 30,
+              "payload_sha256": "d738412d5229e3c2a97c5e0546c085a40f935b5194b9d5d81dc0fe52672a3b9b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 124,
+              "item_id": "item_4cc9ebe22d9b46f1837c3395a2f72ed0",
+              "item_sequence": 31,
+              "payload_sha256": "1ea13a54df5f036a70ab08fddf2f52c3ed030e438b9507504225601359612236",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 127,
+              "item_id": "item_c02450c116d542f4b6a2ad1c6d8875ce",
+              "item_sequence": 32,
+              "payload_sha256": "22b3dc1be69018e6025a33e7025d5447937f372360f46092a30463262f0b84aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 134,
+              "item_id": "item_6d47a9aa36cd40dba6eef3adcdcd41b4",
+              "item_sequence": 33,
+              "payload_sha256": "4ac6ad672f50bace98f25d7fb68a6850780f11459911d99706d4c9af4d2728aa",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 136,
+              "item_id": "item_29266e709b324c82a09fc468a92bc02e",
+              "item_sequence": 34,
+              "payload_sha256": "fd4232a2a48a210d804822856b9f8382c739950d99f814427f86bb6915c26038",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 142,
+              "item_id": "item_303e3241c2cc48119cc910b7700d2de4",
+              "item_sequence": 35,
+              "payload_sha256": "60e56dc57c12dbf5c82f63d77005f8fcb75968f4b07dd0615d33ccda6f0c5bc7",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 145,
+              "item_id": "item_17e994b4abc44cdfb45d91280e803f6d",
+              "item_sequence": 36,
+              "payload_sha256": "11a155ef82bbef7ae458f69f9d81fd355b308e1eab5fa26d0af6edf948cfda31",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 148,
+              "item_id": "item_524f70b45e804d94af95cbb866956378",
+              "item_sequence": 37,
+              "payload_sha256": "3c7ebaf6644a5d9c2d9d7888bf8401cc3f0945bb621ca1660abf154582febe82",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 155,
+              "item_id": "item_4f53f261e0344831ba601d5f830f0372",
+              "item_sequence": 38,
+              "payload_sha256": "f15a85ac96748faab7f52c65c65e94cdfd041407ab0277ca897fa3568fd039ef",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 157,
+              "item_id": "item_39274118f23f47a8968e6e3e3d2326fd",
+              "item_sequence": 39,
+              "payload_sha256": "3b1aa59540dbf94439f71321e7276274db9e313ddfa20c230b984f952f512801",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 163,
+              "item_id": "item_9149aed2b8d7479681883ac39d742605",
+              "item_sequence": 40,
+              "payload_sha256": "36a11337888c9713fea2b95708d58ca3ac4f06ae1610ab4b142309e645e4fe1a",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 166,
+              "item_id": "item_aabb49d7302c42539584b3157d2651a1",
+              "item_sequence": 41,
+              "payload_sha256": "e2d583bb6fb8ee171df566de6c133c7e07cc49a811d1ac2de8432bcd0cf8bc7e",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 169,
+              "item_id": "item_d113755a9ded4c7186b54ffabf33f2bc",
+              "item_sequence": 42,
+              "payload_sha256": "3ed4ec5c4b6c5f888873d821fb690ff448028b5a78457c124b6f17490a3b6a66",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 176,
+              "item_id": "item_5cf3938de5e3452eae8f91fc5bc7e3fa",
+              "item_sequence": 43,
+              "payload_sha256": "d48f6bbcaa05732f163d5a96e9729b9f3a0d3c156d6a106fcb7adb8bee3f4b3f",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 178,
+              "item_id": "item_1919ed7ca54945aa89e0ac75d2e639b6",
+              "item_sequence": 44,
+              "payload_sha256": "4cc87e967260c886812ca43f5cf8cd6229a3eeef7be46b981635a0a68824aa58",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 184,
+              "item_id": "item_0c272558a64f40ccb4706274132364b4",
+              "item_sequence": 45,
+              "payload_sha256": "3c2987ec35e42cabc3f29169608833a2fc9d08256bd38860eb9c089e5288fb1b",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 187,
+              "item_id": "item_faf614c9e0ae4f339af5a9d187a5ce3d",
+              "item_sequence": 46,
+              "payload_sha256": "98c0081beb6e326d82d18382ed483f016cef086b9ddd192413c561aa3f28a2c3",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 189,
+              "item_id": "item_93e20595826a4f72b9f5246a500eb3ad",
+              "item_sequence": 47,
+              "payload_sha256": "f1e481a5660f099adbaf3310df7400562134d65c67e565722284be437ef2fe8c",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 192,
+              "item_id": "item_4bb3357afe184e71a978ef7b30632fb2",
+              "item_sequence": 48,
+              "payload_sha256": "008c8a4d32fb245b507d3c004f3dedfca24c9715bb9e9527bbfb6a064ff2b99a",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 199,
+              "item_id": "item_bc65834bf5584749a2cba4aa2bcc9b71",
+              "item_sequence": 49,
+              "payload_sha256": "34da4c8ce551943b4cefea23f95447990bbdc0e5ca675dead13ce8aabc6fd8b2",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 201,
+              "item_id": "item_2ab70a3869dc4beab40b7d87d9ff3fad",
+              "item_sequence": 50,
+              "payload_sha256": "0eb641e7b19603b8184509974982ab3f3e93eccace7f51dfabb9eb8bcd1df7d9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 203,
+              "item_id": "item_fb0cec5b698a4628ae9162db184ed262",
+              "item_sequence": 51,
+              "payload_sha256": "4342f2235b5710853b8cdccdb67f11d51c18d2c881b92fb82049780dfeffee33",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 205,
+              "item_id": "item_abac49373e2441ce9a94a1f11d4f7b78",
+              "item_sequence": 52,
+              "payload_sha256": "0eb641e7b19603b8184509974982ab3f3e93eccace7f51dfabb9eb8bcd1df7d9",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_87926bcd28ce48e899516668b3b21974"
+            },
+            {
+              "applied_thread_sequence": 210,
+              "item_id": "item_32dbd1cecab841f69f396ddf8900a136",
+              "item_sequence": 1,
+              "payload_sha256": "61af5f95a2d9d52d9cabc2600a19470cbb6b6698b94c46ae3bc6e6dc857bdc23",
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10",
+              "turn_id": "turn_45616ba9fe4644419504b0621d5abde9"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 210,
+              "start_thread_sequence": 5,
+              "thread_id": "thread_09d1ccfd93b04e83bb967f4f89dd6d10"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [],
+          "source_revision": "ef9a0ddaaf1a59d19879e7d12dcc4a7a0b0220b85f9e69234aa5b55e3b28f9f8",
+          "summary": "Tool result bodies archived; message structure preserved.",
+          "tool_result_overrides": {
+            "item_0c272558a64f40ccb4706274132364b4": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_0c272558a64f40ccb4706274132364b4').]",
+            "item_303e3241c2cc48119cc910b7700d2de4": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_303e3241c2cc48119cc910b7700d2de4').]",
+            "item_4da06da0d0c74b229de0d047d886ea03": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]",
+            "item_5869b25054254dc19722e6d5eb87a46e": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_5869b25054254dc19722e6d5eb87a46e').]",
+            "item_9149aed2b8d7479681883ac39d742605": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9149aed2b8d7479681883ac39d742605').]",
+            "item_9a67fb906d5343b3b4c76c240202c261": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]",
+            "item_f0e4c69e81d2496082271dd3dffd3e7a": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f0e4c69e81d2496082271dd3dffd3e7a').]",
+            "item_f47ecf3b41ec4a1cbdab84cee6c90bf9": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]",
+            "item_fcaba32d4af94d8fb71fe833b5396e2f": "{\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_fcaba32d4af94d8fb71fe833b5396e2f').]"
+          }
+        }
+      ]
+    }
+  ],
+  "token_count_source": "tokenizers:deepseek-v4-official",
+  "wire_trace_files": [
+    "sdk-request-1.json",
+    "sdk-request-2.json",
+    "sdk-request-3.json",
+    "sdk-request-4.json",
+    "sdk-request-5.json",
+    "sdk-request-6.json",
+    "sdk-request-7.json",
+    "sdk-request-8.json",
+    "sdk-request-9.json"
+  ],
+  "pass": false
+}

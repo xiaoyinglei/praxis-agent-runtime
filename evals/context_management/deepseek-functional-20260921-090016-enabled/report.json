@@ -1,0 +1,688 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "enabled",
+  "synthetic_only": true,
+  "cases": {
+    "repeated_compaction_restart": {
+      "pass": false,
+      "rounds": [
+        {
+          "round": 1,
+          "answer": null,
+          "checks": {
+            "latest_decision": false,
+            "reason": false,
+            "no_invented_migration": false,
+            "no_invented_implementation": false,
+            "pending_stays_pending": false,
+            "actually_semantically_compacted": false
+          },
+          "turn_id": "turn_ad23cc45f64e41d094cc0dbd003a77f5",
+          "terminal_reason": "model_response_incomplete",
+          "usage": {
+            "input_tokens": 2595,
+            "cached_input_tokens": 0,
+            "cache_write_tokens": 0,
+            "output_tokens": 2048,
+            "reasoning_tokens": 1888,
+            "cost_micros": 0,
+            "model_calls": 1,
+            "tool_calls": 0,
+            "retries": 0,
+            "subagents": 0,
+            "model_ms": 0,
+            "tool_ms": 0,
+            "wall_ms": 0,
+            "tool_output_bytes": 0,
+            "network_bytes": 0,
+            "artifact_bytes": 0
+          },
+          "rollout_valid": true,
+          "summary_calls": 1,
+          "tools": [],
+          "compactions": []
+        }
+      ]
+    },
+    "archived_detail_recall": {
+      "pass": false,
+      "answer": null,
+      "checks": {
+        "exact_code": false,
+        "actual_recall_calls": true,
+        "actually_archived": true
+      },
+      "turn_id": "turn_47daf505f38e4aba9af230ce80b58618",
+      "terminal_reason": "model_response_incomplete",
+      "usage": {
+        "input_tokens": 54246,
+        "cached_input_tokens": 24192,
+        "cache_write_tokens": 0,
+        "output_tokens": 5643,
+        "reasoning_tokens": 3229,
+        "cost_micros": 0,
+        "model_calls": 6,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 2,
+      "tools": [
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "8b13d78a9fedb29552e501b9473cc67ba56f780985b069beab60570ee184e77d"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "936f97611ba24ab3744f0efad75b4b771dc4d172e32856be6f83ffc75bd0ddef"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "c68b802e91626d0aaf39b2f7e7a53dfa8325ce9bd038de335a7b5dac4434218c"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "640ac3a5ec35319f4cd13c3be77bd95d08d360a2bb00f7cfef1b87c27f28dfa2"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "a3e78b66127046e7dca37e11b2f4f4e82722d360496ee6efc3011f8ab57c7613"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "201a690c03dda6ddaceb89f5b1d8392a5151f1d349c008e176452a7c57d4d59d"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "04fda4fb3a3ecc289a1c22b2985ca8209e69947822e596d21a376c62385cc8ca"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "04fda4fb3a3ecc289a1c22b2985ca8209e69947822e596d21a376c62385cc8ca"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "047002684c40da485917fee0692c38417c367e380de175b80981fcaae3922ee5"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "99c0232439c23450876c52c5ab8d79725d16cb28d7369e19422e1e1a196b50c4"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "d65722ec046d7300388b6156b83174d28c9c866d07afd4a73658d7d243431526"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "47ee364382a08356363169bb49efdc96e008094df43fb268e400743a2e5e7fdd"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "fba699ecde09d2fb2282f30d7aa366804b8e01e368f73c089fd1dec4a56851b9"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "7626f27d8da65aad377d52273b5b0c080d80577d41abc6138844bcabff3160ce"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "dcc352ba8995df141182431e932367974e44f5c102dc542a0f5eeaceb2612ccd"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "a3e78b66127046e7dca37e11b2f4f4e82722d360496ee6efc3011f8ab57c7613"
+        },
+        {
+          "name": "read_context",
+          "status": "succeeded",
+          "arguments_digest": "d02a7f48bdf3ba58122e13beb0028f3a3b2885e8342524f3cbb4d54bb9f15aa1"
+        }
+      ],
+      "compactions": [
+        {
+          "algorithm_revision": "old-tool-output-v3",
+          "artifact_refs": [],
+          "context_version": 1,
+          "covered_item_ids": [
+            "item_d2ba8476c6614fac8a3f5a2cc65e9961",
+            "item_39ed1edac5cb49c68acb56d381962fc9",
+            "item_8418d2f956734182a4207bc47fbf4bbc",
+            "item_f7c199380d3940d684a924f8287a2df3",
+            "item_fc2ce3178e1f4424801e80ebe8942ab4",
+            "item_c6d656661dd84d5cb0b8cde6b9fb41c7",
+            "item_524a362f90d244bca03029553ad607d4",
+            "item_f499172d981b4e74895cf5e32cc38308",
+            "item_d1d231188aff43ee997ea4eb9adfb218"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 4,
+              "item_id": "item_d2ba8476c6614fac8a3f5a2cc65e9961",
+              "item_sequence": 1,
+              "payload_sha256": "2739e21580c9e2048906259f60f3df110a2354507caab15ea3007a169ad58eb2",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 6,
+              "item_id": "item_39ed1edac5cb49c68acb56d381962fc9",
+              "item_sequence": 2,
+              "payload_sha256": "01c3bae601f9a20e18363786d0572b017497924aec84388fe268995d970911b1",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_8418d2f956734182a4207bc47fbf4bbc",
+              "item_sequence": 3,
+              "payload_sha256": "7d1d4f74b5bf911cc7c7bb4a8dee32ec5315daeffde2e928e1e2aaf739bb0f1f",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 10,
+              "item_id": "item_f7c199380d3940d684a924f8287a2df3",
+              "item_sequence": 4,
+              "payload_sha256": "924dfac9410304c6be7c64b3b5da691dfda9870990201638ac10c2f8cb433b1c",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 12,
+              "item_id": "item_fc2ce3178e1f4424801e80ebe8942ab4",
+              "item_sequence": 5,
+              "payload_sha256": "c737708cd4bafc0b848a8eb8f4172f0bb312efa7b83254d70ff4421926c67140",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 14,
+              "item_id": "item_c6d656661dd84d5cb0b8cde6b9fb41c7",
+              "item_sequence": 6,
+              "payload_sha256": "bb68a804b1d1edc31a82f945ab8a8fec990a1091e645f1f55468cce449683e14",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 16,
+              "item_id": "item_524a362f90d244bca03029553ad607d4",
+              "item_sequence": 7,
+              "payload_sha256": "12f1adcc72264454233e78ffc9884cb558b1b5f80e980479ae6ad8687ae8e66c",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 18,
+              "item_id": "item_f499172d981b4e74895cf5e32cc38308",
+              "item_sequence": 8,
+              "payload_sha256": "3c761a9af0c90142206554962d1047595a4ec4208488f7d0e236a749f58b8418",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 20,
+              "item_id": "item_d1d231188aff43ee997ea4eb9adfb218",
+              "item_sequence": 9,
+              "payload_sha256": "5d191f5ad5f93b711b562d44ae168870dec68e50674a617c976dc46e056bff37",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 20,
+              "start_thread_sequence": 4,
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "inspectable_sources": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [
+            "item_d2ba8476c6614fac8a3f5a2cc65e9961"
+          ],
+          "source_revision": "70c1cd15c8192f67352e742f873c356d22d24e383b95f50cad74eefb1b39df26",
+          "summary": "[{\"content\":\"Historical sensor log read\",\"item_id\":\"item_39ed1edac5cb49c68acb56d381962fc9\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-0\",\"name\":\"read_log\"}]},{\"content\":\"Tool output archived. Use read_context(item_id='item_8418d2f956734182a4207bc47fbf4bbc') to recover it.\",\"item_id\":\"item_8418d2f956734182a4207bc47fbf4bbc\",\"role\":\"tool\"},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_f7c199380d3940d684a924f8287a2df3\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-1\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_fc2ce3178e1f4424801e80ebe8942ab4\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-1\",\"tool_calls\":[]},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_c6d656661dd84d5cb0b8cde6b9fb41c7\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-2\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_524a362f90d244bca03029553ad607d4\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-2\",\"tool_calls\":[]},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_f499172d981b4e74895cf5e32cc38308\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-3\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_d1d231188aff43ee997ea4eb9adfb218\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-3\",\"tool_calls\":[]}]"
+        },
+        {
+          "algorithm_revision": "semantic-compaction-v3",
+          "artifact_refs": [],
+          "context_version": 2,
+          "covered_item_ids": [
+            "item_d2ba8476c6614fac8a3f5a2cc65e9961",
+            "item_39ed1edac5cb49c68acb56d381962fc9",
+            "item_8418d2f956734182a4207bc47fbf4bbc",
+            "item_f7c199380d3940d684a924f8287a2df3",
+            "item_fc2ce3178e1f4424801e80ebe8942ab4",
+            "item_c6d656661dd84d5cb0b8cde6b9fb41c7",
+            "item_524a362f90d244bca03029553ad607d4",
+            "item_f499172d981b4e74895cf5e32cc38308",
+            "item_d1d231188aff43ee997ea4eb9adfb218",
+            "item_cd72684b5c0c4dedb58cf5e8d34467d4",
+            "item_ae93fab6d7ba4e8697d73a6168060ab1",
+            "item_77810cc9c3564b3a9c987c132bd07d0f",
+            "item_c204c49c40ba4b21984d3749e9ccf752",
+            "item_c9a0c4e882924c9f8c2d46915f69d220",
+            "item_64e20cc4e0b44106b7189f3d8718ef58",
+            "item_19fe6fd162ac41cb8678fc04b39aea55",
+            "item_3a09680ca0ae46ee8dbabb07fc626d9e",
+            "item_f9a204f5c81a46d38246118ab42afb10",
+            "item_e40d949818a4444f8171078c4c8e787d",
+            "item_168bdd5888904967bd5b1602fd828b8d",
+            "item_c757f909ade546f4b14651342c6d44df",
+            "item_2f2befef93a84d4a806172d5aa6c8cfe",
+            "item_eec4c056517d4670bfc2cfe77df9f3f7",
+            "item_d914f4f0beb34c4b860ed1e471e6c8d4",
+            "item_e9672d50b37f479188880eedf90fda9f",
+            "item_ad813d8982a4420db546a4566de540c6",
+            "item_bde7edbf6eee4970af4524138daac68f",
+            "item_7a5feaea1754403c953dbbbb23bf1031",
+            "item_0d7415074f544a42a83014659e79ac83",
+            "item_40d11e7506214bfb9037444da3f76145",
+            "item_555e9764749b4dc581b5672d8e1ff0ce",
+            "item_e599372754e945cdb237dc7c3d706d39"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 4,
+              "item_id": "item_d2ba8476c6614fac8a3f5a2cc65e9961",
+              "item_sequence": 1,
+              "payload_sha256": "2739e21580c9e2048906259f60f3df110a2354507caab15ea3007a169ad58eb2",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 6,
+              "item_id": "item_39ed1edac5cb49c68acb56d381962fc9",
+              "item_sequence": 2,
+              "payload_sha256": "01c3bae601f9a20e18363786d0572b017497924aec84388fe268995d970911b1",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_8418d2f956734182a4207bc47fbf4bbc",
+              "item_sequence": 3,
+              "payload_sha256": "7d1d4f74b5bf911cc7c7bb4a8dee32ec5315daeffde2e928e1e2aaf739bb0f1f",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 10,
+              "item_id": "item_f7c199380d3940d684a924f8287a2df3",
+              "item_sequence": 4,
+              "payload_sha256": "924dfac9410304c6be7c64b3b5da691dfda9870990201638ac10c2f8cb433b1c",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 12,
+              "item_id": "item_fc2ce3178e1f4424801e80ebe8942ab4",
+              "item_sequence": 5,
+              "payload_sha256": "c737708cd4bafc0b848a8eb8f4172f0bb312efa7b83254d70ff4421926c67140",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 14,
+              "item_id": "item_c6d656661dd84d5cb0b8cde6b9fb41c7",
+              "item_sequence": 6,
+              "payload_sha256": "bb68a804b1d1edc31a82f945ab8a8fec990a1091e645f1f55468cce449683e14",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 16,
+              "item_id": "item_524a362f90d244bca03029553ad607d4",
+              "item_sequence": 7,
+              "payload_sha256": "12f1adcc72264454233e78ffc9884cb558b1b5f80e980479ae6ad8687ae8e66c",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 18,
+              "item_id": "item_f499172d981b4e74895cf5e32cc38308",
+              "item_sequence": 8,
+              "payload_sha256": "3c761a9af0c90142206554962d1047595a4ec4208488f7d0e236a749f58b8418",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 20,
+              "item_id": "item_d1d231188aff43ee997ea4eb9adfb218",
+              "item_sequence": 9,
+              "payload_sha256": "5d191f5ad5f93b711b562d44ae168870dec68e50674a617c976dc46e056bff37",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 22,
+              "item_id": "item_cd72684b5c0c4dedb58cf5e8d34467d4",
+              "item_sequence": 10,
+              "payload_sha256": "a71136b7cf0234d9821a0656da15e6b6e51e725b427f112dd3843989db579d6f",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 25,
+              "item_id": "item_ae93fab6d7ba4e8697d73a6168060ab1",
+              "item_sequence": 11,
+              "payload_sha256": "3567c8c67b6837547438c1a8e5b0ea333d5669d467e4ff9faab9402c37b05382",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 34,
+              "item_id": "item_77810cc9c3564b3a9c987c132bd07d0f",
+              "item_sequence": 12,
+              "payload_sha256": "c2475ea6329cbbfde6a3ce91233e2378c5e61dbf9c3f6be8a5a03ac6aacc74a1",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 33,
+              "item_id": "item_c204c49c40ba4b21984d3749e9ccf752",
+              "item_sequence": 13,
+              "payload_sha256": "8bd79e15daed2d90fb8e4d16cbf6525fe4521d75316fb71942e0915e7fd55153",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 36,
+              "item_id": "item_c9a0c4e882924c9f8c2d46915f69d220",
+              "item_sequence": 14,
+              "payload_sha256": "f7a5a965c931a8bb9287ed06beda7b07783e6be7d405b3a2da05e74083b0d18d",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 38,
+              "item_id": "item_64e20cc4e0b44106b7189f3d8718ef58",
+              "item_sequence": 15,
+              "payload_sha256": "73ac9d95d800ff1973e6998c03727d0af11d8913a09578a33d787634358c012f",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 40,
+              "item_id": "item_19fe6fd162ac41cb8678fc04b39aea55",
+              "item_sequence": 16,
+              "payload_sha256": "306becf5f238a7e210435ccdae6259711881cc414dfe8fb7769add9ece678737",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 42,
+              "item_id": "item_3a09680ca0ae46ee8dbabb07fc626d9e",
+              "item_sequence": 17,
+              "payload_sha256": "45c462e056a970b333f0d09730016be290e5cf6f5c91d4210a942d00b88fe251",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 56,
+              "item_id": "item_f9a204f5c81a46d38246118ab42afb10",
+              "item_sequence": 18,
+              "payload_sha256": "fab736f84c6ae6df8af649466011682bc3d94f5decaf3a73f6caa015dfb2f6ae",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 60,
+              "item_id": "item_e40d949818a4444f8171078c4c8e787d",
+              "item_sequence": 19,
+              "payload_sha256": "eeb4ce93882b5514f91c2659353e3b34d258be94694f562831fc691a95b69401",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 64,
+              "item_id": "item_168bdd5888904967bd5b1602fd828b8d",
+              "item_sequence": 20,
+              "payload_sha256": "57e6e8e4e131a3ae7cf42b1dc878c4c03e453ee8d3ab25b89c4769ae40259664",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 69,
+              "item_id": "item_c757f909ade546f4b14651342c6d44df",
+              "item_sequence": 21,
+              "payload_sha256": "e8a9f74f20294705948453aa8527fff374d5b37d35e31fbb15c0fcb5796590e7",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 73,
+              "item_id": "item_2f2befef93a84d4a806172d5aa6c8cfe",
+              "item_sequence": 22,
+              "payload_sha256": "96179b50fa3098e475f989a493129fd67cec61223e03c7c6211e6ff6b60f5054",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 82,
+              "item_id": "item_eec4c056517d4670bfc2cfe77df9f3f7",
+              "item_sequence": 23,
+              "payload_sha256": "d4d6acfc1bf492eccae9e7a58d8aea326db3afbef24686abf91908a2a70d6f9c",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 81,
+              "item_id": "item_d914f4f0beb34c4b860ed1e471e6c8d4",
+              "item_sequence": 24,
+              "payload_sha256": "7473a4543a7a39d6df04e9c4d61610e352140b70ef112aeb09348dd86e0d9940",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 84,
+              "item_id": "item_e9672d50b37f479188880eedf90fda9f",
+              "item_sequence": 25,
+              "payload_sha256": "9db35dcc77f1a849463f7fc17aa498d4a88e7671399b8489e5037cb7bf51721a",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 86,
+              "item_id": "item_ad813d8982a4420db546a4566de540c6",
+              "item_sequence": 26,
+              "payload_sha256": "7983ef69f88f3fe4c4db6a0569324d38c067ea622557a46960758aa10b25e2b2",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 88,
+              "item_id": "item_bde7edbf6eee4970af4524138daac68f",
+              "item_sequence": 27,
+              "payload_sha256": "76d8738e04b1101b484c849e785d76db5c0bfb82cb2144c14bf0f55e63773a27",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 100,
+              "item_id": "item_7a5feaea1754403c953dbbbb23bf1031",
+              "item_sequence": 28,
+              "payload_sha256": "f26930f7ba3c4b817ee6f42427b61a5ec79964dcf6040b1d17e18ad30daac6ee",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 104,
+              "item_id": "item_0d7415074f544a42a83014659e79ac83",
+              "item_sequence": 29,
+              "payload_sha256": "7ae74226c11adc3712dd660dbbc18f5c1d3ff0aeb155a000e1134d84579ebe0e",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 108,
+              "item_id": "item_40d11e7506214bfb9037444da3f76145",
+              "item_sequence": 30,
+              "payload_sha256": "bfd2339f5ec65609d53412ab58fec64658319253103dab50eeed84b06cfa5092",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 112,
+              "item_id": "item_555e9764749b4dc581b5672d8e1ff0ce",
+              "item_sequence": 31,
+              "payload_sha256": "99c39f62596c6b02c8875125459f51b0a2292a21b34f2f7f4f14ef4e0165bbd9",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            },
+            {
+              "applied_thread_sequence": 119,
+              "item_id": "item_e599372754e945cdb237dc7c3d706d39",
+              "item_sequence": 32,
+              "payload_sha256": "1d91c107dddeb5ec920c330ab805ee47f6d4cfa46f93caffa2a4d91f21fdc21b",
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528",
+              "turn_id": "turn_47daf505f38e4aba9af230ce80b58618"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 119,
+              "start_thread_sequence": 4,
+              "thread_id": "thread_8dbc1cc45d9748d6b1f8ee53a5c6a528"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "inspectable_sources": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [
+            "item_d2ba8476c6614fac8a3f5a2cc65e9961"
+          ],
+          "source_revision": "b08ae2ad06ef003a3e21f9b8ccc09af3bce519b6edc6dbf0f5af89a93dbc6ca3",
+          "summary": "## Continuation Summary\n\n**Objective (stated in model reasoning, item_77810cc9c3564b3a9c987c132bd07d0f):** Find the archived tool output containing the sensor Helios calibration code, after context compaction.\n\n**Facts / evidence**\n- Four historical `read_log` calls were made (tool call IDs old-0, old-1, old-2, old-3; responses item_39ed1edac5cb49c68acb56d381962fc9, item_f7c199380d3940d684a924f8287a2df3, item_c6d656661dd84d5cb0b8cde6b9fb41c7, item_f499172d981b4e74895cf5e32cc38308).\n- Negative results: three of the four log outputs (item_fc2ce3178e1f4424801e80ebe8942ab4, item_524a362f90d244bca03029553ad607d4, item_d1d231188aff43ee997ea4eb9adfb218) each contain only \"Recent unrelated sample; no calibration code here.\" (93 chars each). These items were re-read via `read_context` (calls call_01/02/03; results item_e40d949818a4444f8171078c4c8e787d, item_168bdd5888904967bd5b1602fd828b8d, item_c757f909ade546f4b14651342c6d44df) and confirmed unchanged.\n- Output of old-0 was archived by context compaction (item_cd72684b5c0c4dedb58cf5e8d34467d4) with instruction to recover via `read_context(item_id='item_8418d2f956734182a4207bc47fbf4bbc')`. That item is `item_8418d2f956734182a4207bc47fbf4bbc`, total_chars 34298.\n- `read_context` pages of item_8418d2f956734182a4207bc47fbf4bbc executed successfully (is_error false): offset 0 (item_f9a204f5c81a46d38246118ab42afb10), offset 30000 (item_7a5feaea1754403c953dbbbb23bf1031), offset 15000 (item_0d7415074f544a42a83014659e79ac83), offset 2000 (item_40d11e7506214bfb9037444da3f76145).\n- Key finding: the offset-2000 page contains the literal text \"Sensor Helios exact calibration code: HX-7294-KAPPA\" embedded within long repetitive filler (\"Routine calibration sample; nothing changed.\" / \"Routine sample.\"). This is the calibration code, recovered from the archived item.\n- Content at offsets 0–4000, 2000–6000, 15000–19000, 30000–34000 observed as repetitive filler; page at offset 2000 reported `truncated: true, next_offset: 6000` and next_offset 4000/19000/34000 elsewhere.\n- Preserved item ID referenced by compaction but not shown in this fragment: item_d2ba8476c6614fac8a3f5a2cc65e9961.\n\n**Decisions/reasons**\n- Model chose to page the large archived item at varied offsets to locate real calibration content amid filler (item_eec4c056517d4670bfc2cfe77df9f3f7).\n- Model correctly identified the other three items as irrelevant based on their \"no calibration code here\" content.\n\n**Applied changes / verification**\n- None. Durable state: approvals [], interactions [], tool_operations []. No file changes, no passed tests recorded. The successful `read_context` calls are execution evidence only.\n\n**Unresolved / next actions**\n- The archived item has not been fully enumerated; offsets ~6000–15000, 4000–2000, 19000–30000, and 34000–end were not read. Next action implied by the last response is continuing paging from next_offset 6000 of item_8418d2f956734182a4207bc47fbf4bbc, presumably to confirm no other calibration content. No objective beyond locating the code was stated."
+        }
+      ]
+    },
+    "parallel_read_edit_verify": {
+      "pass": true,
+      "checks": {
+        "correct_file": true,
+        "inputs_unchanged": true,
+        "three_actually_overlapped": true,
+        "post_write_read": true
+      },
+      "answer": "Done.\n\n- **Inputs (read from files, not invented):** alpha.txt = 19, beta.txt = 37, gamma.txt = 61\n- **Sum:** 19 + 37 + 61 = **117**\n- **Write:** `result.json` updated from `\"total\": 0` to `\"total\": 117` (single unique occurrence replaced)\n- **Verification read:** `result.json` now contains `{\"total\": 117}`\n\nThe three input files were not modified — only `result.json` was patched.",
+      "maximum_simultaneous_reads": 3,
+      "read_intervals": [
+        {
+          "path": "alpha.txt",
+          "start": 151114.093536541,
+          "end": 151114.394792791
+        },
+        {
+          "path": "beta.txt",
+          "start": 151114.093543583,
+          "end": 151114.395148625
+        },
+        {
+          "path": "gamma.txt",
+          "start": 151114.093546708,
+          "end": 151114.395420208
+        },
+        {
+          "path": "result.json",
+          "start": 151121.073275666,
+          "end": 151121.374844333
+        }
+      ],
+      "turn_id": "turn_c44f791ec14e4008be40301444e6404f",
+      "terminal_reason": "completed",
+      "usage": {
+        "input_tokens": 9692,
+        "cached_input_tokens": 7168,
+        "cache_write_tokens": 0,
+        "output_tokens": 1269,
+        "reasoning_tokens": 914,
+        "cost_micros": 0,
+        "model_calls": 4,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 0,
+      "tools": [
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "a0524016530f678034ed9c34639f08bd2021628c125bf9fe6ad37ce9b4e99c46"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "dc228cb6147d5a54b45210e965cf565a7a0ab9e9f39d4fed48434abb1265b71a"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "c3062e126232d80151776095cb715f8b2e1bf3a9ca55173c547ee5f6f60a07b9"
+        },
+        {
+          "name": "apply_patch",
+          "status": "succeeded",
+          "arguments_digest": "8540cf12e38f8f671fc14e44792b37b96444d02247f85c777dcbd1e02df59803"
+        },
+        {
+          "name": "read_file",
+          "status": "succeeded",
+          "arguments_digest": "5c8497ddb35c27d9ac817d0a37477746621a251c2a71e30d2e15496b29c57651"
+        }
+      ],
+      "compactions": []
+    }
+  }
+}

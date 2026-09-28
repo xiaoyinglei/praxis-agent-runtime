@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import gzip
+import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.util import find_spec
+from pathlib import Path
 from typing import Any
 
 from agent_runtime.text import (
@@ -34,6 +37,20 @@ class TokenAccountingService:
     contract: TokenizerContract
     _backend_kind: str | None = None
     _backend: Any | None = None
+
+    def count_for_budget(self, text: str) -> int:
+        """Count a request without the retrieval word-count fallback.
+
+        With no tokenizer, reserve UTF-8 bytes conservatively rather than omit
+        punctuation, escapes and long numeric strings. This is an estimate of
+        serialized input, not a claim about provider chat-template token usage.
+        """
+        encoded = self._encode(text)
+        return len(encoded) if encoded is not None else len(text.encode("utf-8"))
+
+    def budget_count_source(self) -> str:
+        kind, name = self.backend_descriptor()
+        return "utf8_bytes_conservative" if kind == "simple" else f"{kind}:{name}"
 
     def count(self, text: str) -> int:
         normalized = text.strip()
@@ -169,6 +186,9 @@ class TokenAccountingService:
         if self._backend_kind == "transformers":
             backend = self._backend
             return list(backend.encode(text, add_special_tokens=False)) if backend is not None else None
+        if self._backend_kind == "tokenizers":
+            backend = self._backend
+            return list(backend.encode(text, add_special_tokens=False).ids) if backend is not None else None
         return None
 
     def _decode(self, tokens: Sequence[int]) -> str:
@@ -176,6 +196,9 @@ class TokenAccountingService:
         if self._backend_kind == "tiktoken":
             backend = self._backend
             return "" if backend is None else str(backend.decode(list(tokens)))
+        if self._backend_kind == "tokenizers":
+            backend = self._backend
+            return "" if backend is None else str(backend.decode(list(tokens), skip_special_tokens=True))
         if self._backend_kind == "transformers":
             backend = self._backend
             if backend is None:
@@ -241,6 +264,14 @@ def _build_tokenizer_backend(
     backend: str,
     local_files_only: bool,
 ) -> tuple[str, Any | None]:
+    if model_name == "deepseek-v4-official" and backend == "auto":
+        # Data only: no model weights, remote code, or runtime network access.
+        from tokenizers import Tokenizer  # type: ignore[import-untyped]
+
+        data = gzip.decompress((Path(__file__).parent / "tokenizer_assets/deepseek_v4_tokenizer.json.gz").read_bytes())
+        if hashlib.sha256(data).hexdigest() != "89085f12ef79460ac5f66d1119325ddfc694b4ab209d80bbd81d35f081dc9614":
+            raise RuntimeError("Bundled DeepSeek tokenizer checksum mismatch")
+        return "tokenizers", Tokenizer.from_str(data.decode("utf-8"))
     preferred = _preferred_backend(backend=backend)
     for candidate in preferred:
         built = _try_build_tokenizer(model_name=model_name, backend=candidate, local_files_only=local_files_only)

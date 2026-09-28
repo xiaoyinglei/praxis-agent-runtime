@@ -74,6 +74,17 @@ models:
   # -------------------------------------------------------------------------
   # Chat models: DeepSeek.
   # -------------------------------------------------------------------------
+  # DeepSeek V4.1 Flash, official API identifier as of 2026-09-21.
+  deepseek-flash:
+    capability: chat
+    provider: deepseek
+    tokenizer_model: deepseek-v4-official
+    context_window_tokens: 1048576
+    defaults:
+      provider_options:
+        thinking:
+          type: enabled
+
   deepseek-chat:
     capability: chat
     provider: deepseek

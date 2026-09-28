@@ -1,0 +1,18 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "disabled",
+  "byte_limit": 14000,
+  "steps_per_turn": 16,
+  "tokens_per_turn": 100000,
+  "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+  "script_sha256": "c3b4bcd891e36ce785a081301bca5f28abe1327068aabfe2c9e58d193145f67f",
+  "spec_hashes": {
+    "identity.md": "cc16abd073e9addefd11161594ea6cebdcc0bf1258353a6a36421ebbdf627da1",
+    "deletion.md": "6e3ac1edc6fc64e3d9874e1a092fa61a6a5918b473c67e8ad2cc6adcfc4d958a",
+    "ordering.md": "343f31ae60aa9d47c04d68bf4a404446af9a95d17dca4a6d7bda31e29fe1224d",
+    "aggregation.md": "0de4cff7495d0b46a50046aafcecd04c0426937a7fcdb7c32be39ea13b2cbdae",
+    "empty.md": "4a65fffca92827b3260c1f4bc773dbe40d202869225470177b512c633485b34e",
+    "amounts.md": "89342585a108310b94673e8f35d0ad3fb3f1bc7508f29be5e34358eda81542c9"
+  },
+  "phases": []
+}

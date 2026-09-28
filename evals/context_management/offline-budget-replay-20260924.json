@@ -1,0 +1,85 @@
+{
+  "source": "evals/context_management/deepseek-session-code-20260923-232844",
+  "network_calls": 0,
+  "note": "Offline SDK envelope replay, includes request controls. Not a reconstruction of provider tokenizer or old canonical serialization.",
+  "count_source": "utf8_bytes_conservative",
+  "requests": [
+    {
+      "request": 1,
+      "purpose": "agent_step",
+      "old_reserved_input": 2045,
+      "actual_provider_input": 3241,
+      "sdk_envelope_byte_estimate": 13691
+    },
+    {
+      "request": 2,
+      "purpose": "context_summary",
+      "old_reserved_input": 3870,
+      "actual_provider_input": 13200,
+      "sdk_envelope_byte_estimate": 49472
+    },
+    {
+      "request": 3,
+      "purpose": "agent_step",
+      "old_reserved_input": 2655,
+      "actual_provider_input": 4542,
+      "sdk_envelope_byte_estimate": 18786
+    },
+    {
+      "request": 4,
+      "purpose": "context_summary",
+      "old_reserved_input": 4499,
+      "actual_provider_input": 14716,
+      "sdk_envelope_byte_estimate": 55474
+    },
+    {
+      "request": 5,
+      "purpose": "agent_step",
+      "old_reserved_input": 2655,
+      "actual_provider_input": 4542,
+      "sdk_envelope_byte_estimate": 18786
+    },
+    {
+      "request": 6,
+      "purpose": "context_summary",
+      "old_reserved_input": 4499,
+      "actual_provider_input": 14710,
+      "sdk_envelope_byte_estimate": 55474
+    },
+    {
+      "request": 7,
+      "purpose": "agent_step",
+      "old_reserved_input": 2706,
+      "actual_provider_input": 4834,
+      "sdk_envelope_byte_estimate": 19499
+    },
+    {
+      "request": 8,
+      "purpose": "agent_step",
+      "old_reserved_input": 3019,
+      "actual_provider_input": 5481,
+      "sdk_envelope_byte_estimate": 21620
+    },
+    {
+      "request": 9,
+      "purpose": "agent_step",
+      "old_reserved_input": 3263,
+      "actual_provider_input": 5892,
+      "sdk_envelope_byte_estimate": 23502
+    },
+    {
+      "request": 10,
+      "purpose": "agent_step",
+      "old_reserved_input": 3627,
+      "actual_provider_input": 6689,
+      "sdk_envelope_byte_estimate": 27411
+    },
+    {
+      "request": 11,
+      "purpose": "context_summary",
+      "old_reserved_input": 2325,
+      "actual_provider_input": 5673,
+      "sdk_envelope_byte_estimate": 20899
+    }
+  ]
+}

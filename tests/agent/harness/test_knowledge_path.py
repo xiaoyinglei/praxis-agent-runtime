@@ -174,7 +174,8 @@ async def test_configured_knowledge_uses_the_durable_harness_tool_path(
         binding = runtime.store.read_turn(result.turn_id).binding_manifest
         assert binding["knowledge_revision"] == "rag-corpus-v7"
         assert binding["tool_execution_revisions"] == {
-            "search_knowledge": "integration-search-knowledge-v1:rag-corpus-v7"
+            "search_knowledge": "integration-search-knowledge-v1:rag-corpus-v7",
+            "read_context": "context-recall-v5"
         }
         public = AgentResult._from_harness(result, store=runtime.store)
         [public_call] = public.tool_calls
@@ -225,9 +226,9 @@ async def test_discoverable_knowledge_is_hidden_until_find_tools_result_is_commi
 
         assert result.status == "done"
         assert model.visible_tools == [
-            ("find_tools",),
-            ("find_tools", "search_knowledge"),
-            ("find_tools", "search_knowledge"),
+            ("find_tools", "read_context"),
+            ("find_tools", "read_context", "search_knowledge"),
+            ("find_tools", "read_context", "search_knowledge"),
         ]
         assert [
             (operation.tool_name, operation.status)

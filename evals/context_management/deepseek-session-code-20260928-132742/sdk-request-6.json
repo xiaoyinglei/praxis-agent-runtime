@@ -1,0 +1,385 @@
+{
+  "model": "deepseek-flash",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise coding and file agent. Use the tools that are visible in the\ncurrent request when the task requires workspace inspection, editing,\nexecution, planning, configured knowledge, or another installed capability.\nTool definitions are the authority for their inputs and effects. Preserve\nevidence identifiers and artifact paths. Never invent file contents or tool\nresults. To complete the task, return a non-empty final answer with zero tool\ncalls. There is no `finish` tool: never emit a tool call named `finish`.\n\nContext compaction is a continuation of this conversation, not a new task.\nUse the continuation memory and current messages to answer the active request.\nUse read_context for a specific missing detail, ambiguity, or genuine conflict;\nit reads immutable conversation records, not the live workspace. A successful\nread remains evidence after compaction: do not repeat it merely to reconfirm\nthe same fact. Explicit later revisions supersede earlier decisions; do not\ntreat those as unresolved contradictions. Do not scan the entire archive to\nlook for hypothetical newer decisions when the current history already gives\nthe revision. Once the request is answered by the available evidence, finish.\n\nFor spreadsheet, PDF, CSV, TSV, and JSON tasks, use inspect_data_file to read\nstructure and bounded content; never pass a binary file to read_file. When the\ntask gives the exact data-file path, inspect it directly without listing or\nsearching the workspace first. Use execute_python for calculations, statistics,\ntransformations, charts, and generated artifacts. Pass Python source directly\ninstead of a shell command or heredoc.\nWhen writing, declare the exact output_paths, inspect each required generated\ndata artifact once, and when that inspection reports valid=true, return a\nnon-empty final answer with zero tool calls. Do not\nreread the original binary, repeat the inspection, rewrite\nthe artifact, or escalate to run_command merely for stronger confirmation.\n\nFor coding tasks, search for exact files or symbols before reading broad source\nfiles. Pass a search_text result's line_number to read_file.start_line, never to\nits byte offset. Continue line chunks with next_line and byte chunks with\nnext_offset; never substitute a line number or file size for offset. For an\nimplementation request, establish or update the plan within the first four\ninspection calls and make the first concrete edit within twelve inspection\ncalls. Never submit more than four tool calls in one model turn. Updating the\nplan after the inspection limit can grant only one eight-call focused extension;\nrepeating the plan does not grant more. Do not map the whole repository before\nacting: extract concrete symbols or behaviors from the task, search for the\nexisting choke point, and make the complete coherent change across every\naffected layer. Make the focused delivery change. Match verification to the\nclaim: for a literal file-content task involving text, a targeted read or search\nafter the write can be sufficient; for a generated data artifact, a successful\ninspect_data_file result verifies file structure and content but does not prove\nunrelated code behavior. When the task already supplies the exact file, old\ntext, and replacement, call apply_patch directly; do not pre-read merely to\nreconfirm those inputs because apply_patch fails closed. After a successful\nliteral edit, choose at most one targeted read_file or search_text call. Never\nbatch both tools, and never pair a positive search with a negative search, just\nto double-confirm the same edit. Once that single result shows the requested\nstate and no distinct requirement remains, the next response must be a\nnon-empty final answer with zero tool calls. For a behavioral code change, run\nthe narrowest relevant\nrecognized test, lint, type-check, or build command. Running a pytest file with\n`python` does not execute its tests. Use `pytest -q` from the workspace virtual\nenvironment; use `uv run pytest -q` only when `uv` is available. If no test\nrunner is available in the sandbox, use `python3 -c` with a real top-level\n`assert` that imports and checks the changed behavior; do not install packages\nor request network access.\nPending runtime\nrequirements override these defaults. Reuse successful evidence from an\nunchanged workspace. Do not repeat an edit or inspection, or request command\nexecution solely to reconfirm file content that the existing result already\nestablishes. Fetch a different range or use another tool only for a specific\nunmet requirement. Do not widen into unrelated files after the requested\nbehavior has been implemented and verified.\n\n\nCurrent workspace root and default tool working directory: \"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742/workspace\". Use paths relative to this root. Omit working_dir or use '.' for the default directory. Tool working_dir and declared output_paths must resolve inside this workspace.\n\n{\"event_type\":\"frozen_run_context\",\"payload\":{\"content\":\"Current model ID for this turn: deepseek-flash.\",\"name\":\"runtime_model_identity\"}}"
+    },
+    {
+      "role": "user",
+      "content": "Implement reconcile(events) in ledger.py from identity.md, deletion.md and ordering.md. First read those three documents together with three read_file calls in ONE response. Preserve event dictionaries and the input list; do not change specification documents. Add and run verify.py covering the specification, using python3. Finish only after checking the changed file."
+    },
+    {
+      "role": "assistant",
+      "content": "I'll read the three specification documents together.",
+      "tool_calls": [
+        {
+          "id": "call_00_0Ju1ZboJIiOKfVnJ1UtC3211",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"identity.md\"}"
+          }
+        },
+        {
+          "id": "call_01_SOmHwlgKx6M959Io6Xen3044",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"deletion.md\"}"
+          }
+        },
+        {
+          "id": "call_02_wekTF04fSU6pm3uixB4Z5681",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"ordering.md\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_0Ju1ZboJIiOKfVnJ1UtC3211",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"reconcile(events) returns a new list of winning event dictionaries. Identity is (tenant, id), never id alone. Select greatest seq. Equal seq: the later INPUT POSITION wins. Never modify input list or dictionaries.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve thi\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_f47ecf3b41ec4a1cbdab84cee6c90bf9').]"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_01_SOmHwlgKx6M959Io6Xen3044",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Apply winner selection before deletion. A winning event with deleted=true removes that identity. A later nondeleted event can resurrect an identity. Default deleted is false. No other filtering.\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tena\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_9a67fb906d5343b3b4c76c240202c261').]"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_02_wekTF04fSU6pm3uixB4Z5681",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"Sort live winners lexicographically by (tenant, id). Input uses string tenant/id and integer seq/amount. Preserve every field in the winning dictionary. Empty input yields [].\\n\\nExample input records (independent identities):\\n{\\\"tenant\\\": \\\"tenant-0\\\", \\\"id\\\": \\\"event-0\\\", \\\"seq\\\": 0, \\\"amount\\\": -225179981368524825, \\\"deleted\\\": true, \\\"note\\\": \\\"audit sample 0; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-1\\\", \\\"id\\\": \\\"event-1\\\", \\\"seq\\\": 1, \\\"amount\\\": -216172782113783832, \\\"deleted\\\": false, \\\"note\\\": \\\"audit sample 1; preserve this field\\\"}\\n{\\\"tenant\\\": \\\"tenant-2\\\",\n[Tool result truncated for context capacity. The text above is an incomplete prefix, not a summary. Original: read_context(item_id='item_4da06da0d0c74b229de0d047d886ea03').]"
+    },
+    {
+      "role": "assistant",
+      "content": "I have the three specifications. Now let me check the existing ledger.py.",
+      "tool_calls": [
+        {
+          "id": "call_00_UpQMDclG2MGbfuOXYWru8349",
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "arguments": "{\"path\":\"ledger.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_UpQMDclG2MGbfuOXYWru8349",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"binary_format\":null,\"content\":\"\\\"\\\"\\\"Tenant event ledger.\\\"\\\"\\\"\\n\\ndef reconcile(events):\\n    return list(events)\\n\",\"encoding\":\"utf-8\",\"end_line\":null,\"is_binary\":false,\"next_line\":null,\"next_offset\":null,\"offset\":0,\"path\":\"ledger.py\",\"recommended_tool\":null,\"size_bytes\":75,\"start_line\":null,\"truncated\":false},\"truncated\":false}"
+    },
+    {
+      "role": "assistant",
+      "content": "Now I'll implement reconcile and create verify.py.",
+      "tool_calls": [
+        {
+          "id": "call_00_Jdbw7hTxbGIX1MuT1UQB3946",
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "arguments": "{\"file_path\":\"ledger.py\",\"new_string\":\"\\\"\\\"\\\"Tenant event ledger.\\\"\\\"\\\"\\n\\ndef reconcile(events):\\n    \\\"\\\"\\\"Return the winning, live event dictionaries.\\n\\n    Identity is (tenant, id). The greatest seq wins; on equal seq the later\\n    input position wins. Winner selection happens before deletion: a winning\\n    event with deleted=true removes that identity, and a later nondeleted\\n    event can resurrect it. Live winners are sorted lexicographically by\\n    (tenant, id). Input list and dictionaries are never modified.\\n    \\\"\\\"\\\"\\n    winners = {}\\n    for position, event in enumerate(events):\\n        key = (event[\\\"tenant\\\"], event[\\\"id\\\"])\\n        current = winners.get(key)\\n        if current is None or event[\\\"seq\\\"] > current[0][1] or (\\n            event[\\\"seq\\\"] == current[0][1] and position > current[1]\\n        ):\\n            winners[key] = (event, position)\\n\\n    live = [\\n        event\\n        for event, _position in winners.values()\\n        if not event.get(\\\"deleted\\\", False)\\n    ]\\n    live.sort(key=lambda event: (event[\\\"tenant\\\"], event[\\\"id\\\"]))\\n    return live\",\"old_string\":\"\\\"\\\"\\\"Tenant event ledger.\\\"\\\"\\\"\\n\\ndef reconcile(events):\\n    return list(events)\"}"
+          }
+        },
+        {
+          "id": "call_01_NUhrLT30777dKwzpqNQD7538",
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "arguments": "{\"file_path\":\"verify.py\",\"new_string\":\"\\\"\\\"\\\"Verification for ledger.reconcile against the specification documents.\\\"\\\"\\\"\\n\\nimport copy\\n\\nfrom ledger import reconcile\\n\\n\\ndef test_empty_input():\\n    assert reconcile([]) == []\\n\\n\\ndef test_identity_is_tenant_and_id():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"b\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2},\\n    ]\\n    result = reconcile(events)\\n    assert result == [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"b\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2},\\n    ]\\n\\n\\ndef test_greatest_seq_wins():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 5, \\\"amount\\\": 5},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 9, \\\"amount\\\": 9},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2},\\n    ]\\n    assert reconcile(events) == [{\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 9, \\\"amount\\\": 9}]\\n\\n\\ndef test_equal_seq_later_position_wins():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 3, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 3, \\\"amount\\\": 2},\\n    ]\\n    assert reconcile(events) == [{\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 3, \\\"amount\\\": 2}]\\n\\n\\ndef test_deleted_winner_removes_identity():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2, \\\"deleted\\\": True},\\n    ]\\n    assert reconcile(events) == []\\n\\n\\ndef test_later_nondeleted_resurrects():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1, \\\"deleted\\\": True},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2},\\n    ]\\n    assert reconcile(events) == [{\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2}]\\n\\n\\ndef test_deleted_defaults_to_false():\\n    events = [{\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1}]\\n    assert reconcile(events) == [{\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1}]\\n\\n\\ndef test_sorted_lexicographically_by_tenant_then_id():\\n    events = [\\n        {\\\"tenant\\\": \\\"b\\\", \\\"id\\\": \\\"a\\\", \\\"seq\\\": 1},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"z\\\", \\\"seq\\\": 1},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"a\\\", \\\"seq\\\": 1},\\n    ]\\n    result = reconcile(events)\\n    assert [(e[\\\"tenant\\\"], e[\\\"id\\\"]) for e in result] == [\\n        (\\\"a\\\", \\\"a\\\"),\\n        (\\\"a\\\", \\\"z\\\"),\\n        (\\\"b\\\", \\\"a\\\"),\\n    ]\\n\\n\\ndef test_preserves_every_field():\\n    event = {\\n        \\\"tenant\\\": \\\"a\\\",\\n        \\\"id\\\": \\\"x\\\",\\n        \\\"seq\\\": 1,\\n        \\\"amount\\\": -225179981368524825,\\n        \\\"deleted\\\": False,\\n        \\\"note\\\": \\\"audit sample; preserve this field\\\",\\n    }\\n    result = reconcile([event])\\n    assert result == [event]\\n    assert result[0] is event\\n\\n\\ndef test_does_not_modify_input():\\n    events = [\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 1, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"a\\\", \\\"id\\\": \\\"x\\\", \\\"seq\\\": 2, \\\"amount\\\": 2, \\\"deleted\\\": True},\\n        {\\\"tenant\\\": \\\"b\\\", \\\"id\\\": \\\"y\\\", \\\"seq\\\": 1, \\\"amount\\\": 3},\\n    ]\\n    snapshot = copy.deepcopy(events)\\n    order = list(events)\\n    reconcile(events)\\n    assert events == snapshot\\n    assert events == order\\n\\n\\ndef test_combined_scenario():\\n    events = [\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"a\\\", \\\"seq\\\": 1, \\\"amount\\\": 1},\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"b\\\", \\\"seq\\\": 1, \\\"amount\\\": 2, \\\"deleted\\\": True},\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"a\\\", \\\"seq\\\": 1, \\\"amount\\\": 3},\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"c\\\", \\\"seq\\\": 4, \\\"amount\\\": 4},\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"c\\\", \\\"seq\\\": 4, \\\"amount\\\": 5, \\\"deleted\\\": True},\\n    ]\\n    assert reconcile(events) == [\\n        {\\\"tenant\\\": \\\"t\\\", \\\"id\\\": \\\"a\\\", \\\"seq\\\": 1, \\\"amount\\\": 3},\\n    ]\\n\\n\\ndef main():\\n    tests = [value for name, value in sorted(globals().items()) if name.startswith(\\\"test_\\\")]\\n    for test in tests:\\n        test()\\n        print(\\\"ok\\\", test.__name__)\\n    print(\\\"all\\\", len(tests), \\\"checks passed\\\")\\n\\n\\nif __name__ == \\\"__main__\\\":\\n    main()\\n\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_01_NUhrLT30777dKwzpqNQD7538",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"created\":true,\"file_path\":\"verify.py\",\"message\":\"file created\",\"occurrences\":0,\"replaced\":false},\"truncated\":false}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_Jdbw7hTxbGIX1MuT1UQB3946",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"created\":false,\"file_path\":\"ledger.py\",\"message\":\"patch applied\",\"occurrences\":1,\"replaced\":true},\"truncated\":false}"
+    },
+    {
+      "role": "assistant",
+      "content": "Now let me run verify.py with python3.",
+      "tool_calls": [
+        {
+          "id": "call_00_pn6hTxC7WlCgHvwM1FaI4954",
+          "type": "function",
+          "function": {
+            "name": "run_command",
+            "arguments": "{\"command\":\"python3 verify.py\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_pn6hTxC7WlCgHvwM1FaI4954",
+      "content": "{\"content\":[],\"error_code\":\"command_failed\",\"error_message\":\"command exited with status 1; changing timeout alone cannot fix a completed command, so inspect stdout/stderr or change the command or code\",\"is_error\":true,\"retryable\":false,\"structured_content\":{\"duration_ms\":42.87237499920593,\"execution_mode\":\"restricted_sandbox\",\"exit_code\":1,\"network_enabled\":false,\"sandbox_error\":null,\"stderr\":\"Traceback (most recent call last):\\n  File \\\"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742/workspace/verify.py\\\", line 125, in <module>\\n    main()\\n  File \\\"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742/workspace/verify.py\\\", line 119, in main\\n    test()\\n  File \\\"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742/workspace/verify.py\\\", line 111, in test_combined_scenario\\n    assert reconcile(events) == [\\n  File \\\"/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742/workspace/ledger.py\\\", line 16, in reconcile\\n    if current is None or event[\\\"seq\\\"] > current[0][1] or (\\nKeyError: 1\\n\",\"stdout\":\"\",\"timed_out\":false,\"truncated\":false},\"truncated\":false}"
+    },
+    {
+      "role": "assistant",
+      "content": "My winner-tracking tuple indexing is wrong: `current[0]` is the event dict, so `current[0][1]` indexes the dict by key `1`. I need `current[0][\"seq\"]`.",
+      "tool_calls": [
+        {
+          "id": "call_00_Q3MgNEC7yuT0x5DYvONj4411",
+          "type": "function",
+          "function": {
+            "name": "apply_patch",
+            "arguments": "{\"file_path\":\"ledger.py\",\"new_string\":\"        if current is None or event[\\\"seq\\\"] > current[0][\\\"seq\\\"] or (\\n            event[\\\"seq\\\"] == current[0][\\\"seq\\\"] and position > current[1]\\n        ):\",\"old_string\":\"        if current is None or event[\\\"seq\\\"] > current[0][1] or (\\n            event[\\\"seq\\\"] == current[0][1] and position > current[1]\\n        ):\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "call_00_Q3MgNEC7yuT0x5DYvONj4411",
+      "content": "{\"content\":[],\"error_code\":null,\"error_message\":null,\"is_error\":false,\"retryable\":false,\"structured_content\":{\"created\":false,\"file_path\":\"ledger.py\",\"message\":\"patch applied\",\"occurrences\":1,\"replaced\":true},\"truncated\":false}"
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Read a bounded byte range from one workspace file. Binary files are reported without embedding their bytes; supported spreadsheets and PDFs explicitly route to inspect_data_file. The 16,000-byte default bounds model context; use offset for later chunks, and never set max_bytes above 1,000,000. A targeted read after a write can confirm literal file content. Reuse a sufficient result while the workspace is unchanged; request another range only for content not yet observed. For one literal edit, choose this tool or search_text once, never both as paired confirmation. Binary metadata and a range starting at or past end-of-file do not verify text content.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "description": "Workspace-relative file path.",
+              "maxLength": 4096,
+              "minLength": 1,
+              "title": "Path",
+              "type": "string"
+            },
+            "encoding": {
+              "default": "utf-8",
+              "description": "Text encoding used when decoding non-binary bytes.",
+              "maxLength": 64,
+              "minLength": 1,
+              "title": "Encoding",
+              "type": "string"
+            },
+            "offset": {
+              "default": 0,
+              "description": "Zero-based byte offset, including when max_lines is supplied. Use start_line for a one-based source line instead. For the next non-overlapping chunk, pass the previous output's next_offset value.",
+              "minimum": 0,
+              "title": "Offset",
+              "type": "integer"
+            },
+            "start_line": {
+              "anyOf": [
+                {
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "One-based source line to start from. Pass search_text.line_number here, never in offset.",
+              "title": "Start Line"
+            },
+            "max_lines": {
+              "anyOf": [
+                {
+                  "maximum": 2000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Maximum lines to read from offset or start_line. When start_line is set and max_lines is omitted, 200 lines are returned.",
+              "title": "Max Lines"
+            },
+            "max_bytes": {
+              "default": 16000,
+              "description": "Optional byte limit from 1 through 1,000,000; omit it to use the context-safe 16,000-byte default, then advance offset for another chunk.",
+              "maximum": 1000000,
+              "minimum": 1,
+              "title": "Max Bytes",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "title": "ReadFileInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "apply_patch",
+        "description": "Create a UTF-8 workspace file, or edit an existing file by exact text replacement. Omit old_string only when creating a new file. Without replace_all, the old text must occur exactly once. The write is atomically installed and creation fails if the path exists. Verification toolchains under .venv and node_modules are read-only. After a successful literal edit, use at most one targeted read_file or search_text call, never both, then return a final answer when it proves the requested state. If the task already supplies the exact file, old text, and new text, call apply_patch directly instead of pre-reading merely to reconfirm them; the replacement checks fail closed. Never reapply the patch merely to reconfirm it.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "file_path": {
+              "description": "Workspace-relative path of the file to create or edit.",
+              "maxLength": 4096,
+              "minLength": 1,
+              "title": "File Path",
+              "type": "string"
+            },
+            "old_string": {
+              "anyOf": [
+                {
+                  "maxLength": 1000000,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "description": "Exact text that must already exist; omit only when creating a file.",
+              "title": "Old String"
+            },
+            "new_string": {
+              "description": "Replacement text; an empty value deletes the old text.",
+              "maxLength": 1000000,
+              "title": "New String",
+              "type": "string"
+            },
+            "replace_all": {
+              "default": false,
+              "description": "Replace every occurrence instead of requiring uniqueness.",
+              "title": "Replace All",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "file_path",
+            "new_string"
+          ],
+          "title": "ApplyPatchInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_command",
+        "description": "Run one shell command inside a restricted OS sandbox from a workspace-relative directory. The workspace is read-only by default and a private temporary directory is writable. Set workspace_write=true to request destructive workspace write access; .git, .venv, and node_modules remain read-only. Host environment variables and network access are disabled. Set network=true to request a separate network approval. Timeout or cancellation terminates and reaps the complete process group. Commands fail closed before execution when hardlinked workspace files could bypass path containment. For implementation tasks, locate the affected code before execution and prefer focused verification over a full-repository test run. Use recognized read-only commands to verify code behavior; do not execute a process solely to reconfirm unchanged literal file content already established by a read or search.",
+        "parameters": {
+          "additionalProperties": false,
+          "properties": {
+            "command": {
+              "description": "Shell command to execute in an isolated process group.",
+              "maxLength": 8000,
+              "minLength": 1,
+              "title": "Command",
+              "type": "string"
+            },
+            "working_dir": {
+              "default": ".",
+              "description": "Workspace-relative working directory.",
+              "maxLength": 4096,
+              "title": "Working Dir",
+              "type": "string"
+            },
+            "timeout_seconds": {
+              "default": 120.0,
+              "description": "Per-command timeout in seconds before the whole process group is terminated; use 120, not 120000. Values from 1000 through 600000 are accepted as an unambiguous millisecond form and normalized to seconds. The effective maximum is 600 seconds.",
+              "exclusiveMinimum": 0,
+              "maximum": 600000.0,
+              "title": "Timeout Seconds",
+              "type": "number"
+            },
+            "network": {
+              "default": false,
+              "description": "Request outbound network access. Network is disabled by default and requires a separate approval from command execution.",
+              "title": "Network",
+              "type": "boolean"
+            },
+            "workspace_write": {
+              "default": false,
+              "description": "Request write access to the workspace. The workspace is read-only by default; enabling writes is destructive and requires explicit approval. .git paths always remain read-only, and .git symlink aliases are refused.",
+              "title": "Workspace Write",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "title": "RunCommandInput",
+          "type": "object"
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "read_context",
+        "description": "Recall original content from a compacted context reference by canonical item_id. Use item_id=history to page through the archived Item ID catalog. With item_id=history AND query, search archived original CONTENT without knowing its ID; returns the first matching item and excerpt. start_index (default 0) is a history index for this search mode; use next_index to continue. Each search examines up to 64 archived items. matched=false only describes searched_from_index through searched_to_index; only search_complete=true means there are no further archived items in this view. For more matches within the same item use matched_item_id and next_match_offset. history_index gives chronological order in this visible history; higher means later. The catalog contains metadata only; search a specific item for its content. For a specific fact, supply query to search the ENTIRE original payload case-insensitively and return a bounded excerpt around the first match; use next_match_offset to find another. Never infer absence from skipped pages. A matched=false search covers searched_from to searched_to. Tool results default to the readable original content, without duplicated storage envelopes. Use view=raw for the full canonical JSON payload. Non-tool Items and the catalog use JSON text. Offsets and search matches refer to the selected view; keep view unchanged when paging. Concatenate JSON text pages before parsing. offset is a Unicode character offset (default 0); max_chars defaults to 2000, maximum 4000. If truncated, continue at next_offset. Only completed Items visible to this Turn, including its fork ancestry, can be read.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "item_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "query": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 200
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_chars": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4000
+            },
+            "start_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "view": {
+              "type": "string",
+              "enum": [
+                "content",
+                "raw"
+              ]
+            }
+          },
+          "required": [
+            "item_id"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto",
+  "max_tokens": 4096,
+  "stream": true,
+  "extra_body": {
+    "thinking": {
+      "type": "disabled"
+    }
+  },
+  "parallel_tool_calls": true,
+  "temperature": 0.0,
+  "top_p": 1.0
+}

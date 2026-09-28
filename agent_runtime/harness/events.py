@@ -49,6 +49,7 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "completion_decision",
         "completion_feedback",
         "context_compaction",
+        "context_summary_response",
         "context_message",
         "verification",
     }

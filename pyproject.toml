@@ -32,6 +32,7 @@ dependencies = [
   "redis>=6.4.0",
   "scipy>=1.15",
   "tiktoken>=0.9.0",
+  "tokenizers>=0.22.2",
   "transformers>=4.57.6",
   "typer>=0.15.2",
   "pyyaml>=6.0.2",
@@ -73,6 +74,9 @@ pythonpath = ["."]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+# Immutable evaluation outputs, including model-generated code and failed samples.
+# Keep checking the maintained evaluation runners in the parent directory.
+extend-exclude = ["evals/context_management/deepseek-*"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "N"]

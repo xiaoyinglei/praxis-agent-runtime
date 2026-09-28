@@ -304,26 +304,41 @@ class ToolExecutor:
                 progress_sink=(progress_sinks or {}).get(
                     item.call.tool_call_id
                 ),
+                cancellation_sink=execution_sink,
             )
             await _emit_execution(execution_sink, execution)
             return execution
 
-        if _can_run_in_parallel(tuple(item for _, item in prepared)):
-            limit = context.max_parallel_calls
-            for offset in range(0, len(prepared), limit):
-                batch = prepared[offset : offset + limit]
-                executions = await asyncio.gather(
-                    *(invoke(item) for _, item in batch)
-                )
-                for (index, _), execution in zip(
-                    batch,
-                    executions,
-                    strict=True,
-                ):
-                    completed[index] = execution
-        else:
-            for index, item in prepared:
+        batches: list[list[tuple[int, _PreparedExecution]]] = []
+        batch: list[tuple[int, _PreparedExecution]] = []
+        for entry in prepared:
+            if batch and (
+                len(batch) >= context.max_parallel_calls
+                or not _can_run_in_parallel(tuple(item for _, item in (*batch, entry)))
+            ):
+                batches.append(batch)
+                batch = []
+            batch.append(entry)
+        if batch:
+            batches.append(batch)
+        for batch in batches:
+            if len(batch) == 1:
+                index, item = batch[0]
                 completed[index] = await invoke(item)
+                continue
+            tasks = [asyncio.create_task(invoke(item)) for _, item in batch]
+            try:
+                executions = await asyncio.gather(*tasks)
+            except BaseException:
+                # Keep the next segment behind this barrier until every started
+                # runner and its durable cancellation result have drained.
+                for task in tasks:
+                    if not task.done() and not task.cancelling():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+            for (index, _), execution in zip(batch, executions, strict=True):
+                completed[index] = execution
         return tuple(completed[index] for index in range(len(calls)))
 
     async def _prepare(
@@ -685,6 +700,7 @@ class ToolExecutor:
         prepared: _PreparedExecution,
         *,
         progress_sink: ToolProgressSink | None = None,
+        cancellation_sink: ExecutionSink | None = None,
     ) -> ToolExecution:
         started_record = replace(
             prepared.record,
@@ -780,7 +796,7 @@ class ToolExecutor:
                 status=ExecutionStatus.FAILED,
                 error_code="cancelled",
             )
-            await self._finish(
+            execution = await self._finish(
                 call=prepared.call,
                 result=_error_result(
                     prepared.call,
@@ -791,6 +807,7 @@ class ToolExecutor:
                 record=record,
                 prepared=prepared,
             )
+            await _emit_execution(cancellation_sink, execution)
             raise
         except FileNotFoundError:
             record = replace(

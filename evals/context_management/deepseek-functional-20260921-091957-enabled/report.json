@@ -1,0 +1,639 @@
+{
+  "model": "deepseek-flash",
+  "thinking": "enabled",
+  "synthetic_only": true,
+  "cases": {
+    "repeated_compaction_restart": {
+      "pass": false,
+      "rounds": [
+        {
+          "round": 1,
+          "answer": null,
+          "checks": {
+            "latest_decision": false,
+            "reason": false,
+            "no_invented_migration": false,
+            "no_invented_implementation": false,
+            "pending_stays_pending": false,
+            "actually_semantically_compacted": true
+          },
+          "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b",
+          "terminal_reason": null,
+          "usage": {
+            "input_tokens": 11767,
+            "cached_input_tokens": 1280,
+            "cache_write_tokens": 0,
+            "output_tokens": 3419,
+            "reasoning_tokens": 266,
+            "cost_micros": 0,
+            "model_calls": 8,
+            "tool_calls": 0,
+            "retries": 0,
+            "subagents": 0,
+            "model_ms": 0,
+            "tool_ms": 0,
+            "wall_ms": 0,
+            "tool_output_bytes": 0,
+            "network_bytes": 0,
+            "artifact_bytes": 0
+          },
+          "rollout_valid": true,
+          "summary_calls": 7,
+          "tools": [
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "24e3be5d6cce1aeb6b6b9a8223d4220ac6a8e6097b507bce40a735e7eb307cb4"
+            },
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "3de08e03dc0964ed381d85ad4b82fdf9adf618f5f0c10d7cc6c6258b35e926ea"
+            },
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "a3f345b895976978a2a731fba185ea4d3b33bf3450a373766755e8c95b1658ae"
+            },
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "24e3be5d6cce1aeb6b6b9a8223d4220ac6a8e6097b507bce40a735e7eb307cb4"
+            },
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "a3f345b895976978a2a731fba185ea4d3b33bf3450a373766755e8c95b1658ae"
+            },
+            {
+              "name": "read_context",
+              "status": "succeeded",
+              "arguments_digest": "3de08e03dc0964ed381d85ad4b82fdf9adf618f5f0c10d7cc6c6258b35e926ea"
+            }
+          ],
+          "compactions": [
+            {
+              "algorithm_revision": "semantic-compaction-v3",
+              "artifact_refs": [],
+              "context_version": 1,
+              "covered_item_ids": [
+                "item_61d7b598479c406e9617191fb37524b3",
+                "item_e5782d63356e4e45be45bd45d5c1d06e",
+                "item_cf384d5dec1247278c0ce5d49c310956",
+                "item_168fb853be7b4831820d172fddb0d63b",
+                "item_37306f0c6b614c9f8f7dcef21e6a9134",
+                "item_15e171915c5b42d58591a46610144f7a",
+                "item_2ddeb8ab2e2149d48026fa586587d696"
+              ],
+              "covered_item_refs": [
+                {
+                  "applied_thread_sequence": 4,
+                  "item_id": "item_61d7b598479c406e9617191fb37524b3",
+                  "item_sequence": 1,
+                  "payload_sha256": "ff726484e9f6bf2618978415fa1668a4327d8fb17643edf1ef2f29e97f0ae6c1",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 6,
+                  "item_id": "item_e5782d63356e4e45be45bd45d5c1d06e",
+                  "item_sequence": 2,
+                  "payload_sha256": "4f975991620937ca472b4f90fbc6aedeeb1704c85f52d9dac80078c832ec34ba",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 8,
+                  "item_id": "item_cf384d5dec1247278c0ce5d49c310956",
+                  "item_sequence": 3,
+                  "payload_sha256": "14a4ba329483a02c220e6ed90dc49936174b772942c096e6ba903c1f774d8bc1",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 10,
+                  "item_id": "item_168fb853be7b4831820d172fddb0d63b",
+                  "item_sequence": 4,
+                  "payload_sha256": "2468b45effbc85b84992a9427ffc993317231afb83308ba71025dae85577140e",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 12,
+                  "item_id": "item_37306f0c6b614c9f8f7dcef21e6a9134",
+                  "item_sequence": 5,
+                  "payload_sha256": "fec8c14ad3c9d934d99322462b07f1ac393a9b91ca3ca0a2731593702d110a57",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 15,
+                  "item_id": "item_15e171915c5b42d58591a46610144f7a",
+                  "item_sequence": 6,
+                  "payload_sha256": "15d1da66370687d9156d90aa53e571a0833a7a0eee9b35ee0eb38f6657ae7b19",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 22,
+                  "item_id": "item_2ddeb8ab2e2149d48026fa586587d696",
+                  "item_sequence": 7,
+                  "payload_sha256": "395bd604efa0a0102c4307556115652dad2b0ead10b6f06f8a0a180d9d1f7cb7",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                }
+              ],
+              "covered_sequence_ranges": [
+                {
+                  "end_thread_sequence": 22,
+                  "start_thread_sequence": 4,
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8"
+                }
+              ],
+              "durable_state": {
+                "approvals": [],
+                "interactions": [],
+                "tool_operations": []
+              },
+              "preserved_facts": {
+                "architecture_and_safety_constraints": [],
+                "file_changes": [],
+                "inspectable_sources": [],
+                "uncertain_side_effects": [],
+                "unresolved_work": [],
+                "verification_results": []
+              },
+              "preserved_item_ids": [
+                "item_61d7b598479c406e9617191fb37524b3"
+              ],
+              "source_revision": "76b68af7419bb0d54c17f38f66ac4893cf067f53929893dfa71b4b3837091a82",
+              "summary": "## Continuation Summary\n\n**Objective:** Not explicitly stated in this fragment. No inferred objective added.\n\n**Chronology of events (oldest → newest):**\n\n1. **Database migration REJECTED** (`item_e5782d63356e4e45be45bd45d5c1d06e`, history_index 1)\n   - Reason/evidence: legacy clients require the old schema.\n   - Status: No migration was applied. Negative result preserved.\n\n2. **Repeated routine inspections** (`item_cf384d5dec1247278c0ce5d49c310956`, history_index 2)\n   - Content: \"unchanged, no code edit and no test executed\" repeated many times.\n   - Status: No code edits, no tests executed. No changes applied.\n\n3. **TTL decision** (`item_168fb853be7b4831820d172fddb0d63b`, history_index 3)\n   - Decision: TTL = 17 seconds.\n   - Reason/evidence: upstream invalidation takes 16 seconds.\n   - Authority: Latest user-approved decision, explicitly supersedes all older TTL values.\n   - Status: This is ONLY a decision. Implementation is NOT done. (Not an applied change.)\n\n4. **Restart durability verification** (`item_37306f0c6b614c9f8f7dcef21e6a9134`, history_index 4)\n   - Status: Still PENDING.\n   - Requirement: must prove journal persistence before acknowledgment.\n   - Note: Planned verification, not a passed test.\n\n**Durable state:** approvals: [], interactions: [], tool_operations: [] — no recorded approvals, interactions, or tool operations.\n\n**Protected facts:** All categories empty (architecture/safety constraints, file changes, inspectable sources, uncertain side effects, unresolved work, verification results).\n\n**Applied changes:** None. No code edits, no migration, no implementation, no tests executed.\n\n**Failed/negative results:** Database migration rejected due to legacy client schema dependency; no migration applied.\n\n**Unresolved issues / next actions:**\n- TTL=17s decision awaits implementation (not started).\n- Restart durability verification remains pending; must demonstrate journal persistence before acknowledgment.\n\n**Superseded decisions:** All older TTL values are superseded by the TTL=17s decision (explicit revision).\n\n**Source item IDs for read_context:**\n- `item_e5782d63356e4e45be45bd45d5c1d06e`\n- `item_cf384d5dec1247278c0ce5d49c310956`\n- `item_168fb853be7b4831820d172fddb0d63b`\n- `item_37306f0c6b614c9f8f7dcef21e6a9134`"
+            },
+            {
+              "algorithm_revision": "semantic-compaction-v3",
+              "artifact_refs": [],
+              "context_version": 2,
+              "covered_item_ids": [
+                "item_61d7b598479c406e9617191fb37524b3",
+                "item_e5782d63356e4e45be45bd45d5c1d06e",
+                "item_cf384d5dec1247278c0ce5d49c310956",
+                "item_168fb853be7b4831820d172fddb0d63b",
+                "item_37306f0c6b614c9f8f7dcef21e6a9134",
+                "item_15e171915c5b42d58591a46610144f7a",
+                "item_2ddeb8ab2e2149d48026fa586587d696",
+                "item_87bf22974a4e421682023cf087c9d478",
+                "item_cf79539ad384473c993c8d6bd62920f6",
+                "item_d395d61852c04c4c87c0a8c2646f9f1e",
+                "item_eddd43859815417da64669b2946fec40",
+                "item_ce785d44bd364d9ebaebdec73e8beeb0",
+                "item_d526dbfe18df4ea5be5a74b3f185f87a",
+                "item_4acdb96d585947eeb6bbe94691315f35",
+                "item_e33dfc7acd2148e1992a56d7a8e323e2",
+                "item_2b297b2411e8455ca6ed30d6f5da337d",
+                "item_d9fbc6f4f1854a019446f64bbb956530",
+                "item_7fbefb3d8c584b538add470b4e467027",
+                "item_cf2054135d8b4ba4ac05e328817aeac2",
+                "item_853c2895e32c4986a2711697288e2719",
+                "item_67635de0afb44a7db924ddd3a967d846",
+                "item_e3b654d8d05544a2b1d556d7953b7e1c",
+                "item_da4a8d8d3467465b81c17722dc64f388",
+                "item_29040bd7a19d45dc9ef7456c2e9da246",
+                "item_ba234e1f63534a8cb0b3b4c79f7453c2",
+                "item_5eeb6e1aabf84843b1fa6208950eed95",
+                "item_7737e33dd3c0420db599ac47a32e3804"
+              ],
+              "covered_item_refs": [
+                {
+                  "applied_thread_sequence": 4,
+                  "item_id": "item_61d7b598479c406e9617191fb37524b3",
+                  "item_sequence": 1,
+                  "payload_sha256": "ff726484e9f6bf2618978415fa1668a4327d8fb17643edf1ef2f29e97f0ae6c1",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 6,
+                  "item_id": "item_e5782d63356e4e45be45bd45d5c1d06e",
+                  "item_sequence": 2,
+                  "payload_sha256": "4f975991620937ca472b4f90fbc6aedeeb1704c85f52d9dac80078c832ec34ba",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 8,
+                  "item_id": "item_cf384d5dec1247278c0ce5d49c310956",
+                  "item_sequence": 3,
+                  "payload_sha256": "14a4ba329483a02c220e6ed90dc49936174b772942c096e6ba903c1f774d8bc1",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 10,
+                  "item_id": "item_168fb853be7b4831820d172fddb0d63b",
+                  "item_sequence": 4,
+                  "payload_sha256": "2468b45effbc85b84992a9427ffc993317231afb83308ba71025dae85577140e",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 12,
+                  "item_id": "item_37306f0c6b614c9f8f7dcef21e6a9134",
+                  "item_sequence": 5,
+                  "payload_sha256": "fec8c14ad3c9d934d99322462b07f1ac393a9b91ca3ca0a2731593702d110a57",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 15,
+                  "item_id": "item_15e171915c5b42d58591a46610144f7a",
+                  "item_sequence": 6,
+                  "payload_sha256": "15d1da66370687d9156d90aa53e571a0833a7a0eee9b35ee0eb38f6657ae7b19",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 22,
+                  "item_id": "item_2ddeb8ab2e2149d48026fa586587d696",
+                  "item_sequence": 7,
+                  "payload_sha256": "395bd604efa0a0102c4307556115652dad2b0ead10b6f06f8a0a180d9d1f7cb7",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 24,
+                  "item_id": "item_87bf22974a4e421682023cf087c9d478",
+                  "item_sequence": 8,
+                  "payload_sha256": "c199353ae52e4d7025da705277d1c8d0ae0481c8e62a35f30deeba5248c7f321",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 27,
+                  "item_id": "item_cf79539ad384473c993c8d6bd62920f6",
+                  "item_sequence": 9,
+                  "payload_sha256": "801d6a0f4309fe12a250a0dfc6d1b3dab82b53241adc7fb37cdaad0f2ace2556",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 36,
+                  "item_id": "item_d395d61852c04c4c87c0a8c2646f9f1e",
+                  "item_sequence": 10,
+                  "payload_sha256": "09d0339acd4a6d301e1b5b1937a918649c868e889bcb38228a7ab37fd0747f8f",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 35,
+                  "item_id": "item_eddd43859815417da64669b2946fec40",
+                  "item_sequence": 11,
+                  "payload_sha256": "42b96428d203491bb792ca12d171ac61fa835464328b2ff2d1224ef5773c7bd9",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 38,
+                  "item_id": "item_ce785d44bd364d9ebaebdec73e8beeb0",
+                  "item_sequence": 12,
+                  "payload_sha256": "dac5ae67a6c2b5140a4003b589349c0ef07a93a2203989aa3038d8ba034a1023",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 40,
+                  "item_id": "item_d526dbfe18df4ea5be5a74b3f185f87a",
+                  "item_sequence": 13,
+                  "payload_sha256": "ae05a50330e43a49d762d30b29ca283493377df80b10502a109a2df8495c3ef7",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 42,
+                  "item_id": "item_4acdb96d585947eeb6bbe94691315f35",
+                  "item_sequence": 14,
+                  "payload_sha256": "229a742b9b435401b6d147faca5771131e796d01ada9d1322461890e216431fe",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 54,
+                  "item_id": "item_e33dfc7acd2148e1992a56d7a8e323e2",
+                  "item_sequence": 15,
+                  "payload_sha256": "727c68d952d6613d97030bcab019fe6b57d3febd63824cffa341befe4d7655e0",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 58,
+                  "item_id": "item_2b297b2411e8455ca6ed30d6f5da337d",
+                  "item_sequence": 16,
+                  "payload_sha256": "e4ca5bbb278ab92c71a467f194445dac789409ea9344749e3e13bfe8dc99981c",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 62,
+                  "item_id": "item_d9fbc6f4f1854a019446f64bbb956530",
+                  "item_sequence": 17,
+                  "payload_sha256": "c608f3dcebf1ef39441e6f96f079ade142856f55acc60dedd9468d86d2dec9f0",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 66,
+                  "item_id": "item_7fbefb3d8c584b538add470b4e467027",
+                  "item_sequence": 18,
+                  "payload_sha256": "9f068b472bb07653210e90ccd2cbe907f1a1edc8a43d60adabca4493520e4fa9",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 73,
+                  "item_id": "item_cf2054135d8b4ba4ac05e328817aeac2",
+                  "item_sequence": 19,
+                  "payload_sha256": "44faf3f2635e1c116e6571fcb145a94b69961b19962104400e67ef44d0a520b5",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 76,
+                  "item_id": "item_853c2895e32c4986a2711697288e2719",
+                  "item_sequence": 20,
+                  "payload_sha256": "0eb8d3865ef37cfefb72836f05a850105fbbf9ef19eb43bfe4857673c657cdad",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 83,
+                  "item_id": "item_67635de0afb44a7db924ddd3a967d846",
+                  "item_sequence": 21,
+                  "payload_sha256": "482008594ac07170c17332a4ff81daa4071d7f3a1ab2829ce5a16bba64fdd97f",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 86,
+                  "item_id": "item_e3b654d8d05544a2b1d556d7953b7e1c",
+                  "item_sequence": 22,
+                  "payload_sha256": "77ec35a98285a21dced8b73e10b302a9288c0d1946b49b3e14ddddec63e3ee2d",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 93,
+                  "item_id": "item_da4a8d8d3467465b81c17722dc64f388",
+                  "item_sequence": 23,
+                  "payload_sha256": "e630a4198607622c21f88cf03dd8eb596cc6479ecbd10d4954993040f539b8ea",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 96,
+                  "item_id": "item_29040bd7a19d45dc9ef7456c2e9da246",
+                  "item_sequence": 24,
+                  "payload_sha256": "946b717b5d0bf3a56101a68a74f918cc2a90d83db484f09e9a36cbc31bbf1da6",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 103,
+                  "item_id": "item_ba234e1f63534a8cb0b3b4c79f7453c2",
+                  "item_sequence": 25,
+                  "payload_sha256": "6676de68a58fb2e65fa2e15deb38f268a6c2db1210537ddbb7a79ac8f08f7074",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 106,
+                  "item_id": "item_5eeb6e1aabf84843b1fa6208950eed95",
+                  "item_sequence": 26,
+                  "payload_sha256": "05d5b0d652f8de1f0b165759881c65e830c47861f3238d84e364ecd7e8bb19da",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                },
+                {
+                  "applied_thread_sequence": 113,
+                  "item_id": "item_7737e33dd3c0420db599ac47a32e3804",
+                  "item_sequence": 27,
+                  "payload_sha256": "fe07c27bb87a4bf100b1c2086d3bf3a1252c6e89eec7b0318d5123ef41bbf549",
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8",
+                  "turn_id": "turn_8a51296c452e46e5a0eb31f901acb49b"
+                }
+              ],
+              "covered_sequence_ranges": [
+                {
+                  "end_thread_sequence": 113,
+                  "start_thread_sequence": 4,
+                  "thread_id": "thread_81916c418d3442fa90266f7d0e7804e8"
+                }
+              ],
+              "durable_state": {
+                "approvals": [],
+                "interactions": [],
+                "tool_operations": []
+              },
+              "preserved_facts": {
+                "architecture_and_safety_constraints": [],
+                "file_changes": [],
+                "inspectable_sources": [],
+                "uncertain_side_effects": [],
+                "unresolved_work": [],
+                "verification_results": []
+              },
+              "preserved_item_ids": [
+                "item_61d7b598479c406e9617191fb37524b3"
+              ],
+              "source_revision": "d3bc3e62429790d82c5d234a95a96de300e2a2fcad2203c9a83b3353202cdb97",
+              "summary": "## Continuation Summary\n\n**Objective:** Not explicitly stated in this fragment. No inferred objective added.\n\n**Chronology (oldest → newest):**\n\n1. **Database migration REJECTED** (`item_e5782d63356e4e45be45bd45d5c1d06e`, history_index 1)\n   - Reason/evidence: legacy clients require the old schema.\n   - Status: No migration was applied. Negative result preserved.\n\n2. **Repeated routine inspections** (`item_cf384d5dec1247278c0ce5d49c310956`, history_index 2)\n   - Content: \"unchanged, no code edit and no test executed\" repeated many times.\n   - Status: No code edits, no tests executed.\n\n3. **TTL decision** (`item_168fb853be7b4831820d172fddb0d63b`, history_index 3)\n   - Decision: TTL = 17 seconds.\n   - Reason/evidence: upstream invalidation takes 16 seconds.\n   - Authority: Latest user-approved decision, explicitly supersedes all older TTL values.\n   - Status: Decision ONLY; implementation NOT done.\n\n4. **Restart durability verification** (`item_37306f0c6b614c9f8f7dcef21e6a9134`, history_index 4)\n   - Status: Still PENDING.\n   - Requirement: must prove journal persistence before acknowledgment.\n   - Note: Planned verification, not a passed test.\n\n**Verification actions in this fragment:** Three `read_context` calls were made (history_index 10) for the TTL, migration, and verification items. All three returned successfully (history_index 14–16), confirming the summarized facts verbatim. No code or system changes resulted.\n\n**Durable state:** approvals: [], interactions: [], tool_operations: [] — no recorded approvals, interactions, or tool operations.\n\n**Protected facts:** All categories empty (architecture/safety constraints, file changes, inspectable sources, uncertain side effects, unresolved work, verification results).\n\n**Applied changes:** None. No code edits, no migration, no implementation, no tests executed.\n\n**Failed/negative results:** Database migration rejected due to legacy client schema dependency; no migration applied.\n\n**Unresolved issues / next actions:**\n- TTL=17s decision awaits implementation (not started).\n- Restart durability verification remains pending; must demonstrate journal persistence before acknowledgment.\n\n**Superseded decisions:** All older TTL values are superseded by the TTL=17s decision (explicit revision).\n\n**Source item IDs for read_context:**\n- `item_e5782d63356e4e45be45bd45d5c1d06e`\n- `item_cf384d5dec1247278c0ce5d49c310956`\n- `item_168fb853be7b4831820d172fddb0d63b`\n- `item_37306f0c6b614c9f8f7dcef21e6a9134`"
+            }
+          ]
+        }
+      ]
+    },
+    "archived_detail_recall": {
+      "pass": false,
+      "answer": null,
+      "checks": {
+        "exact_code": false,
+        "actual_recall_calls": false,
+        "actually_archived": true
+      },
+      "turn_id": "turn_2b727000d43445878602a93a9f0fd50e",
+      "terminal_reason": null,
+      "usage": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_micros": 0,
+        "model_calls": 0,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 0,
+      "tools": [],
+      "compactions": [
+        {
+          "algorithm_revision": "old-tool-output-v3",
+          "artifact_refs": [],
+          "context_version": 1,
+          "covered_item_ids": [
+            "item_ab0f09ceac6640a29cdf601c953caa90",
+            "item_fb74843acfa34a7b82b216a0d23860f6",
+            "item_df3ab472b8754813bd8c2d6299cfbbf7",
+            "item_cec76720df1f4173ad25d7405d7e926a",
+            "item_331becc79836402fab7bb34a5e79890e",
+            "item_8858a45cd6ca40bcaaeae1df9e257a5c",
+            "item_e790c73e0d224a21a99429a4d121e00f",
+            "item_e21fbc77f3144221bc6023dfaefd31b5",
+            "item_d47ff38f74a54f0ab69b9fe7b4967feb"
+          ],
+          "covered_item_refs": [
+            {
+              "applied_thread_sequence": 4,
+              "item_id": "item_ab0f09ceac6640a29cdf601c953caa90",
+              "item_sequence": 1,
+              "payload_sha256": "2739e21580c9e2048906259f60f3df110a2354507caab15ea3007a169ad58eb2",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 6,
+              "item_id": "item_fb74843acfa34a7b82b216a0d23860f6",
+              "item_sequence": 2,
+              "payload_sha256": "01c3bae601f9a20e18363786d0572b017497924aec84388fe268995d970911b1",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 8,
+              "item_id": "item_df3ab472b8754813bd8c2d6299cfbbf7",
+              "item_sequence": 3,
+              "payload_sha256": "7d1d4f74b5bf911cc7c7bb4a8dee32ec5315daeffde2e928e1e2aaf739bb0f1f",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 10,
+              "item_id": "item_cec76720df1f4173ad25d7405d7e926a",
+              "item_sequence": 4,
+              "payload_sha256": "924dfac9410304c6be7c64b3b5da691dfda9870990201638ac10c2f8cb433b1c",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 12,
+              "item_id": "item_331becc79836402fab7bb34a5e79890e",
+              "item_sequence": 5,
+              "payload_sha256": "c737708cd4bafc0b848a8eb8f4172f0bb312efa7b83254d70ff4421926c67140",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 14,
+              "item_id": "item_8858a45cd6ca40bcaaeae1df9e257a5c",
+              "item_sequence": 6,
+              "payload_sha256": "bb68a804b1d1edc31a82f945ab8a8fec990a1091e645f1f55468cce449683e14",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 16,
+              "item_id": "item_e790c73e0d224a21a99429a4d121e00f",
+              "item_sequence": 7,
+              "payload_sha256": "12f1adcc72264454233e78ffc9884cb558b1b5f80e980479ae6ad8687ae8e66c",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 18,
+              "item_id": "item_e21fbc77f3144221bc6023dfaefd31b5",
+              "item_sequence": 8,
+              "payload_sha256": "3c761a9af0c90142206554962d1047595a4ec4208488f7d0e236a749f58b8418",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            },
+            {
+              "applied_thread_sequence": 20,
+              "item_id": "item_d47ff38f74a54f0ab69b9fe7b4967feb",
+              "item_sequence": 9,
+              "payload_sha256": "5d191f5ad5f93b711b562d44ae168870dec68e50674a617c976dc46e056bff37",
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20",
+              "turn_id": "turn_2b727000d43445878602a93a9f0fd50e"
+            }
+          ],
+          "covered_sequence_ranges": [
+            {
+              "end_thread_sequence": 20,
+              "start_thread_sequence": 4,
+              "thread_id": "thread_f4265321974f4eb997739912f9ecec20"
+            }
+          ],
+          "durable_state": {
+            "approvals": [],
+            "interactions": [],
+            "tool_operations": []
+          },
+          "preserved_facts": {
+            "architecture_and_safety_constraints": [],
+            "file_changes": [],
+            "inspectable_sources": [],
+            "uncertain_side_effects": [],
+            "unresolved_work": [],
+            "verification_results": []
+          },
+          "preserved_item_ids": [
+            "item_ab0f09ceac6640a29cdf601c953caa90"
+          ],
+          "source_revision": "eebd72d84dee0483c86b5d51a008cb4b90a1b307b522e92f0dcfa44f29cac5de",
+          "summary": "[{\"content\":\"Historical sensor log read\",\"item_id\":\"item_fb74843acfa34a7b82b216a0d23860f6\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-0\",\"name\":\"read_log\"}]},{\"content\":\"Tool output archived. Use read_context(item_id='item_df3ab472b8754813bd8c2d6299cfbbf7') to recover it.\",\"item_id\":\"item_df3ab472b8754813bd8c2d6299cfbbf7\",\"role\":\"tool\"},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_cec76720df1f4173ad25d7405d7e926a\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-1\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_331becc79836402fab7bb34a5e79890e\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-1\",\"tool_calls\":[]},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_8858a45cd6ca40bcaaeae1df9e257a5c\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-2\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_e790c73e0d224a21a99429a4d121e00f\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-2\",\"tool_calls\":[]},{\"content\":\"Historical sensor log read\",\"item_id\":\"item_e21fbc77f3144221bc6023dfaefd31b5\",\"reasoning_content\":null,\"role\":\"assistant\",\"tool_call_id\":null,\"tool_calls\":[{\"arguments\":{},\"id\":\"old-3\",\"name\":\"read_log\"}]},{\"content\":\"Recent unrelated sample; no calibration code here.\",\"item_id\":\"item_d47ff38f74a54f0ab69b9fe7b4967feb\",\"reasoning_content\":null,\"role\":\"tool\",\"tool_call_id\":\"old-3\",\"tool_calls\":[]}]"
+        }
+      ]
+    },
+    "parallel_read_edit_verify": {
+      "pass": false,
+      "checks": {
+        "correct_file": false,
+        "inputs_unchanged": true,
+        "three_actually_overlapped": false,
+        "post_write_read": false
+      },
+      "answer": null,
+      "maximum_simultaneous_reads": 0,
+      "read_intervals": [],
+      "turn_id": "turn_61fb887fbf704878931bd86dcfaf8443",
+      "terminal_reason": null,
+      "usage": {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cost_micros": 0,
+        "model_calls": 0,
+        "tool_calls": 0,
+        "retries": 0,
+        "subagents": 0,
+        "model_ms": 0,
+        "tool_ms": 0,
+        "wall_ms": 0,
+        "tool_output_bytes": 0,
+        "network_bytes": 0,
+        "artifact_bytes": 0
+      },
+      "rollout_valid": true,
+      "summary_calls": 0,
+      "tools": [],
+      "compactions": []
+    }
+  }
+}

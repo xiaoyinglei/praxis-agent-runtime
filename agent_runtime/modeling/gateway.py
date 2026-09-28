@@ -808,6 +808,17 @@ class LLMGateway:
         )
 
     def _stage_budget(self, stage: LLMCallStage) -> LLMStageBudget:
+        if stage == LLMCallStage.CONTEXT_COMPACTION and stage not in self._stage_budgets:
+            # Compaction consumes agent history. The generic summarize input
+            # limit describes a different task and can cause needless fan-out.
+            # Inherit the agent input policy and the configured summary output
+            # allowance; effective_stage_budget still enforces the model window.
+            agent = self._stage_budget(LLMCallStage.AGENT_STEP)
+            summary = self._stage_budget(LLMCallStage.LLM_SUMMARIZE)
+            return summary.model_copy(update={
+                "max_input_tokens": agent.max_input_tokens,
+                "safety_margin_tokens": max(agent.safety_margin_tokens, summary.safety_margin_tokens),
+            })
         try:
             return self._stage_budgets[stage]
         except KeyError as exc:
@@ -826,7 +837,8 @@ class LLMGateway:
         call_kwargs["max_tokens"] = max_output_tokens
 
         max_input_tokens = budget.max_input_tokens
-        input_tokens = self._token_accounting.count(prompt)
+        count = getattr(self._token_accounting, "count_for_budget", None) or self._token_accounting.count
+        input_tokens = count(prompt)
         if input_tokens > max_input_tokens:
             raise LLMContextOverflowError(
                 stage=stage,

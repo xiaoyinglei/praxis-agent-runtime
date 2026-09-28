@@ -339,7 +339,9 @@ class AgentModelsConfig(BaseModel):
         if self.fallback_model and self.fallback_model not in self.models:
             raise ValueError(f"fallback_model not found in models: {self.fallback_model}")
 
-        missing_stages = set(LLMCallStage).difference(self.llm_stage_budgets)
+        # Context compaction derives its input/output policy from agent_step
+        # and llm_summarize unless explicitly configured (including old configs).
+        missing_stages = set(LLMCallStage).difference(self.llm_stage_budgets, {LLMCallStage.CONTEXT_COMPACTION})
         extra_stages = set(self.llm_stage_budgets).difference(LLMCallStage)
         if missing_stages or extra_stages:
             raise ValueError("llm_stage_budgets must define every supported LLM stage exactly once")

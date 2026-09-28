@@ -1,0 +1,25 @@
+{
+  "network_calls": 0,
+  "source": "/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742",
+  "remaining": 84862,
+  "fixed": 108127,
+  "count": 9,
+  "cap": 2048,
+  "continuation_input_limit": 15367,
+  "summary_input_limit": 16000,
+  "byte_limit": 11960,
+  "base_tokens": 3407,
+  "output": 4096,
+  "leaves": [
+    5259,
+    1551,
+    1100,
+    15983,
+    771
+  ],
+  "source_bytes": 51298,
+  "history_entries": 31,
+  "error": "Insufficient budget for the configured summary allowance plus one continuation request.",
+  "legacy_summary_input": true,
+  "required_tokens": 126559
+}

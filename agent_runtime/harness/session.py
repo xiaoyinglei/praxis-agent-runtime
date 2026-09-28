@@ -380,8 +380,7 @@ class Session:
         )
         self.model_control_plane.ensure_model_binding_trust(
             has_existing_bindings=any(
-                "authentication_schema_version" in turn.binding_manifest
-                for turn in self.store.list_turns()
+                "authentication_schema_version" in turn.binding_manifest for turn in self.store.list_turns()
             ),
         )
 
@@ -541,6 +540,13 @@ class Session:
                 and self.store.read_tool_operation(interaction.operation_id).status == "ready"
                 for interaction in self.store.list_interactions(turn_id)
             )
+            recoverable_summary = (
+                turn.status == "running"
+                and bool(model_operations)
+                and model_operations[-1].status == "completed"
+                and model_operations[-1].request_ref.get("purpose") == "context_summary"
+                and model_operations[-1].response_item_id is not None
+            )
             recoverable_committed_response = False
             if (
                 turn.status == "running"
@@ -608,6 +614,21 @@ class Session:
                     "retry",
                 }
             ):
+                internal = await executor.recover_committed_model_response(turn_id=turn_id)
+            elif (
+                not pending
+                and turn.status == "running"
+                and model_operations
+                and model_operations[-1].status == "prepared"
+                and action in {"continue", "retry"}
+            ):
+                internal = await executor.recover_prepared_model(turn_id=turn_id)
+            elif not pending and executor.pending_context_overflow(turn_id) and action in {"continue", "retry"}:
+                internal = await executor.run_turn(
+                    executor.restore_turn_context(turn_id),
+                    start_step=executor.agent_step_count(turn_id),
+                )
+            elif not pending and recoverable_summary and action in {"continue", "retry"}:
                 internal = await executor.recover_committed_model_response(turn_id=turn_id)
             else:
                 raise RuntimeError("resume action does not match the Turn's durable pending state")

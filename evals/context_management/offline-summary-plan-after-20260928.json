@@ -1,0 +1,35 @@
+{
+  "network_calls": 0,
+  "source": "/Users/leixiaoying/LLM/RAG学习/evals/context_management/deepseek-session-code-20260928-132742",
+  "remaining": 84862,
+  "fixed": 41483,
+  "count": 1,
+  "cap": 2048,
+  "continuation_input_limit": 15367,
+  "summary_input_limit": 64000,
+  "byte_limit": 11960,
+  "base_tokens": 3407,
+  "output": 4096,
+  "leaves": [
+    22020
+  ],
+  "source_bytes": 51298,
+  "history_entries": 31,
+  "plan": {
+    "source_hash": "dcaa0b79d3638a7e30373b774d825a33fc0a0863dafb0a83541b83cddfdd2d00",
+    "retained_tail_messages": 0,
+    "summary_output_limit": 2048,
+    "summary_input_limit": 64000,
+    "summary_byte_limit": 11960,
+    "continuation_input_limit": 15367,
+    "continuation_output_limit": 4096,
+    "continuation_token_reserve": 19463,
+    "max_summary_calls": 16,
+    "planned_summary_calls": 1,
+    "planned_token_upper_bound": 43531,
+    "plan_id": "faf1b722cb701770009952e284ff2fbefa8f4aec0b8826bf6d3757d5c4d6c4e7"
+  },
+  "error": "Stopped before summary operation creation/dispatch",
+  "legacy_summary_input": false,
+  "required_tokens": 43531
+}
