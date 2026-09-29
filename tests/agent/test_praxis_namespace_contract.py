@@ -16,7 +16,6 @@ CODING_REFERENCE = ROOT / "CLAUDE.md"
 _HISTORICAL_EXCEPTIONS = {
     ROOT / "evals/code_agent/benchmark_v1.json",
     ROOT / "tests/agent/test_code_agent_benchmark.py",
-    ROOT / "docs/design/context_parallel_source_audit_2026-09-21.md",
 }
 # Provider transcripts, generated workspaces, and offline replays retain the
 # original paths as evidence. They are not portable runtime contracts. Keep the
@@ -145,7 +144,11 @@ def test_coding_reference_tracks_the_current_praxis_runtime() -> None:
     ):
         assert f"`{tool_name}`" in reference
     for current_path in (
-        "agent_runtime/loop/runtime.py",
+        "agent_runtime/harness/turn.py",
+        "agent_runtime/harness/session.py",
+        "agent_runtime/harness/context.py",
+        "agent_runtime/harness/tool_orchestrator.py",
+        "agent_runtime/harness/rollout.py",
         "agent_runtime/builtin/generic.py",
         "agent_runtime/tools/selection.py",
         "agent_runtime/primitive_ops.py",
@@ -156,6 +159,7 @@ def test_coding_reference_tracks_the_current_praxis_runtime() -> None:
         "rag/cli.py",
     ):
         assert f"`{current_path}`" in reference
+        assert (ROOT / current_path).is_file()
 
     stale_terms = (
         "tool_" + "search",

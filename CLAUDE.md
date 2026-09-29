@@ -2,7 +2,7 @@
 
 > 给在本仓库中工作的 coding agent 使用的简明入口。产品定位见
 > [README](README.md)，公开生命周期见
-> [Praxis 产品契约](docs/design/agent_product_contract.md)。
+> [Harness 架构与验收契约](docs/design/praxis_harness_architecture.md)。
 
 ## 开发环境
 
@@ -32,7 +32,9 @@ uv build
 
 uv run python scripts/agent_cli_smoke.py
 uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
-uv run python scripts/agent_tool_aci_eval.py --fake-model --json
+uv run python scripts/agent_harness_acceptance.py validate \
+  --schema evals/harness/acceptance_v1.json \
+  --contract docs/design/praxis_harness_architecture.md
 uv run python scripts/agent_code_benchmark.py validate \
   evals/code_agent/benchmark_v1.json --repository .
 ```
@@ -47,14 +49,13 @@ Praxis 只有一个 Agent 内核，不通过多角色 Agent 转发来组装主�
 
 ```text
 agent CLI / agent_runtime.Agent
-              -> AgentService
-              -> AgentLoop
-              -> ToolRegistry snapshot
-              -> ToolExecutor
-              -> ToolResult / checkpoint / StreamEvent / AgentResult
+              -> Session / TurnExecutor
+              -> ContextManager / ModelAdapter
+              -> ToolOrchestrator / ToolExecutor
+              -> RolloutStore / StreamEvent / AgentResult
 ```
 
-- 每个用户请求是一个 Turn，对外只暴露 `turn_id`。
+- Thread 保存多轮历史；每个用户请求创建一个 Turn；Item 是持久化的执行证据。
 - `previous_turn_id` 创建后续 Turn；`resume` 只恢复已暂停或中断的原 Turn。
 - 计划、工具调用、审批、checkpoint 和验证通过 canonical state/event 展示，
   不建第二套旁路。
@@ -94,7 +95,11 @@ Canonical `Tool` 定义在 `agent_runtime/tools/tool.py`；所有工具来源都
 
 | 责任 | 当前路径 |
 | --- | --- |
-| 单 Agent while-loop | `agent_runtime/loop/runtime.py` |
+| Turn 执行循环 | `agent_runtime/harness/turn.py` |
+| Session 和线程生命周期 | `agent_runtime/harness/session.py` |
+| 上下文投影与压缩 | `agent_runtime/harness/context.py` |
+| 工具批次编排 | `agent_runtime/harness/tool_orchestrator.py` |
+| 持久化及恢复 | `agent_runtime/harness/rollout.py` |
 | Generic definition 与 system prompt | `agent_runtime/builtin/generic.py` |
 | Tool 选择、deferred discovery 与激活 | `agent_runtime/tools/selection.py` |
 | 结构化文件预览模型 | `agent_runtime/primitive_ops.py` |

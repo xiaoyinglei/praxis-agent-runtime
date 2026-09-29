@@ -1,0 +1,3087 @@
+{
+  "source_commit": "2660257ae9f479929e045f1ffb2d8b15a9042fa6",
+  "scope": "Historical results, including failures; raw files remain in the source commit. Not a new acceptance run.",
+  "reports": [
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090006-disabled/report.json",
+      "sha256": "d480208efed624eda45bd6eaeb9e0081692a1c83111e3d2e7c991ccd40685338",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 3882,
+                  "output_tokens": 604,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "context_budget_exhausted",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 23098,
+                  "output_tokens": 2454,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": false,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 15140,
+              "output_tokens": 853,
+              "model_calls": 5
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 7765,
+              "output_tokens": 330,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090016-enabled/report.json",
+      "sha256": "af554e88bfb6a51bed41d49202f9a20487a08c6859b07baf832a2962616148b4",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": false
+                },
+                "terminal_reason": "model_response_incomplete",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 2595,
+                  "output_tokens": 2048,
+                  "model_calls": 1
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": false,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "model_response_incomplete",
+            "summary_calls": 2,
+            "usage": {
+              "input_tokens": 54246,
+              "output_tokens": 5643,
+              "model_calls": 6
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 9692,
+              "output_tokens": 1269,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090242-disabled/report.json",
+      "sha256": "6349ec11481532ea300fca2fe779cb4192340e007bf2abe40d5a32bdc7bede64",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "error": "ValueError: remaining model token budget must be positive"
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4342,
+              "output_tokens": 182,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8091,
+              "output_tokens": 296,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090243-enabled/report.json",
+      "sha256": "acf2a614b392bd46d3acdfdc2dd01ea2820e8af095e4295277e6857cccef088e",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "error": "ValueError: remaining model token budget must be positive"
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4429,
+              "output_tokens": 405,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 11885,
+              "output_tokens": 819,
+              "model_calls": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090901-disabled/report.json",
+      "sha256": "bc94134da682c308498b60fb0fa30d84136d845faf381a50f9af3443b71d58ac",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4028,
+                  "output_tokens": 583,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5451,
+                  "output_tokens": 792,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 7222,
+                  "output_tokens": 1862,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 3843,
+              "output_tokens": 114,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8085,
+              "output_tokens": 328,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-090902-enabled/report.json",
+      "sha256": "7954b4d376213fb4237a4140cdb77c12362917e6fd1cbafd95a054778b2950c0",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 10,
+                "usage": {
+                  "input_tokens": 35378,
+                  "output_tokens": 7916,
+                  "model_calls": 20
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 5,
+                "usage": {
+                  "input_tokens": 24066,
+                  "output_tokens": 5681,
+                  "model_calls": 10
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 3,
+                "usage": {
+                  "input_tokens": 18067,
+                  "output_tokens": 3215,
+                  "model_calls": 6
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4826,
+              "output_tokens": 451,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 11456,
+              "output_tokens": 620,
+              "model_calls": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091300-enabled/report.json",
+      "sha256": "9b0c6ca77d80e1fb9143d439b77febbf3b966feb8c630c1ff8a933c98155e1dc",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 3,
+                "usage": {
+                  "input_tokens": 11850,
+                  "output_tokens": 2312,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 10667,
+                  "output_tokens": 2818,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "model_budget_limit_exceeded",
+                "summary_calls": 16,
+                "usage": {
+                  "input_tokens": 81503,
+                  "output_tokens": 13914,
+                  "model_calls": 27
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 9505,
+              "output_tokens": 1087,
+              "model_calls": 3
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8669,
+              "output_tokens": 578,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091301-disabled/report.json",
+      "sha256": "4d53bb5802b40a4be04158ab02b7f509e9d73916ae931aed55e4ed9ba8ffcf70",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4045,
+                  "output_tokens": 604,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5563,
+                  "output_tokens": 877,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 6311,
+                  "output_tokens": 1060,
+                  "model_calls": 2
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 3842,
+              "output_tokens": 115,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8095,
+              "output_tokens": 298,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091529-enabled/report.json",
+      "sha256": "991ab61646a4b5dbb5cd4c880b6a232a990ada41c7d74585bd32859e2b03b2f1",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 3,
+                "usage": {
+                  "input_tokens": 11832,
+                  "output_tokens": 2494,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 11554,
+                  "output_tokens": 3235,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 5,
+                "usage": {
+                  "input_tokens": 13541,
+                  "output_tokens": 3715,
+                  "model_calls": 7
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 1,
+            "usage": {
+              "input_tokens": 15997,
+              "output_tokens": 2276,
+              "model_calls": 5
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 11514,
+              "output_tokens": 589,
+              "model_calls": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091530-disabled/report.json",
+      "sha256": "a3c9092259ce64c1ddcadd8db0ae5df78d9b2d90b5ea437847a41166b4b3686b",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4020,
+                  "output_tokens": 481,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5350,
+                  "output_tokens": 688,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5859,
+                  "output_tokens": 698,
+                  "model_calls": 2
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4474,
+              "output_tokens": 180,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8223,
+              "output_tokens": 319,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091637-enabled/report.json",
+      "sha256": "dc61a8a77a38c2abce597e788e4141f4a36b8c7b8ab82a9a1a1ea799dddf6ae2",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 19010,
+                  "output_tokens": 3907,
+                  "model_calls": 8
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 20,
+                "usage": {
+                  "input_tokens": 66015,
+                  "output_tokens": 16667,
+                  "model_calls": 30
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 3,
+                "usage": {
+                  "input_tokens": 12110,
+                  "output_tokens": 2986,
+                  "model_calls": 5
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 8494,
+              "output_tokens": 504,
+              "model_calls": 3
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 9225,
+              "output_tokens": 833,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091835-enabled/report.json",
+      "sha256": "97125c3fd5a981179fb3b7d67d9204a171fcf2d58646e1a50b8c380b9c94eac3",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4152,
+                  "output_tokens": 776,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5811,
+                  "output_tokens": 1199,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": "model_budget_limit_exceeded",
+                "summary_calls": 18,
+                "usage": {
+                  "input_tokens": 70843,
+                  "output_tokens": 18876,
+                  "model_calls": 26
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": false,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "terminal_reason": null,
+            "summary_calls": 2,
+            "usage": {
+              "input_tokens": 11911,
+              "output_tokens": 1890,
+              "model_calls": 4
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": false,
+            "checks": {
+              "correct_file": false,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": false,
+              "post_write_read": false
+            },
+            "terminal_reason": null,
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 0,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "model_calls": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-091957-enabled/report.json",
+      "sha256": "33bde1a0958d30b719c9af2c03821ab04ffad9a615b8080d28aab075fd51af8a",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": true
+                },
+                "terminal_reason": null,
+                "summary_calls": 7,
+                "usage": {
+                  "input_tokens": 11767,
+                  "output_tokens": 3419,
+                  "model_calls": 8
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": false,
+              "actual_recall_calls": false,
+              "actually_archived": true
+            },
+            "terminal_reason": null,
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "model_calls": 0
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": false,
+            "checks": {
+              "correct_file": false,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": false,
+              "post_write_read": false
+            },
+            "terminal_reason": null,
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 0,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "model_calls": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145630-enabled/report.json",
+      "sha256": "6e7996f58e03a3af41adf176e59f27f6ab2814492d6d2b33e3907f1dd5f5f46a",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 14,
+                "usage": {
+                  "input_tokens": 24532,
+                  "output_tokens": 7924,
+                  "model_calls": 18
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 21,
+                "usage": {
+                  "input_tokens": 73629,
+                  "output_tokens": 16429,
+                  "model_calls": 32
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 5,
+                "usage": {
+                  "input_tokens": 12346,
+                  "output_tokens": 3229,
+                  "model_calls": 7
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 8377,
+              "output_tokens": 846,
+              "model_calls": 3
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8741,
+              "output_tokens": 570,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145631-disabled/report.json",
+      "sha256": "5e146ff20be48d5c7bf1cbe69442d8f77387a5b7be39171f4c59b6fb66badb77",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4251,
+                  "output_tokens": 642,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5862,
+                  "output_tokens": 861,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 3,
+                "usage": {
+                  "input_tokens": 8228,
+                  "output_tokens": 2288,
+                  "model_calls": 4
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4540,
+              "output_tokens": 172,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 8201,
+              "output_tokens": 295,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145816-enabled/report.json",
+      "sha256": "a6ad83defb98e5e479b75a3562f553f408b7360fd71d197c81aa93714fc53ed5",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 10659,
+                  "output_tokens": 2266,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 5,
+                "usage": {
+                  "input_tokens": 14284,
+                  "output_tokens": 3318,
+                  "model_calls": 7
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 13,
+                "usage": {
+                  "input_tokens": 34156,
+                  "output_tokens": 9743,
+                  "model_calls": 17
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6790,
+              "output_tokens": 213,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12299,
+              "output_tokens": 358,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145818-disabled/report.json",
+      "sha256": "86af61b31c808f98e814925576cc22cb819ff7a68ab8a45f1ee5378dfbc09b98",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5145,
+                  "output_tokens": 653,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 6673,
+                  "output_tokens": 831,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8135,
+                  "output_tokens": 1611,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6322,
+              "output_tokens": 179,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 11741,
+              "output_tokens": 293,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145930-enabled/report.json",
+      "sha256": "eb3a3f01cc427f91cfd70c272babffbb2550fd37a1a09256400f0fbdae57d361",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 10592,
+                  "output_tokens": 2175,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 4,
+                "usage": {
+                  "input_tokens": 13903,
+                  "output_tokens": 3285,
+                  "model_calls": 6
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 7394,
+                  "output_tokens": 1013,
+                  "model_calls": 2
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6620,
+              "output_tokens": 319,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 13483,
+              "output_tokens": 845,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-145931-disabled/report.json",
+      "sha256": "b85cba75b5dd1d34ad6fa7400aa8aabe3810189516e9e2e8ee0ab4e520481b68",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5313,
+                  "output_tokens": 683,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 6879,
+                  "output_tokens": 852,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8347,
+                  "output_tokens": 1621,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6029,
+              "output_tokens": 114,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12279,
+              "output_tokens": 304,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-150050-enabled/report.json",
+      "sha256": "5102e7b55b6d250b20c417386667790c048844ba2b6c623ab813eb310925df92",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "enabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5287,
+                  "output_tokens": 765,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 5,
+                "usage": {
+                  "input_tokens": 14059,
+                  "output_tokens": 3315,
+                  "model_calls": 7
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 7,
+                "usage": {
+                  "input_tokens": 18901,
+                  "output_tokens": 5452,
+                  "model_calls": 9
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6748,
+              "output_tokens": 330,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 16758,
+              "output_tokens": 637,
+              "model_calls": 5
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-150051-disabled/report.json",
+      "sha256": "0f7bbf61c636a9f6caac0e618cd9c0b8cb41ceb6e7abe4a423fc8dc7defa1d36",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5330,
+                  "output_tokens": 702,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 7974,
+                  "output_tokens": 1742,
+                  "model_calls": 3
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8219,
+                  "output_tokens": 1697,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6003,
+              "output_tokens": 109,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12279,
+              "output_tokens": 304,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-201200-disabled/report.json",
+      "sha256": "0994fd13997ee8936d60bb87d742cd32d2e46fc5367f1fe6c618bdcaaa93bbf5",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": false,
+                  "bounded_context_work": true
+                },
+                "turn_status": "interrupted",
+                "terminal_reason": null,
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 0,
+                  "output_tokens": 0,
+                  "model_calls": 0
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": false,
+              "actual_recall_calls": false,
+              "actually_archived": true
+            },
+            "turn_status": "interrupted",
+            "terminal_reason": null,
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "model_calls": 0
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": false,
+            "checks": {
+              "correct_file": false,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": false,
+              "post_write_read": false
+            },
+            "turn_status": "interrupted",
+            "terminal_reason": null,
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 0,
+            "usage": {
+              "input_tokens": 0,
+              "output_tokens": 0,
+              "model_calls": 0
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-201313-disabled/report.json",
+      "sha256": "fff752cdc1f9d8eb297828b80c092f0a90c1577f34322fe5ae8cc45ae595d839",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5245,
+                  "output_tokens": 629,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8023,
+                  "output_tokens": 1855,
+                  "model_calls": 3
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8406,
+                  "output_tokens": 1863,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6636,
+              "output_tokens": 189,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12257,
+              "output_tokens": 293,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260921-202021-disabled/report.json",
+      "sha256": "4e2f9e82f7fb17bed328b3a276be1bbc63fed6891a02d7b72ad0469417e95bec",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5252,
+                  "output_tokens": 630,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 6918,
+                  "output_tokens": 962,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 2,
+                "usage": {
+                  "input_tokens": 8964,
+                  "output_tokens": 2169,
+                  "model_calls": 3
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4305,
+              "output_tokens": 110,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12263,
+              "output_tokens": 296,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260923-091631-disabled/report.json",
+      "sha256": "04667f9bff6750f974e76d36dd2781b651e9525a539251e0641ae74231a7fdbd",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5181,
+                  "output_tokens": 482,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 6596,
+                  "output_tokens": 752,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": false,
+                  "bounded_context_work": true
+                },
+                "turn_status": "failed",
+                "terminal_reason": "context_budget_exhausted",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4207,
+                  "output_tokens": 1030,
+                  "model_calls": 1
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4538,
+              "output_tokens": 97,
+              "model_calls": 2
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12751,
+              "output_tokens": 304,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260923-092048-disabled/report.json",
+      "sha256": "b0f222780be2fd44255c3e1b3c7b5c79a2cbc4d7cd4d9ad0a16fda00630f7a3e",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": false,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5569,
+                  "output_tokens": 732,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 7062,
+                  "output_tokens": 819,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": false,
+                  "reason": false,
+                  "no_invented_migration": false,
+                  "no_invented_implementation": false,
+                  "pending_stays_pending": false,
+                  "actually_semantically_compacted": false,
+                  "bounded_context_work": true
+                },
+                "turn_status": "failed",
+                "terminal_reason": "context_budget_exhausted",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4191,
+                  "output_tokens": 994,
+                  "model_calls": 1
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 7550,
+              "output_tokens": 159,
+              "model_calls": 3
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12745,
+              "output_tokens": 301,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260928-134110-disabled/report.json",
+      "sha256": "9574b44c761880bce9f2880f7f5db42cf1956ea533dbe9950506804a1cff6a4c",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "cases": {
+          "repeated_compaction_restart": {
+            "pass": true,
+            "rounds": [
+              {
+                "round": 1,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 4800,
+                  "output_tokens": 134,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 2,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5387,
+                  "output_tokens": 136,
+                  "model_calls": 2
+                }
+              },
+              {
+                "round": 3,
+                "checks": {
+                  "latest_decision": true,
+                  "reason": true,
+                  "no_invented_migration": true,
+                  "no_invented_implementation": true,
+                  "pending_stays_pending": true,
+                  "actually_semantically_compacted": true,
+                  "bounded_context_work": true
+                },
+                "turn_status": "completed",
+                "terminal_reason": "completed",
+                "summary_calls": 1,
+                "usage": {
+                  "input_tokens": 5424,
+                  "output_tokens": 136,
+                  "model_calls": 2
+                }
+              }
+            ]
+          },
+          "archived_detail_recall": {
+            "pass": false,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": false,
+              "actually_archived": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 4977,
+              "output_tokens": 13,
+              "model_calls": 1
+            }
+          },
+          "parallel_read_edit_verify": {
+            "pass": true,
+            "checks": {
+              "correct_file": true,
+              "inputs_unchanged": true,
+              "three_actually_overlapped": true,
+              "post_write_read": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "maximum_simultaneous_reads": 3,
+            "usage": {
+              "input_tokens": 12960,
+              "output_tokens": 294,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-functional-20260928-183217-disabled/report.json",
+      "sha256": "b6b077181524a782fffdaaf2d87748329f029eab76524fce97e106dac030a566",
+      "result": {
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "prompt": "production",
+        "synthetic_only": true,
+        "script_sha256": "d2663297c14bbd6b62d71d75da7c8612d67001656d2f06d2004b39a255be5a27",
+        "cases": {
+          "archived_detail_recall_hidden": {
+            "pass": true,
+            "checks": {
+              "exact_code": true,
+              "actual_recall_calls": true,
+              "actually_archived": true,
+              "answer_absent_before_recall": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 18883,
+              "output_tokens": 264,
+              "model_calls": 4
+            }
+          }
+        }
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260923-092430/report.json",
+      "sha256": "3d46131711661cefe9a6263210212fe1d2a0fd7d26310e63fd28a7aa87ce78eb",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "6351f226e8cfcee7975492999c712f37f3cde65cd1b4facfde5672cff5bdf388",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 5,
+            "usage": {
+              "input_tokens": 92443,
+              "output_tokens": 4927,
+              "model_calls": 11
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260923-154712/report.json",
+      "sha256": "984176d9e36a67c9706fef3999f9e8c1a4356acffa7b50f0c0bbd03c9e5cadef",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "7f808f8bfbd6717542955ab7f2d3503fe9f53dba8007e58c757b542d162c5712",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 5,
+            "usage": {
+              "input_tokens": 92634,
+              "output_tokens": 5323,
+              "model_calls": 11
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260923-232318/report.json",
+      "sha256": "10bace800f43f3e17f5d107b037394c63cad2745a47e0eb330cc04d3e076ffac",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "c3b4bcd891e36ce785a081301bca5f28abe1327068aabfe2c9e58d193145f67f",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 2,
+            "usage": {
+              "input_tokens": 55932,
+              "output_tokens": 4678,
+              "model_calls": 9
+            }
+          },
+          {
+            "phase": 2,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 2,
+            "usage": {
+              "input_tokens": 30349,
+              "output_tokens": 2808,
+              "model_calls": 4
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260923-232844/report.json",
+      "sha256": "9b4a5c248d69b5f6b24a8788a2e04999d8ae9efc578c68171ccb941b199d9e0f",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "c3b4bcd891e36ce785a081301bca5f28abe1327068aabfe2c9e58d193145f67f",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "failed",
+            "terminal_reason": "model_response_incomplete",
+            "summary_calls": 4,
+            "usage": {
+              "input_tokens": 83520,
+              "output_tokens": 4989,
+              "model_calls": 11
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260924-090813/report.json",
+      "sha256": "deedfff27f7a76cd469a7c3a53a1159dd928e23b93b71c4e130fef6266603001",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": false,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 72329,
+              "output_tokens": 2764,
+              "model_calls": 12
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260924-091327/report.json",
+      "sha256": "3091a99e1e2416039e3b060129bceed93dc2b6d42e101b308d467b6198ace669",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 37200,
+              "output_tokens": 2195,
+              "model_calls": 6
+            }
+          },
+          {
+            "phase": 2,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 1,
+            "usage": {
+              "input_tokens": 67946,
+              "output_tokens": 2674,
+              "model_calls": 10
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260928-132401/report.json",
+      "sha256": "0460d4f9d1b9f0ead785afe2b46cfbc7eb80d3e63ddf26da76be17826a0bb6bd",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 44119,
+              "output_tokens": 2020,
+              "model_calls": 7
+            }
+          },
+          {
+            "phase": 2,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "model_response_incomplete",
+            "summary_calls": 2,
+            "usage": {
+              "input_tokens": 39345,
+              "output_tokens": 4573,
+              "model_calls": 6
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260928-132742/report.json",
+      "sha256": "23bc7394b502a0a57cb2b868e0819b2d09cdc8d9ac41de9eeda74a6496552527",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 51514,
+              "output_tokens": 2506,
+              "model_calls": 8
+            }
+          },
+          {
+            "phase": 2,
+            "checks": {
+              "oracle_passed": false,
+              "completed": false,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": false
+            },
+            "turn_status": "failed",
+            "terminal_reason": "context_budget_exhausted",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 6839,
+              "output_tokens": 107,
+              "model_calls": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-session-code-20260928-133836/report.json",
+      "sha256": "0297f3082b588faecf4fd028b32bee0e1623b396820307beac264d43d1d787a1",
+      "result": {
+        "pass": false,
+        "model": "deepseek-flash",
+        "thinking": "disabled",
+        "byte_limit": 14000,
+        "steps_per_turn": 16,
+        "tokens_per_turn": 100000,
+        "task_sha256": "106e10ebb4ecbcf3ea1335f18156085df23b19d3d0f11349685541254062d911",
+        "script_sha256": "136bebc28fab7e80ded215a5e21bdefd0338234aded56ee784503752efd565f0",
+        "phases": [
+          {
+            "phase": 1,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": false,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 0,
+            "usage": {
+              "input_tokens": 44259,
+              "output_tokens": 2128,
+              "model_calls": 7
+            }
+          },
+          {
+            "phase": 2,
+            "checks": {
+              "oracle_passed": true,
+              "completed": true,
+              "semantic_compaction": true,
+              "parallel_reads": true,
+              "specs_unchanged": true,
+              "verified_rollout": true,
+              "model_ran_verification": true
+            },
+            "turn_status": "completed",
+            "terminal_reason": "completed",
+            "summary_calls": 1,
+            "usage": {
+              "input_tokens": 57319,
+              "output_tokens": 2696,
+              "model_calls": 9
+            }
+          }
+        ]
+      }
+    },
+    {
+      "path": "evals/context_management/deepseek-shape-probe-20260923-155412/report.json",
+      "sha256": "08407de99e56f7a576d757ec1f9abdd5c37ec911fef94dc8f1f28ee30bcdc394",
+      "result": {
+        "scope": "Three request-shape probes; not an end-to-end acceptance verdict. See the original report at source_commit."
+      }
+    }
+  ]
+}

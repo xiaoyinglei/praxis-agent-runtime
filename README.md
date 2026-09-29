@@ -67,7 +67,7 @@ Turn -> Loop -> ACI / ToolExecutor -> workspace
 
 The runtime deliberately uses one Agent loop rather than a chain of role-playing
 agents. Deeper lifecycle details are in the
-[product contract](docs/design/agent_product_contract.md).
+[Harness architecture contract](docs/design/praxis_harness_architecture.md).
 
 ## Current evidence
 
@@ -490,11 +490,11 @@ Focused references:
 
 - [Runbook](docs/RUNBOOK.md) — models, services, private knowledge, and operations
 - [Troubleshooting](docs/TROUBLESHOOTING.md) — common runtime and RAG failures
-- [Product contract](docs/design/agent_product_contract.md) — public lifecycle and boundaries
+- [Harness architecture contract](docs/design/praxis_harness_architecture.md) — public lifecycle and boundaries
 - [Tool-use reliability benchmark](docs/benchmark.md) — plain-language scenarios, scope, and current live result
 - [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) — human-readable approval-continuation evidence
 - [Real non-code data ACI run](docs/runs/deepseek-v4-flash-data-aci.md) — one real combined Excel/PDF/statistics Turn with independent artifact acceptance
-- [Evaluation archive](docs/EVALUATION.md) — historical retrieval baselines with provenance notes
+- [Context evaluation](evals/context_management/README.md) — reproducible runners and a compact index of successful and failed runs
 - [MIT license](LICENSE) — use and redistribution terms
 
 Praxis is available under the [MIT](LICENSE) license.
