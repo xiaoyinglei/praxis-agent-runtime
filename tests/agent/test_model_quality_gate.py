@@ -1218,6 +1218,7 @@ def test_cli_rechecks_source_after_model_trials_before_writing_artifact(
     assert not output_path.exists()
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 @pytest.mark.anyio
 async def test_gate_rejects_a_clean_repository_that_is_not_the_running_source(
     monkeypatch: pytest.MonkeyPatch,
@@ -1248,6 +1249,7 @@ async def test_gate_rejects_a_clean_repository_that_is_not_the_running_source(
     assert model_called is False
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 @pytest.mark.anyio
 async def test_gate_rejects_runtime_import_resolving_outside_source_repository(
     monkeypatch: pytest.MonkeyPatch,
@@ -1384,6 +1386,7 @@ async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
     assert report["infrastructure_failure"]["case_id"] == str(first_case["id"])
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 @pytest.mark.parametrize("failure_stage", ["from_env", "current_model"])
 @pytest.mark.anyio
 async def test_gate_records_control_plane_initialization_failure_before_cases(
@@ -1475,6 +1478,7 @@ async def test_gate_records_control_plane_initialization_failure_before_cases(
     assert "model_control_plane_initialization_failed" in rendered_run
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_cli_returns_two_and_writes_report_for_control_plane_initialization_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1910,6 +1914,7 @@ def test_baseline_validation_recomputes_and_rejects_edited_thresholds() -> None:
         module.validate_baseline(baseline)
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_committed_live_baseline_recomputes_from_raw_observations() -> None:
     module = _load_gate_module()
     suite = module.load_suite(FIXTURE_PATH)
@@ -1921,6 +1926,7 @@ def test_committed_live_baseline_recomputes_from_raw_observations() -> None:
     assert all(entry["trial_count"] == 3 for entry in baseline["models"].values())
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 @pytest.mark.parametrize("provider", [None, "", "   "])
 def test_baseline_requires_a_non_empty_provider_route(provider: object) -> None:
     module = _load_gate_module()
@@ -1936,6 +1942,7 @@ def test_baseline_requires_a_non_empty_provider_route(provider: object) -> None:
         module.validate_baseline(baseline, suite=suite)
 
 
+@pytest.mark.skipif(not BASELINE_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_raw_baseline_tampering_is_detected_before_thresholds() -> None:
     module = _load_gate_module()
     suite = module.load_suite(FIXTURE_PATH)

@@ -23,6 +23,7 @@ def _load_module():
     return module
 
 
+@pytest.mark.skipif(not MANIFEST.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_manifest_freezes_five_distinct_public_path_scenarios() -> None:
     module = _load_module()
 
@@ -46,6 +47,7 @@ def test_manifest_freezes_five_distinct_public_path_scenarios() -> None:
     )
 
 
+@pytest.mark.skipif(not MANIFEST.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_gate_requires_every_scenario_to_pass_three_times() -> None:
     module = _load_module()
     manifest = module.load_manifest(MANIFEST)
@@ -69,6 +71,7 @@ def test_gate_requires_every_scenario_to_pass_three_times() -> None:
     assert summary["reasons"] == []
 
 
+@pytest.mark.skipif(not MANIFEST.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_gate_rejects_missing_failure_duplicate_and_non_exactly_once_effect() -> None:
     module = _load_module()
     manifest = module.load_manifest(MANIFEST)
@@ -106,6 +109,7 @@ def test_gate_rejects_missing_failure_duplicate_and_non_exactly_once_effect() ->
     assert any(reason.startswith("missing:") for reason in summary["reasons"])
 
 
+@pytest.mark.skipif(not MANIFEST.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_manifest_rejects_unknown_mode(tmp_path: Path) -> None:
     module = _load_module()
     payload = json.loads(MANIFEST.read_text(encoding="utf-8"))
@@ -233,6 +237,7 @@ def test_resume_does_not_approve_a_pause_outside_the_allowed_effects(
     assert attempts == (paused,)
 
 
+@pytest.mark.skipif(not MANIFEST.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_gate_rejects_crash_scenario_when_no_injected_crash_was_observed() -> None:
     module = _load_module()
     manifest = module.load_manifest(MANIFEST)

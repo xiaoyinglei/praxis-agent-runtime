@@ -13,7 +13,7 @@ Read-only tasks explicitly opt out of that mutation contract and may answer
 directly. Praxis is designed for one person operating a trusted local workspace,
 with `agent` as the CLI and `agent_runtime.Agent` as the Python API.
 
-![Praxis deterministic fake-model demo](docs/assets/praxis-demo.gif)
+Generate the optional local demo with `scripts/render_praxis_demo.py`.
 
 **DETERMINISTIC DEMO · FAKE MODEL — NOT MODEL QUALITY EVIDENCE.** Every frame is
 generated from the tested public Agent path. The scripted model inspects a file,
@@ -67,25 +67,19 @@ Turn -> Loop -> ACI / ToolExecutor -> workspace
 
 The runtime deliberately uses one Agent loop rather than a chain of role-playing
 agents. Deeper lifecycle details are in the
-[Harness architecture contract](docs/design/praxis_harness_architecture.md).
+Harness architecture contract (local-only).
 
 ## Current evidence
 
-| Evidence | What it establishes | Current state |
-| --- | --- | --- |
-| [Deterministic demo](docs/assets/praxis-demo.gif) | Public Agent wiring: inspect, patch, verify, finish | Reproducible fake-model artifact |
-| [Tool-use reliability benchmark](docs/benchmark.md) | Five fixed, controlled ACI scenarios, repeated three times each | **PASSED — 15/15 scenario executions passed**; worst-trial mean tool calls 1.6 |
-| [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) | Approval, continuation, mutation, validation, and redacted trace | **CONCLUSIVE PASS — 3/3 approval trials completed**; 2 tool calls per trial |
-| [Real non-code data ACI run](docs/runs/deepseek-v4-flash-data-aci.md) | One combined Excel, PDF, and statistical-analysis Turn with managed Python, approval, artifact read-back, and independent acceptance | **CONCLUSIVE FUNCTIONAL PASS — 3/3 artifacts accepted**; one trial, not a reliability benchmark |
-| [30-task protocol](evals/code_agent/benchmark_v1.json) | Manifest shape for a broader coding-agent evaluation | Manifest validated; not run as this change's release gate |
+The public repository includes runtime tests, CLI and fake-model delivery smoke,
+and package installation checks. These validate execution boundaries; they do
+not establish real-model task quality. Infrastructure failures are reported as
+**INCONCLUSIVE**, never converted into a model score.
 
-The tool-use reliability page is generated from a clean source commit after the
-local gates pass. It measures five narrow behaviors: direct file reading, search
-then read, recovery from a renamed file, approval and resume, and stopping after a
-confirmed failure. It does not claim broad coding ability. Infrastructure failures
-are reported as **INCONCLUSIVE**, never converted into a model score. The table
-reports the measured verdict and exact execution count from the linked raw report;
-inspect the expanded trace for case-level evidence.
+Reference checkouts, documentation, generated artifacts and live evaluation
+records are local-only material. They are not required to build or use Praxis
+and are not bundled with a fresh clone. Real-model results must be checked
+against the corresponding local run, rather than inferred from unit-test counts.
 
 ## Quickstart
 
@@ -442,7 +436,7 @@ Index maintenance stays on the optional `rag` command:
 uv run rag --help
 ```
 
-See the [runbook](docs/RUNBOOK.md) for service and private-document workflows.
+See the runbook (local-only) for service and private-document workflows.
 
 ## Safety and limitations
 
@@ -486,15 +480,10 @@ uv run pytest -q
 uv build
 ```
 
-Focused references:
-
-- [Runbook](docs/RUNBOOK.md) — models, services, private knowledge, and operations
-- [Troubleshooting](docs/TROUBLESHOOTING.md) — common runtime and RAG failures
-- [Harness architecture contract](docs/design/praxis_harness_architecture.md) — public lifecycle and boundaries
-- [Tool-use reliability benchmark](docs/benchmark.md) — plain-language scenarios, scope, and current live result
-- [Expanded DeepSeek V4 Flash run](docs/runs/deepseek-v4-flash.md) — human-readable approval-continuation evidence
-- [Real non-code data ACI run](docs/runs/deepseek-v4-flash-data-aci.md) — one real combined Excel/PDF/statistics Turn with independent artifact acceptance
-- [Context evaluation](evals/context_management/README.md) — reproducible runners and a compact index of successful and failed runs
-- [MIT license](LICENSE) — use and redistribution terms
+Local-only material is intentionally excluded from Git: `learn-claude-code/`,
+`docs/`, `artifacts/`, `evals/` and `CLAUDE.md`. Existing local copies remain
+usable. Tests that require those documents or frozen evaluation assets run when
+the assets exist and report explicit skips in a fresh clone; runtime and build
+checks remain required.
 
 Praxis is available under the [MIT](LICENSE) license.

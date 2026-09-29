@@ -29,3 +29,11 @@ data/eval/answers/
 data/eval/diagnostics/
 brath-claude-code
 docs/superpowers/
+
+# Local-only references, documentation and evaluation material.
+/learn-claude-code/
+/docs/
+/artifacts/
+/evals/
+/CLAUDE.md
+/claude.md

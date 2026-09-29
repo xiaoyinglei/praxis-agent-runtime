@@ -2,7 +2,11 @@
 
 from types import SimpleNamespace
 
-from evals.context_management.session_code_live import verification_succeeded
+import pytest
+
+verification_succeeded = pytest.importorskip(
+    "evals.context_management.session_code_live", reason="Local-only live-task evaluator absent"
+).verification_succeeded
 
 
 def test_successful_directory_listing_does_not_hide_failed_verification():
