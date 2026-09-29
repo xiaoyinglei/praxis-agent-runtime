@@ -47,8 +47,9 @@ def _active_contract_files() -> Iterator[Path]:
                 yield path
 
     yield ROOT / "README.md"
-    yield ROOT / "CLAUDE.md"
-    yield ROOT / "docs/RUNBOOK.md"
+    for optional in (CODING_REFERENCE, ROOT / "docs/RUNBOOK.md"):
+        if optional.is_file():
+            yield optional
     yield ROOT / "pyproject.toml"
     yield from (path for path in (ROOT / "docs/design").glob("*.md") if path not in _HISTORICAL_EXCEPTIONS)
 
@@ -111,6 +112,7 @@ def test_active_contracts_do_not_expose_a_personal_checkout_path() -> None:
     assert offenders == []
 
 
+@pytest.mark.skipif(not (_CONTEXT_EVALS / "README.md").is_file(), reason="Local-only evaluation assets absent")
 def test_context_evaluation_runners_remain_active_contracts() -> None:
     active = set(_active_contract_files())
     assert set(_CONTEXT_EVALS.glob("*.py")) <= active
@@ -118,6 +120,7 @@ def test_context_evaluation_runners_remain_active_contracts() -> None:
     assert ROOT / "docs/RUNBOOK.md" in active
 
 
+@pytest.mark.skipif(not CODING_REFERENCE.is_file(), reason="Local-only coding reference absent")
 def test_coding_reference_tracks_the_current_praxis_runtime() -> None:
     reference = CODING_REFERENCE.read_text(encoding="utf-8")
 

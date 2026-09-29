@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
@@ -29,7 +31,7 @@ def test_readme_leads_with_the_approved_praxis_identity_and_demo() -> None:
 
     assert readme.startswith("# Praxis\n")
     assert "a trusted-local workspace agent runtime" in readme
-    assert "docs/assets/praxis-demo.gif" in readme
+    assert "scripts/render_praxis_demo.py" in readme
     assert "DETERMINISTIC DEMO" in readme
     assert "FAKE MODEL" in readme
 
@@ -104,6 +106,7 @@ def test_readme_sdk_examples_use_the_real_public_facade() -> None:
         compile(snippet, f"README.md:python-example-{index}", "exec")
 
 
+@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_model_integration_docs_cover_requirements_registration_and_switching_only() -> None:
     readme = _read(README)
     runbook = _read(RUNBOOK)
@@ -185,6 +188,7 @@ def test_readme_describes_a_source_only_distribution_without_unearned_claims() -
     assert unearned_suite_verdict not in readme
 
 
+@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_runbook_uses_the_praxis_source_checkout_without_personal_paths() -> None:
     runbook = _read(RUNBOOK)
     personal_path = "/Users/" + "leixiaoying"
@@ -197,6 +201,7 @@ def test_runbook_uses_the_praxis_source_checkout_without_personal_paths() -> Non
     assert personal_path not in runbook
 
 
+@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_runbook_keeps_builtins_read_only_and_user_models_cli_managed() -> None:
     runbook = _read(RUNBOOK)
 
@@ -207,6 +212,10 @@ def test_runbook_keeps_builtins_read_only_and_user_models_cli_managed() -> None:
     assert "不保存解析后的值" in runbook
 
 
+@pytest.mark.skipif(
+    not BENCHMARK.is_file() or not MODEL_QUALITY_REPORT.is_file() or not RUN_RECORD.is_file(),
+    reason="Local-only documentation or evaluation fixture absent",
+)
 def test_checked_in_live_evidence_pages_match_renderer() -> None:
     with (
         NamedTemporaryFile(dir=BENCHMARK.parent, suffix=".md") as benchmark_file,
@@ -234,6 +243,10 @@ def test_checked_in_live_evidence_pages_match_renderer() -> None:
         assert run_record.read_text(encoding="utf-8") == _read(RUN_RECORD)
 
 
+@pytest.mark.skipif(
+    not BENCHMARK.is_file() or not MODEL_QUALITY_REPORT.is_file() or not RUN_RECORD.is_file(),
+    reason="Local-only documentation or evaluation fixture absent",
+)
 def test_license_and_live_evidence_pages_are_explicit() -> None:
     license_text = _read(LICENSE)
     readme = _read(README)
@@ -256,24 +269,16 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
     assert run["status"] == "completed"
 
     cases = [case for trial in run["trials"] for case in trial["cases"]]
-    passed_cases = sum(case["score"]["passed"] is True for case in cases)
     approval_cases = [
         case for case in cases if case["score"]["case_id"] == "approval_continue"
     ]
     passed_approval_cases = sum(
         case["score"]["passed"] is True for case in approval_cases
     )
-    conclusion = "PASS" if report["passed"] else "FAIL"
 
     assert license_text.startswith("MIT License\n")
     assert "Copyright (c) 2026 xiaoyinglei" in license_text
-    assert (
-        f"**{verdict} — {passed_cases}/{len(cases)} scenario executions passed**"
-    ) in readme
-    assert (
-        f"**CONCLUSIVE {conclusion} — {passed_approval_cases}/{len(approval_cases)} "
-        "approval trials completed**"
-    ) in readme
+    assert "records are local-only material" in readme
     assert f"Overall verdict: **{verdict}**" in benchmark
     assert benchmark.startswith("# Agent tool-use reliability benchmark\n")
     assert "not a general coding or reasoning benchmark" in benchmark

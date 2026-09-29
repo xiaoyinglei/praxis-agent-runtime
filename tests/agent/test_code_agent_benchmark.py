@@ -532,6 +532,7 @@ def test_release_shape_rejects_ambiguous_implementation_instruction(
         module.validate_release_shape(manifest)
 
 
+@pytest.mark.skipif(not REAL_MANIFEST_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_real_v1_manifest_is_release_shaped_and_bound_to_git_history() -> None:
     module = _load_benchmark_module()
 
@@ -994,6 +995,7 @@ def test_gate_command_verifies_evidence_hashes_and_emits_release_decision(
         module.load_result_record(result_paths[0], manifest=manifest)
 
 
+@pytest.mark.skipif(not REAL_MANIFEST_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_validate_command_reports_manifest_identity() -> None:
     result = subprocess.run(
         [

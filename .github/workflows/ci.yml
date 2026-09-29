@@ -32,8 +32,10 @@ jobs:
       - name: Delivery smoke
         run: uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
       - name: Harness acceptance contract
+        if: ${{ hashFiles('evals/harness/acceptance_v1.json') != '' && hashFiles('docs/design/praxis_harness_architecture.md') != '' }}
         run: uv run python scripts/agent_harness_acceptance.py validate --schema evals/harness/acceptance_v1.json --contract docs/design/praxis_harness_architecture.md
       - name: Benchmark manifest
+        if: ${{ hashFiles('evals/code_agent/benchmark_v1.json') != '' }}
         run: uv run python scripts/agent_code_benchmark.py validate evals/code_agent/benchmark_v1.json --repository .
       - name: Installed wheel smoke
         shell: bash
