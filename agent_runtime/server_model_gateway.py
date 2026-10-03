@@ -14,6 +14,7 @@ import math
 import os
 import sqlite3
 import stat
+import struct
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -126,6 +127,24 @@ def _valid_secret(value: str) -> bool:
     return 16 <= len(value) <= 4096 and value.isascii() and value.isprintable() and not any(c.isspace() for c in value)
 
 
+def private_systemd_acl(acl: bytes, uid: int) -> bool:
+    """systemd >=254 uses root-owned 0440 files with a service-user read ACL.
+
+    The group mode bits are an ACL mask, not a grant to the owning group.
+    Accept only the exact root/service-only ACL; no extra users or groups.
+    """
+    if len(acl) != 44 or struct.unpack_from("<I", acl)[0] != 2:
+        return False
+    entries = set(struct.iter_unpack("<HHI", acl[4:]))
+    return entries == {
+        (1, 4, 0xFFFFFFFF),  # owner (root): read
+        (2, 4, uid),  # named service user: read
+        (4, 0, 0xFFFFFFFF),  # owning group: no access
+        (16, 4, 0xFFFFFFFF),  # ACL mask: read
+        (32, 0, 0xFFFFFFFF),  # everyone else: no access
+    }
+
+
 def load_credentials(providers: Sequence[str]) -> tuple[dict[str, str], str]:
     """No .env/environment key fallback. Never include file contents in errors."""
     directory = os.environ.get("CREDENTIALS_DIRECTORY")
@@ -137,8 +156,15 @@ def load_credentials(providers: Sequence[str]) -> tuple[dict[str, str], str]:
             fd = os.open(Path(directory) / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
             with os.fdopen(fd, "rb") as handle:
                 info = os.fstat(handle.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                if not stat.S_ISREG(info.st_mode):
                     raise ValueError("insecure credential file")
+                if info.st_mode & 0o077:
+                    if (
+                        stat.S_IMODE(info.st_mode) != 0o440
+                        or info.st_uid != 0
+                        or not private_systemd_acl(os.getxattr(handle.fileno(), "system.posix_acl_access"), os.getuid())
+                    ):
+                        raise ValueError("insecure credential ACL")
                 value = handle.read(4098).decode("ascii").strip()
                 if not _valid_secret(value):
                     raise ValueError("invalid credential value")

@@ -277,3 +277,20 @@ def test_budget_rejects_symlink_or_nonregular_state(tmp_path):
     state.mkdir()
     with pytest.raises(ValueError):
         gateway.DailyBudget(state, gateway.ServicePolicy())
+
+
+def test_systemd_credentials_accept_only_root_service_read_acl():
+    import struct
+
+    from agent_runtime.server_model_gateway import private_systemd_acl
+
+    def acl(entries):
+        return struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+
+    entries = [(1, 4, 0xFFFFFFFF), (2, 4, 61234), (4, 0, 0xFFFFFFFF), (16, 4, 0xFFFFFFFF), (32, 0, 0xFFFFFFFF)]
+    assert private_systemd_acl(acl(entries), 61234)
+    assert not private_systemd_acl(acl(entries), 61235)
+    for extra in [(2, 4, 61235), (8, 4, 1000), (32, 4, 0xFFFFFFFF)]:
+        assert not private_systemd_acl(acl([*entries, extra]), 61234)
+    assert not private_systemd_acl(acl([*entries[:2], (4, 4, 0xFFFFFFFF), *entries[3:]]), 61234)
+    assert not private_systemd_acl(b"bad acl", 61234)

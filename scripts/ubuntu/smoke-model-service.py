@@ -77,6 +77,9 @@ from pathlib import Path
 import httpx, uvicorn
 spec=importlib.util.spec_from_file_location("gateway", Path(__file__).with_name("gateway.py"))
 g=importlib.util.module_from_spec(spec); sys.modules["gateway"]=g; spec.loader.exec_module(g)
+for path in Path(os.environ["CREDENTIALS_DIRECTORY"]).iterdir():
+    info=path.stat()
+    print("credential metadata",path.name,oct(info.st_mode & 0o777),info.st_uid,flush=True)
 keys,token=g.load_credentials(["deepseek","groq"])
 def reply(req):
     body=json.loads(req.content)
