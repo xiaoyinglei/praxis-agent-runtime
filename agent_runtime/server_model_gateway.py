@@ -159,10 +159,12 @@ def load_credentials(providers: Sequence[str]) -> tuple[dict[str, str], str]:
                 if not stat.S_ISREG(info.st_mode):
                     raise ValueError("insecure credential file")
                 if info.st_mode & 0o077:
+                    getxattr = getattr(os, "getxattr", None)
                     if (
                         stat.S_IMODE(info.st_mode) != 0o440
                         or info.st_uid != 0
-                        or not private_systemd_acl(os.getxattr(handle.fileno(), "system.posix_acl_access"), os.getuid())
+                        or getxattr is None
+                        or not private_systemd_acl(getxattr(handle.fileno(), "system.posix_acl_access"), os.getuid())
                     ):
                         raise ValueError("insecure credential ACL")
                 value = handle.read(4098).decode("ascii").strip()
