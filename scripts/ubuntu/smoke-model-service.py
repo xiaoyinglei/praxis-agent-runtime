@@ -157,6 +157,11 @@ uvicorn.run(app,host="127.0.0.1",port=18444,access_log=False,log_level="critical
             "Linux systemd smoke passed: non-root credential service, private files, "
             "both routes, loopback auth and restart quota."
         )
+    except Exception:
+        # Fake credentials only: capture the failing service boundary before cleanup.
+        subprocess.run(["systemctl", "show", unit, "--property=Result,ExecMainCode,ExecMainStatus"])
+        subprocess.run(["journalctl", "-u", unit, "--no-pager", "-n", "40"])
+        raise
     finally:
         subprocess.run(["systemctl", "stop", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["systemctl", "reset-failed", unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
