@@ -39,16 +39,14 @@ from agent_runtime.workspace import WorkspaceRuntime
 _MAX_STREAM_BYTES = 16_000
 _MAX_COMMAND_TIMEOUT_SECONDS = 600.0
 _MILLISECONDS_PER_SECOND = 1_000.0
-_STREAM_TRUNCATION_MARKER = (
-    b"\n... output truncated; preserved head and tail ...\n"
-)
+_STREAM_TRUNCATION_MARKER = b"\n... output truncated; preserved head and tail ...\n"
 _MAX_DELTA_BYTES = 200_000
 _MAX_DELTA_CHUNKS = 512
 _DELTA_CHUNK_BYTES = 4_096
 _SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
-_PROTECTED_VERIFICATION_DIRECTORIES = frozenset(
-    {".venv", "node_modules"}
-)
+_BWRAP_PATH = "/usr/bin/bwrap"
+_SANDBOX_PLATFORM = sys.platform
+_PROTECTED_VERIFICATION_DIRECTORIES = frozenset({".venv", "node_modules"})
 
 
 class RunCommandInput(BaseModel):
@@ -98,10 +96,7 @@ class RunCommandInput(BaseModel):
         if value <= _MAX_COMMAND_TIMEOUT_SECONDS:
             return value
         if value < _MILLISECONDS_PER_SECOND:
-            raise ValueError(
-                "timeout_seconds must be at most 600 seconds; "
-                "millisecond values must be at least 1000"
-            )
+            raise ValueError("timeout_seconds must be at most 600 seconds; millisecond values must be at least 1000")
         return value / _MILLISECONDS_PER_SECOND
 
 
@@ -155,10 +150,7 @@ class ManagedPythonInput(BaseModel):
     )
     network: bool = Field(
         default=False,
-        description=(
-            "Request outbound network access. It is disabled by default and "
-            "requires separate approval."
-        ),
+        description=("Request outbound network access. It is disabled by default and requires separate approval."),
     )
     workspace_write: bool = Field(
         default=False,
@@ -184,24 +176,16 @@ class ManagedPythonOutput(BaseModel):
     timed_out: bool
     truncated: bool
     duration_ms: float = Field(ge=0)
-    execution_mode: Literal["managed_python_sandbox"] = (
-        "managed_python_sandbox"
-    )
+    execution_mode: Literal["managed_python_sandbox"] = "managed_python_sandbox"
     python_version: str
     network_enabled: bool = False
     sandbox_error: str | None = None
 
 
 _COMMAND_INPUT_SCHEMA, _validate_command_input = pydantic_input(RunCommandInput)
-_COMMAND_OUTPUT_SCHEMA, _unused_command_output_validator = pydantic_input(
-    RunCommandOutput
-)
-_PYTHON_INPUT_SCHEMA, _validate_python_input_base = pydantic_input(
-    ManagedPythonInput
-)
-_PYTHON_OUTPUT_SCHEMA, _unused_python_output_validator = pydantic_input(
-    ManagedPythonOutput
-)
+_COMMAND_OUTPUT_SCHEMA, _unused_command_output_validator = pydantic_input(RunCommandOutput)
+_PYTHON_INPUT_SCHEMA, _validate_python_input_base = pydantic_input(ManagedPythonInput)
+_PYTHON_OUTPUT_SCHEMA, _unused_python_output_validator = pydantic_input(ManagedPythonOutput)
 
 
 def _validate_python_input(
@@ -270,6 +254,7 @@ def create_run_command_tool(
         definition=ToolDefinition(
             name="run_command",
             description=(
+                "On Linux, only network=false and workspace_write=false are supported. "
                 "Run one shell command inside a restricted OS sandbox from a "
                 "workspace-relative directory. The workspace is read-only by default "
                 "and a private temporary directory is writable. Set "
@@ -298,7 +283,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v6-protected-toolchain",
+        execution_revision="builtin-run-command-v7-linux-read-only",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -335,6 +320,7 @@ def create_execute_python_tool(
         definition=ToolDefinition(
             name="execute_python",
             description=(
+                "On Linux, only network=false and workspace_write=false are supported. "
                 "Run plain Python source with the managed Praxis interpreter in "
                 "a restricted OS sandbox. Unlike run_command, this works when the "
                 "task workspace has no .venv and does not use shell heredocs. Use "
@@ -353,13 +339,9 @@ def create_execute_python_tool(
         run=run,
         normalize_output=_normalize_managed_python_output,
         output_schema=_PYTHON_OUTPUT_SCHEMA,
-        static_effects=frozenset(
-            {ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}
-        ),
-        resolve_use=lambda arguments: _resolve_managed_python_use(
-            workspace, arguments
-        ),
-        execution_revision="builtin-execute-python-v1-managed-runtime",
+        static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
+        resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
+        execution_revision="builtin-execute-python-v2-linux-read-only",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -381,26 +363,19 @@ async def _run_command(
         workspace.resolve_path(request.working_dir or "."),
     )
     if not cwd.is_dir():
-        raise NotADirectoryError(
-            f"workspace working directory not found: {request.working_dir}"
-        )
+        raise NotADirectoryError(f"workspace working directory not found: {request.working_dir}")
 
     started_at = time.monotonic()
-    if not (
-        os.path.isfile(_SANDBOX_EXEC_PATH)
-        and os.access(_SANDBOX_EXEC_PATH, os.X_OK)
-    ):
+    sandbox_issue = _sandbox_availability_issue(request)
+    if sandbox_issue is not None:
         return RunCommandOutput(
             stdout="",
-            stderr=(
-                "restricted command sandbox is unavailable; refusing "
-                "unsandboxed execution"
-            ),
+            stderr=sandbox_issue[1],
             exit_code=-1,
             timed_out=False,
             truncated=False,
             duration_ms=(time.monotonic() - started_at) * 1000,
-            sandbox_error="sandbox_unavailable",
+            sandbox_error=sandbox_issue[0],
         )
 
     preflight_issue = _workspace_sandbox_preflight_issue(
@@ -427,16 +402,14 @@ async def _run_command(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
         )
-        sandbox_profile = _build_command_sandbox_profile(
+        sandbox_argv = _sandbox_argv(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
             allow_network=request.network,
             allow_workspace_write=request.workspace_write,
         )
         process = await asyncio.create_subprocess_exec(
-            _SANDBOX_EXEC_PATH,
-            "-p",
-            sandbox_profile,
+            *sandbox_argv,
             "/bin/sh",
             "-c",
             request.command,
@@ -506,13 +479,16 @@ async def _run_command(
         output = RunCommandOutput(
             stdout=stdout,
             stderr=stderr,
-            exit_code=(
-                process.returncode if process.returncode is not None else -1
-            ),
+            exit_code=(process.returncode if process.returncode is not None else -1),
             timed_out=timed_out,
             truncated=stdout_truncated or stderr_truncated,
             duration_ms=(time.monotonic() - started_at) * 1000,
             network_enabled=request.network,
+            sandbox_error=(
+                "sandbox_start_failed"
+                if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")
+                else None
+            ),
         )
     return output
 
@@ -523,26 +499,17 @@ async def _execute_managed_python(
     *,
     termination_grace_seconds: float,
 ) -> ManagedPythonOutput:
-    cwd = workspace.ensure_within_workspace(
-        workspace.resolve_path(request.working_dir or ".")
-    )
+    cwd = workspace.ensure_within_workspace(workspace.resolve_path(request.working_dir or "."))
     if not cwd.is_dir():
-        raise NotADirectoryError(
-            f"workspace working directory not found: {request.working_dir}"
-        )
+        raise NotADirectoryError(f"workspace working directory not found: {request.working_dir}")
 
     started_at = time.monotonic()
-    if not (
-        os.path.isfile(_SANDBOX_EXEC_PATH)
-        and os.access(_SANDBOX_EXEC_PATH, os.X_OK)
-    ):
+    sandbox_issue = _sandbox_availability_issue(request)
+    if sandbox_issue is not None:
         return _python_sandbox_error(
             started_at=started_at,
-            message=(
-                "managed Python sandbox is unavailable; refusing unsandboxed "
-                "execution"
-            ),
-            code="sandbox_unavailable",
+            message=sandbox_issue[1],
+            code=sandbox_issue[0],
         )
 
     preflight_issue = _workspace_sandbox_preflight_issue(
@@ -568,7 +535,7 @@ async def _execute_managed_python(
             temporary_root=temporary_root,
         )
         environment["PYTHONNOUSERSITE"] = "1"
-        sandbox_profile = _build_command_sandbox_profile(
+        sandbox_argv = _sandbox_argv(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
             allow_network=request.network,
@@ -576,9 +543,7 @@ async def _execute_managed_python(
             additional_read_roots=_runtime_python_read_roots(),
         )
         process = await asyncio.create_subprocess_exec(
-            _SANDBOX_EXEC_PATH,
-            "-p",
-            sandbox_profile,
+            *sandbox_argv,
             sys.executable,
             "-I",
             "-B",
@@ -621,14 +586,17 @@ async def _execute_managed_python(
         return ManagedPythonOutput(
             stdout=stdout,
             stderr=stderr,
-            exit_code=(
-                process.returncode if process.returncode is not None else -1
-            ),
+            exit_code=(process.returncode if process.returncode is not None else -1),
             timed_out=timed_out,
             truncated=stdout_truncated or stderr_truncated,
             duration_ms=(time.monotonic() - started_at) * 1000,
             python_version=platform.python_version(),
             network_enabled=request.network,
+            sandbox_error=(
+                "sandbox_start_failed"
+                if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")
+                else None
+            ),
         )
 
 
@@ -736,6 +704,108 @@ def _command_environment(
     }
 
 
+def _sandbox_availability_issue(
+    request: RunCommandInput | ManagedPythonInput,
+) -> tuple[str, str] | None:
+    executable = _BWRAP_PATH if _SANDBOX_PLATFORM == "linux" else _SANDBOX_EXEC_PATH
+    if _SANDBOX_PLATFORM not in {"linux", "darwin"} or not (
+        os.path.isfile(executable) and os.access(executable, os.X_OK)
+    ):
+        return (
+            "sandbox_unavailable",
+            f"restricted sandbox is unavailable ({executable}; "
+            "Linux requires bubblewrap); refusing unsandboxed execution",
+        )
+    if _SANDBOX_PLATFORM == "linux" and (request.network or request.workspace_write):
+        return (
+            "sandbox_policy_unsupported",
+            "Linux currently requires network=false and workspace_write=false; "
+            "use dedicated workspace file tools for edits. No command was executed.",
+        )
+    return None
+
+
+def _sandbox_argv(
+    *,
+    workspace_root: os.PathLike[str] | str,
+    temporary_root: os.PathLike[str] | str,
+    allow_network: bool,
+    allow_workspace_write: bool = False,
+    additional_read_roots: Sequence[os.PathLike[str] | str] = (),
+) -> list[str]:
+    if _SANDBOX_PLATFORM == "linux":
+        return _linux_sandbox_argv(
+            workspace_root=workspace_root,
+            temporary_root=temporary_root,
+            additional_read_roots=additional_read_roots,
+        )
+    return [
+        _SANDBOX_EXEC_PATH,
+        "-p",
+        _build_command_sandbox_profile(
+            workspace_root=workspace_root,
+            temporary_root=temporary_root,
+            allow_network=allow_network,
+            allow_workspace_write=allow_workspace_write,
+            additional_read_roots=additional_read_roots,
+        ),
+    ]
+
+
+def _linux_sandbox_argv(
+    *,
+    workspace_root: os.PathLike[str] | str,
+    temporary_root: os.PathLike[str] | str,
+    additional_read_roots: Sequence[os.PathLike[str] | str],
+) -> list[str]:
+    """Expose only the runtime, a read-only workspace and private scratch.
+
+    Do not bind the host root or home directory. Network namespaces also
+    isolate abstract Unix sockets; pathname sockets in the workspace are
+    rejected by preflight because read-only mounts do not block connect().
+    """
+    workspace = os.path.realpath(workspace_root)
+    temporary = os.path.realpath(temporary_root)
+    argv = [
+        _BWRAP_PATH,
+        "--unshare-all",
+        "--unshare-user",
+        "--die-with-parent",
+        "--new-session",
+        "--disable-userns",
+        "--cap-drop",
+        "ALL",
+    ]
+    for name in ("usr", "bin", "sbin", "lib", "lib64"):
+        path = Path("/") / name
+        if path.is_symlink():
+            argv.extend(("--symlink", os.readlink(path), str(path)))
+        elif path.is_dir():
+            argv.extend(("--ro-bind", str(path), str(path)))
+    for name in ("/etc/ld.so.cache", "/etc/alternatives", "/etc/ssl/certs"):
+        if Path(name).exists():
+            argv.extend(("--ro-bind", name, name))
+    argv.extend(("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"))
+    roots = set(_trusted_toolchain_roots(workspace_root))
+    roots.update(Path(root).resolve() for root in additional_read_roots)
+    for root in sorted(roots, key=str):
+        if root == Path("/"):
+            raise ValueError("the host root cannot be a sandbox runtime read root")
+        if root.exists() and not root.is_relative_to("/usr"):
+            argv.extend(("--ro-bind", str(root), str(root)))
+    argv.extend(
+        (
+            "--ro-bind",
+            workspace,
+            workspace,
+            "--bind",
+            temporary,
+            temporary,
+        )
+    )
+    return argv
+
+
 def _build_command_sandbox_profile(
     *,
     workspace_root: os.PathLike[str] | str,
@@ -744,30 +814,15 @@ def _build_command_sandbox_profile(
     allow_workspace_write: bool = False,
     additional_read_roots: Sequence[os.PathLike[str] | str] = (),
 ) -> str:
-    workspace = _escape_seatbelt_string(
-        str(os.path.realpath(workspace_root))
-    )
-    temporary = _escape_seatbelt_string(
-        str(os.path.realpath(temporary_root))
-    )
-    trusted_roots = {
-        path.resolve() for path in _trusted_toolchain_roots(workspace_root)
-    }
+    workspace = _escape_seatbelt_string(str(os.path.realpath(workspace_root)))
+    temporary = _escape_seatbelt_string(str(os.path.realpath(temporary_root)))
+    trusted_roots = {path.resolve() for path in _trusted_toolchain_roots(workspace_root)}
     trusted_roots.update(
-        Path(path).expanduser().resolve()
-        for path in additional_read_roots
-        if Path(path).expanduser().exists()
+        Path(path).expanduser().resolve() for path in additional_read_roots if Path(path).expanduser().exists()
     )
-    trusted_toolchains = tuple(
-        _escape_seatbelt_string(str(path))
-        for path in sorted(trusted_roots, key=str)
-    )
-    trusted_toolchain_reads = "".join(
-        f'  (subpath "{path}")\n' for path in trusted_toolchains
-    )
-    trusted_toolchain_ancestors = "".join(
-        f'  (path-ancestors "{path}")\n' for path in trusted_toolchains
-    )
+    trusted_toolchains = tuple(_escape_seatbelt_string(str(path)) for path in sorted(trusted_roots, key=str))
+    trusted_toolchain_reads = "".join(f'  (subpath "{path}")\n' for path in trusted_toolchains)
+    trusted_toolchain_ancestors = "".join(f'  (path-ancestors "{path}")\n' for path in trusted_toolchains)
     workspace_write_policy = f'  (subpath "{workspace}")\n' if allow_workspace_write else ""
     network_policy = (
         # DNS is the only approved AF_UNIX endpoint; local service and Docker
@@ -792,7 +847,7 @@ def _build_command_sandbox_profile(
         '  (global-name "com.apple.trustd.agent")\n'
         '  (global-name "com.apple.SystemConfiguration.DNSConfiguration")\n'
         '  (global-name "com.apple.SystemConfiguration.configd"))\n'
-        "(allow sysctl-read (sysctl-name-regex #\"^net.routetable\"))"
+        '(allow sysctl-read (sysctl-name-regex #"^net.routetable"))'
         if allow_network
         else ""
     )
@@ -862,7 +917,7 @@ def _build_command_sandbox_profile(
         "(deny file-write*\n"
         "  (require-all\n"
         f'    (subpath "{workspace}")\n'
-        "    (regex #\"/[nN][oO][dD][eE]_[mM][oO][dD][uU][lL][eE][sS]"
+        '    (regex #"/[nN][oO][dD][eE]_[mM][oO][dD][uU][lL][eE][sS]'
         '($|/)")))\n'
         f"{network_policy}\n"
     )
@@ -951,48 +1006,30 @@ def _workspace_sandbox_preflight_issue(
                     is_symlink = entry.is_symlink()
                     is_directory = entry.is_dir(follow_symlinks=False)
                 except OSError:
-                    relative = Path(
-                        os.path.relpath(entry.path, root)
-                    ).as_posix()
+                    relative = Path(os.path.relpath(entry.path, root)).as_posix()
                     return (
                         "workspace_scan_failed",
                         f"workspace containment scan failed at {relative}",
                     )
-                entry_is_git_metadata = (
-                    directory_is_git_metadata
-                    or entry.name.casefold() == ".git"
-                )
+                entry_is_git_metadata = directory_is_git_metadata or entry.name.casefold() == ".git"
                 entry_is_verification_toolchain = bool(
-                    directory_is_verification_toolchain
-                    or entry.name.casefold()
-                    in _PROTECTED_VERIFICATION_DIRECTORIES
+                    directory_is_verification_toolchain or entry.name.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
                 )
                 if entry_is_verification_toolchain and is_symlink:
                     try:
                         resolved_target = Path(entry.path).resolve()
                     except (OSError, RuntimeError):
-                        relative = Path(
-                            os.path.relpath(entry.path, root)
-                        ).as_posix()
+                        relative = Path(os.path.relpath(entry.path, root)).as_posix()
                         return (
                             "workspace_scan_failed",
-                            (
-                                "workspace containment scan failed at "
-                                f"{relative}"
-                            ),
+                            (f"workspace containment scan failed at {relative}"),
                         )
                     if resolved_target.is_relative_to(root_path):
-                        target_relative = resolved_target.relative_to(
-                            root_path
-                        )
+                        target_relative = resolved_target.relative_to(root_path)
                         if not any(
-                            part.casefold()
-                            in _PROTECTED_VERIFICATION_DIRECTORIES
-                            for part in target_relative.parts
+                            part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES for part in target_relative.parts
                         ):
-                            relative = Path(
-                                os.path.relpath(entry.path, root)
-                            ).as_posix()
+                            relative = Path(os.path.relpath(entry.path, root)).as_posix()
                             return (
                                 "workspace_verifier_alias",
                                 (
@@ -1003,15 +1040,10 @@ def _workspace_sandbox_preflight_issue(
                                 ),
                             )
                 if allow_workspace_write and entry_is_git_metadata and is_symlink:
-                    relative = Path(
-                        os.path.relpath(entry.path, root)
-                    ).as_posix()
+                    relative = Path(os.path.relpath(entry.path, root)).as_posix()
                     return (
                         "workspace_git_alias",
-                        (
-                            "workspace write refused because Git metadata "
-                            f"path {relative} is a symlink"
-                        ),
+                        (f"workspace write refused because Git metadata path {relative} is a symlink"),
                     )
                 if is_symlink:
                     continue
@@ -1027,17 +1059,23 @@ def _workspace_sandbox_preflight_issue(
                 try:
                     metadata = entry.stat(follow_symlinks=False)
                 except OSError:
-                    relative = Path(
-                        os.path.relpath(entry.path, root)
-                    ).as_posix()
+                    relative = Path(os.path.relpath(entry.path, root)).as_posix()
                     return (
                         "workspace_scan_failed",
                         f"workspace containment scan failed at {relative}",
                     )
+                if _SANDBOX_PLATFORM == "linux" and stat.S_ISSOCK(metadata.st_mode):
+                    return (
+                        "workspace_socket_detected",
+                        "Linux sandbox refuses pathname sockets in the workspace",
+                    )
+                if _SANDBOX_PLATFORM == "linux" and not stat.S_ISREG(metadata.st_mode):
+                    return (
+                        "workspace_special_file_detected",
+                        "Linux sandbox refuses FIFOs and device files in the workspace",
+                    )
                 if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
-                    relative = Path(
-                        os.path.relpath(entry.path, root)
-                    ).as_posix()
+                    relative = Path(os.path.relpath(entry.path, root)).as_posix()
                     key = (metadata.st_dev, metadata.st_ino)
                     (
                         expected_count,
@@ -1059,55 +1097,32 @@ def _workspace_sandbox_preflight_issue(
                         max(expected_count, metadata.st_nlink),
                         observed_count + 1,
                         first_relative,
-                        seen_protected
-                        or entry_is_git_metadata
-                        or entry_is_verification_toolchain,
-                        seen_unprotected
-                        or not (
-                            entry_is_git_metadata
-                            or entry_is_verification_toolchain
-                        ),
+                        seen_protected or entry_is_git_metadata or entry_is_verification_toolchain,
+                        seen_unprotected or not (entry_is_git_metadata or entry_is_verification_toolchain),
                     )
                 pointer_kind: Literal["gitdir", "commondir"] | None = None
                 if entry.name.casefold() == ".git":
                     pointer_kind = "gitdir"
-                elif (
-                    directory_is_git_metadata
-                    and entry.name.casefold() == "commondir"
-                ):
+                elif directory_is_git_metadata and entry.name.casefold() == "commondir":
                     pointer_kind = "commondir"
-                if (
-                    allow_workspace_write
-                    and stat.S_ISREG(metadata.st_mode)
-                    and pointer_kind is not None
-                ):
+                if allow_workspace_write and stat.S_ISREG(metadata.st_mode) and pointer_kind is not None:
                     try:
                         pointer_targets = _git_metadata_pointer_targets(
                             Path(entry.path),
                             kind=pointer_kind,
                         )
                     except (OSError, UnicodeError, RuntimeError):
-                        relative = Path(
-                            os.path.relpath(entry.path, root)
-                        ).as_posix()
+                        relative = Path(os.path.relpath(entry.path, root)).as_posix()
                         return (
                             "workspace_scan_failed",
-                            (
-                                "workspace containment scan failed at "
-                                f"{relative}"
-                            ),
+                            (f"workspace containment scan failed at {relative}"),
                         )
                     for pointer_target in pointer_targets:
                         if not pointer_target.is_relative_to(root_path):
                             continue
                         target_relative = pointer_target.relative_to(root_path)
-                        if not any(
-                            part.casefold() == ".git"
-                            for part in target_relative.parts
-                        ):
-                            relative = Path(
-                                os.path.relpath(entry.path, root)
-                            ).as_posix()
+                        if not any(part.casefold() == ".git" for part in target_relative.parts):
+                            relative = Path(os.path.relpath(entry.path, root)).as_posix()
                             return (
                                 "workspace_git_alias",
                                 (
@@ -1123,17 +1138,10 @@ def _workspace_sandbox_preflight_issue(
         seen_protected,
         seen_unprotected,
     ) in hardlinks.values():
-        if observed_count < expected_count or (
-            allow_workspace_write
-            and seen_protected
-            and seen_unprotected
-        ):
+        if observed_count < expected_count or (allow_workspace_write and seen_protected and seen_unprotected):
             return (
                 "workspace_hardlink_detected",
-                (
-                    "workspace access refused because "
-                    f"{first_relative} has a hardlink outside its protected scope"
-                ),
+                (f"workspace access refused because {first_relative} has a hardlink outside its protected scope"),
             )
     return None
 
@@ -1234,11 +1242,7 @@ def _bounded_stream(value: bytes) -> tuple[str, bool]:
         available = _MAX_STREAM_BYTES - len(_STREAM_TRUNCATION_MARKER)
         head_size = available // 2
         tail_size = available - head_size
-        bounded = (
-            value[:head_size]
-            + _STREAM_TRUNCATION_MARKER
-            + value[-tail_size:]
-        )
+        bounded = value[:head_size] + _STREAM_TRUNCATION_MARKER + value[-tail_size:]
     return bounded.decode("utf-8", errors="replace"), truncated
 
 
@@ -1277,9 +1281,7 @@ def _resolve_managed_python_use(
     workspace: WorkspaceRuntime,
     arguments: Mapping[str, JsonValue],
 ) -> ResolvedToolUse:
-    cwd = workspace.ensure_within_workspace(
-        workspace.resolve_path(str(arguments["working_dir"]) or ".")
-    )
+    cwd = workspace.ensure_within_workspace(workspace.resolve_path(str(arguments["working_dir"]) or "."))
     effects = {
         ToolEffect.READ_WORKSPACE,
         ToolEffect.EXECUTE_PROCESS,
@@ -1292,16 +1294,10 @@ def _resolve_managed_python_use(
         for raw_path in output_paths:
             if not isinstance(raw_path, str):
                 raise ValueError("output path must be a string")
-            target = workspace.ensure_within_workspace(
-                workspace.resolve_path(raw_path)
-            )
-            output_targets.append(
-                ToolTarget(kind="workspace_path", value=str(target))
-            )
+            target = workspace.ensure_within_workspace(workspace.resolve_path(raw_path))
+            output_targets.append(ToolTarget(kind="workspace_path", value=str(target)))
     else:
-        output_targets.append(
-            ToolTarget(kind="workspace_path", value=str(workspace.root))
-        )
+        output_targets.append(ToolTarget(kind="workspace_path", value=str(workspace.root)))
     if arguments.get("network") is True:
         effects.add(ToolEffect.NETWORK)
     return ResolvedToolUse(
@@ -1362,9 +1358,7 @@ def _normalize_managed_python_output(raw: object) -> NormalizedToolOutput:
             structured_content=structured,
             is_error=True,
             error_code="timeout_cancelled",
-            error_message=(
-                "Python code timed out and its process group was terminated"
-            ),
+            error_message=("Python code timed out and its process group was terminated"),
             retryable=False,
         )
     if validated.sandbox_error is not None:

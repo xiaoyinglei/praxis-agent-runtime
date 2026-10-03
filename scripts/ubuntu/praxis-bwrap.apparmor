@@ -1,0 +1,8 @@
+# Optional Ubuntu 24.04 user-namespace allowance for the distro-owned bwrap.
+# Install only after administrator review; do not disable AppArmor globally.
+abi <abi/4.0>,
+include <tunables/global>
+
+profile praxis-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+}

@@ -34,6 +34,7 @@ def fake_sandbox_exec(
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    monkeypatch.setattr(shell_module, "_SANDBOX_PLATFORM", "darwin")
     monkeypatch.setattr(shell_module, "_SANDBOX_EXEC_PATH", str(executable))
     create_subprocess_exec = asyncio.create_subprocess_exec
 

@@ -960,6 +960,7 @@ async def test_run_command_streams_stdout_and_stderr_before_completion(
         encoding="utf-8",
     )
     sandbox.chmod(0o755)
+    monkeypatch.setattr(shell_module, "_SANDBOX_PLATFORM", "darwin")
     monkeypatch.setattr(shell_module, "_SANDBOX_EXEC_PATH", str(sandbox))
     workspace = open_workspace(tmp_path / "workspace", create=True)
     tool = create_run_command_tool(workspace)

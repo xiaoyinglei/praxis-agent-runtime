@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,6 +15,19 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
+      - name: Prepare Linux sandbox
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3-venv python3-pip
+          if ! /usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true; then
+            if sudo grep -R -q '/usr/bin/bwrap' /etc/apparmor.d; then
+              echo 'Existing bwrap AppArmor policy blocks the namespace probe; refusing a second profile.' >&2
+              exit 1
+            fi
+            sudo install -m 0644 scripts/ubuntu/praxis-bwrap.apparmor /etc/apparmor.d/praxis-bwrap
+            sudo apparmor_parser -r /etc/apparmor.d/praxis-bwrap
+            /usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true
+          fi
       - name: Sync locked environment
         run: uv sync --locked
       - name: Ruff
@@ -23,6 +36,13 @@ jobs:
         run: uv run mypy
       - name: Pytest
         run: uv run pytest -q
+      - name: Model service isolation smoke
+        run: |
+          smoke_wheels="$RUNNER_TEMP/praxis-model-wheels"
+          mkdir -p "$smoke_wheels"
+          /usr/bin/python3 -m pip download --require-hashes --only-binary=:all: --no-deps \
+            -r scripts/ubuntu/requirements-model-service.txt -d "$smoke_wheels"
+          sudo /usr/bin/python3 -I scripts/ubuntu/smoke-model-service.py --wheel-dir "$smoke_wheels"
       - name: Import contracts
         run: uv run lint-imports
       - name: Build distribution
