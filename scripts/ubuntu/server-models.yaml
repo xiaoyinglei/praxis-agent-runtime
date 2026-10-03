@@ -1,0 +1,28 @@
+# Provider keys belong only to praxis-model; the Agent uses this proxy credential.
+providers:
+  server_service:
+    protocol: openai_compatible
+    location: local
+    base_url: http://127.0.0.1:18444/v1
+    api_key_env: PRAXIS_GATEWAY_TOKEN
+models:
+  deepseek-flash:
+    capability: chat
+    provider: server_service
+    tokenizer_model: deepseek-v4-official
+    context_window_tokens: 1048576
+    max_output_tokens: 4096
+    timeout_seconds: 150
+    defaults:
+      provider_options:
+        thinking:
+          type: enabled
+  openai/gpt-oss-120b:
+    capability: chat
+    provider: server_service
+    tokenizer_model: gpt-oss-120b
+    context_window_tokens: 131072
+    max_output_tokens: 4096
+    timeout_seconds: 150
+defaults:
+  primary_model: deepseek-flash

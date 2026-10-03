@@ -29,7 +29,10 @@ def load_env_file(path: Path | str = ".env") -> Path | None:
     first. When that path is a missing ``.env`` inside a linked worktree, the
     primary checkout's ``.env`` is treated as shared, read-only configuration.
     Existing process environment variables always win.
+    ``PRAXIS_DISABLE_DOTENV=1`` disables all file loading for supervised deployments.
     """
+    if os.environ.get("PRAXIS_DISABLE_DOTENV") == "1":
+        return None
     configured_path = os.environ.get("AGENT_ENV_FILE")
     env_path = (
         Path(configured_path).expanduser()
