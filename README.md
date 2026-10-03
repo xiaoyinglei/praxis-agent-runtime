@@ -447,11 +447,16 @@ repository, or an untrusted operator into a safe workload.
 - Read/execute and workspace-write capabilities are distinct. Writes and command
   execution can require approval; `.git` mutations remain outside the default
   workspace-write boundary.
-- Real `run_command` and `execute_python` execution currently require macOS
-  `/usr/bin/sandbox-exec` and a Seatbelt profile. If that executable is absent,
-  the tool will fail closed with `sandbox_unavailable`; on other platforms it is
-  unavailable, and this repository has no equivalent command-sandbox safety
-  evidence. The fake sandbox fixtures are test-only and are not safety evidence.
+- On macOS, `run_command` and `execute_python` use `/usr/bin/sandbox-exec`
+  with a Seatbelt profile. On Linux they use `/usr/bin/bwrap` (Bubblewrap) for
+  read-only, network-disabled execution. Linux requests for workspace writes
+  or network access fail closed with `sandbox_policy_unsupported`; Python
+  artifact generation is not yet supported there. Dedicated file tools can
+  still edit workspace files. See [Ubuntu deployment](DEPLOY_UBUNTU.md) and
+  [server model credentials and startup](SERVER_MODELS.md).
+  Missing backends are unavailable (`sandbox_unavailable`); setup failures
+  never fall back to unrestricted execution. The fake sandbox fixtures are
+  test-only and are not safety evidence.
 - `inspect_data_file` returns bounded previews, structural validity, and a
   runtime-computed SHA-256. That proves which artifact was inspected; it does
   not by itself prove that a formula, statistical method, or business conclusion

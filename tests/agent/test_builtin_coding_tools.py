@@ -1388,6 +1388,7 @@ async def test_run_command_fails_closed_when_sandbox_is_unavailable(
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
     sentinel = workspace.root / "must-not-exist.txt"
+    monkeypatch.setattr(shell_module, "_SANDBOX_PLATFORM", "darwin")
     monkeypatch.setattr(
         shell_module,
         "_SANDBOX_EXEC_PATH",

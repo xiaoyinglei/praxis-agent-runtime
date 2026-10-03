@@ -905,6 +905,8 @@ def _user_definition_to_model_spec(
 
 
 def _load_env_file(path: Path) -> None:
+    if os.environ.get("PRAXIS_DISABLE_DOTENV") == "1":
+        return
     if not path.is_file():
         return
     for line in path.read_text(encoding="utf-8").splitlines():

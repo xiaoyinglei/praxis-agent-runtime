@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from collections.abc import (
     Awaitable,
     Callable,
 )
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -40,40 +42,41 @@ class LocalProviderProbe:
         ]
         | None = None,
     ) -> None:
-        self._request_json = (
-            request_json
-            or _request_json
-        )
+        self._request_json = request_json or _request_json
 
-    async def ensure_ready(self,spec: ModelSpec,) -> None:
+    async def ensure_ready(
+        self,
+        spec: ModelSpec,
+    ) -> None:
         if getattr(spec, "location", None) != "local":
             return
 
         runtime = getattr(spec, "runtime", None)
-        health_url = (
-            getattr(runtime, "health_url", None)
-            if runtime is not None
-            else None
-        )
+        health_url = getattr(runtime, "health_url", None) if runtime is not None else None
         if not health_url:
             base_url = getattr(spec, "base_url", None)
             if base_url:
                 health_url = f"{str(base_url).rstrip('/')}/models"
 
         if not health_url:
-            raise LocalRuntimeError(
-                f"Local model {spec.id!r} has no base_url"
-            )
+            raise LocalRuntimeError(f"Local model {spec.id!r} has no base_url")
 
-        expected = (
-            getattr(runtime, "expected_model_contains", None)
-            if runtime is not None
-            else None
-        ) or spec.id
+        expected = (getattr(runtime, "expected_model_contains", None) if runtime is not None else None) or spec.id
 
         try:
-            payload = await self._request_json(str(health_url),5.0,)
-    
+            if self._request_json is _request_json:
+                base = urlsplit(str(getattr(spec, "base_url", "") or ""))
+                health = urlsplit(str(health_url))
+                default_ports = {"http": 80, "https": 443}
+                base_port = base.port if base.port is not None else default_ports.get(base.scheme)
+                health_port = health.port if health.port is not None else default_ports.get(health.scheme)
+                same_origin = (base.scheme, base.hostname, base_port) == (health.scheme, health.hostname, health_port)
+                key_name = getattr(spec, "api_key_env", None)
+                api_key = os.environ.get(key_name) if same_origin and key_name else None
+                payload = await _request_json(str(health_url), 5.0, api_key=api_key)
+            else:
+                payload = await self._request_json(str(health_url), 5.0)
+
         except Exception as exc:
             raise LocalRuntimeError(
                 _provider_not_running_message(
@@ -96,11 +99,7 @@ def _provider_not_running_message(
     health_url: str,
 ) -> str:
     runtime = getattr(spec, "runtime", None)
-    launch_command = (
-        getattr(runtime, "launch_command", ())
-        if runtime is not None
-        else ()
-    )
+    launch_command = getattr(runtime, "launch_command", ()) if runtime is not None else ()
 
     message = (
         f"Local provider for model {spec.id!r} is not running "
@@ -118,12 +117,14 @@ def _provider_not_running_message(
 async def _request_json(
     url: str,
     timeout: float,
+    *,
+    api_key: str | None = None,
 ) -> object:
     async with httpx.AsyncClient(
         trust_env=False,
         timeout=httpx.Timeout(timeout),
     ) as client:
-        response = await client.get(url)
+        response = await client.get(url, headers={"Authorization": f"Bearer {api_key}"} if api_key else {})
 
         response.raise_for_status()
 
@@ -142,10 +143,7 @@ def _raise_if_unexpected_model(
 
     model_names = _model_names(payload)
 
-    if any(
-        expected in name
-        for name in model_names
-    ):
+    if any(expected in name for name in model_names):
         return
 
     raise EndpointConflictError(
@@ -167,10 +165,7 @@ def _model_names(
 
             for item in data:
                 if isinstance(item, dict):
-                    value = (
-                        item.get("id")
-                        or item.get("model")
-                    )
+                    value = item.get("id") or item.get("model")
                     if value is not None:
                         names.append(str(value))
 
@@ -183,12 +178,10 @@ def _model_names(
             return [str(payload["id"])]
 
     if isinstance(payload, list):
-        return [
-            str(item)
-            for item in payload
-        ]
+        return [str(item) for item in payload]
 
     return []
+
 
 async def ensure_local_provider_ready(
     spec: ModelSpec,

@@ -1,0 +1,18 @@
+# Reduced CLI/runtime profile; constrain with an export of the repository uv.lock.
+# This deliberately excludes optional RAG and document/data processing packages.
+# Install the project separately with --no-deps (see DEPLOY_UBUNTU.md).
+pydantic
+httpx[socks]
+openai
+pyyaml
+tiktoken
+tokenizers
+typer
+rich
+jsonschema
+regex
+wcwidth
+prompt-toolkit
+ormsgpack
+anyio
+mcp
