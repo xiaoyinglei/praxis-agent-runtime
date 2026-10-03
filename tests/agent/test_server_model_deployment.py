@@ -211,3 +211,63 @@ def test_agent_venv_accepts_stdlib_and_uv_config_then_relocates(tmp_path, key):
     config.write_text("version_info = 3.13.0\n")
     with pytest.raises(ValueError):
         validator.validate_agent_config(config)
+
+
+@pytest.mark.parametrize("args", [[], ["run", "hello world", "--model", "deepseek-flash"]])
+def test_praxis_entrypoint_switches_identity_and_preserves_arguments(tmp_path, args):
+    import json
+
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    capture = tmp_path / "arguments.json"
+    for name, source in {
+        "id": "#!/bin/sh\nprintf '%s\\n' admin\n",
+        "systemctl": "#!/bin/sh\nexit 0\n",
+        "sudo": (
+            "#!/usr/bin/env python3\nimport json, os, sys\nfrom pathlib import Path\n"
+            "Path(os.environ['CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n"
+        ),
+    }.items():
+        command = commands / name
+        command.write_text(source)
+        command.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "praxis.sh"), *args],
+        env={
+            **os.environ,
+            "PATH": f"{commands}:{os.environ['PATH']}",
+            "CAPTURE": str(capture),
+            "TERM": "xterm-256color",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(capture.read_text()) == [
+        "-H",
+        "-u",
+        "praxis-agent",
+        "--",
+        "/usr/bin/env",
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "TERM=xterm-256color",
+        "/usr/local/bin/praxis-agent",
+        *(args or ["chat"]),
+    ]
+
+
+def test_praxis_entrypoint_explains_inactive_service_without_launching(tmp_path):
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    command = commands / "systemctl"
+    command.write_text("#!/bin/sh\nexit 3\n")
+    command.chmod(0o755)
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "praxis.sh")],
+        env={**os.environ, "PATH": f"{commands}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 1
+    assert "sudo systemctl start praxis-model" in result.stderr

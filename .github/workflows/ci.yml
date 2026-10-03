@@ -18,7 +18,7 @@ jobs:
       - name: Prepare Linux sandbox
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap python3-venv python3-pip
+          sudo apt-get install -y bubblewrap apparmor python3-venv python3-pip
           if ! /usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true; then
             if sudo grep -R -q '/usr/bin/bwrap' /etc/apparmor.d; then
               echo 'Existing bwrap AppArmor policy blocks the namespace probe; refusing a second profile.' >&2

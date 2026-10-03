@@ -42,11 +42,11 @@ sudo bash scripts/ubuntu/install-model-service.sh /home/admin/praxis-server
 ```bash
 sudo systemctl status praxis-model --no-pager
 sudo ss -ltnp 'sport = :18444'
-sudo -iu praxis-agent praxis-agent model list --source
-sudo -iu praxis-agent praxis-agent model probe deepseek-flash --level full
-sudo -iu praxis-agent praxis-agent model probe openai/gpt-oss-120b --level full
-sudo -iu praxis-agent praxis-agent run "只回复：连接成功" --model deepseek-flash --no-require-workspace-change
-sudo -iu praxis-agent praxis-agent chat --model deepseek-flash
+praxis model list --source
+praxis model probe deepseek-flash --level full
+praxis model probe openai/gpt-oss-120b --level full
+praxis run "只回复：连接成功" --model deepseek-flash --no-require-workspace-change
+praxis chat --model deepseek-flash
 ```
 
 `model list` 证明目录能加载；代理 `/v1/models` 只返回已启用路由，不访问供应商，因此不是账户鉴权证据。实际 completion / Agent turn 才能验证供应商账户和模型访问权；会产生实际用量。DeepSeek thinking 模式在短 probe 的输出预算内可能不返回文本，遇到此情形使用完整 Agent turn 检查。
@@ -68,17 +68,19 @@ sudo -iu praxis-agent praxis-agent chat --model deepseek-flash
 
 `agent chat` 已有 Markdown 会话、模型/状态栏、工具记录折叠和批准输入。它是终端界面，目前没有浏览器聊天窗口、项目列表或图形化密钥设置页。`agent run` 是单任务命令；非 TTY 或 `TERM=dumb` 会降级为纯文本。
 
+安装完成后，在服务器输入 `praxis` 即进入终端聊天；它自动切换到隔离的 Agent 用户，默认启动 chat。管理员可能需要输入 sudo 密码，这是系统身份切换，不是大模型密钥。无需手动设置供应商环境变量。服务未运行时入口会提示启动命令。
+
 在真实终端保留 SSH TTY：
 
 ```bash
 ssh -t praxis
-sudo -iu praxis-agent env TERM=xterm-256color praxis-agent chat
+praxis
 ```
 
 也可以安装完成后从 Mac 一条命令进入：
 
 ```bash
-ssh -t praxis 'sudo -iu praxis-agent env TERM=xterm-256color praxis-agent chat'
+ssh -t praxis 'praxis'
 ```
 
 在 chat 输入 `/model` 打开模型选择，`/help` 查看交互键；模型计算在云端，工具执行和工作区在服务器。新密钥服务当前会缓冲完整响应后再显示，所以等待期间没有实时 token 输出。它尚不提供网页 UI；若要浏览器操作，应另行设计带身份认证的 Agent 会话入口，而不是把密钥服务的 loopback 端口开放到公网。
@@ -98,12 +100,12 @@ JSON/SSE 响应都先在限额内缓冲并检查凭证回显，再交给 Agent�
 ```bash
 sudo /usr/bin/python3 -I /opt/praxis/provision-model-secrets.py --rotate-token
 sudo systemctl restart praxis-model
-sudo -iu praxis-agent praxis-agent chat
+praxis chat
 ```
 
 轮换后重启服务、重新启动已有 Agent 进程；旧进程持有的 token 将失效。两个 token 文件更新过程中或重启之前可能暂时拒绝调用，预算保持不变。供应商 key 需要由管理员在供应商平台撤销/更新，再在服务器隐藏输入并替换对应 root-only 文件，不通过 Agent 文件工具操作。
 
-回退时先 `sudo systemctl disable --now praxis-model`；如有本地保留的旧 Mac 网关，可自行切回旧启动方式。完整卸载由管理员确认不再需要工作区及预算证据后，移除 unit、`/usr/local/bin/praxis-agent`、`/opt/praxis`、凭证和两个系统用户；不要自动删除用户工作区或用量证据。部分安装失败时保留私有文件，确认失败位置后再处理，安装器不会自动覆盖或删除它们。
+回退时先 `sudo systemctl disable --now praxis-model`；如有本地保留的旧 Mac 网关，可自行切回旧启动方式。完整卸载由管理员确认不再需要工作区及预算证据后，移除 unit、`/usr/local/bin/praxis`、`/usr/local/bin/praxis-agent`、`/opt/praxis`、凭证和两个系统用户；不要自动删除用户工作区或用量证据。部分安装失败时保留私有文件，确认失败位置后再处理，安装器不会自动覆盖或删除它们。
 
 ## 安全边界和验证证据
 
@@ -115,7 +117,7 @@ sudo -iu praxis-agent praxis-agent chat
 
 ### 2026-10-03 本次验证记录
 
-- 本地 Agent / model-runtime 回归：1672 passed、45 skipped。新网关/部署测试包含在该次运行中。
+- 本地 Agent / model-runtime 回归：1697 passed、51 skipped。新网关/部署测试包含在该次运行中。
 - 新服务及 Python 部署脚本：ruff、mypy 通过；5 条 import-linter 边界全部保留。
 - 只用十个 SHA-256 锁定 wheel 的独立虚拟环境：安装、import-hook 检查和独立服务 CLI 加载通过。
 - `ssh praxis` 现有 Linux 沙箱测试：18 passed；该运行没有上传新源码或凭证。

@@ -7,7 +7,7 @@ if [[ "$EUID" != 0 ]]; then
   exit 1
 fi
 source_root="$(cd -- "${1:?Usage: install-model-service.sh /path/to/reviewed/praxis}" && pwd -P)"
-for destination in /opt/praxis /etc/praxis-model /etc/systemd/system/praxis-model.service /usr/local/bin/praxis-agent /var/lib/praxis-model /var/lib/praxis-agent /var/lib/private/praxis-model; do
+for destination in /opt/praxis /etc/praxis-model /etc/systemd/system/praxis-model.service /usr/local/bin/praxis-agent /usr/local/bin/praxis /var/lib/praxis-model /var/lib/praxis-agent /var/lib/private/praxis-model; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Initial installation refuses existing destination: $destination" >&2
     exit 1
@@ -53,9 +53,10 @@ useradd --system --user-group --create-home --home-dir /var/lib/praxis-agent --s
 chmod 0700 /var/lib/praxis-agent
 install -d -m 0700 -o praxis-agent -g praxis-agent /var/lib/praxis-agent/workspace
 install -m 0755 "$source_root/scripts/ubuntu/start-server-agent.sh" /usr/local/bin/praxis-agent
+install -m 0755 "$source_root/scripts/ubuntu/praxis.sh" /usr/local/bin/praxis
 install -m 0644 "$source_root/scripts/ubuntu/praxis-model.service" /etc/systemd/system/praxis-model.service
 /usr/bin/python3 -I /opt/praxis/provision-model-secrets.py
 systemctl daemon-reload
 systemctl enable --now praxis-model.service
 systemctl is-active --quiet praxis-model.service
-printf '%s\n' 'Service active. Authenticate/probe each provider, then use: sudo -iu praxis-agent praxis-agent chat'
+printf '%s\n' 'Service active. Enter terminal chat with: praxis (model menu: /model; help: /help)'
