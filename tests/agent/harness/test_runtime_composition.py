@@ -76,6 +76,7 @@ async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) 
         assert binding["tool_execution_policy"] == {
             "active_skill_ids": [],
             "allow_execute_tools": False,
+        "allow_web_tools": False,
             "allow_write_tools": False,
             "auto_approve_sandboxed": False,
             "denied_tool_names": [],

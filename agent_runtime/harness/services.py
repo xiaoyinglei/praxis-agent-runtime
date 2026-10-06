@@ -53,6 +53,7 @@ def _tool_execution_policy_snapshot(
     return {
         "allow_write_tools": context.allow_write_tools,
         "allow_execute_tools": context.allow_execute_tools,
+        "allow_web_tools": context.allow_web_tools,
         "active_skill_ids": sorted(context.active_skill_ids),
         "deny_effects": sorted(effect.value for effect in context.deny_effects),
         "max_parallel_calls": context.max_parallel_calls,

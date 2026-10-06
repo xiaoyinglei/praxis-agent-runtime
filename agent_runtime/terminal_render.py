@@ -30,6 +30,29 @@ DEFAULT_COMMAND_TAIL_ROWS = 3
 DEFAULT_PARTIAL_ROW_BYTES = 16 * 1024
 DEFAULT_PROGRESS_MESSAGES = 8
 
+
+def web_error_message(code: object) -> str:
+    """Keep stable technical error codes in the log, with readable terminal summaries."""
+    messages = {
+        "web_search_unconfigured": "搜索服务尚未配置，请联系部署者配置搜索后端。",
+        "web_search_blocked": "搜索服务暂时限制访问，请稍后再试。",
+        "web_search_invalid_response": "搜索服务返回了无法读取的页面，暂时无法取得搜索结果。",
+        "web_content_empty": "此网页没有可读取的正文，可能需要浏览器加载或登录。",
+        "web_content_unsupported": "暂不支持读取此网页的内容格式。",
+        "web_source_unavailable": "保存的网页记录不可用，请重新打开原始链接。",
+        "http_error": "网页暂时无法访问，链接可能已失效或被网站限制。",
+        "timeout": "联网请求超时，请稍后再试。",
+        "network_error": "暂时无法连接网站，请检查网络或稍后再试。",
+        "web_request_budget_exceeded": "本次联网尝试已达到上限，请根据已有信息回答。",
+        "invalid_url": "链接无效，请提供完整的公网网页地址。",
+        "private_address": "该链接不是可访问的公网地址。",
+        "nonpublic_address": "DNS 返回了非公网地址，直连已拦截；请检查 DNS 或配置可信 HTTP 代理。",
+        "proxy_connection_failed": "已配置的代理拒绝了连接，请检查代理配置。",
+    }
+    if isinstance(code, str):
+        return messages.get(code, "此次联网操作未成功，可查看详细记录。")
+    return "此次联网操作未成功。"
+
 _ANSI_ESCAPE = regex.compile(
     r"(?:\x1b\][^\x07]*(?:\x07|\x1b\\))|(?:\x1b\[[0-?]*[ -/]*[@-~])"
 )
@@ -572,6 +595,8 @@ class TerminalToolEventDisplay:
             self._render_diff(result.get("metadata"))
             return
         error = event.error or result.get("error_message")
+        if name in {"web_search", "web_fetch"}:
+            error = web_error_message(result.get("error_code"))
         suffix = f": {safe_terminal_text(error)}" if isinstance(error, str) else ""
         command_suffix = (
             self._command_suffix(result)
@@ -584,9 +609,16 @@ class TerminalToolEventDisplay:
             event.item_kind is not TurnItemKind.COMMAND and name != "run_command"
             or not command_output_streamed
         ):
-            self._write_result(structured)
+            if name in {"web_search", "web_fetch"}:
+                self._write_error_result(structured)
+            else:
+                self._write_result(structured)
         self._render_truncation_warnings(name, result)
         self._render_diff(result.get("metadata"))
+
+    def _write_error_result(self, value: object) -> None:
+        if self._verbose:
+            self._write_result(value)
 
     def _render_legacy_start(self, event: StreamEvent) -> None:
         tool_id = event.data.get("tool_id")

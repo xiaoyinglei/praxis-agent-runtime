@@ -257,6 +257,9 @@ class RolloutContextManager:
             )
         )
         artifacts = [dict(i.payload) for i in facts_items if i.kind == "input_file"]
+        tool_views = {item_id: message.content for item_id, message in projected if message.role == "tool"}
+        artifacts.extend(ref for i in facts_items
+                         if (ref := _web_source_reference(i, tool_views.get(i.item_id))) is not None)
         artifacts = _unique_json([*artifacts, *(ref for i in prior for ref in i.payload.get("artifact_refs", []))])
         payload = {
             "covered_item_ids": [i.item_id for i in covered],
@@ -430,16 +433,19 @@ class RolloutContextManager:
         for item_id, message in eligible:
             if message.role != "tool" or item_id in unsettled or by_id[item_id].payload.get("is_error"):
                 continue
-            content = f"Tool output archived. Use read_context(item_id={item_id!r}) to recover it."
-            if max_result_bytes is not None:
-                raw = message.content.encode("utf-8")
-                if len(raw) <= max_result_bytes:
-                    continue
-                prefix = raw[:max_result_bytes].decode("utf-8", errors="ignore")
-                content = (
-                    prefix + "\n[Tool result truncated for context capacity. The text above is an incomplete prefix, "
-                    f"not a summary. Original: read_context(item_id={item_id!r}).]"
-                )
+            content = _web_result_excerpt(message.content, max_result_bytes, item_id)
+            if content is None:
+                content = f"Tool output archived. Use read_context(item_id={item_id!r}) to recover it."
+                if max_result_bytes is not None:
+                    raw = message.content.encode("utf-8")
+                    if len(raw) <= max_result_bytes:
+                        continue
+                    prefix = raw[:max_result_bytes].decode("utf-8", errors="ignore")
+                    content = (
+                        prefix + "\n[Tool result truncated for context capacity. "
+                        "The text above is an incomplete prefix, "
+                        f"not a summary. Original: read_context(item_id={item_id!r}).]"
+                    )
             if len(content.encode()) >= len(message.content.encode()):
                 continue
             overrides[item_id] = content
@@ -472,7 +478,7 @@ class RolloutContextManager:
                 "artifact_refs": [],
                 "durable_state": self._store.context_durable_state(turn_id),
                 "context_version": version,
-                "algorithm_revision": "tool-output-elision-v4",
+                "algorithm_revision": "tool-output-elision-v5",
                 "tool_result_overrides": dict(overrides),
             }
             yield ContextCompactionCandidate(turn_id, revision, _json(payload), _json([asdict(m) for m in result]))
@@ -802,3 +808,76 @@ def _message_size_bytes(message: HarnessMessage) -> int:
         sort_keys=True,
     )
     return len(encoded.encode("utf-8"))
+
+
+def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str | None:
+    """Shrink only a saved web body; keep its typed cursor and citation metadata intact.
+
+    Metadata is a non-elidable floor, even for a zero body budget. Admission
+    still measures the full envelope and fails closed if that floor cannot fit.
+    Canonical original ToolResults and artifacts are never changed.
+    """
+    try:
+        envelope = json.loads(content)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    source = envelope.get("structured_content")
+    if (not isinstance(source, dict) or not isinstance(source.get("source_id"), str)
+            or not source["source_id"].startswith("artifact_") or not isinstance(source.get("content"), str)
+            or not isinstance(source.get("start_line"), int) or "next_line" not in source):
+        return None
+    if budget is not None and len(content.encode()) <= budget:
+        return content
+    # Preserve complete numbered lines, so the next cursor never skips unseen evidence.
+    kept: list[str] = []
+    used = 0
+    for line in source["content"].splitlines():
+        size = len(line.encode()) + bool(kept)
+        if budget is None or used + size > budget:
+            break
+        kept.append(line)
+        used += size
+    omitted = len(kept) < len(source["content"].splitlines())
+    projected = {**source, "content": "\n".join(kept), "links": [], "context_truncated": True}
+    if omitted:
+        projected["fetch_next_line"] = source.get("fetch_next_line", source["next_line"])
+        projected["next_line"] = source["start_line"] + len(kept)
+        projected["truncated"] = True
+    return _json({**envelope, "structured_content": projected, "truncated": True,
+                  "archive_lookup": f"read_context(item_id={item_id!r}) recovers the original tool message; "
+                                    "web_fetch(source_id=structured_content.source_id, start_line=next_line) "
+                                    "continues the saved webpage. item_id is not a source_id."})
+
+
+def _web_source_reference(item: ItemSnapshot, projected_content: str | None = None) -> dict[str, Any] | None:
+    if item.kind != "tool_result" or item.payload.get("is_error"):
+        return None
+    source = item.payload.get("structured_content")
+    if source is None:
+        try:
+            source = json.loads(item.payload.get("model_content", "")).get("structured_content")
+        except (ValueError, AttributeError, TypeError):
+            return None
+    if not isinstance(source, Mapping) or not isinstance(source.get("source_id"), str):
+        return None
+    if not source["source_id"].startswith("artifact_") or not source.get("url"):
+        return None
+    if projected_content is not None:
+        try:
+            visible = json.loads(projected_content).get("structured_content")
+        except (ValueError, AttributeError, TypeError):
+            visible = None
+        if isinstance(visible, Mapping) and visible.get("source_id") == source["source_id"]:
+            source = visible
+        else:
+            # Older plain-prefix elision may have lost the cursor: reread from
+            # the original start rather than silently skipping omitted lines.
+            source = {**source, "next_line": source.get("start_line", 1), "context_truncated": True}
+    return {"item_id": item.item_id, **{key: source[key] for key in (
+        "source_id", "url", "title", "published_at", "published_at_source", "content_hash",
+        "start_line", "next_line", "fetch_next_line", "context_truncated", "total_lines",
+        "source_truncated", "truncated",
+        "view", "line_basis", "section_id", "next_section", "next_link",
+    ) if key in source}}

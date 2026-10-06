@@ -140,6 +140,7 @@ class Session:
                     agent,
                     allow_write_tools=service_options.pop("allow_write_tools", False),
                     allow_execute_tools=service_options.pop("allow_execute_tools", False),
+                    allow_web_tools=service_options.pop("allow_web_tools", False),
                 )
                 service_options.update(resource_options)
             if model is None:
@@ -156,6 +157,7 @@ class Session:
             settings = thread.settings
             if settings:
                 policy = dict(settings["tool_execution_policy"])
+                policy.setdefault("allow_web_tools", False)
                 policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
                 if not explicit_tool_context:
                     self.tool_execution_context = replace(self.tool_execution_context, **policy)
@@ -323,6 +325,7 @@ class Session:
         *,
         allow_write_tools: bool | None = None,
         allow_execute_tools: bool | None = None,
+        allow_web_tools: bool | None = None,
         require_confirmation_for: frozenset[str] | None = None,
         denied_tool_names: frozenset[str] | None = None,
         deny_effects: frozenset[ToolEffect] | None = None,
@@ -334,6 +337,7 @@ class Session:
             for name, value in {
                 "allow_write_tools": allow_write_tools,
                 "allow_execute_tools": allow_execute_tools,
+                "allow_web_tools": allow_web_tools,
                 "require_confirmation_for": require_confirmation_for,
                 "denied_tool_names": denied_tool_names,
                 "deny_effects": deny_effects,
@@ -356,6 +360,7 @@ class Session:
         *,
         allow_write_tools: bool,
         allow_execute_tools: bool,
+        allow_web_tools: bool,
     ) -> tuple[BoundHarnessModel, dict[str, Any]]:
         from agent_runtime.agent import _close_owned_sync_resource
         from agent_runtime.runtime.mcp import (
@@ -394,6 +399,48 @@ class Session:
         resident = create_resident_coding_tools(
             workspace,
             plan_updater=acknowledge_plan_update,
+        )
+        from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
+        from agent_runtime.tools.builtins.web import WEB_SOURCE_MEDIA_TYPE, create_web_tools, load_search_key
+        from agent_runtime.tools.web_http import PublicWebClient, PublicWebError
+
+        web_client = (PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy)
+                      if agent.web_proxy_url is not None else PublicWebClient())
+        self._stack.push_async_callback(web_client.aclose)
+
+        def save_web_source(content: bytes) -> str:
+            turn_id = current_tool_turn_id()
+            if turn_id is None:
+                raise RuntimeError("web source requires an active tool Turn")
+            return self.store.commit_artifact(
+                turn_id=turn_id, content=content, media_type=WEB_SOURCE_MEDIA_TYPE, name="web-source.json",
+            ).artifact_id
+
+        def load_web_source(source_id: str) -> bytes:
+            artifact = self.store.read_artifact_metadata(source_id)
+            thread = self.store.read_thread(artifact.thread_id)
+            if artifact.media_type != WEB_SOURCE_MEDIA_TYPE or Path(thread.workspace).resolve() != workspace.root:
+                raise KeyError("web source belongs to another security domain")
+            return self.store.read_artifact(source_id)
+
+        def check_web_budget() -> None:
+            turn_id = current_tool_turn_id()
+            if turn_id is None:
+                raise RuntimeError("web request requires an active tool Turn")
+            attempts = sum(
+                max(1, operation.attempt_count)
+                for operation in self.store.list_tool_operations(turn_id)
+                if operation.tool_name in {"web_search", "web_fetch"} and "network" in operation.effects
+                and not (operation.result_item_id and self.store.read_item(operation.result_item_id)
+                         .payload.get("metadata", {}).get("web_cache_hit") is True)
+            )
+            if attempts > 32:
+                raise PublicWebError("web_request_budget_exceeded", "A Turn allows at most 32 web request attempts.")
+
+        web_tools = create_web_tools(
+            web_client, save_source=save_web_source, load_source=load_web_source,
+            search_key=load_search_key(agent.web_search_key_file, workspace=workspace.root),
+            before_request=check_web_budget, cache_scope=current_tool_turn_id,
         )
         skill_policy = SkillPolicy()
         manifests = [
@@ -441,7 +488,7 @@ class Session:
                 "config_source": trust.source,
                 "config_sha256": trust.config_sha256,
             }
-        tools = {tool.definition.name: tool for tool in (*resident, *mcp_tools)}
+        tools = {tool.definition.name: tool for tool in (*resident, *web_tools, *mcp_tools)}
 
         from agent_runtime.builtin.generic import coding_instructions
         from agent_runtime.harness.model_adapter import ControlPlaneHarnessModel
@@ -462,6 +509,7 @@ class Session:
                 cwd=workspace.root,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
+                allow_web_tools=allow_web_tools,
             ),
             knowledge_runner=knowledge_runner if callable(knowledge_runner) else None,
             knowledge_revision=knowledge_revision,
@@ -667,6 +715,7 @@ class Session:
             if not isinstance(policy_value, Mapping):
                 raise RuntimeError("source Step has no tool execution policy")
             policy = dict(policy_value)
+            policy.setdefault("allow_web_tools", False)
             binding["tool_execution_policy"] = dict(policy)
             policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
             child_options = {

@@ -252,6 +252,7 @@ class ToolApprovalProfile(StrEnum):
     """Runtime-owned attestation used by explicit automatic-approval policies."""
 
     RESTRICTED_READ_ONLY_PROCESS = "restricted_read_only_process"
+    PUBLIC_WEB_READ = "public_web_read"
 
 
 @dataclass(frozen=True, slots=True)

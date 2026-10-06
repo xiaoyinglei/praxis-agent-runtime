@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -48,6 +49,8 @@ class Agent:
         knowledge: RAGKnowledgeConfig | None = None,
         enable_workspace_mcp: bool = True,
         mcp_config_trust: MCPConfigTrustDecision | None = None,
+        web_search_key_file: Path | str | None = None,
+        web_proxy_url: str | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
@@ -69,6 +72,10 @@ class Agent:
         self.knowledge = knowledge
         self.enable_workspace_mcp = enable_workspace_mcp
         self.mcp_config_trust = mcp_config_trust
+        self.web_search_key_file = None if web_search_key_file is None else Path(web_search_key_file)
+        from agent_runtime.tools.web_http import web_proxy_configuration
+
+        self.web_proxy_url, self.web_no_proxy = web_proxy_configuration(web_proxy_url, dict(os.environ))
         self._selection_requester = selection_requester
         self._followup_model_id: str | None = None
 
@@ -108,6 +115,7 @@ class Agent:
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
+        allow_web_tools: bool = False,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AgentResult:
@@ -116,6 +124,7 @@ class Agent:
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
             max_turns=max_turns, max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
             event_sink=event_sink, _event_dispatcher=_event_dispatcher,
@@ -127,6 +136,7 @@ class Agent:
         self, *, previous_turn_id: str | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
+        allow_web_tools: bool = False,
         max_turns: int | None = None, max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
         event_sink: AgentEventSink | None = None,
@@ -139,6 +149,7 @@ class Agent:
             agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id,
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
             max_steps=16 if max_turns is None else max_turns,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
@@ -235,6 +246,7 @@ class Agent:
         require_workspace_change: bool = True,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
+        allow_web_tools: bool = False,
     ) -> AsyncIterator[StreamEvent]:
         """Yield committed durable events while the Turn is still running."""
 
@@ -251,6 +263,7 @@ class Agent:
                 require_workspace_change=require_workspace_change,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
+                allow_web_tools=allow_web_tools,
                 _event_dispatcher=dispatcher,
             )
         )

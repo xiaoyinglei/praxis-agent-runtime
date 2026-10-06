@@ -1,0 +1,3 @@
+# Captured web responses are byte-exact fixtures with recorded SHA-256 hashes.
+tests/agent/fixtures/web/*.html -text -whitespace
+tests/agent/fixtures/web/raw_source.txt -text -whitespace

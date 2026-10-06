@@ -214,6 +214,7 @@ class ToolOrchestrator:
         if call.tool_name in revisions:
             self.restore_tools({call.tool_name: revisions[call.tool_name]})
         policy = dict(snapshot["binding_manifest"].get("tool_execution_policy", {}))
+        policy.setdefault("allow_web_tools", False)
         if "deny_effects" in policy:
             policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
         return self._context_for_turn(turn_id, base=replace(self._execution_context, **policy))

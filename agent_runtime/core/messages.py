@@ -175,7 +175,25 @@ def tool_result_message(result: ToolResult) -> ModelMessage:
 
     if not isinstance(result, ToolResult):
         raise TypeError("result must be a ToolResult")
-    payload: Mapping[str, JsonValue] = {
+    payload = tool_result_payload(result)
+    return ModelMessage(
+        role="tool",
+        content=canonical_json_text(payload),
+        tool_call_id=result.tool_call_id,
+    )
+
+
+def tool_result_payload(result: ToolResult) -> Mapping[str, JsonValue]:
+    """Build the same model envelope for budget admission and transcript insertion."""
+    structured = result.structured_content
+    if (result.tool_name == "web_fetch" and not result.is_error and isinstance(structured, Mapping)
+            and isinstance(structured.get("source_id"), str)):
+        runtime_fields = {"network_bytes", "cache_hit", "connection_mode", "failure_stage",
+                          "extraction_method", "error_code", "error_message", "raw_body_base64"}
+        structured = {key: value for key, value in structured.items() if key not in runtime_fields
+                      and (value is not None or key in {"next_line", "next_link", "next_section"})}
+        return {"structured_content": structured, "is_error": False, "truncated": result.truncated}
+    return {
         "content": tuple(
             {
                 "type": block.type,
@@ -183,18 +201,13 @@ def tool_result_message(result: ToolResult) -> ModelMessage:
             }
             for block in result.content
         ),
-        "structured_content": result.structured_content,
+        "structured_content": structured,
         "is_error": result.is_error,
         "error_code": result.error_code,
         "error_message": result.error_message,
         "retryable": result.retryable,
         "truncated": result.truncated,
     }
-    return ModelMessage(
-        role="tool",
-        content=canonical_json_text(payload),
-        tool_call_id=result.tool_call_id,
-    )
 
 
 def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:

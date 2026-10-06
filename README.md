@@ -391,11 +391,146 @@ with `asyncio.run(main())`; async applications should directly `await` the Agent
 | **Files and code** | `agent` / `agent_runtime.Agent` | Discover, read, search, patch, inspect diffs, run bounded verification |
 | **Data and documents** | `inspect_data_file` + sandboxed `execute_python` | Inspect CSV/TSV/JSON/XLSX/XLSM/PDF inputs; calculate, transform, chart, and structurally verify generated artifacts without a workspace `.venv` |
 | **Private knowledge** | Explicit `RAGKnowledgeConfig` | Retrieve cited evidence from a configured local knowledge index |
+| **Public internet** | `web_search` + `web_fetch` | Search for sources; read public websites, documentation and source files; continue saved content offline |
 | **Extensions** | Workspace Skills, configured MCP servers, and bounded subagent delegation | Add installed ACI capabilities without replacing the core loop |
 
 Capabilities are assembled for the current workspace. Availability does not
 grant permission: tool visibility, write authority, command execution, network
 access, and approval are separate controls.
+
+## Public web research
+
+`web_fetch` opens public HTTP(S) URLs on Linux and macOS. It reads HTML,
+UTF-8 text/Markdown/source code and JSON; PDF text extraction is available on Linux
+with worker memory limits, up to 20 pages. A GitHub page or raw file is one
+possible source. Login and JavaScript-only pages may return a clear reading
+error; these tools do not include an interactive browser or clone repositories.
+
+```bash
+uv run agent run "Read https://docs.python.org/3/library/asyncio.html and explain cancellation" \
+  --no-require-workspace-change
+uv run agent chat
+```
+
+CLI search and URL reading are enabled by default. Ask naturally in chat;
+`--no-web-tools` restores approval before each network call. With no search key,
+`web_search` uses Bing's public search page on Linux and macOS. This requires
+no search API key, but results depend on the upstream service's availability,
+relevance and limits. Verification pages and unexpected markup return clear
+failures; the Agent never solves verification challenges or treats them as results.
+
+Optionally, general search can use Brave Search. Provision its API key in a protected regular
+file outside the workspace, owned by the current user or root with mode `0400`
+or `0600`. Supply the file path, never the key itself:
+
+```bash
+uv run agent run "Find primary sources about Python task cancellation" \
+  --allow-web-tools --no-require-workspace-change \
+  --web-search-key-file /absolute/private/path/search.key
+uv run agent resume --last --action allow_once \
+  --web-search-key-file /absolute/private/path/search.key
+```
+
+`PRAXIS_WEB_SEARCH_KEY_FILE` is an alternative CLI configuration for Brave.
+In the SDK, optionally configure `Agent(web_search_key_file=...)` and pass
+`allow_web_tools=True` to `run`, `stream`, or `session`; read-only research also
+uses `require_workspace_change=False`.
+
+The model receives extracted main text, source URLs, hashes and immutable
+`source_id` snapshots. `published_at` is an optional page-declared publication
+date; `fetched_at` is retrieval time. Neither a successful fetch nor a search
+freshness preference establishes that a source is the latest available news.
+Low-relevance and repeated-result diagnostics expose upstream search limitations.
+
+The default excerpt budget is 12,000 bytes (`max_bytes=4096..16000`), with at most
+8 links. Full extracted text stays in the artifact. Numbered lines wrap long
+lines at 512 characters; they are snapshot lines, not original HTML/source-code
+line numbers. Use `source_id` and `start_line=next_line` to continue, or `find`
+for literal text search. Context elision preserves the source metadata and moves
+`next_line` to the first omitted line; `fetch_next_line` records the original
+excerpt boundary. A tool-message `item_id` belongs to `read_context` and must
+never be converted into a webpage `source_id`.
+
+Saved sources remain readable after a restart within the same workspace and
+checkpoint store, with hash verification. Within an active Turn, repeated URLs
+reuse a snapshot; `refresh=true` explicitly refetches. Repeated searches reuse
+results, and identical results across query variants are reported without
+resending the whole list. This URL/query cache is local to the active Session;
+cross-process continuation uses the persisted `source_id`. `source_truncated`
+means the extraction limit was reached; continuation cannot recover discarded
+content. Link labels and snippets are discovery leads until the linked body is
+read. Login, JavaScript-only pages and unfamiliar DOM layouts remain limitations.
+
+Run `uv run python scripts/agent_web_quality.py` for the fixed-page extraction,
+model-output budget, evidence-retention and continuation acceptance checks.
+
+Authorization applies to these two built-in tools. With `--no-web-tools`, or
+without SDK authorization, network calls
+pause for approval before DNS or HTTP; shell and MCP permissions are separate.
+Each Turn permits at most 32 network tool attempts; each fetch has a 20-second
+network deadline, five redirects, and 2 MB encoded/decoded body limits. In direct
+mode, public addresses are checked at each connection and redirect. TLS remains verified.
+Queries and URL parameters leave the machine. External pages are untrusted
+evidence; granting web access is not protection against all prompt injection or
+private-data disclosure.
+
+Web proxy configuration is read once when `Agent` is created. Precedence is
+`--web-proxy` / `Agent(web_proxy_url=...)`, `PRAXIS_WEB_PROXY`, `https_proxy`,
+`HTTPS_PROXY`, `http_proxy`, then `HTTP_PROXY`. Without a configured proxy the
+client retains strict direct connections. `NO_PROXY` (lowercase takes precedence)
+accepts comma/space-separated hosts, domain suffixes, optional ports, or `*`;
+matching URLs use strict direct connections, including after redirects.
+SOCKS/`ALL_PROXY` is not supported. Proxy endpoints must use HTTP(S), with no
+credentials, path, query or fragment. Workspace files cannot configure the proxy.
+
+```bash
+uv run agent chat --model deepseek-chat --web-proxy http://127.0.0.1:7892
+uv run agent chat --model deepseek-chat --web-proxy direct
+```
+
+The explicit proxy endpoint may be local, but private literal target URLs and
+invalid redirects remain blocked. **Trusted proxy mode delegates hostname
+resolution and final destination-IP enforcement to the upstream proxy.** A
+public-looking hostname can still resolve privately there; ordinary URL checks
+do not establish public-only egress. Use an upstream with destination-IP controls
+when that boundary is required. Direct DNS pinning is not claimed for proxy mode.
+Proxy failures never silently fall back to direct access. Approval, tool budgets,
+TLS verification, body limits and snapshot continuation use the same canonical
+tool path in both modes. Tool results identify `connection_mode` and
+`failure_stage` without exposing the proxy endpoint. `nonpublic_address` means
+direct DNS validation failed before a website response, not that a repository is
+private, nonexistent or misspelled. Restart the CLI to pick up changed proxy
+environment variables; resumed sessions use the new caller's network configuration.
+
+Web reads save a versioned snapshot containing the bounded original response,
+its SHA-256 hash, extracted text, positioned links and a heading index. Existing
+version-1 snapshots remain readable; they have no raw response or link positions.
+HTML semantic documents retain code, tables and image alt text. Pages without a
+semantic document use structural selection and Trafilatura with a paragraph
+retention check. Markdown is parsed with CommonMark for navigation while its
+source text remains unchanged. These transformations are not a guarantee that
+all page information was recovered; `view="raw"` can inspect original UTF-8 text.
+
+`web_fetch` accepts `view="outline"` with `start_section` / `next_section` for
+heading navigation, `section_id` for bounded section reads, and `view="links"`
+with `start_link` / `next_link` to browse saved links. Links carry stable IDs;
+HTML `[label][L1]` markers correspond to `links.id=1`. Excerpt links come from
+actual occurrences, not text-label matching. `links_truncated` reports omitted
+excerpt links. Continue content with `start_line=next_line`; preserve `section_id`
+or `view="raw"` when continuing those reads. Numbered lines belong to the saved
+view, wrap at 512 characters, and must not be cited as original source-file lines.
+The navigation map is limited to 200 links; `source_links_truncated` distinguishes
+that extraction limit from an excerpt's shorter link list.
+
+`max_tokens` (default 6,000, range 1,000–16,000) bounds the complete model tool
+message, including its JSON envelope, links and headings. `token_count_source`
+identifies the bundled reference tokenizer estimate, not provider billing; if
+that tokenizer is unavailable, UTF-8 bytes are counted conservatively. The
+existing `max_bytes` and network/parser limits remain separate resource bounds.
+Canonical results retain diagnostic metadata; successful model messages omit
+network counters and empty error fields. A too-small budget returns an explicit
+error rather than silently advancing past unread lines. The raw response is kept
+in the existing artifact store and is never injected into model context by default.
 
 ## Optional RAG
 
