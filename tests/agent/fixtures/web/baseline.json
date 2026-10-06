@@ -1,0 +1,89 @@
+{
+  "tokenizer": "tokenizers:deepseek-v4-official",
+  "pages": {
+    "news_29": {
+      "fixture_sha256": "ed65cb2aabffd09208863190c710cf4ab8fa017dff2c3174c47907c7f8bb5c85",
+      "gold_blocks": 2,
+      "full_retention": 1.0,
+      "first_80_lines_retention": 0.0,
+      "non_gold_text_share": 0.9235,
+      "noise_marker_hits": 3,
+      "annotated_noise_markers": 5,
+      "model_bytes": 23980,
+      "model_text_tokens": 7749,
+      "model_links": 200,
+      "extracted_bytes": 25432,
+      "fetch_repeat_network_calls": 2,
+      "continuation_ok": true,
+      "source_id_matches_artifact": true
+    },
+    "news_30": {
+      "fixture_sha256": "da68e3d701f0a818b68cdcfc21cf8d1638da0c64bf2634d14591f5b81bac9f2f",
+      "gold_blocks": 4,
+      "full_retention": 1.0,
+      "first_80_lines_retention": 0.0,
+      "non_gold_text_share": 0.9309,
+      "noise_marker_hits": 2,
+      "annotated_noise_markers": 4,
+      "model_bytes": 23960,
+      "model_text_tokens": 7756,
+      "model_links": 200,
+      "extracted_bytes": 25083,
+      "fetch_repeat_network_calls": 2,
+      "continuation_ok": true,
+      "source_id_matches_artifact": true
+    },
+    "python_docs": {
+      "fixture_sha256": "1d4b668096dd9cd811c9be1d631c091824c21f952b93898838676301bedcd276",
+      "gold_blocks": 321,
+      "full_retention": 1.0,
+      "first_80_lines_retention": 0.0067,
+      "non_gold_text_share": 0.0894,
+      "noise_marker_hits": 2,
+      "annotated_noise_markers": 3,
+      "model_bytes": 6531,
+      "model_text_tokens": 2052,
+      "model_links": 37,
+      "extracted_bytes": 64557,
+      "fetch_repeat_network_calls": 2,
+      "continuation_ok": true,
+      "source_id_matches_artifact": true
+    },
+    "raw_source": {
+      "fixture_sha256": "4d15480ac046f089209798e8650476ef4a28ebe6f81b400758f8ef42ec6b5509",
+      "gold_blocks": 1,
+      "full_retention": 1.0,
+      "first_80_lines_retention": 0.0,
+      "non_gold_text_share": 0,
+      "noise_marker_hits": 0,
+      "annotated_noise_markers": 0,
+      "model_bytes": 4608,
+      "model_text_tokens": 1376,
+      "model_links": 0,
+      "extracted_bytes": 7152,
+      "fetch_repeat_network_calls": 2,
+      "continuation_ok": true,
+      "source_id_matches_artifact": true
+    },
+    "company_index": {
+      "fixture_sha256": "345cc8ee879b5e45a05da62b80e038db1770d98229a4efe84b5386b6b409aba0",
+      "gold_blocks": 2,
+      "full_retention": 1.0,
+      "first_80_lines_retention": 0.0,
+      "non_gold_text_share": 0.9946,
+      "noise_marker_hits": 1,
+      "annotated_noise_markers": 3,
+      "model_bytes": 25735,
+      "model_text_tokens": 8603,
+      "model_links": 167,
+      "extracted_bytes": 32285,
+      "fetch_repeat_network_calls": 2,
+      "continuation_ok": true,
+      "source_id_matches_artifact": true
+    }
+  },
+  "baseline_source_sha256": {
+    "web.py": "fe5e391b30016ffbb44068cdc4b998d1d55b3f97478929837eada9ed8a0d9432",
+    "web_content.py": "acfffa223a86273fee281ca4faf97b6e1f53dc5bfe0307174f6ab377b302d803"
+  }
+}

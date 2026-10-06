@@ -35,7 +35,9 @@ sudo bash scripts/ubuntu/install-model-service.sh /home/admin/praxis-server
 
 安装器在服务器终端隐藏提示输入 DeepSeek、Groq API key。这是一次明确的密钥托管变更：密钥将保存在该服务器。不要把值发到聊天、写进 shell 命令参数或打开 shell trace；没有自动读取或传输 Mac `.env` 的行为。两把密钥输入并验证格式后才写文件；真实账户权限还需要下述 completion probe。
 
-供应商密钥和服务侧代理凭证在 `/etc/praxis-model`，目录 0700、文件 0400、root 所有。systemd 将它们复制给 `praxis-model`。Agent 只能读 `/var/lib/praxis-agent/proxy.token`；工作目录是 `/var/lib/praxis-agent/workspace`。密钥服务的私有状态在 `/var/lib/praxis-model`。两个用户均不加入 sudo 或管理员组。
+供应商密钥和服务侧代理凭证在 `/etc/praxis-model`，目录 0700、文件 0400、root 所有。systemd 将它们复制给 `praxis-model`。Agent 读取 `/var/lib/praxis-agent/proxy.token`；工作目录是 `/var/lib/praxis-agent/workspace`。密钥服务的私有状态在 `/var/lib/praxis-model`。两个用户均不加入 sudo 或管理员组。
+
+公网搜索和阅读通过独立的 `web_search`、`web_fetch` 工具默认开启，不需要放开 Linux 命令沙箱的网络。正常启动 `praxis-agent chat` 后即可自然提问；`--no-web-tools` 可恢复联网审批。未配置搜索密钥时使用 Bing 公开搜索页面，可能遇到限流、验证页面或相关性不足；失败会明确显示，不会当作有效结果。也可由管理员将可选的 Brave Search 密钥写入 `/var/lib/praxis-agent/search.key`，文件归 `praxis-agent` 所有、权限 `0400`，不要放进 workspace，也不要使用模型供应商或代理凭证。启动器仅传入该文件的路径，`run`、`chat`、`resume` 均读取此配置。查询会发给所选搜索服务，工具仅访问公网 HTTP(S) 地址。详见 [公网工具说明](README.md#public-web-research)。
 
 ## 验证及使用
 

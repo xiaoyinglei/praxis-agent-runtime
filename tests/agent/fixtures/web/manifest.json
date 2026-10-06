@@ -1,0 +1,27 @@
+{
+  "news_29": {
+    "url": "https://finance.sina.com.cn/jjxw/2026-09-29/doc-initpatz6145090.shtml",
+    "content_type": "text/html",
+    "bytes": 96159
+  },
+  "news_30": {
+    "url": "https://finance.sina.com.cn/roll/2026-09-30/doc-initqqvi2188200.shtml",
+    "content_type": "text/html",
+    "bytes": 95921
+  },
+  "python_docs": {
+    "url": "https://docs.python.org/3/library/asyncio-task.html",
+    "content_type": "text/html",
+    "bytes": 177639
+  },
+  "raw_source": {
+    "url": "https://raw.githubusercontent.com/psf/requests/main/src/requests/api.py",
+    "content_type": "text/plain; charset=utf-8",
+    "bytes": 7152
+  },
+  "company_index": {
+    "url": "https://finance.sina.com.cn/realstock/company/sz002273/nc.shtml",
+    "content_type": "text/html",
+    "bytes": 158323
+  }
+}

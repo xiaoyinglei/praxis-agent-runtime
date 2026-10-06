@@ -1,4 +1,4 @@
-"""Launch the Agent with only its proxy credential and a fixed service catalog."""
+"""Launch with its proxy credential, optional search key path and fixed catalog."""
 
 import os
 import pwd
@@ -16,7 +16,7 @@ def agent_environment(token_path: Path, home: Path, term: str) -> dict[str, str]
         token = handle.read(4098).decode("ascii").strip()
     if not 16 <= len(token) <= 4096 or not token.isprintable() or any(c.isspace() for c in token):
         raise ValueError("invalid Agent proxy credential")
-    return {
+    env = {
         "HOME": str(home),
         "USER": "praxis-agent",
         "LOGNAME": "praxis-agent",
@@ -28,6 +28,21 @@ def agent_environment(token_path: Path, home: Path, term: str) -> dict[str, str]
         "RAG_AGENT_MODELS_PATH": "/opt/praxis/server-models.yaml",
         "PRAXIS_MODEL_REGISTRY_PATH": str(home / ".config/praxis/models.yaml"),
     }
+    search_path = home / "search.key"
+    if search_path.exists() or search_path.is_symlink():
+        search_fd = os.open(search_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(search_fd, "rb") as handle:
+            search_info = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(search_info.st_mode) or search_info.st_mode & 0o077
+                or search_info.st_uid != os.getuid()
+            ):
+                raise ValueError("insecure search credential")
+            search_key = handle.read(4097).decode("ascii").strip()
+        if not 16 <= len(search_key) <= 4096 or not search_key.isprintable() or any(c.isspace() for c in search_key):
+            raise ValueError("invalid search credential")
+        env["PRAXIS_WEB_SEARCH_KEY_FILE"] = str(search_path)
+    return env
 
 
 def main() -> None:
@@ -38,7 +53,9 @@ def main() -> None:
     try:
         env = agent_environment(home / "proxy.token", home, os.environ.get("TERM", "dumb"))
     except (OSError, UnicodeError, ValueError):
-        raise SystemExit("Missing or insecure Agent proxy credential; contact the server administrator.") from None
+        raise SystemExit(
+            "Missing or insecure Agent proxy/search credential; contact the server administrator."
+        ) from None
     os.chdir(home / "workspace")
     argv = sys.argv[1:] or ["chat"]
     # -I excludes cwd, PYTHONPATH and user site; app is root-owned.

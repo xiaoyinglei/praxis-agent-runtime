@@ -3,6 +3,10 @@
 # Install the project separately with --no-deps (see DEPLOY_UBUNTU.md).
 pydantic
 httpx[socks]
+httpcore
+beautifulsoup4
+trafilatura
+markdown-it-py
 openai
 pyyaml
 tiktoken

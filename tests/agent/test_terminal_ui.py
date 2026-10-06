@@ -6,6 +6,23 @@ from agent_runtime.streaming.events import ItemStatus, TurnItemKind, item_comple
 from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
 
 
+@pytest.mark.anyio
+async def test_web_error_details_are_retained_but_collapsed():
+    view = Conversation()
+    display = ConversationEventDisplay(view)
+    display.begin_turn()
+    await display.emit(item_completed(
+        turn_id="t", item_id="s", item_kind=TurnItemKind.TOOL, status=ItemStatus.FAILED,
+        error="RAW detail", data={"result": {"tool_name": "web_search", "error_code": "timeout",
+            "error_message": "RAW detail", "structured_content": {"error_message": "RAW detail"}}},
+    ))
+    display.finish()
+    assert "联网请求超时" in view.plain_text()
+    assert "RAW detail" not in view.plain_text()
+    display.set_verbose(True)
+    assert "RAW detail" in view.plain_text()
+
+
 def test_nested_folds_toggle_in_place_without_duplicating_output():
     view = Conversation()
     group = view.add_group()

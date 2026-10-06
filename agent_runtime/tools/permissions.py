@@ -48,6 +48,7 @@ class ToolExecutionContext:
     cwd: Path | str | None = None
     allow_write_tools: bool = False
     allow_execute_tools: bool = False
+    allow_web_tools: bool = False
     approved_tool_call_ids: frozenset[str] = frozenset()
     denied_tool_call_ids: frozenset[str] = frozenset()
     active_skill_ids: frozenset[str] = frozenset()
@@ -61,6 +62,7 @@ class ToolExecutionContext:
         for name in (
             "allow_write_tools",
             "allow_execute_tools",
+            "allow_web_tools",
             "auto_approve_sandboxed",
         ):
             if type(getattr(self, name)) is not bool:
@@ -134,6 +136,14 @@ def can_use_tool(
             UseToolDecision.ASK,
             f"runtime policy requires confirmation for tool: {tool_name}",
         )
+    if (
+        context.allow_web_tools
+        and tool.approval_profile is ToolApprovalProfile.PUBLIC_WEB_READ
+        and tool_name in {"web_search", "web_fetch"}
+        and resolved.effects == frozenset({ToolEffect.NETWORK})
+        and any(target.kind == "public_web" for target in resolved.targets)
+    ):
+        return CanUseToolResult(UseToolDecision.ALLOW, "public web reading is pre-approved by runtime policy")
     if (
         context.auto_approve_sandboxed
         and (

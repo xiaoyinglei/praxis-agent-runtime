@@ -136,6 +136,8 @@ _TOOL_LABELS = {
     "run_command": "执行命令",
     "list_directory": "列出目录",
     "search_files": "搜索文件",
+    "web_search": "搜索网页",
+    "web_fetch": "读取网页",
 }
 
 
@@ -231,6 +233,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         # Folding hides retained content; it must not reuse the eight-row plain CLI preview.
         for line in bounded_result_lines(value, width=self._width, max_rows=2000):
             self._record_detail(line.replace("(/verbose 查看完整结果)", "(界面显示上限)"))
+
+    def _write_error_result(self, value: object) -> None:
+        self._write_result(value)
+        if self._target:
+            self._target.expanded = False
 
     def _render_text(self, value: object, *, answer: bool = True) -> None:
         if not isinstance(value, str) or not value:

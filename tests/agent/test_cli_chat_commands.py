@@ -30,6 +30,32 @@ class _SessionFactory:
             self.closed += 1
 
 
+def test_local_provider_startup_failure_has_readable_message():
+    import click
+
+    from agent_runtime.local_runtime import LocalRuntimeError
+
+    async def unavailable():
+        raise LocalRuntimeError("RAW http://127.0.0.1:8080/v1/models")
+
+    with pytest.raises(click.ClickException, match="本地模型服务尚未就绪") as exc:
+        cli._run_cli_async(unavailable())
+    assert "127.0.0.1" not in str(exc.value)
+    assert "RAW" not in str(exc.value)
+
+
+def test_failure_details_are_available_only_in_verbose_output(capsys):
+    from agent_runtime.result import AgentDiagnostic
+
+    diagnostic = AgentDiagnostic(code="model_step_budget_exhausted", component="runtime", message="RAW diagnosis")
+    cli._display_failure(stop_reason=diagnostic.code, diagnostics=[diagnostic], verbose=False)
+    output = capsys.readouterr().out
+    assert "尝试次数上限" in output
+    assert "RAW diagnosis" not in output
+    cli._display_failure(stop_reason=diagnostic.code, diagnostics=[diagnostic], verbose=True)
+    assert "RAW diagnosis" in capsys.readouterr().out
+
+
 @pytest.mark.anyio
 async def test_chat_model_picker_switches_session_without_provider_request(tmp_path):
     from agent_runtime.terminal_app import TerminalChatApp

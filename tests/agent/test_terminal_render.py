@@ -38,6 +38,22 @@ def test_safe_terminal_text_removes_ansi_and_unsafe_controls() -> None:
     assert rendered == "red\nnext\tvalue"
 
 
+@pytest.mark.anyio
+async def test_web_failure_shows_actionable_message_without_raw_payload(capsys):
+    display = TerminalToolEventDisplay(width=100)
+    await display.emit(item_completed(
+        turn_id="t", item_id="s", item_kind=TurnItemKind.TOOL, status=ItemStatus.FAILED,
+        error="RAW provider error",
+        data={"result": {"tool_name": "web_search", "error_code": "web_search_blocked",
+                         "error_message": "RAW provider error", "structured_content": {
+                             "error_code": "web_search_blocked", "error_message": "RAW provider error"}}},
+    ))
+    output = capsys.readouterr().out
+    assert "搜索服务暂时限制访问" in output
+    assert "RAW provider error" not in output
+    assert "error_code" not in output
+
+
 def test_display_rows_respects_cjk_cell_width() -> None:
     assert display_rows("你好a", width=4) == ["你好", "a"]
 

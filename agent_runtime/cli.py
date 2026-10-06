@@ -9,7 +9,7 @@ import sys
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypedDict
 
 import click
 import typer
@@ -20,6 +20,7 @@ from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.knowledge import RAGKnowledgeConfig
+from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeError
 from agent_runtime.model_admin import (
     ModelAdminService,
     ModelDefinitionArguments,
@@ -36,7 +37,7 @@ from agent_runtime.models import (
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.terminal_input import TerminalComposer
-from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text
+from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -51,6 +52,11 @@ model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑定的本地信任域。")
 logger = logging.getLogger(__name__)
+
+
+class _WebOptions(TypedDict, total=False):
+    web_search_key_file: Path
+    web_proxy_url: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,10 +100,11 @@ def _format_tool_summary(result: AgentResult) -> str:
         status_icon = "✗" if tool_call.is_error else "✓"
         tool_info = f"  {status_icon} {tool_call.tool_name}"
         if tool_call.is_error:
-            error_message = safe_terminal_text(tool_call.error_message or "unknown tool error")
-            tool_info += (
-                f" ({tool_call.error_code or 'tool_error'}: {error_message})"
-            )
+            if tool_call.tool_name in {"web_search", "web_fetch"}:
+                tool_info += f"：{web_error_message(tool_call.error_code)}"
+            else:
+                error_message = safe_terminal_text(tool_call.error_message or "unknown tool error")
+                tool_info += f" ({tool_call.error_code or 'tool_error'}: {error_message})"
         lines.append(tool_info)
     return "\n".join(lines)
 
@@ -122,9 +129,9 @@ def _format_plan_summary(result: AgentResult) -> str:
 
 def _failure_title(stop_reason: str | None) -> str:
     if stop_reason == "model_provider_failed":
-        return "错误: 模型调用失败 (model_provider_failed)"
-    if stop_reason:
-        return f"错误: Agent 运行失败 ({stop_reason})"
+        return "模型服务暂时无法完成请求，请检查模型配置或稍后重试。"
+    if stop_reason == "model_step_budget_exhausted":
+        return "本次执行已达到尝试次数上限，任务尚未完成。"
     return "错误: Agent 运行失败"
 
 
@@ -156,17 +163,11 @@ def _display_failure(
     verbose: bool,
 ) -> None:
     print(f"\n{_failure_title(stop_reason)}")
-    selected = _failure_diagnostics(diagnostics, stop_reason=stop_reason)
-    if selected:
-        for diagnostic in selected:
-            _print_diagnostic(diagnostic)
-    elif verbose and stop_reason:
-        print(f"  stop_reason: {stop_reason}")
     if verbose:
-        selected_ids = {id(diagnostic) for diagnostic in selected}
+        if stop_reason:
+            print(f"  stop_reason: {stop_reason}")
         for diagnostic in diagnostics:
-            if id(diagnostic) not in selected_ids:
-                _print_diagnostic(diagnostic)
+            _print_diagnostic(diagnostic)
 
 
 def _display_agent_result(
@@ -353,19 +354,28 @@ def _create_agent_facade(
     model_session_path: Path | None = None,
     knowledge: RAGKnowledgeConfig | None = None,
     enable_workspace_mcp: bool = True,
+    web_search_key_file: Path | None = None,
+    web_proxy_url: str | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
 
-    return Agent(
-        model=model,
-        checkpoint_db=checkpoint_db,
-        workspace_path=workspace_path,
-        model_session_path=model_session_path,
-        knowledge=knowledge,
-        enable_workspace_mcp=enable_workspace_mcp,
-        _selection_requester=_selection_requester,
-    )
+    try:
+        return Agent(
+            model=model,
+            checkpoint_db=checkpoint_db,
+            workspace_path=workspace_path,
+            model_session_path=model_session_path,
+            knowledge=knowledge,
+            enable_workspace_mcp=enable_workspace_mcp,
+            web_search_key_file=web_search_key_file,
+            web_proxy_url=web_proxy_url,
+            _selection_requester=_selection_requester,
+        )
+    except ValueError as error:
+        if str(error).startswith("Web proxy must"):
+            raise typer.BadParameter(str(error), param_hint="--web-proxy / proxy environment") from None
+        raise
 
 
 def _is_interactive_terminal() -> bool:
@@ -394,6 +404,12 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
 
     try:
         return asyncio.run(awaitable)
+    except EndpointConflictError as exc:
+        logger.debug("Local model endpoint conflict", exc_info=True)
+        raise click.ClickException("本地模型端口已被其他服务占用，请检查模型服务配置。") from exc
+    except LocalRuntimeError as exc:
+        logger.debug("Local model provider unavailable", exc_info=True)
+        raise click.ClickException("本地模型服务尚未就绪，请先启动模型服务，或切换到已配置的云端模型。") from exc
     except (
         FileNotFoundError,
         KeyError,
@@ -435,6 +451,7 @@ async def _run_facade_command(
     require_workspace_change: bool = True,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
+    allow_web_tools: bool = False,
     event_display: _CLIToolEventDisplay | None = None,
 ) -> AgentResult:
     """Run one Turn and optionally drive its approval lifecycle."""
@@ -450,6 +467,7 @@ async def _run_facade_command(
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
             event_sink=display,
         )
         while result.status == "paused" and interactive_approval:
@@ -531,6 +549,7 @@ async def _chat_facade_loop(
     previous_turn_id: str | None = None,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
+    allow_web_tools: bool = False,
     _ui: TerminalChatApp | None = None,
 ) -> None:
     if _ui is None and _is_tty(sys.stdin) and _is_tty(sys.stdout) and os.environ.get("TERM") != "dumb":
@@ -540,7 +559,7 @@ async def _chat_facade_loop(
         await ui.run(lambda: _chat_facade_loop(
             facade, max_tokens_total=max_tokens_total, max_turns=max_turns,
             previous_turn_id=previous_turn_id, allow_write_tools=allow_write_tools,
-            allow_execute_tools=allow_execute_tools, _ui=ui,
+            allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools, _ui=ui,
         ))
         return
     event_display = _ui.display if _ui else _CLIToolEventDisplay(interactive=False)
@@ -552,6 +571,8 @@ async def _chat_facade_loop(
     model_id = facade.current_model().id
     if _ui is None:
         _print_startup_banner(model_id)
+    print("网页网络: " + ("可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
+                          if getattr(facade, "web_proxy_url", None) else "严格直连"))
     from contextlib import AsyncExitStack
 
     async with AsyncExitStack() as stack:
@@ -561,6 +582,7 @@ async def _chat_facade_loop(
             max_turns=max_turns, max_tokens_total=max_tokens_total,
             require_workspace_change=False, allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
         ))
         while True:
             try:
@@ -593,6 +615,7 @@ async def _chat_facade_loop(
                     max_turns=max_turns, max_tokens_total=max_tokens_total,
                     require_workspace_change=False, allow_write_tools=allow_write_tools,
                     allow_execute_tools=allow_execute_tools,
+                    allow_web_tools=allow_web_tools,
                 ))
                 current_turn_id = None
                 chat_workspace = default_chat_workspace
@@ -1262,6 +1285,16 @@ def agent_chat(
         bool,
         typer.Option("--allow-execute-tools", help="预授权进程执行类调用"),
     ] = False,
+    allow_web_tools: Annotated[
+        bool, typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
+    ] = True,
+    web_proxy_url: Annotated[
+        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+    ] = None,
+    web_search_key_file: Annotated[
+        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+                                  help="工作区外的受保护 Brave Search 密钥文件"),
+    ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
     if previous_turn_id is not None and last:
@@ -1295,6 +1328,11 @@ def agent_chat(
         facade_model = None
         facade_workspace = binding.workspace_path or Path.cwd()
         facade_knowledge = binding.knowledge
+    web_options: _WebOptions = {}
+    if web_search_key_file is not None:
+        web_options["web_search_key_file"] = web_search_key_file
+    if web_proxy_url is not None:
+        web_options["web_proxy_url"] = web_proxy_url
     facade = _create_agent_facade(
         model=facade_model,
         checkpoint_db=checkpoint_db,
@@ -1302,6 +1340,7 @@ def agent_chat(
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
         knowledge=facade_knowledge,
         _selection_requester="user",
+        **web_options,
     )
     _run_cli_async(
         _chat_facade_loop(
@@ -1311,6 +1350,7 @@ def agent_chat(
             previous_turn_id=effective_previous_turn_id,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
         )
     )
 
@@ -1391,6 +1431,16 @@ def agent_run(
         bool,
         typer.Option("--allow-execute-tools", help="预授权本次进程执行类调用"),
     ] = False,
+    allow_web_tools: Annotated[
+        bool, typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
+    ] = True,
+    web_proxy_url: Annotated[
+        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+    ] = None,
+    web_search_key_file: Annotated[
+        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+                                  help="工作区外的受保护 Brave Search 密钥文件"),
+    ] = None,
     disable_workspace_mcp: Annotated[
         bool,
         typer.Option(
@@ -1425,6 +1475,8 @@ def agent_run(
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
         enable_workspace_mcp=not disable_workspace_mcp,
+        web_search_key_file=web_search_key_file,
+        web_proxy_url=web_proxy_url,
         _selection_requester="user",
     )
     interactive_approval = not non_interactive and _is_interactive_terminal()
@@ -1441,6 +1493,7 @@ def agent_run(
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools,
             event_display=event_display,
         )
     )
@@ -1501,6 +1554,14 @@ def agent_resume(
         typer.Option("--input", help="clarification/choice 恢复时的用户输入"),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
+    web_proxy_url: Annotated[
+        str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
+    ] = None,
+    web_search_key_file: Annotated[
+        Path | None,
+        typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+                     help="工作区外、仅所有者可读的 Brave Search 密钥文件"),
+    ] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
     if turn_id is not None and last:
@@ -1534,11 +1595,17 @@ def agent_resume(
         if action == "abort"
         else _cli_turn(checkpoint_db, effective_turn_id)
     )
+    web_options: _WebOptions = {}
+    if web_search_key_file is not None:
+        web_options["web_search_key_file"] = web_search_key_file
+    if web_proxy_url is not None:
+        web_options["web_proxy_url"] = web_proxy_url
     facade = _create_agent_facade(
         model=None,
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
+        **web_options,
     )
     event_display = _CLIToolEventDisplay()
     if action is None:

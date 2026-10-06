@@ -355,7 +355,7 @@ def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: 
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed" and len(gateway.requests) == 1
         [compaction] = [i for i in store.list_items(turn.turn_id) if i.kind == "context_compaction"]
-        assert compaction.payload["algorithm_revision"] == "tool-output-elision-v4"
+        assert compaction.payload["algorithm_revision"] == "tool-output-elision-v5"
         projected = RolloutContextManager(store).build(turn.turn_id)
         for index in range(5):
             assert any(m.role == "assistant" and m.content == f"finding {index}" for m in projected)
