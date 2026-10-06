@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 
+import click
 import httpcore
 import pytest
+import typer.rich_utils
 from typer.testing import CliRunner
 
 from agent_runtime import Agent
@@ -149,10 +151,13 @@ async def test_agent_executor_fetch_uses_proxy_and_records_mode(tmp_path, monkey
 
 
 @pytest.mark.parametrize("command", ["chat", "run", "resume"])
-def test_cli_exposes_proxy_override(command):
+@pytest.mark.parametrize("force_terminal", [False, True])
+def test_cli_exposes_proxy_override(command, force_terminal, monkeypatch):
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(typer.rich_utils, "FORCE_TERMINAL", force_terminal)
     result = CliRunner().invoke(agent_app, [command, "--help"])
     assert result.exit_code == 0
-    assert "--web-proxy" in result.stdout
+    assert "--web-proxy" in click.unstyle(result.stdout)
 
 
 def test_proxy_failure_does_not_fall_back_to_direct(monkeypatch):
