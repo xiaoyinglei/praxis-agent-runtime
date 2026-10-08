@@ -144,6 +144,22 @@ environment and do not inherit those keys.
 
 ## Model configuration
 
+For direct DeepSeek CLI operation without the independent model service:
+
+```bash
+.venv/bin/python scripts/ubuntu/start-deepseek-chat.py
+```
+
+The first start prompts for the Key with terminal echo disabled and saves it to
+`~/.config/praxis/credentials/deepseek.key` (mode `0600`, directory `0700`, outside
+the workspace). Later starts read this file without prompting. Replace the Key
+explicitly with `--configure`. The launcher rejects unsafe files and passes the
+Key only through the model process environment, never command arguments; existing
+tool subprocess environment filtering still applies. A saved Key's format is
+checked locally; the provider authenticates each actual API request. This is the
+direct single-user CLI path; use the independent credential service below when
+separate OS identities are required.
+
 Inspect model IDs with `uv run agent model list --source`. The checked-in
 catalog currently defaults to `openai/gpt-oss-120b` via Groq and reads
 `GROQ_API_KEY`. Other configured providers read `DEEPSEEK_API_KEY`,
