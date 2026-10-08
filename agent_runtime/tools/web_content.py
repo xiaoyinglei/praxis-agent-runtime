@@ -199,6 +199,7 @@ def extract_content(
         published_at, published_at_source = _published_time(soup)
         if soup.title:
             title = soup.title.get_text(" ", strip=True)[:500]
+        fallback_html = ''.join(str(n) for n in soup.find_all(['nav', 'form', 'dialog', 'noscript']))
         for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
             comment.extract()
         for element in soup.find_all([
@@ -216,6 +217,10 @@ def extract_content(
             if _NOISE.search(re.sub(r"([a-z])([A-Z])", r"\1 \2", identity)):
                 element.decompose()
         root, extraction_method = _content_root(soup)
+        if not root.get_text(strip=True) and fallback_html:
+            # Preserve visible fallback text when the selected body has no text.
+            root = BeautifulSoup(fallback_html, 'html.parser')
+            extraction_method = 'visible_text_fallback'
         if extraction_method in {"paragraph_density", "trafilatura"}:
             for paragraph in list(root.find_all("p")):
                 text_length = len(paragraph.get_text(strip=True))
@@ -223,7 +228,7 @@ def extract_content(
                 if text_length > 20 and linked / text_length > 0.9:
                     paragraph.decompose()
         if not root.get_text(strip=True):
-            raise PublicWebError("web_content_empty", "No readable text was found in the HTML body.")
+            raise PublicWebError('web_content_empty', 'No extracted text was found.')
         found: list[dict[str, str]] = []
         terms = [term.casefold() for term in re.findall(r"[^\W_]+", title) if len(term) >= 4]
         related = [anchor for anchor in soup.find_all("a", href=True)
@@ -294,7 +299,7 @@ def extract_content(
         raise PublicWebError("web_content_unsupported", "This response content type is unsupported.")
     if not text.strip():
         raise PublicWebError(
-            "web_content_empty", "No readable text was found; the page may require JavaScript or authentication.",
+            "web_content_empty", "No extracted text was found.",
         )
     return ExtractedContent(title[:500], text[:max_characters], links, truncated or len(text) > max_characters,
                             published_at, published_at_source, extraction_method,

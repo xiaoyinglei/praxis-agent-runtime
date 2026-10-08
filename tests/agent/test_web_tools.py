@@ -63,7 +63,7 @@ async def test_fetch_preserves_code_links_and_reads_same_snapshot_without_networ
         assert second["links"][0]["url"] == "https://example.com/next"
         assert second["content_hash"] == first["content_hash"]
         assert len(requests) == 1
-        assert len(sources) == 1
+        assert len(sources) == 2
     finally:
         await client.aclose()
 
@@ -184,7 +184,7 @@ async def test_invalid_source_or_unsupported_content_is_error(tmp_path):
     try:
         for args, error in [
             ({"url": "https://example.com/bin"}, "web_content_unsupported"),
-            ({"source_id": "artifact_" + "0" * 32}, "web_source_unavailable"),
+            ({"source_id": "artifact_" + "f" * 32}, "web_source_unavailable"),
         ]:
             result = await tools["web_fetch"].run(args)
             assert result["error_code"] == error
@@ -229,7 +229,7 @@ def test_blank_pdf_is_not_reported_as_readable_content():
     with pymupdf.open() as doc:
         doc.new_page()
         data = doc.tobytes()
-    with pytest.raises(PublicWebError, match="No readable text"):
+    with pytest.raises(PublicWebError, match="No extracted text"):
         extract_content(data, "application/pdf", "https://example.com/scan.pdf")
 
 

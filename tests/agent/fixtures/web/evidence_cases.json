@@ -1,0 +1,133 @@
+[
+  {
+    "id": "city_only_search",
+    "provenance": "Minimal reproduction of server Bing result observed 2026-10-08; synthetic HTML, not an original response capture.",
+    "tool": "web_search",
+    "arguments": {
+      "query": "北京 Agent 开发工程师 招聘 大模型"
+    },
+    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://www.beijing.gov.cn/'>北京市人民政府</a></h2><div class='b_caption'><p>北京城市概况</p></div></li></ol>",
+    "expected": {
+      "error_code": null,
+      "result_status": "results"
+    },
+    "is_error": false
+  },
+  {
+    "id": "ignored_site_restriction",
+    "provenance": "Synthetic counterexample: a hostname mentioned in a URL query does not satisfy site:.",
+    "tool": "web_search",
+    "arguments": {
+      "query": "site:zhipin.com 北京 Agent 招聘"
+    },
+    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://example.com/?next=zhipin.com'>北京 Agent 招聘</a></h2><div class='b_caption'><p>岗位</p></div></li></ol>",
+    "expected": {
+      "error_code": null,
+      "result_status": "results"
+    },
+    "is_error": false
+  },
+  {
+    "id": "loading_shell",
+    "provenance": "Minimal loading-shell reproduction of BOSS response observed 2026-10-08; synthetic HTML.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/jobs"
+    },
+    "html": "<html><body><div id='app'>加载中，请稍候</div><script src='/app.js'></script></body></html>",
+    "expected": {
+      "error_code": null
+    },
+    "is_error": false,
+    "raw_contains": "<html><body><div id='app'>加载中，请稍候</div><script src='/app.js'></script></body></html>",
+    "content_contains": "加载中，请稍候"
+  },
+  {
+    "id": "login_shell",
+    "provenance": "Synthetic access barrier.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/jobs"
+    },
+    "html": "<main><h1>Sign in to continue</h1><form><input type='password'></form></main>",
+    "expected": {
+      "error_code": null
+    },
+    "is_error": false,
+    "raw_contains": "<main><h1>Sign in to continue</h1><form><input type='password'></form></main>",
+    "content_contains": "Sign in to continue"
+  },
+  {
+    "id": "navigation_leads",
+    "provenance": "Synthetic index: links are usable discovery leads, without being verified job details.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/jobs"
+    },
+    "html": "<main><a href='/job/1'>北京 Agent 工程师</a><a href='/job/2'>昆明 Python 工程师</a></main>",
+    "expected": {
+      "error_code": null
+    },
+    "is_error": false,
+    "raw_contains": "<main><a href='/job/1'>北京 Agent 工程师</a><a href='/job/2'>昆明 Python 工程师</a></main>",
+    "content_contains": "北京 Agent 工程师"
+  },
+  {
+    "id": "short_valid_document",
+    "provenance": "Synthetic short documentation counterexample.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/api"
+    },
+    "html": "<main><h1>API</h1><p>Use GET /v1.</p></main>",
+    "expected": {
+      "error_code": null
+    },
+    "is_error": false,
+    "raw_contains": "<main><h1>API</h1><p>Use GET /v1.</p></main>",
+    "content_contains": "Use GET /v1."
+  },
+  {
+    "id": "valid_document_with_noscript",
+    "provenance": "Synthetic short document with an optional JavaScript notice; static body is usable.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/api"
+    },
+    "html": "<main><h1>API</h1><p>Use GET /v1.</p></main><noscript>Please enable JavaScript for enhanced navigation.</noscript>",
+    "expected": {
+      "error_code": null
+    },
+    "is_error": false,
+    "raw_contains": "<main><h1>API</h1><p>Use GET /v1.</p></main><noscript>Please enable JavaScript for enhanced navigation.</noscript>",
+    "content_contains": "Use GET /v1."
+  },
+  {
+    "id": "boolean_query",
+    "provenance": "Synthetic query-language counterexample; backend interprets OR.",
+    "tool": "web_search",
+    "arguments": {
+      "query": "Python OR Rust"
+    },
+    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://docs.python.org/'>Python documentation</a></h2><div class='b_caption'><p>Python language</p></div></li></ol>",
+    "expected": {
+      "error_code": null,
+      "result_status": "results"
+    },
+    "is_error": false
+  },
+  {
+    "id": "empty_extraction",
+    "provenance": "Synthetic empty extracted text, with raw response retained.",
+    "tool": "web_fetch",
+    "arguments": {
+      "url": "https://example.com/empty"
+    },
+    "html": "<body><script src=\"/app.js\"></script></body>",
+    "expected": {
+      "error_code": "web_content_empty"
+    },
+    "is_error": true,
+    "raw_contains": "<script src=\"/app.js\"></script>"
+  }
+]

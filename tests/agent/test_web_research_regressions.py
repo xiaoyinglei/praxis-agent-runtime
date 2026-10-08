@@ -63,7 +63,7 @@ async def test_fetch_budget_keeps_complete_cursor_and_never_loses_long_line_tail
             assert len(output['content'].encode()) <= 4096
             seen += output['content']
         assert 'TAIL' in seen
-        assert len(hits) == len(sources) == 1
+        assert len(hits) == 1 and len(sources) == 2
     finally:
         await client.aclose()
 
@@ -78,13 +78,14 @@ async def test_repeated_url_reuses_snapshot_and_does_not_repeat_network(tmp_path
         second = await tools['web_fetch'].run({'url': 'https://example.com/doc'})
         assert first['source_id'] == second['source_id']
         assert second['network_bytes'] == 0
-        assert len(hits) == len(sources) == 1
+        assert len(hits) == 1 and len(sources) == 2
     finally:
         await client.aclose()
 
 
 @pytest.mark.anyio
-async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extraction_error", [False, True])
+async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, monkeypatch, extraction_error):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
     from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
@@ -95,7 +96,9 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
     real_client = http_module.PublicWebClient
     monkeypatch.setattr(http_module, 'PublicWebClient', lambda **options: real_client(
         **options, transport=httpx.MockTransport(
-        lambda _: httpx.Response(200, text='evidence line\n' * 2000, headers={'content-type': 'text/plain'}))))
+        lambda _: httpx.Response(200, text='<body><script></script></body>' if extraction_error
+                                else 'evidence line\n' * 2000,
+                                headers={'content-type': 'text/html' if extraction_error else 'text/plain'}))))
     database = tmp_path / 'state.sqlite'
     model = FetchThenAnswer({'url': 'https://example.com/doc', 'max_lines': 500})
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
@@ -105,27 +108,55 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
         item = next(i for i in store.list_items(result.turn_id) if i.kind == 'tool_result')
         expected = item.payload['structured_content']
         thread, turn = start(store, tmp_path)
+        if extraction_error:
+            from tests.agent.harness.test_tool_result_elision import exchange
+            exchange(store, turn.turn_id, 'prior', 'Prior inspection. ' * 3000)
         seed(store, turn_id=turn.turn_id, kind='model_response', payload={
             'text': '', 'tool_calls': [{'id': item.payload['tool_call_id'], 'name': 'web_fetch',
                                      'arguments': {'url': 'https://example.com/doc'}}],
         })
         seed(store, turn_id=turn.turn_id, kind='tool_result', payload=dict(item.payload))
-        manager = RolloutContextManager(store, max_total_bytes=5000)
+        manager = RolloutContextManager(store, max_total_bytes=8000 if extraction_error else 5000)
+        if extraction_error:
+            digest, _ = manager.semantic_source(turn.turn_id)
+            manager.commit_compaction(manager.semantic_candidate(
+                turn.turn_id, source_hash=digest, summary='Earlier inspection and webpage extraction failed.',
+            ))
         # Replay through real request admission, rather than testing only a helper.
         wire_model, gateway = model_for(20000)
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=wire_model,
                               context_manager=manager, completion_gate=Accept())
         _, prepared = await runner._prepare_compacted_step(runner.restore_turn_context(turn.turn_id), step=3)
-        message = next(m for m in prepared.request_ref['step_snapshot']['messages'] if m['role'] == 'tool')
-        data = json.loads(message['content'])['structured_content']
+        messages = prepared.request_ref['step_snapshot']['messages']
+        if extraction_error:
+            visible = str(messages)
+            assert expected['source_id'] in visible and expected['error_message'] in visible
+            contexts = [json.loads(m['content'].removeprefix('Context compaction:\n'))
+                        for m in messages if m['role'] == 'context']
+            data = next(ref for context in contexts for ref in context.get('artifact_refs', [])
+                        if ref.get('source_id') == expected['source_id'])
+            assert data['item_id'].startswith('item_')
+        else:
+            message = next(m for m in messages if m['role'] == 'tool')
+            data = json.loads(message['content'])['structured_content']
         for key in ['source_id', 'url', 'source_truncated', 'content_hash']:
             assert data[key] == expected[key]
-        assert data['truncated'] is True
-        assert data['fetch_next_line'] == expected['next_line']
-        assert data['next_line'] <= expected['next_line']
-        assert 'item_' in message['content'] and data['source_id'].startswith('artifact_')
+        if extraction_error:
+            for key in ['error_code', 'error_message', 'render_mode', 'connection_mode', 'failure_stage']:
+                assert data[key] == expected[key]
+            assert data['error_code'] == 'web_content_empty'
+        else:
+            assert data['truncated'] is True
+            assert data['fetch_next_line'] == expected['next_line']
+            assert data['next_line'] <= expected['next_line']
+        if not extraction_error:
+            assert 'item_' in message['content']
+        assert data['source_id'].startswith('artifact_')
         assert item.payload == store.read_item(item.item_id).payload
-        assert not gateway.requests
+        if extraction_error:
+            assert all(":context-summary:" in request.request_id for request in gateway.requests)
+        else:
+            assert not gateway.requests
         assert store.verify().valid
 
 
@@ -149,7 +180,7 @@ async def test_find_in_snapshot_locates_evidence_without_refetching(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_search_reports_lexical_mismatch_and_unverified_freshness(tmp_path):
+async def test_search_retains_backend_results_and_unverified_freshness(tmp_path):
     hits = []
     body = '<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/mineral">水晶矿物</a>' \
            '</h2><div class="b_caption"><p>石英百科介绍</p></div></li></ol>'
@@ -157,7 +188,7 @@ async def test_search_reports_lexical_mismatch_and_unverified_freshness(tmp_path
         200, text=body, headers={'content-type': 'text/html'}))
     try:
         first = await tools['web_search'].run({'query': '水晶光电 最新消息', 'freshness': 'pw'})
-        assert first['result_status'] == 'possible_low_relevance'
+        assert first['result_status'] == 'results'
         assert first['freshness_verified'] is False
         assert first['freshness_requested'] == 'pw'
         again = await tools['web_search'].run({'query': '水晶光电 最新消息', 'freshness': 'pw'})
@@ -207,7 +238,7 @@ def test_paragraph_document_discards_link_only_promotions_and_qr_widgets():
 
 
 @pytest.mark.anyio
-async def test_query_variants_that_return_identical_sources_report_no_new_evidence(tmp_path):
+async def test_query_variants_report_identical_results_as_execution_fact(tmp_path):
     body = '<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/page">Unrelated</a>' \
            '</h2><div class="b_caption"><p>Same snippet</p></div></li></ol>'
     tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
@@ -217,7 +248,9 @@ async def test_query_variants_that_return_identical_sources_report_no_new_eviden
         second = await tools['web_search'].run({'query': 'another query'})
         assert second['result_status'] == 'repeated_results'
         assert second['previous_query'] == 'different first query'
-        assert second['results'] == []
+        assert len(second['results']) == 1
+        assert second['results'][0]['url'] == 'https://example.com/page'
+        assert 'warning' not in second and 'missing_query_terms' not in second['results'][0]
     finally:
         await client.aclose()
 

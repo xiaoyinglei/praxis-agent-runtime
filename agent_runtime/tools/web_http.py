@@ -12,9 +12,10 @@ import ipaddress
 import socket
 import ssl
 import zlib
-from collections.abc import AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import Any
 from urllib.request import proxy_bypass_environment  # type: ignore[attr-defined]
 
 import httpcore
@@ -31,6 +32,7 @@ class PublicWebError(Exception):
             "invalid_url": "url_validation", "network_error": "connect", "timeout": "request",
         }.get(code, "response_processing")
         self.connection_mode = "unknown"
+        self.render_diagnostics: Mapping[str, Any] | None = None
         super().__init__(message)
 
 
@@ -110,6 +112,10 @@ class FetchedResponse:
     body: bytes
     network_bytes: int
     connection_mode: str = "direct"
+    warning: str | None = None
+    response_headers: Mapping[str, str] | None = None
+    render_diagnostics: Mapping[str, Any] | None = None
+    status_code: int = 200
 
 
 # Matches httpcore's public backend signature, without importing private modules.
@@ -370,7 +376,15 @@ class PublicWebClient:
         url: str,
         headers: Mapping[str, str] | None = None,
         allow_redirects: bool = True,
+        *,
+        request_budget: Callable[[], None] | None = None,
+        byte_budget: Callable[[int, int], None] | None = None,
+        max_response_bytes: int | None = None,
     ) -> FetchedResponse:
+        """GET with optional trusted per-response limits; the client's default is unchanged."""
+        response_limit = self._max_bytes if max_response_bytes is None else max_response_bytes
+        if response_limit < 1:
+            raise ValueError('Response byte limit must be positive.')
         target = validate_public_url(url)
         request_headers = httpx.Headers(headers)
         request_headers["Accept-Encoding"] = "gzip, identity"
@@ -378,7 +392,8 @@ class PublicWebClient:
         token = _progress.set(progress)
         try:
             async with asyncio.timeout(self._timeout):
-                return await self._get(target, request_headers, allow_redirects)
+                return await self._get(target, request_headers, allow_redirects, request_budget, byte_budget,
+                                       response_limit)
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
             failure = PublicWebError("timeout", "The public HTTP request exceeded its deadline.")
             failure.failure_stage, failure.connection_mode = progress.stage, progress.mode
@@ -390,9 +405,15 @@ class PublicWebClient:
         finally:
             _progress.reset(token)
 
-    async def _get(self, target: httpx.URL, headers: httpx.Headers, allow_redirects: bool) -> FetchedResponse:
+    async def _get(
+        self, target: httpx.URL, headers: httpx.Headers, allow_redirects: bool,
+        request_budget: Callable[[], None] | None, byte_budget: Callable[[int, int], None] | None,
+        response_limit: int,
+    ) -> FetchedResponse:
         wire_bytes = 0
         for redirects in range(self._max_redirects + 1):
+            if request_budget is not None:
+                request_budget()
             # Own redirects and raw decoding rather than using HTTPX's client,
             # which eagerly parses Location even when redirects are disabled.
             request = httpx.Request(
@@ -457,8 +478,18 @@ class PublicWebClient:
                 if not 200 <= response.status_code < 300:
                     raise PublicWebError("http_error", f"The remote server returned HTTP {response.status_code}.")
                 _stage("http_response")
-                body, wire_bytes = await self._read_body(response, wire_bytes)
-                return FetchedResponse(str(target), response.headers.get("Content-Type", ""), body, wire_bytes, mode)
+                body, wire_bytes = await self._read_body(response, wire_bytes, byte_budget, response_limit)
+                # The browser broker serves already decoded bytes. Forward only
+                # real, bounded CORS metadata; never cookies or Content-Encoding.
+                cors_headers = {
+                    name: value for name in (
+                        "access-control-allow-origin", "access-control-allow-credentials",
+                        "access-control-expose-headers",
+                    ) if (value := response.headers.get(name)) is not None
+                    and len(value) <= 1024 and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+                }
+                return FetchedResponse(str(target), response.headers.get("Content-Type", ""), body, wire_bytes, mode,
+                                       response_headers=cors_headers, status_code=response.status_code)
             except PublicWebError as error:
                 error.connection_mode = mode
                 raise
@@ -471,7 +502,12 @@ class PublicWebClient:
                 await response.aclose()
         raise AssertionError("Redirect loop must return or raise.")
 
-    async def _read_body(self, response: httpx.Response, wire_bytes: int) -> tuple[bytes, int]:
+    async def _read_body(
+        self, response: httpx.Response, wire_bytes: int,
+        byte_budget: Callable[[int, int], None] | None = None,
+        response_limit: int | None = None,
+    ) -> tuple[bytes, int]:
+        limit = self._max_bytes if response_limit is None else response_limit
         encoding = response.headers.get("Content-Encoding", "identity").lower().strip()
         if encoding not in {"", "identity", "gzip"}:
             raise PublicWebError("unsupported_encoding", "The response uses an unsupported content encoding.")
@@ -483,19 +519,25 @@ class PublicWebClient:
                 raise PublicWebError("invalid_encoding", "The compressed response is not a raw byte stream.")
             content = response.content
             wire_bytes += len(content)
-            if wire_bytes > self._max_bytes:
+            if byte_budget is not None:
+                byte_budget(len(content), len(content))
+            if wire_bytes > limit:
                 raise PublicWebError("response_too_large", "The response exceeds the byte limit.")
             return content, wire_bytes
         body = bytearray()
         try:
             async for chunk in response.aiter_raw():
                 wire_bytes += len(chunk)
-                if wire_bytes > self._max_bytes:
+                if byte_budget is not None:
+                    byte_budget(len(chunk), 0)
+                if wire_bytes > limit:
                     raise PublicWebError("response_too_large", "The response exceeds the byte limit.")
                 if decoder is not None:
-                    chunk = decoder.decompress(chunk, self._max_bytes - len(body) + 1)
+                    chunk = decoder.decompress(chunk, limit - len(body) + 1)
+                if byte_budget is not None:
+                    byte_budget(0, len(chunk))
                 body.extend(chunk)
-                if len(body) > self._max_bytes:
+                if len(body) > limit:
                     raise PublicWebError("response_too_large", "The response exceeds the byte limit.")
             if decoder is not None and (not decoder.eof or decoder.unused_data):
                 raise PublicWebError("invalid_encoding", "The gzip response is incomplete or malformed.")

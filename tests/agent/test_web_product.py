@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 
 import httpx
@@ -54,11 +55,18 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     assert model.requests[0].binding_manifest["tool_execution_policy"]["allow_web_tools"] is True
     with RolloutStore(database) as store:
         artifacts = store.list_artifacts(result.turn_id)
-        assert len(artifacts) == 1
-        source = json.loads(store.read_artifact(artifacts[0].artifact_id))
+        assert len(artifacts) == 2
+        tool_output = next(i.payload['structured_content'] for i in store.list_items(result.turn_id)
+                           if i.kind == 'tool_result')
+        source_id = tool_output['source_id']
+        source = json.loads(store.read_artifact(source_id))
+        original = next(json.loads(store.read_artifact(a.artifact_id)) for a in artifacts
+                        if a.artifact_id != source_id)
+        assert original['extraction_method'] == 'not_attempted'
+        assert base64.b64decode(original['raw_body_base64']) == b'line one\nline two'
         assert source["text"] == "line one\nline two"
         assert store.verify().valid
-    model2 = FetchThenAnswer({"source_id": artifacts[0].artifact_id, "start_line": 2})
+    model2 = FetchThenAnswer({"source_id": source_id, "start_line": 2})
     agent2 = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent2, "_harness_model", lambda: model2)
     restored = await agent2.run("Continue saved source", require_workspace_change=False)
@@ -70,7 +78,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
         assert outputs[0]["is_error"] is False
         assert "line two" in outputs[0]["structured_content"]["content"]
     other = Agent(workspace_path=tmp_path / "other-workspace", checkpoint_db=database, enable_workspace_mcp=False)
-    monkeypatch.setattr(other, "_harness_model", lambda: FetchThenAnswer({"source_id": artifacts[0].artifact_id}))
+    monkeypatch.setattr(other, "_harness_model", lambda: FetchThenAnswer({"source_id": source_id}))
     denied = await other.run("Read another workspace snapshot", require_workspace_change=False)
     with RolloutStore(database) as store:
         outputs = [item.payload for item in store.list_items(denied.turn_id) if item.kind == "tool_result"]
