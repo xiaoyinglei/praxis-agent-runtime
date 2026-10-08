@@ -403,8 +403,32 @@ access, and approval are separate controls.
 `web_fetch` opens public HTTP(S) URLs on Linux and macOS. It reads HTML,
 UTF-8 text/Markdown/source code and JSON; PDF text extraction is available on Linux
 with worker memory limits, up to 20 pages. A GitHub page or raw file is one
-possible source. Login and JavaScript-only pages may return a clear reading
-error; these tools do not include an interactive browser or clone repositories.
+possible source. Results report actual extraction errors, truncation, source
+identity and read mode. Bounded responses are saved before extraction, so failed
+extractions remain inspectable through `view="raw"`.
+
+URL fetches accept `render=true` for optional Chromium execution. Install with
+`uv sync --extra browser` and `uv run --extra browser playwright install --only-shell chromium`.
+Linux also needs `bwrap`, working unprivileged namespaces and Chromium's native
+shared libraries. The Playwright installer can install those system libraries
+with `playwright install --with-deps --only-shell chromium`; this changes system
+packages and is a separate environment setup step. The renderer denies
+direct IP networking and brokers public GETs through the existing HTTP client;
+it blocks POST, service workers, WebSockets, popups and downloads. Text snapshots
+skip image, font and media resources. Rendering has
+a 30-second overall deadline, 64 HTTP requests, 8 MB network/decode limits and a
+2 MB DOM limit. Script resources may use the total 8 MB response budget;
+documents retain the ordinary HTTP response limit. Missing or incompatible
+isolation returns `web_browser_unavailable`.
+Failed or blocked public script, style and data subrequests preserve an acquired
+DOM with concrete diagnostics. Main-document, isolation and worker-protocol
+failures remain errors. Cross-origin reads retain the server's bounded CORS
+headers and remain subject to Chromium's CORS checks.
+macOS reports unavailability before starting a browser because Chromium cannot
+start inside the required outer network sandbox. Verify Linux installation with
+the explicit integration tests below; dependency installation alone does not
+establish working dynamic-page support. This is a snapshot reader, not
+an interactive browser or a login capability.
 
 Direct reads validate every DNS answer, then try at most eight distinct public
 addresses when TCP or TLS setup fails. DNS, TCP, TLS, redirects and response
@@ -449,7 +473,8 @@ The model receives extracted main text, source URLs, hashes and immutable
 `source_id` snapshots. `published_at` is an optional page-declared publication
 date; `fetched_at` is retrieval time. Neither a successful fetch nor a search
 freshness preference establishes that a source is the latest available news.
-Low-relevance and repeated-result diagnostics expose upstream search limitations.
+Search preserves the backend query and leads without judging semantic relevance.
+Identical title/URL/snippet lists across queries report `previous_query`.
 
 The default excerpt budget is 12,000 bytes (`max_bytes=4096..16000`), with at most
 8 links. Full extracted text stays in the artifact. Numbered lines wrap long
@@ -463,15 +488,53 @@ never be converted into a webpage `source_id`.
 Saved sources remain readable after a restart within the same workspace and
 checkpoint store, with hash verification. Within an active Turn, repeated URLs
 reuse a snapshot; `refresh=true` explicitly refetches. Repeated searches reuse
-results, and identical results across query variants are reported without
-resending the whole list. This URL/query cache is local to the active Session;
+results, and identical results across query variants retain the leads with a
+`previous_query` reference. HTTP and rendered snapshots use distinct cache entries.
+This URL/query cache is local to the active Session;
 cross-process continuation uses the persisted `source_id`. `source_truncated`
 means the extraction limit was reached; continuation cannot recover discarded
 content. Link labels and snippets are discovery leads until the linked body is
-read. Login, JavaScript-only pages and unfamiliar DOM layouts remain limitations.
+read. The query is passed unchanged to the backend; tools do not parse query
+language or classify pages by login/loading text or navigation proportions.
+Received bounded responses are archived before parsing. Extraction errors retain
+a source ID for `view=raw` inspection, and empty extracted text reports only
+that fact. Legacy quality labels remain parseable but do not control reads.
+Context references preserve source identity, cursors, read mode, archive item ID
+and actual errors. Upstream search ranking and unfamiliar DOM layouts remain
+limitations.
 
 Run `uv run python scripts/agent_web_quality.py` for the fixed-page extraction,
-model-output budget, evidence-retention and continuation acceptance checks.
+model-output budget, evidence-retention and continuation acceptance checks,
+including raw evidence after extraction failure and query/page counterexamples.
+These deterministic checks do not establish real-model task completion.
+Manual paired real-model trials use the public SDK and reuse the code benchmark's
+subprocess cleanup, diffs and redacted logs. They are separate from its frozen
+manifest and fast CI. Prepare a local baseline snapshot, then run:
+
+```bash
+git archive HEAD agent_runtime rag configs scripts | tar -x -C /absolute/baseline-snapshot
+uv run python scripts/agent_web_task_trials.py --baseline /absolute/baseline-snapshot \
+  --output /absolute/trial-results --trials 2
+```
+
+Create the baseline directory first. The runner uses configured `deepseek-flash`,
+fixed permissions and budgets, and controlled HTTP fixtures with a real model.
+It checks actual output values and code behavior independently, records runtime
+budget exhaustion separately from provider/network failure, and preserves source
+hashes and checkpoints. macOS dynamic rendering is recorded as unavailable.
+These trials do not establish open-internet search quality or Linux browser task
+completion with a real model. Search backends require separate live inspection.
+CI runs this acceptance separately from the deterministic SDK smoke.
+Rendering reports concrete blocked subactions and resource counts while retaining
+an acquired DOM, including when a load-state deadline expires. Missing main
+documents, invalid worker messages and unavailable isolation remain failures.
+The overall deadline kills the worker and its descendants. Request and byte
+limits remain fixed. Browser requests do not forward cookies, authorization or
+Origin headers; bounded server CORS response headers are preserved as received.
+No CORS permission is fabricated. A server requiring an Origin request header
+may therefore behave differently from an ordinary browser.
+Run browser isolation/integration tests explicitly with
+`PRAXIS_TEST_BROWSER=1 uv run --extra browser pytest -q tests/agent/test_web_browser.py`.
 
 Authorization applies to these two built-in tools. With `--no-web-tools`, or
 without SDK authorization, network calls

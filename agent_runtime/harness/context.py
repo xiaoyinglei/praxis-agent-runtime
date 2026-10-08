@@ -852,7 +852,7 @@ def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str |
 
 
 def _web_source_reference(item: ItemSnapshot, projected_content: str | None = None) -> dict[str, Any] | None:
-    if item.kind != "tool_result" or item.payload.get("is_error"):
+    if item.kind != "tool_result":
         return None
     source = item.payload.get("structured_content")
     if source is None:
@@ -860,7 +860,17 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
             source = json.loads(item.payload.get("model_content", "")).get("structured_content")
         except (ValueError, AttributeError, TypeError):
             return None
-    if not isinstance(source, Mapping) or not isinstance(source.get("source_id"), str):
+    if not isinstance(source, Mapping):
+        return None
+    if isinstance(source.get('query'), str) and isinstance(source.get('provider'), str):
+        return {'item_id': item.item_id, 'kind': 'search_leads',
+                **{key: source[key] for key in ('query', 'provider', 'result_status', 'previous_query',
+                                               'freshness_requested', 'freshness_verified', 'error_code',
+                                               'error_message', 'connection_mode', 'failure_stage',
+                                               'cache_hit', 'results_truncated')
+                   if key in source},
+                'is_error': bool(item.payload.get('is_error'))}
+    if not isinstance(source.get("source_id"), str):
         return None
     if not source["source_id"].startswith("artifact_") or not source.get("url"):
         return None
@@ -880,4 +890,6 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
         "start_line", "next_line", "fetch_next_line", "context_truncated", "total_lines",
         "source_truncated", "truncated",
         "view", "line_basis", "section_id", "next_section", "next_link",
-    ) if key in source}}
+        "warning", "extraction_method", "connection_mode", "failure_stage", "render_mode",
+        "render_diagnostics", "error_code", "error_message",
+    ) if key in source}, 'is_error': bool(item.payload.get('is_error'))}

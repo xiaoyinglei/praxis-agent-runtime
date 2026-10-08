@@ -137,7 +137,7 @@ async def test_outline_section_links_and_raw_views_share_one_verified_snapshot(t
         saved = json.loads(sources[first['source_id']])
         assert base64.b64decode(saved['raw_body_base64']).decode() == body
         assert saved['version'] == 2
-        assert len(hits) == len(sources) == 1
+        assert len(hits) == 1 and len(sources) == 2
     finally:
         await client.aclose()
 

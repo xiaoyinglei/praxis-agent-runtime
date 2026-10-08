@@ -149,6 +149,49 @@ async def measure(extractor: Any, web_module: Any) -> dict[str, Any]:
     return records
 
 
+async def measure_evidence_cases() -> dict[str, Any]:
+    """Deterministic evidence contracts; this is not a real-model task evaluation."""
+    cases = json.loads((FIXTURES / 'evidence_cases.json').read_text())
+    records = {}
+    for case in cases:
+        body = case['html'].encode()
+        blobs: dict[str, bytes] = {}
+        def save(content: bytes, target: dict[str, bytes] = blobs) -> str:
+            identity = f'artifact_{len(target):032x}'
+            target[identity] = content
+            return identity
+        client = PublicWebClient(transport=httpx.MockTransport(lambda _, data=body: httpx.Response(
+            200, content=data, headers={'content-type': 'text/html'})))
+        try:
+            tools = web.create_web_tools(client, save_source=save, load_source=blobs.__getitem__)
+            executor = ToolExecutor({tool.definition.name: tool for tool in tools})
+            name = case['tool']
+            origin = ToolCallOrigin('quality', 'quality', (name,))
+            result = await executor.execute(ToolCall(case['id'], name, case['arguments'], origin),
+                                            context=ToolExecutionContext(allow_web_tools=True))
+            envelope = json.loads(tool_result_message(result.result).content)
+            output = envelope['structured_content']
+            for key, expected in case['expected'].items():
+                assert output.get(key) == expected, (case['id'], key, output)
+            assert result.result.is_error == case['is_error'], (case['id'], result.result)
+            assert 'content_status' not in output and 'missing_query_terms' not in output
+            if case.get('content_contains'):
+                assert case['content_contains'] in output['content'], (case['id'], output)
+            if output.get('source_id'):
+                snapshot = json.loads(blobs[output['source_id']])
+                assert 'content_status' not in snapshot
+                raw = await next(t for t in tools if t.definition.name == 'web_fetch').run({
+                    'source_id': output['source_id'], 'view': 'raw',
+                })
+                assert raw['error_code'] is None
+                assert case['raw_contains'] in raw['content'], (case['id'], raw)
+            records[case['id']] = {'passed': True, 'expected': case['expected'],
+                                   'is_error': result.result.is_error}
+        finally:
+            await client.aclose()
+    return records
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument('--before-dir', type=Path)
@@ -157,6 +200,8 @@ async def main() -> None:
     extractor, module = load_before(args.before_dir) if args.before_dir else (extract_content, web)
     records = await measure(extractor, module)
     result = {'tokenizer': ACCOUNTING.budget_count_source(), 'pages': records}
+    if not args.before_dir:
+        result['evidence_cases'] = await measure_evidence_cases()
     if args.before_dir:
         result['baseline_source_sha256'] = {
             p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in args.before_dir.glob('*.py')

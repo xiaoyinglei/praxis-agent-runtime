@@ -36,6 +36,13 @@ jobs:
         run: uv run mypy
       - name: Pytest
         run: uv run pytest -q
+      - name: Web evidence quality acceptance
+        run: uv run python scripts/agent_web_quality.py
+      - name: Chromium evidence and isolation acceptance
+        run: |
+          uv sync --locked --extra browser
+          uv run --extra browser playwright install --with-deps --only-shell chromium
+          PRAXIS_TEST_BROWSER=1 uv run --extra browser pytest -q tests/agent/test_web_browser.py
       - name: Model service isolation smoke
         run: |
           smoke_wheels="$RUNNER_TEMP/praxis-model-wheels"

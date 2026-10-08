@@ -1,0 +1,37 @@
+[
+  {
+    "id": "code_change",
+    "instruction": "Implement parse_pair(text) in pairs.py: split once at the first colon, strip both sides, and raise ValueError when the colon is absent or either side is empty. Run focused verification before finishing.",
+    "files": {"pairs.py": "def parse_pair(text):\n    raise NotImplementedError\n"},
+    "write": true,
+    "expected": null
+  },
+  {
+    "id": "research",
+    "instruction": "Read https://example.com/releases/a and https://example.com/releases/b. Return only a JSON object mapping each release name to its declared support months, with integer values.",
+    "pages": {
+      "/releases/a": "<article><h1>Juniper</h1><p>Juniper support lasts 17 months.</p></article>",
+      "/releases/b": "<article><h1>Cedar</h1><p>Cedar support lasts 29 months.</p></article>"
+    },
+    "expected": {"Juniper": 17, "Cedar": 29}
+  },
+  {
+    "id": "directory",
+    "instruction": "Read the documentation directory https://example.com/docs/. Return only a JSON object mapping its three document labels to their absolute destination URLs.",
+    "pages": {"/docs/": "<nav><a href='/docs/intro'>Introduction</a><a href='/docs/api'>API</a><a href='/docs/config'>Configuration</a></nav>"},
+    "expected": {"Introduction": "https://example.com/docs/intro", "API": "https://example.com/docs/api", "Configuration": "https://example.com/docs/config"}
+  },
+  {
+    "id": "blocked_recovery",
+    "instruction": "Inspect https://example.com/broken.json as received even if normal extraction fails. Identify the literal ticket value from the raw response. Return only JSON with key ticket and that string value; do not repair the response.",
+    "pages": {"/broken.json": "{\"ticket\": \"Q7-amber-492\", invalid JSON}"},
+    "expected": {"ticket": "Q7-amber-492"}
+  },
+  {
+    "id": "dynamic_read",
+    "instruction": "Read https://example.com/dynamic with JavaScript rendering and return only JSON with key reading and the displayed value. If this environment cannot render, explain the actual capability limitation; do not guess the value.",
+    "pages": {"/dynamic": "<html><body><main id='v'>Loading</main><script>document.querySelector('#v').textContent='iris-638'</script></body></html>"},
+    "requires_browser": true,
+    "expected": {"reading": "iris-638"}
+  }
+]

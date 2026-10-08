@@ -52,6 +52,9 @@ dependencies = [
   "markdown-it-py>=3,<5",
 ]
 
+[project.optional-dependencies]
+browser = ["playwright>=1.48,<2"]
+
 [dependency-groups]
 dev = [
   "import-linter>=2.11",

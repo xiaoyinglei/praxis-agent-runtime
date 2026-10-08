@@ -273,6 +273,25 @@ class TurnExecutor:
         if self._prepare_binding is not None:
             await self._prepare_binding(step.binding_manifest)
         prepared = self._model.prepare(step.model_request())
+        remaining = step.model_token_budget_remaining
+        if (
+            step.purpose == "agent_step"
+            and step.budget_pressure
+            and step.compaction_plan is None
+            and remaining is not None
+            and prepared.resource_request.total_tokens > remaining
+        ):
+            # Ordinary completion must fit the Turn's remaining capacity. Keep
+            # joint summary/continuation plans intact and leave the atomic
+            # dispatch reservation authoritative. Reprepare so wire, hashes,
+            # pricing and the durable snapshot all use the same output cap.
+            output_limit = remaining - prepared.resource_request.input_tokens
+            if output_limit < 1:
+                raise ContextBudgetExceededError("No output capacity remains after measuring the model input.")
+            step = replace(step, output_token_limit=min(prepared.resource_request.output_tokens, output_limit))
+            prepared = self._model.prepare(step.model_request())
+            if prepared.resource_request.total_tokens > remaining:
+                raise ContextBudgetExceededError("The capped model request exceeds the remaining Turn budget.")
         if step.request_id is not None and step.request_id.endswith(":context-retry:1"):
             prepared = replace(prepared, resource_request=replace(prepared.resource_request, retries=1))
         snapshot = {
