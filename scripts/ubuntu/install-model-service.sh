@@ -7,6 +7,21 @@ if [[ "$EUID" != 0 ]]; then
   exit 1
 fi
 source_root="$(cd -- "${1:?Usage: install-model-service.sh /path/to/reviewed/praxis}" && pwd -P)"
+model_cache=/var/cache/praxis-model-pip
+# The privileged installer never consumes an Agent/user-writable wheel cache.
+/usr/bin/python3 -I - "$model_cache" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+cache = Path(sys.argv[1])
+if cache.is_symlink():
+    raise SystemExit('Model wheel cache must not be a symlink.')
+if cache.exists():
+    info = cache.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+        raise SystemExit('Model wheel cache must be root-owned and not writable by other users.')
+PY
 for destination in /opt/praxis /etc/praxis-model /etc/systemd/system/praxis-model.service /usr/local/bin/praxis-agent /usr/local/bin/praxis /var/lib/praxis-model /var/lib/praxis-agent /var/lib/private/praxis-model; do
   if [[ -e "$destination" || -L "$destination" ]]; then
     echo "Initial installation refuses existing destination: $destination" >&2
@@ -35,8 +50,9 @@ done
 install -m 0644 "$source_root/scripts/ubuntu/requirements-model-service.txt" /opt/praxis/requirements-model-service.txt
 # Dedicated OS interpreter, fresh venv, immutable locked wheels; never copy editable Agent hooks here.
 /usr/bin/python3 -I -m venv /opt/praxis/model-venv
+install -d -m 0700 -o root -g root "$model_cache"
 /opt/praxis/model-venv/bin/python -I -m pip --isolated --disable-pip-version-check install \
-  --no-cache-dir --index-url https://pypi.org/simple --require-hashes --only-binary=:all: \
+  --cache-dir "$model_cache" --index-url https://pypi.org/simple --require-hashes --only-binary=:all: \
   -r /opt/praxis/requirements-model-service.txt
 /opt/praxis/model-venv/bin/python -I /opt/praxis/validate-model-venv.py
 # The Agent's larger environment is separate and never receives provider keys.

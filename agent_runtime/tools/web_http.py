@@ -13,6 +13,7 @@ import socket
 import ssl
 import zlib
 from collections.abc import AsyncIterator, Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from urllib.request import proxy_bypass_environment  # type: ignore[attr-defined]
 
@@ -115,11 +116,70 @@ class FetchedResponse:
 SocketOption = tuple[int, int, int] | tuple[int, int, bytes | bytearray] | tuple[int, int, None, int]
 
 
-class _PublicStream(httpcore.AsyncNetworkStream):
-    """Close a connected socket if TLS setup fails or is cancelled."""
+@dataclass
+class _RequestProgress:
+    stage: str = "connect"
+    mode: str = "unknown"
 
-    def __init__(self, stream: httpcore.AsyncNetworkStream) -> None:
+
+_progress: ContextVar[_RequestProgress | None] = ContextVar("public_web_progress", default=None)
+
+
+def _stage(value: str) -> None:
+    progress = _progress.get()
+    if progress is not None:
+        progress.stage = value
+
+
+class _ConnectionCandidates:
+    """One validated DNS snapshot and one deadline for TCP plus verified TLS."""
+
+    def __init__(
+        self, backend: httpcore.AsyncNetworkBackend, addresses: list[str], port: int,
+        timeout: float | None, local_address: str | None, socket_options: Iterable[SocketOption] | None,
+    ) -> None:
+        self.backend = backend
+        self.addresses = list(dict.fromkeys(addresses))[:8]
+        self.port = port
+        self.deadline = asyncio.get_running_loop().time() + (timeout if timeout is not None else 20)
+        self.local_address = local_address
+        self.socket_options = socket_options
+        self.index = 0
+        self.attempt_deadline = self.deadline
+
+    def remaining(self) -> float:
+        return max(0, self.attempt_deadline - asyncio.get_running_loop().time())
+
+    async def connect(self) -> httpcore.AsyncNetworkStream:
+        last_error: Exception = httpcore.ConnectTimeout()
+        while self.index < len(self.addresses):
+            now = asyncio.get_running_loop().time()
+            remaining = self.deadline - now
+            if remaining <= 0:
+                raise httpcore.ConnectTimeout()
+            # Reserve time for other candidates even when the request budget is small.
+            budget = min(3.0, remaining / (len(self.addresses) - self.index))
+            self.attempt_deadline = now + budget
+            address = self.addresses[self.index]
+            self.index += 1
+            _stage("tcp_connect")
+            try:
+                async with asyncio.timeout(budget):
+                    return await self.backend.connect_tcp(
+                        address, self.port, timeout=budget, local_address=self.local_address,
+                        socket_options=self.socket_options,
+                    )
+            except (httpcore.NetworkError, httpcore.TimeoutException, OSError, TimeoutError) as error:
+                last_error = error
+        raise last_error
+
+
+class _PublicStream(httpcore.AsyncNetworkStream):
+    """Retry only pre-HTTP connections, closing each failed or cancelled socket."""
+
+    def __init__(self, stream: httpcore.AsyncNetworkStream, candidates: _ConnectionCandidates | None = None) -> None:
         self._stream = stream
+        self._candidates = candidates
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         return await self._stream.read(max_bytes, timeout)
@@ -136,11 +196,27 @@ class _PublicStream(httpcore.AsyncNetworkStream):
         server_hostname: str | None = None,
         timeout: float | None = None,
     ) -> httpcore.AsyncNetworkStream:
-        try:
-            return _PublicStream(await self._stream.start_tls(ssl_context, server_hostname, timeout))
-        except BaseException:
-            await self._stream.aclose()
-            raise
+        while True:
+            _stage("tls_handshake")
+            budget = self._candidates.remaining() if self._candidates is not None else timeout
+            try:
+                async with asyncio.timeout(budget):
+                    secured = await self._stream.start_tls(ssl_context, server_hostname, budget)
+                return _PublicStream(secured)
+            except BaseException as error:
+                try:
+                    # Closing a failed socket must not mask the original failure or cancellation.
+                    async with asyncio.timeout(0.1):
+                        await self._stream.aclose()
+                except Exception:
+                    pass
+                recoverable = isinstance(
+                    error, (httpcore.NetworkError, httpcore.TimeoutException, OSError, TimeoutError)
+                )
+                if (self._candidates is None or self._candidates.index >= len(self._candidates.addresses)
+                        or not recoverable):
+                    raise
+                self._stream = await self._candidates.connect()
 
     def get_extra_info(self, info: str) -> object:
         return self._stream.get_extra_info(info)
@@ -161,6 +237,8 @@ class _PublicNetworkBackend(httpcore.AsyncNetworkBackend):
         # Numeric connects avoid the second, unchecked DNS resolution that allows
         # rebinding. Every A/AAAA answer must be public before choosing one.
         async with asyncio.timeout(timeout):
+            started = asyncio.get_running_loop().time()
+            _stage("dns_resolution")
             try:
                 ipaddress.ip_address(host)
             except ValueError:
@@ -180,14 +258,9 @@ class _PublicNetworkBackend(httpcore.AsyncNetworkBackend):
                     "No website response was received, so this does not establish whether a repository "
                     "is private, missing or misspelled. Check DNS or configure a trusted HTTP proxy."
                 ))
-            stream = await self._backend.connect_tcp(
-                addresses[0],
-                port,
-                timeout=timeout,
-                local_address=local_address,
-                socket_options=socket_options,
-            )
-            return _PublicStream(stream)
+            remaining = None if timeout is None else max(0, timeout - (asyncio.get_running_loop().time() - started))
+            candidates = _ConnectionCandidates(self._backend, addresses, port, remaining, local_address, socket_options)
+            return _PublicStream(await candidates.connect(), candidates)
 
 
 class _CoreStream(httpx.AsyncByteStream):
@@ -221,6 +294,14 @@ class _PublicTransport(httpx.AsyncBaseTransport):
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         assert isinstance(request.stream, httpx.AsyncByteStream)
+        async def trace(event: str, info: dict[str, object]) -> None:
+            if event.endswith("start_tls.started"):
+                _stage("tls_handshake")
+            elif "send_request_" in event and event.endswith(".started"):
+                _stage("http_request")
+            elif "receive_response_" in event and event.endswith(".started"):
+                _stage("http_response")
+        request.extensions["trace"] = trace
         response = await self._pool.handle_async_request(
             httpcore.Request(
                 method=request.method,
@@ -293,15 +374,21 @@ class PublicWebClient:
         target = validate_public_url(url)
         request_headers = httpx.Headers(headers)
         request_headers["Accept-Encoding"] = "gzip, identity"
+        progress = _RequestProgress()
+        token = _progress.set(progress)
         try:
             async with asyncio.timeout(self._timeout):
                 return await self._get(target, request_headers, allow_redirects)
-        except TimeoutError:
-            raise PublicWebError("timeout", "The public HTTP request exceeded its deadline.") from None
-        except (httpx.TimeoutException, httpcore.TimeoutException):
-            raise PublicWebError("timeout", "The public HTTP request exceeded its deadline.") from None
+        except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
+            failure = PublicWebError("timeout", "The public HTTP request exceeded its deadline.")
+            failure.failure_stage, failure.connection_mode = progress.stage, progress.mode
+            raise failure from None
         except (httpx.HTTPError, httpcore.NetworkError, httpcore.ProtocolError, OSError):
-            raise PublicWebError("network_error", "The public HTTP request failed.") from None
+            failure = PublicWebError("network_error", "The public HTTP request failed.")
+            failure.failure_stage, failure.connection_mode = progress.stage, progress.mode
+            raise failure from None
+        finally:
+            _progress.reset(token)
 
     async def _get(self, target: httpx.URL, headers: httpx.Headers, allow_redirects: bool) -> FetchedResponse:
         wire_bytes = 0
@@ -317,12 +404,16 @@ class PublicWebClient:
                 },
             )
             mode = self.connection_mode(target)
+            progress = _progress.get()
+            assert progress is not None
+            progress.mode, progress.stage = mode, "connect"
             transport = self._proxy_transport if mode == "trusted_proxy" else self._transport
             assert transport is not None
             try:
                 response = await transport.handle_async_request(request)
             except (httpx.TimeoutException, httpcore.TimeoutException, TimeoutError):
                 failure = PublicWebError("timeout", "The public HTTP connection exceeded its deadline.")
+                failure.failure_stage = progress.stage
                 failure.connection_mode = mode
                 raise failure from None
             except PublicWebError as error:
@@ -337,6 +428,7 @@ class PublicWebClient:
                 failure = PublicWebError(
                     "network_error", "The public HTTP connection failed; no website response was received."
                 )
+                failure.failure_stage = progress.stage
                 failure.connection_mode = mode
                 raise failure from None
             try:
@@ -364,6 +456,7 @@ class PublicWebClient:
                     continue
                 if not 200 <= response.status_code < 300:
                     raise PublicWebError("http_error", f"The remote server returned HTTP {response.status_code}.")
+                _stage("http_response")
                 body, wire_bytes = await self._read_body(response, wire_bytes)
                 return FetchedResponse(str(target), response.headers.get("Content-Type", ""), body, wire_bytes, mode)
             except PublicWebError as error:
@@ -371,6 +464,7 @@ class PublicWebClient:
                 raise
             except (httpx.TimeoutException, httpcore.TimeoutException, TimeoutError):
                 failure = PublicWebError("timeout", "The public HTTP response exceeded its deadline.")
+                failure.failure_stage = "http_response"
                 failure.connection_mode = mode
                 raise failure from None
             finally:

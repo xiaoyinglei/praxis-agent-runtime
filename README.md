@@ -406,6 +406,15 @@ with worker memory limits, up to 20 pages. A GitHub page or raw file is one
 possible source. Login and JavaScript-only pages may return a clear reading
 error; these tools do not include an interactive browser or clone repositories.
 
+Direct reads validate every DNS answer, then try at most eight distinct public
+addresses when TCP or TLS setup fails. DNS, TCP, TLS, redirects and response
+reading share the request deadline; each TCP/TLS candidate receives at most
+three seconds within that budget. TLS still verifies the origin hostname and
+certificate. Failed connections are closed, and an HTTP request that has begun
+is never replayed by IP failover. Structured failures distinguish DNS resolution
+and address validation, TCP connection, TLS handshake, HTTP sending and response
+reading through `failure_stage`, with the route in `connection_mode`.
+
 ```bash
 uv run agent run "Read https://docs.python.org/3/library/asyncio.html and explain cancellation" \
   --no-require-workspace-change
