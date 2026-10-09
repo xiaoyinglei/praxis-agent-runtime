@@ -195,7 +195,6 @@ def extract_content(
         nonce = uuid4().hex
         for node in soup.find_all(True):
             node.attrs.pop("data-praxis-link", None)
-            node.attrs.pop("data-praxis-selected", None)
         published_at, published_at_source = _published_time(soup)
         if soup.title:
             title = soup.title.get_text(" ", strip=True)[:500]
@@ -207,38 +206,15 @@ def extract_content(
             "form", "dialog", "svg", "button", "input",
         ]):
             element.decompose()
-        for element in list(soup.find_all(["div", "section", "ul", "header"])):
-            if element.parent is None:
-                continue
-            classes = element.get("class")
-            class_text = " ".join(classes) if isinstance(classes, list) else str(classes or "")
-            identity = " ".join([str(element.get("id", "")), class_text,
-                                 str(element.get("role", ""))])
-            if _NOISE.search(re.sub(r"([a-z])([A-Z])", r"\1 \2", identity)):
-                element.decompose()
         root, extraction_method = _content_root(soup)
         if not root.get_text(strip=True) and fallback_html:
             # Preserve visible fallback text when the selected body has no text.
             root = BeautifulSoup(fallback_html, 'html.parser')
             extraction_method = 'visible_text_fallback'
-        if extraction_method in {"paragraph_density", "trafilatura"}:
-            for paragraph in list(root.find_all("p")):
-                text_length = len(paragraph.get_text(strip=True))
-                linked = sum(len(a.get_text(strip=True)) for a in paragraph.find_all("a"))
-                if text_length > 20 and linked / text_length > 0.9:
-                    paragraph.decompose()
         if not root.get_text(strip=True):
             raise PublicWebError('web_content_empty', 'No extracted text was found.')
         found: list[dict[str, str]] = []
-        terms = [term.casefold() for term in re.findall(r"[^\W_]+", title) if len(term) >= 4]
-        related = [anchor for anchor in soup.find_all("a", href=True)
-                   if not any(parent is root for parent in anchor.parents)
-                   and not any(parent.get("data-praxis-selected") for parent in anchor.parents
-                               if isinstance(parent, Tag))
-                   and len(anchor.get_text(strip=True)) >= 8
-                   and any(term in anchor.get_text(" ", strip=True).casefold() for term in terms)][:20]
-        related_labels: list[str] = []
-        for anchor in [*root.find_all("a", href=True), *related]:
+        for anchor in root.find_all("a", href=True):
             try:
                 href = str(validate_public_url(urljoin(url, str(anchor.get("href")))))
             except (PublicWebError, ValueError):
@@ -253,16 +229,10 @@ def extract_content(
             if len(found) < MAX_SOURCE_LINKS:
                 found.append({"url": href, "text": label})
                 anchor["data-praxis-link"] = f"{nonce}:{len(found)}"
-                if any(anchor is related_anchor for related_anchor in related):
-                    related_labels.append(label)
             else:
                 links_truncated = True
         links = tuple(found)
         text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", _html_text(root, url)).strip()
-        if related_labels:
-            text += ("\n\n## Related link labels (article text not yet verified)\n"
-                     + "\n".join("- " + _html_text(anchor, url).strip() for anchor in related
-                                 if anchor.get("data-praxis-link")))
         # Only renderer-generated boundaries determine positions. Page text and
         # code containing literal [L1] cannot impersonate an actual hyperlink.
         marker_pattern = re.compile(r"\x00" + nonce + r":(\d+)\x00(.*?)\x00/" + nonce + r":\1\x00", re.S)
@@ -347,95 +317,18 @@ def _html_text(node: Tag | NavigableString, url: str) -> str:
     return content
 
 
-# Generic DOM roles and whole class/id words, never site names or task keywords.
-_NOISE = re.compile(
-    r"(?:^|[-_\s])(?:nav|navigation|menu|sidebar|footer|advertisement|advert|ads|social|share|sharing|"
-    r"recommend|recommended|recommendations|related|comments|comment|cookie|banner|breadcrumb|qr|qrcode)(?:$|[-_\s])",
-    re.I,
-)
-
-
 def _content_root(soup: BeautifulSoup) -> tuple[Tag, str]:
-    """Prefer semantic document regions; otherwise select the densest paragraph container."""
+    """Honor declared document regions; otherwise preserve the cleaned body without ranking."""
     semantic = soup.select("main, [role=main], article, [itemprop=articleBody]")
     if semantic:
-        root = max(semantic, key=lambda node: len(node.get_text(strip=True)))
-        articles = root.select("article, [itemprop=articleBody]")
-        # A single self-contained article can have surrounding application chrome.
-        # Multiple articles and directories remain one document, preserving their siblings.
-        if len(articles) == 1:
-            outside = [node for node in root.find_all(["a", "p", "pre", "table"])
-                       if not any(p is articles[0] for p in node.parents)
-                       and (node.name != "p" or bool(node.get_text(strip=True)))]
-            if not outside:
-                root = articles[0]
-            else:
-                # Read the primary document first, retaining meaningful sibling
-                # data and directory links later in this same immutable view.
-                root.insert(0, articles[0].extract())
+        root = semantic[0]
+        for node in semantic[1:]:
+            while root is not node and not any(parent is root for parent in node.parents):
+                parent = root.parent
+                assert isinstance(parent, Tag)
+                root = parent
         return root, "semantic"
-    candidates: dict[int, tuple[Tag, float]] = {}
-    for paragraph in soup.find_all(["p", "pre"]):
-        length = len(paragraph.get_text(strip=True))
-        if length < 40:
-            continue
-        parent = paragraph.parent
-        for depth in range(3):
-            if not isinstance(parent, Tag) or parent.name in {"body", "html", "[document]"}:
-                break
-            key = id(parent)
-            old = candidates.get(key, (parent, 0.0))[1]
-            candidates[key] = (parent, old + length / (depth + 1))
-            parent = parent.parent
-    if candidates:
-        def score(candidate: tuple[Tag, float]) -> float:
-            node, paragraph_score = candidate
-            total = max(1, len(node.get_text(strip=True)))
-            linked = sum(len(a.get_text(strip=True)) for a in node.find_all("a"))
-            return paragraph_score * (1 - min(1, linked / total))
-        root = max(candidates.values(), key=score)[0]
-        root["data-praxis-selected"] = "1"
-        # Restrict article extraction to the structural candidate; whole-page
-        # extraction can reintroduce widgets and silently lose document sections.
-        mature = _article_root(root)
-        if mature is not None:
-            evidence = [re.sub(r"\s+", "", p.get_text()) for p in root.find_all(["p", "pre"])
-                        if len(p.get_text(strip=True)) >= 40]
-            extracted = re.sub(r"\s+", "", mature.get_text())
-            if all(block in extracted for block in evidence):
-                return mature, "trafilatura"
-        return root, "paragraph_density"
     return soup.body or soup, "body_fallback"
-
-
-def _article_root(soup: Tag) -> Tag | None:
-    """Use a mature article extractor on cleaned DOM; keep the original fallback available."""
-    from trafilatura import extract
-
-    if len(soup.get_text(strip=True)) < 400:
-        return None
-    xml = extract(str(soup), output_format="xml", include_comments=False, include_links=True,
-                  include_tables=True, include_images=True, include_formatting=True, favor_recall=True)
-    if not xml:
-        return None
-    document = BeautifulSoup(xml, "xml")
-    root = document.find("main")
-    if not isinstance(root, Tag):
-        return None
-    for node in root.find_all(True):
-        if node.name == "ref":
-            node.name = "a"
-            node["href"] = str(node.get("target") or "")
-        elif node.name == "head":
-            level = str(node.get("rend", "h2"))
-            node.name = level if level in {"h1", "h2", "h3", "h4", "h5", "h6"} else "h2"
-        elif node.name == "graphic":
-            node.name = "img"
-        elif node.name == "code":
-            node.name = "pre"
-        elif node.name in {"row", "cell", "list", "item"}:
-            node.name = {"row": "tr", "cell": "td", "list": "ul", "item": "li"}[node.name]
-    return root
 
 
 def _markdown_links(text: str, url: str) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, int], ...], bool]:

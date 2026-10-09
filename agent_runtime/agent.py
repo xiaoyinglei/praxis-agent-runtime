@@ -50,6 +50,7 @@ class Agent:
         enable_workspace_mcp: bool = True,
         mcp_config_trust: MCPConfigTrustDecision | None = None,
         web_search_key_file: Path | str | None = None,
+        web_search_provider: str | None = None,
         web_proxy_url: str | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
@@ -57,6 +58,11 @@ class Agent:
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
+        if web_search_provider is not None:
+            if web_search_provider not in {"bing", "brave", "tavily"}:
+                raise ValueError("Web search provider must be bing, brave or tavily.")
+            if (web_search_provider == "bing") != (web_search_key_file is None):
+                raise ValueError("Web search requires a key file for brave/tavily and no key file for bing.")
         if mcp_config_trust is not None:
             from agent_runtime.runtime.mcp import MCPConfigTrustDecision
 
@@ -73,6 +79,7 @@ class Agent:
         self.enable_workspace_mcp = enable_workspace_mcp
         self.mcp_config_trust = mcp_config_trust
         self.web_search_key_file = None if web_search_key_file is None else Path(web_search_key_file)
+        self.web_search_provider = web_search_provider
         from agent_runtime.tools.web_http import web_proxy_configuration
 
         self.web_proxy_url, self.web_no_proxy = web_proxy_configuration(web_proxy_url, dict(os.environ))

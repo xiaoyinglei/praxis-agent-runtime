@@ -121,7 +121,8 @@
     "provenance": "Synthetic empty extracted text, with raw response retained.",
     "tool": "web_fetch",
     "arguments": {
-      "url": "https://example.com/empty"
+      "url": "https://example.com/empty",
+      "render": false
     },
     "html": "<body><script src=\"/app.js\"></script></body>",
     "expected": {

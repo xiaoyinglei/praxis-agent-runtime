@@ -100,7 +100,7 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
                                 else 'evidence line\n' * 2000,
                                 headers={'content-type': 'text/html' if extraction_error else 'text/plain'}))))
     database = tmp_path / 'state.sqlite'
-    model = FetchThenAnswer({'url': 'https://example.com/doc', 'max_lines': 500})
+    model = FetchThenAnswer({'url': 'https://example.com/doc', 'max_lines': 500, 'render': False})
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, '_harness_model', lambda: model)
     result = await agent.run('Read external evidence', allow_web_tools=True, require_workspace_change=False)
@@ -228,13 +228,14 @@ def test_semantic_summary_and_zero_body_elision_keep_source_identity(tmp_path):
         assert source['source_id'] in str(RolloutContextManager(store).build(turn.turn_id))
 
 
-def test_paragraph_document_discards_link_only_promotions_and_qr_widgets():
+def test_unmarked_link_paragraph_is_preserved_without_inferring_promotion_from_text():
     body = ('<div><p><a href="/promo">A long promotion link with no article evidence</a></p>'
             '<p>' + 'Useful factual article evidence. ' * 10 + '</p>'
             '<div class="inlineQr_wrap">Scan for unrelated promotion</div></div>').encode()
     result = extract_content(body, 'text/html', 'https://example.com/news')
     assert 'Useful factual' in result.text
-    assert 'promotion' not in result.text
+    assert 'A long promotion link with no article evidence' in result.text
+    assert 'Scan for unrelated promotion' in result.text
 
 
 @pytest.mark.anyio

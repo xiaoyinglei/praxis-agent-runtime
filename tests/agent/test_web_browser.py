@@ -136,7 +136,10 @@ def test_broker_counts_redirects_and_decoded_bytes():
         broker = browser._Broker(client)
         try:
             initial = await broker.fetch("https://example.com/start")
-            assert initial.url == "https://example.com/final"
+            assert initial.url == "https://example.com/start" and initial.status_code == 302
+            assert broker.budget.requests == 1
+            final = await broker.reply({"type": "fetch", "method": "GET", "url": "https://example.com/final"})
+            assert base64.b64decode(final['body']) == b'done'
             assert broker.budget.requests == 2
             assert broker.budget.wire_bytes == 4
             assert broker.budget.decoded_bytes == 4

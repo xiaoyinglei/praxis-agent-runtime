@@ -407,7 +407,26 @@ possible source. Results report actual extraction errors, truncation, source
 identity and read mode. Bounded responses are saved before extraction, so failed
 extractions remain inspectable through `view="raw"`.
 
-URL fetches accept `render=true` for optional Chromium execution. Install with
+HTML extraction preserves the declared `main`, `role="main"`, `article` and
+`itemprop="articleBody"` regions in document order, including their siblings
+inside a declared main region. Without these standard markers it retains the
+cleaned body rather than guessing a single region from paragraph density or
+class names. Unmarked pages can therefore include unrelated text; use outlines,
+links and literal `find` to locate evidence. The frozen quality corpus requires
+all source facts to survive. For body fallbacks, residual noise and first-window
+placement are diagnostic metrics; they do not authorize discarding text.
+
+URL fetches default to `render="auto"`: read HTTP first, then try isolated
+Chromium once if HTML extraction reports `web_content_empty`. The received HTTP
+response seeds the browser without a duplicate document fetch. Static text,
+non-HTML responses and other failures do not trigger rendering. Use `render=false`
+for HTTP only or `render=true` to render immediately. Raw-view URL reads default
+to HTTP only, and saved-source reads never render or refetch. Automatic recovery
+returns the actual browser error when rendering is unavailable or fails;
+`static_source_id` retains the original HTTP snapshot for inspection. Failed
+network or browser attempts can be retried by a new call. The whole fetch tool
+has a 75-second cap, covering HTTP, both parsing stages and the bounded renderer.
+Install with
 `uv sync --extra browser` and `uv run --extra browser playwright install --only-shell chromium`.
 Linux also needs `bwrap`, working unprivileged namespaces and Chromium's native
 shared libraries. The Playwright installer can install those system libraries
@@ -424,6 +443,10 @@ Failed or blocked public script, style and data subrequests preserve an acquired
 DOM with concrete diagnostics. Main-document, isolation and worker-protocol
 failures remain errors. Cross-origin reads retain the server's bounded CORS
 headers and remain subject to Chromium's CORS checks.
+Public subrequests carry only the origin of Chromium's actual Referer, with
+paths and queries removed. Real redirect responses and bounded Referrer-Policy
+headers go back to Chromium so it applies the source policy at each hop; each
+hop still passes the public URL, address and resource budget checks.
 macOS reports unavailability before starting a browser because Chromium cannot
 start inside the required outer network sandbox. Verify Linux installation with
 the explicit integration tests below; dependency installation alone does not
@@ -452,7 +475,7 @@ no search API key, but results depend on the upstream service's availability,
 relevance and limits. Verification pages and unexpected markup return clear
 failures; the Agent never solves verification challenges or treats them as results.
 
-Optionally, general search can use Brave Search. Provision its API key in a protected regular
+General search can also use Tavily or Brave Search. Provision the chosen service's API key in a protected regular
 file outside the workspace, owned by the current user or root with mode `0400`
 or `0600`. Supply the file path, never the key itself:
 
@@ -462,12 +485,48 @@ uv run agent run "Find primary sources about Python task cancellation" \
   --web-search-key-file /absolute/private/path/search.key
 uv run agent resume --last --action allow_once \
   --web-search-key-file /absolute/private/path/search.key
+
+# Tavily: explicitly select the service so its key is never sent to Brave.
+uv run agent chat --model deepseek-flash \
+  --web-search-provider tavily \
+  --web-search-key-file /absolute/private/path/tavily.key
 ```
 
-`PRAXIS_WEB_SEARCH_KEY_FILE` is an alternative CLI configuration for Brave.
-In the SDK, optionally configure `Agent(web_search_key_file=...)` and pass
+`--web-search-provider` accepts `bing`, `brave`, or `tavily`. Without this option,
+the existing default remains Bing with no key and Brave with a key. Explicit
+Tavily/Brave selection requires a key file; Bing rejects a supplied key. Invalid
+configuration fails before model requests rather than falling back to another service.
+`PRAXIS_WEB_SEARCH_PROVIDER` and `PRAXIS_WEB_SEARCH_KEY_FILE` are alternative CLI
+configuration, including for `run`, `chat`, and `resume`. Resuming a paused Turn
+requires the original search service and its credential; a key is not stored in checkpoints.
+
+Tavily uses its official `POST https://api.tavily.com/search` endpoint with Bearer
+authentication. Each uncached request selects `search_depth=basic` (1 API credit)
+and disables automatic parameter selection, generated answers, raw content and
+images. Results map to the same title/URL/snippet contract; private URLs and
+credential-echoing responses are rejected or omitted. Freshness maps to Tavily's
+day/week/month/year preference and does not verify publication dates. Requests
+reuse the public DNS checks, proxy selection, 20-second deadline and 2 MB wire/decoded
+response limits. Authenticated API redirects are rejected. This API POST capability
+is not exposed as a page action: `web_fetch` and its browser broker remain GET-only.
+Authentication, quota and other HTTP failures report the actual status, with no
+automatic retry or switch to Bing/Brave. See [Tavily search](https://docs.tavily.com/documentation/api-reference/endpoint/search)
+and [credits](https://docs.tavily.com/documentation/api-credits).
+
+In the SDK, configure
+`Agent(web_search_provider="tavily", web_search_key_file="/absolute/private/path/tavily.key")`
+and pass
 `allow_web_tools=True` to `run`, `stream`, or `session`; read-only research also
 uses `require_workspace_change=False`.
+
+For the direct Ubuntu launcher, export only the service and credential **path**
+before starting; `start-deepseek-chat.py` preserves these settings:
+
+```bash
+export PRAXIS_WEB_SEARCH_PROVIDER=tavily
+export PRAXIS_WEB_SEARCH_KEY_FILE=/home/admin/.config/praxis/credentials/tavily.key
+python3 scripts/ubuntu/start-deepseek-chat.py --repo .
+```
 
 The model receives extracted main text, source URLs, hashes and immutable
 `source_id` snapshots. `published_at` is an optional page-declared publication

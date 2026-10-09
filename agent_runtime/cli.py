@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 class _WebOptions(TypedDict, total=False):
     web_search_key_file: Path
+    web_search_provider: str
     web_proxy_url: str
 
 
@@ -355,6 +356,7 @@ def _create_agent_facade(
     knowledge: RAGKnowledgeConfig | None = None,
     enable_workspace_mcp: bool = True,
     web_search_key_file: Path | None = None,
+    web_search_provider: str | None = None,
     web_proxy_url: str | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
@@ -369,12 +371,15 @@ def _create_agent_facade(
             knowledge=knowledge,
             enable_workspace_mcp=enable_workspace_mcp,
             web_search_key_file=web_search_key_file,
+            web_search_provider=web_search_provider,
             web_proxy_url=web_proxy_url,
             _selection_requester=_selection_requester,
         )
     except ValueError as error:
         if str(error).startswith("Web proxy must"):
             raise typer.BadParameter(str(error), param_hint="--web-proxy / proxy environment") from None
+        if str(error).startswith("Web search"):
+            raise typer.BadParameter(str(error), param_hint="--web-search-provider / --web-search-key-file") from None
         raise
 
 
@@ -1293,7 +1298,11 @@ def agent_chat(
     ] = None,
     web_search_key_file: Annotated[
         Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
-                                  help="工作区外的受保护 Brave Search 密钥文件"),
+                                  help="工作区外的受保护搜索服务密钥文件"),
+    ] = None,
+    web_search_provider: Annotated[
+        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+                                 help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
@@ -1331,6 +1340,8 @@ def agent_chat(
     web_options: _WebOptions = {}
     if web_search_key_file is not None:
         web_options["web_search_key_file"] = web_search_key_file
+    if web_search_provider is not None:
+        web_options["web_search_provider"] = web_search_provider
     if web_proxy_url is not None:
         web_options["web_proxy_url"] = web_proxy_url
     facade = _create_agent_facade(
@@ -1439,7 +1450,11 @@ def agent_run(
     ] = None,
     web_search_key_file: Annotated[
         Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
-                                  help="工作区外的受保护 Brave Search 密钥文件"),
+                                  help="工作区外的受保护搜索服务密钥文件"),
+    ] = None,
+    web_search_provider: Annotated[
+        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+                                 help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
     disable_workspace_mcp: Annotated[
         bool,
@@ -1476,6 +1491,7 @@ def agent_run(
         knowledge=_load_knowledge_config(knowledge_config),
         enable_workspace_mcp=not disable_workspace_mcp,
         web_search_key_file=web_search_key_file,
+        web_search_provider=web_search_provider,
         web_proxy_url=web_proxy_url,
         _selection_requester="user",
     )
@@ -1560,7 +1576,11 @@ def agent_resume(
     web_search_key_file: Annotated[
         Path | None,
         typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
-                     help="工作区外、仅所有者可读的 Brave Search 密钥文件"),
+                     help="工作区外、仅所有者可读的搜索服务密钥文件"),
+    ] = None,
+    web_search_provider: Annotated[
+        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+                                 help="bing | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
@@ -1598,6 +1618,8 @@ def agent_resume(
     web_options: _WebOptions = {}
     if web_search_key_file is not None:
         web_options["web_search_key_file"] = web_search_key_file
+    if web_search_provider is not None:
+        web_options["web_search_provider"] = web_search_provider
     if web_proxy_url is not None:
         web_options["web_proxy_url"] = web_proxy_url
     facade = _create_agent_facade(

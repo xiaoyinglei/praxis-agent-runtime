@@ -25,7 +25,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 if __name__ != "__main__":
-    from agent_runtime.tools.web_http import FetchedResponse, PublicWebClient, PublicWebError, validate_public_url
+    from agent_runtime.tools.web_http import (
+        FetchedResponse,
+        PublicWebClient,
+        PublicWebError,
+        public_origin_referer,
+        validate_public_url,
+    )
 
 MAX_REQUESTS = 64
 MAX_NETWORK_BYTES = 8_000_000
@@ -74,7 +80,7 @@ class _Broker:
     def __init__(self, client: PublicWebClient) -> None:
         self.client = client
         self.budget = _Budget()
-        self.pending: dict[tuple[str, str], FetchedResponse] = {}
+        self.pending: dict[tuple[str, str, str | None], FetchedResponse] = {}
         self.skipped_resources: dict[str, int] = {}
         self.skipped_url_kinds: dict[str, int] = {}
         self.blocked_actions: dict[str, int] = {}
@@ -107,10 +113,12 @@ class _Broker:
             'resource_failures': {f'{code}:{kind}': count for (code, kind), count in self.resource_failures.items()},
         }
 
-    async def fetch(self, url: str, resource_type: str = "Document") -> FetchedResponse:
+    async def fetch(self, url: str, resource_type: str = "Document", referer: str | None = None) -> FetchedResponse:
         return await self.client.get(
-            str(validate_public_url(url)), request_budget=self.budget.on_request, byte_budget=self.budget.on_bytes,
+            str(validate_public_url(url)), headers={"Referer": referer} if referer is not None else None,
+            request_budget=self.budget.on_request, byte_budget=self.budget.on_bytes,
             max_response_bytes=MAX_NETWORK_BYTES if resource_type == "Script" else None,
+            allow_redirects=False, return_redirects=True,
         )
 
     def record_skip(self, message: dict[str, Any]) -> None:
@@ -133,12 +141,23 @@ class _Broker:
             'Document', 'Script', 'Stylesheet', 'XHR', 'Fetch', 'Other', 'Manifest', 'Ping', 'Preflight',
         }:
             raise _error("web_browser_protocol_error", "The browser returned an invalid resource type.")
+        referer = message.get("referer")
+        if referer is not None:
+            if not isinstance(referer, str) or len(referer) > 4096:
+                raise _error("web_browser_protocol_error", "The browser returned an invalid source origin.")
+            try:
+                source = validate_public_url(referer)
+                referer = public_origin_referer(referer, source)
+            except PublicWebError:
+                raise _error("web_browser_protocol_error", "The browser returned an invalid source origin.") from None
         limit_class = "Script" if resource_type == "Script" else "Document"
         try:
             url = str(validate_public_url(url))
-            response = self.pending.pop((url, limit_class), None)
+            if referer is not None:
+                referer = public_origin_referer(referer, validate_public_url(url))
+            response = self.pending.pop((url, limit_class, referer), None)
             if response is None:
-                response = await self.fetch(url, limit_class)
+                response = await self.fetch(url, limit_class, referer)
         except PublicWebError as error:
             # An already denied subresource cannot cross the boundary. Only
             # known HTTP/policy errors are recoverable; protocol/isolation are fatal.
@@ -152,12 +171,10 @@ class _Broker:
             key = (error.code, resource_type)
             self.resource_failures[key] = self.resource_failures.get(key, 0) + 1
             return {"type": "abort"}
-        final_url = str(validate_public_url(response.url))
-        if final_url != url:
-            # Chromium must observe the redirect before receiving bytes, so the
-            # final document/base URL and script origin remain correct.
-            self.pending[(final_url, limit_class)] = response
-            return {"type": "response", "status": 302, "headers": {"location": final_url}}
+        if 300 <= response.status_code < 400:
+            # Chromium owns redirects and their Referrer-Policy; each hop re-enters this broker.
+            return {"type": "response", "status": response.status_code,
+                    "headers": dict(response.response_headers or {})}
         return {
             "type": "response", "status": response.status_code,
             "headers": {"content-type": response.content_type or "application/octet-stream",
@@ -250,7 +267,7 @@ async def _serve_worker(
         stderr=asyncio.subprocess.DEVNULL, start_new_session=True, limit=_RESULT_LINE_LIMIT,
     )
     assert process.stdout is not None and process.stdin is not None
-    broker.pending[(initial.url, "Document")] = initial
+    broker.pending[(initial.url, "Document", None)] = initial
     try:
         start = {"type": "start", "url": initial.url, "timeout_seconds": timeout_seconds}
         process.stdin.write(json.dumps(start).encode() + b"\n")
@@ -307,19 +324,24 @@ async def _serve_worker(
                     final_url, "text/html; charset=utf-8", body, broker.budget.wire_bytes, initial.connection_mode,
                     warning=warning,
                     render_diagnostics=broker.diagnostics(dom_bytes=len(body), load_timeouts=timeouts),
+                    request_count=broker.budget.requests,
                 )
     finally:
         cleanup = asyncio.create_task(_kill_worker(process))
         await asyncio.shield(cleanup)
 
 
-async def render_public_page(client: PublicWebClient, url: str) -> FetchedResponse:
+async def render_public_page(
+    client: PublicWebClient, url: str, *, initial_response: FetchedResponse | None = None,
+) -> FetchedResponse:
     """Render a text snapshot within 30 seconds, 64 GETs, 8 MB reads and 2 MB DOM.
 
     Image, font and media requests are skipped; script/style/API reads remain.
     Install the optional browser extra and its Chromium executable first.
     Unsupported isolation or a missing renderer is an explicit failure, with no
     static-HTTP fallback. Cancellation closes the worker and browser descendants.
+    An initial response from PublicWebClient can seed the document without a
+    second fetch; its bytes and HTTP redirect hops count against the rendering budget.
     """
     validate_public_url(url)
     if sys.platform == "darwin":
@@ -329,7 +351,7 @@ async def render_public_page(client: PublicWebClient, url: str) -> FetchedRespon
     if importlib.util.find_spec("playwright") is None:
         raise _error("web_browser_unavailable", "Install the optional browser extra and Playwright Chromium.")
     broker: _Broker | None = None
-    initial: FetchedResponse | None = None
+    initial: FetchedResponse | None = initial_response
 
     def attach_facts(error: PublicWebError) -> PublicWebError:
         if broker is not None:
@@ -345,7 +367,13 @@ async def render_public_page(client: PublicWebClient, url: str) -> FetchedRespon
                 bootstrap = f"import runpy; runpy.run_path({str(Path(__file__).resolve())!r}, run_name='__main__')"
                 command = _sandbox_command([sys.executable, "-I", "-B", "-c", bootstrap], directory)
                 broker = _Broker(client)
-                initial = await broker.fetch(url)
+                if initial is None:
+                    initial = await broker.fetch(url)
+                else:
+                    validate_public_url(initial.url)
+                    for _ in range(initial.request_count):
+                        broker.budget.on_request()
+                    broker.budget.on_bytes(initial.network_bytes, len(initial.body))
                 remaining = max(0.01, deadline - asyncio.get_running_loop().time() - 0.5)
                 return await _serve_worker(command, _worker_environment(directory), broker, initial,
                                            timeout_seconds=remaining)
@@ -461,8 +489,14 @@ async def _worker() -> None:
                     })
                     return
                 async with lock:
+                    source = next((value for key, value in request.get("headers", {}).items()
+                                   if key.lower() == "referer"), None)
+                    referer = None
+                    if isinstance(source, str):
+                        parsed_source = urlsplit(source)
+                        referer = f"{parsed_source.scheme}://{parsed_source.netloc}/"
                     _worker_write({"type": "fetch", "method": request["method"], "url": request["url"],
-                                   "resource_type": resource_type})
+                                   "resource_type": resource_type, "referer": referer})
                     reply = await loop.run_in_executor(None, _worker_read, _RESPONSE_LINE_LIMIT)
                     if reply.get("type") == "abort":
                         await session.send("Fetch.failRequest", {
