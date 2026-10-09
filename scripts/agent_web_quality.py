@@ -135,6 +135,7 @@ async def measure(extractor: Any, web_module: Any) -> dict[str, Any]:
                                    and continuation.result.structured_content['content_hash'] == output['content_hash'])
             records[name] = {
                 'fixture_sha256': hashlib.sha256(body).hexdigest(),
+                'extraction_method': extracted.extraction_method,
                 'gold_blocks': len(expected), 'full_retention': round(full_retention, 4),
                 'first_80_lines_retention': round(excerpt_retention, 4),
                 'non_gold_text_share': round(max(0, 1 - sum(weights) * full_retention / max(1, len(full))), 4),
@@ -210,12 +211,16 @@ async def main() -> None:
         baseline = json.loads((FIXTURES / 'baseline.json').read_text())['pages']
         for name, record in records.items():
             assert record['fixture_sha256'] == baseline[name]['fixture_sha256']
-            assert record['full_retention'] >= 0.98, (name, 'lost body evidence', record)
-            assert record['noise_marker_hits'] == 0, (name, 'known noise survived', record)
+            assert record['full_retention'] == 1.0, (name, 'lost body evidence', record)
+            # Unmarked documents preserve the cleaned body in source order. Noise
+            # and first-window placement are diagnostic, not authority to discard facts.
+            if record['extraction_method'] == 'semantic':
+                assert record['noise_marker_hits'] == 0, (name, 'known noise survived', record)
+            assert record['model_text_tokens'] <= 6000
             assert record['model_links'] <= 8
             assert record['fetch_repeat_network_calls'] == 1
             assert record['continuation_ok'] and record['source_id_matches_artifact']
-            if name.startswith('news_') or name == 'company_index':
+            if record['extraction_method'] == 'semantic' and (name.startswith('news_') or name == 'company_index'):
                 assert record['first_80_lines_retention'] == 1.0
                 if name.startswith('news_'):
                     assert record['non_gold_text_share'] <= 0.1

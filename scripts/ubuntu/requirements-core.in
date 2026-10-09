@@ -5,7 +5,6 @@ pydantic
 httpx[socks]
 httpcore
 beautifulsoup4
-trafilatura
 markdown-it-py
 openai
 pyyaml

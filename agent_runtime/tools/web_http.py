@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import socket
 import ssl
 import zlib
@@ -116,6 +117,7 @@ class FetchedResponse:
     response_headers: Mapping[str, str] | None = None
     render_diagnostics: Mapping[str, Any] | None = None
     status_code: int = 200
+    request_count: int = 1
 
 
 # Matches httpcore's public backend signature, without importing private modules.
@@ -333,8 +335,16 @@ class _PublicTransport(httpx.AsyncBaseTransport):
         await self._pool.aclose()
 
 
+def public_origin_referer(value: str, target: httpx.URL) -> str | None:
+    """Preserve only a public source origin; never disclose URL paths or downgrade HTTPS."""
+    source = validate_public_url(value)
+    if source.scheme == "https" and target.scheme == "http":
+        return None
+    return str(source.copy_with(path="/", query=None, fragment=None))
+
+
 class PublicWebClient:
-    """GET-only public web client with a deadline and separate wire/decoded limits.
+    """Bounded public GET reads and trusted application-owned JSON POST calls.
 
     A transport may be supplied by trusted application code for deterministic
     tests. Tools must never expose that setting to the model. Redirects discard
@@ -380,8 +390,30 @@ class PublicWebClient:
         request_budget: Callable[[], None] | None = None,
         byte_budget: Callable[[int, int], None] | None = None,
         max_response_bytes: int | None = None,
+        return_redirects: bool = False,
     ) -> FetchedResponse:
         """GET with optional trusted per-response limits; the client's default is unchanged."""
+        return await self._request(
+            "GET", url, headers, allow_redirects, request_budget, byte_budget, max_response_bytes,
+            return_redirects=return_redirects,
+        )
+
+    async def post_json(
+        self, url: str, body: Mapping[str, Any], *, headers: Mapping[str, str] | None = None,
+    ) -> FetchedResponse:
+        """POST for fixed API integrations, never model-directed page actions; redirects are forbidden."""
+        content = json.dumps(body, ensure_ascii=False, allow_nan=False).encode("utf-8")
+        if len(content) > self._max_bytes:
+            raise PublicWebError("request_too_large", "The JSON request exceeds the byte limit.")
+        request_headers = httpx.Headers(headers)
+        request_headers["Content-Type"] = "application/json"
+        return await self._request("POST", url, request_headers, False, None, None, None, content)
+
+    async def _request(
+        self, method: str, url: str, headers: Mapping[str, str] | None, allow_redirects: bool,
+        request_budget: Callable[[], None] | None, byte_budget: Callable[[int, int], None] | None,
+        max_response_bytes: int | None, content: bytes | None = None, *, return_redirects: bool = False,
+    ) -> FetchedResponse:
         response_limit = self._max_bytes if max_response_bytes is None else max_response_bytes
         if response_limit < 1:
             raise ValueError('Response byte limit must be positive.')
@@ -392,8 +424,8 @@ class PublicWebClient:
         token = _progress.set(progress)
         try:
             async with asyncio.timeout(self._timeout):
-                return await self._get(target, request_headers, allow_redirects, request_budget, byte_budget,
-                                       response_limit)
+                return await self._send(method, target, request_headers, allow_redirects, request_budget, byte_budget,
+                                        response_limit, content, return_redirects)
         except (TimeoutError, httpx.TimeoutException, httpcore.TimeoutException):
             failure = PublicWebError("timeout", "The public HTTP request exceeded its deadline.")
             failure.failure_stage, failure.connection_mode = progress.stage, progress.mode
@@ -405,10 +437,10 @@ class PublicWebClient:
         finally:
             _progress.reset(token)
 
-    async def _get(
-        self, target: httpx.URL, headers: httpx.Headers, allow_redirects: bool,
+    async def _send(
+        self, method: str, target: httpx.URL, headers: httpx.Headers, allow_redirects: bool,
         request_budget: Callable[[], None] | None, byte_budget: Callable[[int, int], None] | None,
-        response_limit: int,
+        response_limit: int, content: bytes | None, return_redirects: bool,
     ) -> FetchedResponse:
         wire_bytes = 0
         for redirects in range(self._max_redirects + 1):
@@ -417,9 +449,10 @@ class PublicWebClient:
             # Own redirects and raw decoding rather than using HTTPX's client,
             # which eagerly parses Location even when redirects are disabled.
             request = httpx.Request(
-                "GET",
+                method,
                 target,
                 headers=headers,
+                content=content,
                 extensions={
                     "timeout": dict.fromkeys(("connect", "read", "write", "pool"), self._timeout),
                 },
@@ -453,7 +486,30 @@ class PublicWebClient:
                 failure.connection_mode = mode
                 raise failure from None
             try:
+                response_headers = {
+                    name: value for name in (
+                        "access-control-allow-origin", "access-control-allow-credentials",
+                        "access-control-expose-headers", "referrer-policy",
+                    ) if (value := response.headers.get(name)) is not None
+                    and len(value) <= 1024 and all(ord(char) >= 32 and ord(char) != 127 for char in value)
+                }
                 if 300 <= response.status_code < 400:
+                    if return_redirects:
+                        location = response.headers.get("Location")
+                        if not location:
+                            raise PublicWebError("invalid_redirect", "The redirect has no valid destination.")
+                        try:
+                            destination = validate_public_url(str(target.join(location)))
+                        except httpx.InvalidURL:
+                            raise PublicWebError("invalid_redirect", "The redirect has no valid destination.") from None
+                        if len(str(destination)) > 4096:
+                            raise PublicWebError("invalid_redirect", "The redirect has no valid destination.")
+                        return FetchedResponse(
+                            str(target), response.headers.get("Content-Type", ""), b"", wire_bytes, mode,
+                            response_headers={**response_headers, "location": str(destination)},
+                            status_code=response.status_code,
+                            request_count=redirects + 1,
+                        )
                     if not allow_redirects:
                         raise PublicWebError("redirect_not_allowed", "Redirects are disabled for this request.")
                     if redirects >= self._max_redirects:
@@ -479,17 +535,10 @@ class PublicWebClient:
                     raise PublicWebError("http_error", f"The remote server returned HTTP {response.status_code}.")
                 _stage("http_response")
                 body, wire_bytes = await self._read_body(response, wire_bytes, byte_budget, response_limit)
-                # The browser broker serves already decoded bytes. Forward only
-                # real, bounded CORS metadata; never cookies or Content-Encoding.
-                cors_headers = {
-                    name: value for name in (
-                        "access-control-allow-origin", "access-control-allow-credentials",
-                        "access-control-expose-headers",
-                    ) if (value := response.headers.get(name)) is not None
-                    and len(value) <= 1024 and all(ord(char) >= 32 and ord(char) != 127 for char in value)
-                }
+                # Preserve actual bounded browser policies, never cookies or Content-Encoding.
                 return FetchedResponse(str(target), response.headers.get("Content-Type", ""), body, wire_bytes, mode,
-                                       response_headers=cors_headers, status_code=response.status_code)
+                                       response_headers=response_headers, status_code=response.status_code,
+                                       request_count=redirects + 1)
             except PublicWebError as error:
                 error.connection_mode = mode
                 raise

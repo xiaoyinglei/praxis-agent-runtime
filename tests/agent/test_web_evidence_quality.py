@@ -121,14 +121,14 @@ async def test_failed_extraction_saves_raw_response_and_cached_failure(tmp_path,
     tools, client, sources = web_tools(tmp_path, lambda req: hits.append(req) or httpx.Response(
         200, content=body, headers={'content-type': media}))
     try:
-        output = await tools['web_fetch'].run({'url': 'https://example.com/source'})
+        output = await tools['web_fetch'].run({'url': 'https://example.com/source', 'render': False})
         assert output['error_code'] == code
         assert output['source_id'] in sources
         assert output['network_bytes'] == len(body)
         assert 'JavaScript' not in output['error_message'] and 'authentication' not in output['error_message']
         raw = await tools['web_fetch'].run({'source_id': output['source_id'], 'view': 'raw'})
         assert raw['error_code'] is None and body.decode() in raw['content']
-        again = await tools['web_fetch'].run({'url': 'https://example.com/source'})
+        again = await tools['web_fetch'].run({'url': 'https://example.com/source', 'render': False})
         assert again['error_code'] == code and again['cache_hit'] and again['network_bytes'] == 0
         assert len(hits) == 1
     finally:

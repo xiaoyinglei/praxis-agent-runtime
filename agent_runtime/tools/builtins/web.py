@@ -40,6 +40,7 @@ from agent_runtime.tools.web_http import PublicWebClient, PublicWebError, valida
 WEB_TOOL_NAMES = ("web_search", "web_fetch")
 WEB_SOURCE_MEDIA_TYPE = "application/vnd.praxis.web-source+json"
 _SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+_TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
 
 class WebSearchInput(BaseModel):
@@ -75,16 +76,18 @@ class WebFetchInput(BaseModel):
     refresh: bool = Field(
         default=False, description="With url, bypass this Turn's snapshot cache when fresh content is needed.",
     )
-    render: bool = Field(
-        default=False,
-        description="With url, execute JavaScript using optional isolated Chromium. No login or POST support.",
+    render: bool | Literal['auto'] = Field(
+        default='auto',
+        description=("auto (default): try isolated Chromium once when HTML extraction is empty; "
+                     "false: HTTP only; true: always render. Auto raw reads use HTTP; source_id never refetches. "
+                     "No login or POST support."),
     )
 
     @model_validator(mode="after")
     def choose_source(self) -> WebFetchInput:
         if (self.url is None) == (self.source_id is None):
             raise ValueError("provide exactly one of url or source_id")
-        if self.render and self.url is None:
+        if self.render is True and self.url is None:
             raise ValueError('render requires url; source_id reads the existing snapshot')
         if self.url is not None:
             try:
@@ -131,11 +134,12 @@ class WebSource(BaseModel):
     raw_body_base64: str | None = Field(default=None, max_length=2_666_668)
     raw_content_type: str = ""
     raw_content_hash: str | None = None
-    extraction_version: str = "document-v2"
+    extraction_version: str = "document-v3"
     sections: list[WebSection] = Field(default_factory=list)
     links_truncated: bool = False
     warning: str | None = None
     render_mode: str = 'http'
+    static_source_id: str | None = None
     render_diagnostics: dict[str, Any] | None = None
     extraction_error_code: str | None = None
     extraction_error_message: str | None = None
@@ -205,6 +209,7 @@ class WebFetchOutput(BaseModel):
     section_id: str | None = None
     source_links_truncated: bool = False
     render_mode: str = 'http'
+    static_source_id: str | None = None
     render_diagnostics: dict[str, Any] | None = None
 
 
@@ -246,19 +251,26 @@ def _contains_credential(value: object, credential: str) -> bool:
 def create_web_tools(
     client: PublicWebClient, *, save_source: Callable[[bytes], str], load_source: Callable[[str], bytes],
     search_key: str | None = None,
+    search_provider: str | None = None,
     before_request: Callable[[], None] | None = None,
     cache_scope: Callable[[], str | None] = lambda: None,
 ) -> tuple[Tool, ...]:
+    provider = search_provider if search_provider is not None else ("brave" if search_key is not None else "bing")
+    if provider not in {"bing", "brave", "tavily"}:
+        raise ValueError("Web search provider must be bing, brave or tavily.")
+    if (provider == "bing") != (search_key is None):
+        raise ValueError("Web search requires a credential for brave/tavily and no credential for bing.")
     accounting = TokenAccountingService(TokenizerContract("", "deepseek-v4-official", "deepseek-v4-official"))
     search_schema, validate_search = pydantic_input(WebSearchInput)
     fetch_schema, validate_fetch = pydantic_input(WebFetchInput)
     search_output_schema, _ = pydantic_input(WebSearchOutput)
     fetch_output_schema, _ = pydantic_input(WebFetchOutput)
-    search_endpoint = _SEARCH_ENDPOINT if search_key is not None else "https://www.bing.com/search"
+    search_endpoint = {"bing": "https://www.bing.com/search", "brave": _SEARCH_ENDPOINT,
+                       "tavily": _TAVILY_ENDPOINT}[provider]
 
     async def search_uncached(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
         request = WebSearchInput.model_validate(arguments)
-        if search_key is None:
+        if provider == "bing":
             params = {"q": request.query, "count": str(request.max_results)}
             if request.freshness:
                 period = {"pd": "ez1", "pw": "ez2", "pm": "ez3"}.get(request.freshness)
@@ -292,21 +304,38 @@ def create_web_tools(
         try:
             if before_request is not None:
                 before_request()
-            response = await client.get(
-                str(httpx.URL(_SEARCH_ENDPOINT).copy_merge_params(params)),
-                headers={"X-Subscription-Token": search_key, "Accept": "application/json"},
-                allow_redirects=False,
-            )
+            assert search_key is not None
+            if provider == "tavily":
+                body: dict[str, Any] = {
+                    "query": request.query, "max_results": request.max_results,
+                    "search_depth": "basic", "auto_parameters": False,
+                    "include_answer": False, "include_raw_content": False, "include_images": False,
+                }
+                if request.freshness:
+                    body["time_range"] = {"pd": "day", "pw": "week", "pm": "month", "py": "year"}[
+                        request.freshness]
+                response = await client.post_json(search_endpoint, body, headers={
+                    "Authorization": f"Bearer {search_key}", "Accept": "application/json",
+                })
+            else:
+                response = await client.get(
+                    str(httpx.URL(search_endpoint).copy_merge_params(params)),
+                    headers={"X-Subscription-Token": search_key, "Accept": "application/json"},
+                    allow_redirects=False,
+                )
             payload = json.loads(response.body)
             if _contains_credential(payload, search_key):
                 raise ValueError("credential echoed by provider")
-            if not isinstance(payload, dict) or not isinstance(payload.get("web"), dict):
+            if not isinstance(payload, dict):
                 raise ValueError("invalid search response")
-            items = payload["web"].get("results")
-            if not isinstance(items, list):
+            result_group = payload if provider == "tavily" else payload.get("web")
+            if not isinstance(result_group, dict):
+                raise ValueError("invalid search response")
+            provider_items = result_group.get("results")
+            if not isinstance(provider_items, list):
                 raise ValueError("invalid search results")
             results: list[SearchResult] = []
-            for item in items[:20]:
+            for item in provider_items[:20]:
                 if not isinstance(item, dict) or not isinstance(item.get("url"), str):
                     continue
                 try:
@@ -316,7 +345,7 @@ def create_web_tools(
                 if len(url) > 4096:
                     continue
                 title = item.get("title", "")
-                snippet = item.get("description", "")
+                snippet = item.get("content" if provider == "tavily" else "description", "")
                 if not isinstance(title, str) or not isinstance(snippet, str):
                     raise ValueError("search text fields must be strings")
                 results.append(SearchResult(
@@ -325,17 +354,17 @@ def create_web_tools(
                 if len(results) == request.max_results:
                     break
             return WebSearchOutput(
-                query=request.query, provider="brave", results=results, network_bytes=response.network_bytes,
+                query=request.query, provider=provider, results=results, network_bytes=response.network_bytes,
                 connection_mode=response.connection_mode,
             ).model_dump(mode="json")
         except PublicWebError as error:
-            return WebSearchOutput(query=request.query, provider="brave",
+            return WebSearchOutput(query=request.query, provider=provider,
                                    error_code=error.code, error_message=str(error),
                                    connection_mode=error.connection_mode,
                                    failure_stage=error.failure_stage).model_dump(mode="json")
         except (ValueError, RecursionError):
             return WebSearchOutput(
-                query=request.query, provider="brave",
+                query=request.query, provider=provider,
                 error_code="web_search_invalid_response", error_message="Search provider returned an invalid response.",
             ).model_dump(mode="json")
 
@@ -346,52 +375,68 @@ def create_web_tools(
         source_id = request.source_id
         cache_hit = False
         connection_mode = "saved_source"
+        static_source_id: str | None = None
         try:
-            mode = 'browser' if request.render else 'http'
-            cache_key = (cache_scope(), request.url, mode)
+            mode = 'browser' if request.render is True else 'http'
+            cache_mode = 'auto' if request.render == 'auto' and request.view != 'raw' else mode
+            cache_key = (cache_scope(), request.url, cache_mode)
             if request.url is not None and not request.refresh:
                 source_id = source_cache.get(cache_key)
                 cache_hit = source_id is not None
             if request.url is not None and (source_id is None or request.refresh):
                 if before_request is not None:
                     before_request()
-                if request.render:
+                if request.render is True:
                     from agent_runtime.tools.web_browser import render_public_page
                     response = await render_public_page(client, request.url)
                 else:
                     response = await client.get(request.url)
-                connection_mode = response.connection_mode
-                network_bytes = response.network_bytes
-                source = WebSource(
-                    url=response.url, title=response.url[:500], text='', fetched_at=datetime.now(UTC).isoformat(),
-                    extraction_method='not_attempted', content_hash=hashlib.sha256(b'').hexdigest(),
-                    raw_body_base64=base64.b64encode(response.body).decode('ascii'),
-                    raw_content_type=response.content_type, raw_content_hash=hashlib.sha256(response.body).hexdigest(),
-                    warning=response.warning, render_mode=mode,
-                    render_diagnostics=dict(response.render_diagnostics) if response.render_diagnostics else None,
-                )
-                # Archive received bytes before entering the killable parser. A failed or
-                # interrupted extraction cannot erase the original response.
-                source_id = save_source(source.model_dump_json().encode())
-                try:
-                    extracted = await extract_content_async(response.body, response.content_type, response.url)
-                    source = source.model_copy(update={
-                        'title': extracted.title, 'text': extracted.text,
-                        'published_at': extracted.published_at, 'published_at_source': extracted.published_at_source,
-                        'extraction_method': extracted.extraction_method,
-                        'content_hash': hashlib.sha256(extracted.text.encode()).hexdigest(),
-                        'links': _located_links(extracted.text, extracted.links, extracted.link_occurrences),
-                        'truncated': extracted.truncated, 'sections': _sections(extracted.text),
-                        'links_truncated': extracted.links_truncated,
-                    })
-                except PublicWebError as error:
-                    source = source.model_copy(update={
-                        'extraction_method': 'failed', 'extraction_error_code': error.code,
-                        'extraction_error_message': str(error),
-                    })
-                source_id = save_source(source.model_dump_json().encode())
+                for attempt in range(2):
+                    connection_mode = response.connection_mode
+                    network_bytes = response.network_bytes
+                    source = WebSource(
+                        url=response.url, title=response.url[:500], text='', fetched_at=datetime.now(UTC).isoformat(),
+                        extraction_method='not_attempted', content_hash=hashlib.sha256(b'').hexdigest(),
+                        raw_body_base64=base64.b64encode(response.body).decode('ascii'),
+                        raw_content_type=response.content_type,
+                        raw_content_hash=hashlib.sha256(response.body).hexdigest(),
+                        warning=response.warning, render_mode=mode, static_source_id=static_source_id,
+                        render_diagnostics=dict(response.render_diagnostics) if response.render_diagnostics else None,
+                    )
+                    # Archive each response before parsing or trying the browser.
+                    source_id = save_source(source.model_dump_json().encode())
+                    try:
+                        extracted = await extract_content_async(response.body, response.content_type, response.url)
+                        source = source.model_copy(update={
+                            'title': extracted.title, 'text': extracted.text,
+                            'published_at': extracted.published_at,
+                            'published_at_source': extracted.published_at_source,
+                            'extraction_method': extracted.extraction_method,
+                            'content_hash': hashlib.sha256(extracted.text.encode()).hexdigest(),
+                            'links': _located_links(extracted.text, extracted.links, extracted.link_occurrences),
+                            'truncated': extracted.truncated, 'sections': _sections(extracted.text),
+                            'links_truncated': extracted.links_truncated,
+                        })
+                    except PublicWebError as error:
+                        source = source.model_copy(update={
+                            'extraction_method': 'failed', 'extraction_error_code': error.code,
+                            'extraction_error_message': str(error),
+                        })
+                    source_id = save_source(source.model_dump_json().encode())
+                    if (attempt == 0 and request.render == 'auto' and request.view != 'raw'
+                            and source.extraction_error_code == 'web_content_empty'
+                            and response.content_type.split(';', 1)[0].strip().lower()
+                            in {'text/html', 'application/xhtml+xml'}):
+                        from agent_runtime.tools.web_browser import render_public_page
+
+                        static_source_id = source_id
+                        mode = 'browser'
+                        response = await render_public_page(client, response.url, initial_response=response)
+                        continue
+                    break
+                assert source_id is not None
                 source_cache[cache_key] = source_id
-                source_cache[(cache_scope(), response.url, mode)] = source_id
+                source_cache[(cache_scope(), response.url, cache_mode)] = source_id
                 while len(source_cache) > 256:
                     del source_cache[next(iter(source_cache))]
                 network_bytes = response.network_bytes
@@ -410,6 +455,7 @@ def create_web_tools(
                             raise ValueError("invalid raw snapshot hash")
                 except (KeyError, ValueError, RuntimeError, OSError):
                     raise PublicWebError("web_source_unavailable", "Saved web source is missing or invalid.") from None
+            assert source is not None
             output = _read_source(source, request, source_id=source_id or "", network_bytes=network_bytes,
                                   cache_hit=cache_hit, connection_mode=connection_mode)
             return _fit_output(output, request, accounting).model_dump(mode="json")
@@ -418,8 +464,12 @@ def create_web_tools(
                 source_id=source_id, url=source.url if source else request.url or "",
                 content_hash=source.content_hash if source else "",
                 error_code=error.code, error_message=str(error),
-                connection_mode=error.connection_mode, failure_stage=error.failure_stage,
+                connection_mode=(connection_mode if source is not None and error.connection_mode == 'unknown'
+                                 else error.connection_mode), failure_stage=error.failure_stage,
                 render_mode=source.render_mode if source else mode,
+                static_source_id=static_source_id or (source.static_source_id if source else None),
+                network_bytes=(int(error.render_diagnostics.get('wire_bytes', network_bytes))
+                               if error.render_diagnostics else network_bytes),
                 render_diagnostics=dict(error.render_diagnostics) if error.render_diagnostics else None,
             ).model_dump(mode="json")
 
@@ -501,8 +551,11 @@ def create_web_tools(
         Tool(
             definition=ToolDefinition("web_search", (
                 "Search the public internet for external facts and sources. Returns titles, URLs and snippets; "
-                "use web_fetch to read supporting content. Uses public Bing search without credentials, "
-                "or Brave when a search credential is configured. "
+                "use web_fetch to read supporting content. "
+                + ("Uses configured Tavily basic search (one API credit per uncached request); "
+                   "no generated answer is requested or returned. " if provider == "tavily" else
+                   "Uses public Bing search without credentials, or Brave when a search credential is configured. ")
+                +
                 "Queries leave this machine: never include credentials or private workspace content. "
                 "The backend interprets the query as supplied. repeated_results means the title/URL/snippet list "
                 "is identical to previous_query. "
@@ -517,6 +570,7 @@ def create_web_tools(
             resolve_use=lambda _args: ResolvedToolUse(
                 effects=frozenset({ToolEffect.NETWORK}), targets=(ToolTarget("public_web", search_endpoint),),
             ), execution_revision=(
+                "builtin-public-web-search-tavily-v1" if provider == "tavily" else
                 "builtin-public-web-v5" if search_key is not None else "builtin-public-web-search-bing-v5"
             ),
             idempotent=True, concurrency_safe=True,
@@ -540,10 +594,13 @@ def create_web_tools(
                 "Use find for literal page-text search without reading every line. "
                 "Snapshots preserve the bounded original response and extracted text. view=raw reads UTF-8 "
                 "original text without re-fetching; legacy snapshots may not contain it. "
+                "HTML uses declared main/article regions; otherwise it preserves the cleaned body in source order. "
+                "Unmarked pages can include unrelated page text; "
+                "inspect outlines and links or use find to locate evidence. "
                 "line_basis identifies the selected view; numbered lines are virtual, "
                 "never original file line citations. "
                 "Publication dates are page declarations; fetched_at is retrieval time, never publication time. "
-                "Repeated URLs reuse this Turn's snapshot; refresh=true explicitly bypasses the cache. "
+                "Repeated successful URL reads reuse this Turn's snapshot; refresh=true bypasses the cache. "
                 "Continue using "
                 "source_id + start_line=next_line; this needs no network and does not refetch changing content. "
                 "Preserve view=raw or section_id when continuing those reads. "
@@ -551,7 +608,8 @@ def create_web_tools(
                 "source_truncated means extraction hit its fixed limit; continuation cannot recover discarded text. "
                 "Extraction failures retain a source_id for raw inspection and report the actual parser error. "
                 "No extracted text does not establish why the page has no text. "
-                "For JavaScript pages request render=true explicitly. It requires optional Playwright/Chromium and OS "
+                "Default render=auto tries Chromium once for empty extracted HTML; render=false reads HTTP only, "
+                "render=true renders immediately. This requires optional Playwright/Chromium and OS "
                 "network isolation; missing capabilities fail clearly. Rendering allows bounded public GETs only, "
                 "without login, cookies, POST, downloads or verification solving. Browser cache is separate from HTTP. "
                 "Text snapshots skip images, fonts and media; rendering is limited to 64 GETs, 30 seconds, "
@@ -563,6 +621,7 @@ def create_web_tools(
                 "Load-state timeouts retain an acquired DOM within the total deadline; no snapshot is explicit. "
                 "render_diagnostics reports actual requests, wire/decoded/DOM bytes, skips and blocked reasons. "
                 "For browser snapshots view=raw is the saved rendered DOM, not the original HTTP response. "
+                "After automatic recovery, static_source_id reads the original HTTP snapshot. "
                 "Only public destinations on ports 80/443; no custom headers, cookies or request body. "
                 "Direct connections enforce public DNS addresses; a user-configured trusted proxy resolves "
                 "hostnames upstream and owns final-IP restrictions. connection_mode identifies the route; "
@@ -573,9 +632,9 @@ def create_web_tools(
             validate_input=validate_fetch, run=fetch,
             normalize_output=lambda raw: normalized(raw, WebFetchOutput, fetch_output_schema),
             output_schema=fetch_output_schema, static_effects=frozenset(), resolve_use=resolve_fetch,
-            execution_revision="builtin-public-web-v5", idempotent=True, concurrency_safe=True,
+            execution_revision="builtin-public-web-v7", idempotent=True, concurrency_safe=True,
             cancellation_mode=CancellationMode.COOPERATIVE, interrupt_behavior=InterruptBehavior.CANCEL,
-            timeout_seconds=45.0, max_model_output_bytes=65_536,
+            timeout_seconds=75.0, max_model_output_bytes=65_536,
             approval_profile=ToolApprovalProfile.PUBLIC_WEB_READ,
         ),
     )
@@ -670,6 +729,7 @@ def _read_source(
         published_at=source.published_at, published_at_source=source.published_at_source,
         extraction_method=source.extraction_method, cache_hit=cache_hit,
         warning=source.warning, render_mode=source.render_mode, render_diagnostics=source.render_diagnostics,
+        static_source_id=source.static_source_id,
         content_hash=(source.raw_content_hash or "") if basis == "raw_source" else source.content_hash,
         start_line=request.start_line, total_lines=len(lines), source_truncated=source.truncated,
         network_bytes=network_bytes, connection_mode=connection_mode, view=request.view, line_basis=basis,

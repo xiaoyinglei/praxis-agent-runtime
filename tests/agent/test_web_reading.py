@@ -14,12 +14,12 @@ from agent_runtime.tools.web_content import extract_content
 from tests.agent.test_web_tools import call, web_tools
 
 
-def test_nested_article_excludes_container_chrome_without_losing_evidence():
+def test_nested_article_preserves_unmarked_siblings_inside_declared_main():
     body = ('<main><div>' + 'Account settings and actions. ' * 100 + '</div><article>'
             '<h1>Reference</h1><p>The complete article evidence.</p></article></main>').encode()
     output = extract_content(body, 'text/html', 'https://example.com/reference')
     assert 'complete article evidence' in output.text
-    assert 'Account settings' not in output.text
+    assert 'Account settings' in output.text
 
 
 def test_multiple_articles_and_directory_links_are_preserved():
@@ -31,12 +31,14 @@ def test_multiple_articles_and_directory_links_are_preserved():
     assert {link['url'] for link in output.links} == {'https://example.com/a', 'https://example.com/b'}
 
 
-def test_primary_article_precedes_directory_without_discarding_directory():
+def test_document_preserves_source_order_and_directory_without_discarding_siblings():
     body = b'<main><table><tr><td><a href="/source.py">source.py</a></td></tr></table>' \
            b'<p>Additional factual context outside the article.</p>' \
            b'<article><h1>Guide</h1><p>The main document.</p></article></main>'
     output = extract_content(body, 'text/html', 'https://example.com/project')
-    assert output.text.startswith('# Guide')
+    assert (
+        output.text.index('source.py') < output.text.index('Additional factual context') < output.text.index('# Guide')
+    )
     assert 'Additional factual context' in output.text
     assert any(link['url'] == 'https://example.com/source.py' for link in output.links)
 

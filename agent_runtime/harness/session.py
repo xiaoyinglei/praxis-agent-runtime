@@ -440,6 +440,7 @@ class Session:
         web_tools = create_web_tools(
             web_client, save_source=save_web_source, load_source=load_web_source,
             search_key=load_search_key(agent.web_search_key_file, workspace=workspace.root),
+            search_provider=agent.web_search_provider,
             before_request=check_web_budget, cache_scope=current_tool_turn_id,
         )
         skill_policy = SkillPolicy()
