@@ -45,8 +45,11 @@ def test_repeated_offline_install_reuses_manifest_and_wheel_cache(tmp_path):
     fake_uv.chmod(0o755)
     import os
     env = {**os.environ, "PATH": f"{commands}:{os.environ['PATH']}", "CALLS": str(calls)}
+    # The fake installer must inspect its own target, not the test runner's uv venv.
+    environment = tmp_path / "environment"
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(environment)], check=True)
     args = [sys.executable, str(ROOT / "scripts/ubuntu/install-agent-deps.py"), str(repo),
-            "--python", sys.executable, "--cache-dir", str(tmp_path / "cache")]
+            "--python", str(environment / "bin/python"), "--cache-dir", str(tmp_path / "cache")]
     first = subprocess.run(args, env=env, capture_output=True, text=True)
     assert first.returncode == 0, first.stderr
     wheels = tmp_path / "wheels"
