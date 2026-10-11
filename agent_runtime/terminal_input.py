@@ -16,6 +16,21 @@ DEFAULT_HISTORY_BYTES = 64 * 1024
 _GRAPHEME = regex.compile(r"\X")
 
 
+def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
+    """Translate terminal shortcuts only into choices offered by this request."""
+    value = value.strip()
+    if value in options:
+        return value
+    aliases = {
+        "a": ("approve", "allow_once"),
+        "y": ("approve", "allow_once"),
+        "yes": ("approve", "allow_once"),
+        "n": ("deny",), "no": ("deny",), "d": ("deny",),
+        "c": ("continue",),
+    }
+    return next((choice for choice in aliases.get(value.casefold(), ()) if choice in options), None)
+
+
 _COMPOSER_BINDINGS = KeyBindings()
 
 

@@ -93,6 +93,7 @@ def test_launcher_passes_key_only_in_environment_and_skips_dotenv(monkeypatch, t
     key_path = tmp_path / "private/deepseek.key"
     module.load_key(key_path, prompt=lambda _: "fake-protected-deepseek-key")
     calls = []
+    monkeypatch.setattr(module, "validate_workspace_readiness", lambda *args: None)
     monkeypatch.setattr(os, "execve", lambda path, argv, env: calls.append((path, argv, env)))
     monkeypatch.chdir(tmp_path)
     module.start(repo, key_path)

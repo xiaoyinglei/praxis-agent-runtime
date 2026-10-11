@@ -7,6 +7,16 @@ import sys
 from pathlib import Path
 
 
+def validate_workspace_readiness(workspace: Path) -> None:
+    """Use the shell tool's containment check before opening interactive chat."""
+    from agent_runtime.tools.builtins.shell import _workspace_sandbox_preflight_issue
+
+    issue = _workspace_sandbox_preflight_issue(workspace, allow_workspace_write=False)
+    if issue is not None:
+        code, message = issue
+        raise ValueError(f"{code}: {message}")
+
+
 def agent_environment(token_path: Path, home: Path, term: str) -> dict[str, str]:
     fd = os.open(token_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
@@ -42,6 +52,15 @@ def agent_environment(token_path: Path, home: Path, term: str) -> dict[str, str]
         if not 16 <= len(search_key) <= 4096 or not search_key.isprintable() or any(c.isspace() for c in search_key):
             raise ValueError("invalid search credential")
         env["PRAXIS_WEB_SEARCH_KEY_FILE"] = str(search_path)
+    patch_path = home / ".local/lib/praxis/codex-patch"
+    if patch_path.exists() or patch_path.is_symlink():
+        patch_info = patch_path.lstat()
+        if (
+            not stat.S_ISREG(patch_info.st_mode) or patch_info.st_mode & 0o022
+            or patch_info.st_uid not in {0, os.getuid()} or not os.access(patch_path, os.X_OK)
+        ):
+            raise ValueError("insecure optional Codex patch executable")
+        env["PRAXIS_CODEX_APPLY_PATCH"] = str(patch_path)
     return env
 
 
@@ -54,10 +73,17 @@ def main() -> None:
         env = agent_environment(home / "proxy.token", home, os.environ.get("TERM", "dumb"))
     except (OSError, UnicodeError, ValueError):
         raise SystemExit(
-            "Missing or insecure Agent proxy/search credential; contact the server administrator."
+            "Missing or insecure Agent proxy/search credential or patch executable; contact the server administrator."
         ) from None
-    os.chdir(home / "workspace")
+    workspace = home / "workspace"
     argv = sys.argv[1:] or ["chat"]
+    if argv[0] in {"run", "chat", "resume"}:
+        sys.path.insert(0, "/opt/praxis/app")
+        try:
+            validate_workspace_readiness(workspace)
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"Agent workspace is not ready: {error}") from None
+    os.chdir(workspace)
     # -I excludes cwd, PYTHONPATH and user site; app is root-owned.
     code = "import sys; sys.path.insert(0, '/opt/praxis/app'); from agent_runtime.cli import agent_app; agent_app()"
     python = "/opt/praxis/agent-venv/bin/python"

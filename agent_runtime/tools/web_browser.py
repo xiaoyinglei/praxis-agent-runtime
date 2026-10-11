@@ -32,6 +32,7 @@ if __name__ != "__main__":
         public_origin_referer,
         validate_public_url,
     )
+    from agent_runtime.tools.web_limits import WebLimits
 
 MAX_REQUESTS = 64
 MAX_NETWORK_BYTES = 8_000_000
@@ -63,28 +64,54 @@ class _Budget:
     requests: int = 0
     wire_bytes: int = 0
     decoded_bytes: int = 0
+    max_requests: int = MAX_REQUESTS
+    max_network_bytes: int = MAX_NETWORK_BYTES
 
     def on_request(self) -> None:
-        if self.requests >= MAX_REQUESTS or max(self.wire_bytes, self.decoded_bytes) > MAX_NETWORK_BYTES:
+        if self.requests >= self.max_requests:
             raise _error("web_browser_budget_exceeded", "Browser rendering exceeded its HTTP request budget.")
+        if max(self.wire_bytes, self.decoded_bytes) >= self.max_network_bytes:
+            raise _error("web_browser_budget_exceeded", "Browser rendering exhausted its response byte budget.")
         self.requests += 1
 
     def on_bytes(self, wire_delta: int, decoded_delta: int) -> None:
         self.wire_bytes += wire_delta
         self.decoded_bytes += decoded_delta
-        if max(self.wire_bytes, self.decoded_bytes) > MAX_NETWORK_BYTES:
+        if max(self.wire_bytes, self.decoded_bytes) > self.max_network_bytes:
             raise _error("web_browser_budget_exceeded", "Browser rendering exceeded its response byte budget.")
 
 
 class _Broker:
-    def __init__(self, client: PublicWebClient) -> None:
+    def __init__(self, client: PublicWebClient, *, limits: WebLimits | None = None) -> None:
         self.client = client
-        self.budget = _Budget()
+        self.budget = (_Budget() if limits is None else _Budget(
+            max_requests=limits.browser_requests, max_network_bytes=limits.browser_network_bytes,
+        ))
         self.pending: dict[tuple[str, str, str | None], FetchedResponse] = {}
         self.skipped_resources: dict[str, int] = {}
         self.skipped_url_kinds: dict[str, int] = {}
         self.blocked_actions: dict[str, int] = {}
         self.resource_failures: dict[tuple[str, str], int] = {}
+        self.failed_resources: list[dict[str, str]] = []
+        self.failed_resources_omitted = 0
+
+    def record_failure(self, *, url: str, method: str, resource_type: str, reason: str) -> None:
+        # Paths identify failed resources; credentials, query values and fragments
+        # are intentionally absent. No request body or headers are retained.
+        from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
+
+        try:
+            target = urlsplit(url)
+            location = f"{target.scheme}://{target.hostname}{target.path}"
+        except ValueError:
+            location = "[invalid URL]"
+        if len(self.failed_resources) >= 16:
+            self.failed_resources_omitted += 1
+            return
+        self.failed_resources.append({
+            "url": redact_sensitive_text(location)[:512], "method": method[:16],
+            "resource_type": resource_type[:32], "reason": reason[:80],
+        })
 
     @property
     def warning(self) -> str | None:
@@ -103,6 +130,10 @@ class _Broker:
         if not isinstance(reason, str) or reason not in _BLOCKED_REASONS:
             raise _error('web_browser_protocol_error', 'The browser returned an invalid blocked-action diagnostic.')
         self.blocked_actions[reason] = self.blocked_actions.get(reason, 0) + 1
+        url = message.get('url')
+        if isinstance(url, str):
+            self.record_failure(url=url, method=str(message.get('method', '')),
+                                resource_type=str(message.get('resource_type', 'Other')), reason=reason)
 
     def diagnostics(self, *, dom_bytes: int | None = None, load_timeouts: list[str] | None = None) -> dict[str, Any]:
         return {
@@ -111,6 +142,13 @@ class _Broker:
             'snapshot_available': dom_bytes is not None, 'load_timeouts': load_timeouts or [],
             'blocked_actions': dict(self.blocked_actions), 'skipped_resources': dict(self.skipped_resources),
             'resource_failures': {f'{code}:{kind}': count for (code, kind), count in self.resource_failures.items()},
+            'failed_resources': list(self.failed_resources),
+            'failed_resources_omitted': self.failed_resources_omitted,
+            'limits': {'requests': self.budget.max_requests, 'network_bytes': self.budget.max_network_bytes,
+                       'dom_bytes': MAX_DOM_BYTES, 'timeout_seconds': RENDER_TIMEOUT_SECONDS},
+            'remaining': {'requests': max(0, self.budget.max_requests - self.budget.requests),
+                          'network_bytes': max(0, self.budget.max_network_bytes - max(
+                              self.budget.wire_bytes, self.budget.decoded_bytes))},
         }
 
     async def fetch(self, url: str, resource_type: str = "Document", referer: str | None = None) -> FetchedResponse:
@@ -159,6 +197,7 @@ class _Broker:
             if response is None:
                 response = await self.fetch(url, limit_class, referer)
         except PublicWebError as error:
+            self.record_failure(url=url, method=method, resource_type=resource_type, reason=error.code)
             # An already denied subresource cannot cross the boundary. Only
             # known HTTP/policy errors are recoverable; protocol/isolation are fatal.
             if resource_type not in _OPTIONAL_RESOURCE_TYPES:
@@ -333,6 +372,7 @@ async def _serve_worker(
 
 async def render_public_page(
     client: PublicWebClient, url: str, *, initial_response: FetchedResponse | None = None,
+    limits: WebLimits | None = None,
 ) -> FetchedResponse:
     """Render a text snapshot within 30 seconds, 64 GETs, 8 MB reads and 2 MB DOM.
 
@@ -366,7 +406,7 @@ async def render_public_page(
             with tempfile.TemporaryDirectory(prefix="praxis-web-browser-") as directory:
                 bootstrap = f"import runpy; runpy.run_path({str(Path(__file__).resolve())!r}, run_name='__main__')"
                 command = _sandbox_command([sys.executable, "-I", "-B", "-c", bootstrap], directory)
-                broker = _Broker(client)
+                broker = _Broker(client) if limits is None else _Broker(client, limits=limits)
                 if initial is None:
                     initial = await broker.fetch(url)
                 else:
@@ -478,7 +518,8 @@ async def _worker() -> None:
                     await session.send("Fetch.failRequest", {
                         "requestId": event["requestId"], "errorReason": "BlockedByClient",
                     })
-                    _worker_write({"type": "blocked", "reason": "method_not_get"})
+                    _worker_write({"type": "blocked", "reason": "method_not_get", "url": request["url"][:4096],
+                                   "method": request["method"], "resource_type": event.get("resourceType", "Other")})
                     return
                 resource_type = event.get("resourceType", "Other")
                 if resource_type in _VISUAL_RESOURCE_TYPES:

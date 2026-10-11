@@ -9,7 +9,9 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
+from agent_runtime.modeling.contracts import context_capacity_policy
 from agent_runtime.streaming.events import (
+    EventType,
     ItemStatus,
     StreamEvent,
     TurnItemKind,
@@ -52,6 +54,7 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "context_summary_response",
         "context_message",
         "verification",
+        "resource_usage",
     }
 )
 _SUPPRESSED_RECORD_TYPES = frozenset(
@@ -456,6 +459,20 @@ class RolloutEventReader:
         if record.record_type == "item_completed":
             if not isinstance(item_id, str) or start is None:
                 raise RuntimeError("completed internal Item has no durable start")
+            payload = record.payload.get("payload", {})
+            if kind == "context_compaction" and isinstance(payload.get("capacity_diagnostics"), Mapping):
+                return (StreamEvent(type=EventType.COMPACT_LAYER, turn_id=record.turn_id or "",
+                                    data=dict(payload["capacity_diagnostics"])),)
+            if kind == "model_request":
+                request_ref = payload.get("request_ref", {})
+                projection = request_ref.get("context_projection", {})
+                if (projection.get("policy_revision") == "context-capacity-v2"
+                        and context_capacity_policy(request_ref.get("step_snapshot", {}).get("binding_manifest", {}))
+                        is not None):
+                    return (StreamEvent(type=EventType.BUDGET_UPDATE, turn_id=record.turn_id or "", data={
+                        "purpose": request_ref.get("purpose"), "context_projection": dict(projection),
+                        "budget_status": request_ref.get("budget_status", {}),
+                    }),)
             if item_id in duplicate_answer_ids or kind in _SUPPRESSED_ITEM_KINDS:
                 return ()
             if kind == "command_execution":
@@ -482,7 +499,17 @@ class RolloutEventReader:
         if record.record_type == "turn_started":
             if turn_id is None:
                 raise RuntimeError("turn_started record is missing turn_id")
-            return turn_started(turn_id)
+            event = turn_started(turn_id)
+            binding = record.payload.get("binding_manifest", {})
+            policy = context_capacity_policy(binding)
+            if policy is not None:
+                envelope = binding.get("binding", binding)
+                definition = envelope.get("definition", envelope)
+                event = replace(event, data={**event.data,
+                    "context_capacity_policy": policy.model_dump(mode="json"),
+                    "model_context_tokens": definition.get("context_window_tokens", "unknown"),
+                })
+            return event
         if record.record_type == "turn_paused":
             if turn_id is None:
                 raise RuntimeError("turn_paused record is missing turn_id")

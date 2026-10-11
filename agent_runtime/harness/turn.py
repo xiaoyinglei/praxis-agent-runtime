@@ -50,6 +50,7 @@ from agent_runtime.harness.tool_orchestrator import (
     ToolApprovalRequiredError,
     ToolOrchestrator,
 )
+from agent_runtime.modeling.contracts import context_capacity_policy
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     TurnItemKind,
@@ -236,6 +237,9 @@ class TurnExecutor:
                 *messages,
                 HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
             )
+        if context_capacity_policy(turn_context.binding_manifest) is not None:
+            messages = (*messages, HarnessMessage(role="context", content="Runtime budget status:\n" +
+                         json.dumps(self._budget_status(turn_context), sort_keys=True)))
         tools = (
             ()
             if self._tool_router is None
@@ -256,6 +260,8 @@ class TurnExecutor:
             "model_cost_budget_total_micros",
             "budget_root_turn_id",
             "budget_parent_turn_id",
+            "web_limits",
+            "context_capacity_policy",
         ):
             if name in turn_context.binding_manifest:
                 binding[name] = turn_context.binding_manifest[name]
@@ -269,10 +275,46 @@ class TurnExecutor:
             budget_pressure=pressure,
         )
 
+    def _budget_status(self, turn: TurnContext) -> dict[str, Any]:
+        state = self._store.read_budget_state(turn.turn_id)
+        web = turn.binding_manifest.get("web_limits")
+        web_remaining: int | str = "unset"
+        if isinstance(web, Mapping) and isinstance(web.get("turn_requests"), int):
+            used = self._store.read_resource_usage(turn.turn_id, "public_web_requests")["used"]
+            web_remaining = max(0, web["turn_requests"] - used)
+        return {
+            "agent_steps_remaining": max(0, turn.binding_manifest.get("model_step_budget", self._max_steps)
+                                         - self.agent_step_count(turn.turn_id)),
+            "model_requests_remaining": state.remaining("model_calls") if state.limits.model_calls is not None
+            else "unset",
+            "web_requests_remaining": web_remaining,
+            "tokens_remaining": state.remaining("tokens") if state.limits.tokens is not None else "unset",
+            "cost_remaining_micros": state.remaining("cost_micros")
+            if state.limits.cost_micros is not None else "unset",
+        }
+
     async def _prepare_step(self, step: StepContext) -> PreparedModelCall:
+        policy = context_capacity_policy(step.binding_manifest)
+        if policy is not None and step.purpose == "context_summary":
+            # A large token window does not authorize an unbounded history
+            # envelope. The planner splits complete work units before provider
+            # serialization; an indivisible unit fails with originals intact.
+            sizes = [len(message.content.encode("utf-8")) for message in step.messages]
+            if (max(sizes, default=0) > policy.max_item_bytes
+                    or sum(sizes) > policy.max_total_bytes):
+                raise ContextBudgetExceededError(
+                    "byte_guard: Summary fragment exceeds its frozen materialization limit.",
+                    reason_code="byte_guard",
+                )
         if self._prepare_binding is not None:
             await self._prepare_binding(step.binding_manifest)
         prepared = self._model.prepare(step.model_request())
+        if (policy is not None and step.purpose == "context_summary"
+                and prepared.request_ref.get("serialized_input_bytes", 0) > policy.max_total_bytes):
+            raise ContextBudgetExceededError(
+                "byte_guard: Serialized summary request exceeds its frozen materialization limit.",
+                reason_code="byte_guard",
+            )
         remaining = step.model_token_budget_remaining
         if (
             step.purpose == "agent_step"
@@ -308,6 +350,20 @@ class TurnExecutor:
             "model_token_budget_remaining": step.model_token_budget_remaining,
             "budget_pressure": step.budget_pressure,
         }
+        budget_status = next((json.loads(message.content.removeprefix("Runtime budget status:\n"))
+                              for message in reversed(step.messages)
+                              if message.content.startswith("Runtime budget status:\n")), None)
+        if context_capacity_policy(step.binding_manifest) is not None:
+            if budget_status is None:
+                budget_status = self._budget_status(step.turn)
+            from agent_runtime.harness.context import RolloutContextManager
+            if (isinstance(self._context_manager, RolloutContextManager)
+                    and "context_projection" in prepared.request_ref):
+                limits = self._context_manager.limits(step.turn.turn_id)
+                projection = {**prepared.request_ref["context_projection"],
+                              "byte_guards": {"item": limits["max_item_bytes"], "total": limits["max_total_bytes"]},
+                              "message_guard": limits["max_messages"]}
+                prepared = replace(prepared, request_ref={**prepared.request_ref, "context_projection": projection})
         return replace(
             prepared,
             request_ref={
@@ -315,6 +371,7 @@ class TurnExecutor:
                 "purpose": step.purpose,
                 **({"request_id": step.request_id} if step.request_id else {}),
                 "step_snapshot": snapshot,
+                **({"budget_status": budget_status} if budget_status is not None else {}),
                 **({"compaction_plan": dict(step.compaction_plan)} if step.compaction_plan is not None else {}),
             },
         )
@@ -694,7 +751,10 @@ class TurnExecutor:
             + source
         )
         output_limit = None if plan is None else plan["summary_output_limit"]
-        digest = hashlib.sha256((prompt + str(output_limit)).encode()).hexdigest()
+        identity = prompt + str(output_limit)
+        if plan is not None and plan.get("policy_revision") == "context-capacity-v2":
+            identity += f":context-capacity-v2:{plan['summary_input_limit']}"
+        digest = hashlib.sha256(identity.encode()).hexdigest()
         return StepContext(
             turn=turn,
             step=step,
@@ -721,11 +781,31 @@ class TurnExecutor:
         """One generation per complete source fragment, with durable call accounting."""
         max_calls = turn.binding_manifest.get("model_step_budget", self._max_steps)
 
-        async def summarize(text: str, *, merged_input: bool = False) -> str:
+        async def summarize(
+            text: str, *, merged_input: bool = False, node: Mapping[str, Any] | None = None
+        ) -> str:
+            active_plan = plan
+            if node is not None:
+                assert plan is not None
+                if hashlib.sha256(text.encode()).hexdigest() != node["source_hash"]:
+                    raise ContextSourceChangedError("Frozen summary fragment changed.")
+                if "children" in node:
+                    left_source, right_source = _split_summary_history(text)
+                    left = await summarize(left_source, node=node["children"][0])
+                    right = await summarize(right_source, node=node["children"][1])
+                    text = _merge_summary_history(left, right)
+                    merged_input = True
+                active_plan = {**plan, "summary_input_limit": node["input_limit"]}
+
+            def validate(answer: str) -> str:
+                if (plan is not None and plan.get("policy_revision") == "context-capacity-v2"
+                        and _summary_serialized_bytes(answer) > plan["summary_byte_limit"]):
+                    raise ContextBudgetExceededError("Summary exceeds its frozen serialized byte bound.")
+                return answer
             remaining = self._store.read_budget_state(turn.turn_id).remaining("tokens")
             if remaining is not None and remaining < 1:
                 raise ContextBudgetExceededError("No model token budget remains for semantic compaction.")
-            context = self._summary_step(turn, step=step, source=text, plan=plan)
+            context = self._summary_step(turn, step=step, source=text, plan=active_plan)
             operations = self._store.list_model_operations(turn.turn_id)
             existing = next((op for op in operations if op.request_ref.get("request_id") == context.request_id), None)
             if existing is not None and existing.status == "completed" and existing.response_item_id:
@@ -735,12 +815,18 @@ class TurnExecutor:
                 answer = item.payload.get("text", "")
                 if not isinstance(answer, str) or not answer.strip() or item.payload.get("tool_calls"):
                     raise ContextBudgetExceededError("Summary must be nonempty and contain no tool calls.")
-                return answer
+                # Cached content must satisfy the new byte bound and admission
+                # limit too. This preparation performs no provider I/O.
+                if node is not None:
+                    await self._prepare_step(context)
+                return validate(answer)
             if existing is not None:
                 context = self.restore_step_context(turn, existing)
             try:
                 prepared = await self._prepare_step(context)
             except ContextBudgetExceededError:
+                if node is not None:
+                    raise ContextBudgetExceededError("Summary exceeds its frozen node input limit.") from None
                 if merged_input and plan is not None:
                     raise ContextBudgetExceededError(
                         "Merged summaries exceed the frozen summary input budget."
@@ -792,15 +878,99 @@ class TurnExecutor:
                 raise _SummaryStoppedError(response)
             if not response.text.strip() or response.tool_calls:
                 raise ContextBudgetExceededError("Summary must be nonempty and contain no tool calls.")
-            return response.text
+            return validate(response.text)
 
-        return await summarize(source)
+        return await summarize(source, node=None if plan is None else plan.get("summary_tree"))
+
+    async def _plan_capacity_compaction(
+        self, turn: TurnContext, *, step: int, source_hash: str, source: str,
+        retained: int, base: PreparedModelCall, byte_allowance: int,
+    ) -> dict[str, Any]:
+        """Reserve actual leaves and bounded summary slots, never model capacity."""
+        policy = context_capacity_policy(turn.binding_manifest)
+        assert policy is not None
+        target = base.request_ref["context_projection"]["post_compact_target"]
+        byte_limit = min(policy.summary_serialized_bytes, byte_allowance)
+        if byte_limit < _summary_serialized_bytes(""):
+            raise ContextBudgetExceededError("No serialized summary slot remains.")
+        continuation_limit = min(
+            target, base.request_ref["serialized_input_bytes"] + byte_limit - _summary_serialized_bytes("")
+        )
+        if base.resource_request.input_tokens > continuation_limit:
+            raise ContextBudgetExceededError("Fixed continuation exceeds its frozen input limit.")
+        probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
+        plan: dict[str, Any] = {
+            "policy_revision": policy.revision,
+            "source_hash": source_hash,
+            "retained_tail_messages": retained,
+            "summary_byte_limit": byte_limit,
+            "summary_output_limit": probe.resource_request.output_tokens,
+            "summary_input_limit": probe.request_ref["context_projection"]["max_input_tokens"],
+            "continuation_input_limit": continuation_limit,
+            "continuation_output_limit": base.resource_request.output_tokens,
+            "continuation_token_reserve": continuation_limit + base.resource_request.output_tokens,
+            "max_summary_calls": turn.binding_manifest.get("model_step_budget", self._max_steps),
+        }
+        # Empty child slots measure the fixed merge wrapper in the real native
+        # or local serializer; B includes escaping in both enclosing formats.
+        merge_floor = await self._prepare_step(self._summary_step(
+            turn, step=step, source=_merge_summary_history("", ""), plan=plan,
+        ))
+        merge_limit = min(plan["summary_input_limit"], merge_floor.request_ref["serialized_input_bytes"]
+                          + 2 * (byte_limit - _summary_serialized_bytes("")))
+        nodes: list[tuple[int, int | None]] = []
+
+        async def measure(text: str) -> dict[str, Any]:
+            digest = hashlib.sha256(text.encode()).hexdigest()
+            try:
+                leaf = await self._prepare_step(self._summary_step(turn, step=step, source=text, plan=plan))
+            except ContextBudgetExceededError:
+                left, right = _split_summary_history(text)
+                children = [await measure(left), await measure(right)]
+                rates = base.request_ref.get("pricing_micros_per_1m", {})
+                cost = estimated_model_cost_micros(
+                    input_tokens=merge_limit, max_output_tokens=plan["summary_output_limit"], pricing=rates,
+                )
+                nodes.append((merge_limit, cost))
+                return {"source_hash": digest, "input_limit": merge_limit, "children": children}
+            nodes.append((leaf.resource_request.input_tokens,
+                          leaf.resource_request.cost_micros if leaf.request_ref.get("pricing_known") else None))
+            return {"source_hash": digest, "input_limit": leaf.resource_request.input_tokens}
+
+        plan["summary_tree"] = await measure(source)
+        used = sum(max(1, len(self._store.list_model_attempts(op.operation_id)))
+                   for op in self._store.list_model_operations(turn.turn_id)
+                   if op.request_ref.get("purpose") == "context_summary")
+        if used + len(nodes) > plan["max_summary_calls"]:
+            raise ContextBudgetExceededError("Planned summary work exceeds the Turn model-step allowance.")
+        required = (sum(tokens + plan["summary_output_limit"] for tokens, _ in nodes)
+                    + plan["continuation_token_reserve"])
+        remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
+        if remaining is not None and required > remaining:
+            raise ContextBudgetExceededError("Insufficient budget for summary tree plus one continuation request.")
+        plan.update(planned_summary_calls=len(nodes), planned_token_upper_bound=required)
+        if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
+            continuation_cost = estimated_model_cost_micros(
+                input_tokens=continuation_limit, max_output_tokens=base.resource_request.output_tokens,
+                pricing=base.request_ref.get("pricing_micros_per_1m", {}),
+            )
+            if continuation_cost is None or any(cost is None for _, cost in nodes):
+                raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
+            required_cost = continuation_cost + sum(cost for _, cost in nodes if cost is not None)
+            remaining_cost = self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            if remaining_cost is not None and required_cost > remaining_cost:
+                raise ContextBudgetExceededError("Insufficient monetary budget for summary and continuation.")
+            plan.update(continuation_cost_reserve=continuation_cost, planned_cost_upper_bound=required_cost)
+        plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+        return plan
 
     async def _prepare_compacted_step(
         self,
         turn: TurnContext,
         *,
         step: int,
+        trigger_reason: str = "explicit_compaction",
+        before_input_tokens: int | None = None,
     ) -> tuple[StepContext, PreparedModelCall]:
         """Measure/commit identical projections; plan summary and continuation together."""
         from agent_runtime.harness.context import RolloutContextManager
@@ -828,6 +998,16 @@ class TurnExecutor:
             return context, prepared
 
         manager = self._context_manager
+        before_state = self._store.read_budget_state(turn.turn_id)
+        if isinstance(manager, RolloutContextManager) and manager.capacity_policy(turn.turn_id) is not None:
+            if before_input_tokens is None:
+                raw_messages = tuple(message for _, message in manager._projected_messages(turn.turn_id))
+                try:
+                    before = await self._prepare_step(self.capture_step_context(turn, step=step, messages=raw_messages))
+                except ContextBudgetExceededError as exc:
+                    before_input_tokens = getattr(exc, "input_tokens", None)
+                else:
+                    before_input_tokens = before.resource_request.input_tokens
         for _retry in range(3):
             try:
                 if not isinstance(manager, RolloutContextManager):
@@ -841,45 +1021,47 @@ class TurnExecutor:
                             raise RuntimeError("Committed context differs from the measured candidate.")
                         return context, prepared
                     raise ContextBudgetExceededError("No legal compaction candidate fits; original history retained.")
-                # Bound the whole batch against the actual serialized request.
-                # Search only local projections; these prepare calls do no I/O.
-                # Keep all call/result roles and canonical originals unchanged.
-                retained = manager.semantic_retained_tail(turn.turn_id)
-                protect_current = False
-                if retained:
-                    try:
-                        await accept(manager.semantic_floor(turn.turn_id, retained_tail_messages=retained))
-                    except ContextBudgetExceededError:
-                        pass
-                    else:
-                        protect_current = True
-                low, high = 0, manager.max_tool_result_bytes(turn.turn_id)
-                best = None
-                while low <= high:
-                    limit = 0 if best is None and low == 0 else (low + high) // 2
-                    fitting_candidate = None
-                    for bounded_candidate in manager.cheap_candidates(
-                        turn.turn_id, include_recent=not protect_current, max_result_bytes=limit,
-                    ):
+                capacity_policy = manager.capacity_policy(turn.turn_id)
+                if capacity_policy is None:
+                    # Bound the whole batch against the actual serialized request.
+                    # Search only local projections; these prepare calls do no I/O.
+                    # Keep all call/result roles and canonical originals unchanged.
+                    retained = manager.semantic_retained_tail(turn.turn_id)
+                    protect_current = False
+                    if retained:
                         try:
-                            await accept(bounded_candidate)
+                            await accept(manager.semantic_floor(turn.turn_id, retained_tail_messages=retained))
                         except ContextBudgetExceededError:
-                            continue
-                        fitting_candidate = bounded_candidate
-                        break
-                    if fitting_candidate is None:
-                        if limit == 0:
+                            pass
+                        else:
+                            protect_current = True
+                    low, high = 0, manager.max_tool_result_bytes(turn.turn_id)
+                    best = None
+                    while low <= high:
+                        limit = 0 if best is None and low == 0 else (low + high) // 2
+                        fitting_candidate = None
+                        for bounded_candidate in manager.cheap_candidates(
+                            turn.turn_id, include_recent=not protect_current, max_result_bytes=limit,
+                        ):
+                            try:
+                                await accept(bounded_candidate)
+                            except ContextBudgetExceededError:
+                                continue
+                            fitting_candidate = bounded_candidate
                             break
-                        high = limit - 1
-                    else:
-                        best = fitting_candidate
-                        low = limit + 1
-                if best is not None:
-                    context, prepared = await accept(best)
-                    await self._commit(partial(manager.commit_compaction, best))
-                    if manager.build(turn.turn_id) != best.messages:
-                        raise RuntimeError("Committed tool projection differs from the measured candidate.")
-                    return context, prepared
+                        if fitting_candidate is None:
+                            if limit == 0:
+                                break
+                            high = limit - 1
+                        else:
+                            best = fitting_candidate
+                            low = limit + 1
+                    if best is not None:
+                        context, prepared = await accept(best)
+                        await self._commit(partial(manager.commit_compaction, best))
+                        if manager.build(turn.turn_id) != best.messages:
+                            raise RuntimeError("Committed tool projection differs from the measured candidate.")
+                        return context, prepared
                 retained = manager.semantic_retained_tail(turn.turn_id)
                 try:
                     floor = manager.semantic_floor(turn.turn_id, retained_tail_messages=retained)
@@ -919,6 +1101,23 @@ class TurnExecutor:
                 )
                 if saved is not None:
                     plan = dict(saved)
+                    retained = plan["retained_tail_messages"]
+                elif capacity_policy is not None:
+                    try:
+                        plan = await self._plan_capacity_compaction(
+                            turn, step=step, source_hash=source_hash, source=source, retained=retained,
+                            base=base, byte_allowance=manager.summary_byte_allowance(floor),
+                        )
+                    except (ContextBudgetExceededError, PricingUnavailableError):
+                        if not retained:
+                            raise
+                        retained = 0
+                        floor = manager.semantic_floor(turn.turn_id)
+                        _, base = await accept(floor)
+                        plan = await self._plan_capacity_compaction(
+                            turn, step=step, source_hash=source_hash, source=source, retained=0,
+                            base=base, byte_allowance=manager.summary_byte_allowance(floor),
+                        )
                 else:
                     probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
                     projection = base.request_ref.get("context_projection", {})
@@ -1035,6 +1234,26 @@ class TurnExecutor:
                     # summary, dropping only its redundant verbatim replay.
                     candidate = manager.semantic_candidate(turn.turn_id, source_hash=source_hash, summary=summary)
                     context, prepared = await accept(candidate, plan)
+                if capacity_policy is not None:
+                    state = self._store.read_budget_state(turn.turn_id)
+                    diagnostics = {
+                        **prepared.request_ref["context_projection"],
+                        "compacted": True,
+                        "trigger_reason": trigger_reason,
+                        "before_input_tokens": before_input_tokens,
+                        "after_input_tokens": prepared.resource_request.input_tokens,
+                        "summary_calls": state.used.model_calls - before_state.used.model_calls,
+                        "summary_tokens": state.used.total_tokens - before_state.used.total_tokens,
+                        "summary_cost_micros": state.used.cost_micros - before_state.used.cost_micros
+                        if prepared.request_ref.get("pricing_known") else "unknown",
+                        "budget_status": self._budget_status(turn),
+                    }
+                    candidate = replace(candidate, payload_json=json.dumps({
+                        **json.loads(candidate.payload_json), "capacity_diagnostics": diagnostics,
+                    }, sort_keys=True))
+                    prepared = replace(prepared, request_ref={**prepared.request_ref,
+                        "context_projection": {**prepared.request_ref["context_projection"],
+                                               "trigger_reason": trigger_reason, "compacted": True}})
                 await self._commit(partial(manager.commit_compaction, candidate))
                 if manager.build(turn.turn_id) != candidate.messages:
                     raise RuntimeError("Committed context differs from the measured candidate.")
@@ -1120,7 +1339,11 @@ class TurnExecutor:
                         prepared = await self._prepare_step(step_context)
             except ContextBudgetExceededError as exc:
                 try:
-                    step_context, prepared = await self._prepare_compacted_step(turn_context, step=step)
+                    step_context, prepared = await self._prepare_compacted_step(
+                        turn_context, step=step,
+                        trigger_reason="provider_overflow" if reactive else exc.reason_code,
+                        before_input_tokens=getattr(exc, "input_tokens", None),
+                    )
                 except _SummaryStoppedError as stopped:
                     return stopped.result
                 except (ContextBudgetExceededError, ContextSourceChangedError) as failure:
@@ -1632,6 +1855,8 @@ class TurnExecutor:
                 proposal_item_id=proposal.item_id,
                 action=decision.action,
                 reason=decision.reason,
+                validation_status=decision.validation_status,
+                validation_scope=decision.validation_scope,
             )
         )
         if decision.action == "continue":
@@ -1775,3 +2000,15 @@ def _split_summary_history(text: str) -> tuple[str, str]:
             "A complete summary work unit exceeds its input budget; original history retained.",
             reason_code="summary_unit_exceeds_context",
         ) from exc
+
+
+def _summary_serialized_bytes(summary: str) -> int:
+    """Bound the summary slot through history/compaction JSON and wire JSON."""
+    inner = json.dumps(summary, ensure_ascii=False)
+    return len(json.dumps(inner, ensure_ascii=False).encode("utf-8"))
+
+
+def _merge_summary_history(left: str, right: str) -> str:
+    return json.dumps({"history": [{"role": "context", "content": left},
+                                  {"role": "context", "content": right}],
+                       "history_order": "Earlier summary, then later summary."}, ensure_ascii=False)

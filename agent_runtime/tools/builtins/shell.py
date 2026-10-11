@@ -329,8 +329,9 @@ def create_execute_python_tool(
                 "such as pandas, openpyxl, PyMuPDF, SciPy, and matplotlib. The "
                 "workspace is read-only by default. For generated files, set "
                 "workspace_write=true and list every intended output in "
-                "output_paths; then call inspect_data_file once on each required "
-                "artifact and return a final answer. Do not invoke a shell or create a heredoc "
+                "output_paths. Use inspect_data_file to inspect generated artifacts "
+                "and check the requested results. A valid file structure does not "
+                "verify calculation or transformation correctness. Do not invoke a shell or create a heredoc "
                 "from the Python code merely to repeat inspection."
             ),
             input_schema=_PYTHON_INPUT_SCHEMA,

@@ -16,7 +16,8 @@ from urllib.parse import parse_qs, urljoin, urlsplit
 from uuid import uuid4
 
 from bs4 import BeautifulSoup
-from bs4.element import Comment, NavigableString, Tag
+from bs4.element import Comment, Tag
+from markdownify import MarkdownConverter
 
 from agent_runtime.tools.web_http import PublicWebError, validate_public_url
 
@@ -198,21 +199,12 @@ def extract_content(
         published_at, published_at_source = _published_time(soup)
         if soup.title:
             title = soup.title.get_text(" ", strip=True)[:500]
-        fallback_html = ''.join(str(n) for n in soup.find_all(['nav', 'form', 'dialog', 'noscript']))
         for comment in soup.find_all(string=lambda value: isinstance(value, Comment)):
             comment.extract()
-        for element in soup.find_all([
-            "head", "script", "style", "noscript", "template", "nav", "footer", "aside",
-            "form", "dialog", "svg", "button", "input",
-        ]):
+        for element in soup.find_all(["head", "script", "style", "template"]):
             element.decompose()
-        root, extraction_method = _content_root(soup)
-        if not root.get_text(strip=True) and fallback_html:
-            # Preserve visible fallback text when the selected body has no text.
-            root = BeautifulSoup(fallback_html, 'html.parser')
-            extraction_method = 'visible_text_fallback'
-        if not root.get_text(strip=True):
-            raise PublicWebError('web_content_empty', 'No extracted text was found.')
+        root = soup.body or soup
+        extraction_method = "markdownify_full_body"
         found: list[dict[str, str]] = []
         for anchor in root.find_all("a", href=True):
             try:
@@ -232,7 +224,8 @@ def extract_content(
             else:
                 links_truncated = True
         links = tuple(found)
-        text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", _html_text(root, url)).strip()
+        converter = _SourceMarkdownConverter(heading_style="ATX", bullets="-", escape_misc=True)
+        text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", converter.convert_soup(root)).strip()
         # Only renderer-generated boundaries determine positions. Page text and
         # code containing literal [L1] cannot impersonate an actual hyperlink.
         marker_pattern = re.compile(r"\x00" + nonce + r":(\d+)\x00(.*?)\x00/" + nonce + r":\1\x00", re.S)
@@ -276,59 +269,41 @@ def extract_content(
                             tuple(item for item in occurrences if item["start"] < max_characters), links_truncated)
 
 
-def _html_text(node: Tag | NavigableString, url: str) -> str:
-    if isinstance(node, Comment):
-        return ""
-    if isinstance(node, NavigableString):
-        return " ".join(str(node).split()) + (" " if str(node).strip() else "")
-    if node.name == "pre":
-        code = node.find("code")
-        language = ""
-        if isinstance(code, Tag):
-            classes = code.get("class")
-            for value in classes if isinstance(classes, list) else []:
-                if re.fullmatch(r"language-[\w+-]{1,30}", value):
-                    language = value.removeprefix("language-")
-                    break
-        return "\n```" + language + "\n" + node.get_text().rstrip("\n") + "\n```\n"
-    if node.name == "img":
-        return str(node.get("alt", "")).strip() + " "
-    if node.name == "br":
-        return "\n"
-    if node.name == "a":
-        label = "".join(_html_text(child, url) for child in node.children
-                        if isinstance(child, (Tag, NavigableString))).strip()
-        marker = node.get("data-praxis-link")
-        if marker:
-            identifier = str(marker).rsplit(":", 1)[1]
-            return f"\x00{marker}\x00[{label}][L{identifier}]\x00/{marker}\x00 "
-        return label + " "
-    content = "".join(_html_text(child, url) for child in node.children if isinstance(child, (Tag, NavigableString)))
-    if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
-        return "\n" + "#" * int(node.name[1]) + " " + content.strip() + "\n"
-    if node.name == "li":
-        return "\n- " + content.strip() + "\n"
-    if node.name in {
-        "p", "div", "section", "article", "main", "tr", "ul", "ol", "table", "blockquote", "dl", "dt", "dd",
-    }:
-        return "\n" + content.strip() + "\n"
-    if node.name in {"td", "th"}:
-        return content.strip() + "\t"
-    return content
+class _SourceMarkdownConverter(MarkdownConverter):
+    """Use the library renderer while keeping runtime-owned link identities."""
 
+    def convert_a(self, el: Tag, text: str, parent_tags: set[str]) -> str:
+        label = text.strip()
+        marker = el.get("data-praxis-link")
+        if not marker or not label:
+            return text
+        identifier = str(marker).rsplit(":", 1)[1]
+        prefix = " " if text[:1].isspace() else ""
+        suffix = " " if text[-1:].isspace() else ""
+        return f"{prefix}\x00{marker}\x00[{label}][L{identifier}]\x00/{marker}\x00{suffix}"
 
-def _content_root(soup: BeautifulSoup) -> tuple[Tag, str]:
-    """Honor declared document regions; otherwise preserve the cleaned body without ranking."""
-    semantic = soup.select("main, [role=main], article, [itemprop=articleBody]")
-    if semantic:
-        root = semantic[0]
-        for node in semantic[1:]:
-            while root is not node and not any(parent is root for parent in node.parents):
-                parent = root.parent
-                assert isinstance(parent, Tag)
-                root = parent
-        return root, "semantic"
-    return soup.body or soup, "body_fallback"
+    def convert_img(self, el: Tag, text: str, parent_tags: set[str]) -> str:
+        # Markdownify's type stub omits this public renderer method.
+        return cast(str, self.escape(str(el.get("alt", "")).strip(), parent_tags))  # type: ignore[attr-defined]
+
+    def convert_video(self, el: Tag, text: str, parent_tags: set[str]) -> str:
+        return text
+
+    def convert_dd(self, el: Tag, text: str, parent_tags: set[str]) -> str:
+        # CommonMark has no definition-list syntax. Preserve paragraphs instead
+        # of the library's indented extension, which becomes a code block.
+        return "\n\n" + text.strip() + "\n\n"
+
+    def convert_pre(self, el: Tag, text: str, parent_tags: set[str]) -> str:
+        source_code = el.get_text().rstrip("\n")
+        if not source_code.strip():
+            return ""
+        code = el.find("code")
+        classes = code.get("class") if isinstance(code, Tag) else None
+        language = next((value.removeprefix("language-") for value in classes or []
+                         if re.fullmatch(r"language-[\w+-]{1,30}", value)), "")
+        fence = "`" * max(3, max((len(run) + 1 for run in re.findall(r"`+", source_code)), default=3))
+        return "\n\n" + fence + language + "\n" + source_code + "\n" + fence + "\n\n"
 
 
 def _markdown_links(text: str, url: str) -> tuple[tuple[dict[str, str], ...], tuple[dict[str, int], ...], bool]:

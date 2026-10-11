@@ -13,6 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from uuid import uuid4
 
+from agent_runtime.core.runtime_diagnostics import exception_diagnostic, redact_sensitive_text
 from agent_runtime.tools.permissions import (
     CanUseToolResult,
     ToolExecutionContext,
@@ -444,12 +445,13 @@ class ToolExecutor:
                 record=None,
                 started_at=started_at,
             )
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="invalid_arguments",
+                    error=error,
                     message="tool input validation failed",
                     retryable=True,
                 ),
@@ -465,12 +467,13 @@ class ToolExecutor:
                 effects=tool.static_effects | dynamic.effects,
                 targets=dynamic.targets,
             )
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="use_resolution_failed",
+                    error=error,
                     message="tool effects and targets could not be resolved",
                     retryable=False,
                 ),
@@ -493,12 +496,13 @@ class ToolExecutor:
                 started_at=started_at,
                 resolved=resolved,
             )
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="hard_guard_failed",
+                    error=error,
                     message="tool hard guard failed closed",
                     retryable=False,
                 ),
@@ -511,12 +515,13 @@ class ToolExecutor:
             boundary = self._boundary_resolver(tool, resolved, context)
             if not isinstance(boundary, ExecutionBoundary):
                 raise TypeError("boundary resolver must return ExecutionBoundary")
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="execution_boundary_failed",
+                    error=error,
                     message="execution boundary could not be selected",
                     retryable=False,
                 ),
@@ -529,12 +534,13 @@ class ToolExecutor:
             decision = self._permission_decider(tool, arguments, resolved, context)
             if not isinstance(decision, CanUseToolResult):
                 raise TypeError("permission decider must return CanUseToolResult")
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="permission_failed",
+                    error=error,
                     message="tool permission decision failed closed",
                     retryable=False,
                 ),
@@ -660,12 +666,13 @@ class ToolExecutor:
                 approved = await approved
             if approved not in (True, False, None):
                 raise TypeError("approval resolver must return bool or None")
-        except Exception:
+        except Exception as error:
             return await self._finish(
                 call=call,
                 result=_error_result(
                     call,
                     code="approval_failed",
+                    error=error,
                     message="tool approval resolution failed closed",
                     retryable=True,
                     metadata=_approval_metadata(call, resolved, decision),
@@ -809,7 +816,7 @@ class ToolExecutor:
             )
             await _emit_execution(cancellation_sink, execution)
             raise
-        except FileNotFoundError:
+        except FileNotFoundError as error:
             record = replace(
                 prepared.record,
                 status=ExecutionStatus.FAILED,
@@ -820,13 +827,14 @@ class ToolExecutor:
                 result=_error_result(
                     prepared.call,
                     code="file_not_found",
+                    error=error,
                     message="Requested file or directory does not exist.",
                     retryable=False,
                 ),
                 record=record,
                 prepared=prepared,
             )
-        except Exception:
+        except Exception as error:
             record = replace(
                 prepared.record,
                 status=ExecutionStatus.FAILED,
@@ -837,8 +845,9 @@ class ToolExecutor:
                 result=_error_result(
                     prepared.call,
                     code="runner_failed",
+                    error=error,
                     message="tool runner failed",
-                    retryable=prepared.tool.idempotent,
+                    retryable=False,
                 ),
                 record=record,
                 prepared=prepared,
@@ -848,30 +857,33 @@ class ToolExecutor:
             output = prepared.tool.normalize_output(raw)
             if not isinstance(output, NormalizedToolOutput):
                 raise TypeError("normalize_output must return NormalizedToolOutput")
-        except Exception:
+        except Exception as error:
             return await self._failed_after_runner(
                 prepared,
                 code="normalization_failed",
+                error=error,
                 message="tool output normalization failed",
             )
         try:
             output = self._output_validator(prepared.tool, output)
             if not isinstance(output, NormalizedToolOutput):
                 raise TypeError("output validator must return NormalizedToolOutput")
-        except Exception:
+        except Exception as error:
             return await self._failed_after_runner(
                 prepared,
                 code="output_validation_failed",
+                error=error,
                 message="normalized tool output failed validation",
             )
         try:
             output, truncated = self._externalizer(prepared.tool, output)
             if not isinstance(output, NormalizedToolOutput) or type(truncated) is not bool:
                 raise TypeError("externalizer must return (NormalizedToolOutput, bool)")
-        except Exception:
+        except Exception as error:
             return await self._failed_after_runner(
                 prepared,
                 code="externalization_failed",
+                error=error,
                 message="tool output could not be externalized or bounded",
             )
 
@@ -909,6 +921,7 @@ class ToolExecutor:
         *,
         code: str,
         message: str,
+        error: Exception,
     ) -> ToolExecution:
         record = replace(
             prepared.record,
@@ -920,6 +933,7 @@ class ToolExecutor:
             result=_error_result(
                 prepared.call,
                 code=code,
+                error=error,
                 message=message,
                 retryable=False,
                 metadata={
@@ -975,6 +989,11 @@ class ToolExecutor:
                         ),
                     }
                 )
+            if record is not None:
+                metadata["operation_id"] = record.operation_id
+                diagnostic = metadata.get("diagnostic")
+                if isinstance(diagnostic, Mapping):
+                    metadata["diagnostic"] = {**diagnostic, "operation_id": record.operation_id}
             result = replace(result, metadata=metadata)
         if record is not None:
             await _emit_record(record_sink, record)
@@ -1406,8 +1425,14 @@ def _error_result(
     message: str,
     retryable: bool,
     metadata: Mapping[str, JsonValue] | None = None,
+    error: Exception | None = None,
 ) -> ToolResult:
-    safe_message = " ".join(message.split())[:512]
+    safe_message = " ".join(redact_sensitive_text(message).split())[:512]
+    result_metadata = dict(metadata or {})
+    if error is not None:
+        result_metadata["diagnostic"] = exception_diagnostic(
+            error, stage=code, tool_call_id=call.tool_call_id,
+        )
     return ToolResult(
         tool_call_id=call.tool_call_id,
         tool_name=call.tool_name,
@@ -1416,7 +1441,7 @@ def _error_result(
         error_code=code,
         error_message=safe_message,
         retryable=retryable,
-        metadata={} if metadata is None else metadata,
+        metadata=result_metadata,
     )
 
 

@@ -294,8 +294,8 @@ def create_read_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "max_bytes above 1,000,000. A targeted read after a write can confirm "
                 "literal file content. Reuse a sufficient result while the workspace "
                 "is unchanged; request another range only for content not yet observed. "
-                "For one literal edit, choose this tool or search_text once, never both "
-                "as paired confirmation. Binary metadata and a range starting at or "
+                "A read verifies observed content, not execution behavior. "
+                "Binary metadata and a range starting at or "
                 "past end-of-file do not verify text content."
             ),
             input_schema=_READ_INPUT_SCHEMA,
@@ -332,12 +332,11 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 "text replacement. Omit old_string only when creating a new file. "
                 "Without replace_all, the old text must occur exactly once. The write "
                 "is atomically installed and creation fails if the path exists. Verification "
-                "toolchains under .venv and node_modules are read-only. After a "
-                "successful literal edit, use at most one targeted read_file or "
-                "search_text call, never both, then return a final answer when it proves the requested "
-                "state. If the task already supplies the exact file, old text, and new "
-                "text, call apply_patch directly instead of pre-reading merely to "
-                "reconfirm them; the replacement checks fail closed. Never reapply the "
+                "toolchains under .venv and node_modules are read-only. A successful "
+                "replacement establishes that the supplied text was written; it does "
+                "not verify execution behavior. Select verification for the requested "
+                "result. If the task supplies the exact file, old text, and new text, "
+                "the replacement checks fail closed and can avoid a redundant read. Never reapply the "
                 "patch merely to reconfirm it."
             ),
             input_schema=_PATCH_INPUT_SCHEMA,

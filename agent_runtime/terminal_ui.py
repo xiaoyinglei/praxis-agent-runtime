@@ -97,7 +97,7 @@ class Conversation:
             rows.append((f"… 已省略 {self.omitted_blocks} 段较早记录", None, "dim"))
         for block in self.blocks:
             if block.kind != "group":
-                prefix = "❯ " if block.kind == "user" else "● " if block.kind == "answer" else ""
+                prefix = "你 › " if block.kind == "user" else "● " if block.kind == "answer" else ""
                 rows.append((prefix + block.detail(), None, block.kind))
             else:
                 errors = sum(child.failed for child in block.children)
@@ -192,6 +192,12 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             self._new_answer = True
         try:
             await super().emit(event)
+            if self._target and self._target.failed:
+                result = event.data.get("result")
+                code = result.get("error_code") if isinstance(result, dict) else event.data.get("error_code")
+                if isinstance(code, str) and code:
+                    self._target.title += " · " + safe_terminal_text(code)
+                self._target.title += " · 点击查看记录"
         finally:
             self._target = None
         if self.group and self._started_at is not None:

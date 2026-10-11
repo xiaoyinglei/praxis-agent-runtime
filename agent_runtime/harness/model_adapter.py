@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, cast
@@ -42,7 +43,7 @@ from agent_runtime.harness.protocol import (
     ModelDispatchPreflightError,
     PreparedModelCall,
 )
-from agent_runtime.modeling.contracts import LLMCallStage
+from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, context_capacity_policy
 from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
     ProviderDelta,
@@ -182,6 +183,8 @@ class GatewayHarnessModel:
             resolved=self._resolved,
             stage=stage,
             input_token_limit=request.input_token_limit,
+            capacity_policy=context_capacity_policy(request.binding_manifest)
+            or getattr(self._resolved.gateway, "context_policy", None),
         )
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
@@ -225,6 +228,10 @@ class GatewayHarnessModel:
                 "pricing_known": pricing_known,
                 "continuation_summary_role": summary_role,
                 "reserved_cost_micros": resource_request.cost_micros,
+                "serialized_input_bytes": len(model_request_input_text(
+                    canonical_request, provider=self._resolved.provider,
+                    supports_native_tools=self._resolved.capabilities.supports_native_tools,
+                ).encode("utf-8")),
                 **({"context_projection": context_projection} if context_projection is not None else {}),
             },
             resource_request=resource_request,
@@ -645,6 +652,7 @@ def _budgeted_request(
     resolved: ResolvedModel,
     stage: LLMCallStage = LLMCallStage.AGENT_STEP,
     input_token_limit: int | None = None,
+    capacity_policy: ContextCapacityPolicy | None = None,
 ) -> tuple[StableModelContext, ModelRequest, Mapping[str, Any] | None]:
     def build(candidate: StableModelContext) -> ModelRequest:
         return build_model_request(
@@ -654,13 +662,12 @@ def _budgeted_request(
             settings=settings,
         )
 
-    canonical = build(context)
     gateway = resolved.gateway
     accounting = resolved.token_accounting
     effective_budget = getattr(gateway, "effective_stage_budget", None)
     count = getattr(accounting, "count_for_budget", None) or getattr(accounting, "count", None)
     if not callable(effective_budget) or not callable(count):
-        return context, canonical, None
+        return context, build(context), None
     budget = effective_budget(
         stage,
         kwargs={"max_tokens": settings.max_output_tokens},
@@ -680,8 +687,40 @@ def _budgeted_request(
             )
         )
 
+    effective_input_limit = max_input_tokens
+    policy_fields: dict[str, Any] = {}
+    if capacity_policy is not None:
+        window = resolved.capabilities.context_window_tokens
+        auto_limit = min(effective_input_limit, window * 9 // 10)
+        configured = gateway.stage_budget(stage) if callable(getattr(gateway, "stage_budget", None)) else None
+        policy_fields = {
+            "model_context_tokens": window,
+            "output_reserve_tokens": budget.max_output_tokens,
+            "safety_margin_tokens": budget.safety_margin_tokens,
+            "explicit_input_cap": None if configured is None else configured.max_input_tokens,
+            "effective_input_limit": effective_input_limit,
+            "auto_compact_limit": auto_limit,
+            "post_compact_target": auto_limit * 8 // 10,
+            "byte_guards": {"item": capacity_policy.max_item_bytes, "total": capacity_policy.max_total_bytes},
+            "message_guard": capacity_policy.max_messages,
+            "policy_revision": capacity_policy.revision,
+            "trigger_reason": None,
+        }
+        if stage == LLMCallStage.AGENT_STEP and input_token_limit is None:
+            max_input_tokens = auto_limit
+        if stage == LLMCallStage.AGENT_STEP:
+            context = build_stable_context(
+                instructions=context.instructions, frozen_run_context=context.frozen_run_context,
+                initial_user_task=context.initial_user_task,
+                transcript=(*context.transcript, ModelMessage(role="context", content="Runtime input limits:\n" +
+                    json.dumps({key: policy_fields[key] for key in (
+                        "model_context_tokens", "explicit_input_cap", "effective_input_limit",
+                        "auto_compact_limit", "post_compact_target",
+                    )}, sort_keys=True))),
+            )
     if input_token_limit is not None:
         max_input_tokens = min(max_input_tokens, input_token_limit)
+    canonical = build(context)
     input_tokens = measured(canonical)
     if input_tokens <= max_input_tokens:
         return (
@@ -696,10 +735,12 @@ def _budgeted_request(
                     if callable(getattr(accounting, "budget_count_source", None))
                     else "external_counter"
                 ),
+                **policy_fields,
             },
         )
 
     raise ContextCompactionRequiredError(
         input_tokens=input_tokens,
         max_input_tokens=max_input_tokens,
+        reason_code="token_threshold" if capacity_policy is not None else "context_budget_exhausted",
     )

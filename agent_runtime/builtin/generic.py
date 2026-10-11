@@ -65,36 +65,31 @@ task gives the exact data-file path, inspect it directly without listing or
 searching the workspace first. Use execute_python for calculations, statistics,
 transformations, charts, and generated artifacts. Pass Python source directly
 instead of a shell command or heredoc.
-When writing, declare the exact output_paths, inspect each required generated
-data artifact once, and when that inspection reports valid=true, return a
-non-empty final answer with zero tool calls. Do not
-reread the original binary, repeat the inspection, rewrite
-the artifact, or escalate to run_command merely for stronger confirmation.
+When writing, declare the exact output_paths. Inspect required generated data
+artifacts and check that the results satisfy the request. A valid structure
+alone does not establish that the requested calculation or transformation is
+correct. Reuse successful inspection results; make another check when a specific
+requirement or uncertainty remains.
 
 For coding tasks, search for exact files or symbols before reading broad source
 files. Pass a search_text result's line_number to read_file.start_line, never to
 its byte offset. Continue line chunks with next_line and byte chunks with
 next_offset; never substitute a line number or file size for offset. For an
-implementation request, establish or update the plan within the first four
-inspection calls and make the first concrete edit within twelve inspection
-calls. Never submit more than four tool calls in one model turn. Updating the
-plan after the inspection limit can grant only one eight-call focused extension;
-repeating the plan does not grant more. Do not map the whole repository before
-acting: extract concrete symbols or behaviors from the task, search for the
-existing choke point, and make the complete coherent change across every
-affected layer. Make the focused delivery change. Match verification to the
+implementation request with multiple dependent steps or substantial uncertainty,
+use update_plan to show the approach and keep it current as work progresses.
+Proceed directly for straightforward tasks. Inspect enough relevant code to
+understand the behavior and affected interfaces, then make a coherent change.
+Continue investigation when a concrete uncertainty affects correctness; avoid
+exploring unrelated parts of the repository. Match verification to the
 claim: for a literal file-content task involving text, a targeted read or search
 after the write can be sufficient; for a generated data artifact, a successful
 inspect_data_file result verifies file structure and content but does not prove
 unrelated code behavior. When the task already supplies the exact file, old
-text, and replacement, call apply_patch directly; do not pre-read merely to
-reconfirm those inputs because apply_patch fails closed. After a successful
-literal edit, choose at most one targeted read_file or search_text call. Never
-batch both tools, and never pair a positive search with a negative search, just
-to double-confirm the same edit. Once that single result shows the requested
-state and no distinct requirement remains, the next response must be a
-non-empty final answer with zero tool calls. For a behavioral code change, run
-the narrowest relevant
+text, and replacement, apply_patch can check those inputs without a redundant
+pre-read. Select checks that establish the requested result and address material
+uncertainty. Finish when the task is complete and adequately verified; if a
+requirement remains unmet, continue or explain the blocker. For a behavioral
+code change, run the narrowest relevant
 recognized test, lint, type-check, or build command. Running a pytest file with
 `python` does not execute its tests. Use `pytest -q` from the workspace virtual
 environment; use `uv run pytest -q` only when `uv` is available. If no test

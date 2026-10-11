@@ -5,6 +5,7 @@ import fcntl
 import hashlib
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,26 @@ def locked_manifest(text, lock):
     if not result:
         raise ValueError("empty compiled profile")
     return "\n".join(result) + "\n"
+
+
+def validate_environment_files(environment):
+    """Check the entire venv, including wheel headers installed under include/."""
+    pending = [Path(environment)]
+    while pending:
+        with os.scandir(pending.pop()) as entries:
+            for entry in entries:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+                    relative = Path(entry.path).relative_to(environment)
+                    raise ValueError(
+                        f"dependency environment contains a hardlinked file: {relative}; "
+                        "recreate this venv with copy-mode installation before using shell tools"
+                    )
 
 
 def install(repo, python, cache, offline=False, wheel_dir=None):
@@ -92,11 +113,16 @@ def install(repo, python, cache, offline=False, wheel_dir=None):
         # Re-validate pins and immutable hashes on every use, including offline runs.
         if locked_manifest(manifest.read_text(), lock) != manifest.read_text():
             raise ValueError("cached manifest differs from uv.lock; remove the manifest and retry")
-        print("Installing binary core dependencies from persistent wheel cache.", flush=True)
+        print("Installing binary core dependencies as private copies from persistent wheel cache.", flush=True)
         run(["pip", "install", "--python", str(python), "--require-hashes", "--only-binary", ":all:",
-             *source, "-r", str(manifest)])
+             "--link-mode", "copy", "--reinstall", *source, "-r", str(manifest)])
         # uv also caches the editable build backend. --offline never downloads build tools.
-        run(["pip", "install", "--python", str(python), "--no-deps", "-e", "."])
+        run(["pip", "install", "--python", str(python), "--link-mode", "copy", "--reinstall", "--no-deps", "-e", "."])
+        environment = Path(subprocess.check_output(
+            [str(python), "-I", "-c", "import sys; print(sys.prefix)"], text=True, timeout=10,
+        ).strip())
+        if (environment / "pyvenv.cfg").is_file():
+            validate_environment_files(environment)
     print(f"Core dependencies ready. Cache: {cache}")
 
 

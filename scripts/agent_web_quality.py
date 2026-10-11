@@ -56,9 +56,12 @@ def load_before(directory: Path) -> tuple[Any, Any]:
     return modules[0].extract_content, modules[1]
 
 
-def normalized(text: str) -> str:
-    text = re.sub(r'\[([^]]*)\]\([^)]*\)', r'\1', text)
-    text = re.sub(r'\[([^]]*)\]\[L\d+\]', r'\1', text)
+def normalized(text: str, *, markdown: bool = False) -> str:
+    if markdown:
+        from markdown_it import MarkdownIt
+
+        text = re.sub(r'(?<!\\)\[([^]]*)\]\[L\d+\]', r'\1', text)
+        text = BeautifulSoup(MarkdownIt('commonmark').render(text), 'html.parser').get_text()
     return re.sub(r'\s+', '', text)
 
 
@@ -82,7 +85,8 @@ async def measure(extractor: Any, web_module: Any) -> dict[str, Any]:
         extracted = extractor(body, meta['content_type'], meta['url'])
         expected = gold(body, name)
         weights = [len(normalized(text)) for text in expected]
-        full = normalized(extracted.text)
+        markdown_output = 'html' in meta['content_type']
+        full = normalized(extracted.text, markdown=markdown_output)
         full_retention = sum(w for t, w in zip(expected, weights, strict=True)
                              if normalized(t) in full) / max(1, sum(weights))
         blobs: dict[str, bytes] = {}
@@ -111,7 +115,7 @@ async def measure(extractor: Any, web_module: Any) -> dict[str, Any]:
             envelope_data['structured_content']['fetched_at'] = '2026-10-05T00:00:00+00:00'
             envelope = json.dumps(envelope_data, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
             output = envelope_data['structured_content']
-            excerpt = normalized(re.sub(r'^\d+: ', '', output['content'], flags=re.M))
+            excerpt = normalized(re.sub(r'^\d+: ', '', output['content'], flags=re.M), markdown=markdown_output)
             excerpt_retention = sum(w for t, w in zip(expected, weights, strict=True)
                                     if normalized(t) in excerpt) / max(1, sum(weights))
             # Annotated markers for this fixed corpus, not production extraction rules.

@@ -49,6 +49,7 @@ dependencies = [
   "regex>=2025.7.34",
   "wcwidth>=0.2.13",
   "markdown-it-py>=3,<5",
+  "markdownify>=1.2.3,<2",
 ]
 
 [project.optional-dependencies]

@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
+type AgentValidationStatus = Literal["not_evaluated", "passed", "failed"]
 type AgentPauseKind = Literal[
     "tool_approval",
     "tool_reconciliation",
@@ -141,6 +142,9 @@ class AgentResult:
     plan_events: tuple[PlanEvent, ...]
     needs_user_input: str | None = None
     thread_id: str = ""
+    # The runtime lifecycle is separate from validation of this narrow scope.
+    validation_status: AgentValidationStatus = "not_evaluated"
+    validation_scope: str | None = None
 
     @classmethod
     def _from_harness(
@@ -165,6 +169,17 @@ class AgentResult:
             if isinstance((value := usage.get("usage_source")), str)
         )
         items = store.list_items(result.turn_id)
+        decisions = [
+            item for item in items
+            if item.kind == "completion_decision" and item.status == "completed"
+        ]
+        decision = decisions[-1].payload if decisions else {}
+        validation_status = decision.get("validation_status", "not_evaluated")
+        if validation_status not in {"not_evaluated", "passed", "failed"}:
+            raise RuntimeError("canonical completion validation status is malformed")
+        validation_scope = decision.get("validation_scope")
+        if validation_scope is not None and not isinstance(validation_scope, str):
+            raise RuntimeError("canonical completion validation scope is malformed")
         arguments_by_id = {
             str(item.payload["tool_call_id"]): item.payload.get("arguments")
             for item in items
@@ -430,6 +445,8 @@ class AgentResult:
             plan_events=plan_events,
             needs_user_input=None if pause is None else pause.question,
             thread_id=thread.thread_id,
+            validation_status=cast(AgentValidationStatus, validation_status),
+            validation_scope=validation_scope,
         )
 
 
@@ -582,6 +599,7 @@ __all__ = [
     "AgentPlan",
     "AgentResult",
     "AgentResultStatus",
+    "AgentValidationStatus",
     "AgentToolCall",
     "AgentToolSummary",
     "AgentUsage",

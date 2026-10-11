@@ -271,6 +271,8 @@ class Session:
             turn_id = f"turn_{uuid4().hex}"
             binding = dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
             binding["budget_root_turn_id"] = turn_id
+            if self._agent is not None:
+                binding["web_limits"] = self._agent.web_limits.model_dump(mode="json")
             result = await self._executor().run(
                 turn_id=turn_id,
                 user_message=task,
@@ -403,6 +405,7 @@ class Session:
         from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
         from agent_runtime.tools.builtins.web import WEB_SOURCE_MEDIA_TYPE, create_web_tools, load_search_key
         from agent_runtime.tools.web_http import PublicWebClient, PublicWebError
+        from agent_runtime.tools.web_limits import WebLimits
 
         web_client = (PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy)
                       if agent.web_proxy_url is not None else PublicWebClient())
@@ -423,25 +426,102 @@ class Session:
                 raise KeyError("web source belongs to another security domain")
             return self.store.read_artifact(source_id)
 
-        def check_web_budget() -> None:
+        def current_web_limits() -> WebLimits:
+            turn = self.store.read_turn(current_tool_turn_id())
+            return WebLimits.model_validate(turn.binding_manifest.get("web_limits", {}))
+
+        def persisted_web_attempts() -> int:
             turn_id = current_tool_turn_id()
-            if turn_id is None:
-                raise RuntimeError("web request requires an active tool Turn")
-            attempts = sum(
-                max(1, operation.attempt_count)
-                for operation in self.store.list_tool_operations(turn_id)
-                if operation.tool_name in {"web_search", "web_fetch"} and "network" in operation.effects
-                and not (operation.result_item_id and self.store.read_item(operation.result_item_id)
-                         .payload.get("metadata", {}).get("web_cache_hit") is True)
+            # New Turns bind WebLimits and use durable unit reservations from
+            # their first request. Only pre-upgrade Turns need legacy counting.
+            if "web_limits" in self.store.read_turn(turn_id).binding_manifest:
+                return 0
+            attempts = 0
+            for operation in self.store.list_tool_operations(turn_id):
+                if (operation.tool_name not in {"web_search", "web_fetch"}
+                        or "network" not in operation.effects or not operation.attempt_count):
+                    continue
+                if operation.result_item_id:
+                    payload = self.store.read_item(operation.result_item_id).payload
+                    metadata = payload.get("metadata", {})
+                    if (metadata.get("web_cache_hit") is True
+                            or metadata.get("web_request_attempted") is False):
+                        # Only the last attempt is known not to have reached the
+                        # network; earlier recovered attempts remain unknown.
+                        attempts += max(0, operation.attempt_count - 1)
+                        continue
+                # Current running attempts have not reserved network yet. Previous
+                # attempts and unknown outcomes after recovery count conservatively.
+                attempts += (max(0, operation.attempt_count - 1)
+                             if operation.status == "running" and operation.claim_owner == self.worker_id
+                             else operation.attempt_count)
+            return attempts
+
+        def web_budget_status() -> dict[str, Any]:
+            limit = current_web_limits().turn_requests
+            usage = self.store.read_resource_usage(
+                current_tool_turn_id(), "public_web_requests", initial_used=persisted_web_attempts(),
             )
-            if attempts > 32:
-                raise PublicWebError("web_request_budget_exceeded", "A Turn allows at most 32 web request attempts.")
+            attempts = usage["used"]
+            return {"limit": limit, "used": min(attempts, limit), "remaining": max(0, limit - attempts),
+                    "unit": "network_tool_attempts", "unknown_attempts_counted": True,
+                    "last_reservation_item_id": usage["item_id"]}
+
+        def check_web_budget() -> None:
+            limit = current_web_limits().turn_requests
+            try:
+                # Commit a unit before network I/O; the SQLite transaction also
+                # serializes separate Sessions/processes sharing this Turn.
+                self.store.reserve_resource_unit(
+                    current_tool_turn_id(), "public_web_requests", limit=limit,
+                    initial_used=persisted_web_attempts(),
+                )
+            except ValueError as error:
+                if str(error) != "resource_limit_exceeded":
+                    raise
+                raise PublicWebError(
+                    "web_request_budget_exceeded", f"This Turn permits {limit} web request attempts.",
+                ) from None
+
+        def saved_fetch_failure(url: str, mode: str) -> dict[str, Any] | None:
+            from agent_runtime.tools.builtins.web import WebFetchInput
+
+            items = self.store.list_items(current_tool_turn_id())
+            arguments = {
+                item.payload.get("tool_call_id"): item.payload.get("arguments")
+                for item in items if item.kind == "tool_call" and item.payload.get("tool_name") == "web_fetch"
+            }
+            for item in reversed(items):
+                if item.kind != "tool_result" or item.payload.get("tool_name") != "web_fetch":
+                    continue
+                prior_args = arguments.get(item.payload.get("tool_call_id"))
+                if not isinstance(prior_args, dict):
+                    continue
+                try:
+                    request = WebFetchInput.model_validate(prior_args)
+                except ValueError:
+                    # Rejected input is not acquisition evidence and must not
+                    # prevent unrelated valid requests after continuation.
+                    continue
+                prior_mode = ("auto" if request.render == "auto" and request.view != "raw" else
+                              "browser" if request.render is True else "http")
+                if request.url != url or prior_mode != mode:
+                    continue
+                output = item.payload.get("structured_content")
+                # The newest acquisition supersedes older failure evidence, including explicit refresh.
+                if not isinstance(output, dict) or not output.get("error_code"):
+                    return None
+                return {**output, "failure_origin": {"item_id": item.item_id,
+                                                     "tool_call_id": str(item.payload.get("tool_call_id"))}}
+            return None
 
         web_tools = create_web_tools(
             web_client, save_source=save_web_source, load_source=load_web_source,
             search_key=load_search_key(agent.web_search_key_file, workspace=workspace.root),
             search_provider=agent.web_search_provider,
             before_request=check_web_budget, cache_scope=current_tool_turn_id,
+            resource_limits=current_web_limits, budget_status=web_budget_status,
+            failure_lookup=saved_fetch_failure,
         )
         skill_policy = SkillPolicy()
         manifests = [
@@ -712,6 +792,14 @@ class Session:
                     model_binding=source_binding,
                 )
             )
+            from agent_runtime.tools.web_limits import WebLimits
+
+            web_limits = source_binding.get("web_limits")
+            if web_limits is None and parent_turn_id is not None:
+                web_limits = self.store.read_turn(parent_turn_id).binding_manifest.get("web_limits")
+            if web_limits is None and self._agent is not None:
+                web_limits = self._agent.web_limits.model_dump(mode="json")
+            binding["web_limits"] = WebLimits.model_validate(web_limits or {}).model_dump(mode="json")
             policy_value = source_binding["tool_execution_policy"]
             if not isinstance(policy_value, Mapping):
                 raise RuntimeError("source Step has no tool execution policy")

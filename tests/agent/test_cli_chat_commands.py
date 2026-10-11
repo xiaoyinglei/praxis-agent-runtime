@@ -503,7 +503,7 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
     from agent_runtime.terminal_app import TerminalChatApp
 
     calls = []
-    pause = AgentPause(request_id="approval", kind="approval", question="允许执行命令？", options=("deny",))
+    pause = AgentPause(request_id="approval", kind="tool_approval", question="允许执行命令？", options=("deny",))
 
     class Facade(_SessionFactory):
         workspace_path = tmp_path
@@ -530,10 +530,10 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
             await wait_for(lambda: ui.waiting)
             pipe.send_text("run\r")
             await wait_for(lambda: ui.status == "等待确认" and ui.waiting)
-            pipe.send_text("a\r")  # Alias cannot authorize an option that was not offered.
-            await wait_for(lambda: "请输入: deny" in ui.view.plain_text())
+            pipe.send_text("Y")  # Shortcut cannot authorize an option that was not offered.
+            await asyncio.sleep(.05)
             assert calls == []
-            pipe.send_text("n\r")
+            pipe.send_text("N")
             await wait_for(lambda: "已拒绝" in ui.view.plain_text() and ui.waiting)
             pipe.send_text("/exit\r")
             await asyncio.wait_for(task, 3)
@@ -544,3 +544,87 @@ async def test_live_ui_approval_validates_choice_and_resumes_same_turn(tmp_path)
                 with suppress(asyncio.CancelledError):
                     await task
         assert calls == [("paused-turn", "deny")]
+
+
+@pytest.mark.anyio
+async def test_live_ui_clarification_resumes_with_text_instead_of_aborting(tmp_path):
+    import asyncio
+    from dataclasses import replace
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.result import AgentPause
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    calls = []
+    request = AgentPause(request_id="question", kind="clarification", question="你的工作年限？")
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return SimpleNamespace(id="fake-model")
+
+        async def submit(self, message, **kwargs):
+            return replace(_result(turn_id="question-turn"), status="paused", pause=request)
+
+        async def resume(self, turn_id, action, **kwargs):
+            calls.append((turn_id, action, kwargs.get("user_input")))
+            return _result(turn_id=turn_id, answer="已收到条件")
+
+    async def wait_for(predicate):
+        async with asyncio.timeout(3):
+            while not predicate():
+                await asyncio.sleep(.01)
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="fake-model", workspace=str(tmp_path), input=pipe, output=DummyOutput())
+        task = asyncio.create_task(ui.run(lambda: cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=ui)))
+        try:
+            await wait_for(lambda: ui.waiting)
+            pipe.send_text("run\r")
+            await wait_for(lambda: ui.status == "等待确认" and ui.waiting)
+            pipe.send_text("两年\r")
+            await wait_for(lambda: "已收到条件" in ui.view.plain_text() and ui.waiting)
+            pipe.send_text("/exit\r")
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                from contextlib import suppress
+                with suppress(asyncio.CancelledError):
+                    await task
+        assert calls == [("question-turn", "continue", "两年")]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind,options,typed,action,user_input", [
+    ("clarification", (), "两年", "continue", "两年"),
+    ("choice", ("两年", "五年"), "两年", "continue", "两年"),
+    ("tool_approval", ("approve", "deny"), "Y", "approve", None),
+])
+async def test_interactive_run_preserves_pause_action_and_text(
+    monkeypatch, kind, options, typed, action, user_input,
+):
+    from dataclasses import replace
+
+    from agent_runtime.result import AgentPause
+
+    calls = []
+    request = AgentPause(request_id="question", kind=kind, question="需要确认", options=options)
+
+    class Facade:
+        async def run(self, *args, **kwargs):
+            return replace(_result(turn_id="run-turn"), status="paused", pause=request)
+
+        async def resume(self, turn_id, action, **kwargs):
+            calls.append((turn_id, action, kwargs.get("user_input")))
+            return _result(turn_id=turn_id)
+
+    monkeypatch.setattr("builtins.input", lambda _: typed)
+    result = await cli._run_facade_command(
+        Facade(), task="task", files=(), max_tokens_total=None, interactive_approval=True,
+    )
+    assert result.status == "done"
+    assert calls == [("run-turn", action, user_input)]

@@ -23,6 +23,22 @@ async def test_web_error_details_are_retained_but_collapsed():
     assert "RAW detail" in view.plain_text()
 
 
+@pytest.mark.anyio
+async def test_failed_tool_title_identifies_error_and_detail_entry():
+    view = Conversation()
+    display = ConversationEventDisplay(view)
+    display.begin_turn()
+    await display.emit(item_completed(
+        turn_id="t", item_id="failed", item_kind=TurnItemKind.TOOL, status=ItemStatus.FAILED,
+        error="tool runner failed",
+        data={"result": {"tool_name": "web_fetch", "error_code": "runner_failed",
+                         "error_message": "tool runner failed", "structured_content": None}},
+    ))
+    title = display.group.children[0].title
+    assert "runner_failed" in title
+    assert "点击查看" in title
+
+
 def test_nested_folds_toggle_in_place_without_duplicating_output():
     view = Conversation()
     group = view.add_group()

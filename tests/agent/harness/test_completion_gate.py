@@ -23,6 +23,7 @@ def _commit_tool_result(
     arguments: dict[str, object],
     result: dict[str, object],
     resources: tuple[dict[str, object], ...] = (),
+    operation_failed: bool = False,
 ) -> None:
     store.record_tool_call(
         turn_id=turn_id,
@@ -65,9 +66,9 @@ def _commit_tool_result(
         operation_id=operation_id,
         claim_generation=claim.claim_generation,
         fencing_token=claim.fencing_token,
-        status="succeeded",
+        status="failed" if operation_failed else "succeeded",
         attempt_count=1,
-        error_code=None,
+        error_code="command_failed" if operation_failed else None,
         requires_reconciliation=False,
     )
     store.record_tool_result(
@@ -77,8 +78,8 @@ def _commit_tool_result(
             "tool_call_id": call_id,
             "tool_name": tool_name,
             "structured_content": result,
-            "is_error": False,
-            "error_code": None,
+            "is_error": operation_failed,
+            "error_code": "command_failed" if operation_failed else None,
             "error_message": None,
             "retryable": False,
             "truncated": False,
@@ -94,7 +95,7 @@ def _commit_tool_result(
         structured_content=result,
         resources=resources,
     )
-    if evidence is not None:
+    if evidence is not None and not operation_failed:
         store.record_verification(
             turn_id=turn_id,
             operation_id=operation_id,
@@ -146,6 +147,8 @@ def test_model_or_unlinked_tool_cannot_forge_completion_evidence(
 
         assert decision.action == "continue"
         assert "workspace change" in decision.reason
+        assert decision.validation_status == "failed"
+        assert decision.validation_scope == "workspace_change"
 
 
 def test_verification_must_happen_after_the_latest_workspace_change(
@@ -209,6 +212,8 @@ def test_verification_must_happen_after_the_latest_workspace_change(
         fresh = gate.evaluate(_proposal(store, turn.turn_id))
 
         assert fresh.action == "accept"
+        assert fresh.validation_status == "passed"
+        assert fresh.validation_scope == "workspace_change"
         assert store.verify().valid is True
 
 

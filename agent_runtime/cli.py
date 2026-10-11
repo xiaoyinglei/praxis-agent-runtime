@@ -36,8 +36,9 @@ from agent_runtime.models import (
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
-from agent_runtime.terminal_input import TerminalComposer
+from agent_runtime.terminal_input import TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
+from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -54,10 +55,32 @@ model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑�
 logger = logging.getLogger(__name__)
 
 
+@agent_app.command("history")
+def agent_history(
+    checkpoint_db: Annotated[Path, typer.Option("--checkpoint-db")] = DEFAULT_CHECKPOINT_PATH,
+    turn_id: Annotated[str | None, typer.Option("--turn-id")] = None,
+    call_id: Annotated[str | None, typer.Option("--call-id")] = None,
+    item_id: Annotated[str | None, typer.Option("--item-id")] = None,
+    limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 20,
+) -> None:
+    """只读历史记录：默认列出 Turn；按 Turn/调用/结果 ID 定位诊断，不调用模型。"""
+    import sqlite3
+
+    from agent_runtime.history import list_history_turns, read_history
+
+    try:
+        rows = (list_history_turns(checkpoint_db, limit=limit) if not any((turn_id, call_id, item_id)) else
+                read_history(checkpoint_db, turn_id=turn_id, tool_call_id=call_id, item_id=item_id, limit=limit))
+    except (OSError, ValueError, KeyError, sqlite3.Error):
+        raise typer.BadParameter("历史数据库或指定记录不可读取；请检查路径和 ID。") from None
+    typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
 class _WebOptions(TypedDict, total=False):
     web_search_key_file: Path
     web_search_provider: str
     web_proxy_url: str
+    web_limits_file: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +218,17 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
+    if result.status == "done":
+        scope = (
+            f"（范围: {safe_terminal_text(result.validation_scope)}）"
+            if result.validation_scope is not None else ""
+        )
+        print(f"\n验证状态: {result.validation_status}{scope}")
+        if result.validation_status == "not_evaluated":
+            print("本轮运行已结束；任务验收尚未评估。")
+        elif result.validation_scope == "workspace_change":
+            print("此状态仅表示工作区修改及修改后的验证检查。")
+
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")
 
@@ -244,22 +278,29 @@ async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | No
     req = result.pause
     if req is None:
         return None
+    if req.kind == "tool_approval":
+        return await ui.choose_approval(req)
     print(f"\n⏸ 需要确认: {req.question}")
     for call in req.tool_calls:
         print(f"  {call.tool_name}: {call.args_preview}")
         if call.reason:
             print(f"  原因: {call.reason}")
-    options = req.options or ("allow_once", "deny", "continue", "abort")
-    print(f"选项: {', '.join(options)}")
-    aliases = {"a": "allow_once", "y": "allow_once", "yes": "allow_once",
-               "n": "deny", "no": "deny", "d": "deny", "c": "continue"}
+    options = req.options
+    text_answer = req.kind in {"clarification", "choice"}
+    if not options and not text_answer:
+        print("此暂停没有提供可选操作，已取消当前执行。")
+        return None
+    print(f"选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
     while True:
         choice = (await ui.prompt(approval=True)).strip()
-        if choice in {"q", "exit", "/exit"}:
+        if choice.casefold() in {"q", "exit", "/exit"}:
             return None
-        choice = aliases.get(choice, choice)
-        if choice in options:
-            return choice
+        if text_answer:
+            resolved = choice if choice and (not options or choice in options) else None
+        else:
+            resolved = resolve_pause_choice(choice, options)
+        if resolved is not None:
+            return resolved
         print(f"请输入: {', '.join(options)}；q 取消")
 
 
@@ -280,27 +321,24 @@ def _handle_pause(
             if tc.reason:
                 print(f"     原因: {tc.reason}")
 
-    options = req.options or ("allow_once", "deny", "continue", "abort")
-    print(f"  选项: {', '.join(options)}")
+    options = req.options
+    text_answer = req.kind in {"clarification", "choice"}
+    if not options and not text_answer:
+        print("此暂停没有提供可选操作，已取消当前执行。")
+        return None
+    print(f"  选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
 
     while True:
         choice = input("> ").strip()
-        if choice in options:
-            break
-        if choice in {"a", "y", "yes"}:
-            choice = "allow_once"
-            break
-        if choice in {"n", "no", "d"}:
-            choice = "deny"
-            break
-        if choice in {"c"}:
-            choice = "continue"
-            break
-        if choice in {"q", "exit", "/exit"}:
+        if choice.casefold() in {"q", "exit", "/exit"}:
             return None
-        print(f"  请输入: {', '.join(options)} (或 a=允许, n=拒绝, q=退出)")
-
-    return choice
+        if text_answer:
+            resolved = choice if choice and (not options or choice in options) else None
+        else:
+            resolved = resolve_pause_choice(choice, options)
+        if resolved is not None:
+            return resolved
+        print(f"  请输入: {', '.join(options)} (或 Y=允许, N=拒绝, q=退出)")
 
 
 def _display_pending_recovery(
@@ -347,6 +385,19 @@ def _display_pending_recovery(
         print("   需要文本时，在 continue 命令后添加 --input '<text>'。")
 
 
+def _load_web_limits(path: Path | None) -> WebLimits:
+    if path is None:
+        return WebLimits()
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(4097)
+        if len(data) > 4096:
+            raise ValueError("configuration exceeds 4096 bytes")
+        return WebLimits.model_validate_json(data)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(f"无效网页预算配置: {error}", param_hint="--web-limits") from None
+
+
 def _create_agent_facade(
     *,
     model: str | None = None,
@@ -358,6 +409,7 @@ def _create_agent_facade(
     web_search_key_file: Path | None = None,
     web_search_provider: str | None = None,
     web_proxy_url: str | None = None,
+    web_limits_file: Path | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
@@ -373,6 +425,7 @@ def _create_agent_facade(
             web_search_key_file=web_search_key_file,
             web_search_provider=web_search_provider,
             web_proxy_url=web_proxy_url,
+            web_limits=_load_web_limits(web_limits_file),
             _selection_requester=_selection_requester,
         )
     except ValueError as error:
@@ -406,9 +459,14 @@ def _is_tty(stream: object) -> bool:
 
 def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
     """Run one public async operation and render known model setup failures."""
+    from agent_runtime.harness.tool_orchestrator import ToolResultCommitError
 
     try:
         return asyncio.run(awaitable)
+    except ToolResultCommitError as exc:
+        diagnostic = exc.result.metadata.get("diagnostic", {})
+        detail = json.dumps(diagnostic, ensure_ascii=False, default=dict)
+        raise click.ClickException(f"工具结果提交失败，未确认持久化；请勿自动重试。诊断: {detail}") from None
     except EndpointConflictError as exc:
         logger.debug("Local model endpoint conflict", exc_info=True)
         raise click.ClickException("本地模型端口已被其他服务占用，请检查模型服务配置。") from exc
@@ -481,11 +539,14 @@ async def _run_facade_command(
             if action is None:
                 break
             display.begin_turn()
-            result = await facade.resume(
-                result.turn_id,
-                action,
-                event_sink=display,
-            )
+            if result.pause is not None and result.pause.kind in {"clarification", "choice"}:
+                result = await facade.resume(
+                    result.turn_id, "continue", user_input=action, event_sink=display,
+                )
+            else:
+                result = await facade.resume(
+                    result.turn_id, action, event_sink=display,
+                )
         return result
     finally:
         display.finish()
@@ -670,13 +731,19 @@ async def _chat_facade_loop(
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
+                text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
                 action = await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result)
                 if action is None:
                     result = await session.resume(result.turn_id, "abort")
                     print("已取消。")
                     break
                 event_display.begin_turn(reset=False)
-                resumption = session.resume(result.turn_id, action, event_sink=event_display)
+                if text_answer:
+                    resumption = session.resume(
+                        result.turn_id, "continue", user_input=action, event_sink=event_display,
+                    )
+                else:
+                    resumption = session.resume(result.turn_id, action, event_sink=event_display)
                 try:
                     result = await _ui.operation(resumption) if _ui else await resumption
                 except asyncio.CancelledError:
@@ -1293,6 +1360,10 @@ def agent_chat(
     allow_web_tools: Annotated[
         bool, typer.Option("--allow-web-tools/--no-web-tools", help="启用公网搜索和网页读取（默认开启）"),
     ] = True,
+    web_limits_file: Annotated[
+        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
+                                 help="有界网页预算JSON；恢复使用原Turn配置"),
+    ] = None,
     web_proxy_url: Annotated[
         str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
@@ -1338,6 +1409,8 @@ def agent_chat(
         facade_workspace = binding.workspace_path or Path.cwd()
         facade_knowledge = binding.knowledge
     web_options: _WebOptions = {}
+    if web_limits_file is not None:
+        web_options["web_limits_file"] = web_limits_file
     if web_search_key_file is not None:
         web_options["web_search_key_file"] = web_search_key_file
     if web_search_provider is not None:
@@ -1456,6 +1529,10 @@ def agent_run(
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
                                  help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
+    web_limits_file: Annotated[
+        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
+                                 help="有界网页预算JSON；Turn请求与浏览器资源分别配置，恢复使用原Turn配置"),
+    ] = None,
     disable_workspace_mcp: Annotated[
         bool,
         typer.Option(
@@ -1493,6 +1570,7 @@ def agent_run(
         web_search_key_file=web_search_key_file,
         web_search_provider=web_search_provider,
         web_proxy_url=web_proxy_url,
+        web_limits_file=web_limits_file,
         _selection_requester="user",
     )
     interactive_approval = not non_interactive and _is_interactive_terminal()
@@ -1570,6 +1648,10 @@ def agent_resume(
         typer.Option("--input", help="clarification/choice 恢复时的用户输入"),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
+    web_limits_file: Annotated[
+        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
+                                 help="有界网页预算JSON；恢复使用原Turn配置"),
+    ] = None,
     web_proxy_url: Annotated[
         str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
@@ -1616,6 +1698,8 @@ def agent_resume(
         else _cli_turn(checkpoint_db, effective_turn_id)
     )
     web_options: _WebOptions = {}
+    if web_limits_file is not None:
+        web_options["web_limits_file"] = web_limits_file
     if web_search_key_file is not None:
         web_options["web_search_key_file"] = web_search_key_file
     if web_search_provider is not None:

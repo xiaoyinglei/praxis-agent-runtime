@@ -33,7 +33,11 @@ execute bounded tool calls, pause at approval boundaries, and continue from
 durable state. Default modification turns finish against diff and verification
 evidence. A read-only turn using `--no-require-workspace-change`, or the SDK with
 `require_workspace_change=False`, may return analysis without manufacturing a
-change. RAG is an optional private-knowledge capability, not the product's default
+change. Runtime completion is separate from validation: `AgentResult.validation_status`
+is `not_evaluated`, `passed`, or `failed`, and `validation_scope` names the check.
+The built-in delivery gate checks `workspace_change` evidence only. Read-only
+answers and legacy gates without an explicit validation result are `not_evaluated`;
+ending a turn does not certify answer correctness. RAG is an optional private-knowledge capability, not the product's default
 execution path.
 
 ## Runtime architecture

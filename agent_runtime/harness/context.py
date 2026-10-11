@@ -16,6 +16,7 @@ from agent_runtime.harness.protocol import (
     HarnessToolCall,
 )
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
+from agent_runtime.modeling.contracts import ContextCapacityPolicy, context_capacity_policy
 
 
 class RolloutContextManager:
@@ -25,21 +26,33 @@ class RolloutContextManager:
         self,
         store: RolloutStore,
         *,
-        max_item_bytes: int = 500_000,
-        max_total_bytes: int = 4_000_000,
-        max_messages: int = 2_000,
+        max_item_bytes: int | None = None,
+        max_total_bytes: int | None = None,
+        max_messages: int | None = None,
     ) -> None:
         for name, value in (
             ("max_item_bytes", max_item_bytes),
             ("max_total_bytes", max_total_bytes),
             ("max_messages", max_messages),
         ):
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
         self._store = store
         self._max_item_bytes = max_item_bytes
         self._max_total_bytes = max_total_bytes
         self._max_messages = max_messages
+
+    def capacity_policy(self, turn_id: str) -> ContextCapacityPolicy | None:
+        return context_capacity_policy(self._store.read_turn(turn_id).binding_manifest)
+
+    def limits(self, turn_id: str | None = None) -> dict[str, int]:
+        policy = None if turn_id is None else self.capacity_policy(turn_id)
+        defaults = {"max_item_bytes": 500_000, "max_total_bytes": 4_000_000, "max_messages": 2000}
+        return {
+            name: explicit if (explicit := getattr(self, "_" + name)) is not None
+            else (getattr(policy, name) if policy is not None else value)
+            for name, value in defaults.items()
+        }
 
     def compact(
         self,
@@ -63,29 +76,34 @@ class RolloutContextManager:
         )
 
     def build(self, turn_id: str) -> tuple[HarnessMessage, ...]:
-        return self._validate_budget(tuple(message for _, message in self._projected_messages(turn_id)))
+        return self._validate_budget(
+            tuple(message for _, message in self._projected_messages(turn_id)), turn_id=turn_id
+        )
 
-    def _validate_budget(self, projected: tuple[HarnessMessage, ...]) -> tuple[HarnessMessage, ...]:
+    def _validate_budget(
+        self, projected: tuple[HarnessMessage, ...], *, turn_id: str | None = None
+    ) -> tuple[HarnessMessage, ...]:
+        limits = self.limits(turn_id)
         messages: list[HarnessMessage] = []
         total_bytes = 0
 
         def append(message: HarnessMessage) -> None:
             nonlocal total_bytes
             item_bytes = _message_size_bytes(message)
-            if item_bytes > self._max_item_bytes:
+            if item_bytes > limits["max_item_bytes"]:
                 raise ContextBudgetExceededError(
-                    "Model context single Item exceeds the configured byte limit "
-                    f"({item_bytes} > {self._max_item_bytes})."
+                    "byte_guard: Model context single Item exceeds the configured byte limit "
+                    f"({item_bytes} > {limits['max_item_bytes']}).", reason_code="byte_guard"
                 )
-            if len(messages) >= self._max_messages:
+            if len(messages) >= limits["max_messages"]:
                 raise ContextBudgetExceededError(
-                    "Model context exceeds the configured message-count limit "
-                    f"({len(messages) + 1} > {self._max_messages})."
+                    "message_guard: Model context exceeds the configured message-count limit "
+                    f"({len(messages) + 1} > {limits['max_messages']}).", reason_code="message_guard"
                 )
-            if total_bytes + item_bytes > self._max_total_bytes:
+            if total_bytes + item_bytes > limits["max_total_bytes"]:
                 raise ContextBudgetExceededError(
-                    "Model context exceeds the configured total byte limit "
-                    f"({total_bytes + item_bytes} > {self._max_total_bytes})."
+                    "byte_guard: Model context exceeds the configured total byte limit "
+                    f"({total_bytes + item_bytes} > {limits['max_total_bytes']}).", reason_code="byte_guard"
                 )
             messages.append(message)
             total_bytes += item_bytes
@@ -166,11 +184,13 @@ class RolloutContextManager:
             len(messages),
         )
         cut = _tool_safe_boundary(messages, min(first_uncertain, max(0, len(messages) - retained)))
+        semantic_cut = _tool_safe_boundary(messages, first_uncertain)
         item_kinds = {item.item_id: item.kind for item in items}
         for index in range(len(projected) - 1, -1, -1):
             if item_kinds.get(projected[index][0]) not in {"context_message", "completion_feedback"}:
                 break
             cut = min(cut, index)
+            semantic_cut = min(semantic_cut, index)
         if cut == 0:
             raise ContextBudgetExceededError(
                 "No completed context is available for compaction.", reason_code="no_compactable_context"
@@ -184,6 +204,12 @@ class RolloutContextManager:
             raise ContextBudgetExceededError(
                 "No completed context is available for compaction.", reason_code="no_compactable_context"
             )
+        semantic_tail = (summary_override is not None and self.capacity_policy(turn_id) is not None and retained > 0)
+        if semantic_tail:
+            # The source already summarizes this exchange. Preserve its raw
+            # replay separately, so the next summary does not summarize it again.
+            raw_cut = (len(items) if semantic_cut == len(projected)
+                       else next(n for n, item in enumerate(items) if item.item_id == projected[semantic_cut][0]))
         covered = items[:raw_cut]
         protected_users = {latest_user}
         first_tail_role = next((m.role for _, m in projected[cut:] if m.role != "context"), None)
@@ -191,7 +217,10 @@ class RolloutContextManager:
             anchor = next((item_id for item_id, m in reversed(projected[:cut]) if m.role == "user"), None)
             if anchor is not None:
                 protected_users.add(anchor)
-        protected = tuple(i.item_id for i in covered if i.item_id in protected_users)
+        preserved = protected_users | (
+            {item_id for item_id, _ in projected[cut:semantic_cut]} if semantic_tail else set()
+        )
+        protected = tuple(i.item_id for i in covered if i.item_id in preserved)
         facts_items = tuple(i for i in covered if i.item_id not in protected)
         facts = _runtime_preserved_facts(self._store, turn_id=turn_id, covered_items=facts_items)
         derived_facts = {category: list(entries) for category, entries in facts.items()}
@@ -219,6 +248,7 @@ class RolloutContextManager:
                         "semantic-compaction-v3",
                         "semantic-compaction-v4",
                         "semantic-compaction-v5",
+                        "semantic-compaction-v6",
                     }
                     previous = [
                         entry
@@ -256,11 +286,15 @@ class RolloutContextManager:
                 ]
             )
         )
-        artifacts = [dict(i.payload) for i in facts_items if i.kind == "input_file"]
-        tool_views = {item_id: message.content for item_id, message in projected if message.role == "tool"}
-        artifacts.extend(ref for i in facts_items
-                         if (ref := _web_source_reference(i, tool_views.get(i.item_id))) is not None)
+        # Raw replay and semantic coverage are separate: references still cover
+        # the retained exchange, so later summaries retain its exact coordinates.
+        reference_items = covered if self.capacity_policy(turn_id) is not None else facts_items
+        artifacts = [dict(i.payload) for i in reference_items if i.kind == "input_file"]
+        artifacts.extend(ref for i in reference_items if (ref := _web_source_reference(i)) is not None)
         artifacts = _unique_json([*artifacts, *(ref for i in prior for ref in i.payload.get("artifact_refs", []))])
+        if self.capacity_policy(turn_id) is not None:
+            artifacts = [ref for ref in artifacts if ref.get("kind") != "web_acquired_ranges"]
+            artifacts.extend(_web_acquired_ranges(artifacts))
         payload = {
             "covered_item_ids": [i.item_id for i in covered],
             "preserved_item_ids": list(protected),
@@ -269,13 +303,15 @@ class RolloutContextManager:
             "artifact_refs": artifacts,
             "durable_state": self._store.context_durable_state(turn_id),
             "context_version": max(versions, default=0) + 1,
-            "algorithm_revision": "rollout-compaction-v2" if summary_override is None else "semantic-compaction-v4",
+            "algorithm_revision": "rollout-compaction-v2" if summary_override is None else (
+                "semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"
+            ),
         }
         synthetic = replace(items[-1], item_id="candidate", kind="context_compaction", payload=payload)
         result = tuple(m for _, m in _project_items((*items, synthetic)))
         _validate_tool_groups(result)
         if validate:
-            self._validate_budget(result)
+            self._validate_budget(result, turn_id=turn_id)
         if require_reduction and sum(map(_message_size_bytes, result)) >= sum(map(_message_size_bytes, messages)):
             raise ContextBudgetExceededError(
                 "Compaction candidate does not reduce context size.", reason_code="candidate_not_smaller"
@@ -293,7 +329,7 @@ class RolloutContextManager:
         tail = messages[cut:]
         # Let actual candidate measurement decide how much room the task and
         # summary need. A fixed half-window cap discards useful evidence too soon.
-        if sum(map(_message_size_bytes, tail)) >= self._max_total_bytes:
+        if sum(map(_message_size_bytes, tail)) >= self.limits(turn_id)["max_total_bytes"]:
             return 0
         return len(tail)
 
@@ -308,7 +344,9 @@ class RolloutContextManager:
     def summary_byte_allowance(self, floor: ContextCompactionCandidate) -> int:
         messages = floor.messages
         context_size = next(_message_size_bytes(m) for m in messages if m.role == "context")
-        return min(self._max_total_bytes - sum(map(_message_size_bytes, messages)), self._max_item_bytes - context_size)
+        limits = self.limits(floor.turn_id)
+        return min(limits["max_total_bytes"] - sum(map(_message_size_bytes, messages)),
+                   limits["max_item_bytes"] - context_size)
 
     def semantic_source(self, turn_id: str, *, retained_tail_messages: int = 0) -> tuple[str, str]:
         """Freeze the current continuation plus new history, without truncation.
@@ -349,6 +387,24 @@ class RolloutContextManager:
             or str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-"))
             for item_id in item.payload.get("covered_item_ids", ())
         }
+        if self.capacity_policy(turn_id) is not None:
+            # Elision coverage proves archival, not semantic coverage. Recover
+            # canonical evidence only after the most recent semantic summary.
+            semantic = next((item for item in reversed(items) if item.kind == "context_compaction"
+                             and str(item.payload.get("algorithm_revision", "")).startswith("semantic-compaction-")),
+                            None)
+            summarized = set() if semantic is None else set(semantic.payload["covered_item_ids"])
+            sources = []
+            if semantic is not None:
+                sources.append({"history_index": history_positions[semantic.item_id],
+                                **asdict(_compaction_message(semantic.payload))})
+            for item in items:
+                if (item.item_id not in covered or item.item_id in summarized or item.status != "completed"
+                        or item.kind == "context_compaction"):
+                    continue
+                message = _item_message(item)
+                if message is not None and (item.item_id not in protected or message.role != "user"):
+                    sources.append({"history_index": history_positions[item.item_id], **asdict(message)})
         sources.extend(
             {
                 "history_index": history_positions[item.item_id],
@@ -393,7 +449,9 @@ class RolloutContextManager:
         if candidate.source_revision != revision:
             raise ContextSourceChangedError("Context changed while projecting its semantic summary.")
         payload = json.loads(candidate.payload_json)
-        payload["algorithm_revision"] = "semantic-compaction-v4"
+        payload["algorithm_revision"] = (
+            "semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"
+        )
         return replace(candidate, payload_json=_json(payload))
 
     def max_tool_result_bytes(self, turn_id: str) -> int:
@@ -433,7 +491,9 @@ class RolloutContextManager:
         for item_id, message in eligible:
             if message.role != "tool" or item_id in unsettled or by_id[item_id].payload.get("is_error"):
                 continue
-            content = _web_result_excerpt(message.content, max_result_bytes, item_id)
+            canonical = _item_message(by_id[item_id])
+            content = _web_result_excerpt(canonical.content if canonical is not None else message.content,
+                                          max_result_bytes, item_id)
             if content is None:
                 content = f"Tool output archived. Use read_context(item_id={item_id!r}) to recover it."
                 if max_result_bytes is not None:
@@ -453,7 +513,7 @@ class RolloutContextManager:
                 replace(m, content=overrides[source_id]) if source_id in overrides else m for source_id, m in projected
             )
             try:
-                self._validate_budget(result)
+                self._validate_budget(result, turn_id=turn_id)
                 _validate_tool_groups(result)
             except ContextBudgetExceededError:
                 continue
@@ -497,6 +557,7 @@ class RolloutContextManager:
             context_version=payload["context_version"],
             algorithm_revision=payload["algorithm_revision"],
             tool_result_overrides=payload.get("tool_result_overrides"),
+            capacity_diagnostics=payload.get("capacity_diagnostics"),
         )
 
     def _projected_messages(self, turn_id: str) -> tuple[tuple[str, HarnessMessage], ...]:
@@ -722,7 +783,9 @@ def _compaction_projection(
         for target in covered:
             replacements.pop(target, None)
         anchor = covered[0]
-        if item.payload.get("algorithm_revision") in {"semantic-compaction-v4", "semantic-compaction-v5"}:
+        if item.payload.get("algorithm_revision") in {
+            "semantic-compaction-v4", "semantic-compaction-v5", "semantic-compaction-v6",
+        }:
             protected = set(item.payload.get("preserved_item_ids", ()))
             anchor = next((original.item_id for original in items if original.item_id in protected
                            and original.kind == "model_response"), anchor)
@@ -830,7 +893,7 @@ def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str |
         return None
     if budget is not None and len(content.encode()) <= budget:
         return content
-    # Preserve complete numbered lines, so the next cursor never skips unseen evidence.
+    # Visibility may shrink; completed acquisition and its cursor never change.
     kept: list[str] = []
     used = 0
     for line in source["content"].splitlines():
@@ -841,9 +904,9 @@ def _web_result_excerpt(content: str, budget: int | None, item_id: str) -> str |
         used += size
     omitted = len(kept) < len(source["content"].splitlines())
     projected = {**source, "content": "\n".join(kept), "links": [], "context_truncated": True}
+    projected.pop("fetch_next_line", None)
+    projected["visible_end_line"] = source["start_line"] + len(kept) - 1 if kept else None
     if omitted:
-        projected["fetch_next_line"] = source.get("fetch_next_line", source["next_line"])
-        projected["next_line"] = source["start_line"] + len(kept)
         projected["truncated"] = True
     return _json({**envelope, "structured_content": projected, "truncated": True,
                   "archive_lookup": f"read_context(item_id={item_id!r}) recovers the original tool message; "
@@ -874,18 +937,13 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
         return None
     if not source["source_id"].startswith("artifact_") or not source.get("url"):
         return None
-    if projected_content is not None:
-        try:
-            visible = json.loads(projected_content).get("structured_content")
-        except (ValueError, AttributeError, TypeError):
-            visible = None
-        if isinstance(visible, Mapping) and visible.get("source_id") == source["source_id"]:
-            source = visible
-        else:
-            # Older plain-prefix elision may have lost the cursor: reread from
-            # the original start rather than silently skipping omitted lines.
-            source = {**source, "next_line": source.get("start_line", 1), "context_truncated": True}
-    return {"item_id": item.item_id, **{key: source[key] for key in (
+    # References report canonical acquisition, never an older elision cursor.
+    del projected_content
+    content = source.get("content")
+    start = source.get("start_line")
+    lines = content.splitlines() if isinstance(content, str) else []
+    acquired_end = start + len(lines) - 1 if type(start) is int and lines else None
+    return {"item_id": item.item_id, "acquired_end_line": acquired_end, **{key: source[key] for key in (
         "source_id", "url", "title", "published_at", "published_at_source", "content_hash",
         "start_line", "next_line", "fetch_next_line", "context_truncated", "total_lines",
         "source_truncated", "truncated",
@@ -893,3 +951,25 @@ def _web_source_reference(item: ItemSnapshot, projected_content: str | None = No
         "warning", "extraction_method", "connection_mode", "failure_stage", "render_mode",
         "render_diagnostics", "error_code", "error_message",
     ) if key in source}, 'is_error': bool(item.payload.get('is_error'))}
+
+
+def _web_acquired_ranges(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Derive acquisition intervals from canonical evidence; gaps stay explicit."""
+    grouped: dict[str, tuple[dict[str, Any], list[tuple[int, int]]]] = {}
+    for ref in refs:
+        start, end = ref.get("start_line"), ref.get("acquired_end_line")
+        if not ref.get("source_id") or type(start) is not int or type(end) is not int or end < start:
+            continue
+        coordinates = {key: ref.get(key) for key in ("source_id", "content_hash", "view", "line_basis")}
+        _, ranges = grouped.setdefault(_json(coordinates), (coordinates, []))
+        ranges.append((start, end))
+    result = []
+    for coordinates, ranges in grouped.values():
+        merged: list[list[int]] = []
+        for start, end in sorted(ranges):
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        result.append({"kind": "web_acquired_ranges", **coordinates, "acquired_ranges": merged})
+    return result

@@ -33,9 +33,9 @@ async def test_nonsemantic_document_preserves_sibling_evidence_through_tool(tmp_
         assert result['error_code'] is None
         assert primary in result['content']
         assert secondary in result['content']
-        assert 'Global links' not in result['content']
-        assert 'Copyright boilerplate' not in result['content']
-        assert result['extraction_method'] == 'body_fallback'
+        assert 'Global links' in result['content']
+        assert 'Copyright boilerplate' in result['content']
+        assert result['extraction_method'] == 'markdownify_full_body'
     finally:
         await client.aclose()
 
@@ -51,13 +51,13 @@ def test_multiple_document_regions_preserve_all_documents(region):
 
 
 @pytest.mark.parametrize('region', ['main', 'div role="main"', 'article', 'div itemprop="articleBody"'])
-def test_declared_document_region_excludes_unmarked_page_actions(region):
+def test_declared_document_region_does_not_discard_page_actions(region):
     tag = region.split()[0]
     html = (f'<body><{region}><h1>Source</h1><div>Declared source facts.</div></{tag}>'
             '<div><a href="/">Home action</a><a href="#">Page action</a></div></body>').encode()
     result = extract_content(html, 'text/html', 'https://example.com/reference')
     assert 'Declared source facts.' in result.text
-    assert 'Home action' not in result.text and 'Page action' not in result.text
+    assert 'Home action' in result.text and 'Page action' in result.text
 
 
 def test_class_names_do_not_authorize_discarding_unmarked_content():
@@ -65,7 +65,7 @@ def test_class_names_do_not_authorize_discarding_unmarked_content():
                              b'<div>Additional facts outside that class.</div></body>',
                              'text/html', 'https://example.com/reference')
     assert 'One fact.' in result.text and 'Additional facts outside that class.' in result.text
-    assert result.extraction_method == 'body_fallback'
+    assert result.extraction_method == 'markdownify_full_body'
 
 
 def test_article_does_not_discard_div_and_list_facts_inside_main():

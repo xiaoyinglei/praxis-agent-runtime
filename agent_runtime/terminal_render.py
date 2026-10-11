@@ -37,10 +37,10 @@ def web_error_message(code: object) -> str:
         "web_search_unconfigured": "搜索服务尚未配置，请联系部署者配置搜索后端。",
         "web_search_blocked": "搜索服务暂时限制访问，请稍后再试。",
         "web_search_invalid_response": "搜索服务返回了无法读取的页面，暂时无法取得搜索结果。",
-        "web_content_empty": "此网页没有可读取的正文，可能需要浏览器加载或登录。",
+        "web_content_empty": "正文提取为空；展开记录查看获取方式和资源限制。",
         "web_content_unsupported": "暂不支持读取此网页的内容格式。",
         "web_source_unavailable": "保存的网页记录不可用，请重新打开原始链接。",
-        "http_error": "网页暂时无法访问，链接可能已失效或被网站限制。",
+        "http_error": "远端返回 HTTP 错误；展开记录查看状态码。",
         "timeout": "联网请求超时，请稍后再试。",
         "network_error": "暂时无法连接网站，请检查网络或稍后再试。",
         "web_request_budget_exceeded": "本次联网尝试已达到上限，请根据已有信息回答。",
@@ -48,9 +48,14 @@ def web_error_message(code: object) -> str:
         "private_address": "该链接不是可访问的公网地址。",
         "nonpublic_address": "DNS 返回了非公网地址，直连已拦截；请检查 DNS 或配置可信 HTTP 代理。",
         "proxy_connection_failed": "已配置的代理拒绝了连接，请检查代理配置。",
+        "web_browser_unavailable": "浏览器读取不可用，请检查浏览器依赖与隔离环境。",
+        "web_browser_budget_exceeded": "浏览器加载达到资源上限，请查看加载记录。",
+        "web_browser_timeout": "浏览器加载超时，请查看加载记录。",
+        "web_browser_failed": "浏览器加载失败，请查看加载记录。",
+        "runner_failed": "网页工具执行异常；展开记录查看诊断，历史记录可能缺少异常详情。",
     }
     if isinstance(code, str):
-        return messages.get(code, "此次联网操作未成功，可查看详细记录。")
+        return messages.get(code, f"联网操作失败（{safe_terminal_text(code)}）；/verbose 查看现有记录。")
     return "此次联网操作未成功。"
 
 _ANSI_ESCAPE = regex.compile(
@@ -444,6 +449,37 @@ class TerminalToolEventDisplay:
             self._render_legacy_error(event)
         elif event.type is EventType.PLAN_UPDATED:
             self._render_plan(event)
+        elif event.type is EventType.TURN_STARTED and isinstance(event.data.get("context_capacity_policy"), Mapping):
+            policy = event.data["context_capacity_policy"]
+            assert isinstance(policy, Mapping)
+            self._write_line(
+                f"上下文政策 {policy.get('revision')}: 模型窗口={event.data.get('model_context_tokens', 'unknown')} · "
+                f"正文 guards={policy.get('max_item_bytes')}/{policy.get('max_total_bytes')} bytes · "
+                f"消息 guard={policy.get('max_messages')}"
+            )
+        elif event.type is EventType.BUDGET_UPDATE:
+            projection = event.data.get("context_projection", {})
+            status = event.data.get("budget_status", {})
+            if isinstance(projection, Mapping) and isinstance(status, Mapping):
+                cap = projection.get("explicit_input_cap")
+                self._write_line(
+                    f"输入上限={projection.get('effective_input_limit', 'unknown')} · "
+                    f"压缩阈值={projection.get('auto_compact_limit', 'unknown')} · "
+                    f"显式 cap={cap if cap is not None else 'unset'} · "
+                    f"剩余 agent 步骤={status.get('agent_steps_remaining', 'unknown')} · "
+                    f"模型请求={status.get('model_requests_remaining', 'unset')} · "
+                    f"Web 请求={status.get('web_requests_remaining', 'unset')} · "
+                    f"token={status.get('tokens_remaining', 'unset')} · "
+                    f"费用额度(micros)={status.get('cost_remaining_micros', 'unknown')}"
+                )
+        elif event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data:
+            data = event.data
+            self._write_line(
+                f"语义压缩 {data['trigger_reason']}: 输入 {data.get('before_input_tokens', 'unknown')} → "
+                f"{data.get('after_input_tokens', 'unknown')} · 摘要请求={data.get('summary_calls', 'unknown')} · "
+                f"token={data.get('summary_tokens', 'unknown')} · "
+                f"费用(micros)={data.get('summary_cost_micros', 'unknown')}"
+            )
         elif event.type is EventType.RECOVERY:
             strategy = event.data.get("strategy")
             if isinstance(strategy, str) and strategy:

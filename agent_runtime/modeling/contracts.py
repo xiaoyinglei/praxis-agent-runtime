@@ -9,6 +9,7 @@ from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     JsonValue,
     TypeAdapter,
@@ -37,9 +38,32 @@ class LLMCallStage(StrEnum):
 
 
 class LLMStageBudget(BaseModel):
-    max_input_tokens: int = Field(gt=0)
+    max_input_tokens: int | None = Field(gt=0)
     max_output_tokens: int = Field(gt=0)
     safety_margin_tokens: int = Field(default=512, ge=0)
+
+
+class ContextCapacityPolicy(BaseModel):
+    """Frozen admission and memory guards for newly created Turns."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    revision: Literal["context-capacity-v2"] = "context-capacity-v2"
+    max_item_bytes: int = Field(default=8 * 1024 * 1024, gt=0, strict=True)
+    max_total_bytes: int = Field(default=32 * 1024 * 1024, gt=0, strict=True)
+    max_messages: int = Field(default=2000, gt=0, strict=True)
+    summary_serialized_bytes: int = Field(default=32 * 1024, gt=0, strict=True)
+
+
+def context_capacity_policy(binding: Mapping[str, object]) -> ContextCapacityPolicy | None:
+    envelope = binding.get("binding", binding)
+    if not isinstance(envelope, Mapping):
+        return None
+    definition = envelope.get("definition", envelope)
+    if not isinstance(definition, Mapping):
+        return None
+    raw = definition.get("context_capacity_policy")
+    return None if raw is None else ContextCapacityPolicy.model_validate(raw)
 
 
 class LLMUsage(BaseModel):
@@ -183,7 +207,7 @@ class LLMCallResult[T]:
 
 DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
     LLMCallStage.AGENT_STEP: LLMStageBudget(
-        max_input_tokens=64_000,
+        max_input_tokens=None,
         max_output_tokens=32_768,
     ),
     LLMCallStage.GOAL_CONTRACT: LLMStageBudget(

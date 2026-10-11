@@ -28,6 +28,10 @@ jobs:
             sudo apparmor_parser -r /etc/apparmor.d/praxis-bwrap
             /usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true
           fi
+      - name: Install pinned optional patch executor
+        run: |
+          python3 scripts/ubuntu/install-codex-patch.py --destination "$RUNNER_TEMP/codex-patch"
+          echo "PRAXIS_TEST_CODEX_BINARY=$RUNNER_TEMP/codex-patch" >> "$GITHUB_ENV"
       - name: Sync locked environment
         run: uv sync --locked
       - name: Ruff
