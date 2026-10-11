@@ -271,3 +271,205 @@ def test_praxis_entrypoint_explains_inactive_service_without_launching(tmp_path)
     )
     assert result.returncode == 1
     assert "sudo systemctl start praxis-model" in result.stderr
+
+
+def test_core_reinstall_repairs_cached_wheel_hardlinks(tmp_path, monkeypatch):
+    """Exercise real uv files; mock only resolver preparation for a tiny wheel."""
+    import hashlib
+    import sys
+    import zipfile
+
+    from agent_runtime.tools.builtins.shell import _workspace_sandbox_preflight_issue
+
+    installer = load_script("install-agent-deps.py")
+    repo = tmp_path / "repo"
+    (repo / "scripts/ubuntu").mkdir(parents=True)
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    wheel = wheels / "demo-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        files = {
+            "demo.py": "VALUE = 42\n",
+            "demo-1.0.data/headers/demo.h": "/* header fixture */\n",
+            "demo-1.0.dist-info/METADATA": "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+            "demo-1.0.dist-info/WHEEL": (
+                "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+            ),
+        }
+        files["demo-1.0.dist-info/RECORD"] = "".join(f"{name},,\n" for name in [*files, "demo-1.0.dist-info/RECORD"])
+        for name, content in files.items():
+            archive.writestr(name, content)
+    digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    (repo / "uv.lock").write_text(
+        '[[package]]\nname="demo"\nversion="1.0"\n'
+        '[package.source]\nregistry="https://pypi.org/simple"\n'
+        '[[package.wheels]]\nhash="sha256:' + digest + '"\n'
+    )
+    (repo / "scripts/ubuntu/requirements-core.in").write_text("demo\n")
+    environment = repo / ".venv"
+    cache = tmp_path / "cache"
+    subprocess.run(
+        ["uv", "--cache-dir", str(cache / "uv"), "venv", "--python", sys.executable, str(environment)],
+        check=True,
+    )
+    python = environment / "bin/python"
+    subprocess.run(
+        ["uv", "--cache-dir", str(cache / "uv"), "pip", "install", "--python", str(python),
+         "--link-mode", "hardlink", str(wheel)], check=True,
+    )
+    installed = next(environment.glob("lib/python*/site-packages/demo.py"))
+    header = next(environment.glob("include/**/demo.h"))
+    assert installed.stat().st_nlink > 1
+    assert header.stat().st_nlink > 1
+    assert _workspace_sandbox_preflight_issue(repo, allow_workspace_write=False)[0] == "workspace_hardlink_detected"
+    real_run = subprocess.run
+    installation_calls = []
+
+    def run(args, **kwargs):
+        if "--output-file" in args:
+            Path(args[args.index("--output-file") + 1]).write_text("demo==1.0\n")
+            return subprocess.CompletedProcess(args, 0)
+        if "pip" in args:
+            installation_calls.append(args)
+        if "-e" in args:
+            return subprocess.CompletedProcess(args, 0)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(installer.subprocess, "run", run)
+    installer.install(repo, python, cache, offline=True, wheel_dir=wheels)
+    assert installed.stat().st_nlink == 1
+    assert header.stat().st_nlink == 1
+    assert _workspace_sandbox_preflight_issue(repo, allow_workspace_write=False) is None
+    assert all("--link-mode" in args and args[args.index("--link-mode") + 1] == "copy" for args in installation_calls)
+    assert all("--reinstall" in args for args in installation_calls)
+
+
+def test_dependency_file_check_includes_headers_outside_site_packages(tmp_path):
+    installer = load_script("install-agent-deps.py")
+    environment = tmp_path / "venv"
+    header = environment / "include/site/python3.12/greenlet/greenlet.h"
+    header.parent.mkdir(parents=True)
+    cached = tmp_path / "cached-header.h"
+    cached.write_text("/* fixture */\n")
+    os.link(cached, header)
+    with pytest.raises(ValueError, match="include/site/python3.12/greenlet/greenlet.h"):
+        installer.validate_environment_files(environment)
+    header.unlink()
+    header.write_text(cached.read_text())
+    installer.validate_environment_files(environment)
+
+
+def test_server_launcher_readiness_uses_shell_workspace_containment(tmp_path):
+    launcher = load_script("launch-server-agent.py")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".venv/include").mkdir(parents=True)
+    cached = tmp_path / "outside.h"
+    cached.write_text("fixture")
+    linked = workspace / ".venv/include/header.h"
+    os.link(cached, linked)
+    with pytest.raises(ValueError, match="workspace_hardlink_detected"):
+        launcher.validate_workspace_readiness(workspace)
+    linked.unlink()
+    linked.write_text(cached.read_text())
+    launcher.validate_workspace_readiness(workspace)
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_repaired_workspace_runs_real_shell_without_relaxing_hardlink_check(tmp_path):
+    from agent_runtime.tools.builtins import shell
+    from agent_runtime.workspace import open_workspace
+
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    cached = tmp_path / "wheel-file"
+    cached.write_text("fixture")
+    linked = workspace.root / ".venv/include/header.h"
+    linked.parent.mkdir(parents=True)
+    os.link(cached, linked)
+    result = await shell._run_command(
+        workspace, shell.RunCommandInput(command="printf deployment-ready"), termination_grace_seconds=0.1,
+    )
+    assert result.sandbox_error == "workspace_hardlink_detected"
+    assert not result.stdout
+    linked.unlink()
+    linked.write_text(cached.read_text())
+    result = await shell._run_command(
+        workspace, shell.RunCommandInput(command="printf deployment-ready"), termination_grace_seconds=0.1,
+    )
+    assert result.sandbox_error is None
+    assert result.exit_code == 0
+    assert result.stdout == "deployment-ready"
+
+
+@pytest.mark.parametrize(
+    "argv", [["chat"], ["run", "task"], ["resume", "id"], [], ["model", "list"], ["history"], ["--help"]],
+)
+def test_server_launcher_checks_only_agent_turn_entrypoints(tmp_path, monkeypatch, argv):
+    import sys
+    from types import SimpleNamespace
+
+    launcher = load_script("launch-server-agent.py")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(launcher.pwd, "getpwnam", lambda _: SimpleNamespace(pw_uid=os.getuid(), pw_dir=str(tmp_path)))
+    monkeypatch.setattr(launcher, "agent_environment", lambda *args: {})
+    monkeypatch.setattr(sys, "argv", ["launch-server-agent.py", *argv])
+    checks = []
+    launched = []
+    monkeypatch.setattr(launcher, "validate_workspace_readiness", lambda root: checks.append(root))
+    monkeypatch.setattr(launcher.os, "execve", lambda *args: launched.append(args))
+    monkeypatch.chdir(tmp_path)
+    launcher.main()
+    assert checks == ([workspace] if not argv or argv[0] in {"chat", "run", "resume"} else [])
+    assert launched
+
+
+def _direct_environment(tmp_path):
+    import shlex
+    import sys
+
+    environment = tmp_path / "runtime"
+    (environment / "bin").mkdir(parents=True)
+    agent = environment / "bin/agent"
+    agent.write_text("#!/bin/sh\nexit 0\n")
+    agent.chmod(0o700)
+    python = environment / "bin/python"
+    python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    python.chmod(0o700)
+    return environment
+
+
+def test_direct_start_refuses_hardlinks_before_loading_credentials(tmp_path, monkeypatch):
+    launcher = load_script("start-deepseek-chat.py")
+    workspace = tmp_path / "repo"
+    (workspace / ".venv/include").mkdir(parents=True)
+    cached = tmp_path / "cached-header"
+    cached.write_text("fixture")
+    os.link(cached, workspace / ".venv/include/header.h")
+    environment = _direct_environment(tmp_path)
+    monkeypatch.setattr(launcher, "load_key", lambda *args, **kwargs: pytest.fail("credential read before readiness"))
+    monkeypatch.setattr(launcher.os, "execve", lambda *args: pytest.fail("must not launch Agent"))
+    with pytest.raises(ValueError, match="workspace_hardlink_detected.*header.h"):
+        launcher.start(workspace, tmp_path / "unused-key", venv=environment)
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_direct_start_keeps_exec_path_and_arguments_after_readiness(tmp_path, monkeypatch, external):
+    launcher = load_script("start-deepseek-chat.py")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    environment = _direct_environment(tmp_path)
+    if not external:
+        environment.rename(workspace / ".venv")
+        environment = workspace / ".venv"
+    configured = []
+    monkeypatch.setattr(launcher, "load_key", lambda path, **kwargs: configured.append(kwargs) or "fake-credential")
+    calls = []
+    monkeypatch.setattr(launcher.os, "execve", lambda *args: calls.append(args))
+    monkeypatch.chdir(tmp_path)
+    launcher.start(workspace, tmp_path / "unused-key", configure=True, venv=environment if external else None)
+    assert configured == [{"configure": True}]
+    agent = str(environment / "bin/agent")
+    assert calls[0][0:2] == (agent, [agent, "chat", "--model", "deepseek-flash"])
+    assert Path.cwd() == workspace

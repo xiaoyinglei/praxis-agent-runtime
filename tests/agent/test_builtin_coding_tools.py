@@ -149,10 +149,12 @@ def test_resident_tool_docs_distinguish_content_from_behavior(
     assert "never reapply the patch" in (
         tools["apply_patch"].definition.description.casefold()
     )
-    assert "instead of pre-reading" in tools["apply_patch"].definition.description
-    assert "never both" in tools["apply_patch"].definition.description
+    assert "replacement checks fail closed" in tools["apply_patch"].definition.description
+    assert "does not verify execution behavior" in (
+        tools["apply_patch"].definition.description
+    )
     assert "non-truncated" in tools["search_text"].definition.description
-    assert "never batch paired confirmations" in (
+    assert "not execution behavior" in (
         tools["search_text"].definition.description
     )
     assert "verify code behavior" in tools["run_command"].definition.description

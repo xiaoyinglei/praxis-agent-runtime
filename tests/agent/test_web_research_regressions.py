@@ -12,7 +12,7 @@ from tests.agent.test_web_tools import web_tools
 FIXTURES = Path(__file__).parent / 'fixtures' / 'web'
 
 
-def test_article_starts_with_evidence_and_ignores_comment_examples():
+def test_full_body_preserves_regions_and_ignores_comment_examples():
     html = b'''<html><head><title>Evidence</title>
     <meta property="article:published_time" content="2026-09-29T10:00:00+08:00"></head>
     <body><nav>Global navigation</nav><!-- <p>comment script example</p> -->
@@ -22,9 +22,9 @@ def test_article_starts_with_evidence_and_ignores_comment_examples():
     <p>Read the <a href="/announcement">original announcement</a>.</p>
     <aside>Unrelated recommendations</aside></article><footer>All rights reserved</footer></body></html>'''
     result = extract_content(html, 'text/html', 'https://example.com/news')
-    for noise in ['Global navigation', 'comment script example', 'Buy now', 'Unrelated recommendations',
-                  'All rights reserved']:
-        assert noise not in result.text
+    assert 'comment script example' not in result.text
+    for visible in ['Global navigation', 'Buy now', 'Unrelated recommendations', 'All rights reserved']:
+        assert visible in result.text
     assert 'Actual source paragraph' in result.text
     assert result.published_at == '2026-09-29T10:00:00+08:00'
     assert result.links == ({'url': 'https://example.com/announcement', 'text': 'original announcement'},)
@@ -35,9 +35,9 @@ def test_docs_preserve_code_tables_and_content_links():
            b'<table><tr><th>Option</th><th>Value</th></tr><tr><td>Timeout</td><td>10</td></tr></table>' \
            b'<a href="/next">Next section</a></main>'
     result = extract_content(body, 'text/html', 'https://example.com/guide')
-    assert 'Navigation' not in result.text
+    assert 'Navigation' in result.text
     assert 'def f():\n    return 42' in result.text
-    assert 'Timeout\t10' in result.text
+    assert '| Timeout | 10 |' in result.text
     assert result.links[0]['url'] == 'https://example.com/next'
 
 
@@ -147,8 +147,9 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
             assert data['error_code'] == 'web_content_empty'
         else:
             assert data['truncated'] is True
-            assert data['fetch_next_line'] == expected['next_line']
-            assert data['next_line'] <= expected['next_line']
+            assert 'fetch_next_line' not in data
+            assert data['next_line'] == expected['next_line']
+            assert data['visible_end_line'] < expected['next_line']
         if not extraction_error:
             assert 'item_' in message['content']
         assert data['source_id'].startswith('artifact_')
@@ -264,7 +265,7 @@ def test_multiregion_page_preserves_relevant_news_links_outside_dense_body():
     result = extract_content(body, 'text/html', 'https://example.com/company')
     assert {'url': 'https://example.com/news/report',
             'text': 'Example Corporation publishes a new report'} in result.links
-    assert all(link['url'] != 'https://example.com/help' for link in result.links)
+    assert any(link['url'] == 'https://example.com/help' for link in result.links)
     assert 'Example Corporation publishes a new report' in result.text
 
 

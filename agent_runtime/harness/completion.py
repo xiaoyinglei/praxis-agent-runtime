@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 
 from agent_runtime.harness.protocol import CompletionDecision, CompletionProposal
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, ToolOperationSnapshot
+from agent_runtime.harness.verification import assess_tool_verification
 
 
 class DeliveryCompletionGate:
-    """Accept delivery only after a trusted change and later verification."""
+    """Validate required workspace-change evidence, not answer correctness."""
 
     def __init__(self, store: RolloutStore) -> None:
         self._store = store
@@ -22,10 +24,14 @@ class DeliveryCompletionGate:
         ):
             return CompletionDecision(
                 action="accept",
-                reason="No workspace-change evidence is required for this Turn.",
+                reason=(
+                    "Workspace-change validation is not required for this Turn; "
+                    "task acceptance has not been evaluated."
+                ),
             )
 
-        trusted = self._trusted_results(proposal.turn_id)
+        # A failed multi-file operation may still have attested partial writes.
+        trusted = self._trusted_results(proposal.turn_id, include_failed=True)
         changes = [
             (item, operation)
             for item, operation in trusted
@@ -35,6 +41,8 @@ class DeliveryCompletionGate:
             return CompletionDecision(
                 action="continue",
                 reason="A verified workspace change is still required.",
+                validation_status="failed",
+                validation_scope="workspace_change",
             )
 
         latest_change_sequence = max(item.sequence for item, _operation in changes)
@@ -58,20 +66,26 @@ class DeliveryCompletionGate:
         if not verified_after_change:
             return CompletionDecision(
                 action="continue",
-                reason=(
-                    "Post-change verification is still required. Run a recognized test "
-                    "runner (for example `uv run pytest -q ...`) successfully after the "
-                    "latest workspace change; running a pytest file with `python` does "
-                    "not execute its tests."
+                reason=self._verification_feedback(
+                    proposal.turn_id,
+                    latest_change_sequence,
+                    latest_change_resources,
                 ),
+                validation_status="failed",
+                validation_scope="workspace_change",
             )
         return CompletionDecision(
             action="accept",
             reason="The latest workspace change has trusted post-change verification.",
+            validation_status="passed",
+            validation_scope="workspace_change",
         )
 
     def _trusted_results(
-        self, turn_id: str
+        self,
+        turn_id: str,
+        *,
+        include_failed: bool = False,
     ) -> tuple[tuple[ItemSnapshot, ToolOperationSnapshot], ...]:
         items = self._store.list_items(turn_id)
         items_by_id = {item.item_id: item for item in items}
@@ -84,8 +98,9 @@ class DeliveryCompletionGate:
             and isinstance(item.payload.get("tool_call_id"), str)
         }
         trusted: list[tuple[ItemSnapshot, ToolOperationSnapshot]] = []
+        statuses = {"succeeded", "failed"} if include_failed else {"succeeded"}
         for operation in self._store.list_tool_operations(turn_id):
-            if operation.status != "succeeded" or operation.result_item_id is None:
+            if operation.status not in statuses or operation.result_item_id is None:
                 continue
             result = items_by_id.get(operation.result_item_id)
             call = calls_by_id.get(operation.tool_call_id)
@@ -100,6 +115,88 @@ class DeliveryCompletionGate:
                 continue
             trusted.append((result, operation))
         return tuple(trusted)
+
+    def _verification_feedback(
+        self,
+        turn_id: str,
+        latest_change_sequence: int,
+        changed_resources: set[str],
+    ) -> str:
+        calls = {
+            item.payload.get("tool_call_id"): item
+            for item in self._store.list_items(turn_id)
+            if item.kind == "tool_call"
+        }
+        candidates = sorted(
+            (
+                (item, operation)
+                for item, operation in self._trusted_results(turn_id, include_failed=True)
+                if item.sequence > latest_change_sequence
+                and operation.tool_name in {"run_command", "execute_python", "read_file", "inspect_data_file"}
+            ),
+            key=lambda pair: pair[0].sequence,
+            reverse=True,
+        )
+        feedback: dict[str, object] = {
+            "validation": "post_change_verification",
+            "reason_code": "verification_missing",
+            "message": "No successful verification of the latest workspace change has been recorded.",
+            "next_action": "Run the project's documented checks directly after the latest workspace change, "
+            "using a recognized test runner, static check, or explicit assertion.",
+        }
+        if candidates:
+            item, operation = candidates[0]
+            call = calls[operation.tool_call_id]
+            arguments = call.payload.get("arguments", {})
+            assessment = assess_tool_verification(
+                tool_name=operation.tool_name,
+                arguments=arguments,
+                structured_content=item.payload.get("structured_content"),
+                resources=operation.resources,
+            )
+            code, message = assessment.reason_code, assessment.message
+            if operation.status == "failed" and assessment.evidence is not None:
+                code, message = (
+                    "tool_failed",
+                    "The tool operation failed; its output cannot attest successful verification.",
+                )
+            elif assessment.evidence is not None:
+                code, message = (
+                    "unrelated_inspection",
+                    "The inspection targets could not be matched to the latest attested write targets. "
+                    "Run the project's checks or obtain inspection evidence matching those targets.",
+                )
+                feedback["attested_write_targets"] = [target[:500] for target in sorted(changed_resources)[:8]]
+                feedback["inspected_targets"] = [target[:500] for target in assessment.evidence.verified_resources[:8]]
+            feedback.update(
+                reason_code=code,
+                message=message,
+                tool_call_id=operation.tool_call_id,
+                tool_name=operation.tool_name,
+            )
+            if assessment.suggested_command and len(assessment.suggested_command) <= 2000:
+                feedback["suggested_command"] = assessment.suggested_command
+                feedback["next_action"] = (
+                    "Run suggested_command directly in the same working directory in a separate run_command call. "
+                    "Then inspect the exit status and output."
+                )
+            command = arguments.get("command")
+            if isinstance(command, str):
+                feedback["command"] = command[:2000]
+            structured = item.payload.get("structured_content")
+            if isinstance(structured, Mapping):
+                exit_code = structured.get("exit_code")
+                if isinstance(exit_code, int) and not isinstance(exit_code, bool):
+                    feedback["exit_code"] = exit_code
+            if item.payload.get("error_code"):
+                feedback["error_code"] = str(item.payload["error_code"])[:200]
+        elif any(item.sequence <= latest_change_sequence for item in self._trusted_verifications(turn_id)):
+            feedback.update(
+                reason_code="verification_stale",
+                message="The recorded verification happened before the latest workspace change. "
+                "Rerun verification against the updated files.",
+            )
+        return json.dumps(feedback, ensure_ascii=False)
 
     def _trusted_verifications(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         operations = {

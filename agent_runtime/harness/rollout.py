@@ -43,6 +43,13 @@ from agent_runtime.streaming.events import (
 _REDUCER_VERSION = 1
 
 
+def _validate_resource_usage_input(resource: str, initial_used: int) -> None:
+    if not isinstance(resource, str) or not resource.strip() or len(resource) > 120:
+        raise ValueError("resource must be a non-empty name of at most 120 characters")
+    if type(initial_used) is not int or initial_used < 0:
+        raise ValueError("initial resource usage must be a non-negative integer")
+
+
 def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
     return {
         channel: derive_model_public_item_id(
@@ -235,22 +242,35 @@ class ArtifactSnapshot:
 
 
 class RolloutStore:
-    """Own canonical records and update projections through one reducer."""
+    """Own canonical records and update projections through one reducer.
+
+    read_only uses SQLite mode=ro and rejects business/artifact mutations. SQLite
+    may create WAL/SHM protocol files while reading; active WAL commits stay visible.
+    """
 
     def __init__(
         self,
         path: Path,
+        *,
+        read_only: bool = False,
     ) -> None:
         self._path = Path(path)
+        self._read_only = read_only
         self._artifact_root = self._path.with_name(f"{self._path.name}.artifacts")
         self._pending_transaction_records: list[RolloutRecord] | None = None
         self._captured_commits: list[tuple[RolloutRecord, ...]] | None = None
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self._path, isolation_level=None)
+        if read_only:
+            self._connection = sqlite3.connect(
+                f"{self._path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None,
+            )
+        else:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            self._connection = sqlite3.connect(self._path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._create_schema()
+        if not read_only:
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._create_schema()
 
     def __enter__(self) -> RolloutStore:
         return self
@@ -260,6 +280,10 @@ class RolloutStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def _assert_writable(self) -> None:
+        if self._read_only:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
 
     @property
     def epoch(self) -> str:
@@ -298,6 +322,7 @@ class RolloutStore:
     ) -> ArtifactSnapshot:
         """Durably write an immutable blob before appending its canonical reference."""
 
+        self._assert_writable()
         if not isinstance(content, bytes):
             raise TypeError("artifact content must be bytes")
         if not isinstance(media_type, str) or not media_type.strip():
@@ -848,6 +873,7 @@ class RolloutStore:
         durable_state: Mapping[str, Any] | None = None,
         algorithm_revision: str | None = None,
         tool_result_overrides: Mapping[str, str] | None = None,
+        capacity_diagnostics: Mapping[str, Any] | None = None,
     ) -> ItemSnapshot:
         """Append an auditable replacement for one committed context prefix."""
 
@@ -882,7 +908,7 @@ class RolloutStore:
                 item_id not in covered_item_ids for item_id in preserved_item_ids
             ):
                 raise ValueError("preserved Items must belong to the covered prefix")
-            if algorithm_revision == "semantic-compaction-v5":
+            if algorithm_revision in {"semantic-compaction-v5", "semantic-compaction-v6"}:
                 pending: set[tuple[str, str]] = set()
                 replay_results: set[str] = set()
                 for item in visible_items:
@@ -900,7 +926,8 @@ class RolloutStore:
                         replay_results.add(item.item_id)
                     elif item.kind != "user_message" or pending:
                         raise ValueError("only user Items and complete tool exchanges can be preserved")
-                if pending or replay_results != set(tool_result_overrides or {}):
+                if pending or (algorithm_revision == "semantic-compaction-v5"
+                               and replay_results != set(tool_result_overrides or {})):
                     raise ValueError("preserved tool exchanges require all paired archived results")
                 for source_turn in {item.turn_id for item in visible_items if item.item_id in replay_results}:
                     if any(op.result_item_id in replay_results and (op.requires_reconciliation or
@@ -977,6 +1004,8 @@ class RolloutStore:
             }
             if tool_result_overrides is not None:
                 payload["tool_result_overrides"] = dict(tool_result_overrides)
+            if capacity_diagnostics is not None:
+                payload["capacity_diagnostics"] = _json_object(capacity_diagnostics, field="capacity diagnostics")
             if expected_source_revision is not None:
                 payload.update(
                     source_revision=expected_source_revision,
@@ -3850,6 +3879,56 @@ class RolloutStore:
             ).fetchall()
         return tuple(_approval_snapshot(row) for row in rows)
 
+    def read_resource_usage(
+        self, turn_id: str, resource: str, initial_used: int = 0,
+    ) -> dict[str, Any]:
+        """Read the latest durable counter; legacy usage applies only before its first Item."""
+
+        _validate_resource_usage_input(resource, initial_used)
+        self.read_turn(turn_id)
+        rows = self._connection.execute(
+            """SELECT item_id, payload_json FROM items
+               WHERE turn_id = ? AND kind = 'resource_usage' AND status = 'completed' AND producer = 'runtime'
+               ORDER BY sequence DESC""", (turn_id,),
+        )
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            if payload.get("resource") != resource:
+                continue
+            used, limit = payload.get("used"), payload.get("limit")
+            if type(used) is not int or type(limit) is not int or not 0 <= used <= limit <= 256 or limit < 1:
+                raise RuntimeError("canonical resource_usage payload is malformed")
+            return {"resource": resource, "limit": limit, "used": used,
+                    "remaining": max(0, limit - used), "item_id": str(row["item_id"])}
+        return {"resource": resource, "limit": None, "used": initial_used, "remaining": None, "item_id": None}
+
+    def reserve_resource_unit(
+        self, turn_id: str, resource: str, limit: int, initial_used: int = 0,
+    ) -> dict[str, Any]:
+        """Commit one conservative unit before I/O, serialized across Store connections."""
+
+        _validate_resource_usage_input(resource, initial_used)
+        if type(limit) is not int or not 1 <= limit <= 256:
+            raise ValueError("resource limit must be an integer between 1 and 256")
+        item_id = f"item_{uuid4().hex}"
+        with self._transaction():
+            thread_id = self._running_turn_thread_id(turn_id)
+            usage = self.read_resource_usage(turn_id, resource, initial_used)
+            if usage["limit"] is not None and usage["limit"] != limit:
+                raise ValueError("resource_limit_mismatch")
+            if usage["used"] >= limit:
+                raise ValueError("resource_limit_exceeded")
+            used = usage["used"] + 1
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="runtime",
+                payload={"item_id": item_id, "kind": "resource_usage"},
+            )
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="runtime",
+                payload={"item_id": item_id, "payload": {"resource": resource, "limit": limit, "used": used}},
+            )
+        return {"resource": resource, "limit": limit, "used": used, "remaining": limit - used, "item_id": item_id}
+
     def record_final_proposal(self, *, turn_id: str, answer: str) -> ItemSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
@@ -3879,11 +3958,19 @@ class RolloutStore:
         proposal_item_id: str,
         action: str,
         reason: str,
+        validation_status: str = "not_evaluated",
+        validation_scope: str | None = None,
     ) -> ItemSnapshot:
         if action not in {"accept", "continue", "pause", "fail"}:
             raise ValueError(f"unsupported completion action: {action}")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("completion reason must be non-empty")
+        if validation_status not in {"not_evaluated", "passed", "failed"}:
+            raise ValueError(f"unsupported completion validation status: {validation_status}")
+        if validation_scope is not None and (
+            not isinstance(validation_scope, str) or not validation_scope.strip()
+        ):
+            raise ValueError("completion validation scope must be non-empty or None")
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
@@ -3911,6 +3998,8 @@ class RolloutStore:
                         "proposal_item_id": proposal_item_id,
                         "action": action,
                         "reason": reason,
+                        "validation_status": validation_status,
+                        "validation_scope": validation_scope,
                     },
                 },
             )
@@ -4270,6 +4359,7 @@ class RolloutStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
+        self._assert_writable()
         if self._pending_transaction_records is not None:
             yield
             return

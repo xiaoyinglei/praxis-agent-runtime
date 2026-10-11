@@ -13,6 +13,47 @@ prevent creation of new reserved `.git`/`.venv` paths in an otherwise writable
 workspace, and sharing the host network would expose more than outbound IP
 connections. Do not bypass the sandbox with a shell wrapper or silent fallback.
 
+## Optional native Codex patch tool
+
+The default file tools continue to work without Codex. To opt into the native
+patch format on Linux, install the pinned `rust-v0.162.1` executable **outside
+all Agent workspaces**. The standard-library installer supports x86_64 and
+aarch64 and verifies the release archive SHA-256 before installing its exact
+executable member:
+
+```bash
+python3 scripts/ubuntu/install-codex-patch.py --destination "$HOME/.local/lib/praxis/codex-patch"
+export PRAXIS_CODEX_APPLY_PATCH="$HOME/.local/lib/praxis/codex-patch"
+PRAXIS_TEST_CODEX_BINARY="$PRAXIS_CODEX_APPLY_PATCH" uv run pytest -q tests/agent/test_codex_apply_patch.py tests/agent/test_linux_codex_patch.py
+```
+
+`--archive /path/to/downloaded.tar.gz` supports offline installation with the
+same digest check. Unset `PRAXIS_CODEX_APPLY_PATCH` to restore the default patch
+tool in a direct CLI session. For the isolated `launch-server-agent.py` entrypoint,
+install to the same `.local/lib/praxis/codex-patch` path under the `praxis-agent`
+account's home. The launcher loads this fixed optional path, ignores ambient
+`PRAXIS_CODEX_APPLY_PATCH`, and rejects symlinks, nonexecutables, untrusted owners,
+or group/world-writable binaries. Removing or renaming this optional executable
+disables it for that launcher. This adapter invokes Codex's offline patch component only; it does not
+start Codex's agent or send source code to a model provider. Binary upgrades
+require reviewing and updating the pinned archive digests.
+
+Linux runs native Codex inside Bubblewrap with a private view containing only
+the declared candidate files. It then validates every output and commits the
+changes using the existing atomic file helpers. The child cannot write the
+original workspace. Network access is disabled. Protected path components
+`.git`, `.venv`, `node_modules`, `.agent_memory`, and `.praxis`, symlink targets
+or parents, parent traversal, and targets outside the workspace are rejected.
+Each patch has a 30,000-character limit, at most 128 targets, and a 64 MiB total
+limit on staged input or output files. Host targets are checked against their
+initial contents before commit to detect concurrent edits; this is a trusted
+local workspace contract, not a transactional multiwriter filesystem.
+
+Native failures can leave earlier valid edits, as on macOS; the result reports
+an error and actual workspace changes. Timeout or cancellation discards the
+private view. Invalid output boundaries are rejected before any host commit.
+The general Linux command/Python sandbox policy remains read-only.
+
 ## Host preparation
 
 Use a regular user, Python 3.12 or 3.13, Git, uv, and Bubblewrap:
@@ -42,7 +83,7 @@ restrictions](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-
 Deploy the revision containing this Linux change, then run:
 
 ```bash
-uv sync --frozen
+uv sync --frozen --link-mode copy
 uv run agent --help
 uv run pytest -q tests/agent/test_linux_sandbox.py
 ```
@@ -75,7 +116,7 @@ python3 scripts/ubuntu/install-agent-deps.py . --python .venv/bin/python
 # Once this exact lock/profile/Python platform has been installed successfully:
 python3 scripts/ubuntu/install-agent-deps.py . --python .venv/bin/python --offline
 # Optional test runner, separate from the deployment profile:
-uv pip install --python .venv/bin/python pytest
+uv pip install --python .venv/bin/python --link-mode copy pytest
 .venv/bin/agent model probe deepseek-flash --level stream
 .venv/bin/agent run "只回复：连接成功" --model deepseek-flash --no-require-workspace-change
 .venv/bin/python -m pytest -q tests/agent/test_linux_sandbox.py
@@ -90,6 +131,40 @@ persistent location; do not prune it between deployments. `--offline` forbids
 network access, including build dependencies, and fails clearly if the exact
 manifest, compatible wheel, or build backend has not been cached. A new lock or
 Python platform needs a new warm-up. The installer never downloads model weights.
+
+Every core and editable install uses `--link-mode copy --reinstall`. Copy mode
+keeps dependency files independent of uv's wheel cache; reinstall also repairs
+an existing environment whose installed versions are already correct but whose
+files still share cache inodes. Merely setting copy mode on a future install
+does not repair those existing files. The installer checks all regular files
+in the target venv after installation, including `include/` headers, and fails
+if any hardlinks remain. Additional packages outside the core profile must also
+be reinstalled with copy mode, or the environment must be recreated.
+
+Prefer keeping the runtime venv outside the Agent workspace for direct CLI
+deployments. For example, while in the reviewed repository:
+
+```bash
+agent_venv="$HOME/.local/share/praxis/venvs/core"
+uv venv --python 3.12 "$agent_venv"
+python3 scripts/ubuntu/install-agent-deps.py . --python "$agent_venv/bin/python"
+"$agent_venv/bin/agent" run "只回复：连接成功" --model deepseek-flash --no-require-workspace-change
+```
+
+The original `.venv` commands remain compatible with the direct credential
+launcher and initial model-service installer below. The direct credential
+launcher also accepts `--venv /path/to/runtime`, as shown below. A venv left inside the
+workspace still participates in the shell containment scan even when the
+Agent runs from an external environment; move a retired venv outside the
+workspace or repair it before using shell tools.
+
+For an existing reduced `.venv` installation, deploy the reviewed installer and
+rerun `python3 scripts/ubuntu/install-agent-deps.py . --python .venv/bin/python
+--offline` with the warmed cache. Inspect the final readiness result before
+starting the Agent. `workspace_hardlink_detected` means the workspace contains
+files that alias another scope, so both `run_command` and `execute_python` refuse
+execution before starting a process. This is a deployment problem; do not disable
+the check, exclude `.venv`, or grant additional shell permissions to bypass it.
 
 If the server's PyPI route is unavailable, download the matching locked Linux
 wheels on a trusted machine and transfer them over SSH. Use `--wheel-dir
@@ -148,6 +223,8 @@ For direct DeepSeek CLI operation without the independent model service:
 
 ```bash
 .venv/bin/python scripts/ubuntu/start-deepseek-chat.py
+# Runtime outside the workspace, using the same private saved credential:
+python3 scripts/ubuntu/start-deepseek-chat.py --venv "$HOME/.local/share/praxis/venvs/core"
 ```
 
 The first start prompts for the Key with terminal echo disabled and saves it to
@@ -159,6 +236,12 @@ tool subprocess environment filtering still applies. A saved Key's format is
 checked locally; the provider authenticates each actual API request. This is the
 direct single-user CLI path; use the independent credential service below when
 separate OS identities are required.
+
+Before loading or prompting for a credential, this launcher runs the installed
+shell containment check with the selected venv's Python and a fixed timeout.
+An unsafe workspace stops startup with its error code and path; an import or
+readiness subprocess failure asks for dependency repair. `--configure` still
+explicitly replaces the saved key after readiness succeeds.
 
 Inspect model IDs with `uv run agent model list --source`. The checked-in
 catalog currently defaults to `openai/gpt-oss-120b` via Groq and reads

@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+from collections import deque
 from collections.abc import Iterable
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 MAX_RUNTIME_DIAGNOSTICS = 20
 MAX_RUNTIME_DIAGNOSTIC_MESSAGE_LENGTH = 500
+MAX_EXCEPTION_TRACEBACK_FRAMES = 12
 _SENSITIVE_ENV_NAME_PARTS = (
     "KEY",
     "PASSWORD",
@@ -49,6 +51,47 @@ def redact_sensitive_text(value: object) -> str:
         redacted = redacted.replace(secret, "[REDACTED]")
     redacted = _CREDENTIAL_TOKEN_RE.sub("[REDACTED]", redacted)
     return _BEARER_TOKEN_RE.sub("Bearer [REDACTED]", redacted)
+
+
+def exception_diagnostic(
+    error: Exception,
+    *,
+    stage: str,
+    tool_call_id: str | None = None,
+    operation_id: str | None = None,
+    turn_id: str | None = None,
+) -> dict[str, Any]:
+    """Capture bounded frame identities, never source text or frame locals."""
+
+    frames: deque[dict[str, Any]] = deque(maxlen=MAX_EXCEPTION_TRACEBACK_FRAMES)
+    frame_count = 0
+    traceback = error.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        frames.append({
+            "filename": redact_sensitive_text(code.co_filename)[:512],
+            "lineno": traceback.tb_lineno,
+            "function": redact_sensitive_text(code.co_name)[:120],
+        })
+        frame_count += 1
+        traceback = traceback.tb_next
+    try:
+        message = redact_sensitive_text(error).strip()
+    except Exception:
+        message = "exception message unavailable"
+    diagnostic: dict[str, Any] = {
+        "stage": stage,
+        "exception_type": type(error).__name__[:120],
+        "message": (message or type(error).__name__)[:MAX_RUNTIME_DIAGNOSTIC_MESSAGE_LENGTH],
+        "traceback": list(frames),
+        "traceback_truncated": frame_count > MAX_EXCEPTION_TRACEBACK_FRAMES,
+    }
+    for name, value in (
+        ("tool_call_id", tool_call_id), ("operation_id", operation_id), ("turn_id", turn_id),
+    ):
+        if value is not None:
+            diagnostic[name] = value
+    return diagnostic
 
 
 class RuntimeDiagnostic(BaseModel):
@@ -123,4 +166,5 @@ __all__ = [
     "RuntimeDiagnostic",
     "merge_runtime_diagnostics",
     "redact_sensitive_text",
+    "exception_diagnostic",
 ]

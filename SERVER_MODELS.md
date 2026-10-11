@@ -65,6 +65,8 @@ praxis chat --model deepseek-flash
 
 部署代码与工作目录分开。需要编辑自己的项目时，由管理员把项目复制/检出到该用户可写的工作目录；不要把供应商密钥、服务源码或配置放进 Agent 的工作区。当前 Linux shell/Python 沙箱仍只允许只读、禁网络执行；修改工作区使用现有文件工具，不能把本次模型接入当作 Linux shell 写权限支持。
 
+Agent 的运行环境在工作区外的 `/opt/praxis/agent-venv`。启动器在进入 chat/run/resume 前复用 shell 的工作区包含性检查；若出现 `workspace_hardlink_detected`，会直接显示问题路径并停止启动。`history`、`model` 和帮助命令仍可用于诊断。复制项目时不要把仍与 uv wheel cache 硬链接的旧 `.venv` 带入 `/var/lib/praxis-agent/workspace`。需要保留项目测试环境时，按 `DEPLOY_UBUNTU.md` 用 `--link-mode copy` 重装，或把退役环境移出工作区；新增启动检查不会放宽已有沙箱边界。
+
 
 ## 终端交互界面
 

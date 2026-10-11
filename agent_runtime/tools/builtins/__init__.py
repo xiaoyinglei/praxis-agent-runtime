@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import os
+
+from agent_runtime.tools.builtins.codex_patch import create_codex_apply_patch_tool
 from agent_runtime.tools.builtins.data import create_inspect_data_file_tool
 from agent_runtime.tools.builtins.filesystem import (
     create_apply_patch_tool,
@@ -40,7 +43,11 @@ def create_resident_coding_tools(
         create_list_files_tool(workspace),
         create_read_file_tool(workspace),
         create_inspect_data_file_tool(workspace),
-        create_apply_patch_tool(workspace),
+        (
+            create_codex_apply_patch_tool(workspace, os.environ["PRAXIS_CODEX_APPLY_PATCH"])
+            if os.environ.get("PRAXIS_CODEX_APPLY_PATCH")
+            else create_apply_patch_tool(workspace)
+        ),
         create_run_command_tool(
             workspace,
             hard_timeout_seconds=command_hard_timeout_seconds,

@@ -215,8 +215,10 @@ llm_budgets:
   # One Harness sampling round may produce tool calls or a final answer.
   # The model declaration supplies the requested output limit; this policy is
   # only the model-independent ceiling for an agent step.
+  # A null input cap uses the model window after output and safety reserves.
+  # Set a positive integer only to impose an additional per-request input cap.
   agent_step:
-    max_input_tokens: 64000
+    max_input_tokens: null
     max_output_tokens: 32768
     safety_margin_tokens: 512
 

@@ -128,8 +128,16 @@ class CompletionProposal:
 
 @dataclass(frozen=True, slots=True)
 class CompletionDecision:
+    """Runtime action and independent validation of the stated scope.
+
+    Accepting an answer ends the Turn; it does not imply validation passed.
+    Legacy custom gates that only return action/reason remain not_evaluated.
+    """
+
     action: Literal["accept", "continue", "pause", "fail"]
     reason: str
+    validation_status: Literal["not_evaluated", "passed", "failed"] = "not_evaluated"
+    validation_scope: str | None = None
 
 
 class CompletionGate(Protocol):
@@ -189,13 +197,14 @@ class ContextCompactionRequiredError(ContextBudgetExceededError):
         input_tokens: int,
         max_input_tokens: int,
         retained_tail_messages: int = 0,
+        reason_code: str = "context_budget_exhausted",
     ) -> None:
         self.input_tokens = input_tokens
         self.max_input_tokens = max_input_tokens
         self.retained_tail_messages = retained_tail_messages
         super().__init__(
             "Committed context requires durable compaction before provider dispatch: "
-            f"{input_tokens} > {max_input_tokens} input tokens."
+            f"{input_tokens} > {max_input_tokens} input tokens.", reason_code=reason_code
         )
 
 

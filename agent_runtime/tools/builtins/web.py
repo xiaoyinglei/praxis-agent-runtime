@@ -36,9 +36,16 @@ from agent_runtime.tools.tool import (
 )
 from agent_runtime.tools.web_content import MAX_SOURCE_CHARACTERS, extract_content_async, extract_search_results_async
 from agent_runtime.tools.web_http import PublicWebClient, PublicWebError, validate_public_url
+from agent_runtime.tools.web_limits import WebLimits
+from agent_runtime.tools.web_snapshot import compare_saved_sources
 
 WEB_TOOL_NAMES = ("web_search", "web_fetch")
 WEB_SOURCE_MEDIA_TYPE = "application/vnd.praxis.web-source+json"
+_CACHEABLE_FETCH_ERRORS = {
+    "http_error", "nonpublic_address", "invalid_url", "response_too_large",
+    "web_browser_unavailable", "web_browser_budget_exceeded", "web_browser_failed",
+    "web_browser_request_blocked",
+}
 _SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 _TAVILY_ENDPOINT = "https://api.tavily.com/search"
 
@@ -58,6 +65,10 @@ class WebFetchInput(BaseModel):
     source_id: str | None = Field(
         default=None, pattern=r"^artifact_[0-9a-f]{32}$",
         description="An earlier web_fetch source_id. Reads the same saved source without network access.",
+    )
+    compare_to_source_id: str | None = Field(
+        default=None, pattern=r"^artifact_[0-9a-f]{32}$",
+        description="Earlier saved source to compare with this full snapshot. No baseline means no change claim.",
     )
     start_line: int = Field(default=1, ge=1, description="Start at this 1-based saved-source line.")
     max_lines: int = Field(default=100, ge=1, le=500)
@@ -134,7 +145,7 @@ class WebSource(BaseModel):
     raw_body_base64: str | None = Field(default=None, max_length=2_666_668)
     raw_content_type: str = ""
     raw_content_hash: str | None = None
-    extraction_version: str = "document-v3"
+    extraction_version: str = "document-v4"
     sections: list[WebSection] = Field(default_factory=list)
     links_truncated: bool = False
     warning: str | None = None
@@ -164,6 +175,8 @@ class WebSearchOutput(BaseModel):
     results: list[SearchResult] = Field(default_factory=list)
     network_bytes: int = 0
     cache_hit: bool = False
+    request_attempted: bool = False
+    request_budget: dict[str, Any] | None = None
     results_truncated: bool = False
     freshness_requested: str | None = None
     freshness_verified: bool = False
@@ -185,6 +198,8 @@ class WebFetchOutput(BaseModel):
     extraction_method: str = ""
     warning: str | None = None
     cache_hit: bool = False
+    request_attempted: bool = False
+    request_budget: dict[str, Any] | None = None
     content_hash: str = ""
     content: str = ""
     start_line: int = 1
@@ -211,6 +226,9 @@ class WebFetchOutput(BaseModel):
     render_mode: str = 'http'
     static_source_id: str | None = None
     render_diagnostics: dict[str, Any] | None = None
+    comparison: dict[str, Any] | None = None
+    failure_origin: dict[str, str] | None = None
+    diagnostics_source_id: str | None = None
 
 
 def load_search_key(path: Path | None, *, workspace: Path) -> str | None:
@@ -254,6 +272,9 @@ def create_web_tools(
     search_provider: str | None = None,
     before_request: Callable[[], None] | None = None,
     cache_scope: Callable[[], str | None] = lambda: None,
+    resource_limits: Callable[[], WebLimits] | None = None,
+    budget_status: Callable[[], dict[str, Any]] | None = None,
+    failure_lookup: Callable[[str, str], dict[str, Any] | None] | None = None,
 ) -> tuple[Tool, ...]:
     provider = search_provider if search_provider is not None else ("brave" if search_key is not None else "bing")
     if provider not in {"bing", "brave", "tavily"}:
@@ -368,14 +389,42 @@ def create_web_tools(
                 error_code="web_search_invalid_response", error_message="Search provider returned an invalid response.",
             ).model_dump(mode="json")
 
+    def read_saved_source(source_id: str) -> WebSource:
+        try:
+            blob = load_source(source_id)
+            if len(blob) > 5_000_000:
+                raise ValueError("oversized snapshot")
+            source = WebSource.model_validate_json(blob)
+            if hashlib.sha256(source.text.encode()).hexdigest() != source.content_hash:
+                raise ValueError("invalid snapshot hash")
+            if source.raw_body_base64 is not None:
+                raw = base64.b64decode(source.raw_body_base64, validate=True)
+                if hashlib.sha256(raw).hexdigest() != source.raw_content_hash:
+                    raise ValueError("invalid raw snapshot hash")
+            return source
+        except (KeyError, ValueError, RuntimeError, OSError):
+            raise PublicWebError("web_source_unavailable", "Saved web source is missing or invalid.") from None
+
+    async def render_page(url: str, *, initial_response: Any = None) -> Any:
+        from agent_runtime.tools.web_browser import render_public_page
+
+        options: dict[str, Any] = {}
+        if initial_response is not None:
+            options["initial_response"] = initial_response
+        if resource_limits is not None:
+            options["limits"] = resource_limits()
+        return await render_public_page(client, url, **options)
+
     async def fetch_uncached(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
         request = WebFetchInput.model_validate(arguments)
         network_bytes = 0
+        request_attempted = False
         source: WebSource | None = None
         source_id = request.source_id
         cache_hit = False
         connection_mode = "saved_source"
         static_source_id: str | None = None
+        acquisition_completed = False
         try:
             mode = 'browser' if request.render is True else 'http'
             cache_mode = 'auto' if request.render == 'auto' and request.view != 'raw' else mode
@@ -386,9 +435,9 @@ def create_web_tools(
             if request.url is not None and (source_id is None or request.refresh):
                 if before_request is not None:
                     before_request()
+                request_attempted = True
                 if request.render is True:
-                    from agent_runtime.tools.web_browser import render_public_page
-                    response = await render_public_page(client, request.url)
+                    response = await render_page(request.url)
                 else:
                     response = await client.get(request.url)
                 for attempt in range(2):
@@ -427,11 +476,9 @@ def create_web_tools(
                             and source.extraction_error_code == 'web_content_empty'
                             and response.content_type.split(';', 1)[0].strip().lower()
                             in {'text/html', 'application/xhtml+xml'}):
-                        from agent_runtime.tools.web_browser import render_public_page
-
                         static_source_id = source_id
                         mode = 'browser'
-                        response = await render_public_page(client, response.url, initial_response=response)
+                        response = await render_page(response.url, initial_response=response)
                         continue
                     break
                 assert source_id is not None
@@ -442,36 +489,47 @@ def create_web_tools(
                 network_bytes = response.network_bytes
             else:
                 assert source_id is not None
-                try:
-                    blob = load_source(source_id)
-                    if len(blob) > 5_000_000:
-                        raise ValueError("oversized snapshot")
-                    source = WebSource.model_validate_json(blob)
-                    if hashlib.sha256(source.text.encode()).hexdigest() != source.content_hash:
-                        raise ValueError("invalid snapshot hash")
-                    if source.raw_body_base64 is not None:
-                        raw = base64.b64decode(source.raw_body_base64, validate=True)
-                        if hashlib.sha256(raw).hexdigest() != source.raw_content_hash:
-                            raise ValueError("invalid raw snapshot hash")
-                except (KeyError, ValueError, RuntimeError, OSError):
-                    raise PublicWebError("web_source_unavailable", "Saved web source is missing or invalid.") from None
+                source = read_saved_source(source_id)
+            acquisition_completed = True
             assert source is not None
             output = _read_source(source, request, source_id=source_id or "", network_bytes=network_bytes,
                                   cache_hit=cache_hit, connection_mode=connection_mode)
+            baseline = None
+            if request.compare_to_source_id is not None:
+                baseline = read_saved_source(request.compare_to_source_id)
+            output.comparison = compare_saved_sources(
+                source.model_dump(mode="json"), None if baseline is None else baseline.model_dump(mode="json"),
+                current_source_id=source_id or "", baseline_source_id=request.compare_to_source_id,
+            )
+            output.request_attempted = request_attempted
+            output.request_budget = budget_status() if budget_status is not None else None
             return _fit_output(output, request, accounting).model_dump(mode="json")
         except PublicWebError as error:
-            return WebFetchOutput(
+            diagnostics_source_id = None
+            if error.render_diagnostics is not None:
+                diagnostic_source = WebSource(
+                    url=source.url if source else request.url or "", title="Failed acquisition diagnostics",
+                    fetched_at=datetime.now(UTC).isoformat(), text="", content_hash=hashlib.sha256(b"").hexdigest(),
+                    extraction_method="failed", extraction_error_code=error.code, extraction_error_message=str(error),
+                    render_mode=mode, render_diagnostics=dict(error.render_diagnostics),
+                )
+                diagnostics_source_id = save_source(diagnostic_source.model_dump_json().encode())
+            output = WebFetchOutput(
                 source_id=source_id, url=source.url if source else request.url or "",
                 content_hash=source.content_hash if source else "",
                 error_code=error.code, error_message=str(error),
+                request_attempted=request_attempted,
+                request_budget=budget_status() if budget_status is not None else None,
                 connection_mode=(connection_mode if source is not None and error.connection_mode == 'unknown'
                                  else error.connection_mode), failure_stage=error.failure_stage,
-                render_mode=source.render_mode if source else mode,
+                render_mode=source.render_mode if acquisition_completed and source else mode,
                 static_source_id=static_source_id or (source.static_source_id if source else None),
                 network_bytes=(int(error.render_diagnostics.get('wire_bytes', network_bytes))
                                if error.render_diagnostics else network_bytes),
                 render_diagnostics=dict(error.render_diagnostics) if error.render_diagnostics else None,
-            ).model_dump(mode="json")
+                diagnostics_source_id=diagnostics_source_id,
+            )
+            return _fit_output(output, request, accounting).model_dump(mode="json")
 
     # Session-local maps store only IDs/results. Scope is the canonical Turn ID in production.
     # Locks prevent concurrent identical calls from doing duplicate network work.
@@ -479,18 +537,44 @@ def create_web_tools(
     search_cache: dict[tuple[str | None, str], dict[str, Any]] = {}
     search_signatures: dict[tuple[str | None, str], str] = {}
     fetch_lock, search_lock = asyncio.Lock(), asyncio.Lock()
+    failed_fetches: dict[tuple[Any, ...], dict[str, Any]] = {}
 
     async def fetch(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
+        request = WebFetchInput.model_validate(arguments)
+        mode = 'auto' if request.render == 'auto' and request.view != 'raw' else (
+            'browser' if request.render is True else 'http')
+        condition = (cache_scope(), request.url, mode,
+                     resource_limits().model_dump_json() if resource_limits is not None else None)
         async with fetch_lock:
-            return await fetch_uncached(arguments)
+            if request.url is not None and not request.refresh:
+                previous = failed_fetches.get(condition)
+                if previous is None and failure_lookup is not None:
+                    previous = failure_lookup(request.url, mode)
+                if previous is not None and previous.get("error_code") in _CACHEABLE_FETCH_ERRORS:
+                    cached_output = WebFetchOutput.model_validate({
+                        **previous, "cache_hit": True, "network_bytes": 0, "request_attempted": False,
+                        "request_budget": budget_status() if budget_status is not None else None,
+                    })
+                    return _fit_output(cached_output, request, accounting).model_dump(mode="json")
+            output = await fetch_uncached(arguments)
+            if request.url is not None and output["error_code"] in _CACHEABLE_FETCH_ERRORS:
+                failed_fetches[condition] = output
+                while len(failed_fetches) > 256:
+                    del failed_fetches[next(iter(failed_fetches))]
+            elif request.refresh:
+                failed_fetches.pop(condition, None)
+            return output
 
     async def search(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
         request = WebSearchInput.model_validate(arguments)
         key = (cache_scope(), request.model_dump_json())
         async with search_lock:
             if key in search_cache:
-                return {**search_cache[key], "network_bytes": 0, "cache_hit": True}
+                return {**search_cache[key], "network_bytes": 0, "cache_hit": True, "request_attempted": False,
+                        "request_budget": budget_status() if budget_status is not None else None}
             output = await search_uncached(arguments)
+            output["request_attempted"] = output["error_code"] != "web_request_budget_exceeded"
+            output["request_budget"] = budget_status() if budget_status is not None else None
             original_results = output["results"]
             bounded_results = []
             result_bytes = 0
@@ -535,7 +619,7 @@ def create_web_tools(
             is_error=value["error_code"] is not None, error_code=value["error_code"],
             error_message=value["error_message"],
             metadata={"network_bytes": value["network_bytes"], "external_content_untrusted": True,
-                      "web_cache_hit": value["cache_hit"]},
+                      "web_cache_hit": value["cache_hit"], "web_request_attempted": value["request_attempted"]},
         )
 
     def resolve_fetch(arguments: Mapping[str, JsonValue]) -> ResolvedToolUse:
@@ -583,7 +667,7 @@ def create_web_tools(
                 "Open a public HTTP(S) URL or continue an immutable saved source. When the task provides a URL, "
                 "open it directly. Read HTML/docs, UTF-8 text/Markdown/source code, JSON "
                 "and PDF (Linux only, up to 20 pages). "
-                "Returns extracted main text, numbered lines (long lines wrapped at 512 characters), "
+                "Returns full-body readable Markdown, numbered lines (long lines wrapped at 512 characters), "
                 "up to 8 links from the excerpt, source_id and next_line. "
                 "Links have stable IDs and actual occurrence positions; [label][Lid] refers to links.id. "
                 "max_bytes bounds the excerpt; max_tokens bounds the complete model message using the stated "
@@ -591,11 +675,12 @@ def create_web_tools(
                 "Use view=outline to inspect headings and section_id to read one section; for long documents "
                 "choose relevant sections rather than blindly paging from the beginning. "
                 "Use view=links and start_link=next_link to browse omitted links. "
-                "Use find for literal page-text search without reading every line. "
+                "Use find for literal saved-text search without reading every line; HTML text is Markdown, "
+                "so search terms must include any visible Markdown escapes. "
                 "Snapshots preserve the bounded original response and extracted text. view=raw reads UTF-8 "
                 "original text without re-fetching; legacy snapshots may not contain it. "
-                "HTML uses declared main/article regions; otherwise it preserves the cleaned body in source order. "
-                "Unmarked pages can include unrelated page text; "
+                "HTML preserves the full body in source order, including text outside main/article regions. "
+                "Pages can include navigation, recommendations and other unrelated text; "
                 "inspect outlines and links or use find to locate evidence. "
                 "line_basis identifies the selected view; numbered lines are virtual, "
                 "never original file line citations. "
@@ -603,23 +688,40 @@ def create_web_tools(
                 "Repeated successful URL reads reuse this Turn's snapshot; refresh=true bypasses the cache. "
                 "Continue using "
                 "source_id + start_line=next_line; this needs no network and does not refetch changing content. "
+                "next_line reports this tool page's continuation even when context later hides body lines. "
+                "visible_end_line reports only the current excerpt. read_context(item_id=...) restores archived "
+                "tool evidence; explicit start_line ranges may be reread for verification. "
                 "Preserve view=raw or section_id when continuing those reads. "
                 "Use the exact source_id, never convert a tool message item_id into a source_id. "
                 "source_truncated means extraction hit its fixed limit; continuation cannot recover discarded text. "
                 "Extraction failures retain a source_id for raw inspection and report the actual parser error. "
                 "No extracted text does not establish why the page has no text. "
+                "Extraction success means a snapshot was acquired, not that requested facts or user eligibility "
+                "were verified. Match conclusions to actual source evidence and stated user conditions; unknown "
+                "conditions remain unknown. If acquired text is insufficient, choose render=true or another "
+                "verifiable source. Do not infer missing user facts from related skills or attributes. "
+                "comparison reports full saved text provenance; compare_to_source_id selects an earlier baseline. "
+                "baseline_missing cannot establish additions or changes. changed means text differs, not business "
+                "requirements changed; inspect both sources before making a factual change claim. "
+                "request_budget reports remaining Turn network tool attempts, separate from browser resources and "
+                "model tokens. Same-condition failures are reused; refresh=true explicitly retries, render=true "
+                "changes acquisition mode. Resource limits and 403/access denials will not be fixed by repeating "
+                "an unchanged request. "
                 "Default render=auto tries Chromium once for empty extracted HTML; render=false reads HTTP only, "
                 "render=true renders immediately. This requires optional Playwright/Chromium and OS "
                 "network isolation; missing capabilities fail clearly. Rendering allows bounded public GETs only, "
                 "without login, cookies, POST, downloads or verification solving. Browser cache is separate from HTTP. "
                 "Text snapshots skip images, fonts and media; rendering is limited to 64 GETs, 30 seconds, "
-                "8 MB total wire/decoded data and a 2 MB DOM. Scripts may use the 8 MB resource limit; "
+                "8 MB total wire/decoded data and a 2 MB DOM by default. User-configured bounded web_limits may "
+                "change request/total byte ceilings; actual limits and remaining resources appear in diagnostics. "
+                "Individual scripts retain the 8 MB resource limit; "
                 "document responses keep the HTTP client's ordinary response limit. "
                 "Public subresource network failures preserve the DOM with partial-load warnings; "
                 "Blocked subactions and exhausted resource budgets abort those reads and retain an acquired DOM with "
                 "bounded diagnostics. Missing main documents, invalid worker protocol and isolation failures fail. "
                 "Load-state timeouts retain an acquired DOM within the total deadline; no snapshot is explicit. "
-                "render_diagnostics reports actual requests, wire/decoded/DOM bytes, skips and blocked reasons. "
+                "render_diagnostics reports actual requests, wire/decoded/DOM bytes, skips, blocked reasons and "
+                "bounded failed-resource URLs with query/fragment values omitted. "
                 "For browser snapshots view=raw is the saved rendered DOM, not the original HTTP response. "
                 "After automatic recovery, static_source_id reads the original HTTP snapshot. "
                 "Only public destinations on ports 80/443; no custom headers, cookies or request body. "
@@ -796,6 +898,13 @@ def _fit_output(
         output.next_section = int(removed.id.removeprefix("section_"))
         if request.view == "outline":
             output.truncated = True
+    if output.render_diagnostics is not None:
+        resources = output.render_diagnostics.get("failed_resources", [])
+        while resources and count() > request.max_tokens:
+            resources.pop()
+            output.render_diagnostics["failed_resources_omitted"] = (
+                output.render_diagnostics.get("failed_resources_omitted", 0) + 1
+            )
     selected = output.content.splitlines()
     while len(selected) > 1 and count() > request.max_tokens:
         selected.pop()

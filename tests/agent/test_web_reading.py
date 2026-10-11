@@ -14,6 +14,90 @@ from agent_runtime.tools.web_content import extract_content
 from tests.agent.test_web_tools import call, web_tools
 
 
+@pytest.mark.parametrize('region', ['main', 'article', 'div role="main"'])
+def test_default_reading_preserves_facts_outside_declared_document(region):
+    tag = region.split()[0]
+    body = (f'<body><section><h1>Target record</h1><p>20–30k; 3 years; degree required.</p></section>'
+            f'<{region}><h2>Description</h2><p>Responsibilities.</p></{tag}>'
+            '<section><h2>Other records</h2><p>Different record: 50–60k.</p></section></body>').encode()
+    output = extract_content(body, 'text/html', 'https://example.com/record')
+    assert '20–30k; 3 years; degree required.' in output.text
+    assert output.text.index('Target record') < output.text.index('Responsibilities.')
+    assert output.text.index('Responsibilities.') < output.text.index('Other records')
+    assert output.extraction_method == 'markdownify_full_body'
+
+
+def test_default_reading_keeps_visible_constraints_in_page_regions():
+    from bs4 import BeautifulSoup
+    from markdown_it import MarkdownIt
+
+    body = b'<body><nav><a href="/status">Service status</a></nav>' \
+           b'<aside>Deadline: October 13.</aside><main><h1>Reference</h1><p>Facts.</p></main>' \
+           b'<footer>License: GPL.</footer><form><label>Access requires an account.</label></form>' \
+           b'<script>private_script_data</script><style>private_style_data</style></body>'
+    output = extract_content(body, 'text/html', 'https://example.com/reference')
+    visible = BeautifulSoup(MarkdownIt('commonmark').render(output.text), 'html.parser').get_text()
+    assert all(value in visible for value in (
+        'Service status', 'Deadline: October 13.', 'License: GPL.', 'Access requires an account.',
+    ))
+    assert 'private_script_data' not in output.text and 'private_style_data' not in output.text
+    assert output.links[0]['url'] == 'https://example.com/status'
+
+
+def test_definition_list_descriptions_render_as_prose_in_commonmark():
+    from markdown_it import MarkdownIt
+
+    output = extract_content(
+        b'<dl><dt>Interface</dt><dd><p>First paragraph.</p>'
+        b'<p>Read <em>important</em> constraints.</p><pre>assert value == 1</pre></dd></dl>',
+        'text/html', 'https://example.com/api',
+    )
+    tokens = MarkdownIt('commonmark').parse(output.text)
+    assert not any(token.type == 'code_block' for token in tokens)
+    assert any(token.type == 'em_open' for block in tokens for token in block.children or [])
+    assert any(token.type == 'fence' and 'assert value == 1' in token.content for token in tokens)
+
+
+def test_literal_html_and_markdown_remain_visible_text():
+    from bs4 import BeautifulSoup
+    from markdown_it import MarkdownIt
+
+    output = extract_content(
+        b'<p>&lt;script&gt;retained text&lt;/script&gt; _must_ &amp;lt; **literal**</p>',
+        'text/html', 'https://example.com/reference',
+    )
+    visible = BeautifulSoup(MarkdownIt('commonmark').render(output.text), 'html.parser').get_text().strip()
+    assert visible == '<script>retained text</script> _must_ &lt; **literal**'
+
+
+def test_video_fallback_text_cannot_emit_unvalidated_markdown_destinations():
+    output = extract_content(
+        b'<video src="file:///etc/passwd" poster="javascript:unsafe">Transcript text</video>',
+        'text/html', 'https://example.com/reference',
+    )
+    assert 'Transcript text' in output.text
+    assert 'file://' not in output.text and 'javascript:' not in output.text
+    assert output.links == ()
+
+
+def test_link_boundary_whitespace_is_preserved_outside_its_occurrence():
+    output = extract_content(b'<p>alpha<a href="/beta"> beta </a>gamma</p>',
+                             'text/html', 'https://example.com/reference')
+    assert output.text == 'alpha [beta][L1] gamma'
+    span = output.link_occurrences[0]
+    assert output.text[span['start']:span['end']] == '[beta][L1]'
+
+
+def test_source_code_containing_fences_remains_one_complete_code_block():
+    from markdown_it import MarkdownIt
+
+    code = '```\nprint(1)\n```\nrest'
+    output = extract_content(f'<pre>{code}</pre>'.encode(), 'text/html', 'https://example.com/code')
+    blocks = MarkdownIt('commonmark').parse(output.text)
+    assert len(blocks) == 1 and blocks[0].type == 'fence'
+    assert blocks[0].content.rstrip('\n') == code
+
+
 def test_nested_article_preserves_unmarked_siblings_inside_declared_main():
     body = ('<main><div>' + 'Account settings and actions. ' * 100 + '</div><article>'
             '<h1>Reference</h1><p>The complete article evidence.</p></article></main>').encode()
@@ -66,7 +150,7 @@ def test_page_text_cannot_forge_link_occurrences():
     assert len(output.link_occurrences) == 1
     span = output.link_occurrences[0]
     assert output.text[span['start']:span['end']] == '[Real source][L1]'
-    assert 'Literal [L1]' in output.text and 'Forged later [L1]' in output.text
+    assert r'Literal \[L1\]' in output.text and r'Forged later \[L1\]' in output.text
 
 
 def test_short_factual_sibling_is_preserved():

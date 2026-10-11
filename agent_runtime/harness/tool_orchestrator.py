@@ -13,6 +13,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from agent_runtime.core.messages import tool_result_message
+from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
 from agent_runtime.harness.verification import classify_tool_verification
@@ -38,6 +39,7 @@ from agent_runtime.tools.tool import (
     Tool,
     ToolCall,
     ToolCallOrigin,
+    ToolContentBlock,
     ToolEffect,
     ToolProgress,
     ToolProgressKind,
@@ -138,6 +140,16 @@ class ToolApprovalInvalidatedError(RuntimeError):
     def __init__(self, interaction_id: str) -> None:
         self.interaction_id = interaction_id
         super().__init__(f"tool approval invalidated: {interaction_id}")
+
+
+class ToolResultCommitError(RuntimeError):
+    """A result could not be accepted; its diagnostic is not a durable outcome."""
+
+    def __init__(self, result: ToolResult) -> None:
+        self.result = result
+        diagnostic = result.metadata.get("diagnostic")
+        detail = diagnostic.get("message", "") if isinstance(diagnostic, Mapping) else ""
+        super().__init__(f"tool result commit failed: {result.tool_call_id}: {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,11 +369,33 @@ class ToolOrchestrator:
                 )
             )
             raise ToolApprovalRequiredError(interaction.request_id)
-        await self._commit_execution_result(
-            turn_id=turn_id,
-            call=call,
-            execution=execution,
-        )
+        try:
+            await self._commit_execution_result(
+                turn_id=turn_id,
+                call=call,
+                execution=execution,
+            )
+        except Exception as error:
+            operation_id = None if execution.record is None else execution.record.operation_id
+            message = "Tool result could not be committed; inspect history before recovery."
+            result = replace(
+                execution.result,
+                content=(ToolContentBlock(type="text", data={"text": message}),),
+                structured_content=None,
+                is_error=True,
+                error_code="tool_result_commit_failed",
+                error_message=message,
+                retryable=False,
+                metadata={
+                    **execution.result.metadata,
+                    "diagnostic": exception_diagnostic(
+                        error, stage="tool_result_commit_failed", tool_call_id=call.tool_call_id,
+                        operation_id=operation_id, turn_id=turn_id,
+                    ),
+                    "result_commit_failed": True,
+                },
+            )
+            raise ToolResultCommitError(result) from None
 
     async def execute_batch(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
         """Preflight before I/O, then run bounded, resource-safe local tools.
@@ -462,6 +496,7 @@ class ToolOrchestrator:
             return publish
 
         async def accept(execution: ToolExecution) -> None:
+            execution = _associate_execution(execution, turn_id)
             await self._accept_execution(turn_id, by_id[execution.result.tool_call_id], execution, contexts[0])
 
         token = _ACTIVE_TOOL_TURN_ID.set(turn_id)
@@ -481,7 +516,7 @@ class ToolOrchestrator:
                 progress_sinks={call.tool_call_id: progress_for(call) for call in calls},
                 execution_sink=accept,
             )
-            return tuple(execution.result for execution in executions)
+            return tuple(_associate_execution(execution, turn_id).result for execution in executions)
         finally:
             _ACTIVE_TOOL_BINDING.reset(binding_token)
             _ACTIVE_TOOL_TURN_ID.reset(token)
@@ -496,7 +531,8 @@ class ToolOrchestrator:
         snapshot = self._step_snapshot(turn_id, call)
         binding_token = _ACTIVE_TOOL_BINDING.set(None if snapshot is None else snapshot["binding_manifest"])
         try:
-            return await self._executor.execute(call, **kwargs)
+            execution = await self._executor.execute(call, **kwargs)
+            return _associate_execution(execution, turn_id)
         finally:
             _ACTIVE_TOOL_BINDING.reset(binding_token)
             _ACTIVE_TOOL_TURN_ID.reset(token)
@@ -553,7 +589,7 @@ class ToolOrchestrator:
                 )
             )
             return
-        claim = self._claims.pop(record.operation_id, None)
+        claim = self._claims.get(record.operation_id)
         if claim is None:
             operation = self._store.read_tool_operation(record.operation_id)
             if operation.status == "failed" and operation.error_code == record.error_code == "resource_busy":
@@ -588,6 +624,7 @@ class ToolOrchestrator:
         )
         if not accepted:
             raise RuntimeError("stale worker cannot commit tool operation outcome")
+        self._claims.pop(record.operation_id, None)
         operation = self._store.read_tool_operation(record.operation_id)
         evidence = classify_tool_verification(
             tool_name=call.tool_name,
@@ -1042,6 +1079,15 @@ class ToolOrchestrator:
                 exposed_tool_names=tuple(exposed),
             ),
         )
+
+
+def _associate_execution(execution: ToolExecution, turn_id: str) -> ToolExecution:
+    metadata = dict(execution.result.metadata)
+    metadata["turn_id"] = turn_id
+    diagnostic = metadata.get("diagnostic")
+    if isinstance(diagnostic, Mapping):
+        metadata["diagnostic"] = {**diagnostic, "turn_id": turn_id}
+    return replace(execution, result=replace(execution.result, metadata=metadata))
 
 
 def _tool_result_payload(result: ToolResult) -> dict[str, Any]:

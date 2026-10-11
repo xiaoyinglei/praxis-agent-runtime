@@ -1,3 +1,5 @@
+import pytest
+
 from agent_runtime.modeling.tokenization import TokenAccountingService, TokenizerContract
 
 
@@ -67,12 +69,13 @@ def test_adapter_and_gateway_reserve_the_same_serialized_input():
     assert prepared.request_ref["context_projection"]["count_source"] == "utf8_bytes_conservative"
 
 
-def test_context_compaction_can_consume_agent_history_without_generic_summary_splitting():
-    """A valid agent history must not inherit the smaller generic summarize window."""
+@pytest.mark.parametrize("legacy,expected_limit", [(True, 64000), (False, 97440)])
+def test_context_compaction_can_consume_agent_history_without_generic_summary_splitting(legacy, expected_limit):
+    """Both frozen policies accept history beyond the generic summarize window."""
     from dataclasses import replace
 
     from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
-    from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+    from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMStageBudget
     from agent_runtime.modeling.gateway import LLMGateway
     from tests.agent.harness.test_model_adapter import _resolved_model
 
@@ -86,7 +89,7 @@ def test_context_compaction_can_consume_agent_history_without_generic_summary_sp
                                  max_input_tokens=64000, max_output_tokens=4096),
                              LLMCallStage.LLM_SUMMARIZE: LLMStageBudget(
                                  max_input_tokens=16000, max_output_tokens=2048),
-                         })
+                         }, context_policy=None if legacy else ContextCapacityPolicy())
     resolved = _resolved_model(gateway=gateway, token_accounting=accounting)
     resolved = replace(resolved, capabilities=replace(resolved.capabilities, max_output_tokens=4096))
     model = GatewayHarnessModel(model_id="test", resolved=resolved, instructions=("Answer.",))
@@ -96,7 +99,7 @@ def test_context_compaction_can_consume_agent_history_without_generic_summary_sp
     ))
     assert 16000 < prepared.resource_request.input_tokens < 64000
     assert prepared.resource_request.output_tokens == 2048
-    assert prepared.request_ref["context_projection"]["max_input_tokens"] == 64000
+    assert prepared.request_ref["context_projection"]["max_input_tokens"] == expected_limit
     # Ordinary summarization keeps its configured policy.
     assert gateway.effective_stage_budget(LLMCallStage.LLM_SUMMARIZE).max_input_tokens == 16000
     stage = prepared.dispatch_payload.stage

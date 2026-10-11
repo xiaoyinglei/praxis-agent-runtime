@@ -76,7 +76,10 @@ def test_resident_aci_spells_out_observed_model_argument_pitfalls(
     assert "advisory" in update.description
     assert "never prove" in update.description
 
-    assert "preferred first tool" in tools["search_text"].definition.description
+    search = tools["search_text"].definition.description
+    assert "literal or regex matching" in search
+    assert "bounded context lines" in search
+    assert "not execution behavior" in search
     assert "not a code-search tool" in tools["list_files"].definition.description
     assert "focused verification" in tools["run_command"].definition.description
 

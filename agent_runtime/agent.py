@@ -22,6 +22,7 @@ from agent_runtime.models import (
 from agent_runtime.result import AgentPause, AgentResult
 from agent_runtime.streaming.events import StreamEvent
 from agent_runtime.streaming.sink import TurnEventDispatcher
+from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -52,12 +53,16 @@ class Agent:
         web_search_key_file: Path | str | None = None,
         web_search_provider: str | None = None,
         web_proxy_url: str | None = None,
+        web_limits: WebLimits | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
+        if web_limits is not None and not isinstance(web_limits, WebLimits):
+            raise TypeError("web_limits must be WebLimits or None")
+        self.web_limits = web_limits or WebLimits()
         if web_search_provider is not None:
             if web_search_provider not in {"bing", "brave", "tavily"}:
                 raise ValueError("Web search provider must be bing, brave or tavily.")

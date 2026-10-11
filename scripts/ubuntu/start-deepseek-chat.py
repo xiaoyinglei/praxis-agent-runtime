@@ -2,8 +2,10 @@
 """Direct CLI startup with one-time, private DeepSeek credential setup."""
 import argparse
 import getpass
+import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -71,11 +73,36 @@ def load_key(path, *, configure=False, prompt=None):
     return value
 
 
-def start(repo, key_path, *, configure=False):
+def validate_workspace_readiness(repo, python):
+    """Run the installed shell containment check before reading any credential."""
+    code = (
+        "import json,sys; from pathlib import Path; "
+        "from agent_runtime.tools.builtins.shell import _workspace_sandbox_preflight_issue; "
+        "print(json.dumps(_workspace_sandbox_preflight_issue(Path(sys.argv[1]), allow_workspace_write=False)))"
+    )
+    result = subprocess.run(
+        [str(python), "-I", "-B", "-c", code, str(repo)], cwd=repo,
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        raise ValueError("Agent environment readiness check failed; reinstall the core dependencies.")
+    try:
+        issue = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        raise ValueError("Agent environment readiness check returned invalid output.") from None
+    if issue is not None:
+        if not isinstance(issue, list) or len(issue) != 2 or not all(isinstance(value, str) for value in issue):
+            raise ValueError("Agent environment readiness check returned invalid output.")
+        raise ValueError(f"Agent workspace is not ready: {issue[0]}: {issue[1]}")
+
+
+def start(repo, key_path, *, configure=False, venv=None):
     repo = Path(repo).resolve(strict=True)
-    agent = repo / ".venv/bin/agent"
+    environment = Path(venv).resolve(strict=True) if venv is not None else repo / ".venv"
+    agent = environment / "bin/agent"
     if not agent.is_file() or not os.access(agent, os.X_OK):
         raise ValueError("Agent environment is missing; install the core dependencies first.")
+    validate_workspace_readiness(repo, environment / "bin/python")
     key = load_key(key_path, configure=configure)
     env = dict(os.environ)
     env["DEEPSEEK_API_KEY"] = key
@@ -87,11 +114,13 @@ def start(repo, key_path, *, configure=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--venv", type=Path, help="Runtime virtualenv; defaults to the repository's .venv.")
     parser.add_argument("--configure", action="store_true", help="Explicitly replace the saved Key via hidden input.")
     args = parser.parse_args()
     try:
-        start(args.repo, Path.home() / ".config/praxis/credentials/deepseek.key", configure=args.configure)
-    except (ValueError, OSError, EOFError, getpass.GetPassWarning) as error:
+        start(args.repo, Path.home() / ".config/praxis/credentials/deepseek.key",
+              configure=args.configure, venv=args.venv)
+    except (ValueError, OSError, EOFError, getpass.GetPassWarning, subprocess.SubprocessError) as error:
         print(f"Startup failed: {error if isinstance(error, ValueError) else type(error).__name__}", file=sys.stderr)
         return 1
     return 0

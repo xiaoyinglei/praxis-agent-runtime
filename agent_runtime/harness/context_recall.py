@@ -228,6 +228,8 @@ def create_context_recall_tool(store: RolloutStore) -> Tool:
             name=READ_CONTEXT_NAME,
             description=(
                 "Recall original content from a compacted context reference by canonical item_id. "
+                "This restores archived evidence without a network request. Web next_line describes the original "
+                "fetched page's continuation; visible_end_line describes only its current context excerpt. "
                 "Use item_id=history to page through the archived Item ID catalog. "
                 "With item_id=history AND query, search archived original CONTENT without knowing its ID; "
                 "returns the first matching item and excerpt. start_index (default 0) is a history index "

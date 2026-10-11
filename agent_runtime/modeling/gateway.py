@@ -19,6 +19,7 @@ from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
 from agent_runtime.core.model_request import ModelRequest
 from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
+    ContextCapacityPolicy,
     LLMCallResult,
     LLMCallStage,
     LLMProviderResult,
@@ -75,6 +76,7 @@ ProviderDeltaSink = Callable[[ProviderDelta], None | Awaitable[None]]
 _PROVIDER_BRIDGE_MAXSIZE = 64
 _PROVIDER_BRIDGE_POLL_SECONDS = 0.005
 _PROVIDER_BRIDGE_PUT_TIMEOUT_SECONDS = 0.05
+_DEFAULT_CONTEXT_POLICY = ContextCapacityPolicy()
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +203,7 @@ class LLMGateway:
         model_context_tokens: int,
         stage_budgets: Mapping[LLMCallStage, LLMStageBudget] | None = None,
         provider_quota_gate: ProviderQuotaGate | None = None,
+        context_policy: ContextCapacityPolicy | None = _DEFAULT_CONTEXT_POLICY,
     ) -> None:
         if model_context_tokens <= 0:
             raise ValueError("model_context_tokens must be positive")
@@ -209,6 +212,11 @@ class LLMGateway:
         self._model_context_tokens = model_context_tokens
         self._stage_budgets = dict(stage_budgets or DEFAULT_LLM_STAGE_BUDGETS)
         self._provider_quota_gate = provider_quota_gate
+        self.context_policy = context_policy
+
+    @property
+    def model_context_tokens(self) -> int:
+        return self._model_context_tokens
 
     @property
     def token_accounting(self) -> TokenAccounting:
@@ -228,13 +236,8 @@ class LLMGateway:
             budget,
             kwargs=kwargs,
         )
-        max_input_tokens = min(
-            budget.max_input_tokens,
-            max(
-                self._model_context_tokens - max_output_tokens - budget.safety_margin_tokens,
-                0,
-            ),
-        )
+        hard_input = self._model_context_tokens - max_output_tokens - budget.safety_margin_tokens
+        max_input_tokens = hard_input if budget.max_input_tokens is None else min(budget.max_input_tokens, hard_input)
         if max_input_tokens <= 0:
             raise ValueError(f"No input budget remains for {stage.value} after reserving output and safety margin")
         return budget.model_copy(
@@ -811,12 +814,12 @@ class LLMGateway:
         if stage == LLMCallStage.CONTEXT_COMPACTION and stage not in self._stage_budgets:
             # Compaction consumes agent history. The generic summarize input
             # limit describes a different task and can cause needless fan-out.
-            # Inherit the agent input policy and the configured summary output
-            # allowance; effective_stage_budget still enforces the model window.
+            # New Turns independently use model capacity; legacy definitions
+            # retain the agent cap and the configured summary output allowance.
             agent = self._stage_budget(LLMCallStage.AGENT_STEP)
             summary = self._stage_budget(LLMCallStage.LLM_SUMMARIZE)
             return summary.model_copy(update={
-                "max_input_tokens": agent.max_input_tokens,
+                "max_input_tokens": agent.max_input_tokens if self.context_policy is None else None,
                 "safety_margin_tokens": max(agent.safety_margin_tokens, summary.safety_margin_tokens),
             })
         try:
@@ -837,6 +840,7 @@ class LLMGateway:
         call_kwargs["max_tokens"] = max_output_tokens
 
         max_input_tokens = budget.max_input_tokens
+        assert max_input_tokens is not None  # effective_stage_budget resolves optional caps
         count = getattr(self._token_accounting, "count_for_budget", None) or self._token_accounting.count
         input_tokens = count(prompt)
         if input_tokens > max_input_tokens:

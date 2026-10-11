@@ -453,6 +453,7 @@ class ModelRegistry:
                 token_accounting=token_accounting,
                 model_context_tokens=capabilities.context_window_tokens,
                 stage_budgets=stage_budgets,
+                context_policy=definition.context_capacity_policy,
             ),
             model_id=definition.model_id,
             provider=resolved_provider,

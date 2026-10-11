@@ -8,9 +8,17 @@ import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from agent_runtime.core.llm_config import (
     AgentModelsConfig,
@@ -21,7 +29,7 @@ from agent_runtime.core.llm_config import (
     validate_http_url,
 )
 from agent_runtime.modeling.config import GenerationConfig, GenerationTaskConfig
-from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
+from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMStageBudget
 
 
 class GenerationTaskDefinition(BaseModel):
@@ -44,7 +52,7 @@ class GenerationDefinition(BaseModel):
 class StageBudgetDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    max_input_tokens: int = Field(gt=0, strict=True)
+    max_input_tokens: int | None = Field(gt=0, strict=True)
     max_output_tokens: int = Field(gt=0, strict=True)
     safety_margin_tokens: int = Field(ge=0, strict=True)
 
@@ -198,6 +206,15 @@ class ModelExecutionDefinition(BaseModel):
     runtime: RuntimeDefinition | None
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
+    context_capacity_policy: ContextCapacityPolicy | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_definition(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload = handler(self)
+        # Legacy archives and authenticated bindings must retain exact bytes.
+        if self.context_capacity_policy is None:
+            payload.pop("context_capacity_policy", None)
+        return dict(payload)
 
     @field_validator("base_url")
     @classmethod
@@ -298,6 +315,7 @@ def build_model_execution_definition(
                 config=config,
             ).items()
         },
+        context_capacity_policy=ContextCapacityPolicy(),
     )
 
 

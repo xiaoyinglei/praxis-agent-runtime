@@ -143,6 +143,36 @@ async def test_completed_child_charges_actual_usage_and_releases_unused_allocati
             assert store.verify().valid is True
 
 
+@pytest.mark.anyio
+async def test_child_inherits_frozen_parent_web_limits_with_independent_turn_usage(tmp_path: Path) -> None:
+    from agent_runtime.tools.web_limits import WebLimits
+
+    class ParentLimitsModel(SmallAnswerModel):
+        def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
+            assert request.binding_manifest["web_limits"] == limits
+            assert store.reserve_resource_unit(request.turn_id, "public_web_requests", 1)["used"] == 1
+            return super().prepare(request)
+
+    limits = WebLimits(turn_requests=1, browser_requests=7, browser_network_bytes=2_000_000).model_dump(mode="json")
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=tmp_path)
+        parent = store.start_turn(thread_id=thread.thread_id, user_message="parent", binding_manifest={
+            "model_id": "test-model", "model_step_budget": 8, "model_token_budget_total": 100,
+            "web_limits": limits,
+        })
+        store.reserve_resource_unit(parent.turn_id, "public_web_requests", 1)
+        async with await Session.open(database=database, workspace=tmp_path, model=ParentLimitsModel(),
+                                      thread_id=parent.thread_id, completion_gate=AcceptAnswer()) as manager:
+            child = await manager.run_child(parent_turn_id=parent.turn_id, user_message="child",
+                                            max_steps=2, max_tokens_total=60)
+            assert child.status == "completed"
+            assert store.read_turn(child.turn_id).binding_manifest["web_limits"] == limits
+            assert store.read_resource_usage(child.turn_id, "public_web_requests")["used"] == 1
+            assert store.read_resource_usage(parent.turn_id, "public_web_requests")["remaining"] == 0
+            assert store.verify().valid
+
+
 def test_active_child_allocation_prevents_parallel_budget_oversell(
     tmp_path: Path,
 ) -> None:

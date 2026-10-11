@@ -1147,6 +1147,14 @@ async def test_runner_normalizer_output_validator_and_externalizer_failures_trac
         )
         assert execution.result.error_code == error_code
         assert "secret" not in (execution.result.error_message or "")
+        diagnostic = execution.result.metadata["diagnostic"]
+        assert diagnostic["stage"] == error_code
+        assert diagnostic["exception_type"] in {"RuntimeError", "ToolValidationError"}
+        assert diagnostic["tool_call_id"] == name
+        assert diagnostic["operation_id"] == execution.record.operation_id
+        assert diagnostic["traceback"]
+        assert set(diagnostic["traceback"][-1]) == {"filename", "lineno", "function"}
+        assert execution.result.retryable is False
         _assert_one_trace(executor, name, error_code)
 
 
