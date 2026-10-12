@@ -202,7 +202,7 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if result.status == "done":
+    if result.status == "done" and (verbose or result.validation_status != "not_evaluated"):
         scope = (
             f"（范围: {safe_terminal_text(result.validation_scope)}）"
             if result.validation_scope is not None else ""
@@ -585,9 +585,12 @@ def _print_chat_help() -> None:
     print("  /model [current|list|switch <id>]")
     print("  /model             交互终端内用 ↑↓ 选择模型，Enter 确认，Esc 取消")
     print("  /verbose           切换详细输出")
-    print("  执行记录：点击 ▸ 展开/收起；Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
-    print("  Alt+Enter 换行；PageUp/PageDown 滚动；Ctrl+End 回到底部；Ctrl+C 取消")
-    print("  鼠标拖选复制，右键粘贴到输入框；F2 切换终端原生鼠标选择")
+    print("  /copy              复制最近回答，并输出原始 Markdown 到终端滚动历史")
+    print("  /transcript        将当前保留的会话输出到终端滚动历史，方便完整选取")
+    print("  执行记录：Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
+    print("  Ctrl+J / Alt+Enter 换行；PageUp/PageDown 滚动记录；Ctrl+End 回到底部；Ctrl+C 取消")
+    print("  默认使用终端原生拖选、复制和粘贴（macOS：⌘C / ⌘V）；多行粘贴后按 Enter 发送")
+    print("  F2 可开启鼠标交互，再按 F2 恢复终端原生选择")
     print("  /exit              退出")
 
 
@@ -615,14 +618,13 @@ async def _chat_facade_loop(
     event_display = _ui.display if _ui else _CLIToolEventDisplay(interactive=False)
     composer = TerminalComposer() if _ui is None else None
     current_turn_id = previous_turn_id
+    last_result: AgentResult | None = None
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
     chat_workspace = default_chat_workspace
     model_id = facade.current_model().id
     if _ui is None:
         _print_startup_banner(model_id)
-    print("网页网络: " + ("可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
-                          if getattr(facade, "web_proxy_url", None) else "严格直连"))
     from contextlib import AsyncExitStack
 
     async with AsyncExitStack() as stack:
@@ -656,6 +658,25 @@ async def _chat_facade_loop(
                 print(f"模型: {model_id}")
                 print(f"工作区: {chat_workspace}")
                 print(f"详细输出: {'开' if verbose else '关'}")
+                print("网页网络: " + ("可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
+                                      if getattr(facade, "web_proxy_url", None) else "严格直连"))
+                event_display.show_context_status()
+                if last_result is not None:
+                    print(f"验证状态: {last_result.validation_status}")
+                continue
+            if query == "/copy":
+                if last_result is None or not last_result.answer:
+                    print("暂无可复制的回答。")
+                elif _ui:
+                    await _ui.copy_answer(last_result.answer)
+                else:
+                    print(safe_terminal_text(last_result.answer))
+                continue
+            if query == "/transcript":
+                if _ui:
+                    await _ui.show_text(_ui.view.transcript())
+                else:
+                    print("当前会话已输出在终端中；可直接使用终端滚动历史选取。")
                 continue
             if query in {"/new", "/clear"}:
                 await stack.aclose()
@@ -668,6 +689,8 @@ async def _chat_facade_loop(
                     allow_web_tools=allow_web_tools,
                 ))
                 current_turn_id = None
+                last_result = None
+                event_display.clear_context_status()
                 chat_workspace = default_chat_workspace
                 model_id = session.current_model().id
                 if _ui:
@@ -678,6 +701,8 @@ async def _chat_facade_loop(
                 verbose = not verbose
                 event_display.set_verbose(verbose)
                 print(f"详细输出: {'开' if verbose else '关'}")
+                if verbose:
+                    event_display.show_context_status()
                 continue
             if query == "/model" or query.startswith("/model "):
                 if _ui and query in {"/model", "/model list"}:
@@ -737,6 +762,7 @@ async def _chat_facade_loop(
                     result = await session.resume(result.turn_id, "abort", event_sink=event_display)
                     print("已取消当前执行；已发生的文件修改不会回滚。")
             event_display.finish()
+            last_result = result
             _display_agent_result(
                 result,
                 verbose=verbose,

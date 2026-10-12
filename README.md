@@ -176,22 +176,25 @@ $ uv run agent chat
 Interactive `agent chat` uses a live conversation viewport with Markdown answers,
 a multiline composer, and a model/status bar. Execution groups and individual
 tools expand and collapse **in place**, including while output is streaming.
-Click the triangle or its row to toggle it; no command is needed. Errors remain
-visible even when their execution group is collapsed.
+Native terminal selection, copy and paste are enabled by default, including over
+SSH. The composer and Markdown code backgrounds use the terminal's own colors.
+Errors remain visible even when their execution group is collapsed.
 
 | Control | Action |
 | --- | --- |
 | `/model` | Open model picker; arrows select, Enter confirms, Esc cancels; clicking a model also selects it |
-| Drag over answer text | Select and copy to the system clipboard on macOS |
-| Right click | Paste into the composer without sending |
-| `F2` | Toggle native terminal mouse selection / interactive folding and scrolling |
-| Click `▸` / `▾` | Expand / collapse the execution group or individual tool |
+| Drag over answer text | Native terminal selection; use the terminal's Copy command (`Cmd+C` on macOS) |
+| Terminal Paste / `Cmd+V` on macOS | Paste into the composer; bracketed multiline paste never sends automatically |
+| `/copy` | Request clipboard copy of the latest answer as raw Markdown; also put the full answer in native scrollback |
+| `/transcript` | Put the retained conversation in native scrollback for selection and terminal search |
+| `F2` | Opt into application mouse interaction, or return to native terminal selection |
+| Click `▸` / `▾` in F2 mouse mode | Expand / collapse the execution group or individual tool |
 | `Ctrl+O` | Toggle the latest execution group without leaving the composer |
 | `Tab`, then arrows and `Enter` / Space | Navigate records and toggle the selected row |
 | `Tab` / `Esc` while navigating records | Return to the composer |
-| Mouse wheel / `PageUp` / `PageDown` | Scroll the conversation viewport |
+| `PageUp` / `PageDown` (or mouse wheel in F2 mode) | Scroll the conversation viewport |
 | `Ctrl+End` | Follow the latest output again |
-| `Enter` / `Alt+Enter` | Send / insert a newline |
+| `Enter` / `Ctrl+J` or `Alt+Enter` | Send / insert a newline |
 | `Ctrl+C` | Copy a selection first; otherwise cancel execution, clear input, or exit if empty |
 | `Ctrl+D` at an empty prompt | Exit |
 
@@ -202,8 +205,18 @@ choices. Cancelling waits for execution cleanup; existing file changes are not
 rolled back. Mouse interaction requires a terminal with mouse reporting and
 cursor-position reports; keyboard folding is also available.
 Unchanged history reuses its layout when scrolling or refreshing the status bar.
-Resizing or receiving new content invalidates the layout. Use `F2` for native
-terminal selection and copy shortcuts if the terminal does not support drag reporting.
+An idle prompt has no periodic redraw to disturb native selection. Resizing or
+receiving new content invalidates the layout. `/copy` uses `pbcopy` only on a local
+Mac; elsewhere it sends an OSC 52 clipboard request for answers up to 64 KiB.
+Client terminals may reject that request, so the full answer is also printed above
+the application for native copy. The server never reads the client's clipboard;
+use the terminal's normal Paste command. In F2 mode, right-click paste is available
+only on a local Mac; over SSH, return to native mouse mode for the terminal's menu.
+
+Context capacity, compaction thresholds and budget counters appear only in
+`/status` or detailed output (`/verbose`). A compaction produces a short progress
+notice. Ordinary chat no longer prints `not_evaluated` validation messages;
+explicit verification results, errors and approval requests remain visible.
 
 Tool calls rejected before execution (for example, invalid arguments or an
 out-of-workspace path) also appear in the execution records, marked as not

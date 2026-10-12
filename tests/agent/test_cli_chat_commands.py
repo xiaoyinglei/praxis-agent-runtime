@@ -160,7 +160,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
             turn_calls.append((args, kwargs))
             raise AssertionError("slash commands must not reach the agent")
 
-    commands = iter(["/status", "/new", "/status", "/details", "/help", "/unknown", "/exit"])
+    commands = iter(["/status", "/copy", "/transcript", "/new", "/status", "/details", "/help", "/unknown", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
 
     await cli._chat_facade_loop(
@@ -176,8 +176,26 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     assert "/new" in output
     assert "未知命令: /unknown" in output
     assert "未知命令: /details" in output
-    assert "点击 ▸ 展开/收起" in output
+    assert "Ctrl+O 切换最近记录" in output
+    assert "暂无可复制的回答" in output
+    assert "当前会话已输出在终端中" in output
     assert turn_calls == []
+
+
+def test_ordinary_chat_hides_unevaluated_status_but_keeps_real_verification(capsys):
+    from dataclasses import replace
+
+    result = _result(answer="你好")
+    cli._display_agent_result(result, verbose=False)
+    output = capsys.readouterr().out
+    assert "你好" in output
+    assert "not_evaluated" not in output and "任务验收" not in output
+    cli._display_agent_result(result, verbose=True)
+    assert "not_evaluated" in capsys.readouterr().out
+    cli._display_agent_result(replace(result, validation_status="passed", validation_scope="workspace_change"),
+                              verbose=False)
+    output = capsys.readouterr().out
+    assert "passed" in output and "工作区修改" in output
 
 
 @pytest.mark.anyio

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import os
 import sys
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
-from prompt_toolkit.application import Application
+from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.clipboard import ClipboardData
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.data_structures import Point
@@ -25,10 +26,12 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import Output
+from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.theme import Theme
 
 from agent_runtime.result import AgentPause
 from agent_runtime.terminal_input import _COMPOSER_BINDINGS, BoundedPromptHistory, resolve_pause_choice
@@ -39,8 +42,12 @@ from agent_runtime.terminal_ui import Block, Conversation, ConversationEventDisp
 @lru_cache(maxsize=128)
 def _markdown(text: str, width: int, color: bool) -> StyleAndTextTuples:
     stream = io.StringIO()
-    console = Console(file=stream, width=width, force_terminal=True, no_color=not color)
-    console.print(Markdown(text, code_theme="ansi_dark"), end="")
+    console = Console(
+        file=stream, width=width, force_terminal=True, no_color=not color,
+        theme=Theme({"markdown.code": "bold", "markdown.code_block": "none",
+                     "markdown.link": "underline", "markdown.link_url": "none"}),
+    )
+    console.print(Markdown(text, code_theme="ansi_light"), end="")
     return list(to_formatted_text(ANSI(stream.getvalue().rstrip("\n"))))
 
 
@@ -107,7 +114,8 @@ class TerminalChatApp:
         self._selecting = False
         self._highlight_key: object = None
         self._highlighted: StyleAndTextTuples = []
-        self._mouse_enabled = True
+        # The client terminal owns selection and its clipboard, including over SSH.
+        self._mouse_enabled = False
         self._model_choices: list[str] = []
         self._model_index = 0
         self._model_pending: asyncio.Future[str | None] | None = None
@@ -120,10 +128,11 @@ class TerminalChatApp:
             prompt="❯ ",
             multiline=True,
             wrap_lines=True,
-            height=3,
+            height=lambda: Dimension(min=3, preferred=min(8, self.editor.document.line_count + 1), max=8),
             style="class:input",
             history=BoundedPromptHistory(),
-            completer=WordCompleter(["/help", "/status", "/new", "/clear", "/model", "/verbose", "/exit"]),
+            completer=WordCompleter(["/help", "/status", "/new", "/clear", "/model", "/verbose",
+                                     "/copy", "/transcript", "/exit"]),
             complete_while_typing=Condition(lambda: self.editor.text.startswith("/")),
         )
         self.approval_body = TextArea(
@@ -202,6 +211,8 @@ class TerminalChatApp:
         @keys.add("f2")
         def native_mouse(event: KeyPressEvent) -> None:
             self._mouse_enabled = not self._mouse_enabled
+            self._selection_start = self._selection_end = None
+            self.status = "鼠标交互已开启" if self._mouse_enabled else "终端原生选择已开启"
 
         @keys.add("enter", filter=has_focus(self.editor))
         def send(event: KeyPressEvent) -> None:
@@ -214,6 +225,7 @@ class TerminalChatApp:
                 self._follow = True
 
         @keys.add("escape", "enter", filter=has_focus(self.editor))
+        @keys.add("c-j", filter=has_focus(self.editor))
         def newline(event: KeyPressEvent) -> None:
             self.editor.buffer.insert_text("\n")
 
@@ -334,14 +346,15 @@ class TerminalChatApp:
             full_screen=False,
             input=input,
             output=output,
-            refresh_interval=0.2,
+            # Repainting an idle prompt can clear the terminal's native selection.
+            refresh_interval=None,
             min_redraw_interval=0.05,
             style=Style.from_dict(
                 {
-                    "header": "bold ansicyan",
+                    "header": "bold ansiblue",
                     "assistant": "bold",
-                    "user": "bold ansicyan",
-                    "group": "ansicyan",
+                    "user": "bold ansiblue",
+                    "group": "bold",
                     "tool": "",
                     "dim": "ansibrightblack",
                     "error": "ansired",
@@ -352,7 +365,7 @@ class TerminalChatApp:
                     "approval-deny": "ansiyellow bold",
                     "approval-cancel": "ansibrightblack",
                     "approval-selected": "reverse bold",
-                    "input": "bg:#17212b",
+                    "input": "",
                 }
             )
             if "NO_COLOR" not in os.environ
@@ -517,33 +530,84 @@ class TerminalChatApp:
         return output
 
     async def _paste_text(self) -> None:
-        text = self.app.clipboard.get_data().text
-        if sys.platform == "darwin":
+        # A server's clipboard (or our kill ring) is not the SSH client's clipboard.
+        if sys.platform != "darwin" or os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
+            self.status = "请用终端粘贴快捷键；F2 可恢复原生右键菜单"
+            self.invalidate()
+            return
+        try:
+            process = await asyncio.create_subprocess_exec("pbpaste", stdout=asyncio.subprocess.PIPE)
             try:
-                process = await asyncio.create_subprocess_exec("pbpaste", stdout=asyncio.subprocess.PIPE)
-                data, _ = await process.communicate()
-                if process.returncode == 0:
-                    text = data.decode("utf-8", errors="replace")
-            except OSError:
-                pass
+                data, _ = await asyncio.wait_for(process.communicate(), 3)
+            except (TimeoutError, asyncio.CancelledError) as exc:
+                if process.returncode is None:
+                    with suppress(ProcessLookupError):
+                        process.kill()
+                await process.communicate()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                self.status = "剪贴板读取超时，请用终端粘贴快捷键"
+                return
+            if process.returncode != 0:
+                self.status = "请用终端粘贴快捷键"
+                return
+            text = data.decode("utf-8", errors="replace")
+        except OSError:
+            self.status = "请用终端粘贴快捷键"
+            return
+        finally:
+            self.invalidate()
         self.app.layout.focus(self.editor)
         self.editor.buffer.insert_text(text)
         self.invalidate()
 
     def _copy_text(self, text: str) -> None:
         self.app.clipboard.set_data(ClipboardData(text))
-        async def copy() -> None:
-            if sys.platform == "darwin":
+        self.app.create_background_task(self._write_clipboard(text))
+
+    async def _write_clipboard(self, text: str) -> None:
+        if sys.platform == "darwin" and not (os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY")):
+            try:
+                process = await asyncio.create_subprocess_exec("pbcopy", stdin=asyncio.subprocess.PIPE)
                 try:
-                    process = await asyncio.create_subprocess_exec("pbcopy", stdin=asyncio.subprocess.PIPE)
-                    await process.communicate(text.encode("utf-8"))
-                    self.status = "已复制" if process.returncode == 0 else "系统复制失败，可按 F2 使用终端原生选择"
-                except OSError:
-                    self.status = "系统复制失败，可按 F2 使用终端原生选择"
-            else:
-                self.status = "已选择；F2 切换终端原生复制"
-            self.invalidate()
-        self.app.create_background_task(copy())
+                    await asyncio.wait_for(process.communicate(text.encode("utf-8")), 3)
+                except (TimeoutError, asyncio.CancelledError) as exc:
+                    if process.returncode is None:
+                        with suppress(ProcessLookupError):
+                            process.kill()
+                    await process.communicate()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    self.status = "复制超时，请用终端原生选择"
+                    self.invalidate()
+                    return
+                self.status = "已复制" if process.returncode == 0 else "复制失败，请用终端原生选择"
+            except OSError:
+                self.status = "复制失败，请用终端原生选择"
+        elif len(text.encode("utf-8")) <= 64 * 1024:
+            # OSC 52 targets the client terminal without reading its clipboard.
+            # Terminals may reject it, so never claim an acknowledged copy.
+            payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            def request() -> None:
+                self.app.output.write_raw(f"\x1b]52;c;{payload}\x07")
+                self.app.output.flush()
+            await run_in_terminal(request)
+            self.status = "已请求终端复制；未生效时请原生选取"
+        else:
+            self.status = "回答较长，请从终端滚动历史中原生选取"
+        self.invalidate()
+
+    async def show_text(self, text: str) -> None:
+        """Write above the UI into native scrollback, bypassing redirected stdout."""
+        await run_in_terminal(lambda: print_formatted_text(
+            safe_terminal_text(text), output=self.app.output,
+        ))
+
+    async def copy_answer(self, text: str) -> None:
+        # Native scrollback is available even when the client rejects OSC 52.
+        await self.show_text("最近回答（原始 Markdown，可在终端滚动历史中选取）\n\n" + text + "\n")
+        await self._write_clipboard(text)
+        self.view.message(self.status + "\n", "notice")
 
     def _resolve_model(self, choice: str | None) -> None:
         if self._model_pending is not None and not self._model_pending.done():
@@ -664,13 +728,13 @@ class TerminalChatApp:
                 hints.append("N拒绝")
             return [("class:dim", " " + " · ".join([*hints, "Esc取消", "Tab详情"]))]
         if self._model_pending is not None:
-            return [("class:dim", " 选择模型 · ↑↓ 移动 · Enter 确认 · Esc 取消 · 点击选择")]
+            return [("class:dim", " 选择模型 · ↑↓ 移动 · Enter 确认 · Esc 取消")]
         activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
-        mouse_hint = "F2 原生选择" if self._mouse_enabled else "F2 恢复鼠标"
+        mouse_hint = "F2 原生选择" if self._mouse_enabled else "拖选复制"
         return [
             (
                 "class:dim",
-                f" {activity} · Enter 发送 · Ctrl+O 记录 · {mouse_hint}",
+                f" {activity} · Enter 发送 · Ctrl+J 换行 · {mouse_hint}",
             )
         ]
 
@@ -690,9 +754,17 @@ class TerminalChatApp:
     async def operation(self, awaitable: Coroutine[Any, Any, Any]) -> Any:
         self._operation = asyncio.create_task(awaitable)
         self.status = "工作中"
+        async def refresh() -> None:
+            while True:
+                self.invalidate()
+                await asyncio.sleep(0.2)
+        refresh_task = asyncio.create_task(refresh())
         try:
             return await self._operation
         finally:
+            refresh_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await refresh_task
             self._operation = None
             self.status = "就绪"
             self.invalidate()

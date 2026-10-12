@@ -498,6 +498,7 @@ def test_terminal_displays_capacity_compaction_and_unknown_cost(capsys):
     from agent_runtime.terminal_render import TerminalToolEventDisplay
 
     display = TerminalToolEventDisplay(interactive=False)
+    display.set_verbose(True)
     asyncio.run(
         display.emit(
             StreamEvent(
@@ -541,6 +542,33 @@ def test_terminal_displays_capacity_compaction_and_unknown_cost(capsys):
     assert "1015296" in rendered and "943718" in rendered
     assert "message_guard" in rendered and "64000" in rendered and "3000" in rendered
     assert "unknown" in rendered and "unset" in rendered
+
+
+@pytest.mark.anyio
+async def test_context_details_are_available_on_request_without_chat_noise(capsys):
+    from agent_runtime.streaming.events import EventType, StreamEvent
+    from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
+
+    view = Conversation()
+    display = ConversationEventDisplay(view)
+    for remaining in (15, 14):
+        await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="turn", data={
+            "context_projection": {"effective_input_limit": 1015296, "auto_compact_limit": 943718},
+            "budget_status": {"agent_steps_remaining": remaining},
+        }))
+    assert "1015296" not in view.plain_text() and "压缩阈值" not in view.plain_text()
+    display.show_context_status()
+    rendered = capsys.readouterr().out
+    assert "1015296" in rendered and "943718" in rendered
+    assert "剩余 agent 步骤=14" in rendered and "剩余 agent 步骤=15" not in rendered
+    display.set_verbose(True)
+    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="turn", data={
+        "context_projection": {"effective_input_limit": 999}, "budget_status": {},
+    }))
+    assert "输入上限=999" in view.plain_text()
+    display.clear_context_status()
+    display.show_context_status()
+    assert capsys.readouterr().out == ""
 
 
 def test_retained_exchange_is_semantically_covered_on_next_summary(tmp_path):

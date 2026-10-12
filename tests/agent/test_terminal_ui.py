@@ -59,6 +59,20 @@ def test_nested_folds_toggle_in_place_without_duplicating_output():
     assert "unique detail" not in view.plain_text()
 
 
+def test_transcript_includes_collapsed_details_without_changing_view():
+    view = Conversation()
+    view.message("# 原始 Markdown\n", "answer")
+    group = view.add_group()
+    tool = view.add_tool(group, "读取文件")
+    tool.append("unique retained detail")
+    group.expanded = tool.expanded = False
+    assert "unique retained detail" not in view.plain_text()
+    transcript = view.transcript()
+    assert transcript.count("unique retained detail") == 1
+    assert "# 原始 Markdown" in transcript
+    assert not group.expanded and not tool.expanded
+
+
 @pytest.mark.anyio
 async def test_events_preserve_answer_and_tool_details_without_stdout(capsys):
     view = Conversation()
@@ -251,6 +265,7 @@ async def test_rendered_mouse_coordinates_and_resize():
     output = Vt100_Output(io.StringIO(), lambda: terminal_size[0], enable_cpr=True)
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(model="demo", workspace="/tmp/中文工作区", input=pipe, output=output)
+        ui._mouse_enabled = True  # Explicit application mouse mode; native selection is the default.
         ui.view.message("检查测试\n", "user")
         group = ui.view.add_group()
         child = ui.view.add_tool(group, "读取文件 · demo.py")
@@ -346,6 +361,96 @@ def test_assistant_role_marker_does_not_break_markdown_heading():
     visible = "".join(fragment[1] for fragment in ui.fragments())
     assert "Heading" in visible and "# Heading" not in visible
     assert "```" not in visible
+
+
+def test_markdown_inline_and_fenced_code_do_not_force_background_colors():
+    from agent_runtime.terminal_app import _markdown
+
+    fragments = _markdown("Use `/home/admin/praxis`.\n\n```python\nprint('你好')\n```", 80, True)
+    assert "你好" in "".join(text for _, text, *_ in fragments)
+    assert all("bg:" not in style for style, *_ in fragments)
+
+
+@pytest.mark.anyio
+async def test_native_mouse_and_idle_prompt_preserve_multiline_paste():
+    import asyncio
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    stream = io.StringIO()
+    with create_pipe_input() as pipe:
+        output = Vt100_Output(stream, lambda: Size(rows=24, columns=80), enable_cpr=False)
+        ui = TerminalChatApp(model="test", workspace="/tmp", input=pipe, output=output)
+        submitted = []
+
+        async def conversation():
+            submitted.append(await ui.prompt())
+
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            async with asyncio.timeout(3):
+                while not ui.waiting or ui.app.renderer._last_screen is None:
+                    await asyncio.sleep(.01)
+            assert not ui.app.mouse_support()
+            assert "\x1b[?1000h" not in stream.getvalue()
+            pipe.send_text("\x1b[200~你好\n第二行👩‍💻\x1b[201~")
+            await asyncio.sleep(.1)
+            assert ui.waiting and not submitted
+            assert ui.editor.text == "你好\n第二行👩‍💻"
+            pipe.send_text("\x7f\x0a尾行")  # Delete an entire grapheme, Ctrl+J adds a newline.
+            await asyncio.sleep(.1)
+            assert ui.editor.text == "你好\n第二行\n尾行"
+            renders = ui.app.render_counter
+            await asyncio.sleep(.3)
+            assert ui.app.render_counter == renders  # No idle redraw clearing native selection.
+            pipe.send_text("\r")
+            await asyncio.wait_for(task, 3)
+            assert submitted == ["你好\n第二行\n尾行"]
+        finally:
+            if not task.done():
+                task.cancel()
+                from contextlib import suppress
+
+                with suppress(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.anyio
+async def test_ssh_copy_requests_client_clipboard_without_claiming_success(monkeypatch):
+    import asyncio
+    import base64
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from agent_runtime import terminal_app
+
+    monkeypatch.setenv("SSH_CONNECTION", "client server")
+    monkeypatch.setattr(terminal_app.sys, "platform", "linux")
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("An SSH server must not invoke a local clipboard program")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected)
+    stream = io.StringIO()
+    ui = terminal_app.TerminalChatApp(
+        model="test", workspace="/tmp",
+        output=Vt100_Output(stream, lambda: Size(rows=24, columns=80), enable_cpr=False),
+    )
+    await ui.copy_answer("# 你好\n完整的回答")
+    encoded = base64.b64encode("# 你好\n完整的回答".encode()).decode()
+    assert f"\x1b]52;c;{encoded}\x07" in stream.getvalue()
+    assert "完整的回答" in stream.getvalue()  # Native scrollback fallback, no stdout redirection.
+    assert "已请求" in ui.status and ui.status != "已复制"
+    ui.app.clipboard.set_text("old kill ring")
+    await ui._paste_text()
+    assert ui.editor.text == ""  # Never silently paste the server's kill ring instead.
 
 
 @pytest.mark.anyio
@@ -506,6 +611,7 @@ async def test_vt100_drag_paste_and_native_mouse_toggle(monkeypatch):
     with create_pipe_input() as pipe:
         output = Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=80), enable_cpr=True)
         ui = TerminalChatApp(model="test", workspace="/tmp", input=pipe, output=output)
+        ui._mouse_enabled = True
         ui.view.message("你好 Python", "notice")
         copied = []
         monkeypatch.setattr(ui, "_copy_text", copied.append)

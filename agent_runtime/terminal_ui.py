@@ -128,6 +128,26 @@ class Conversation:
     def plain_text(self) -> str:
         return "\n".join(text for text, _, _ in self.rows())
 
+    def transcript(self) -> str:
+        """Export retained content independently of the viewport's folding state."""
+        lines: list[str] = []
+        if self.omitted_blocks:
+            lines.append(f"… 已省略 {self.omitted_blocks} 段较早记录")
+        for block in self.blocks:
+            if block.kind == "group":
+                lines.append(block.title)
+                if block.omitted:
+                    lines.append(f"… 已省略 {block.omitted} 项较早操作")
+                if block.text:
+                    lines.append(block.detail())
+                for child in block.children:
+                    lines.extend([child.title, child.detail()])
+            else:
+                prefix = "你 › " if block.kind == "user" else "Praxis\n" if block.kind == "answer" else ""
+                lines.append(prefix + block.detail())
+            lines.append("")
+        return "\n".join(lines)
+
 
 _TOOL_LABELS = {
     "read_file": "读取文件",
@@ -271,6 +291,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
 
     def set_verbose(self, verbose: bool) -> None:
         # Verbose is a view preference; it must not change event retention.
+        super().set_verbose(verbose)
         for block in self.view.blocks:
             if block.kind == "group":
                 block.expanded = verbose

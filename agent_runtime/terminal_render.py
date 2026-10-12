@@ -365,6 +365,7 @@ class TerminalToolEventDisplay:
         self._changed_files: dict[str, str] = {}
         self._detail_lines: deque[str] = deque(maxlen=2000)
         self._details_omitted = 0
+        self._context_status: dict[str, str] = {}
         self._live: Live | None = None
 
     def activity_text(self) -> str:
@@ -424,6 +425,18 @@ class TerminalToolEventDisplay:
     def set_verbose(self, verbose: bool) -> None:
         self._verbose = verbose
 
+    def show_context_status(self) -> None:
+        for line in self._context_status.values():
+            print(line)
+
+    def clear_context_status(self) -> None:
+        self._context_status.clear()
+
+    def _render_context_status(self, key: str, value: str) -> None:
+        self._context_status[key] = value
+        if self._verbose:
+            self._write_line(value)
+
     async def emit(self, event: StreamEvent) -> None:
         if event.type is EventType.THINKING_DELTA or (
             event.type is EventType.ITEM_DELTA and event.delta_kind is ItemDeltaKind.REASONING
@@ -452,7 +465,8 @@ class TerminalToolEventDisplay:
         elif event.type is EventType.TURN_STARTED and isinstance(event.data.get("context_capacity_policy"), Mapping):
             policy = event.data["context_capacity_policy"]
             assert isinstance(policy, Mapping)
-            self._write_line(
+            self._render_context_status(
+                "capacity",
                 f"上下文政策 {policy.get('revision')}: 模型窗口={event.data.get('model_context_tokens', 'unknown')} · "
                 f"正文 guards={policy.get('max_item_bytes')}/{policy.get('max_total_bytes')} bytes · "
                 f"消息 guard={policy.get('max_messages')}"
@@ -462,7 +476,8 @@ class TerminalToolEventDisplay:
             status = event.data.get("budget_status", {})
             if isinstance(projection, Mapping) and isinstance(status, Mapping):
                 cap = projection.get("explicit_input_cap")
-                self._write_line(
+                self._render_context_status(
+                    "budget",
                     f"输入上限={projection.get('effective_input_limit', 'unknown')} · "
                     f"压缩阈值={projection.get('auto_compact_limit', 'unknown')} · "
                     f"显式 cap={cap if cap is not None else 'unset'} · "
@@ -474,12 +489,15 @@ class TerminalToolEventDisplay:
                 )
         elif event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data:
             data = event.data
-            self._write_line(
+            self._render_context_status(
+                "compaction",
                 f"语义压缩 {data['trigger_reason']}: 输入 {data.get('before_input_tokens', 'unknown')} → "
                 f"{data.get('after_input_tokens', 'unknown')} · 摘要请求={data.get('summary_calls', 'unknown')} · "
                 f"token={data.get('summary_tokens', 'unknown')} · "
                 f"费用(micros)={data.get('summary_cost_micros', 'unknown')}"
             )
+            if not self._verbose:
+                self._write_line("已整理较早对话，继续执行。")
         elif event.type is EventType.RECOVERY:
             strategy = event.data.get("strategy")
             if isinstance(strategy, str) and strategy:
@@ -495,6 +513,7 @@ class TerminalToolEventDisplay:
         self._started_at = self._clock()
         self._activity_status = "等待模型"
         if reset:
+            self.clear_context_status()
             self._elapsed_seconds = 0.0
             self._tool_count = 0
             self._changed_files.clear()
