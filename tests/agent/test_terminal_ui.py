@@ -74,6 +74,39 @@ def test_transcript_includes_collapsed_details_without_changing_view():
 
 
 @pytest.mark.anyio
+async def test_completed_answers_enter_native_scrollback_once_and_remain_inspectable():
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    stream = io.StringIO()
+    ui = TerminalChatApp(
+        model="test", workspace="/tmp",
+        output=Vt100_Output(stream, lambda: Size(rows=24, columns=80), enable_cpr=False),
+    )
+    ui.view.message("first question\n", "user")
+    ui.view.message("first complete answer\n")
+    await ui.flush_scrollback()
+    first = stream.getvalue()
+    assert "first complete answer" in first
+    assert "first complete answer" not in "".join(t for _, t, *_ in ui.fragments())
+    await ui.flush_scrollback()
+    assert stream.getvalue() == first
+    # Adjacent messages of the same role must not append to a committed block.
+    ui.view.message("second complete answer\n")
+    assert not ui.view.blocks[-1].in_scrollback
+    await ui.flush_scrollback()
+    assert stream.getvalue().count("first complete answer") == 1
+    assert stream.getvalue().count("second complete answer") == 1
+    assert "first complete answer" in ui.view.transcript()
+    ui._move(-10)
+    assert "first complete answer" in "".join(t for _, t, *_ in ui.fragments())
+
+
+@pytest.mark.anyio
 async def test_events_preserve_answer_and_tool_details_without_stdout(capsys):
     view = Conversation()
     display = ConversationEventDisplay(view)

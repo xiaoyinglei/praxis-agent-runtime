@@ -177,7 +177,10 @@ Interactive `agent chat` uses a live conversation viewport with Markdown answers
 a multiline composer, and a model/status bar. Execution groups and individual
 tools expand and collapse **in place**, including while output is streaming.
 Native terminal selection, copy and paste are enabled by default, including over
-SSH. The composer and Markdown code backgrounds use the terminal's own colors.
+SSH. Before the next ordinary prompt, completed output is written once to native
+terminal scrollback and the live viewport shrinks to the remaining content. Use
+the terminal's wheel/trackpad to read earlier answers without a slash command.
+The composer and Markdown code backgrounds use the terminal's own colors.
 Errors remain visible even when their execution group is collapsed.
 
 | Control | Action |
@@ -192,8 +195,8 @@ Errors remain visible even when their execution group is collapsed.
 | `Ctrl+O` | Toggle the latest execution group without leaving the composer |
 | `Tab`, then arrows and `Enter` / Space | Navigate records and toggle the selected row |
 | `Tab` / `Esc` while navigating records | Return to the composer |
-| `PageUp` / `PageDown` (or mouse wheel in F2 mode) | Scroll the conversation viewport |
-| `Ctrl+End` | Follow the latest output again |
+| `PageUp` / `PageDown` (or mouse wheel in F2 mode) | Inspect and scroll retained conversation history inside the application |
+| `Ctrl+End` | Leave history inspection and follow the latest output again |
 | `Enter` / `Ctrl+J` or `Alt+Enter` | Send / insert a newline |
 | `Ctrl+C` | Copy a selection first; otherwise cancel execution, clear input, or exit if empty |
 | `Ctrl+D` at an empty prompt | Exit |
@@ -212,6 +215,11 @@ Client terminals may reject that request, so the full answer is also printed abo
 the application for native copy. The server never reads the client's clipboard;
 use the terminal's normal Paste command. In F2 mode, right-click paste is available
 only on a local Mac; over SSH, return to native mouse mode for the terminal's menu.
+Completed output remains in terminal scrollback independently of the bounded
+application view. The terminal itself controls its scrollback limit. While a
+response is streaming, `PageUp` (usually `Fn+Up` on a Mac) inspects the application
+history; `Ctrl+End` returns to the current output. Pending approval panels are not
+committed into scrollback until the interaction has finished.
 
 Context capacity, compaction thresholds and budget counters appear only in
 `/status` or detailed output (`/verbose`). A compaction produces a short progress

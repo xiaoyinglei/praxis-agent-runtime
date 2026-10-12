@@ -26,7 +26,7 @@ from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import Output
-from prompt_toolkit.shortcuts import print_formatted_text
+from prompt_toolkit.renderer import print_formatted_text
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
@@ -104,9 +104,10 @@ class TerminalChatApp:
         self._operation: asyncio.Task[Any] | None = None
         self._row = 0
         self._follow = True
+        self._show_history = False
         self._fold_rows: dict[int, Block] = {}
         self._line_count = 1
-        self._layout_key: tuple[int, int] | None = None
+        self._layout_key: tuple[int, int, bool] | None = None
         self._fragments: StyleAndTextTuples = []
         self._plain_lines: list[str] = []
         self._selection_start: Point | None = None
@@ -211,6 +212,8 @@ class TerminalChatApp:
         @keys.add("f2")
         def native_mouse(event: KeyPressEvent) -> None:
             self._mouse_enabled = not self._mouse_enabled
+            self._show_history = self._mouse_enabled
+            self._follow = True
             self._selection_start = self._selection_end = None
             self.status = "鼠标交互已开启" if self._mouse_enabled else "终端原生选择已开启"
 
@@ -222,6 +225,7 @@ class TerminalChatApp:
                 self.editor.text = ""
                 assert self._pending is not None
                 self._pending.set_result(value)
+                self._show_history = False
                 self._follow = True
 
         @keys.add("escape", "enter", filter=has_focus(self.editor))
@@ -235,6 +239,8 @@ class TerminalChatApp:
                 self.editor.buffer.complete_next()
                 return
             event.app.layout.focus(self.body)
+            self._show_history = True
+            self.fragments()
             self._follow = False
             self._row = max(self._fold_rows, default=0)
 
@@ -242,6 +248,8 @@ class TerminalChatApp:
         @keys.add("escape", filter=has_focus(self.body))
         def focus_input(event: KeyPressEvent) -> None:
             event.app.layout.focus(self.editor)
+            self._show_history = False
+            self._follow = True
 
         @keys.add("up", filter=has_focus(self.body))
         def up(event: KeyPressEvent) -> None:
@@ -261,6 +269,7 @@ class TerminalChatApp:
 
         @keys.add("c-end")
         def latest(event: KeyPressEvent) -> None:
+            self._show_history = False
             self._follow = True
 
         @keys.add("enter", filter=has_focus(self.body))
@@ -269,6 +278,7 @@ class TerminalChatApp:
             block = self._fold_rows.get(self._row)
             if block:
                 self.view.toggle(block)
+                self._show_history = True
 
         @keys.add("c-o")
         def toggle_latest(event: KeyPressEvent) -> None:
@@ -277,6 +287,7 @@ class TerminalChatApp:
                 block = next((b for b in reversed(self.view.blocks) if b.kind == "group"), None)
             if block:
                 self.view.toggle(block)
+                self._show_history = True
 
         @keys.add("c-c")
         def cancel(event: KeyPressEvent) -> None:
@@ -306,7 +317,8 @@ class TerminalChatApp:
         body_window = Window(
             self.body,
             wrap_lines=False,
-            height=lambda: Dimension(min=0, preferred=max(0, self.app.output.get_size().rows - 8)),
+            height=lambda: Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8)),
+            dont_extend_height=True,
         )
         layout = HSplit(
             [
@@ -390,6 +402,9 @@ class TerminalChatApp:
         return Point(0, max(0, self._line_count - 1) if self._follow else min(self._row, max(0, self._line_count - 1)))
 
     def _move(self, amount: int) -> None:
+        if not self._show_history and any(block.in_scrollback for block in self.view.blocks):
+            self._show_history = True
+            self.fragments()
         self._row = max(0, min(self._cursor().y + amount, self._line_count - 1))
         self._follow = False
         self.invalidate()
@@ -428,7 +443,8 @@ class TerminalChatApp:
 
     def fragments(self) -> StyleAndTextTuples:
         width = max(4, self.app.output.get_size().columns - 1) if hasattr(self, "app") else 80
-        key = (self.view.revision, width)
+        history = self._show_history or self._mouse_enabled
+        key = (self.view.revision, width, history)
         if self._layout_key == key:
             return self._highlight_selection(self._fragments)
         if self._layout_key is not None and self._layout_key[1] != width:
@@ -436,7 +452,7 @@ class TerminalChatApp:
         fragments: StyleAndTextTuples = []
         line = 0
         self._fold_rows = {}
-        for text, block, style in self.view.rows():
+        for text, block, style in self.view.rows(include_scrollback=history):
             if style == "answer" and text.strip():
                 rendered = _markdown(text.removeprefix("● "), max(1, width - 2), "NO_COLOR" not in os.environ)
                 handler = self._handler(None, line)
@@ -600,8 +616,39 @@ class TerminalChatApp:
     async def show_text(self, text: str) -> None:
         """Write above the UI into native scrollback, bypassing redirected stdout."""
         await run_in_terminal(lambda: print_formatted_text(
-            safe_terminal_text(text), output=self.app.output,
+            self.app.output, [("", safe_terminal_text(text) + "\n")], self.app.style or Style.from_dict({}),
         ))
+
+    async def flush_scrollback(self) -> None:
+        """Commit stable output once; keep the viewport for streaming and inspection."""
+        pending = [block for block in self.view.blocks if not block.in_scrollback]
+        if not pending:
+            return
+        width = max(4, self.app.output.get_size().columns - 1)
+        fragments: StyleAndTextTuples = []
+        for text, _, style in self.view.rows(include_scrollback=False):
+            if style == "answer" and text.strip():
+                fragments.append(("class:assistant", "Praxis\n"))
+                fragments.extend(_markdown(text.removeprefix("● "), width, "NO_COLOR" not in os.environ))
+                fragments.append(("", "\n"))
+            else:
+                fragments.append((f"class:{style}" if style else "", text + "\n"))
+        for block in pending:
+            block.in_scrollback = True
+        self._show_history = False
+        self._follow = True
+        self.view.invalidate()
+        try:
+            # The resumed UI must already be compact, otherwise its repaint would
+            # push the just-printed answer off the visible terminal again.
+            await run_in_terminal(lambda: print_formatted_text(
+                self.app.output, fragments, self.app.style or Style.from_dict({}),
+            ))
+        except BaseException:
+            for block in pending:
+                block.in_scrollback = False
+            self.view.invalidate()
+            raise
 
     async def copy_answer(self, text: str) -> None:
         # Native scrollback is available even when the client rejects OSC 52.
@@ -739,6 +786,8 @@ class TerminalChatApp:
         ]
 
     async def prompt(self, *, approval: bool = False) -> str:
+        if not approval:
+            await self.flush_scrollback()
         self.status = "等待确认" if approval else "就绪"
         self._pending = asyncio.get_running_loop().create_future()
         self.app.layout.focus(self.editor)

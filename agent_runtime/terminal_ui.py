@@ -20,6 +20,7 @@ class Block:
     children: list[Block] = field(default_factory=list)
     omitted: int = 0
     failed: bool = False
+    in_scrollback: bool = False
 
     def append(self, text: str) -> None:
         self.text += safe_terminal_text(text)
@@ -68,7 +69,7 @@ class Conversation:
         return block
 
     def message(self, text: str, kind: str = "answer") -> None:
-        if self.blocks and self.blocks[-1].kind == kind and kind != "user":
+        if self.blocks and self.blocks[-1].kind == kind and kind != "user" and not self.blocks[-1].in_scrollback:
             self.blocks[-1].append(text)
         else:
             block = self._add(Block(kind))
@@ -91,11 +92,13 @@ class Conversation:
         block.expanded = not block.expanded
         self.invalidate()
 
-    def rows(self) -> list[tuple[str, Block | None, str]]:
+    def rows(self, *, include_scrollback: bool = True) -> list[tuple[str, Block | None, str]]:
         rows: list[tuple[str, Block | None, str]] = []
         if self.omitted_blocks:
             rows.append((f"… 已省略 {self.omitted_blocks} 段较早记录", None, "dim"))
         for block in self.blocks:
+            if block.in_scrollback and not include_scrollback:
+                continue
             if block.kind != "group":
                 prefix = "你 › " if block.kind == "user" else "● " if block.kind == "answer" else ""
                 rows.append((prefix + block.detail(), None, block.kind))
