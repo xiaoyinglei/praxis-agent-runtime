@@ -143,7 +143,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
         async def dispatch(
             self,
             prepared: PreparedModelCall,
-        ) -> HarnessModelResponse:
+         *, delta_sink: object = None) -> HarnessModelResponse:
             del prepared
             self.dispatch_calls += 1
             raise AssertionError("oversized context must not reach provider I/O")

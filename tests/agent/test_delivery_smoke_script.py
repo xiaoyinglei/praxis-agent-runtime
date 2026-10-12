@@ -70,3 +70,35 @@ def test_demo_trace_rejects_absolute_paths() -> None:
 
     assert module._contains_demo_absolute_path("read /Users/alice/private.py")
     assert not module._contains_demo_absolute_path("read fixture.py")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('scenario', ['no_change', 'verify_before_change', 'unreached_assertion'])
+async def test_default_delivery_smoke_rejects_missing_or_unexecuted_checks(scenario):
+    module = _load_smoke_module()
+    case = module.build_cases()[1]
+    read = module.HarnessToolCall(id='read', name='read_file', arguments={'path': 'fixture.py'})
+    patch = module.HarnessToolCall(id='patch', name='apply_patch', arguments={
+        'file_path': 'fixture.py', 'old_string': 'before', 'new_string': 'after'})
+    unexecuted = module.HarnessToolCall(id='unchecked', name='execute_python', arguments={
+        'code': 'def never_called():\n    assert False\nprint("no check ran")'})
+    calls = {'no_change': (read,), 'verify_before_change': (read, patch),
+             'unreached_assertion': (patch, unexecuted)}[scenario]
+
+    class Model(module._SmokeModel):
+        async def dispatch(self, prepared, *, delta_sink=None):
+            step = int(prepared.request_ref['step'])
+            if step <= len(calls):
+                return module._response(text='', step=step, tool_calls=(calls[step - 1],))
+            return module._response(text='praxis demo complete', step=step)
+
+    result = await module._run_case(case, model=Model(case))
+    assert not result.passed
+    assert result.status != 'done'
+    assert result.validation_status == 'failed'
+    assert result.validation_scope == 'workspace_change'
+    if scenario == 'no_change':
+        assert result.workspace_diff == ''
+    else:
+        assert "-value = 'before'" in result.workspace_diff
+        assert "+value = 'after'" in result.workspace_diff

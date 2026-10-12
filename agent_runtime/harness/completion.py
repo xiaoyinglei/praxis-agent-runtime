@@ -19,24 +19,17 @@ class DeliveryCompletionGate:
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
         turn = self._store.read_turn(proposal.turn_id)
         policy = turn.binding_manifest.get("completion_policy", {})
-        if not isinstance(policy, Mapping) or not policy.get(
-            "require_workspace_change", False
-        ):
+        if not isinstance(policy, Mapping) or not policy.get("require_workspace_change", False):
             return CompletionDecision(
                 action="accept",
                 reason=(
-                    "Workspace-change validation is not required for this Turn; "
-                    "task acceptance has not been evaluated."
+                    "Workspace-change validation is not required for this Turn; task acceptance has not been evaluated."
                 ),
             )
 
         # A failed multi-file operation may still have attested partial writes.
         trusted = self._trusted_results(proposal.turn_id, include_failed=True)
-        changes = [
-            (item, operation)
-            for item, operation in trusted
-            if _is_workspace_change(item, operation)
-        ]
+        changes = [(item, operation) for item, operation in trusted if _is_workspace_change(item, operation)]
         if not changes:
             return CompletionDecision(
                 action="continue",
@@ -162,8 +155,8 @@ class DeliveryCompletionGate:
                 )
             elif assessment.evidence is not None:
                 code, message = (
-                    "unrelated_inspection",
-                    "The inspection targets could not be matched to the latest attested write targets. "
+                    "unrelated_inspection" if assessment.evidence.kind == "inspection" else "unrelated_verification",
+                    "The observed verification targets could not be matched to the latest attested write targets. "
                     "Run the project's checks or obtain inspection evidence matching those targets.",
                 )
                 feedback["attested_write_targets"] = [target[:500] for target in sorted(changed_resources)[:8]]
@@ -199,17 +192,12 @@ class DeliveryCompletionGate:
         return json.dumps(feedback, ensure_ascii=False)
 
     def _trusted_verifications(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
-        operations = {
-            operation.operation_id: operation
-            for operation in self._store.list_tool_operations(turn_id)
-        }
+        operations = {operation.operation_id: operation for operation in self._store.list_tool_operations(turn_id)}
+        items = {item.item_id: item for item in self._store.list_items(turn_id)}
+        calls = {item.payload.get("tool_call_id"): item for item in items.values() if item.kind == "tool_call"}
         trusted: list[ItemSnapshot] = []
-        for item in self._store.list_items(turn_id):
-            if (
-                item.kind != "verification"
-                or item.status != "completed"
-                or item.producer != "runtime"
-            ):
+        for item in items.values():
+            if item.kind != "verification" or item.status != "completed" or item.producer != "runtime":
                 continue
             operation_id = item.payload.get("operation_id")
             operation = operations.get(operation_id) if isinstance(operation_id, str) else None
@@ -221,19 +209,49 @@ class DeliveryCompletionGate:
                 or item.payload.get("arguments_digest") != operation.arguments_digest
             ):
                 continue
+            source = items.get(operation.result_item_id)
+            call = calls.get(operation.tool_call_id)
+            if (
+                source is None
+                or call is None
+                or source.kind != "tool_result"
+                or source.status != "completed"
+                or source.producer != "tool"
+                or call.kind != "tool_call"
+                or call.status != "completed"
+                or call.producer != "model"
+                or call.payload.get("tool_name") != operation.tool_name
+                or source.payload.get("tool_call_id") != operation.tool_call_id
+                or source.payload.get("tool_name") != operation.tool_name
+                or source.payload.get("is_error") is True
+                or not isinstance(call.payload.get("arguments"), Mapping)
+            ):
+                continue
+            evidence = assess_tool_verification(
+                tool_name=operation.tool_name,
+                arguments=call.payload.get("arguments", {}),
+                structured_content=source.payload.get("structured_content"),
+                resources=operation.resources,
+            ).evidence
+            # Old logs stay immutable; today's gate rechecks the bound source
+            # instead of inheriting historical classification mistakes.
+            if (
+                evidence is None
+                or item.payload.get("verification_kind") != evidence.kind
+                or item.payload.get("verifier") != evidence.verifier
+                or tuple(item.payload.get("verified_resources", ())) != evidence.verified_resources
+            ):
+                continue
             trusted.append(item)
         return tuple(trusted)
 
 
-def _is_workspace_change(
-    item: ItemSnapshot, operation: ToolOperationSnapshot
-) -> bool:
+def _is_workspace_change(item: ItemSnapshot, operation: ToolOperationSnapshot) -> bool:
     metadata = item.payload.get("metadata")
     if not isinstance(metadata, Mapping):
         return False
     has_write_claim = any(
-        resource.get("kind") == "filesystem" and resource.get("access") == "write"
-        for resource in operation.resources
+        resource.get("kind") == "filesystem" and resource.get("access") == "write" for resource in operation.resources
     )
     return (
         has_write_claim
@@ -248,7 +266,7 @@ def _verification_matches_change(
     changed_resources: set[str],
 ) -> bool:
     kind = item.payload.get("verification_kind")
-    if kind in {"test", "static_analysis", "assertion"}:
+    if kind in {"test", "static_analysis"}:
         return True
     if kind != "inspection":
         return False

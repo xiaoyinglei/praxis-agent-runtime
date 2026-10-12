@@ -149,7 +149,7 @@ async def test_public_session_failure_is_inspectable_without_model_replay(tmp_pa
     from agent_runtime.history import read_history
 
     class DiagnosticModel(PatchThenAnswerModel):
-        async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+        async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
             if prepared.request_ref["request_id"].endswith(":step:1"):
                 return HarnessModelResponse(
                     text="",

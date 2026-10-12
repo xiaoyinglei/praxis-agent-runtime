@@ -17,7 +17,7 @@ class _UnusedModel:
     def prepare(self, request):  # type: ignore[no-untyped-def]
         raise AssertionError("capture_step_context must not call the provider")
 
-    async def dispatch(self, prepared):  # type: ignore[no-untyped-def]
+    async def dispatch(self, prepared, *, delta_sink: object = None):  # type: ignore[no-untyped-def]
         raise AssertionError("capture_step_context must not call the provider")
 
 

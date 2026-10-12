@@ -55,7 +55,7 @@ class PublicHarnessModel:
             request_ref={"step": request.step},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="answer from replacement harness",
@@ -65,13 +65,13 @@ class PublicHarnessModel:
 
 
 class FailingPublicHarnessModel(PublicHarnessModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ConnectionError("provider connection ended after dispatch")
 
 
 class IncompletePublicHarnessModel(PublicHarnessModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="partial public answer",
@@ -91,7 +91,7 @@ async def test_public_read_result_after_disconnect_never_constructs_model_runtim
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
-    monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
     committed = await agent.run(
         "commit before disconnect",
         require_workspace_change=False,
@@ -100,7 +100,7 @@ async def test_public_read_result_after_disconnect_never_constructs_model_runtim
     def fail_model_construction() -> object:
         raise AssertionError("read_result must not construct a model runtime")
 
-    monkeypatch.setattr(agent, "_harness_model", fail_model_construction)
+    monkeypatch.setattr(agent, "_model_factory", fail_model_construction)
     replayed = await agent.read_result(committed.turn_id)
 
     assert replayed == committed
@@ -119,7 +119,7 @@ async def test_public_result_exposes_durable_unknown_model_diagnostic(
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     monkeypatch.setattr(
         agent,
-        "_harness_model",
+        "_model_factory",
         lambda: FailingPublicHarnessModel(),
     )
 
@@ -145,7 +145,7 @@ async def test_public_result_exposes_durable_incomplete_model_diagnostic(
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     monkeypatch.setattr(
         agent,
-        "_harness_model",
+        "_model_factory",
         lambda: IncompletePublicHarnessModel(),
     )
 
@@ -179,7 +179,7 @@ async def test_public_agent_can_explicitly_disable_workspace_mcp_discovery_and_f
         workspace_path=workspace,
         enable_workspace_mcp=False,
     )
-    monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
 
     result = await agent.run(
         "run without repository MCP servers",
@@ -208,7 +208,7 @@ async def test_public_followup_uses_current_mcp_configuration_and_requires_curre
     )
     monkeypatch.setattr(
         first_agent,
-        "_harness_model",
+        "_model_factory",
         lambda: PublicHarnessModel(),
     )
     first = await first_agent.run("first", require_workspace_change=False)
@@ -218,7 +218,7 @@ async def test_public_followup_uses_current_mcp_configuration_and_requires_curre
     )
     monkeypatch.setattr(
         fresh_process_agent,
-        "_harness_model",
+        "_model_factory",
         lambda: PublicHarnessModel(),
     )
 
@@ -262,7 +262,7 @@ class PatchThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -288,7 +288,7 @@ class PatchThenAnswerModel:
 
 
 class DestructivePythonThenAnswerModel(PatchThenAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -322,12 +322,36 @@ class CapturingPublicModel(PublicHarnessModel):
         return super().prepare(request)
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("limits", [{"max_steps": 2}, {"max_turns": 2}, {"max_steps": 2, "max_turns": 2}])
+async def test_public_step_budget_and_legacy_alias_freeze_the_same_limit(tmp_path, monkeypatch, limits):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "rollout.sqlite3"
+    agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    result = await agent.run("direct answer", require_workspace_change=False, **limits)
+    assert result.status == "done"
+    with RolloutStore(database) as store:
+        assert store.read_turn(result.turn_id).binding_manifest["model_step_budget"] == 2
+
+
+@pytest.mark.anyio
+async def test_conflicting_step_budget_aliases_fail_before_model_dispatch(tmp_path, monkeypatch):
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.sqlite3", enable_workspace_mcp=False)
+    model = CapturingPublicModel()
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    with pytest.raises(ValueError, match="max_steps and legacy max_turns must agree"):
+        await agent.run("direct answer", require_workspace_change=False, max_steps=2, max_turns=3)
+    assert not model.requests
+
+
 class BlockingPublicModel(PublicHarnessModel):
     def __init__(self) -> None:
         self.dispatch_started = asyncio.Event()
         self.release_dispatch = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.dispatch_started.set()
         await self.release_dispatch.wait()
@@ -342,7 +366,7 @@ class AcknowledgedStreamCancelModel(PublicHarnessModel):
     def __init__(self) -> None:
         self.dispatch_started = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.dispatch_started.set()
         try:
@@ -358,7 +382,7 @@ class BlockingResumeModel(PatchThenAnswerModel):
         self.resume_dispatch_started = asyncio.Event()
         self.release_resume_dispatch = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return await super().dispatch(prepared)
         self.resume_dispatch_started.set()
@@ -371,7 +395,7 @@ class BlockingResumeModel(PatchThenAnswerModel):
 
 
 class PlanThenAnswerModel(PatchThenAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -421,7 +445,7 @@ async def test_public_agent_uses_rollout_harness_not_legacy_service(
         async def emit(self, event: StreamEvent) -> None:
             events.append(event)
 
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     result = await agent.run(
         "answer through the public SDK",
         require_workspace_change=False,
@@ -456,7 +480,7 @@ async def test_public_resume_approves_the_same_durable_harness_turn(
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     model = PatchThenAnswerModel()
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
 
     paused = await agent.run(
         "change value.txt",
@@ -514,7 +538,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     monkeypatch.setattr(
         agent,
-        "_harness_model",
+        "_model_factory",
         lambda: DestructivePythonThenAnswerModel(),
     )
 
@@ -551,7 +575,7 @@ async def test_public_abort_cancels_only_a_safely_paused_turn(
     target.write_text("before", encoding="utf-8")
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
-    monkeypatch.setattr(agent, "_harness_model", lambda: PatchThenAnswerModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PatchThenAnswerModel())
     paused = await agent.run(
         "change value.txt",
         require_workspace_change=False,
@@ -577,7 +601,7 @@ async def test_public_agent_freezes_and_durably_enforces_model_budget(
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
 
     result = await agent.run(
         "claim a change without making one",
@@ -608,7 +632,7 @@ async def test_public_agent_rejects_untrusted_workspace_mcp_before_start(
     config.write_text("servers: []\n", encoding="utf-8")
     monkeypatch.setenv("AGENT_MCP_CONFIG", str(config))
     agent = Agent(checkpoint_db=tmp_path / "praxis.sqlite3", workspace_path=workspace)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
 
     with pytest.raises(PermissionError, match="workspace MCP config is not trusted"):
         await agent.run("do not start MCP", require_workspace_change=False)
@@ -637,7 +661,7 @@ async def test_public_agent_binds_explicit_workspace_mcp_trust_to_the_turn(
         workspace_path=workspace,
         mcp_config_trust=trust,
     )
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
 
     result = await agent.run("use the exact trusted config", require_workspace_change=False)
 
@@ -663,7 +687,7 @@ async def test_public_agent_stages_files_as_canonical_input_items(
     database = tmp_path / "praxis.sqlite3"
     model = CapturingPublicModel()
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
 
     result = await agent.run(
         "use the attached brief",
@@ -699,7 +723,7 @@ async def test_public_astream_replays_events_from_canonical_rollout(
         checkpoint_db=tmp_path / "praxis.sqlite3",
         workspace_path=workspace,
     )
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     events = [
         event
         async for event in agent.stream(
@@ -729,7 +753,7 @@ async def test_public_astream_emits_committed_turn_start_before_model_finishes(
         workspace_path=workspace,
     )
     model = BlockingPublicModel()
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     stream = agent.stream(
         "stream while the model is blocked",
         require_workspace_change=False,
@@ -755,7 +779,7 @@ async def test_confirmed_stream_cancel_commits_request_then_turn_aborted(
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     model = AcknowledgedStreamCancelModel()
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     stream = agent.stream(
         "cancel the controlling stream",
         require_workspace_change=False,
@@ -793,7 +817,7 @@ async def test_unconfirmed_stream_cancel_retains_interrupted_turn_for_reconcilia
     database = tmp_path / "praxis.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     model = BlockingPublicModel()
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     stream = agent.stream(
         "cancel with an unknown provider outcome",
         require_workspace_change=False,
@@ -843,7 +867,7 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
             if event.type is EventType.TURN_STARTED:
                 turn_started.set()
 
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     run = asyncio.create_task(
         agent.run(
             "publish while the model is blocked",
@@ -895,7 +919,7 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
 
     monkeypatch.setattr(RolloutStore, "__init__", reject_record_listener)
     monkeypatch.setattr(harness_session, "RolloutStore", RolloutStore)
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     running = asyncio.create_task(
         agent.run(
             "await committed batch delivery",
@@ -983,7 +1007,7 @@ async def test_cli_arun_sink_and_astream_share_identical_v2_lifecycle(
             checkpoint_db=tmp_path / f"{name}.sqlite3",
             workspace_path=workspace,
         )
-        monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+        monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
         return agent
 
     cli_agent = configured_agent("cli")
@@ -1046,7 +1070,7 @@ async def test_public_runtime_emits_v2_only_without_implicit_legacy_duplicates(
         checkpoint_db=tmp_path / "praxis.sqlite3",
         workspace_path=workspace,
     )
-    monkeypatch.setattr(agent, "_harness_model", lambda: PublicHarnessModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
 
     class Capture:
         def __init__(self) -> None:
@@ -1092,7 +1116,7 @@ async def test_public_resume_event_sink_is_live_and_does_not_replay_old_events(
         workspace_path=workspace,
     )
     model = BlockingResumeModel()
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     paused = await agent.run(
         "change value.txt",
         require_workspace_change=False,
@@ -1150,7 +1174,7 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
     def fail_model_construction() -> object:
         raise AssertionError("abort must not construct a model runtime")
 
-    monkeypatch.setattr(agent, "_harness_model", fail_model_construction)
+    monkeypatch.setattr(agent, "_model_factory", fail_model_construction)
 
     result = await agent.resume(turn.turn_id, "abort")
 
@@ -1185,7 +1209,7 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
     def fail_model_construction() -> object:
         raise AssertionError("incompatible legacy resume must fail before runtime")
 
-    monkeypatch.setattr(agent, "_harness_model", fail_model_construction)
+    monkeypatch.setattr(agent, "_model_factory", fail_model_construction)
 
     with pytest.raises(RuntimeError, match="incompatible legacy Turn"):
         await agent.resume(turn.turn_id, "allow_once")
@@ -1206,7 +1230,7 @@ async def test_public_result_projects_plan_from_committed_tool_items(
         checkpoint_db=tmp_path / "praxis.sqlite3",
         workspace_path=workspace,
     )
-    monkeypatch.setattr(agent, "_harness_model", lambda: PlanThenAnswerModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PlanThenAnswerModel())
 
     result = await agent.run(
         "plan this answer",

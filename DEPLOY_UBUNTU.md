@@ -83,7 +83,7 @@ restrictions](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-
 Deploy the revision containing this Linux change, then run:
 
 ```bash
-uv sync --frozen --link-mode copy
+uv sync --locked --link-mode copy
 uv run agent --help
 uv run pytest -q tests/agent/test_linux_sandbox.py
 ```
@@ -92,10 +92,11 @@ The real Linux tests intentionally fail if bwrap cannot start; installing the
 binary alone is insufficient. Fake sandbox fixtures test process mechanics,
 not isolation. The Linux backend never falls back to unsandboxed execution.
 
-The current default dependency set also includes RAG, document processing and
-local model libraries. On a small server, review download/disk requirements
-before syncing the full environment. A manually reduced validation virtualenv
-is not equivalent to a complete supported `uv sync` installation.
+The default dependency set includes the Agent's document/data tools. RAG
+backends and local MLX inference require `--extra rag` and `--extra local-mlx`,
+respectively. Use `uv sync --locked --all-extras --link-mode copy` for the full
+development environment. A manually reduced validation virtualenv is not
+equivalent to a complete supported default `uv sync` installation.
 
 For noninteractive SSH, uv may not be on PATH even though interactive login
 finds it. For the inspected admin account, use `/home/admin/.local/bin/uv` or
@@ -105,8 +106,8 @@ explicitly add `$HOME/.local/bin` to PATH in the launch environment.
 
 For the coding Agent and cloud-model path only, use the checked-in core list
 with versions constrained by `uv.lock`. This is a deliberate partial install:
-RAG and document/data tools may need additional dependencies, and the full
-project metadata still declares those packages. Do not treat this as a full
+Document/data tools need additional dependencies from the default profile;
+RAG requires its explicit extra. Do not treat this as a full
 `uv sync` installation or use `pip check` to claim that all project dependencies
 are installed.
 
@@ -213,7 +214,7 @@ another option when direct access is unavailable. Never disable TLS validation,
 use an unreviewed GitHub mirror, or increase `http.postBuffer` to address fetch EOF.
 
 Start this reduced installation with `.venv/bin/agent`, not `uv run agent`:
-`uv run` normally synchronizes the full project dependency set. Model API keys
+`uv run` normally synchronizes the default project dependency set. Model API keys
 belong in the parent Agent environment; sandboxed commands receive a sanitized
 environment and do not inherit those keys.
 

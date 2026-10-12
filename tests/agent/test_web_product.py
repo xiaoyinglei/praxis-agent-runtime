@@ -21,7 +21,7 @@ class FetchThenAnswer(PatchThenAnswerModel):
         self.requests.append(request)
         return super().prepare(request)
 
-    async def dispatch(self, prepared):
+    async def dispatch(self, prepared, *, delta_sink: object = None):
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="", provider_response_id="fetch-call", usage={},
@@ -48,7 +48,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     database = tmp_path / "checkpoints.sqlite"
     model = FetchThenAnswer({"url": "https://example.com/doc", "max_lines": 1})
     agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     result = await agent.run("Read external docs", allow_web_tools=True, require_workspace_change=False)
     assert result.status == "done"
     assert {"web_search", "web_fetch"}.issubset({t.definition.name for t in model.requests[0].tools})
@@ -68,7 +68,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
         assert store.verify().valid
     model2 = FetchThenAnswer({"source_id": source_id, "start_line": 2})
     agent2 = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
-    monkeypatch.setattr(agent2, "_harness_model", lambda: model2)
+    monkeypatch.setattr(agent2, "_model_factory", lambda: model2)
     restored = await agent2.run("Continue saved source", require_workspace_change=False)
     assert restored.status == "done"
     assert len(requests) == 1
@@ -78,7 +78,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
         assert outputs[0]["is_error"] is False
         assert "line two" in outputs[0]["structured_content"]["content"]
     other = Agent(workspace_path=tmp_path / "other-workspace", checkpoint_db=database, enable_workspace_mcp=False)
-    monkeypatch.setattr(other, "_harness_model", lambda: FetchThenAnswer({"source_id": source_id}))
+    monkeypatch.setattr(other, "_model_factory", lambda: FetchThenAnswer({"source_id": source_id}))
     denied = await other.run("Read another workspace snapshot", require_workspace_change=False)
     with RolloutStore(database) as store:
         outputs = [item.payload for item in store.list_items(denied.turn_id) if item.kind == "tool_result"]
@@ -99,7 +99,7 @@ async def test_unapproved_product_fetch_pauses_then_resume_uses_original_permiss
     )))
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "state.sqlite", enable_workspace_mcp=False)
     model = FetchThenAnswer({"url": "https://example.com"})
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     paused = await agent.run("Read a page", require_workspace_change=False)
     assert paused.status == "paused"
     assert not requests
@@ -125,12 +125,12 @@ async def test_search_resume_in_new_agent_uses_explicit_external_credential(tmp_
     options = dict(workspace_path=tmp_path / "workspace", checkpoint_db=tmp_path / "state.sqlite",
                    enable_workspace_mcp=False, web_search_key_file=key)
     first = Agent(**options)
-    monkeypatch.setattr(first, "_harness_model", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
+    monkeypatch.setattr(first, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
     paused = await first.run("Search public docs", require_workspace_change=False)
     assert paused.status == "paused"
     assert requests == []
     second = Agent(**options)
-    monkeypatch.setattr(second, "_harness_model", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
+    monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
     resumed = await second.resume(paused.turn_id, "allow_once")
     assert resumed.status == "done"
     assert len(requests) == 1
@@ -256,7 +256,7 @@ async def test_product_search_budget_is_persisted_and_credential_is_not(tmp_path
     key.chmod(0o400)
 
     class RepeatedSearch(PatchThenAnswerModel):
-        async def dispatch(self, prepared):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
             step = int(prepared.request_ref["request_id"].rsplit(":", 1)[-1])
             if step <= 33:
                 return HarnessModelResponse(text="", provider_response_id=f"search-{step}", usage={},
@@ -267,7 +267,7 @@ async def test_product_search_budget_is_persisted_and_credential_is_not(tmp_path
     database = tmp_path / "state.sqlite"
     agent = Agent(workspace_path=tmp_path / "workspace", checkpoint_db=database,
                   enable_workspace_mcp=False, web_search_key_file=key)
-    monkeypatch.setattr(agent, "_harness_model", lambda: RepeatedSearch())
+    monkeypatch.setattr(agent, "_model_factory", lambda: RepeatedSearch())
     result = await agent.run("Look up docs", allow_web_tools=True, require_workspace_change=False, max_turns=40)
     assert result.status == "done"
     assert len(hits) == 32

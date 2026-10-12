@@ -99,7 +99,7 @@ class AnswerAfterRecovery:
             request_ref={"request_id": f"recovery:{request.step}"},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="Recovered tool call was consumed exactly once.",

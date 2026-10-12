@@ -114,7 +114,7 @@ async def test_conversation_reuses_resources_until_session_close(
         models.append(model)
         return model
 
-    monkeypatch.setattr(agent, "_harness_model", make_model)
+    monkeypatch.setattr(agent, "_model_factory", make_model)
     assert callable(getattr(agent, "session", None)), "Agent must create a conversation-scoped Session"
     async with agent.session(require_workspace_change=False) as session:
         resources = (session.store, session.model, session.tool_orchestrator, session.event_dispatcher)
@@ -137,7 +137,7 @@ async def test_close_waits_for_active_turn_and_rejects_competing_submit(tmp_path
 
     model = BlockingPublicModel()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     async with agent.session(require_workspace_change=False) as session:
         running = asyncio.create_task(session.submit("first"))
         await asyncio.wait_for(model.dispatch_started.wait(), 1)
@@ -180,7 +180,7 @@ async def test_mcp_process_lives_across_submissions_and_exits_on_close(tmp_path,
     monkeypatch.delenv("AGENT_MCP_CONFIG", raising=False)
     trust = decide_mcp_config_trust(config, workspace_root=tmp_path, trust_workspace=True)
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", mcp_config_trust=trust)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     async with agent.session(require_workspace_change=False) as session:
         tool = session.tools["mcp__test_server__read_only_info"]
         first = await session.submit("first")
@@ -224,7 +224,7 @@ async def test_failed_open_releases_store_and_model_control(tmp_path, monkeypatc
 
     monkeypatch.setattr(RolloutStore, "__init__", record_store)
     monkeypatch.setattr(agent, "_get_model_control_plane", record_plane)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     monkeypatch.setattr(session_module, "configure_services", fail_services)
     with pytest.raises(RuntimeError, match="assembly failed"):
         async with agent.session():
@@ -243,7 +243,7 @@ async def test_agent_factory_sessions_have_independent_model_state_and_resources
         enable_workspace_mcp=False,
         model_session_path=None,
     )
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     async with agent.session(require_workspace_change=False) as first:
         async with agent.session(require_workspace_change=False) as second:
             assert first.thread_id != second.thread_id
@@ -268,7 +268,7 @@ async def test_cancelled_turn_keeps_session_open_and_can_be_aborted(tmp_path, mo
 
     model = BlockingPublicModel()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     async with agent.session(require_workspace_change=False) as session:
         running = asyncio.create_task(session.submit("cancel me"))
         await asyncio.wait_for(model.dispatch_started.wait(), 1)
@@ -290,7 +290,7 @@ async def test_one_shot_stream_does_not_drop_buffered_events_after_session_close
     from agent_runtime.streaming.events import EventType
 
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     events = []
     async for event in agent.stream("slow consumer", require_workspace_change=False):
         events.append(event)
@@ -358,7 +358,7 @@ async def test_session_open_creates_and_reuses_trust_without_manual_init(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     agent = Agent(workspace_path=workspace, checkpoint_db=workspace / "rollout.db", enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     trust_path = registry_path.parent / "binding-trust.json"
     assert not trust_path.exists()
     async with agent.session(require_workspace_change=False):

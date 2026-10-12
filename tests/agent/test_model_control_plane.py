@@ -415,15 +415,15 @@ def test_bundled_catalog_has_no_process_launcher_configuration() -> None:
     assert all("runtime" not in model for model in payload["models"].values())
 
 
-def test_bundled_tool_decision_budget_supports_coding_turns() -> None:
+def test_bundled_budget_defines_current_agent_stage_and_omits_obsolete_stages() -> None:
     payload = yaml.safe_load(Path("configs/models.yaml").read_text(encoding="utf-8"))
-
-    budget = payload["llm_budgets"]["tool_decision"]
-    assert budget["max_input_tokens"] == 32_000
-    assert budget["max_output_tokens"] == 4_096
-    default = DEFAULT_LLM_STAGE_BUDGETS[LLMCallStage.TOOL_DECISION]
-    assert default.max_input_tokens == 32_000
-    assert default.max_output_tokens == 4_096
+    budget = payload["llm_budgets"]["agent_step"]
+    assert budget["max_input_tokens"] is None
+    assert budget["max_output_tokens"] == 32_768
+    default = DEFAULT_LLM_STAGE_BUDGETS[LLMCallStage.AGENT_STEP]
+    assert default.max_input_tokens is None
+    assert default.max_output_tokens == 32_768
+    assert "tool_decision" not in payload["llm_budgets"]
 
 
 def test_env_loader_uses_shared_env_for_linked_worktree(

@@ -330,6 +330,9 @@ class _StaticHarnessModel:
             usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
         )
 
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
 
 @pytest.mark.anyio
 async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> None:
@@ -340,7 +343,7 @@ async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> 
         checkpoint_db=tmp_path / "rollout.sqlite3",
         workspace_path=workspace,
     )
-    agent._harness_model = _StaticHarnessModel
+    agent._model_factory = _StaticHarnessModel
 
     await agent.run(
         "hello",

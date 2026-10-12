@@ -457,14 +457,14 @@ def test_valid_data_inspection_verifies_the_changed_artifact(tmp_path: Path) -> 
         assert decision.action == "accept"
 
 
-def test_inline_python_assert_is_verification_but_assert_text_is_not() -> None:
+def test_inline_python_source_alone_does_not_attest_assertion_execution() -> None:
     assert classify_tool_verification(
         tool_name="run_command",
         arguments={
             "command": "python3 -c \"from calculator import add; assert add(2, 3) == 5\""
         },
         structured_content={"exit_code": 0},
-    ) is not None
+    ) is None
     assert classify_tool_verification(
         tool_name="run_command",
         arguments={"command": "python3 -c \"print('assert add(2, 3) == 5')\""},

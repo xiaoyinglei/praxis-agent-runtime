@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import hashlib
 import re
 import tempfile
@@ -50,6 +51,8 @@ class SmokeResult:
     event_lines: tuple[str, ...] = ()
     workspace_diff: str = ""
     error: str = ""
+    validation_status: str = "not_evaluated"
+    validation_scope: str | None = None
 
 
 def build_cases() -> tuple[SmokeCase, ...]:
@@ -160,39 +163,43 @@ def _response(
     )
 
 
-async def _run_case(case: SmokeCase) -> SmokeResult:
+async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> SmokeResult:
     with tempfile.TemporaryDirectory(prefix=f"praxis-{case.name}-") as temp:
         root = Path(temp)
         workspace = root / "workspace"
         workspace.mkdir()
         if case.name == "praxis_demo":
             (workspace / "fixture.py").write_text("value = 'before'\n", encoding="utf-8")
+        before = (workspace / "fixture.py").read_text() if case.name == "praxis_demo" else ""
         agent = Agent(
             checkpoint_db=root / "rollout.sqlite3",
             workspace_path=workspace,
         )
-        model = _SmokeModel(case)
-        agent.__dict__["_harness_model"] = lambda: model
+        model = model or _SmokeModel(case)
+        agent.__dict__["_model_factory"] = lambda: model
         result = await agent.run(
             case.task,
             allow_write_tools=True,
-            require_workspace_change=False,
+            require_workspace_change=case.name != "direct_answer",
+            max_turns=6,
         )
-        if result.status == "paused":
+        while result.status == "paused":
             result = await agent.resume(result.turn_id, "allow_once")
+        after = (workspace / "fixture.py").read_text() if case.name == "praxis_demo" else ""
         tools = tuple(call.tool_name for call in result.tool_calls)
         expected_answer = "4" if case.name == "direct_answer" else "praxis demo complete"
         passed = (
             result.status == "done"
             and result.answer == expected_answer
             and tools == case.expected_tools
+            and (case.name == "direct_answer" or (
+                after == "value = 'after'\n" and after != before
+                and result.validation_status == "passed" and result.validation_scope == "workspace_change"
+            ))
         )
         event_lines = _v2_event_lines(result)
-        diff = (
-            "--- a/fixture.py\n+++ b/fixture.py\n@@ -1 +1 @@\n-before\n+after\n"
-            if case.name == "praxis_demo"
-            else ""
-        )
+        diff = "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                          fromfile="a/fixture.py", tofile="b/fixture.py"))
         return SmokeResult(
             name=case.name,
             passed=passed,
@@ -202,6 +209,8 @@ async def _run_case(case: SmokeCase) -> SmokeResult:
             event_lines=event_lines,
             workspace_diff=diff,
             error="" if passed else "public Harness result did not match the smoke contract",
+            validation_status=result.validation_status,
+            validation_scope=result.validation_scope,
         )
 
 

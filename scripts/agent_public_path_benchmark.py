@@ -8,15 +8,22 @@ import asyncio
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_MANIFEST = ROOT / "tests" / "agent" / "fixtures" / "public_path_scenarios_v1.json"
+_CANDIDATE_INDEX = "candidate-source.json"
+_SOURCE_ROOTS = frozenset({"agent_runtime", "rag", "configs", "scripts", "tests"})
+_SOURCE_FILES = frozenset({"pyproject.toml", "uv.lock", "README.md", "LICENSE", ".importlinter"})
 
 _SCHEMA_VERSION = "praxis-public-path-scenarios-v1"
 _RESULT_SCHEMA = "praxis-public-path-result-v1"
@@ -67,7 +74,86 @@ def _canonical_hash(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def load_manifest(path: Path) -> PublicPathManifest:
+
+def _source_path(relative: str) -> bool:
+    path = Path(relative)
+    return (
+        not path.is_absolute()
+        and ".." not in path.parts
+        and "__pycache__" not in path.parts
+        and path.suffix != ".pyc"
+        and (path.parts[0] in _SOURCE_ROOTS or relative in _SOURCE_FILES)
+    )
+
+
+def freeze_candidate(repository: Path, destination: Path) -> dict[str, object]:
+    """Copy actual tracked/untracked release source, without modifying Git."""
+    repository, destination = repository.resolve(), destination.resolve()
+    if destination.is_relative_to(repository):
+        raise ValueError("candidate destination must be outside the source workspace")
+    listed = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=repository, check=True, capture_output=True,
+    )
+    paths = sorted({part.decode() for part in listed.stdout.split(b"\0") if part})
+    files: dict[str, str] = {}
+    contents: dict[str, bytes] = {}
+    for relative in paths:
+        if not _source_path(relative):
+            continue
+        source = repository / relative
+        if source.is_symlink():
+            raise ValueError(f"candidate source cannot be a symlink: {relative}")
+        if not source.is_file():
+            continue  # A tracked deletion is reflected in the frozen file set.
+        contents[relative] = source.read_bytes()
+        files[relative] = hashlib.sha256(contents[relative]).hexdigest()
+    if not files:
+        raise ValueError("candidate source contains no release files")
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repository, check=True, capture_output=True,
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=False, capture_output=True, text=True,
+    )
+    identity: dict[str, object] = {
+        "schema_version": "praxis-candidate-source-v1",
+        "source_sha256": _canonical_hash(files),
+        "git_head": head.stdout.strip() if head.returncode == 0 else None,
+        "git_dirty": bool(status.stdout),
+        "files": files,
+    }
+    destination.mkdir(parents=True, exist_ok=False)
+    for relative, content in contents.items():
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+    # Fail if the source changed while copying, rather than claim a coherent snapshot.
+    for relative, content in contents.items():
+        if (repository / relative).read_bytes() != content:
+            raise ValueError(f"source changed while freezing: {relative}")
+    _write_json_atomic(destination / _CANDIDATE_INDEX, identity)
+    return verify_candidate(destination)
+
+
+def verify_candidate(root: Path) -> dict[str, object]:
+    identity = json.loads((root / _CANDIDATE_INDEX).read_text(encoding="utf-8"))
+    if identity.get("schema_version") != "praxis-candidate-source-v1":
+        raise ValueError("unsupported candidate source schema")
+    actual: dict[str, str] = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root).as_posix()
+        if not _source_path(relative):
+            continue
+        if path.is_symlink():
+            raise ValueError(f"candidate source changed to symlink: {relative}")
+        if path.is_file():
+            actual[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    if identity.get("files") != actual or identity.get("source_sha256") != _canonical_hash(actual):
+        raise ValueError("candidate source changed after freeze")
+    return dict(identity)
+
+def load_manifest(path: Path = DEFAULT_MANIFEST) -> PublicPathManifest:
     raw: Any = json.loads(path.read_text(encoding="utf-8"))
     payload = _mapping(raw, field="manifest")
     if payload.get("schema_version") != _SCHEMA_VERSION:
@@ -227,13 +313,13 @@ def _run_process(
     cwd: Path,
     timeout_seconds: int = 900,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        command,
-        cwd=cwd,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=timeout_seconds,
+    from scripts.agent_code_benchmark import _redact_secrets, _run_command
+
+    # Reuse the maintained group cleanup and timeout behavior, so a failed
+    # live trial still produces evidence and cannot leave tool children alive.
+    result = _run_command(command, cwd=cwd, timeout_seconds=timeout_seconds)
+    return subprocess.CompletedProcess(
+        list(command), result.returncode, _redact_secrets(result.stdout), _redact_secrets(result.stderr),
     )
 
 
@@ -267,6 +353,7 @@ def _resume_until_terminal(
     workspace: Path,
     checkpoint: Path,
     allowed_approval_effects: frozenset[str],
+    timeout_seconds: int = 900,
 ) -> tuple[subprocess.CompletedProcess[str], tuple[subprocess.CompletedProcess[str], ...]]:
     attempts: list[subprocess.CompletedProcess[str]] = [initial]
     current = initial
@@ -298,6 +385,7 @@ def _resume_until_terminal(
                 "--verbose",
             ],
             cwd=workspace,
+            timeout_seconds=timeout_seconds,
         )
         attempts.append(current)
     return current, tuple(attempts)
@@ -351,6 +439,8 @@ def _run_crash_recovery(
     checkpoint: Path,
     model_session: Path,
     run_directory: Path,
+    max_turns: int = 30,
+    timeout_seconds: int = 900,
 ) -> tuple[
     subprocess.CompletedProcess[str],
     tuple[subprocess.CompletedProcess[str], ...],
@@ -376,8 +466,11 @@ def _run_crash_recovery(
             scenario.prompt,
             "--turn-file",
             str(turn_file),
+            "--max-turns",
+            str(max_turns),
         ],
         cwd=workspace,
+        timeout_seconds=timeout_seconds,
     )
     if crashed.returncode != 97 or not turn_file.is_file():
         return crashed, (crashed,), 0, False, None
@@ -394,6 +487,7 @@ def _run_crash_recovery(
             "--verbose",
         ],
         cwd=workspace,
+        timeout_seconds=timeout_seconds,
     )
     terminal, resumed = _resume_until_terminal(
         initial=recovery,
@@ -401,6 +495,7 @@ def _run_crash_recovery(
         workspace=workspace,
         checkpoint=checkpoint,
         allowed_approval_effects=_SCENARIO_APPROVAL_EFFECTS,
+        timeout_seconds=timeout_seconds,
     )
     return terminal, (crashed, *resumed), len(resumed) - 1, True, turn_id
 
@@ -412,6 +507,8 @@ def run_scenario(
     model: str,
     agent_command: Sequence[str],
     artifacts_root: Path,
+    max_turns: int = 30,
+    timeout_seconds: int = 900,
 ) -> tuple[dict[str, object], Path]:
     if repetition < 1:
         raise ValueError("repetition must be positive")
@@ -440,7 +537,7 @@ def run_scenario(
         "--model-session-path",
         str(model_session),
         "--max-turns",
-        "30",
+        str(max_turns),
         "--non-interactive",
         "--require-workspace-change",
         "--verbose",
@@ -452,25 +549,27 @@ def run_scenario(
     recovered_turn_id: str | None
     if scenario.mode == "direct":
         command.extend(("--allow-write-tools", "--allow-execute-tools"))
-        initial = _run_process(command, cwd=workspace)
+        initial = _run_process(command, cwd=workspace, timeout_seconds=timeout_seconds)
         terminal, attempts = _resume_until_terminal(
             initial=initial,
             agent_command=agent_command,
             workspace=workspace,
             checkpoint=checkpoint,
             allowed_approval_effects=_SCENARIO_APPROVAL_EFFECTS,
+            timeout_seconds=timeout_seconds,
         )
         approval_count = len(attempts) - 1
         crash_observed = False
         recovered_turn_id = None
     elif scenario.mode == "approval":
-        initial = _run_process(command, cwd=workspace)
+        initial = _run_process(command, cwd=workspace, timeout_seconds=timeout_seconds)
         terminal, attempts = _resume_until_terminal(
             initial=initial,
             agent_command=agent_command,
             workspace=workspace,
             checkpoint=checkpoint,
             allowed_approval_effects=_SCENARIO_APPROVAL_EFFECTS,
+            timeout_seconds=timeout_seconds,
         )
         approval_count = len(attempts) - 1
         crash_observed = False
@@ -490,6 +589,8 @@ def run_scenario(
             checkpoint=checkpoint,
             model_session=model_session,
             run_directory=run_directory,
+            max_turns=max_turns,
+            timeout_seconds=timeout_seconds,
         )
     stdout = "\n\n".join(attempt.stdout for attempt in attempts)
     stderr = "\n\n".join(attempt.stderr for attempt in attempts)
@@ -571,6 +672,8 @@ def run_benchmark(
     *,
     agent_command: Sequence[str],
     artifacts_root: Path,
+    max_turns: int = 30,
+    timeout_seconds: int = 900,
 ) -> tuple[dict[str, object], tuple[Path, ...]]:
     results: list[dict[str, object]] = []
     paths: list[Path] = []
@@ -582,9 +685,15 @@ def run_benchmark(
                 model=manifest.model,
                 agent_command=agent_command,
                 artifacts_root=artifacts_root,
+                max_turns=max_turns,
+                timeout_seconds=timeout_seconds,
             )
             results.append(result)
             paths.append(path)
+            print(
+                f"[public-path] {scenario.scenario_id} {repetition}/{manifest.repetitions}: {result['status']}",
+                file=sys.stderr, flush=True,
+            )
     return evaluate_results(manifest, results), tuple(paths)
 
 
@@ -595,6 +704,7 @@ def _write_release_evidence(
     manifest: PublicPathManifest,
     summary: Mapping[str, object],
     result_paths: Sequence[Path],
+    execution: Mapping[str, object],
 ) -> None:
     root = artifacts_root.expanduser().resolve()
     expanded = path.expanduser()
@@ -618,6 +728,7 @@ def _write_release_evidence(
             "schema_version": _EVIDENCE_SCHEMA,
             "manifest_fingerprint": manifest.fingerprint,
             "model": manifest.model,
+            "execution": dict(execution),
             "results": records,
             "gate": dict(summary),
         },
@@ -627,13 +738,20 @@ def _write_release_evidence(
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-public-path-benchmark")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    freeze = subparsers.add_parser("freeze", help="Freeze actual candidate source outside this checkout.")
+    freeze.add_argument("--repository", type=Path, default=ROOT)
+    freeze.add_argument("--destination", type=Path, required=True)
     validate = subparsers.add_parser("validate")
-    validate.add_argument("manifest", type=Path)
+    validate.add_argument("manifest", nargs="?", type=Path, default=DEFAULT_MANIFEST)
     run = subparsers.add_parser("run")
-    run.add_argument("manifest", type=Path)
+    run.add_argument("manifest", nargs="?", type=Path, default=DEFAULT_MANIFEST)
     run.add_argument("--artifacts-root", type=Path)
     run.add_argument("--evidence-artifact", type=Path, required=True)
     run.add_argument("--agent-command", default="current-runtime")
+    run.add_argument("--model", help="Configured model alias; preserved in evidence.")
+    run.add_argument("--env-file", type=Path, default=Path(".env"))
+    run.add_argument("--max-turns", type=int, default=30)
+    run.add_argument("--timeout-seconds", type=int, default=900)
     gate = subparsers.add_parser("gate")
     gate.add_argument("manifest", type=Path)
     gate.add_argument("results", nargs="+", type=Path)
@@ -644,35 +762,37 @@ def _build_parser() -> argparse.ArgumentParser:
     crash.add_argument("--model", required=True)
     crash.add_argument("--prompt", required=True)
     crash.add_argument("--turn-file", type=Path, required=True)
+    crash.add_argument("--max-turns", type=int, default=30)
     return parser
 
 
 def _crash_child(args: argparse.Namespace) -> int:
-    from agent_runtime.agent import Agent
+    from agent_runtime import Agent
 
-    def listener(record: object) -> None:
-        turn_id = getattr(record, "turn_id", None)
-        if isinstance(turn_id, str) and turn_id:
-            args.turn_file.parent.mkdir(parents=True, exist_ok=True)
-            with args.turn_file.open("w", encoding="utf-8") as stream:
-                stream.write(turn_id)
-                stream.flush()
-                os.fsync(stream.fileno())
-        if getattr(record, "record_type", None) != "item_completed":
-            return
-        payload = getattr(record, "payload", None)
-        if not isinstance(payload, Mapping):
-            return
-        item_payload = payload.get("payload")
-        if not isinstance(item_payload, Mapping):
-            return
-        tool_calls = item_payload.get("tool_calls")
-        if (
-            isinstance(tool_calls, Sequence)
-            and not isinstance(tool_calls, (str, bytes))
-            and bool(tool_calls)
-        ):
-            os._exit(97)
+    class CrashAfterModelToolCall:
+        def __init__(self) -> None:
+            self.turn_recorded = False
+
+        async def emit(self, event: object) -> None:
+            turn_id = getattr(event, "turn_id", None)
+            if not self.turn_recorded and isinstance(turn_id, str) and turn_id:
+                args.turn_file.parent.mkdir(parents=True, exist_ok=True)
+                with args.turn_file.open("w", encoding="utf-8") as stream:
+                    stream.write(turn_id)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                self.turn_recorded = True
+            if (getattr(event, "type", None) != "item_completed"
+                    or getattr(event, "item_kind", None) != "agent_message"):
+                return
+            data = getattr(event, "data", None)
+            if not isinstance(data, Mapping):
+                return
+            tool_calls = data.get("tool_calls")
+            if isinstance(tool_calls, Sequence) and not isinstance(tool_calls, (str, bytes)) and tool_calls:
+                # Public completion is emitted from committed model output,
+                # before execution continues to the requested tools.
+                os._exit(97)
 
     agent = Agent(
         model=args.model,
@@ -683,9 +803,9 @@ def _crash_child(args: argparse.Namespace) -> int:
     asyncio.run(
         agent.run(
             args.prompt,
-            max_turns=30,
+            max_turns=args.max_turns,
             require_workspace_change=True,
-            _record_listener=listener,
+            event_sink=CrashAfterModelToolCall(),
         )
     )
     return 3
@@ -696,6 +816,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "crash-child":
         return _crash_child(args)
     try:
+        if args.command == "freeze":
+            identity = freeze_candidate(args.repository, args.destination)
+            print(json.dumps({"source_sha256": identity["source_sha256"], "git_dirty": identity["git_dirty"]}))
+            return 0
         manifest = load_manifest(args.manifest)
         if args.command == "validate":
             payload: Mapping[str, object] = {
@@ -706,6 +830,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             exit_code = 0
         elif args.command == "run":
+            import agent_runtime
+            from agent_runtime.core.llm_registry import ModelRegistry
+
+            source = verify_candidate(ROOT)
+            if not Path(agent_runtime.__file__).resolve().is_relative_to(ROOT):
+                raise ValueError("running runtime does not belong to frozen candidate; set PYTHONPATH")
+            if args.max_turns < 1 or args.timeout_seconds < 1:
+                raise ValueError("run budgets must be positive")
+            if args.model:
+                manifest = replace(manifest, model=args.model)
+            registry = ModelRegistry.from_env(str(args.env_file))
+            definition = registry.get_model_definition(manifest.model)
+            execution: dict[str, object] = {
+                "kind": "configured_live_model" if args.agent_command == "current-runtime" else "external_command",
+                "source": source,
+                "source_unchanged": False,
+                "platform": platform.platform(),
+                "python": platform.python_version(),
+                "provider": definition.provider_name or definition.provider.value,
+                "model_id": definition.model_id,
+                "definition_revision": definition.definition_revision,
+                "max_turns": args.max_turns,
+                "timeout_seconds_per_process": args.timeout_seconds,
+            }
             artifacts_root = args.artifacts_root
             if artifacts_root is None:
                 configured = os.environ.get("PRAXIS_ACCEPTANCE_ARTIFACT_ROOT")
@@ -715,17 +863,25 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "PRAXIS_ACCEPTANCE_ARTIFACT_ROOT"
                     )
                 artifacts_root = Path(configured)
+            if artifacts_root.resolve().is_relative_to(ROOT):
+                raise ValueError("run artifacts must be outside frozen candidate")
             summary, result_paths = run_benchmark(
                 manifest,
                 agent_command=_resolve_agent_command(args.agent_command),
                 artifacts_root=artifacts_root,
+                max_turns=args.max_turns,
+                timeout_seconds=args.timeout_seconds,
             )
+            if verify_candidate(ROOT) != source:
+                raise ValueError("candidate source changed during evaluation")
+            execution["source_unchanged"] = True
             _write_release_evidence(
                 path=args.evidence_artifact,
                 artifacts_root=artifacts_root,
                 manifest=manifest,
                 summary=summary,
                 result_paths=result_paths,
+                execution=execution,
             )
             payload = summary
             exit_code = 0 if summary["release_ready"] else 1

@@ -210,19 +210,6 @@ DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
         max_input_tokens=None,
         max_output_tokens=32_768,
     ),
-    LLMCallStage.GOAL_CONTRACT: LLMStageBudget(
-        max_input_tokens=3_000,
-        max_output_tokens=512,
-        safety_margin_tokens=256,
-    ),
-    LLMCallStage.RETRIEVAL_HINT: LLMStageBudget(
-        max_input_tokens=2_000,
-        max_output_tokens=256,
-    ),
-    LLMCallStage.TOOL_DECISION: LLMStageBudget(
-        max_input_tokens=32_000,
-        max_output_tokens=4_096,
-    ),
     LLMCallStage.RETRIEVAL_SUMMARY: LLMStageBudget(
         max_input_tokens=6_000,
         max_output_tokens=1_024,
@@ -231,20 +218,12 @@ DEFAULT_LLM_STAGE_BUDGETS: dict[LLMCallStage, LLMStageBudget] = {
         max_input_tokens=16_000,
         max_output_tokens=2_048,
     ),
-    LLMCallStage.LLM_COMPARE: LLMStageBudget(
-        max_input_tokens=20_000,
-        max_output_tokens=3_072,
-    ),
     LLMCallStage.LLM_GENERATE: LLMStageBudget(
         max_input_tokens=16_000,
         max_output_tokens=3_072,
     ),
     LLMCallStage.RAG_ANSWER: LLMStageBudget(
         max_input_tokens=16_000,
-        max_output_tokens=4_096,
-    ),
-    LLMCallStage.FINAL_SYNTHESIS: LLMStageBudget(
-        max_input_tokens=24_000,
         max_output_tokens=4_096,
     ),
 }

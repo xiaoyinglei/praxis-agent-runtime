@@ -1,4 +1,6 @@
 from agent_runtime.builtin.generic import GENERIC_SYSTEM_PROMPT
+from agent_runtime.tools.builtins.shell import create_run_command_tool
+from agent_runtime.workspace import WorkspaceRuntime
 
 
 def test_system_prompt_exposes_completion_as_a_final_response_not_a_tool() -> None:
@@ -6,11 +8,10 @@ def test_system_prompt_exposes_completion_as_a_final_response_not_a_tool() -> No
 
     assert "There is no `finish` tool" in normalized
     assert "return a non-empty final answer with zero tool calls" in normalized
-    assert (
-        "running a pytest file with `python` does not execute its tests"
-        in normalized.lower()
-    )
-    assert (
-        "use `pytest -q` from the workspace virtual environment"
-        in normalized.lower()
-    )
+
+
+def test_verifier_invocation_guidance_is_owned_by_the_tool(tmp_path) -> None:
+    description = create_run_command_tool(WorkspaceRuntime(root=tmp_path, is_temporary=False)).definition.description
+    assert "Running a pytest file with python does not execute its tests" in description
+    assert "execute_python" in description
+    assert "pytest -q" not in GENERIC_SYSTEM_PROMPT

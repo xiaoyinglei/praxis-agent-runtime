@@ -574,7 +574,7 @@ class Session:
         from agent_runtime.builtin.generic import coding_instructions
         from agent_runtime.harness.model_adapter import ControlPlaneHarnessModel
 
-        override = agent.__dict__.get("_harness_model")
+        override = agent._model_factory
         model = (
             override()
             if callable(override)
@@ -604,9 +604,7 @@ class Session:
 
     async def _prepare_step_binding(self, binding: Mapping[str, Any]) -> None:
         if self.model_control_plane is None or "authentication_schema_version" not in binding:
-            validator = getattr(self.model, "ensure_available", None)
-            if callable(validator):
-                validator(binding, thread_id=binding["thread_id"], turn_id=binding["turn_id"])
+            self.model.ensure_available(binding, thread_id=binding["thread_id"], turn_id=binding["turn_id"])
             return
         from agent_runtime.local_runtime import ensure_local_provider_ready
 

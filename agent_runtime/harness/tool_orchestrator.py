@@ -748,41 +748,9 @@ class ToolOrchestrator:
                 execution_context.denied_tool_call_ids | (set() if approved else {call.tool_call_id})
             ),
         )
-        active_record: ToolExecutionRecord | None = None
-
-        async def persist(updated: ToolExecutionRecord) -> None:
-            nonlocal active_record
-            await self._persist_execution_record(
-                turn_id=turn_id,
-                tool=tool,
-                record=updated,
-            )
-            if updated.status is ExecutionStatus.STARTED:
-                active_record = updated
-
-        async def publish_progress(progress: ToolProgress) -> None:
-            if active_record is None:
-                raise RuntimeError("tool progress arrived before the durable claim")
-            await self._publish_tool_progress(
-                turn_id=turn_id,
-                record=active_record,
-                progress=progress,
-            )
-
-        execution = await self._execute_in_turn(
-            turn_id,
-            call,
-            context=context,
-            record=record,
-            record_sink=persist,
-            progress_sink=publish_progress,
+        return await self._execute_approved_record(
+            turn_id=turn_id, call=call, tool=tool, context=context, record=record,
         )
-        await self._commit_execution_result(
-            turn_id=turn_id,
-            call=call,
-            execution=execution,
-        )
-        return execution.result
 
     async def recover_resolved_approval(self, *, turn_id: str) -> ToolResult:
         """Execute one approved ready operation after a pre-execute crash."""
@@ -852,6 +820,20 @@ class ToolOrchestrator:
             approved_tool_call_ids=(execution_context.approved_tool_call_ids | {call.tool_call_id}),
             denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
         )
+        return await self._execute_approved_record(
+            turn_id=turn_id, call=call, tool=tool, context=context, record=record,
+        )
+
+    async def _execute_approved_record(
+        self,
+        *,
+        turn_id: str,
+        call: ToolCall,
+        tool: Tool,
+        context: ToolExecutionContext,
+        record: ToolExecutionRecord,
+    ) -> ToolResult:
+        """Execute and publish after the caller has validated its approval scope."""
         active_record: ToolExecutionRecord | None = None
 
         async def persist(updated: ToolExecutionRecord) -> None:

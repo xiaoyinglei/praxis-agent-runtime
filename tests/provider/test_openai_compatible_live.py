@@ -74,7 +74,7 @@ async def test_live_canonical_text_completion() -> None:
     )
 
     result = await _live_gateway().agenerate_model_request(
-        stage=LLMCallStage.TOOL_DECISION,
+        stage=LLMCallStage.AGENT_STEP,
         request=request,
         provider="openai-compatible",
         supports_native_tools=True,
@@ -90,7 +90,7 @@ async def test_live_simulated_streaming_tool_completion() -> None:
     chunks = [
         chunk
         async for chunk in _live_gateway().astream_with_tools(
-            stage=LLMCallStage.TOOL_DECISION,
+            stage=LLMCallStage.AGENT_STEP,
             messages=[
                 {
                     "role": "user",

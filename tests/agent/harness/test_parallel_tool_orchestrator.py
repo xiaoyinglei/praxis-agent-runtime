@@ -293,7 +293,7 @@ async def test_actual_turn_batch_overlap_and_approval_resumes_every_sibling(tmp_
         return {"text": "ok"}
 
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
             if len(self.requests) == 1:
                 return HarnessModelResponse(
                     text="",

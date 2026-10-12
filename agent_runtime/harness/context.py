@@ -845,7 +845,9 @@ def _compaction_message(payload: Mapping[str, Any]) -> HarnessMessage:
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError("committed context compaction payload is malformed") from exc
-    return HarnessMessage(role="context", content=f"Context compaction:\n{content}")
+    return HarnessMessage(
+        role="context", content=f"Context compaction:\n{content}", context_category="continuation_summary"
+    )
 
 
 def _message_size_bytes(message: HarnessMessage) -> int:

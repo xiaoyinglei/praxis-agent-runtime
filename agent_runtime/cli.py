@@ -159,22 +159,6 @@ def _failure_title(stop_reason: str | None) -> str:
     return "错误: Agent 运行失败"
 
 
-def _failure_diagnostics(
-    diagnostics: Sequence[AgentDiagnostic],
-    *,
-    stop_reason: str | None,
-) -> list[AgentDiagnostic]:
-    all_diagnostics = list(diagnostics)
-    if not all_diagnostics:
-        return []
-    if stop_reason:
-        exact = [diagnostic for diagnostic in all_diagnostics if diagnostic.code == stop_reason]
-        if exact:
-            return exact
-    errors = [diagnostic for diagnostic in all_diagnostics if diagnostic.severity == "error"]
-    return errors or all_diagnostics[:1]
-
-
 def _print_diagnostic(diagnostic: AgentDiagnostic) -> None:
     suffix = f", {diagnostic.error_type}" if diagnostic.error_type is not None else ""
     print(f"  [{diagnostic.component}] {diagnostic.code}: {diagnostic.message}{suffix}")
@@ -1324,7 +1308,7 @@ def agent_chat(
     ] = False,
     checkpoint_db: Annotated[
         Path,
-        typer.Option("--checkpoint-db", help="SQLite checkpoint 文件"),
+        typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库"),
     ] = DEFAULT_CHECKPOINT_PATH,
     knowledge_config: Annotated[
         Path | None,
@@ -1347,7 +1331,7 @@ def agent_chat(
     ] = None,
     max_turns: Annotated[
         int | None,
-        typer.Option("--max-turns", min=1, help="每条消息允许的最大模型回合数"),
+        typer.Option("--max-steps", "--max-turns", min=1, help="每条消息允许的最大执行 step 数（旧名 --max-turns）"),
     ] = None,
     allow_write_tools: Annotated[
         bool,
@@ -1457,7 +1441,7 @@ def agent_run(
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
     checkpoint_db: Annotated[
         Path,
-        typer.Option("--checkpoint-db", help="SQLite checkpoint 文件；启用后可跨进程 resume"),
+        typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库；支持跨进程 resume"),
     ] = DEFAULT_CHECKPOINT_PATH,
     model_session_path: Annotated[
         Path,
@@ -1476,7 +1460,7 @@ def agent_run(
     ] = None,
     max_turns: Annotated[
         int | None,
-        typer.Option("--max-turns", min=1, help="本次运行允许的最大模型回合数"),
+        typer.Option("--max-steps", "--max-turns", min=1, help="本次运行允许的最大执行 step 数（旧名 --max-turns）"),
     ] = None,
     model: Annotated[
         str | None,
@@ -1634,7 +1618,7 @@ def agent_resume(
     ] = False,
     checkpoint_db: Annotated[
         Path,
-        typer.Option("--checkpoint-db", help="SQLite checkpoint 文件"),
+        typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库"),
     ] = DEFAULT_CHECKPOINT_PATH,
     action: Annotated[
         str | None,

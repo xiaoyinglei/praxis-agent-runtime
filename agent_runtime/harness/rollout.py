@@ -1026,7 +1026,7 @@ class RolloutStore:
                 producer="runtime",
                 payload={"item_id": item_id, "payload": payload},
             )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def cancel_turn(self, *, turn_id: str) -> TurnSnapshot:
         with self._transaction():
@@ -3234,7 +3234,7 @@ class RolloutStore:
                     "request_id": interaction["request_id"],
                 },
             )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def resolve_tool_approval(
         self,
@@ -3772,7 +3772,7 @@ class RolloutStore:
                         "result_item_id": item_id,
                     },
                 )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def read_tool_operation(self, operation_id: str) -> ToolOperationSnapshot:
         row = self._connection.execute(
@@ -3949,7 +3949,7 @@ class RolloutStore:
                 producer="model",
                 payload={"item_id": item_id, "payload": {"text": answer}},
             )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def record_completion_decision(
         self,
@@ -4003,7 +4003,7 @@ class RolloutStore:
                     },
                 },
             )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def record_completion_feedback(
         self,
@@ -4030,7 +4030,7 @@ class RolloutStore:
                 producer="verifier",
                 payload={"item_id": item_id, "payload": {"text": reason}},
             )
-        return self.list_items(turn_id)[-1]
+        return self._latest_item(turn_id)
 
     def _running_turn_thread_id(self, turn_id: str) -> str:
         turn = self._connection.execute("SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
@@ -4065,6 +4065,14 @@ class RolloutStore:
             "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence", (turn_id,)
         ).fetchall()
         return tuple(_item_snapshot(row) for row in rows)
+
+    def _latest_item(self, turn_id: str) -> ItemSnapshot:
+        row = self._connection.execute(
+            "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence DESC LIMIT 1", (turn_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Turn has no Items: {turn_id}")
+        return _item_snapshot(row)
 
     def read_item(self, item_id: str) -> ItemSnapshot:
         row = self._connection.execute(
@@ -4146,6 +4154,11 @@ class RolloutStore:
         return tuple(_record_snapshot(row) for row in rows)
 
     def projection_hashes(self) -> dict[str, str]:
+        """Return versioned metadata digests, not proof of projection integrity.
+
+        Legacy v1 digests hash projection JSON; v2 digests bind the canonical
+        record prefix. verify() independently checks every projection and blob.
+        """
         rows = self._connection.execute(
             "SELECT thread_id, canonical_hash FROM projection_meta ORDER BY thread_id"
         ).fetchall()
@@ -4154,85 +4167,62 @@ class RolloutStore:
     def verify(self) -> VerificationReport:
         errors: list[str] = []
         expected = ProjectionState()
-        rows = self._connection.execute("SELECT * FROM rollout_records ORDER BY record_id").fetchall()
+        rows = self._connection.execute("SELECT * FROM rollout_records ORDER BY record_id")
+        record_positions: dict[str, dict[str, int]] = {}
+        chain_hashes: dict[str, str] = {}
         for row in rows:
+            thread_id = str(row["thread_id"])
+            record = _record_snapshot(row)
+            chain_hashes[thread_id] = _record_prefix_hash(chain_hashes.get(thread_id), record)
+            record_positions[thread_id] = {
+                "applied_thread_sequence": row["thread_sequence"], "applied_record_id": row["record_id"],
+            }
             payload_json = row["payload_json"]
             if hashlib.sha256(payload_json.encode()).hexdigest() != row["payload_hash"]:
                 errors.append(f"record {row['record_id']} payload hash mismatch")
                 continue
             apply_record(
                 expected,
-                _record_snapshot(row),
+                record,
                 reducer_version=_REDUCER_VERSION,
             )
-        actual_threads = {
-            row["thread_id"]: _thread_row_payload(row) for row in self._connection.execute("SELECT * FROM threads")
-        }
-        actual_turns = {
-            row["turn_id"]: _turn_row_payload(row) for row in self._connection.execute("SELECT * FROM turns")
-        }
-        actual_items = {
-            row["item_id"]: _item_row_payload(row) for row in self._connection.execute("SELECT * FROM items")
-        }
-        actual_model_operations = {
-            row["operation_id"]: _model_operation_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM model_operations")
-        }
-        actual_model_attempts = {
-            row["attempt_id"]: _model_attempt_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM model_attempts")
-        }
-        actual_budget_reservations = {
-            row["reservation_id"]: _budget_reservation_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM budget_reservations")
-        }
-        actual_child_budget_allocations = {
-            row["allocation_id"]: _child_budget_allocation_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM child_budget_allocations")
-        }
-        actual_tool_operations = {
-            row["operation_id"]: _tool_operation_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM tool_operations")
-        }
-        actual_interactions = {
-            row["request_id"]: _interaction_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM interactions")
-        }
-        actual_approvals = {
-            row["request_id"]: _approval_row_payload(row) for row in self._connection.execute("SELECT * FROM approvals")
-        }
-        actual_artifacts = {
-            row["artifact_id"]: _artifact_row_payload(row)
-            for row in self._connection.execute("SELECT * FROM artifacts")
-        }
-        for name, expected_payload, actual_payload in (
-            ("threads", expected.threads, actual_threads),
-            ("turns", expected.turns, actual_turns),
-            ("items", expected.items, actual_items),
-            ("model_operations", expected.model_operations, actual_model_operations),
-            ("model_attempts", expected.model_attempts, actual_model_attempts),
-            ("budget_reservations", expected.budget_reservations, actual_budget_reservations),
-            ("child_budget_allocations", expected.child_budget_allocations, actual_child_budget_allocations),
-            ("tool_operations", expected.tool_operations, actual_tool_operations),
-            ("interactions", expected.interactions, actual_interactions),
-            ("approvals", expected.approvals, actual_approvals),
-            ("artifacts", expected.artifacts, actual_artifacts),
+        # Compare one persisted row at a time, retaining strict canonical JSON
+        # types (True != 1 != 1.0) and detecting missing as well as extra rows.
+        for name, key, row_payload in (
+            ("threads", "thread_id", _thread_row_payload),
+            ("turns", "turn_id", _turn_row_payload),
+            ("items", "item_id", _item_row_payload),
+            ("model_operations", "operation_id", _model_operation_row_payload),
+            ("model_attempts", "attempt_id", _model_attempt_row_payload),
+            ("budget_reservations", "reservation_id", _budget_reservation_row_payload),
+            ("child_budget_allocations", "allocation_id", _child_budget_allocation_row_payload),
+            ("tool_operations", "operation_id", _tool_operation_row_payload),
+            ("interactions", "request_id", _interaction_row_payload),
+            ("approvals", "request_id", _approval_row_payload),
+            ("artifacts", "artifact_id", _artifact_row_payload),
         ):
-            if _canonical_json(expected_payload) != _canonical_json(actual_payload):
+            entities = getattr(expected, name)
+            count, mismatch = 0, False
+            for row in self._connection.execute(f"SELECT * FROM {name}"):
+                count += 1
+                if _canonical_json(entities.get(row[key])) != _canonical_json(row_payload(row)):
+                    mismatch = True
+            if mismatch or count != len(entities):
                 errors.append(f"{name} projection mismatch")
         errors.extend(self._artifact_integrity_errors(expected))
-        record_positions = {
-            row["thread_id"]: {
-                "applied_thread_sequence": row["thread_sequence"],
-                "applied_record_id": row["record_id"],
-            }
-            for row in rows
-        }
+        metadata = {row["thread_id"]: row for row in self._connection.execute("SELECT * FROM projection_meta")}
         expected_metadata = {
             thread_id: {
                 **record_positions[thread_id],
                 "reducer_version": _REDUCER_VERSION,
-                "canonical_hash": _projection_hash(expected, thread_id),
+                "canonical_hash": (
+                    _projection_hash(expected, thread_id)
+                    if thread_id in metadata and _metadata_hash_version(metadata[thread_id]) == 1
+                    else chain_hashes[thread_id]
+                ),
+                "hash_version": (
+                    1 if thread_id in metadata and _metadata_hash_version(metadata[thread_id]) == 1 else 2
+                ),
             }
             for thread_id in expected.threads
         }
@@ -4242,8 +4232,9 @@ class RolloutStore:
                 "applied_record_id": row["applied_record_id"],
                 "reducer_version": row["reducer_version"],
                 "canonical_hash": row["canonical_hash"],
+                "hash_version": _metadata_hash_version(row),
             }
-            for row in self._connection.execute("SELECT * FROM projection_meta")
+            for row in metadata.values()
         }
         if _canonical_json(expected_metadata) != _canonical_json(actual_metadata):
             errors.append("projection metadata mismatch")
@@ -4337,10 +4328,13 @@ class RolloutStore:
                 if hashlib.sha256(payload_json.encode()).hexdigest() != row["payload_hash"]:
                     raise RuntimeError(f"cannot rebuild from corrupt record: {row['record_id']}")
             state = ProjectionState()
+            chain_hashes: dict[str, str] = {}
             for row in rows:
+                record = _record_snapshot(row)
+                chain_hashes[record.thread_id] = _record_prefix_hash(chain_hashes.get(record.thread_id), record)
                 apply_record(
                     state,
-                    _record_snapshot(row),
+                    record,
                     reducer_version=_REDUCER_VERSION,
                 )
             self._connection.execute("DELETE FROM projection_meta")
@@ -4355,7 +4349,30 @@ class RolloutStore:
             self._connection.execute("DELETE FROM items")
             self._connection.execute("DELETE FROM turns")
             self._connection.execute("DELETE FROM threads")
-            self._persist_projection_state(state)
+            self._persist_projection_state(state, chain_hashes=chain_hashes)
+
+    def _upgrade_metadata_hash(self, thread_id: str) -> None:
+        """Upgrade one legacy prefix inside the pending business transaction.
+
+        Never overwrite a legacy mismatch: verify canonical replay, every
+        projection and artifacts before replacing its v1 projection digest.
+        """
+        row = self._connection.execute("SELECT * FROM projection_meta WHERE thread_id = ?", (thread_id,)).fetchone()
+        if row is None or _metadata_hash_version(row) == 2:
+            return
+        if _metadata_hash_version(row) != 1:
+            raise RuntimeError("unsupported Rollout metadata hash version")
+        report = self.verify()
+        if not report.valid:
+            raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(report.errors))
+        digest: str | None = None
+        for record_row in self._connection.execute(
+            "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence", (thread_id,),
+        ):
+            digest = _record_prefix_hash(digest, _record_snapshot(record_row))
+        self._connection.execute(
+            "UPDATE projection_meta SET canonical_hash = ?, hash_version = 2 WHERE thread_id = ?", (digest, thread_id),
+        )
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -4397,6 +4414,7 @@ class RolloutStore:
             "SELECT COALESCE(MAX(thread_sequence), 0) + 1 FROM rollout_records WHERE thread_id = ?",
             (thread_id,),
         ).fetchone()[0]
+        self._upgrade_metadata_hash(thread_id)
         committed_at = datetime.now(UTC)
         committed_at_ms = int(committed_at.timestamp() * 1000)
         cursor = self._connection.execute(
@@ -4423,24 +4441,81 @@ class RolloutStore:
         row = self._connection.execute(
             "SELECT * FROM rollout_records WHERE record_id = ?", (cursor.lastrowid,)
         ).fetchone()
-        state = self._load_projection_state(thread_id)
+        record = _record_snapshot(row)
+        state = self._load_projection_state(thread_id, record=record)
         apply_record(
             state,
-            _record_snapshot(row),
+            record,
             reducer_version=_REDUCER_VERSION,
         )
-        self._persist_projection_state(state)
+        self._persist_projection_state(state, changed_sequence=record.thread_sequence, record=record)
         pending = self._pending_transaction_records
         if pending is None:
             raise RuntimeError("RolloutRecord appended outside a transaction")
-        pending.append(_record_snapshot(row))
+        pending.append(record)
 
-    def _load_projection_state(self, thread_id: str) -> ProjectionState:
+    def _load_projection_state(
+        self, thread_id: str, *, record: RolloutRecord | None = None,
+    ) -> ProjectionState:
         state = ProjectionState()
         thread = self._connection.execute("SELECT * FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
         if thread is None:
             return state
         state.threads[thread_id] = _thread_row_payload(thread)
+        if record is not None:
+            # The reducer only needs referenced entities. Item creation also
+            # needs this Turn's existing Items to derive its next sequence.
+            for table, key, identities, row_payload in (
+                ("turns", "turn_id", (record.turn_id,), _turn_row_payload),
+                ("items", "item_id", (record.payload.get("item_id"),), _item_row_payload),
+                (
+                    "model_operations", "operation_id", (record.payload.get("operation_id"),),
+                    _model_operation_row_payload,
+                ),
+                (
+                    "model_attempts", "attempt_id",
+                    (record.payload.get("attempt_id"), record.payload.get("previous_attempt_id")),
+                    _model_attempt_row_payload,
+                ),
+                (
+                    "budget_reservations", "reservation_id", (record.payload.get("reservation_id"),),
+                    _budget_reservation_row_payload,
+                ),
+                (
+                    "child_budget_allocations", "allocation_id", (record.payload.get("allocation_id"),),
+                    _child_budget_allocation_row_payload,
+                ),
+                ("tool_operations", "operation_id", (record.payload.get("operation_id"),), _tool_operation_row_payload),
+                ("interactions", "request_id", (record.payload.get("request_id"),), _interaction_row_payload),
+                ("approvals", "request_id", (record.payload.get("request_id"),), _approval_row_payload),
+                ("artifacts", "artifact_id", (record.payload.get("artifact_id"),), _artifact_row_payload),
+            ):
+                entities = getattr(state, table)
+                for identity in identities:
+                    if identity is None:
+                        continue
+                    if table == "model_attempts":
+                        row = self._connection.execute(
+                            """
+                            SELECT model_attempts.* FROM model_attempts
+                            JOIN model_operations USING (operation_id)
+                            WHERE attempt_id = ? AND thread_id = ?
+                            """,
+                            (identity, thread_id),
+                        ).fetchone()
+                    else:
+                        row = self._connection.execute(
+                            f"SELECT * FROM {table} WHERE {key} = ? AND thread_id = ?",
+                            (identity, thread_id),
+                        ).fetchone()
+                    if row is not None:
+                        entities[row[key]] = row_payload(row)
+            if record.record_type == "item_started":
+                row = self._connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM items WHERE turn_id = ?", (record.turn_id,),
+                ).fetchone()
+                state.item_sequences[str(record.turn_id)] = int(row["sequence"])
+            return state
         for row in self._connection.execute("SELECT * FROM turns WHERE thread_id = ?", (thread_id,)):
             state.turns[row["turn_id"]] = _turn_row_payload(row)
         for row in self._connection.execute("SELECT * FROM items WHERE thread_id = ?", (thread_id,)):
@@ -4478,7 +4553,22 @@ class RolloutStore:
             state.artifacts[row["artifact_id"]] = _artifact_row_payload(row)
         return state
 
-    def _persist_projection_state(self, state: ProjectionState) -> None:
+    def _persist_projection_state(
+        self, state: ProjectionState, *, changed_sequence: int | None = None,
+        record: RolloutRecord | None = None, chain_hashes: Mapping[str, str] | None = None,
+    ) -> None:
+        if changed_sequence is not None:
+            # Every changed reducer entity advances to the current record's
+            # sequence. Do not UPSERT entities loaded only as dependencies.
+            for entities in (
+                state.threads, state.turns, state.items, state.model_operations,
+                state.model_attempts, state.budget_reservations,
+                state.child_budget_allocations, state.tool_operations,
+                state.interactions, state.approvals, state.artifacts,
+            ):
+                for identity in tuple(entities):
+                    if entities[identity]["applied_thread_sequence"] != changed_sequence:
+                        del entities[identity]
         for thread in state.threads.values():
             self._connection.execute(
                 """
@@ -4818,7 +4908,7 @@ class RolloutStore:
                 ),
             )
         for thread_id, thread in state.threads.items():
-            record = self._connection.execute(
+            position = self._connection.execute(
                 """
                 SELECT record_id, thread_sequence
                 FROM rollout_records
@@ -4828,26 +4918,36 @@ class RolloutStore:
                 """,
                 (thread_id,),
             ).fetchone()
-            if record is None:
+            if position is None:
                 raise RuntimeError(f"projection has no canonical records: {thread_id}")
+            if record is not None:
+                metadata = self._connection.execute(
+                    "SELECT canonical_hash FROM projection_meta WHERE thread_id = ?", (thread_id,),
+                ).fetchone()
+                digest = _record_prefix_hash(metadata["canonical_hash"] if metadata else None, record)
+            elif chain_hashes is not None:
+                digest = chain_hashes[thread_id]
+            else:
+                raise RuntimeError("projection persistence requires a canonical prefix hash")
             self._connection.execute(
                 """
                 INSERT INTO projection_meta (
                     thread_id, applied_thread_sequence, applied_record_id,
-                    reducer_version, canonical_hash
-                ) VALUES (?, ?, ?, ?, ?)
+                    reducer_version, canonical_hash, hash_version
+                ) VALUES (?, ?, ?, ?, ?, 2)
                 ON CONFLICT(thread_id) DO UPDATE SET
                     applied_thread_sequence = excluded.applied_thread_sequence,
                     applied_record_id = excluded.applied_record_id,
                     reducer_version = excluded.reducer_version,
-                    canonical_hash = excluded.canonical_hash
+                    canonical_hash = excluded.canonical_hash,
+                    hash_version = excluded.hash_version
                 """,
                 (
                     thread_id,
                     thread["applied_thread_sequence"],
-                    record["record_id"],
+                    position["record_id"],
                     _REDUCER_VERSION,
-                    _projection_hash(state, thread_id),
+                    digest,
                 ),
             )
 
@@ -5030,7 +5130,8 @@ class RolloutStore:
                 applied_thread_sequence INTEGER NOT NULL,
                 applied_record_id INTEGER NOT NULL,
                 reducer_version INTEGER NOT NULL,
-                canonical_hash TEXT NOT NULL
+                canonical_hash TEXT NOT NULL,
+                hash_version INTEGER NOT NULL DEFAULT 1
             );
             PRAGMA user_version = 1;
             """
@@ -5061,6 +5162,34 @@ class RolloutStore:
             self._connection.execute("ALTER TABLE tool_operations ADD COLUMN effects_json TEXT NOT NULL DEFAULT '[]'")
         if "resources_json" not in tool_operation_columns:
             self._connection.execute("ALTER TABLE tool_operations ADD COLUMN resources_json TEXT NOT NULL DEFAULT '[]'")
+        metadata_columns = {str(row["name"]) for row in self._connection.execute("PRAGMA table_info(projection_meta)")}
+        if "hash_version" not in metadata_columns:
+            self._connection.execute("ALTER TABLE projection_meta ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1")
+
+
+def _metadata_hash_version(row: sqlite3.Row) -> int:
+    # Readonly legacy snapshots have never run schema migration.
+    if "hash_version" not in row.keys():
+        return 1
+    value = row["hash_version"]
+    return value if type(value) is int else 0
+
+
+def _record_prefix_hash(previous: str | None, record: RolloutRecord) -> str:
+    """Version 2 binds the canonical envelope and previous per-thread prefix.
+
+    This is not a digest of projections. Full verify independently replays and
+    compares all projected rows and validates referenced artifact contents.
+    """
+    envelope = {
+        "record_id": record.record_id, "record_uuid": record.record_uuid,
+        "thread_id": record.thread_id, "turn_id": record.turn_id,
+        "thread_sequence": record.thread_sequence, "record_type": record.record_type,
+        "producer": record.producer, "payload_schema_version": record.payload_schema_version,
+        "payload_hash": record.payload_hash, "reducer_version": _REDUCER_VERSION,
+    }
+    encoded = b"praxis-record-prefix-v2\0" + (previous or "0" * 64).encode("ascii")
+    return hashlib.sha256(encoded + b"\0" + _canonical_json(envelope).encode()).hexdigest()
 
 
 def _projection_hash(state: ProjectionState, thread_id: str) -> str:

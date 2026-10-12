@@ -17,6 +17,71 @@ ROOT = Path(__file__).parents[3]
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_agent_rollout.py"
 
 
+@pytest.mark.parametrize("history_size", [1, 12])
+def test_settings_update_does_not_rewrite_historical_projections(
+    tmp_path: Path, history_size: int,
+) -> None:
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=tmp_path)
+        for _ in range(history_size):
+            turn = store.start_turn(
+                thread_id=thread.thread_id,
+                user_message="keep historical projections",
+                binding_manifest={"model_id": "test-model"},
+            )
+            store.complete_turn(turn_id=turn.turn_id, answer="preserved")
+        historical_turns = store.list_turns()
+        historical_items = tuple(store.list_items(turn.turn_id) for turn in historical_turns)
+        statements: list[str] = []
+        store._connection.set_trace_callback(statements.append)
+
+        store.update_session_settings(thread.thread_id, {"model_alias": "new-model"})
+
+        store._connection.set_trace_callback(None)
+        inserts = [statement for statement in statements if statement.lstrip().startswith("INSERT INTO")]
+        assert len(inserts) == 3, inserts
+        assert store.list_turns() == historical_turns
+        assert tuple(store.list_items(turn.turn_id) for turn in historical_turns) == historical_items
+        assert store.verify().valid
+        projection_hashes = store.projection_hashes()
+        store.rebuild_projections()
+        assert store.projection_hashes() == projection_hashes
+        assert store.verify().valid
+
+
+def test_incremental_projection_failure_rolls_back_record_and_changed_entities(tmp_path: Path) -> None:
+    database = tmp_path / "rollout.sqlite3"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=tmp_path)
+        turn = store.start_turn(
+            thread_id=thread.thread_id, user_message="atomic update", binding_manifest={},
+        )
+        records = store.list_records(thread.thread_id)
+        thread_before = store.read_thread(thread.thread_id)
+        hashes = store.projection_hashes()
+        items = store.list_items(turn.turn_id)
+        store._connection.execute(
+            """
+            CREATE TRIGGER reject_projection_commit BEFORE UPDATE ON projection_meta
+            BEGIN SELECT RAISE(ABORT, 'projection write rejected'); END
+            """
+        )
+
+        with pytest.raises(sqlite3.IntegrityError, match="projection write rejected"):
+            store.complete_turn(turn_id=turn.turn_id, answer="must roll back")
+
+        assert store.list_records(thread.thread_id) == records
+        assert store.read_thread(thread.thread_id) == thread_before
+        assert store.read_turn(turn.turn_id) == turn
+        assert store.list_items(turn.turn_id) == items
+        assert store.projection_hashes() == hashes
+        assert store.verify().valid
+        store._connection.execute("DROP TRIGGER reject_projection_commit")
+        store.complete_turn(turn_id=turn.turn_id, answer="committed after retry")
+        assert store.verify().valid
+
+
 def test_committed_mutation_returns_only_records_after_commit(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
     workspace = tmp_path / "workspace"
@@ -91,6 +156,9 @@ def test_projection_corruption_is_detected_and_rebuilt_from_records(tmp_path: Pa
         report = store.verify()
         assert report.valid is False
         assert "items projection mismatch" in report.errors
+
+        store.update_session_settings(thread.thread_id, {"model_alias": "updated after corruption"})
+        assert "items projection mismatch" in store.verify().errors
 
         store.rebuild_projections()
 

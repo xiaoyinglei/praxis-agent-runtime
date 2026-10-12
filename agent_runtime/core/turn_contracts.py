@@ -1,42 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from enum import StrEnum
-from uuid import uuid4
-
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_serializer,
-    model_validator,
-)
-
-from agent_runtime.tools.tool import JsonValue, ToolCall, ToolCallOrigin
-
-
-class ToolCallPlan(BaseModel):
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    tool_call_id: str
-    tool_name: str
-    arguments: dict[str, object]
-    origin: ToolCallOrigin | None = None
-
-    @classmethod
-    def create(
-        cls,
-        tool_name: str,
-        arguments: dict[str, object],
-        *,
-        origin: ToolCallOrigin | None = None,
-    ) -> ToolCallPlan:
-        return cls(
-            tool_call_id=f"tc_{uuid4().hex[:12]}",
-            tool_name=tool_name,
-            arguments=arguments,
-            origin=origin,
-        )
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ToolManifestEntry(BaseModel):
@@ -73,63 +37,4 @@ class ToolManifest(BaseModel):
         return self
 
 
-class ToolManifestDriftStatus(StrEnum):
-    MATCH = "match"
-    RECONCILIATION_REQUIRED = "reconciliation_required"
-    NEW_REVISION_REQUIRED = "new_revision_required"
-
-
-class ToolManifestDriftDecision(BaseModel):
-    model_config = ConfigDict(
-        frozen=True,
-        extra="forbid",
-        arbitrary_types_allowed=True,
-    )
-
-    status: ToolManifestDriftStatus
-    reason: str = Field(min_length=1, max_length=200)
-    toolset_revision: str = Field(min_length=1, max_length=500)
-    active_tool_names: tuple[str, ...]
-    missing_tool_names: tuple[str, ...] = ()
-    changed_tool_names: tuple[str, ...] = ()
-    dependent_tool_calls: tuple[ToolCall, ...] = ()
-    provider_wire_hash_guaranteed: bool
-
-    @field_serializer("dependent_tool_calls")
-    def serialize_dependent_tool_calls(
-        self,
-        calls: tuple[ToolCall, ...],
-    ) -> list[dict[str, object]]:
-        return [
-            {
-                "tool_call_id": call.tool_call_id,
-                "tool_name": call.tool_name,
-                "arguments": _plain_tool_json(call.arguments),
-                "origin": {
-                    "request_id": call.origin.request_id,
-                    "toolset_revision": call.origin.toolset_revision,
-                    "exposed_tool_names": list(call.origin.exposed_tool_names),
-                },
-            }
-            for call in calls
-        ]
-
-
-def _plain_tool_json(value: JsonValue) -> object:
-    if isinstance(value, Mapping):
-        return {
-            key: _plain_tool_json(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, tuple):
-        return [_plain_tool_json(item) for item in value]
-    return value
-
-
-__all__ = [
-    "ToolCallPlan",
-    "ToolManifest",
-    "ToolManifestDriftDecision",
-    "ToolManifestDriftStatus",
-    "ToolManifestEntry",
-]
+__all__ = ["ToolManifest", "ToolManifestEntry"]

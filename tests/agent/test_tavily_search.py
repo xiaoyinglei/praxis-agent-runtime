@@ -220,12 +220,12 @@ async def test_tavily_sdk_resume_preserves_provider_and_never_persists_key(tmp_p
     options = dict(workspace_path=tmp_path / "workspace", checkpoint_db=tmp_path / "state.sqlite",
                    enable_workspace_mcp=False, web_search_provider="tavily", web_search_key_file=key)
     first = Agent(**options)
-    monkeypatch.setattr(first, "_harness_model", lambda: FetchThenAnswer({"query": "public jobs"}, "web_search"))
+    monkeypatch.setattr(first, "_model_factory", lambda: FetchThenAnswer({"query": "public jobs"}, "web_search"))
     paused = await first.run("Search public jobs", require_workspace_change=False)
     assert paused.status == "paused"
     assert requests == []
     second = Agent(**options)
-    monkeypatch.setattr(second, "_harness_model", lambda: FetchThenAnswer({"query": "public jobs"}, "web_search"))
+    monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"query": "public jobs"}, "web_search"))
     result = await second.resume(paused.turn_id, "allow_once")
     assert result.status == "done"
     assert len(requests) == 1

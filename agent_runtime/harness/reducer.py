@@ -43,6 +43,8 @@ class ProjectionState:
     interactions: dict[str, dict[str, Any]] = field(default_factory=dict)
     approvals: dict[str, dict[str, Any]] = field(default_factory=dict)
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Transient replay bookkeeping, not a persisted projection or hash input.
+    item_sequences: dict[str, int] = field(default_factory=dict)
 
 
 def apply_record(
@@ -487,11 +489,13 @@ def apply_record(
         case "item_started":
             item_id = payload["item_id"]
             turn_id = _turn_id(record)
+            item_sequence = state.item_sequences.get(turn_id, 0) + 1
+            state.item_sequences[turn_id] = item_sequence
             state.items[item_id] = {
                 "item_id": item_id,
                 "thread_id": thread_id,
                 "turn_id": turn_id,
-                "sequence": sum(item["turn_id"] == turn_id for item in state.items.values()) + 1,
+                "sequence": item_sequence,
                 "kind": payload["kind"],
                 "status": "started",
                 "producer": record.producer,

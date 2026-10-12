@@ -77,6 +77,8 @@ models:
   # DeepSeek V4.1 Flash, official API identifier as of 2026-09-21.
   deepseek-flash:
     capability: chat
+    # Continuation memory uses this explicit wire role, frozen per Turn.
+    continuation_summary_role: assistant
     provider: deepseek
     tokenizer_model: deepseek-v4-official
     context_window_tokens: 1048576
@@ -222,21 +224,6 @@ llm_budgets:
     max_output_tokens: 32768
     safety_margin_tokens: 512
 
-  goal_contract:
-    max_input_tokens: 3000
-    max_output_tokens: 512
-    safety_margin_tokens: 256
-
-  retrieval_hint:
-    max_input_tokens: 2000
-    max_output_tokens: 256
-    safety_margin_tokens: 512
-
-  tool_decision:
-    max_input_tokens: 32000
-    max_output_tokens: 4096
-    safety_margin_tokens: 512
-
   retrieval_summary:
     max_input_tokens: 6000
     max_output_tokens: 1024
@@ -247,11 +234,6 @@ llm_budgets:
     max_output_tokens: 2048
     safety_margin_tokens: 512
 
-  llm_compare:
-    max_input_tokens: 20000
-    max_output_tokens: 3072
-    safety_margin_tokens: 512
-
   llm_generate:
     max_input_tokens: 16000
     max_output_tokens: 3072
@@ -259,11 +241,6 @@ llm_budgets:
 
   rag_answer:
     max_input_tokens: 16000
-    max_output_tokens: 4096
-    safety_margin_tokens: 512
-
-  final_synthesis:
-    max_input_tokens: 24000
     max_output_tokens: 4096
     safety_margin_tokens: 512
 

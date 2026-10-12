@@ -137,7 +137,7 @@ async def test_agent_executor_fetch_uses_proxy_and_records_mode(tmp_path, monkey
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7892")
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "state.sqlite", enable_workspace_mcp=False)
     model = FetchThenAnswer({"url": "https://github.com/xiaoyinglei/praxis-agent-runtime"})
-    monkeypatch.setattr(agent, "_harness_model", lambda: model)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9000")
     result = await agent.run("Read my project", allow_web_tools=True, require_workspace_change=False)
     with RolloutStore(agent.checkpoint_db) as store:

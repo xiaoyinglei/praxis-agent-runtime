@@ -207,6 +207,7 @@ class ModelExecutionDefinition(BaseModel):
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
     context_capacity_policy: ContextCapacityPolicy | None = None
+    continuation_summary_role: Literal["context", "assistant"] | None = None
 
     @model_serializer(mode="wrap")
     def serialize_definition(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
@@ -214,6 +215,8 @@ class ModelExecutionDefinition(BaseModel):
         # Legacy archives and authenticated bindings must retain exact bytes.
         if self.context_capacity_policy is None:
             payload.pop("context_capacity_policy", None)
+        if self.continuation_summary_role is None:
+            payload.pop("continuation_summary_role", None)
         return dict(payload)
 
     @field_validator("base_url")
@@ -270,53 +273,27 @@ def build_model_execution_definition(
     spec: ModelSpec,
     config: AgentModelsConfig,
 ) -> ModelExecutionDefinition:
-    runtime = spec.runtime
-
     endpoint = normalize_model_endpoint(
         provider=spec.provider,
         base_url=spec.base_url,
         location=spec.location,
     )
-
-    return ModelExecutionDefinition(
-        provider=spec.provider,
-        provider_name=spec.provider_name,
-        protocol=spec.protocol,
+    # The validated declaration owns shared field names. Freeze once here;
+    # generation/budget policies and normalized identity belong to this boundary.
+    payload = spec.model_dump(mode="python")
+    payload.update(
         model_id=model_id,
-        tokenizer_model=(spec.tokenizer_model or model_id),
-        context_window_tokens=(spec.context_window_tokens),
-        max_output_tokens=(spec.max_output_tokens),
-        timeout_seconds=spec.timeout_seconds,
+        tokenizer_model=spec.tokenizer_model or model_id,
         base_url=endpoint.base_url,
-        api_key_env=spec.api_key_env,
-        defaults=(RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults))),
-        supports_tools=spec.supports_tools,
-        supports_structured_output=(spec.supports_structured_output),
         location=endpoint.location,
-        input_cost_per_1m=spec.input_cost_per_1m,
-        output_cost_per_1m=spec.output_cost_per_1m,
-        cache_read_cost_per_1m=(spec.cache_read_cost_per_1m),
-        cache_write_cost_per_1m=(spec.cache_write_cost_per_1m),
-        runtime=(
-            RuntimeDefinition(
-                health_url=runtime.health_url,
-                launch_command=runtime.launch_command,
-                expected_model_contains=(runtime.expected_model_contains),
-                startup_timeout_seconds=(runtime.startup_timeout_seconds),
-                poll_interval_seconds=(runtime.poll_interval_seconds),
-            )
-            if runtime is not None
-            else None
-        ),
+        defaults=RequestDefaultsDefinition.model_validate(deepcopy(spec.defaults)),
         generation=_generation_definition(config.generation),
         llm_stage_budgets={
-            stage.value: (StageBudgetDefinition.model_validate(budget.model_dump()))
-            for stage, budget in effective_stage_budgets(
-                config=config,
-            ).items()
+            stage.value: budget.model_dump() for stage, budget in effective_stage_budgets(config=config).items()
         },
         context_capacity_policy=ContextCapacityPolicy(),
     )
+    return ModelExecutionDefinition.model_validate(payload)
 
 
 def canonical_definition_json(definition: ModelExecutionDefinition) -> bytes:

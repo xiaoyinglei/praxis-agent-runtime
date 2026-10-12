@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -90,6 +90,7 @@ class Agent:
         self.web_proxy_url, self.web_no_proxy = web_proxy_configuration(web_proxy_url, dict(os.environ))
         self._selection_requester = selection_requester
         self._followup_model_id: str | None = None
+        self._model_factory: Callable[[], BoundHarnessModel] | None = None
 
     def models(self) -> list[ModelSpec]:
         return self._get_model_control_plane().list_models()
@@ -121,6 +122,7 @@ class Agent:
         *,
         previous_turn_id: str | None = None,
         files: Sequence[str] | None = None,
+        max_steps: int | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
@@ -137,7 +139,7 @@ class Agent:
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
-            max_turns=max_turns, max_tokens_total=max_tokens_total,
+            max_steps=max_steps, max_turns=max_turns, max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
             event_sink=event_sink, _event_dispatcher=_event_dispatcher,
         ) as session:
@@ -149,7 +151,7 @@ class Agent:
         require_workspace_change: bool = True,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
-        max_turns: int | None = None, max_tokens_total: int | None = None,
+        max_steps: int | None = None, max_turns: int | None = None, max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
@@ -157,12 +159,15 @@ class Agent:
     ) -> AsyncIterator[Session]:
         from agent_runtime.harness.session import Session
 
+        if max_steps is not None and max_turns is not None and max_steps != max_turns:
+            raise ValueError("max_steps and legacy max_turns must agree when both are provided")
+        step_budget = max_steps if max_steps is not None else max_turns
         session = await Session.open(
             agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id,
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
-            max_steps=16 if max_turns is None else max_turns,
+            max_steps=16 if step_budget is None else step_budget,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
         )
@@ -252,6 +257,7 @@ class Agent:
         *,
         previous_turn_id: str | None = None,
         files: Sequence[str] | None = None,
+        max_steps: int | None = None,
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
@@ -269,7 +275,7 @@ class Agent:
                 task,
                 previous_turn_id=previous_turn_id,
                 files=files,
-                max_turns=max_turns,
+                max_steps=max_steps, max_turns=max_turns,
                 max_tokens_total=max_tokens_total,
                 max_cost_micros=max_cost_micros,
                 require_workspace_change=require_workspace_change,
@@ -324,15 +330,6 @@ class Agent:
             )
             return projected.pause
 
-    def _harness_model(self) -> BoundHarnessModel:
-        from agent_runtime.builtin.generic import coding_instructions
-        from agent_runtime.harness import ControlPlaneHarnessModel
-
-        return ControlPlaneHarnessModel(
-            control_plane=self._get_model_control_plane(),
-            instructions=coding_instructions(self._workspace_path()),
-        )
-
     def _harness_database(self) -> Path:
         if self.checkpoint_db is not None:
             return Path(self.checkpoint_db).expanduser().resolve()
@@ -372,17 +369,17 @@ class Agent:
         return tuple(values)
     
     def _get_model_control_plane(self) -> ModelControlPlane:
-        from agent_runtime.model_config_io import discover_git_worktree
+        from agent_runtime.runtime.builder import build_model_control_plane
 
         workspace = self._workspace_path()
         session_path = self.model_session_path
         if session_path is not None and not session_path.is_absolute():
             session_path = workspace / session_path
-        return ModelControlPlane.from_env(
-            initial_model_id=self.model,
-            initial_selection_requester=self._selection_requester,
-            session_path=session_path, workspace=workspace,
-            worktree=discover_git_worktree(workspace),
+        return build_model_control_plane(
+            model_id=self.model,
+            selection_requester=self._selection_requester,
+            session_path=session_path,
+            workspace=workspace,
         )
 
 

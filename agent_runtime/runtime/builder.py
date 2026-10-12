@@ -4,12 +4,13 @@ from pathlib import Path
 
 from agent_runtime.model_admin import ModelAdminService
 from agent_runtime.model_config_io import discover_git_worktree
-from agent_runtime.models import ModelControlPlane
+from agent_runtime.models import ModelControlPlane, ModelSwitchRequester
 
 
 def build_model_control_plane(
     *,
     model_id: str | None = None,
+    selection_requester: ModelSwitchRequester = "system",
     session_path: Path | None = None,
     workspace: Path | None = None,
 ) -> ModelControlPlane:
@@ -19,6 +20,7 @@ def build_model_control_plane(
 
     return ModelControlPlane.from_env(
         initial_model_id=model_id,
+        initial_selection_requester=selection_requester,
         session_path=session_path,
         workspace=resolved_workspace,
         worktree=discover_git_worktree(

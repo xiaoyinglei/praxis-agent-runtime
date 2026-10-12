@@ -5,17 +5,18 @@ import json
 import os
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
 from agent_runtime.core.llm_config import (
-    ModelSpec as InternalModelSpec,
+    ModelRuntimeConfig,
+    normalize_model_endpoint,
 )
 from agent_runtime.core.llm_config import (
-    normalize_model_endpoint,
+    ModelSpec as InternalModelSpec,
 )
 from agent_runtime.core.llm_registry import (
     ModelNotAvailableError,
@@ -38,6 +39,7 @@ from agent_runtime.model_config_io import (
 )
 from agent_runtime.model_definition import (
     ModelExecutionDefinition,
+    RuntimeDefinition,
     canonical_definition_json,
 )
 from agent_runtime.model_trust import (
@@ -71,13 +73,17 @@ _MODEL_BINDING_FIELDS = frozenset(
 )
 
 
-
 class ModelPolicyError(ValueError):
     """A model switch request was rejected by policy."""
 
 
 @dataclass(frozen=True, slots=True)
 class ModelRuntimeSpec:
+    """Availability probe metadata and launch hint, not a supervised process.
+
+    Legacy timing fields are informational compatibility data only.
+    """
+
     health_url: str | None = None
     launch_command: tuple[str, ...] = ()
     expected_model_contains: str | None = None
@@ -881,7 +887,6 @@ class ModelControlPlane:
                 if callable(close):
                     stack.callback(close)
 
-
     def _review_frozen_binding(
         self,
         binding: Mapping[str, JsonValue],
@@ -1217,17 +1222,7 @@ def _to_public_definition_spec(
         max_output_tokens=definition.max_output_tokens,
         input_cost_per_1m=definition.input_cost_per_1m,
         output_cost_per_1m=definition.output_cost_per_1m,
-        runtime=(
-            ModelRuntimeSpec(
-                health_url=runtime.health_url,
-                launch_command=runtime.launch_command,
-                expected_model_contains=runtime.expected_model_contains,
-                startup_timeout_seconds=runtime.startup_timeout_seconds,
-                poll_interval_seconds=runtime.poll_interval_seconds,
-            )
-            if runtime is not None
-            else None
-        ),
+        runtime=_to_public_runtime_spec(runtime),
     )
 
 
@@ -1258,17 +1253,10 @@ def _to_public_spec(
     )
 
 
-def _to_public_runtime_spec(runtime: object | None) -> ModelRuntimeSpec | None:
+def _to_public_runtime_spec(runtime: ModelRuntimeConfig | RuntimeDefinition | None) -> ModelRuntimeSpec | None:
     if runtime is None:
         return None
-    launch_command = getattr(runtime, "launch_command", ()) or ()
-    return ModelRuntimeSpec(
-        health_url=getattr(runtime, "health_url", None),
-        launch_command=tuple(str(part) for part in launch_command),
-        expected_model_contains=getattr(runtime, "expected_model_contains", None),
-        startup_timeout_seconds=float(getattr(runtime, "startup_timeout_seconds", 60.0)),
-        poll_interval_seconds=float(getattr(runtime, "poll_interval_seconds", 1.0)),
-    )
+    return ModelRuntimeSpec(**runtime.model_dump(include={item.name for item in fields(ModelRuntimeSpec)}))
 
 
 def format_model_rows(

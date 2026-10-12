@@ -132,7 +132,7 @@ async def test_two_product_sessions_share_one_turn_request_limit(
     database = tmp_path / "sessions.sqlite"
     agent = Agent(workspace_path=tmp_path / "workspace", checkpoint_db=database,
                   enable_workspace_mcp=False, web_limits=WebLimits(turn_requests=2))
-    monkeypatch.setattr(agent, "_harness_model", lambda: PatchThenAnswerModel())
+    monkeypatch.setattr(agent, "_model_factory", lambda: PatchThenAnswerModel())
     async with await Session.open(agent=agent, allow_web_tools=True) as first:
         async with await Session.open(agent=agent, thread_id=first.thread_id, allow_web_tools=True) as second:
             assert first.store is not second.store

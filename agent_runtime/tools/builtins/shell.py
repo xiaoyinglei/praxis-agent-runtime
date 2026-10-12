@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import json
 import math
 import os
 import platform
+import shutil
 import signal
 import stat
 import sys
@@ -180,6 +182,7 @@ class ManagedPythonOutput(BaseModel):
     python_version: str
     network_enabled: bool = False
     sandbox_error: str | None = None
+    verification: dict[str, JsonValue] | None = None
 
 
 _COMMAND_INPUT_SCHEMA, _validate_command_input = pydantic_input(RunCommandInput)
@@ -268,7 +271,11 @@ def create_run_command_tool(
                 "affected code before execution and prefer focused verification "
                 "over a full-repository test run. Use recognized read-only commands "
                 "to verify code behavior; do not execute a process solely to reconfirm "
-                "unchanged literal file content already established by a read or search."
+                "unchanged literal file content already established by a read or search. "
+                "Invoke the project's test runner directly, without pipes, redirects or success fallbacks. "
+                "Running a pytest file with python does not execute its tests; use pytest or python -m pytest. "
+                "uv run --no-sync pytest is supported. For standalone assertion checks use execute_python, "
+                "which observes actual assertion execution."
             ),
             input_schema=_COMMAND_INPUT_SCHEMA,
         ),
@@ -332,7 +339,11 @@ def create_execute_python_tool(
                 "output_paths. Use inspect_data_file to inspect generated artifacts "
                 "and check the requested results. A valid file structure does not "
                 "verify calculation or transformation correctness. Do not invoke a shell or create a heredoc "
-                "from the Python code merely to repeat inspection."
+                "from the Python code merely to repeat inspection. For behavioral verification, execute real "
+                "assertions that check the requested result. Output records only assertions actually reached; "
+                "uncalled functions and skipped branches are not checks. Assertion counts do not establish "
+                "which files or requirements were verified. For delivery, inspect changed artifacts or run "
+                "the project's relevant checks after the write."
             ),
             input_schema=_PYTHON_INPUT_SCHEMA,
         ),
@@ -342,7 +353,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v2-linux-read-only",
+        execution_revision="builtin-execute-python-v3-observed-assertions",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -531,6 +542,9 @@ async def _execute_managed_python(
     ) as temporary_root:
         script_path = Path(temporary_root) / "praxis_task.py"
         script_path.write_text(request.code, encoding="utf-8")
+        runner_path = Path(temporary_root) / "praxis_python_runner.py"
+        report_path = Path(temporary_root) / "verification.json"
+        shutil.copyfile(Path(__file__).parents[1] / "python_verification.py", runner_path)
         environment = _command_environment(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
@@ -548,7 +562,9 @@ async def _execute_managed_python(
             sys.executable,
             "-I",
             "-B",
+            str(runner_path),
             str(script_path),
+            str(report_path),
             cwd=str(cwd),
             env=environment,
             stdout=asyncio.subprocess.PIPE,
@@ -584,6 +600,13 @@ async def _execute_managed_python(
         stderr, stderr_truncated = _bounded_stream(stderr_bytes)
         if timed_out and not stderr:
             stderr = "Python code timed out and its process group was terminated"
+        verification = None
+        if process.returncode == 0 and not timed_out and report_path.is_file():
+            try:
+                if report_path.stat().st_size <= 1_000_000:
+                    verification = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
         return ManagedPythonOutput(
             stdout=stdout,
             stderr=stderr,
@@ -593,6 +616,7 @@ async def _execute_managed_python(
             duration_ms=(time.monotonic() - started_at) * 1000,
             python_version=platform.python_version(),
             network_enabled=request.network,
+            verification=verification,
             sandbox_error=(
                 "sandbox_start_failed"
                 if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")

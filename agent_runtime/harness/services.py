@@ -15,13 +15,13 @@ from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_conte
 from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
-from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchInput,
     create_knowledge_tools,
 )
 from agent_runtime.tools.integrations.skills import create_skill_tools
 from agent_runtime.tools.integrations.subagent import (
+    StandardSubagentOutput,
     SubagentInput,
     create_subagent_tool,
 )
@@ -162,7 +162,6 @@ def configure_services(
     max_steps: int = 16,
     max_tokens_total: int | None = None,
     max_cost_micros: int | None = None,
-    event_dispatcher: TurnEventDispatcher | None = None,
 ) -> None:
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
@@ -235,9 +234,6 @@ def configure_services(
             conclusion = child_turn.terminal_message or ""
         return {
             "conclusion": conclusion,
-            "key_facts": [],
-            "evidence_refs": [],
-            "citations": [],
             "status": ("done" if child.status == "completed" else "paused" if child.status == "paused" else "failed"),
             "child_turn_id": child.turn_id,
             "stop_reason": child_turn.terminal_reason_code or child_turn.status,
@@ -278,7 +274,8 @@ def configure_services(
         (
             create_subagent_tool(
                 run_subagent,
-                execution_revision="harness-child-thread-v3",
+                execution_revision="harness-child-thread-v4",
+                output_model=StandardSubagentOutput,
             ),
         )
         if enable_subagents
@@ -322,30 +319,22 @@ def configure_services(
         snapshot_ref["tools"] = tool_snapshot
     context_manager = RolloutContextManager(store)
     worker_id = f"worker_{uuid4().hex}"
-    tool_router = (
-        None
-        if not tool_snapshot
-        else DurableToolRouter(
-            store=store,
-            tools=tool_snapshot,
-            resident_names=(
-                *(("find_tools",) if discoverable_names else ()),
-                *resident_names,
-            ),
-            discoverable_names=discoverable_names,
-        )
+    tool_router = DurableToolRouter(
+        store=store,
+        tools=tool_snapshot,
+        resident_names=(
+            *(("find_tools",) if discoverable_names else ()),
+            *resident_names,
+        ),
+        discoverable_names=discoverable_names,
     )
     resolved_completion_gate = completion_gate or DeliveryCompletionGate(store)
 
-    session.tool_orchestrator = (
-        None
-        if not tool_snapshot
-        else ToolOrchestrator(
-            store=store,
-            tools=tool_snapshot,
-            execution_context=execution_context,
-            worker_id=worker_id,
-        )
+    session.tool_orchestrator = ToolOrchestrator(
+        store=store,
+        tools=tool_snapshot,
+        execution_context=execution_context,
+        worker_id=worker_id,
     )
     session.tool_execution_context = execution_context
     session.model = model

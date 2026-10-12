@@ -131,13 +131,31 @@ class ModelGenerationDefaults(BaseModel):
 
 
 class ModelRuntimeConfig(BaseModel):
+    """One readiness probe and an optional launch hint; no process supervision.
+
+    Timing fields remain readable for existing declarations and frozen records.
+    They do not start a process or control the single availability probe.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     health_url: str | None = None
     launch_command: tuple[str, ...] = ()
     expected_model_contains: str | None = None
-    startup_timeout_seconds: float = Field(default=60.0, gt=0, allow_inf_nan=False)
-    poll_interval_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    startup_timeout_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Compatibility field; process startup is not implemented",
+        json_schema_extra={"deprecated": True},
+    )
+    poll_interval_seconds: float = Field(
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Compatibility field; availability probing does not poll",
+        json_schema_extra={"deprecated": True},
+    )
 
     @field_validator("health_url")
     @classmethod
@@ -157,6 +175,7 @@ class ModelRuntimeConfig(BaseModel):
         if any(not part or "\x00" in part for part in value):
             raise ValueError("runtime.launch_command entries must be non-empty and contain no NUL")
         return value
+
 
 
 class ModelSpec(BaseModel):
@@ -232,6 +251,7 @@ class ModelSpec(BaseModel):
     )
 
     runtime: ModelRuntimeConfig | None = None
+    continuation_summary_role: Literal["context", "assistant"] = "context"
 
     @field_validator("base_url")
     @classmethod
@@ -341,9 +361,9 @@ class AgentModelsConfig(BaseModel):
 
         # Context compaction is optional in serialized configs. New definitions
         # derive independent model capacity and keep llm_summarize's output cap.
-        missing_stages = set(LLMCallStage).difference(self.llm_stage_budgets, {LLMCallStage.CONTEXT_COMPACTION})
+        missing_stages = set(DEFAULT_LLM_STAGE_BUDGETS).difference(self.llm_stage_budgets)
         extra_stages = set(self.llm_stage_budgets).difference(LLMCallStage)
         if missing_stages or extra_stages:
-            raise ValueError("llm_stage_budgets must define every supported LLM stage exactly once")
+            raise ValueError("llm_stage_budgets must define every active LLM stage exactly once")
 
         return self

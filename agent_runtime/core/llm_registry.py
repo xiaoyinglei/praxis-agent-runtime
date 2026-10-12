@@ -22,7 +22,7 @@ from agent_runtime.core.llm_config import (
     ModelSpec,
     normalize_model_endpoint,
 )
-from agent_runtime.model_config_io import discover_git_worktree
+from agent_runtime.model_config_io import discover_git_worktree, load_model_yaml
 from agent_runtime.model_definition import (
     ModelCapabilities,
     ModelExecutionDefinition,
@@ -59,6 +59,7 @@ class ResolvedModel:
     definition_revision: str | None = None
     pricing_micros_per_1m: Mapping[str, int | None] = field(default_factory=dict)
     pricing_revision: str | None = None
+    continuation_summary_role: Literal["context", "assistant"] = "context"
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,11 +279,9 @@ class ModelRegistry:
 
     @staticmethod
     def _load_yaml_file(path: Path) -> AgentModelsConfig:
-        import yaml
-
-        with open(path, encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+        data = load_model_yaml(path.read_bytes()) or {}
         _validate_raw_catalog(data)
+        assert isinstance(data, dict)
 
         # Support configs/models.yaml: models keyed by model ID plus defaults.
         raw_models = data.get("models", {})
@@ -342,6 +341,7 @@ class ModelRegistry:
                 "cache_read_cost_per_1m": cost.get("cache_read_per_1m"),
                 "cache_write_cost_per_1m": cost.get("cache_write_per_1m"),
                 "runtime": merged.get("runtime"),
+                "continuation_summary_role": entry.get("continuation_summary_role", "context"),
             }
         default_model = defaults.get("primary_model", "")
         if not default_model and agent_models:
@@ -462,6 +462,7 @@ class ModelRegistry:
             request_defaults=definition.defaults,
             generation_config=_generation_config_from_definition(definition),
             definition_revision=definition.definition_revision,
+            continuation_summary_role=_definition_summary_role(definition),
             pricing_micros_per_1m=pricing,
             pricing_revision=pricing_revision(
                 provider=resolved_provider,
@@ -497,39 +498,19 @@ class ModelRegistry:
 
 
 def _model_spec_from_definition(definition: ModelExecutionDefinition) -> ModelSpec:
-    return ModelSpec.model_validate(
-        {
-            "provider": definition.provider,
-            "provider_name": (definition.provider_name),
-            "protocol": definition.protocol,
-            "tokenizer_model": (definition.tokenizer_model),
-            "context_window_tokens": (definition.context_window_tokens),
-            "max_output_tokens": (definition.max_output_tokens),
-            "timeout_seconds": (definition.timeout_seconds),
-            "base_url": definition.base_url,
-            "api_key_env": (definition.api_key_env),
-            "defaults": (
-                definition.defaults.model_dump(
-                    mode="python",
-                    exclude_none=True,
-                )
-            ),
-            "supports_tools": (definition.supports_tools),
-            "supports_structured_output": (definition.supports_structured_output),
-            "location": definition.location,
-            "input_cost_per_1m": (definition.input_cost_per_1m),
-            "output_cost_per_1m": (definition.output_cost_per_1m),
-            "cache_read_cost_per_1m": (definition.cache_read_cost_per_1m),
-            "cache_write_cost_per_1m": (definition.cache_write_cost_per_1m),
-            "runtime": (
-                definition.runtime.model_dump(
-                    mode="python",
-                    exclude_none=True,
-                )
-                if definition.runtime is not None
-                else None
-            ),
-        }
+    payload = definition.model_dump(mode="python", include=set(ModelSpec.model_fields))
+    payload["defaults"] = definition.defaults.model_dump(mode="python", exclude_none=True)
+    payload["continuation_summary_role"] = _definition_summary_role(definition)
+    return ModelSpec.model_validate(payload)
+
+
+def _definition_summary_role(definition: ModelExecutionDefinition) -> Literal["context", "assistant"]:
+    if definition.continuation_summary_role is not None:
+        return definition.continuation_summary_role
+    # Only archives predating the explicit wire setting need identity migration.
+    # Newly declared models always freeze their configured value.
+    return (
+        "assistant" if definition.provider_name == "deepseek" and definition.model_id == "deepseek-flash" else "context"
     )
 
 
@@ -779,6 +760,7 @@ def _validate_raw_catalog(data: object) -> None:
                 "cost",
                 "runtime",
                 "experimental",
+                "continuation_summary_role",
             },
             where=f"chat model {model_id!r}",
         )
@@ -867,42 +849,7 @@ def user_model_registry_path() -> Path:
 def _user_definition_to_model_spec(
     definition: UserModelDefinition,
 ) -> ModelSpec:
-    runtime = (
-        definition.runtime.model_dump(
-            mode="json",
-            exclude_none=True,
-        )
-        if definition.runtime is not None
-        else None
-    )
-
-    return ModelSpec.model_validate(
-        {
-            "provider": definition.provider,
-            "tokenizer_model": (definition.tokenizer_model),
-            "provider_name": (definition.provider_name),
-            "protocol": definition.protocol,
-            "context_window_tokens": (definition.context_window_tokens),
-            "max_output_tokens": (definition.max_output_tokens),
-            "timeout_seconds": (definition.timeout_seconds),
-            "base_url": definition.base_url,
-            "api_key_env": (definition.api_key_env),
-            "defaults": (
-                definition.defaults.model_dump(
-                    mode="json",
-                    exclude_none=True,
-                )
-            ),
-            "supports_tools": (definition.supports_tools),
-            "supports_structured_output": (definition.supports_structured_output),
-            "location": definition.location,
-            "input_cost_per_1m": (definition.input_cost_per_1m),
-            "output_cost_per_1m": (definition.output_cost_per_1m),
-            "cache_read_cost_per_1m": (definition.cache_read_cost_per_1m),
-            "cache_write_cost_per_1m": (definition.cache_write_cost_per_1m),
-            "runtime": runtime,
-        }
-    )
+    return ModelSpec.model_validate(definition.model_dump(mode="python", exclude_none=True))
 
 
 def _load_env_file(path: Path) -> None:

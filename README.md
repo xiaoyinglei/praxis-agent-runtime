@@ -96,8 +96,21 @@ locally. There is no package-index install command implied by this README.
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
 cd praxis-agent-runtime
-uv sync --frozen
+uv sync --locked
 ```
+
+The default install includes the Agent and its document/data tools. Private
+knowledge backends and local MLX inference are separate extras:
+
+```bash
+uv sync --locked --extra rag
+uv sync --locked --extra local-mlx  # Local inference on Apple Silicon
+```
+
+Use `uv run --extra rag` or `uv run --extra local-mlx` for commands that need
+those capabilities. `transformers` tokenizers are available in either extra;
+the default install retains the bundled DeepSeek tokenizer, tiktoken, and the
+conservative fallback for models without an available tokenizer.
 
 ### Connect and switch models
 
@@ -239,7 +252,7 @@ for later Turns.
 窗口 1：启动 Qwen，保持服务运行。首次加载可能需要等待权重下载或加载完成。
 
 ```bash
-uv run python -m mlx_lm.server \
+uv run --extra local-mlx python -m mlx_lm.server \
   --model mlx-community/Qwen3.5-9B-4bit \
   --host 127.0.0.1 --port 8080
 ```
@@ -255,7 +268,7 @@ uv run agent chat --model mlx-community/Qwen3.5-9B-4bit
 运行 Gemma 时，先在模型窗口按 Ctrl+C 停止旧服务，再执行：
 
 ```bash
-uv run python -m mlx_lm.server \
+uv run --extra local-mlx python -m mlx_lm.server \
   --model mlx-community/gemma-4-26b-a4b-it-4bit \
   --host 127.0.0.1 --port 8080
 ```
@@ -274,7 +287,7 @@ Agent；日志写入 `/tmp/praxis-mlx.log`。切换启动模型时，只需修�
 ```bash
 praxis_model_id=mlx-community/Qwen3.5-9B-4bit
 
-uv run python -m mlx_lm.server \
+uv run --extra local-mlx python -m mlx_lm.server \
   --model "$praxis_model_id" \
   --host 127.0.0.1 --port 8080 \
   > /tmp/praxis-mlx.log 2>&1 &
@@ -356,6 +369,18 @@ non-interactive run pauses instead of silently approving them and prints the
 `agent resume` command for the pending Turn.
 
 ### Python API
+
+Execution budgets count model/tool steps within a Turn: use SDK `max_steps` or
+CLI `--max-steps`. The old `max_turns` / `--max-turns` names remain compatible;
+conflicting SDK values are rejected before dispatch. CLI `--rollout-db` names the
+complete SQLite event/projection store; `--checkpoint-db` remains an alias.
+
+Managed Python reports assertions actually executed. Those counts establish
+neither changed-file coverage nor task correctness and cannot alone pass the
+delivery gate. Inspect changed artifacts or run the relevant project checks
+after writing. The gate re-evaluates saved verification against its bound tool
+call/result using current rules; historical classification mistakes do not
+automatically become new completion evidence.
 
 ```python
 import asyncio
@@ -669,6 +694,8 @@ in the existing artifact store and is never injected into model context by defau
 
 ## Optional RAG
 
+Install the knowledge dependencies with `uv sync --locked --extra rag`.
+
 The `rag` package and CLI handle ingestion, retrieval, storage, and diagnostics.
 They are an optional provider boundary beneath Praxis—not an alternate Agent API.
 An ordinary `agent run` does not initialize embedding, reranking, vector storage,
@@ -703,7 +730,7 @@ The RAG runtime initializes only when the model first calls the knowledge tool.
 Index maintenance stays on the optional `rag` command:
 
 ```bash
-uv run rag --help
+uv run --extra rag rag --help
 ```
 
 See the runbook (local-only) for service and private-document workflows.
@@ -748,17 +775,63 @@ buildability, installed-wheel behavior, public CLI/SDK smoke paths, and the
 deterministic demo. Run the same entry points from the checkout:
 
 ```bash
-uv run ruff check .
-uv run mypy
-uv run lint-imports
-uv run pytest -q
+uv sync --locked --all-extras
+uv run --all-extras ruff check .
+uv run --all-extras mypy
+uv run --all-extras lint-imports
+uv run --all-extras pytest -q
 uv build
+uv run python scripts/agent_public_path_benchmark.py validate
+uv run python scripts/agent_model_quality_gate.py validate
 ```
+
+Public-path scenarios and the measured model-quality baseline are maintained in
+`tests/agent/fixtures/`. CI requires both validations; a missing asset fails the
+check. These commands validate stored inputs and observations without calling a
+model. The baseline is historical evidence, not acceptance of today's source.
+
+For current real-model public CLI/SDK acceptance, freeze the actual candidate
+(including uncommitted source) outside the checkout and run that snapshot:
+
+```bash
+uv run python scripts/agent_public_path_benchmark.py freeze \
+  --destination /absolute/candidate
+PYTHONPATH=/absolute/candidate .venv/bin/python \
+  /absolute/candidate/scripts/agent_public_path_benchmark.py run \
+  --model deepseek-flash --env-file /absolute/checkout/.env \
+  --artifacts-root /absolute/acceptance-results --evidence-artifact evidence.json \
+  --max-turns 12 --timeout-seconds 180
+```
+
+Use new candidate/results directories for each run. The snapshot excludes the
+credential file and private evaluation output; execution loads credentials in
+the parent process. Evidence records source/fixture hashes, dirty Git provenance,
+model definition, platform, explicit process budgets and independent checks of
+the final files. It verifies snapshot contents before and after execution.
+Each of five scenarios runs three times, including approval and crash recovery.
+Successful fixed scenarios do not establish arbitrary task or model quality.
+
+Measure history performance without model calls:
+
+```bash
+uv run python scripts/agent_history_benchmark.py --sizes 10 100 1000 5000 \
+  --output /absolute/history-performance.json
+```
+
+`--runtime-root` selects an explicit source snapshot for before/after comparison.
+Per-event metadata uses a versioned canonical-record prefix hash instead of
+serializing all historical projections. Old projection-hash metadata upgrades
+only after full integrity verification and in the same transaction as the new
+event. `projection_hashes()` exposes these versioned metadata digests; a digest
+alone is not proof of projection correctness. `verify()` and Session startup
+still replay canonical records, compare all projection rows and check artifacts.
+Full verification and returning an entire context remain proportional to history.
 
 Local-only material is intentionally excluded from Git: `learn-claude-code/`,
 `docs/`, `artifacts/`, `evals/` and `CLAUDE.md`. Existing local copies remain
 usable. Tests that require those documents or frozen evaluation assets run when
 the assets exist and report explicit skips in a fresh clone; runtime and build
-checks remain required.
+checks remain required. The maintained acceptance fixtures above are part of the
+source tree and never depend on those local-only directories.
 
 Praxis is available under the [MIT](LICENSE) license.

@@ -979,7 +979,7 @@ class TestModelRegistryResolve:
 
         assert (
             resolved.gateway.effective_stage_budget(
-                LLMCallStage.TOOL_DECISION,
+                LLMCallStage.AGENT_STEP,
                 kwargs={"max_tokens": 2_048},
             ).max_input_tokens
             == 5_440
@@ -1009,7 +1009,7 @@ class TestModelRegistryResolve:
         )
         assert resolved.token_accounting.count('{"tools":[{"name":"read_file"}]}') > 4
 
-    def test_explicit_model_output_limit_does_not_expand_tool_decision_stage_budget(
+    def test_explicit_model_output_limit_does_not_expand_active_stage_budget(
         self,
     ) -> None:
         spec = ModelSpec(
@@ -1027,10 +1027,10 @@ class TestModelRegistryResolve:
 
         resolved = registry.resolve("long")
 
-        configured_budget = resolved.gateway.stage_budget(LLMCallStage.TOOL_DECISION)
+        configured_budget = resolved.gateway.stage_budget(LLMCallStage.RAG_ANSWER)
 
         effective_budget = resolved.gateway.effective_stage_budget(
-            LLMCallStage.TOOL_DECISION,
+            LLMCallStage.RAG_ANSWER,
             kwargs={"max_tokens": (resolved.capabilities.max_output_tokens)},
         )
 

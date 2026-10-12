@@ -57,7 +57,7 @@ class _UpdatePlanThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         step = int(prepared.request_ref["step"])
         if step == 1:
             return HarnessModelResponse(
@@ -78,6 +78,9 @@ class _UpdatePlanThenAnswerModel:
             usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},
         )
 
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
 
 async def _run_plan_turn(
     tmp_path: Path,
@@ -87,7 +90,7 @@ async def _run_plan_turn(
     database = tmp_path / "rollout.sqlite3"
     agent = Agent(checkpoint_db=database, workspace_path=workspace)
     model = _UpdatePlanThenAnswerModel()
-    agent._harness_model = lambda: model
+    agent._model_factory = lambda: model
 
     result = await agent.run(
         "Make update_plan durable.",
@@ -166,7 +169,7 @@ async def test_failed_turn_projects_the_canonical_plan_not_raw_tool_claims(
         workspace_path=workspace,
         enable_workspace_mcp=False,
     )
-    agent._harness_model = lambda: _UpdatePlanThenAnswerModel()
+    agent._model_factory = lambda: _UpdatePlanThenAnswerModel()
 
     result = await agent.run(
         "Make update_plan canonical.",

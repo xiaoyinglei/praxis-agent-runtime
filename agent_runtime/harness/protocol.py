@@ -25,6 +25,26 @@ class HarnessMessage:
     tool_calls: tuple[HarnessToolCall, ...] = ()
     tool_call_id: str | None = None
     reasoning_content: str | None = None
+    context_category: Literal["continuation_summary"] | None = None
+
+
+def restore_harness_message(payload: Mapping[str, Any]) -> HarnessMessage:
+    """Decode saved messages; only old snapshots require presentation migration."""
+    category = payload.get("context_category")
+    if (
+        "context_category" not in payload
+        and payload["role"] == "context"
+        and payload["content"].startswith("Context compaction:\n")
+    ):
+        category = "continuation_summary"
+    return HarnessMessage(
+        role=payload["role"],
+        content=payload["content"],
+        tool_calls=tuple(HarnessToolCall(**call) for call in payload.get("tool_calls", ())),
+        tool_call_id=payload.get("tool_call_id"),
+        reasoning_content=payload.get("reasoning_content"),
+        context_category=category,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,10 +202,7 @@ class ContextCompactionCandidate:
 
     @property
     def messages(self) -> tuple[HarnessMessage, ...]:
-        return tuple(
-            HarnessMessage(**{**m, "tool_calls": tuple(HarnessToolCall(**c) for c in m["tool_calls"])})
-            for m in json.loads(self.messages_json)
-        )
+        return tuple(restore_harness_message(m) for m in json.loads(self.messages_json))
 
 
 class ContextCompactionRequiredError(ContextBudgetExceededError):

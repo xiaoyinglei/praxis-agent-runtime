@@ -831,7 +831,7 @@ class ToolThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         if len(self.requests) == 1:
             return HarnessModelResponse(
@@ -851,6 +851,9 @@ class ToolThenAnswerModel:
             provider_response_id="response-final",
             usage={"input_tokens": 5, "output_tokens": 2},
         )
+
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
 
 
 class AcceptToolAnswer:
@@ -1051,7 +1054,7 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
 async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path, correct_arguments, bad_arguments):
     from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
     class RepeatingModel(ToolThenAnswerModel):
-        async def dispatch(self, prepared):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
             count = len(self.requests)
             if correct_arguments and count == 4:
                 return HarnessModelResponse(text="README was read", provider_response_id=None, usage={})
@@ -1085,7 +1088,7 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
 @pytest.mark.anyio
 async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
             count = len(self.requests)
             return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
                 id=f"call-{count}", name="read_file",

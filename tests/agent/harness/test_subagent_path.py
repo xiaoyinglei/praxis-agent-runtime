@@ -64,7 +64,7 @@ class ParentChildModel:
             dispatch_payload=request,
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         request = prepared.dispatch_payload
         assert isinstance(request, HarnessModelRequest)
         initial = request.messages[0].content
@@ -178,3 +178,22 @@ async def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) 
         ]
         assert parent_results[0].payload["metadata"]["child_turn_id"] == child_turn_id
         assert runtime.store.verify().valid is True
+
+
+@pytest.mark.anyio
+async def test_standard_child_schema_revision_rejects_saved_older_tool_binding(tmp_path: Path) -> None:
+    async with await Session.open(
+        database=tmp_path / "rollout.sqlite3",
+        workspace=tmp_path,
+        model=ParentChildModel(),
+        enable_subagents=True,
+    ) as session:
+        assert session.tool_orchestrator is not None
+        task = session.tools["task"]
+        assert task.execution_revision == "integration-subagent-v2:harness-child-thread-v4"
+        assert "key_facts" not in task.output_schema["properties"]
+        with pytest.raises(RuntimeError, match="original operation tool is unavailable: task"):
+            session.tool_orchestrator.restore_tools(
+                {"task": "integration-subagent-v1:harness-child-thread-v3"},
+            )
+        assert session.tool_orchestrator.restore_tools({"task": task.execution_revision}) == (task,)

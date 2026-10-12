@@ -65,7 +65,7 @@ class InspectingModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         [operation] = self._store.list_model_operations()
         [attempt] = self._store.list_model_attempts(operation.operation_id)
         assert operation.status == "dispatched"
@@ -102,7 +102,7 @@ class CompactionRequestingModel(InspectingModel):
             ),
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         operation = self._store.list_model_operations()[-1]
         assert operation.status == "dispatched"
         return HarnessModelResponse(
@@ -127,7 +127,7 @@ class InspectingCompletionGate:
 
 
 class OverBudgetAnswerModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="must not be accepted",
@@ -137,13 +137,13 @@ class OverBudgetAnswerModel(InspectingModel):
 
 
 class PreflightRejectedModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ModelDispatchPreflightError("provider call exceeds remaining budget")
 
 
 class IncompleteResponseModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="partial answer must not be accepted",
@@ -155,13 +155,13 @@ class IncompleteResponseModel(InspectingModel):
 
 
 class FailingDispatchModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ConnectionError("provider connection was lost after dispatch")
 
 
 class RejectedDispatchModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise RuntimeError("provider rejected a validly delivered request")
 
@@ -206,7 +206,7 @@ class RetryThenAnswerModel(InspectingModel):
         super().__init__(store)
         self.dispatch_count = 0
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.dispatch_count += 1
         if self.dispatch_count == 1:
@@ -246,7 +246,7 @@ class StreamingRetryThenAnswerModel(InspectingModel):
 
 
 class ReviseAfterFeedbackModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         request = self.prepared_requests[-1]
         if len(self.prepared_requests) == 1:
@@ -306,7 +306,7 @@ class PauseThenAcceptGate:
 
 
 class AnswerAfterClarificationModel(InspectingModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         if len(self.prepared_requests) == 1:
             return HarnessModelResponse(
@@ -431,6 +431,9 @@ class ZeroDeltaToolThenAnswerModel:
             provider_response_id="response-final",
             usage={"input_tokens": 4, "output_tokens": 2},
         )
+
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
 
 
 class AcceptToolCompleted:

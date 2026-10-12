@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import configparser
+import re
 import subprocess
 import tomllib
 import zipfile
 from pathlib import Path
+
+import yaml
 
 ROOT = Path(__file__).parents[2]
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
@@ -51,34 +54,36 @@ def test_wheel_contains_runtime_and_excludes_legacy_agent(tmp_path: Path) -> Non
 
 
 def test_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
-    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    config = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    # Inspect executable step bodies rather than YAML formatting. Shell line
+    # continuations and indentation do not change the installation contract.
+    workflow = "\n".join(step.get("run", "") for step in config["jobs"]["test"]["steps"])
+    commands = re.sub(r"\s+", " ", workflow.replace("\\\n", " "))
     ordered_commands = [
-        "uv sync --locked",
-        "uv run ruff check .",
-        "uv run mypy",
-        "uv run pytest -q",
-        "uv run lint-imports",
+        "uv sync --locked --all-extras",
+        "uv run --all-extras ruff check .",
+        "uv run --all-extras mypy",
+        "uv run --all-extras pytest -q",
+        "uv run --all-extras lint-imports",
         "uv build",
-        "uv run python scripts/agent_cli_smoke.py",
-        "uv run python scripts/agent_delivery_smoke.py --fake-model --verbose",
-        (
-            "uv run python scripts/agent_harness_acceptance.py validate --schema "
-            "evals/harness/acceptance_v1.json "
-            "--contract docs/design/praxis_harness_architecture.md"
-        ),
-        (
-            "uv run python scripts/agent_code_benchmark.py validate "
-            "evals/code_agent/benchmark_v1.json --repository ."
-        ),
+        "uv run --all-extras python scripts/agent_cli_smoke.py",
+        "uv run --all-extras python scripts/agent_delivery_smoke.py --fake-model --verbose",
+        "uv run --all-extras python scripts/agent_public_path_benchmark.py validate",
+        "uv run --all-extras python scripts/agent_model_quality_gate.py validate",
+        "uv export --locked --all-extras --no-dev --no-hashes --no-emit-project",
         'uv venv --no-project --python 3.12 "$smoke_venv"',
-        'uv pip install --python "$smoke_venv/bin/python" "$wheel"',
+        'uv pip install --python "$smoke_venv/bin/python" --constraint "$smoke_root/constraints.txt" "$wheel"',
+        'cd "$smoke_root"',
         '"$smoke_venv/bin/agent" --help',
+        '"$smoke_venv/bin/agent" run --help',
+        '"$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/agent_delivery_smoke.py" --fake-model',
+        'uv pip install --python "$smoke_venv/bin/python" --constraint "$smoke_root/constraints.txt" "${wheel}[rag]"',
         '"$smoke_venv/bin/rag" --help',
     ]
 
     cursor = -1
     for command in ordered_commands:
-        cursor = workflow.find(command, cursor + 1)
+        cursor = commands.find(command, cursor + 1)
         assert cursor >= 0, f"missing or out-of-order CI command: {command}"
 
     assert 'mktemp -d "$RUNNER_TEMP/praxis-wheel-smoke.XXXXXX"' in workflow

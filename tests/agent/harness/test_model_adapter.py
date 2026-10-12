@@ -200,6 +200,9 @@ class BoundGatewayHarnessModel(GatewayHarnessModel):
             "model_revision": "native-delta-v1",
         }
 
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
 
 class MaxTokensGateway(CapturingGateway):
     async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:

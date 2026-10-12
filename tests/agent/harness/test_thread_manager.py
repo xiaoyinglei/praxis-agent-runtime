@@ -43,7 +43,7 @@ class EchoHistoryModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         return HarnessModelResponse(
             text=f"answer-{len(self.requests)}",
             provider_response_id=f"response-{len(self.requests)}",
@@ -105,7 +105,6 @@ async def test_clarification_continues_with_current_model_when_initial_model_is_
         assert len(model.requests) == 1
         assert model.requests[0].binding_manifest["model_id"] != "unavailable"
         assert session.store.read_thread(session.thread_id).active_turn_id is None
-
 
 
 @pytest.mark.anyio

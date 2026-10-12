@@ -17,7 +17,7 @@ from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 @pytest.mark.anyio
 async def test_false_research_answer_ends_without_becoming_validated(tmp_path, monkeypatch):
     class FalseAnswer(PublicHarnessModel):
-        async def dispatch(self, prepared):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
             from agent_runtime.harness import HarnessModelResponse
             return HarnessModelResponse(
                 text="The moon is made of cheese.",
@@ -27,7 +27,7 @@ async def test_false_research_answer_ends_without_becoming_validated(tmp_path, m
 
     database = tmp_path / "research.sqlite"
     agent = Agent(checkpoint_db=database, workspace_path=tmp_path)
-    monkeypatch.setattr(agent, "_harness_model", lambda: FalseAnswer())
+    monkeypatch.setattr(agent, "_model_factory", lambda: FalseAnswer())
     result = await agent.run("Research the composition of the moon", require_workspace_change=False)
     assert result.status == "done", (result.stop_reason, result.diagnostics)
     assert result.answer == "The moon is made of cheese."

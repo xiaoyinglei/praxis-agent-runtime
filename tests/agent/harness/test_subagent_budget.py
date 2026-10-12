@@ -36,6 +36,9 @@ class AcceptAnswer:
 
 
 class SmallAnswerModel(FixedBindingProvider):
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         digest = hashlib.sha256(f"{request.turn_id}:{request.step}".encode()).hexdigest()
         return PreparedModelCall(
@@ -51,7 +54,7 @@ class SmallAnswerModel(FixedBindingProvider):
             ),
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="child answer",
@@ -65,7 +68,7 @@ class BlockingAnswerModel(SmallAnswerModel):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.started.set()
         await self.release.wait()
@@ -77,7 +80,7 @@ class BlockingAnswerModel(SmallAnswerModel):
 
 
 class UnknownAnswerModel(SmallAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ConnectionError("provider outcome is unknown")
 

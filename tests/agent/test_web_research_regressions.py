@@ -102,7 +102,7 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
     database = tmp_path / 'state.sqlite'
     model = FetchThenAnswer({'url': 'https://example.com/doc', 'max_lines': 500, 'render': False})
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
-    monkeypatch.setattr(agent, '_harness_model', lambda: model)
+    monkeypatch.setattr(agent, '_model_factory', lambda: model)
     result = await agent.run('Read external evidence', allow_web_tools=True, require_workspace_change=False)
     with RolloutStore(database) as store:
         item = next(i for i in store.list_items(result.turn_id) if i.kind == 'tool_result')

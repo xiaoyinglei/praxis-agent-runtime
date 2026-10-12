@@ -96,11 +96,7 @@ class GatewayHarnessModel:
         remaining = request.model_token_budget_remaining
         if remaining is not None and (isinstance(remaining, bool) or not isinstance(remaining, int) or remaining < 1):
             raise ValueError("remaining model token budget must be positive")
-        summary_role = request.continuation_summary_role or (
-            "assistant"
-            if self._resolved.provider == "deepseek" and self._resolved.model_id == "deepseek-flash"
-            else "context"
-        )
+        summary_role = request.continuation_summary_role or self._resolved.continuation_summary_role
         if summary_role not in {"context", "assistant"}:
             raise ValueError("continuation_summary_role must be context or assistant")
         messages = _model_messages(request.messages, continuation_summary_role=summary_role)
@@ -508,10 +504,9 @@ def _model_messages(
         if message.role not in {"user", "assistant", "tool", "context"}:
             raise ValueError(f"unsupported Harness message role: {message.role}")
         role = message.role
-        if has_user and role == "context" and message.content.startswith("Context compaction:\n"):
-            # DeepSeek Flash replay showed user-role execution memory restarts
-            # the initial task; assistant memory continues the completed work.
-            # Ordinary context events and prefixes retain their existing roles.
+        if has_user and role == "context" and message.context_category == "continuation_summary":
+            # Provenance chooses the context fragment; the frozen model binding
+            # chooses its wire role independently of content and identity.
             role = continuation_summary_role
         has_user = has_user or message.role == "user"
         converted.append(

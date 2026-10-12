@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FIXTURE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_cases.json"
-DEFAULT_BASELINE_PATH = ROOT / "evals" / "model_quality" / "baseline_v1.json"
+DEFAULT_BASELINE_PATH = ROOT / "tests" / "agent" / "fixtures" / "model_quality_baseline_v1.json"
 MIN_CALIBRATION_TRIALS = 3
 THRESHOLD_METHOD = "empirical_worst_trial_v1"
 EVALUATOR_VERSION = "agent_model_quality_gate_v4"
@@ -1727,7 +1727,8 @@ def _parser() -> argparse.ArgumentParser:
         "gate",
         help="Run the baseline trial count and fail on model-quality regression.",
     )
-    for command in (calibrate, gate):
+    validate = subparsers.add_parser("validate", help="Validate recorded observations without model calls.")
+    for command in (calibrate, gate, validate):
         command.add_argument(
             "--repository",
             type=Path,
@@ -1760,6 +1761,11 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     try:
+        if args.command == "validate":
+            suite = load_suite(args.fixture)
+            validate_baseline(json.loads(args.baseline.read_text(encoding="utf-8")), suite=suite)
+            print("recorded model baseline validated; no live model calls")
+            return 0
         if args.command == "calibrate":
             return asyncio.run(_calibrate(args))
         return asyncio.run(_gate(args))

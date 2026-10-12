@@ -33,20 +33,20 @@ jobs:
           python3 scripts/ubuntu/install-codex-patch.py --destination "$RUNNER_TEMP/codex-patch"
           echo "PRAXIS_TEST_CODEX_BINARY=$RUNNER_TEMP/codex-patch" >> "$GITHUB_ENV"
       - name: Sync locked environment
-        run: uv sync --locked
+        run: uv sync --locked --all-extras
       - name: Ruff
-        run: uv run ruff check .
+        run: uv run --all-extras ruff check .
       - name: Mypy
-        run: uv run mypy
+        run: uv run --all-extras mypy
       - name: Pytest
-        run: uv run pytest -q
+        run: uv run --all-extras pytest -q
       - name: Web evidence quality acceptance
-        run: uv run python scripts/agent_web_quality.py
+        run: uv run --all-extras python scripts/agent_web_quality.py
       - name: Chromium evidence and isolation acceptance
         run: |
-          uv sync --locked --extra browser
-          uv run --extra browser playwright install --with-deps --only-shell chromium
-          PRAXIS_TEST_BROWSER=1 uv run --extra browser pytest -q tests/agent/test_web_browser.py
+          uv sync --locked --all-extras
+          uv run --all-extras playwright install --with-deps --only-shell chromium
+          PRAXIS_TEST_BROWSER=1 uv run --all-extras pytest -q tests/agent/test_web_browser.py
       - name: Model service isolation smoke
         run: |
           smoke_wheels="$RUNNER_TEMP/praxis-model-wheels"
@@ -55,19 +55,17 @@ jobs:
             -r scripts/ubuntu/requirements-model-service.txt -d "$smoke_wheels"
           sudo /usr/bin/python3 -I scripts/ubuntu/smoke-model-service.py --wheel-dir "$smoke_wheels"
       - name: Import contracts
-        run: uv run lint-imports
+        run: uv run --all-extras lint-imports
       - name: Build distribution
         run: uv build
       - name: CLI projection smoke
-        run: uv run python scripts/agent_cli_smoke.py
+        run: uv run --all-extras python scripts/agent_cli_smoke.py
       - name: Delivery smoke
-        run: uv run python scripts/agent_delivery_smoke.py --fake-model --verbose
-      - name: Harness acceptance contract
-        if: ${{ hashFiles('evals/harness/acceptance_v1.json') != '' && hashFiles('docs/design/praxis_harness_architecture.md') != '' }}
-        run: uv run python scripts/agent_harness_acceptance.py validate --schema evals/harness/acceptance_v1.json --contract docs/design/praxis_harness_architecture.md
-      - name: Benchmark manifest
-        if: ${{ hashFiles('evals/code_agent/benchmark_v1.json') != '' }}
-        run: uv run python scripts/agent_code_benchmark.py validate evals/code_agent/benchmark_v1.json --repository .
+        run: uv run --all-extras python scripts/agent_delivery_smoke.py --fake-model --verbose
+      - name: Public path acceptance assets
+        run: uv run --all-extras python scripts/agent_public_path_benchmark.py validate
+      - name: Recorded model quality baseline
+        run: uv run --all-extras python scripts/agent_model_quality_gate.py validate
       - name: Installed wheel smoke
         shell: bash
         run: |
@@ -78,10 +76,24 @@ jobs:
             printf 'Expected exactly one wheel in dist, found %s\n' "${#wheels[@]}" >&2
             exit 1
           fi
-          wheel="${wheels[0]}"
+          wheel="$(realpath "${wheels[0]}")"
 
+          uv export --locked --all-extras --no-dev --no-hashes --no-emit-project \
+            --output-file "$smoke_root/constraints.txt"
           uv venv --no-project --python 3.12 "$smoke_venv"
-          uv pip install --python "$smoke_venv/bin/python" "$wheel"
+          uv pip install --python "$smoke_venv/bin/python" \
+            --constraint "$smoke_root/constraints.txt" "$wheel"
           cd "$smoke_root"
           "$smoke_venv/bin/agent" --help
+          "$smoke_venv/bin/agent" run --help
+          "$smoke_venv/bin/python" - <<'PY'
+          from importlib.metadata import distributions
+          import pandas, openpyxl, fitz, scipy, matplotlib
+          forbidden = {"docling", "flagembedding", "torch", "transformers", "mlx-lm", "pymilvus"}
+          assert forbidden.isdisjoint({d.metadata["Name"].lower() for d in distributions()})
+          PY
+          PRAXIS_MODEL_REGISTRY_PATH="$smoke_root/models.yaml" \
+            "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/agent_delivery_smoke.py" --fake-model
+          uv pip install --python "$smoke_venv/bin/python" \
+            --constraint "$smoke_root/constraints.txt" "${wheel}[rag]"
           "$smoke_venv/bin/rag" --help

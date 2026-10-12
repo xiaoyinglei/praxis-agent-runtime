@@ -152,7 +152,6 @@
       "fake_arguments": {
         "task": "Review the tool runtime boundary.",
         "context_summary": "Focus on the single Tool contract.",
-        "tool_query": "read source files",
         "max_turns": 3,
         "llm_budget_total": 500
       }

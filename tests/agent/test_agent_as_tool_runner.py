@@ -6,6 +6,7 @@ import pytest
 
 from agent_runtime.tools.executor import ToolExecutor
 from agent_runtime.tools.integrations.subagent import (
+    StandardSubagentOutput,
     SubagentOutput,
     create_subagent_tool,
 )
@@ -114,3 +115,29 @@ def test_subagent_tool_has_bounded_schema_and_execution_contract() -> None:
     assert tool.idempotent is False
     assert tool.concurrency_safe is False
     assert tool.timeout_seconds == 180.0
+
+
+@pytest.mark.anyio
+async def test_standard_child_contract_rejects_unused_input_and_unproduced_output() -> None:
+    calls = []
+
+    def run(arguments):
+        calls.append(arguments)
+        return {"conclusion": "done", "status": "done", "key_facts": ["invented"]}
+
+    tool = create_subagent_tool(run, output_model=StandardSubagentOutput)
+    properties = tool.output_schema["properties"]
+    assert set(properties) == {
+        "conclusion", "status", "child_turn_id", "stop_reason", "pause", "execution_evidence",
+    }
+    assert "tool_query" not in tool.definition.input_schema["properties"]
+    executor = ToolExecutor({"task": tool})
+    context = ToolExecutionContext(approved_tool_call_ids=frozenset({"call-subagent"}))
+    invalid_input = await executor.execute(
+        _call({"task": "Inspect.", "tool_query": "unused capability hint"}), context=context,
+    )
+    assert invalid_input.result.error_code == "invalid_arguments"
+    assert calls == []
+    invalid_output = await executor.execute(_call({"task": "Inspect."}), context=context)
+    assert invalid_output.result.is_error is True
+    assert len(calls) == 1

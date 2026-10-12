@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -82,16 +81,29 @@ def assess_tool_verification(
             "Read its stdout/stderr, resolve the failure, and rerun verification.",
         )
     if tool_name == "execute_python":
-        code = arguments.get("code")
-        if isinstance(code, str) and _contains_assertion(code):
+        observation = structured_content.get("verification")
+        if isinstance(observation, Mapping):
+            passed = observation.get("assertions_passed")
+            failed = observation.get("assertions_failed")
+        else:
+            passed, failed = None, None
+        if (
+            isinstance(passed, int)
+            and not isinstance(passed, bool)
+            and passed > 0
+            and isinstance(failed, int)
+            and failed == 0
+            and not isinstance(failed, bool)
+        ):
             return VerificationAssessment(
                 "verified",
-                "Assertions completed successfully.",
+                "The managed interpreter observed successful assertions. Their coverage of changed files is unknown.",
                 VerificationEvidence(kind="assertion", verifier="python"),
             )
         return VerificationAssessment(
-            "no_assertion",
-            "The Python execution contains no assertion to verify the result.",
+            "assertion_not_executed",
+            "No successful assertion execution was observed. Define and run the check with execute_python; "
+            "unreached assertions, optimized-out assertions and process exit status alone are not evidence.",
         )
     if tool_name != "run_command":
         return VerificationAssessment("unsupported_tool", "This tool result is not verification evidence.")
@@ -138,10 +150,17 @@ def _assess_command(command: str) -> VerificationAssessment:
     if evidence is not None:
         return VerificationAssessment("verified", "The direct verifier completed successfully.", evidence)
     if _classify_invocation(words, allow_non_execution_flags=True) is not None:
+        if _verifier_mode(words) == "unattested_verifier_mode":
+            return VerificationAssessment(
+                "unattested_verifier_mode",
+                "This verifier mode can suppress check failures or replace the test process. "
+                "Its successful exit does not attest successful checks. Run the project's actual checks "
+                "in their ordinary checking mode, preserving failure exit status.",
+            )
         return VerificationAssessment(
             "no_tests_executed",
-            "Help, version, or collection-only flags do not execute verification. "
-            "Remove those flags and run the actual checks.",
+            "Help, listing, collection, setup-only, or build-only modes do not execute verification. "
+            "Run the actual checks instead.",
         )
     return VerificationAssessment(
         "unsupported_command",
@@ -158,28 +177,24 @@ def _classify_invocation(
 ) -> VerificationEvidence | None:
     if not words:
         return None
-    if not allow_non_execution_flags and any(
-        word.lower() in {"-h", "--help", "--version", "--collect-only"} for word in words[1:]
-    ):
+    if not allow_non_execution_flags and _verifier_mode(words) is not None:
         return None
 
+    words = _unwrap_uv(words)
+    if not words:
+        return None
     executable = PurePath(words[0]).name.lower()
     arguments = words[1:]
-    if executable == "uv" and arguments[:1] == ["run"]:
-        if len(arguments) < 2:
-            return None
-        executable = PurePath(arguments[1]).name.lower()
-        arguments = arguments[2:]
 
     if executable in {"python", "python3"}:
         if arguments[:2] == ["-m", "pytest"]:
             return VerificationEvidence(kind="test", verifier="pytest")
         if arguments[:2] == ["-m", "unittest"]:
             return VerificationEvidence(kind="test", verifier="unittest")
-        if arguments[:1] == ["-c"] and len(arguments) == 2:
-            if _contains_assertion(arguments[1]):
-                return VerificationEvidence(kind="assertion", verifier="python")
+        # Shell inline source has no managed execution observations. Even an
+        # assert AST node can be unreachable, optimized out or caught.
         return None
+
     if executable == "pytest":
         return VerificationEvidence(kind="test", verifier="pytest")
     if executable == "mypy":
@@ -197,12 +212,99 @@ def _classify_invocation(
     return None
 
 
-def _contains_assertion(code: str) -> bool:
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return False
-    return any(isinstance(node, ast.Assert) for node in ast.walk(tree))
+def _verifier_mode(words: Sequence[str]) -> str | None:
+    """Recognize documented verifier modes that break the exit-status contract.
+
+    This describes CLI semantics, not task relevance or human output text.
+    Project configuration, plugins and package test scripts remain trusted;
+    successful checks never imply coverage or independent task acceptance.
+    """
+    words = _unwrap_uv(words)
+    if not words:
+        return None
+    runner, arguments = PurePath(words[0]).name.lower(), words[1:]
+    if runner in {"python", "python3"} and arguments[:1] == ["-m"] and len(arguments) > 1:
+        runner, arguments = arguments[1], arguments[2:]
+    # Cargo forwards libtest listing options; Go forwards test binary options.
+    # Other runners stop interpreting their own options at '--'.
+    if runner not in {"cargo", "go"} and "--" in arguments:
+        arguments = arguments[:arguments.index("--")]
+    options = {argument.split("=", 1)[0] for argument in arguments if argument.startswith("--")}
+    short = {
+        char for argument in arguments if argument.startswith("-") and not argument.startswith("--")
+        and runner != "go" for char in argument[1:]
+    }
+    if options & {"--help", "--version", "--collect-only", "--co", "--no-run"} or short & {"h", "V"}:
+        return "no_tests_executed"
+    if runner == "ruff":
+        if options & {"--exit-zero", "--fix-only", "--diff", "--add-noqa", "--watch"} or short & {"e", "w"}:
+            return "unattested_verifier_mode"
+        if options & {"--show-files", "--show-settings"}:
+            return "no_tests_executed"
+    elif runner == "pytest":
+        if options & {"--setup-plan", "--setup-only", "--fixtures", "--fixtures-per-test", "--cache-show"}:
+            return "no_tests_executed"
+    elif runner == "cargo":
+        if "--list" in options:
+            return "no_tests_executed"
+    elif runner == "go":
+        names = {argument.split("=", 1)[0] for argument in arguments}
+        if names & {"-h", "-n", "-c", "-list", "-test.list"}:
+            return "no_tests_executed"
+        if "-exec" in names:
+            return "unattested_verifier_mode"
+    elif runner in {"npm", "pnpm", "yarn"}:
+        if options & {"--if-present", "--script-shell", "--dry-run", "--ignore-scripts"}:
+            return "unattested_verifier_mode"
+    return None
+
+
+def _unwrap_uv(words: Sequence[str]) -> Sequence[str]:
+    """Separate documented wrapper options from its program; unknown forms fail closed."""
+    if not words or PurePath(words[0]).name.lower() != "uv":
+        return words
+    switches = {
+        "--offline",
+        "--no-sync",
+        "--locked",
+        "--frozen",
+        "--active",
+        "--isolated",
+        "--no-project",
+        "--no-dev",
+        "--no-default-groups",
+        "--all-extras",
+        "--no-cache",
+    }
+    values = {
+        "--project",
+        "--directory",
+        "--python",
+        "--extra",
+        "--group",
+        "--package",
+        "--env-file",
+        "--cache-dir",
+        "--index",
+        "--default-index",
+    }
+    index, running = 1, False
+    while index < len(words):
+        word = words[index]
+        if word == "run" and not running:
+            running = True
+            index += 1
+        elif word == "--" and running:
+            return words[index + 1 :]
+        elif word in switches:
+            index += 1
+        elif word.split("=", 1)[0] in values:
+            index += 1 if "=" in word else 2
+        elif word.startswith("-") or not running:
+            return ()
+        else:
+            return words[index:]
+    return ()
 
 
 __all__ = [

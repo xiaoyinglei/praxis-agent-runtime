@@ -6,7 +6,7 @@ import os
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self, cast
+from typing import Any, Literal, Self
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from agent_runtime.core.llm_config import (
     ModelGenerationDefaults,
     ModelProvider,
+    ModelRuntimeConfig,
     normalize_model_endpoint,
     validate_api_key_env_name,
     validate_http_url,
@@ -22,9 +23,11 @@ from agent_runtime.model_config_io import (
     CommitOutcomeUnknown,
     ConfigVersionConflict,
     FileVersion,
+    ModelYamlValidationError,
     atomic_replace_bytes,
     exclusive_config_lock,
     file_fingerprint,
+    load_model_yaml,
     validate_user_config_path,
 )
 
@@ -39,7 +42,6 @@ _UNSET_PATHS = frozenset(
         "output_cost_per_1m",
         "cache_read_cost_per_1m",
         "cache_write_cost_per_1m",
-        
         "runtime.health_url",
         "runtime.expected_model_contains",
         "defaults.temperature",
@@ -67,64 +69,10 @@ class RegistryOverrideActiveError(RuntimeError):
     """The runtime is using a whole-catalog override that ignores this registry."""
 
 
-class RegistryConfigValidationError(ValueError):
-    """The registry YAML is syntactically invalid or structurally ambiguous."""
-
-
-class _StrictSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
-    """Safe YAML loader that rejects duplicate keys at every mapping depth."""
-
-    def construct_mapping(self, node: Any, deep: bool = False) -> dict[Any, Any]:
-        if not isinstance(node, yaml.MappingNode):
-            return cast(dict[Any, Any], super().construct_mapping(node, deep=deep))
-        self.flatten_mapping(node)
-        mapping: dict[Any, Any] = {}
-        for key_node, value_node in node.value:
-            key = self.construct_object(key_node, deep=deep)
-            try:
-                duplicate = key in mapping
-            except TypeError as error:
-                raise RegistryConfigValidationError(
-                    f"Registry YAML mapping key at line {key_node.start_mark.line + 1} is not scalar"
-                ) from error
-            if duplicate:
-                raise RegistryConfigValidationError(
-                    f"Registry YAML contains duplicate mapping key {key!r} "
-                    f"at line {key_node.start_mark.line + 1}"
-                )
-            mapping[key] = self.construct_object(value_node, deep=deep)
-        return mapping
-
-
-class ModelRuntimeDeclaration(BaseModel):
-    """User-owned local process readiness and launch declaration."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    health_url: str | None = None
-    launch_command: tuple[str, ...] = ()
-    expected_model_contains: str | None = Field(default=None, min_length=1)
-    startup_timeout_seconds: float = Field(default=60.0, gt=0, allow_inf_nan=False)
-    poll_interval_seconds: float = Field(default=1.0, gt=0, allow_inf_nan=False)
-
-    @field_validator("health_url")
-    @classmethod
-    def validate_health_url(cls, value: str | None) -> str | None:
-        return validate_http_url(value, field_name="runtime.health_url")
-
-    @field_validator("launch_command", mode="before")
-    @classmethod
-    def validate_launch_command_input(cls, value: object) -> object:
-        if isinstance(value, str):
-            raise ValueError("runtime.launch_command must be an argv array, not a shell command")
-        return value
-
-    @field_validator("launch_command")
-    @classmethod
-    def validate_launch_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if any(not part or "\x00" in part for part in value):
-            raise ValueError("runtime.launch_command argv entries must be non-empty and contain no NUL")
-        return value
+# Keep public registry names while sharing parsing and local readiness fields.
+RegistryConfigValidationError = ModelYamlValidationError
+class ModelRuntimeDeclaration(ModelRuntimeConfig):
+    """Strict user input sharing the runtime fields with catalog declarations."""
 
     @field_validator("expected_model_contains")
     @classmethod
@@ -155,6 +103,7 @@ class UserModelDefinition(BaseModel):
     cache_read_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     runtime: ModelRuntimeDeclaration | None = None
+    continuation_summary_role: Literal["context", "assistant"] = "context"
 
     @field_validator("tokenizer_model", "provider_name", "protocol")
     @classmethod
@@ -583,19 +532,7 @@ def _serialize_document(document: UserModelRegistryDocument) -> bytes:
 
 
 def _load_registry_yaml(payload: bytes) -> object:
-    try:
-        parsed: object = yaml.load(payload, Loader=_StrictSafeLoader)
-    except RegistryConfigValidationError:
-        raise
-    except yaml.YAMLError as error:
-        mark = getattr(error, "problem_mark", None)
-        location = (
-            f" at line {mark.line + 1}, column {mark.column + 1}"
-            if mark is not None
-            else ""
-        )
-        raise RegistryConfigValidationError(f"Invalid registry YAML{location}") from None
-    return parsed
+    return load_model_yaml(payload)
 
 
 def load_user_model_definition(path: Path) -> UserModelDefinition:

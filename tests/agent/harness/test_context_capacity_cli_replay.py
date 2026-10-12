@@ -120,6 +120,9 @@ class ReplayModel(GatewayHarnessModel):
             ),
         }
 
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
 
 @pytest.mark.parametrize("task", ["web", "code", "dialog"])
 @pytest.mark.parametrize("mode", ["capacity", "legacy"])
@@ -150,7 +153,7 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
 
     def create_facade(**options):
         agent = original_facade(**options)
-        monkeypatch.setattr(agent, "_harness_model", lambda: model)
+        monkeypatch.setattr(agent, "_model_factory", lambda: model)
         return agent
 
     monkeypatch.setattr(cli_module, "_create_agent_facade", create_facade)

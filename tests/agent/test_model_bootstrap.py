@@ -108,7 +108,7 @@ async def test_model_bootstrap_uses_current_selected_model_for_new_turn(
         fake_ensure_ready,
     )
 
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     async with agent.session(require_workspace_change=False):
         pass
 
@@ -197,7 +197,7 @@ async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
         fake_ensure_ready,
     )
 
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     operation_binding = {**frozen_binding, "thread_id": thread.thread_id, "turn_id": turn.turn_id}
     async with await Session.open(agent=agent, frozen_turn_id=turn.turn_id) as session:
         assert ready == []
@@ -242,7 +242,7 @@ async def test_provider_bootstrap_uses_session_settings_and_is_reused_across_sub
         lifecycle.append("services_created")
 
     monkeypatch.setattr("agent_runtime.local_runtime.ensure_local_provider_ready", bootstrap)
-    monkeypatch.setattr(agent, "_harness_model", PublicHarnessModel)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     monkeypatch.setattr(session_module, "configure_services", configure_after_bootstrap)
     async with agent.session(require_workspace_change=False) as session:
         assert lifecycle == ["services_created", "provider_ready"]

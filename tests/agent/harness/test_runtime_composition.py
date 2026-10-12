@@ -33,12 +33,15 @@ class PlainModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         return HarnessModelResponse(
             text="composed answer",
             provider_response_id="response-composed",
             usage={"input_tokens": 1, "output_tokens": 1},
         )
+
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
 
 
 class AcceptAnswer:

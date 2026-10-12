@@ -42,7 +42,7 @@ class KnowledgeModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
             return HarnessModelResponse(
@@ -63,6 +63,9 @@ class KnowledgeModel:
             usage={"input_tokens": 8, "output_tokens": 4},
         )
 
+    def ensure_available(self, binding, *, thread_id, turn_id):
+        pass
+
 
 class AcceptGroundedAnswer:
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
@@ -79,7 +82,7 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
         )
         return super().prepare(request)
 
-    async def dispatch(self, prepared: PreparedModelCall) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
             return HarnessModelResponse(

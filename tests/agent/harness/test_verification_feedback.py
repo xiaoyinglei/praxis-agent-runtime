@@ -138,7 +138,6 @@ def test_feedback_reports_the_actual_rejection(tmp_path: Path, command: str, cod
         "cargo test",
         "go test ./...",
         "ruff check .",
-        "python3 -c 'from calculator import add; assert add(2, 3) == 5'",
     ],
 )
 def test_direct_verification_keeps_working(command: str) -> None:

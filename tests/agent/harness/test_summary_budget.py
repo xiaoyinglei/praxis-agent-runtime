@@ -248,7 +248,12 @@ def test_summary_cannot_consume_continuation_monetary_budget(tmp_path: Path):
         assert store.read_budget_state(turn.turn_id).reserved.cost_micros == 0
 
 
-def test_deepseek_summary_role_is_frozen_for_restart_and_legacy_requests(tmp_path: Path):
+@pytest.mark.parametrize(
+    "provider,model_id", [("arbitrary-provider", "arbitrary-model"), ("deepseek", "deepseek-flash")]
+)
+def test_configured_summary_role_is_frozen_for_restart_and_legacy_requests(
+    tmp_path: Path, provider: str, model_id: str
+):
     from dataclasses import replace
 
     from agent_runtime.harness import GatewayHarnessModel
@@ -257,12 +262,17 @@ def test_deepseek_summary_role_is_frozen_for_restart_and_legacy_requests(tmp_pat
 
     gateway = BudgetAwareCapturingGateway(max_input_tokens=9000)
     model = GatewayHarnessModel(
-        model_id="deepseek-flash",
+        model_id=model_id,
         instructions=("Continue task.",),
-        resolved=_resolved_model(
-                gateway=gateway, token_accounting=gateway.token_accounting,
-                provider="deepseek", model_id="deepseek-flash",
+        resolved=replace(
+            _resolved_model(
+                gateway=gateway,
+                token_accounting=gateway.token_accounting,
+                provider=provider,
+                model_id=model_id,
             ),
+            continuation_summary_role="assistant",
+        ),
     )
     with RolloutStore(tmp_path / "role.db") as store:
         thread, turn = start(store, tmp_path)
@@ -277,7 +287,11 @@ def test_deepseek_summary_role_is_frozen_for_restart_and_legacy_requests(tmp_pat
             runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1),
             messages=(
                 HarnessMessage(role="user", content="Read specs then implement."),
-                HarnessMessage(role="context", content="Context compaction:\nAlready read specs."),
+                HarnessMessage(
+                    role="context",
+                    content="Memory with arbitrary presentation.",
+                    context_category="continuation_summary",
+                ),
                 HarnessMessage(role="context", content="A new runtime constraint."),
             ),
         )
@@ -298,6 +312,10 @@ def test_deepseek_summary_role_is_frozen_for_restart_and_legacy_requests(tmp_pat
         # Older snapshots did not encode this choice: preserve their old wire.
         old_snapshot = dict(operation.request_ref["step_snapshot"])
         old_snapshot.pop("continuation_summary_role")
+        old_snapshot["messages"] = [dict(message) for message in old_snapshot["messages"]]
+        for message in old_snapshot["messages"]:
+            message.pop("context_category", None)
+        old_snapshot["messages"][1]["content"] = "Context compaction:\nAlready read specs."
         old = replace(operation, request_ref={**operation.request_ref, "step_snapshot": old_snapshot})
         legacy = runner.restore_step_context(context.turn, old)
         assert legacy.continuation_summary_role == "context"

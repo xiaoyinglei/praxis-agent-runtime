@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import inspect
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
@@ -43,6 +42,7 @@ from agent_runtime.harness.protocol import (
     PreparedModelCall,
     ToolRouter,
     TurnResult,
+    restore_harness_message,
 )
 from agent_runtime.harness.rollout import ItemSnapshot, ModelOperationSnapshot, RolloutStore
 from agent_runtime.harness.tool_orchestrator import (
@@ -382,13 +382,7 @@ class TurnExecutor:
             raise RuntimeError("model operation has no durable Step snapshot")
         # Rebuild the original request, never recapture current Session settings.
         messages = tuple(
-            HarnessMessage(
-                role=item["role"],
-                content=item["content"],
-                tool_call_id=item["tool_call_id"],
-                reasoning_content=item.get("reasoning_content"),
-                tool_calls=tuple(HarnessToolCall(**call) for call in item["tool_calls"]),
-            )
+            restore_harness_message(item)
             for item in snapshot["messages"]
         )
         tools = (
@@ -964,6 +958,121 @@ class TurnExecutor:
         plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
         return plan
 
+    async def _plan_legacy_compaction(
+        self,
+        turn: TurnContext,
+        *,
+        step: int,
+        source_hash: str,
+        source: str,
+        retained: int,
+        base: PreparedModelCall,
+        byte_limit: int,
+    ) -> dict[str, Any]:
+        """Measure the frozen legacy summary budget without dispatch or commit."""
+        probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
+        projection = base.request_ref.get("context_projection", {})
+        max_input = projection.get("max_input_tokens")
+        if not isinstance(max_input, int):
+            raise ContextBudgetExceededError("Summary planning requires a measured model input budget.")
+        base_tokens = base.resource_request.input_tokens
+        output = base.resource_request.output_tokens
+        cap = probe.resource_request.output_tokens
+        if byte_limit < 1 or max_input - base_tokens < cap:
+            raise ContextBudgetExceededError("No capacity remains for a continuation summary.")
+        # Output tokens and escaped UTF-8 bytes are different units.
+        # Reserve the bounded serialized summary space on the input
+        # side; an output token cap is not an input-size guarantee.
+        continuation_input_limit = min(max_input, base_tokens + byte_limit)
+        plan = {
+            "source_hash": source_hash,
+            "retained_tail_messages": retained,
+            "summary_output_limit": cap,
+            "summary_input_limit": probe.request_ref["context_projection"]["max_input_tokens"],
+            "summary_byte_limit": byte_limit,
+            "continuation_input_limit": continuation_input_limit,
+            "continuation_output_limit": output,
+            "continuation_token_reserve": continuation_input_limit + output,
+            "max_summary_calls": turn.binding_manifest.get("model_step_budget", self._max_steps),
+        }
+
+        async def measure_leaves(text: str, active_plan: Mapping[str, Any]) -> list[PreparedModelCall]:
+            try:
+                return [
+                    await self._prepare_step(
+                        self._summary_step(turn, step=step, source=text, plan=active_plan)
+                    )
+                ]
+            except ContextBudgetExceededError:
+                left, right = _split_summary_history(text)
+                return [*await measure_leaves(left, active_plan), *await measure_leaves(right, active_plan)]
+
+        leaves = await measure_leaves(source, plan)
+        count = 2 * len(leaves) - 1
+        used = sum(
+            max(1, len(self._store.list_model_attempts(op.operation_id)))
+            for op in self._store.list_model_operations(turn.turn_id)
+            if op.request_ref.get("purpose") == "context_summary"
+        )
+        if used + count > plan["max_summary_calls"]:
+            raise ContextBudgetExceededError("Planned summary work exceeds the Turn model-step allowance.")
+        summary_input_limit = probe.request_ref["context_projection"]["max_input_tokens"]
+        fixed = (
+            sum(leaf.resource_request.input_tokens for leaf in leaves)
+            + (len(leaves) - 1) * summary_input_limit
+            + continuation_input_limit
+            + output
+        )
+        remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
+        if remaining is not None and fixed + count * cap > remaining:
+            raise ContextBudgetExceededError(
+                "Insufficient budget for the configured summary allowance plus one continuation request."
+            )
+        plan.update(
+            summary_output_limit=cap,
+            continuation_input_limit=continuation_input_limit,
+            continuation_token_reserve=continuation_input_limit + output,
+            planned_summary_calls=count,
+        )
+        # Re-measure after changing limits; no request has been dispatched.
+        leaves = await measure_leaves(source, plan)
+        required = (
+            sum(leaf.resource_request.total_tokens for leaf in leaves)
+            + (len(leaves) - 1) * (summary_input_limit + cap)
+            + plan["continuation_token_reserve"]
+        )
+        if remaining is not None and required > remaining:
+            raise ContextBudgetExceededError("Measured summary plan exceeds the remaining Turn budget.")
+        plan["planned_token_upper_bound"] = required
+        if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
+            rates = base.request_ref.get("pricing_micros_per_1m", {})
+            continuation_cost = estimated_model_cost_micros(
+                input_tokens=plan["continuation_input_limit"],
+                max_output_tokens=output,
+                pricing=rates,
+            )
+            merge_cost = estimated_model_cost_micros(
+                input_tokens=summary_input_limit,
+                max_output_tokens=cap,
+                pricing=rates,
+            )
+            if continuation_cost is None or merge_cost is None:
+                raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
+            required_cost = (
+                sum(leaf.resource_request.cost_micros for leaf in leaves)
+                + (len(leaves) - 1) * merge_cost
+                + continuation_cost
+            )
+            available_cost = self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            if available_cost is not None and required_cost > available_cost:
+                raise ContextBudgetExceededError(
+                    "Insufficient monetary budget for summary and continuation."
+                )
+            plan["continuation_cost_reserve"] = continuation_cost
+            plan["planned_cost_upper_bound"] = required_cost
+        plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
+        return plan
+
     async def _prepare_compacted_step(
         self,
         turn: TurnContext,
@@ -1119,108 +1228,10 @@ class TurnExecutor:
                             base=base, byte_allowance=manager.summary_byte_allowance(floor),
                         )
                 else:
-                    probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
-                    projection = base.request_ref.get("context_projection", {})
-                    max_input = projection.get("max_input_tokens")
-                    if not isinstance(max_input, int):
-                        raise ContextBudgetExceededError("Summary planning requires a measured model input budget.")
-                    base_tokens = base.resource_request.input_tokens
-                    output = base.resource_request.output_tokens
-                    byte_limit = manager.summary_byte_allowance(floor)
-                    cap = probe.resource_request.output_tokens
-                    if byte_limit < 1 or max_input - base_tokens < cap:
-                        raise ContextBudgetExceededError("No capacity remains for a continuation summary.")
-                    # Output tokens and escaped UTF-8 bytes are different units.
-                    # Reserve the bounded serialized summary space on the input
-                    # side; an output token cap is not an input-size guarantee.
-                    continuation_input_limit = min(max_input, base_tokens + byte_limit)
-                    plan = {
-                        "source_hash": source_hash,
-                        "retained_tail_messages": retained,
-                        "summary_output_limit": cap,
-                        "summary_input_limit": probe.request_ref["context_projection"]["max_input_tokens"],
-                        "summary_byte_limit": byte_limit,
-                        "continuation_input_limit": continuation_input_limit,
-                        "continuation_output_limit": output,
-                        "continuation_token_reserve": continuation_input_limit + output,
-                        "max_summary_calls": turn.binding_manifest.get("model_step_budget", self._max_steps),
-                    }
-
-                    async def measure_leaves(text: str, active_plan: Mapping[str, Any]) -> list[PreparedModelCall]:
-                        try:
-                            return [
-                                await self._prepare_step(
-                                    self._summary_step(turn, step=step, source=text, plan=active_plan)
-                                )
-                            ]
-                        except ContextBudgetExceededError:
-                            left, right = _split_summary_history(text)
-                            return [*await measure_leaves(left, active_plan), *await measure_leaves(right, active_plan)]
-
-                    leaves = await measure_leaves(source, plan)
-                    count = 2 * len(leaves) - 1
-                    used = sum(
-                        max(1, len(self._store.list_model_attempts(op.operation_id)))
-                        for op in self._store.list_model_operations(turn.turn_id)
-                        if op.request_ref.get("purpose") == "context_summary"
+                    plan = await self._plan_legacy_compaction(
+                        turn, step=step, source_hash=source_hash, source=source, retained=retained,
+                        base=base, byte_limit=manager.summary_byte_allowance(floor),
                     )
-                    if used + count > plan["max_summary_calls"]:
-                        raise ContextBudgetExceededError("Planned summary work exceeds the Turn model-step allowance.")
-                    summary_input_limit = probe.request_ref["context_projection"]["max_input_tokens"]
-                    fixed = (
-                        sum(leaf.resource_request.input_tokens for leaf in leaves)
-                        + (len(leaves) - 1) * summary_input_limit
-                        + continuation_input_limit
-                        + output
-                    )
-                    remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
-                    if remaining is not None and fixed + count * cap > remaining:
-                        raise ContextBudgetExceededError(
-                            "Insufficient budget for the configured summary allowance plus one continuation request."
-                        )
-                    plan.update(
-                        summary_output_limit=cap,
-                        continuation_input_limit=continuation_input_limit,
-                        continuation_token_reserve=continuation_input_limit + output,
-                        planned_summary_calls=count,
-                    )
-                    # Re-measure after changing limits; no request has been dispatched.
-                    leaves = await measure_leaves(source, plan)
-                    required = (
-                        sum(leaf.resource_request.total_tokens for leaf in leaves)
-                        + (len(leaves) - 1) * (summary_input_limit + cap)
-                        + plan["continuation_token_reserve"]
-                    )
-                    if remaining is not None and required > remaining:
-                        raise ContextBudgetExceededError("Measured summary plan exceeds the remaining Turn budget.")
-                    plan["planned_token_upper_bound"] = required
-                    if turn.binding_manifest.get("model_cost_budget_total_micros") is not None:
-                        rates = base.request_ref.get("pricing_micros_per_1m", {})
-                        continuation_cost = estimated_model_cost_micros(
-                            input_tokens=plan["continuation_input_limit"],
-                            max_output_tokens=output,
-                            pricing=rates,
-                        )
-                        merge_cost = estimated_model_cost_micros(
-                            input_tokens=summary_input_limit,
-                            max_output_tokens=cap,
-                            pricing=rates,
-                        )
-                        if continuation_cost is None or merge_cost is None:
-                            raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
-                        required_cost = (
-                            sum(leaf.resource_request.cost_micros for leaf in leaves)
-                            + (len(leaves) - 1) * merge_cost
-                            + continuation_cost
-                        )
-                        available_cost = self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
-                        if available_cost is not None and required_cost > available_cost:
-                            raise ContextBudgetExceededError(
-                                "Insufficient monetary budget for summary and continuation."
-                            )
-                        plan["continuation_cost_reserve"] = continuation_cost
-                        plan["planned_cost_upper_bound"] = required_cost
-                    plan["plan_id"] = hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest()
                 summary = await self._semantic_summary(turn, step=step, source=source, plan=plan)
                 try:
                     candidate = manager.semantic_candidate(
@@ -1521,14 +1532,10 @@ class TurnExecutor:
                 )
 
         try:
-            dispatch = self._model.dispatch
-            if "delta_sink" in inspect.signature(dispatch).parameters:
-                response = await dispatch(
-                    prepared,
-                    delta_sink=(None if operation.request_ref.get("purpose") == "context_summary" else publish_delta),
-                )
-            else:
-                response = await dispatch(prepared)
+            response = await self._model.dispatch(
+                prepared,
+                delta_sink=(None if operation.request_ref.get("purpose") == "context_summary" else publish_delta),
+            )
         except ModelContextOverflowError as exc:
             await self._commit(
                 partial(
