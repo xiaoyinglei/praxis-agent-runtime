@@ -77,7 +77,7 @@ def main() -> None:
         ) from None
     workspace = home / "workspace"
     argv = sys.argv[1:] or ["chat"]
-    if argv[0] in {"run", "chat", "resume"}:
+    if argv[0] in {"run", "chat", "resume", "recover"}:
         sys.path.insert(0, "/opt/praxis/app")
         try:
             validate_workspace_readiness(workspace)

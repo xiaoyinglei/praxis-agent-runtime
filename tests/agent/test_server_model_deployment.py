@@ -403,7 +403,8 @@ async def test_repaired_workspace_runs_real_shell_without_relaxing_hardlink_chec
 
 
 @pytest.mark.parametrize(
-    "argv", [["chat"], ["run", "task"], ["resume", "id"], [], ["model", "list"], ["history"], ["--help"]],
+    "argv", [["chat"], ["run", "task"], ["resume", "id"], ["recover", "id"], [],
+             ["model", "list"], ["history"], ["--help"]],
 )
 def test_server_launcher_checks_only_agent_turn_entrypoints(tmp_path, monkeypatch, argv):
     import sys
@@ -421,7 +422,7 @@ def test_server_launcher_checks_only_agent_turn_entrypoints(tmp_path, monkeypatc
     monkeypatch.setattr(launcher.os, "execve", lambda *args: launched.append(args))
     monkeypatch.chdir(tmp_path)
     launcher.main()
-    assert checks == ([workspace] if not argv or argv[0] in {"chat", "run", "resume"} else [])
+    assert checks == ([workspace] if not argv or argv[0] in {"chat", "run", "resume", "recover"} else [])
     assert launched
 
 

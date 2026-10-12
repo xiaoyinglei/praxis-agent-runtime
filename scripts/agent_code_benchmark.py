@@ -911,7 +911,7 @@ def run_task(
                 retried = _run_command(
                     (
                         *command_prefix,
-                        "resume",
+                        "recover",
                         turn_id,
                         "--action",
                         "retry",

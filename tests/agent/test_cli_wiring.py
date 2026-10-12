@@ -237,6 +237,8 @@ async def test_cli_renders_canonical_text_tool_and_plan_items(
         pytest.param(
             "chat",
             (
+                "--continue",
+                "--resume",
                 "--previous-turn-id",
                 "--last",
                 "--knowledge-config",
@@ -253,10 +255,10 @@ async def test_cli_renders_canonical_text_tool_and_plan_items(
             id="chat",
         ),
         pytest.param(
-            "resume",
+            "recover",
             ("--last", "--all", "--action", "--input"),
             ("--decision", "--vector-dsn"),
-            id="resume",
+            id="recover",
         ),
     ],
 )

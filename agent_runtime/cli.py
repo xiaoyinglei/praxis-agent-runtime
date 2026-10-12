@@ -5,9 +5,11 @@ import json
 import logging
 import os
 import shlex
+import sqlite3
 import sys
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, TypedDict
 
@@ -19,6 +21,7 @@ from pydantic import ValidationError
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
+from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeError
 from agent_runtime.model_admin import (
@@ -357,7 +360,7 @@ def _display_pending_recovery(
     for option in options:
         command = [
             "agent",
-            "resume",
+            "recover",
             turn_id,
             "--action",
             option,
@@ -586,12 +589,74 @@ def _print_chat_help() -> None:
     print("  /model             交互终端内用 ↑↓ 选择模型，Enter 确认，Esc 取消")
     print("  /verbose           切换详细输出")
     print("  /copy              复制最近回答，并输出原始 Markdown 到终端滚动历史")
-    print("  /transcript        将当前保留的会话输出到终端滚动历史，方便完整选取")
+    print("  /resume [会话ID]   打开当前工作区的旧聊天，回放历史后继续")
     print("  执行记录：Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
     print("  Ctrl+J / Alt+Enter 换行；PageUp/PageDown 滚动记录；Ctrl+End 回到底部；Ctrl+C 取消")
     print("  默认使用终端原生拖选、复制和粘贴（macOS：⌘C / ⌘V）；多行粘贴后按 Enter 发送")
     print("  F2 可开启鼠标交互，再按 F2 恢复终端原生选择")
     print("  /exit              退出")
+
+
+def _chat_session_label(session: ChatSessionSummary) -> str:
+    timestamp = datetime.fromtimestamp(session.updated_at_ms / 1000).astimezone().strftime("%Y-%m-%d %H:%M")
+    state = {"completed": "已完成", "failed": "失败", "cancelled": "已取消",
+             "running": "处理中", "paused": "暂停", "interrupted": "中断"}.get(session.status, session.status)
+    return safe_terminal_text(f"{timestamp} · {state} · {session.title} · {session.thread_id}")
+
+
+async def _select_chat_session(
+    database: Path, workspace: Path, *, selector: str, ui: TerminalChatApp | None,
+) -> ChatSessionSummary | None:
+    try:
+        sessions = list_chat_sessions(database, workspace=workspace)
+    except (OSError, ValueError, sqlite3.Error):
+        raise click.ClickException("会话数据库不可读取；请检查路径。") from None
+    if selector:
+        selected = next((session for session in sessions if session.thread_id == selector), None)
+        if selected is None:
+            raise click.ClickException("当前工作区未找到这个会话 ID；使用 /resume 选择会话。")
+        return selected
+    if not sessions:
+        print("当前工作区没有已保存的聊天。")
+        return None
+    print(f"打开旧聊天 · 工作区 {safe_terminal_text(str(workspace))}")
+    labels = [_chat_session_label(session) for session in sessions]
+    if ui:
+        selected_label = await ui.choose_menu(labels, title="打开旧聊天")
+        return None if selected_label is None else sessions[labels.index(selected_label)]
+    for index, label in enumerate(labels, 1):
+        print(f"  {index}. {label}")
+    while True:
+        try:
+            choice = (await asyncio.to_thread(input, "会话编号或完整 ID（空行取消）: ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not choice:
+            return None
+        if choice.isdecimal() and 1 <= int(choice) <= len(sessions):
+            return sessions[int(choice) - 1]
+        selected = next((session for session in sessions if session.thread_id == choice), None)
+        if selected is not None:
+            return selected
+        print("请选择列表中的编号或完整会话 ID。")
+
+
+def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | None = None) -> None:
+    print(f"会话状态: {_chat_session_label(session)}")
+    if session.active_turn_id:
+        if pending is not None and pending.pause is not None:
+            request = pending.pause
+            print("上一轮等待你的回复: " + safe_terminal_text(request.question))
+            for call in request.tool_calls:
+                print(safe_terminal_text(f"  {call.tool_name}: {call.args_preview}"))
+            if request.options:
+                print("可直接回复: " + ", ".join(request.options))
+                if request.kind == "tool_approval":
+                    print("Y 允许 · N 拒绝；/new 开始新聊天。")
+            else:
+                print("直接输入你的回答即可继续；/new 开始新聊天。")
+        else:
+            print("上一轮尚未结束，历史已打开。完成后可直接发送新消息；/new 开始新聊天。")
 
 
 async def _chat_facade_loop(
@@ -600,6 +665,7 @@ async def _chat_facade_loop(
     max_tokens_total: int | None,
     max_turns: int | None = None,
     previous_turn_id: str | None = None,
+    resume_thread_id: str | None = None,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
     allow_web_tools: bool = False,
@@ -608,10 +674,12 @@ async def _chat_facade_loop(
     if _ui is None and _is_tty(sys.stdin) and _is_tty(sys.stdout) and os.environ.get("TERM") != "dumb":
         from agent_runtime.terminal_app import TerminalChatApp
 
-        ui = TerminalChatApp(model=facade.current_model().id, workspace=str(facade.workspace_path or Path.cwd()))
+        initial_model = "历史聊天" if resume_thread_id is not None else facade.current_model().id
+        ui = TerminalChatApp(model=initial_model, workspace=str(facade.workspace_path or Path.cwd()))
         await ui.run(lambda: _chat_facade_loop(
             facade, max_tokens_total=max_tokens_total, max_turns=max_turns,
             previous_turn_id=previous_turn_id, allow_write_tools=allow_write_tools,
+            resume_thread_id=resume_thread_id,
             allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools, _ui=ui,
         ))
         return
@@ -619,23 +687,78 @@ async def _chat_facade_loop(
     composer = TerminalComposer() if _ui is None else None
     current_turn_id = previous_turn_id
     last_result: AgentResult | None = None
+    last_answer = ""
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
+    default_chat_knowledge = getattr(facade, "knowledge", None)
     chat_workspace = default_chat_workspace
-    model_id = facade.current_model().id
+    model_id = "历史聊天" if resume_thread_id is not None else facade.current_model().id
     if _ui is None:
         _print_startup_banner(model_id)
     from contextlib import AsyncExitStack
 
     async with AsyncExitStack() as stack:
         stack.callback(event_display.finish)
-        session = await stack.enter_async_context(facade.session(
-            previous_turn_id=previous_turn_id,
-            max_turns=max_turns, max_tokens_total=max_tokens_total,
-            require_workspace_change=False, allow_write_tools=allow_write_tools,
-            allow_execute_tools=allow_execute_tools,
-            allow_web_tools=allow_web_tools,
-        ))
+        session: Session | None = None
+        selected_chat: ChatSessionSummary | None = None
+
+        async def reopen(selector: str) -> bool:
+            nonlocal session, selected_chat, current_turn_id, last_result, last_answer, model_id
+            database = facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH
+            selected = await _select_chat_session(
+                database, Path(default_chat_workspace), selector=selector, ui=_ui,
+            )
+            if selected is None:
+                return False
+            messages = read_chat_messages(
+                database, thread_id=selected.thread_id, workspace=Path(default_chat_workspace),
+            )
+            await stack.aclose()
+            stack.callback(event_display.finish)
+            session = None
+            selected_chat = selected
+            current_turn_id = selected.head_turn_id
+            last_result = None
+            last_answer = next((text for kind, text in reversed(messages) if kind == "answer"), "")
+            event_display.clear_context_status()
+            model_id = selected.model_id or "未选择模型"
+            facade.model = selected.model_id
+            facade._followup_model_id = None
+            if _ui:
+                _ui.model = model_id
+                await _ui.replay_messages(messages)
+            else:
+                for kind, text in messages:
+                    print(("你 › " if kind == "user" else "Praxis\n") + safe_terminal_text(text) + "\n")
+            pending = (await facade.read_result(selected.active_turn_id)
+                       if selected.active_turn_id and selected.status in {"paused", "interrupted"} else None)
+            _print_chat_recovery(selected, pending)
+            return True
+
+        async def open_session() -> Session:
+            nonlocal session, model_id
+            if session is not None:
+                return session
+            if selected_chat is not None:
+                anchor = selected_chat.head_turn_id
+                if anchor is not None:
+                    metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor)
+                    facade.knowledge = metadata.runtime.knowledge
+            opened = await stack.enter_async_context(facade.session(
+                previous_turn_id=previous_turn_id if selected_chat is None else None,
+                thread_id=selected_chat.thread_id if selected_chat is not None else None,
+                max_turns=max_turns, max_tokens_total=max_tokens_total,
+                require_workspace_change=False, allow_write_tools=allow_write_tools,
+                allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
+            ))
+            session = opened
+            model_id = opened.current_model().id
+            if _ui:
+                _ui.model = model_id
+            return opened
+
+        if resume_thread_id is not None and not await reopen(resume_thread_id):
+            return
         while True:
             try:
                 if _ui:
@@ -654,6 +777,7 @@ async def _chat_facade_loop(
                 _print_chat_help()
                 continue
             if query == "/status":
+                print(f"会话: {selected_chat.thread_id if selected_chat else getattr(session, 'thread_id', '(new)')}")
                 print(f"Previous Turn: {current_turn_id or '(none)'}")
                 print(f"模型: {model_id}")
                 print(f"工作区: {chat_workspace}")
@@ -665,34 +789,37 @@ async def _chat_facade_loop(
                     print(f"验证状态: {last_result.validation_status}")
                 continue
             if query == "/copy":
-                if last_result is None or not last_result.answer:
+                if not last_answer:
                     print("暂无可复制的回答。")
                 elif _ui:
-                    await _ui.copy_answer(last_result.answer)
+                    await _ui.copy_answer(last_answer)
                 else:
-                    print(safe_terminal_text(last_result.answer))
+                    print(safe_terminal_text(last_answer))
                 continue
-            if query == "/transcript":
-                if _ui:
-                    await _ui.show_text(_ui.view.transcript())
-                else:
-                    print("当前会话已输出在终端中；可直接使用终端滚动历史选取。")
+            if query == "/resume" or query.startswith("/resume "):
+                parts = query.split()
+                if len(parts) > 2:
+                    print("用法: /resume [完整会话ID]")
+                    continue
+                try:
+                    await reopen(parts[1] if len(parts) == 2 else "")
+                except (click.ClickException, OSError, ValueError, KeyError, sqlite3.Error) as error:
+                    print(f"打开会话失败: {safe_terminal_text(str(error))}")
                 continue
             if query in {"/new", "/clear"}:
                 await stack.aclose()
                 stack.callback(event_display.finish)
-                facade.model = model_id
-                session = await stack.enter_async_context(facade.session(
-                    max_turns=max_turns, max_tokens_total=max_tokens_total,
-                    require_workspace_change=False, allow_write_tools=allow_write_tools,
-                    allow_execute_tools=allow_execute_tools,
-                    allow_web_tools=allow_web_tools,
-                ))
+                if session is not None:
+                    facade.model = model_id
+                facade.knowledge = default_chat_knowledge
+                session = None
+                selected_chat = None
+                previous_turn_id = None
                 current_turn_id = None
                 last_result = None
+                last_answer = ""
                 event_display.clear_context_status()
                 chat_workspace = default_chat_workspace
-                model_id = session.current_model().id
                 if _ui:
                     _ui.model = model_id
                 print("下一条消息将使用空历史。")
@@ -705,18 +832,19 @@ async def _chat_facade_loop(
                     event_display.show_context_status()
                 continue
             if query == "/model" or query.startswith("/model "):
+                model_control = session or facade
                 if _ui and query in {"/model", "/model list"}:
                     selected = await _ui.choose_model(
-                        [spec.id for spec in session.models()], session.current_model().id,
+                        [spec.id for spec in model_control.models()], model_id,
                     )
                     if selected is None:
                         continue
                     query = f"/model switch {selected}"
                 _handle_model_slash_command(
                     query,
-                    agent=session,
+                    agent=model_control,
                 )
-                model_id = session.current_model().id
+                model_id = model_control.current_model().id
                 if _ui:
                     _ui.model = model_id
                 continue
@@ -724,9 +852,55 @@ async def _chat_facade_loop(
                 print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
                 continue
 
+            saved_result: AgentResult | None = None
+            saved_action: str | None = None
+            saved_input: str | None = None
+            if selected_chat is not None:
+                # Refresh the durable active slot before opening any resources. Another
+                # process may have started a Turn since the conversation was selected.
+                latest = next((chat for chat in list_chat_sessions(
+                    facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, workspace=Path(default_chat_workspace),
+                ) if chat.thread_id == selected_chat.thread_id), None)
+                if latest is None:
+                    print("会话已不可读取；请重新 /resume 选择。")
+                    continue
+                selected_chat = latest
+                if selected_chat.active_turn_id:
+                    if selected_chat.status not in {"paused", "interrupted"}:
+                        _print_chat_recovery(selected_chat)
+                        continue
+                    saved_result = await facade.read_result(selected_chat.active_turn_id)
+                    request = saved_result.pause
+                    if request is None:
+                        _print_chat_recovery(selected_chat, saved_result)
+                        continue
+                    if request.kind in {"clarification", "choice"}:
+                        if request.options and query not in request.options:
+                            _print_chat_recovery(selected_chat, saved_result)
+                            continue
+                        saved_action, saved_input = "continue", query
+                    else:
+                        saved_action = resolve_pause_choice(query, request.options)
+                        if saved_action is None and _ui:
+                            saved_action = await _handle_ui_pause(saved_result, _ui)
+                        if saved_action is None:
+                            _print_chat_recovery(selected_chat, saved_result)
+                            continue
+                    if saved_action != "abort":
+                        metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, saved_result.turn_id)
+                        facade.knowledge = metadata.runtime.knowledge
+            if saved_result is None:
+                session = await open_session()
+            resume_driver = session if saved_result is None and session is not None else facade
             event_display.begin_turn()
             try:
-                submission = session.submit(query, event_sink=event_display)
+                if saved_result is not None:
+                    assert saved_action is not None
+                    submission = facade.resume(saved_result.turn_id, saved_action,
+                                               user_input=saved_input, event_sink=event_display)
+                else:
+                    assert session is not None
+                    submission = session.submit(query, event_sink=event_display)
                 result = await _ui.operation(submission) if _ui else await submission
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
@@ -734,7 +908,7 @@ async def _chat_facade_loop(
                 _ui.display.interrupted()
                 if _ui.display.turn_id:
                     current_turn_id = _ui.display.turn_id
-                    await session.resume(current_turn_id, "abort", event_sink=event_display)
+                    await resume_driver.resume(current_turn_id, "abort", event_sink=event_display)
                 print("已取消当前执行；已发生的文件修改不会回滚。")
                 continue
             current_turn_id = result.turn_id
@@ -743,26 +917,27 @@ async def _chat_facade_loop(
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
                 action = await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result)
                 if action is None:
-                    result = await session.resume(result.turn_id, "abort")
+                    result = await resume_driver.resume(result.turn_id, "abort")
                     print("已取消。")
                     break
                 event_display.begin_turn(reset=False)
                 if text_answer:
-                    resumption = session.resume(
+                    resumption = resume_driver.resume(
                         result.turn_id, "continue", user_input=action, event_sink=event_display,
                     )
                 else:
-                    resumption = session.resume(result.turn_id, action, event_sink=event_display)
+                    resumption = resume_driver.resume(result.turn_id, action, event_sink=event_display)
                 try:
                     result = await _ui.operation(resumption) if _ui else await resumption
                 except asyncio.CancelledError:
                     if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                         raise
                     _ui.display.interrupted()
-                    result = await session.resume(result.turn_id, "abort", event_sink=event_display)
+                    result = await resume_driver.resume(result.turn_id, "abort", event_sink=event_display)
                     print("已取消当前执行；已发生的文件修改不会回滚。")
             event_display.finish()
             last_result = result
+            last_answer = result.answer or ""
             _display_agent_result(
                 result,
                 verbose=verbose,
@@ -1204,10 +1379,10 @@ def _latest_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db) as store:
+    with RolloutStore(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
-            statuses={"paused"},
+            statuses={"paused", "interrupted", "running"},
             workspace_path=workspace_path,
         )
         return None if turn is None else _project_cli_turn(store, turn)
@@ -1218,10 +1393,10 @@ def _latest_abortable_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db) as store:
+    with RolloutStore(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
-            statuses={"paused"},
+            statuses={"paused", "interrupted", "running"},
             workspace_path=workspace_path,
         )
         return None if turn is None else _project_abortable_cli_turn(store, turn)
@@ -1232,7 +1407,7 @@ def _latest_completed_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db) as store:
+    with RolloutStore(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"completed", "failed", "cancelled"},
@@ -1242,7 +1417,7 @@ def _latest_completed_cli_turn(
 
 
 def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RolloutStore(checkpoint_db) as store:
+    with RolloutStore(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -1251,7 +1426,7 @@ def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
 
 
 def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RolloutStore(checkpoint_db) as store:
+    with RolloutStore(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -1330,8 +1505,12 @@ def agent_chat(
     ] = None,
     last: Annotated[
         bool,
-        typer.Option("--last", help="从当前工作区最近的已完成 Turn 继续"),
+        typer.Option("--last", hidden=True, help="兼容别名：使用 --continue"),
     ] = False,
+    continue_chat: Annotated[bool, typer.Option("--continue", help="打开当前工作区最近聊天，回放后继续")] = False,
+    resume_thread_id: Annotated[
+        str | None, typer.Option("--resume", help="打开指定会话 ID；交互选择请使用 agent resume"),
+    ] = None,
     checkpoint_db: Annotated[
         Path,
         typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库"),
@@ -1387,19 +1566,17 @@ def agent_chat(
     ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
-    if previous_turn_id is not None and last:
-        raise typer.BadParameter("--previous-turn-id 与 --last 不能同时使用")
+    if sum((previous_turn_id is not None, last or continue_chat, resume_thread_id is not None)) > 1:
+        raise typer.BadParameter("--previous-turn-id、--continue/--last 和 --resume 只能选择一个")
     effective_previous_turn_id = previous_turn_id
     continued_turn: _CLITurn | None = None
-    if last:
-        latest = _latest_completed_cli_turn(
-            checkpoint_db,
-            workspace_path=Path.cwd(),
-        )
-        if latest is None:
-            raise typer.BadParameter("当前工作区没有可继续的 Turn")
-        effective_previous_turn_id = latest.turn_id
-        continued_turn = latest
+    if last or continue_chat:
+        sessions = list_chat_sessions(checkpoint_db, workspace=Path.cwd())
+        if not sessions:
+            raise typer.BadParameter("当前工作区没有已保存的聊天")
+        resume_thread_id = sessions[0].thread_id
+    if resume_thread_id is not None and knowledge_config is not None:
+        raise typer.BadParameter("打开旧聊天时使用保存的知识库配置，不能传 --knowledge-config")
     if effective_previous_turn_id is not None and knowledge_config is not None:
         raise typer.BadParameter("继续已有 Turn 时不能传 --knowledge-config；Turn 的 RuntimeBinding 是唯一配置来源")
     if effective_previous_turn_id is not None and model is not None:
@@ -1442,6 +1619,7 @@ def agent_chat(
             max_tokens_total=max_tokens_total,
             max_turns=max_turns,
             previous_turn_id=effective_previous_turn_id,
+            resume_thread_id=resume_thread_id,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
@@ -1612,7 +1790,7 @@ def agent_run(
         print("⏸  已保存 checkpoint，可跨进程恢复:")
         resume_args = [
             "agent",
-            "resume",
+            "recover",
             result.turn_id,
             "--checkpoint-db",
             str(checkpoint_db),
@@ -1630,6 +1808,31 @@ def agent_run(
 
 @agent_app.command(name="resume")
 def agent_resume(
+    thread_id: Annotated[str | None, typer.Argument(help="稳定会话 ID；省略则选择当前工作区旧聊天")] = None,
+    checkpoint_db: Annotated[
+        Path, typer.Option("--rollout-db", "--checkpoint-db", help="已有 SQLite Rollout 数据库"),
+    ] = DEFAULT_CHECKPOINT_PATH,
+    web_proxy_url: Annotated[str | None, typer.Option("--web-proxy", help="当前调用的可信网页代理")] = None,
+    web_limits_file: Annotated[
+        Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="新 Turn 的有界网页预算 JSON"),
+    ] = None,
+    web_search_key_file: Annotated[
+        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+                                 help="工作区外的受保护搜索服务密钥文件"),
+    ] = None,
+    web_search_provider: Annotated[
+        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+                                 help="bing | brave | tavily"),
+    ] = None,
+) -> None:
+    """重新打开旧聊天：只读回放历史，下一条消息创建新 Turn。原任务恢复使用 recover。"""
+    agent_chat(resume_thread_id=thread_id or "", checkpoint_db=checkpoint_db,
+               web_proxy_url=web_proxy_url, web_limits_file=web_limits_file,
+               web_search_key_file=web_search_key_file, web_search_provider=web_search_provider)
+
+
+@agent_app.command(name="recover")
+def agent_recover(
     turn_id: Annotated[
         str | None,
         typer.Argument(help="要恢复的 UUID Turn ID"),

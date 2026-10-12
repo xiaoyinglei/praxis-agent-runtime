@@ -103,3 +103,47 @@ def test_launcher_passes_key_only_in_environment_and_skips_dotenv(monkeypatch, t
     assert env["DEEPSEEK_API_KEY"] == "fake-protected-deepseek-key"
     assert env["PRAXIS_DISABLE_DOTENV"] == "1"
     assert all("fake-protected" not in arg for arg in argv)
+
+
+@pytest.mark.parametrize("options, expected", [
+    ({"resume": ""}, ["resume"]),
+    ({"resume": "thread_saved"}, ["resume", "thread_saved"]),
+    ({"continue_chat": True}, ["chat", "--continue"]),
+    ({"recover_args": ["turn_saved", "--action", "continue"]},
+     ["recover", "turn_saved", "--action", "continue"]),
+])
+def test_reopening_reuses_private_key_and_forwards_session_arguments(monkeypatch, tmp_path, options, expected):
+    module = launcher()
+    repo = tmp_path / "repo"
+    (repo / ".venv/bin").mkdir(parents=True)
+    agent = repo / ".venv/bin/agent"
+    agent.write_text("placeholder")
+    agent.chmod(0o700)
+    key_path = tmp_path / "private/deepseek.key"
+    module.load_key(key_path, prompt=lambda _: "fake-protected-deepseek-key")
+    calls = []
+    monkeypatch.setattr(module, "hidden_prompt", lambda _: pytest.fail("Do not request saved credentials again"))
+    monkeypatch.setattr(module, "validate_workspace_readiness", lambda *args: None)
+    monkeypatch.setattr(os, "execve", lambda path, argv, env: calls.append((path, argv, env)))
+    monkeypatch.chdir(tmp_path)
+    module.start(repo, key_path, **options)
+    _, argv, env = calls[0]
+    assert argv == [str(agent), *expected]
+    assert env["DEEPSEEK_API_KEY"] == "fake-protected-deepseek-key"
+    assert all("fake-protected" not in arg for arg in argv)
+
+
+@pytest.mark.parametrize("arguments, expected", [
+    (["--resume"], {"resume": "", "continue_chat": False, "recover_args": None}),
+    (["--resume", "thread_saved"], {"resume": "thread_saved", "continue_chat": False, "recover_args": None}),
+    (["--continue"], {"resume": None, "continue_chat": True, "recover_args": None}),
+    (["recover", "turn_saved", "--action", "continue"],
+     {"resume": None, "continue_chat": False, "recover_args": ["turn_saved", "--action", "continue"]}),
+])
+def test_launcher_main_routes_resume_continue_and_recover(monkeypatch, arguments, expected):
+    module = launcher()
+    captured = []
+    monkeypatch.setattr(module.sys, "argv", ["praxis", *arguments])
+    monkeypatch.setattr(module, "start", lambda *args, **options: captured.append(options))
+    assert module.main() == 0
+    assert {name: captured[0][name] for name in expected} == expected

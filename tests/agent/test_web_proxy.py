@@ -150,7 +150,7 @@ async def test_agent_executor_fetch_uses_proxy_and_records_mode(tmp_path, monkey
     assert backend.hosts == ["127.0.0.1"]
 
 
-@pytest.mark.parametrize("command", ["chat", "run", "resume"])
+@pytest.mark.parametrize("command", ["chat", "run", "resume", "recover"])
 @pytest.mark.parametrize("force_terminal", [False, True])
 def test_cli_exposes_proxy_override(command, force_terminal, monkeypatch):
     monkeypatch.setenv("TERM", "xterm-256color")

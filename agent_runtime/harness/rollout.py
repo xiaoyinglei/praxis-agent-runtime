@@ -4056,8 +4056,10 @@ class RolloutStore:
             raise KeyError(f"unknown turn: {turn_id}")
         return _turn_snapshot(row)
 
-    def list_turns(self) -> tuple[TurnSnapshot, ...]:
-        rows = self._connection.execute("SELECT * FROM turns ORDER BY rowid").fetchall()
+    def list_turns(self, thread_id: str | None = None) -> tuple[TurnSnapshot, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM turns WHERE (? IS NULL OR thread_id = ?) ORDER BY rowid", (thread_id, thread_id),
+        ).fetchall()
         return tuple(_turn_snapshot(row) for row in rows)
 
     def list_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
@@ -4085,6 +4087,10 @@ class RolloutStore:
 
     def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         self._assert_artifact_integrity()
+        return self.list_conversation_items(turn_id)
+
+    def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
+        """Read original Items through the fork point; do not load or execute artifacts."""
         turn = self._connection.execute(
             "SELECT thread_id, turn_index FROM turns WHERE turn_id = ?", (turn_id,)
         ).fetchone()
@@ -4130,6 +4136,13 @@ class RolloutStore:
                 ).fetchall()
             )
         return tuple(_item_snapshot(row) for row in rows)
+
+    def last_record(self, thread_id: str) -> RolloutRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence DESC LIMIT 1",
+            (thread_id,),
+        ).fetchone()
+        return None if row is None else _record_snapshot(row)
 
     def list_records(self, thread_id: str) -> tuple[RolloutRecord, ...]:
         rows = self._connection.execute(

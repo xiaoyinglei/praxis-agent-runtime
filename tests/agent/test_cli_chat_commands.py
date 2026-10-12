@@ -160,7 +160,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
             turn_calls.append((args, kwargs))
             raise AssertionError("slash commands must not reach the agent")
 
-    commands = iter(["/status", "/copy", "/transcript", "/new", "/status", "/details", "/help", "/unknown", "/exit"])
+    commands = iter(["/status", "/copy", "/new", "/status", "/details", "/help", "/unknown", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
 
     await cli._chat_facade_loop(
@@ -178,7 +178,7 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     assert "未知命令: /details" in output
     assert "Ctrl+O 切换最近记录" in output
     assert "暂无可复制的回答" in output
-    assert "当前会话已输出在终端中" in output
+    assert "/transcript" not in output
     assert turn_calls == []
 
 

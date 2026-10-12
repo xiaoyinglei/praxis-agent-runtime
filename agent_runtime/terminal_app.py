@@ -7,10 +7,10 @@ import base64
 import io
 import os
 import sys
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import redirect_stdout, suppress
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 from prompt_toolkit.application import Application, run_in_terminal
@@ -120,6 +120,7 @@ class TerminalChatApp:
         self._model_choices: list[str] = []
         self._model_index = 0
         self._model_pending: asyncio.Future[str | None] | None = None
+        self._menu_title = "选择模型"
         self.model_menu = FormattedTextControl(
             self._model_fragments, focusable=True,
             get_cursor_position=lambda: Point(0, self._model_index),
@@ -133,7 +134,7 @@ class TerminalChatApp:
             style="class:input",
             history=BoundedPromptHistory(),
             completer=WordCompleter(["/help", "/status", "/new", "/clear", "/model", "/verbose",
-                                     "/copy", "/transcript", "/exit"]),
+                                     "/copy", "/resume", "/exit"]),
             complete_while_typing=Condition(lambda: self.editor.text.startswith("/")),
         )
         self.approval_body = TextArea(
@@ -619,6 +620,26 @@ class TerminalChatApp:
             self.app.output, [("", safe_terminal_text(text) + "\n")], self.app.style or Style.from_dict({}),
         ))
 
+    async def replay_messages(self, messages: Sequence[tuple[str, str]]) -> None:
+        """Publish saved messages in native scrollback; retain a bounded inspection view."""
+        await self.flush_scrollback()
+        for kind, text in messages:
+            width = max(4, self.app.output.get_size().columns - 1)
+            fragments: StyleAndTextTuples = (
+                [("class:user", "你 › " + safe_terminal_text(text) + "\n\n")]
+                if kind == "user" else
+                [("class:assistant", "Praxis\n"),
+                 *_markdown(safe_terminal_text(text), width, "NO_COLOR" not in os.environ), ("", "\n\n")]
+            )
+            await run_in_terminal(partial(
+                print_formatted_text, self.app.output, fragments, self.app.style or Style.from_dict({}),
+            ))
+            self.view.message(text + "\n", kind)
+            self.view.blocks[-1].in_scrollback = True
+        self._show_history = False
+        self._follow = True
+        self.view.invalidate()
+
     async def flush_scrollback(self) -> None:
         """Commit stable output once; keep the viewport for streaming and inspection."""
         pending = [block for block in self.view.blocks if not block.in_scrollback]
@@ -751,10 +772,11 @@ class TerminalChatApp:
             ))
         return result
 
-    async def choose_model(self, choices: list[str], current: str) -> str | None:
+    async def choose_menu(self, choices: list[str], *, title: str, current: str = "") -> str | None:
         if not choices:
             return None
         self._model_choices = choices
+        self._menu_title = title
         self._model_index = choices.index(current) if current in choices else 0
         self._model_pending = asyncio.get_running_loop().create_future()
         self.app.layout.focus(self.model_menu)
@@ -766,6 +788,9 @@ class TerminalChatApp:
             self.app.layout.focus(self.editor)
             self.invalidate()
 
+    async def choose_model(self, choices: list[str], current: str) -> str | None:
+        return await self.choose_menu(choices, title="选择模型", current=current)
+
     def _footer(self) -> StyleAndTextTuples:
         if self._approval is not None:
             hints = []
@@ -775,7 +800,7 @@ class TerminalChatApp:
                 hints.append("N拒绝")
             return [("class:dim", " " + " · ".join([*hints, "Esc取消", "Tab详情"]))]
         if self._model_pending is not None:
-            return [("class:dim", " 选择模型 · ↑↓ 移动 · Enter 确认 · Esc 取消")]
+            return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
         activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
         mouse_hint = "F2 原生选择" if self._mouse_enabled else "拖选复制"
         return [

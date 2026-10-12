@@ -66,7 +66,7 @@ def _result(
     )
 
 
-def test_agent_resume_uses_public_facade_and_stable_result(
+def test_agent_recover_uses_public_facade_and_stable_result(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -95,7 +95,7 @@ def test_agent_resume_uses_public_facade_and_stable_result(
 
     database = tmp_path / "agent.sqlite"
     turn_id = _persist_cli_turn(database, tmp_path / "workspace")
-    cli.agent_resume(
+    cli.agent_recover(
         turn_id=turn_id,
         checkpoint_db=database,
         action="allow_once",
@@ -142,7 +142,7 @@ def test_schema_v3_resume_reads_only_outer_model_id(
 
     monkeypatch.setattr(cli, "_create_agent_facade", create_facade)
 
-    cli.agent_resume(
+    cli.agent_recover(
         turn_id=turn_id,
         checkpoint_db=database,
         action="continue",
@@ -167,7 +167,7 @@ def test_cli_resume_rejects_legacy_outer_model_alias_for_provider_actions(
     )
 
     with pytest.raises(RuntimeError, match="legacy model_alias binding is unsupported"):
-        cli.agent_resume(
+        cli.agent_recover(
             turn_id=turn_id,
             checkpoint_db=database,
             action=action,
@@ -194,7 +194,7 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
     monkeypatch.chdir(workspace)
 
     with pytest.raises(typer.Exit) as exc_info:
-        cli.agent_resume(
+        cli.agent_recover(
             turn_id=None if use_last else turn.turn_id,
             last=use_last,
             checkpoint_db=database,
@@ -247,7 +247,7 @@ async def test_public_resume_rejects_explicit_unavailable_session_model_before_i
     assert clarification.status == "pending"
 
 
-def test_agent_resume_without_action_prints_pending_recovery_info(
+def test_agent_recover_without_action_prints_pending_recovery_info(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -286,7 +286,7 @@ def test_agent_resume_without_action_prints_pending_recovery_info(
     turn_id = _persist_cli_turn(database, tmp_path / "workspace")
 
     with pytest.raises(typer.Exit) as exc_info:
-        cli.agent_resume(
+        cli.agent_recover(
             turn_id=turn_id,
             checkpoint_db=database,
             action=None,
@@ -301,7 +301,7 @@ def test_agent_resume_without_action_prints_pending_recovery_info(
     assert resumed == []
 
 
-def test_agent_resume_without_pending_request_offers_continue(
+def test_agent_recover_without_pending_request_offers_continue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -320,7 +320,7 @@ def test_agent_resume_without_pending_request_offers_continue(
     monkeypatch.setattr(cli, "_create_agent_facade", lambda **_kwargs: _Facade())
 
     with pytest.raises(typer.Exit) as exc_info:
-        cli.agent_resume(
+        cli.agent_recover(
             turn_id=turn_id,
             checkpoint_db=database,
             action=None,

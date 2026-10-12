@@ -154,14 +154,14 @@ def run_smoke() -> CLISmokeResult:
 
         root_command = get_command(agent_app)
         commands = root_command.commands if isinstance(root_command, click.Group) else {}
-        resume_command = commands.get("resume")
+        resume_command = commands.get("recover")
         resume_options = {
             option
             for parameter in (() if resume_command is None else resume_command.params)
             if isinstance(parameter, click.Option)
             for option in (*parameter.opts, *parameter.secondary_opts)
         }
-        checks["command_surface"] = {"chat", "run", "resume", "model"} <= set(commands) and {
+        checks["command_surface"] = {"chat", "run", "resume", "recover", "model"} <= set(commands) and {
             "--last",
             "--action",
         } <= resume_options

@@ -96,7 +96,7 @@ def validate_workspace_readiness(repo, python):
         raise ValueError(f"Agent workspace is not ready: {issue[0]}: {issue[1]}")
 
 
-def start(repo, key_path, *, configure=False, venv=None):
+def start(repo, key_path, *, configure=False, venv=None, resume=None, continue_chat=False, recover_args=None):
     repo = Path(repo).resolve(strict=True)
     environment = Path(venv).resolve(strict=True) if venv is not None else repo / ".venv"
     agent = environment / "bin/agent"
@@ -108,7 +108,15 @@ def start(repo, key_path, *, configure=False, venv=None):
     env["DEEPSEEK_API_KEY"] = key
     env["PRAXIS_DISABLE_DOTENV"] = "1"
     os.chdir(repo)
-    os.execve(str(agent), [str(agent), "chat", "--model", "deepseek-flash"], env)
+    if resume is not None:
+        arguments = ["resume", *([resume] if resume else [])]
+    elif continue_chat:
+        arguments = ["chat", "--continue"]
+    elif recover_args is not None:
+        arguments = ["recover", *recover_args]
+    else:
+        arguments = ["chat", "--model", "deepseek-flash"]
+    os.execve(str(agent), [str(agent), *arguments], env)
 
 
 def main():
@@ -116,10 +124,20 @@ def main():
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--venv", type=Path, help="Runtime virtualenv; defaults to the repository's .venv.")
     parser.add_argument("--configure", action="store_true", help="Explicitly replace the saved Key via hidden input.")
+    reopening = parser.add_mutually_exclusive_group()
+    reopening.add_argument("--resume", nargs="?", const="", metavar="THREAD_ID",
+                           help="Reopen a saved chat; omit its ID to choose a workspace conversation.")
+    reopening.add_argument("--continue", dest="continue_chat", action="store_true",
+                           help="Reopen the most recent chat in this launcher's workspace.")
+    parser.add_argument("command", nargs="?", choices=["recover"], help="Explicitly recover an unfinished task.")
+    parser.add_argument("recovery_arguments", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.command == "recover" and (args.resume is not None or args.continue_chat):
+        parser.error("recover cannot be combined with --resume or --continue")
     try:
         start(args.repo, Path.home() / ".config/praxis/credentials/deepseek.key",
-              configure=args.configure, venv=args.venv)
+              configure=args.configure, venv=args.venv, resume=args.resume, continue_chat=args.continue_chat,
+              recover_args=args.recovery_arguments if args.command == "recover" else None)
     except (ValueError, OSError, EOFError, getpass.GetPassWarning, subprocess.SubprocessError) as error:
         print(f"Startup failed: {error if isinstance(error, ValueError) else type(error).__name__}", file=sys.stderr)
         return 1

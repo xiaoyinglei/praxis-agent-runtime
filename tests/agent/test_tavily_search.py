@@ -238,7 +238,7 @@ async def test_tavily_sdk_resume_preserves_provider_and_never_persists_key(tmp_p
         assert "fake-tavily-secret" not in repr(items)
 
 
-@pytest.mark.parametrize("command", ["run", "chat", "resume"])
+@pytest.mark.parametrize("command", ["run", "chat", "resume", "recover"])
 def test_cli_forwards_search_provider_and_key_from_environment(command, tmp_path, monkeypatch):
     from typer.testing import CliRunner
 
@@ -265,7 +265,7 @@ def test_cli_forwards_search_provider_and_key_from_environment(command, tmp_path
     monkeypatch.setattr(cli, "_chat_facade_loop", chat_loop)
     database = tmp_path / "state.sqlite"
     arguments = [command, "public jobs"] if command == "run" else [command]
-    if command == "resume":
+    if command == "recover":
         turn_id = _persist_cli_turn(database, tmp_path / "workspace")
         arguments += [turn_id, "--checkpoint-db", str(database), "--action", "allow_once"]
     key = tmp_path / "search.key"

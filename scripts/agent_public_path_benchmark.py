@@ -376,7 +376,7 @@ def _resume_until_terminal(
         current = _run_process(
             [
                 *agent_command,
-                "resume",
+                "recover",
                 turn_id,
                 "--checkpoint-db",
                 str(checkpoint),
@@ -478,7 +478,7 @@ def _run_crash_recovery(
     recovery = _run_process(
         [
             *agent_command,
-            "resume",
+            "recover",
             turn_id,
             "--checkpoint-db",
             str(checkpoint),

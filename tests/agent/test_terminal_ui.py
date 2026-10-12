@@ -59,20 +59,6 @@ def test_nested_folds_toggle_in_place_without_duplicating_output():
     assert "unique detail" not in view.plain_text()
 
 
-def test_transcript_includes_collapsed_details_without_changing_view():
-    view = Conversation()
-    view.message("# 原始 Markdown\n", "answer")
-    group = view.add_group()
-    tool = view.add_tool(group, "读取文件")
-    tool.append("unique retained detail")
-    group.expanded = tool.expanded = False
-    assert "unique retained detail" not in view.plain_text()
-    transcript = view.transcript()
-    assert transcript.count("unique retained detail") == 1
-    assert "# 原始 Markdown" in transcript
-    assert not group.expanded and not tool.expanded
-
-
 @pytest.mark.anyio
 async def test_completed_answers_enter_native_scrollback_once_and_remain_inspectable():
     import io
@@ -101,9 +87,35 @@ async def test_completed_answers_enter_native_scrollback_once_and_remain_inspect
     await ui.flush_scrollback()
     assert stream.getvalue().count("first complete answer") == 1
     assert stream.getvalue().count("second complete answer") == 1
-    assert "first complete answer" in ui.view.transcript()
+    assert "first complete answer" in ui.view.plain_text()
     ui._move(-10)
     assert "first complete answer" in "".join(t for _, t, *_ in ui.fragments())
+
+
+@pytest.mark.anyio
+async def test_saved_messages_replay_in_full_even_when_inspection_view_is_bounded():
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from agent_runtime.terminal_app import TerminalChatApp
+    from agent_runtime.terminal_ui import MAX_TEXT
+
+    stream = io.StringIO()
+    ui = TerminalChatApp(
+        model="test", workspace="/tmp",
+        output=Vt100_Output(stream, lambda: Size(rows=24, columns=80), enable_cpr=False),
+    )
+    text = "begin saved answer\n" + "middle saved line\n" * (MAX_TEXT // 16) + "end saved answer"
+    await ui.replay_messages((("user", "saved question"), ("answer", text)))
+    rendered = stream.getvalue()
+    assert "saved question" in rendered and "begin saved answer" in rendered and "end saved answer" in rendered
+    assert rendered.count("middle saved line") == text.count("middle saved line")
+    assert ui.view.blocks[-1].omitted > 0
+    assert all(block.in_scrollback for block in ui.view.blocks)
+    await ui.flush_scrollback()
+    assert stream.getvalue() == rendered
 
 
 @pytest.mark.anyio

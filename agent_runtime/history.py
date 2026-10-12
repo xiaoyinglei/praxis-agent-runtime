@@ -3,12 +3,94 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
+
+
+@dataclass(frozen=True, slots=True)
+class ChatSessionSummary:
+    thread_id: str
+    title: str
+    updated_at_ms: int
+    status: str
+    head_turn_id: str | None
+    active_turn_id: str | None
+    model_id: str | None
+
+
+def list_chat_sessions(database: Path, *, workspace: Path) -> tuple[ChatSessionSummary, ...]:
+    """List workspace conversations, excluding runtime-created child agent Threads."""
+    if not database.exists():
+        return ()
+    expected_workspace = workspace.expanduser().resolve()
+    with RolloutStore(database, read_only=True) as store:
+        sessions = []
+        for thread in store.list_threads():
+            if Path(thread.workspace).resolve() != expected_workspace:
+                continue
+            turns = store.list_turns(thread.thread_id)
+            if not turns:
+                continue
+            # Child runs have a durable parent binding, unlike user conversation forks.
+            if turns[0].binding_manifest.get("budget_parent_turn_id") is not None:
+                continue
+            first = next((item.payload.get("text") for item in store.list_items(turns[0].turn_id)
+                          if item.kind == "user_message"), "")
+            latest = store.read_turn(thread.active_turn_id or thread.head_turn_id or turns[-1].turn_id)
+            record = store.last_record(thread.thread_id)
+            model_id = thread.settings.get("model_id") or latest.binding_manifest.get("model_id")
+            sessions.append(ChatSessionSummary(
+                thread.thread_id, " ".join(str(first).split())[:100],
+                record.committed_at_ms if record else 0, latest.status,
+                thread.head_turn_id, thread.active_turn_id, model_id if isinstance(model_id, str) else None,
+            ))
+        return tuple(sorted(sessions, key=lambda session: session.updated_at_ms, reverse=True))
+
+
+def read_chat_messages(
+    database: Path, *, thread_id: str, workspace: Path,
+) -> tuple[tuple[str, str], ...]:
+    """Replay saved human/assistant text, including fork ancestors and no tool results.
+
+    Original Items survive context compaction. Model output and the final
+    agent_message may represent the same answer; publish that answer only once.
+    Incomplete output is not presented as a finished assistant answer.
+    """
+    with RolloutStore(database, read_only=True) as store:
+        thread = store.read_thread(thread_id)
+        if Path(thread.workspace).resolve() != workspace.expanduser().resolve():
+            raise ValueError("会话属于其他工作区")
+        anchor = thread.active_turn_id or thread.head_turn_id
+        if anchor is None:
+            return ()
+        items = store.list_conversation_items(anchor)
+        final_answers = {item.turn_id: item.payload.get("text") for item in items
+                         if item.kind == "agent_message" and item.status == "completed"}
+        committed_responses = {operation.response_item_id for turn_id in {item.turn_id for item in items}
+                               for operation in store.list_model_operations(turn_id)
+                               if operation.status == "completed"
+                               and operation.request_ref.get("purpose") != "context_summary"}
+        messages = []
+        for item in items:
+            text = item.payload.get("text")
+            if item.status != "completed" or not isinstance(text, str) or not text.strip():
+                continue
+            if item.kind == "user_message":
+                messages.append(("user", text))
+            elif item.kind == "agent_message":
+                messages.append(("answer", text))
+            elif item.kind == "model_response":
+                if item.item_id not in committed_responses or item.payload.get("response_status") == "incomplete":
+                    continue
+                if not item.payload.get("tool_calls") and text == final_answers.get(item.turn_id):
+                    continue
+                messages.append(("answer", text))
+        return tuple(messages)
 
 
 def list_history_turns(database: Path, *, limit: int = 20) -> list[dict[str, Any]]:

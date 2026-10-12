@@ -160,7 +160,7 @@ def test_cli_resume_forwards_key_file_from_environment(tmp_path, monkeypatch):
     database = tmp_path / "state.sqlite"
     turn_id = _persist_cli_turn(database, tmp_path / "workspace")
     path = tmp_path / "search.key"
-    result = CliRunner().invoke(cli.agent_app, ["resume", turn_id, "--checkpoint-db", str(database),
+    result = CliRunner().invoke(cli.agent_app, ["recover", turn_id, "--checkpoint-db", str(database),
                                                "--action", "allow_once"],
                                 env={"PRAXIS_WEB_SEARCH_KEY_FILE": str(path)})
     assert result.exit_code == 0, result.output
@@ -219,7 +219,7 @@ def test_cli_exposes_web_authorization_and_search_credential_path():
         web_option = next(p for p in get_command(agent_app).commands[command].params if p.name == "allow_web_tools")
         assert web_option.default is True
         assert "--no-web-tools" in web_option.secondary_opts
-    assert "web_search_key_file" in {p.name for p in get_command(agent_app).commands["resume"].params}
+    assert "web_search_key_file" in {p.name for p in get_command(agent_app).commands["recover"].params}
 
 
 def test_server_launcher_forwards_only_optional_protected_search_key_path(tmp_path):

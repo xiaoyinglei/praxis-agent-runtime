@@ -147,7 +147,7 @@ class Agent:
 
     @asynccontextmanager
     async def session(
-        self, *, previous_turn_id: str | None = None,
+        self, *, previous_turn_id: str | None = None, thread_id: str | None = None,
         require_workspace_change: bool = True,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
@@ -163,7 +163,7 @@ class Agent:
             raise ValueError("max_steps and legacy max_turns must agree when both are provided")
         step_budget = max_steps if max_steps is not None else max_turns
         session = await Session.open(
-            agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id,
+            agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id, thread_id=thread_id,
             require_workspace_change=require_workspace_change,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
@@ -215,7 +215,7 @@ class Agent:
     async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
-        with RolloutStore(self._harness_database()) as store:
+        with RolloutStore(self._harness_database(), read_only=True) as store:
             turn = store.read_turn(turn_id)
             thread = store.read_thread(turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
@@ -312,7 +312,7 @@ class Agent:
     async def pending_input(self, turn_id: str) -> AgentPause | None:
         from agent_runtime.harness import RolloutStore, TurnResult
 
-        with RolloutStore(self._harness_database()) as store:
+        with RolloutStore(self._harness_database(), read_only=True) as store:
             turn = store.read_turn(turn_id)
             thread = store.read_thread(turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():

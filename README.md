@@ -189,7 +189,7 @@ Errors remain visible even when their execution group is collapsed.
 | Drag over answer text | Native terminal selection; use the terminal's Copy command (`Cmd+C` on macOS) |
 | Terminal Paste / `Cmd+V` on macOS | Paste into the composer; bracketed multiline paste never sends automatically |
 | `/copy` | Request clipboard copy of the latest answer as raw Markdown; also put the full answer in native scrollback |
-| `/transcript` | Put the retained conversation in native scrollback for selection and terminal search |
+| `/resume [THREAD_ID]` | Reopen a saved workspace conversation; choose a chat when the ID is omitted |
 | `F2` | Opt into application mouse interaction, or return to native terminal selection |
 | Click `▸` / `▾` in F2 mouse mode | Expand / collapse the execution group or individual tool |
 | `Ctrl+O` | Toggle the latest execution group without leaving the composer |
@@ -248,16 +248,61 @@ execution group, with bounded tool details (2,000 display rows and 131,072
 characters per block; 8,388,608 text characters across the viewport). Display omissions are explicitly marked; folding never
 changes durable history. Tool/ACI truncation is reported separately. `/verbose`
 also opens or closes retained execution details. Redirected input/output and
-`TERM=dumb` retain the plain-text chat path; `agent run` and `agent resume` retain
+`TERM=dumb` retain the plain-text chat path; `agent run` and `agent recover` retain
 their existing command-line output.
 
 The next message keeps the current conversation history and creates a new Turn
 bound to the selected model ID; no restart or `/new` is required. An invalid ID
 prints the available IDs, keeps the previous model, and does not contact a
 provider. Each completed or paused Turn retains an authenticated, immutable
-definition in durable history. `agent resume` therefore continues that Turn's
+definition in durable history. `agent recover` therefore continues that Turn's
 original model even after the model ID is updated, removed, or selected differently
 for later Turns.
+
+### 重新打开旧聊天
+
+退出程序或断开 SSH 后，已保存的聊天仍在工作区的 `.praxis/checkpoints.sqlite` 中。
+`resume` 统一表示打开一个聊天 Thread；浏览与回放只读数据库，不调用模型或执行旧工具。
+会话选择器显示首条提问摘要、最后活动时间、最新状态和完整会话 ID，按最近活动排序，
+只列当前工作区的会话（排除运行时子智能体的 Thread）。交互终端用 ↑↓ / Enter / Esc；
+纯文本终端用编号或完整 ID，空行取消。
+
+服务器既有 `praxis` 启动器会继续读取保存的密钥和搜索服务配置，无需重新配置：
+
+```bash
+praxis --resume                  # 选择旧聊天
+praxis --resume thread_<id>      # 直接打开稳定会话 ID
+praxis --continue                # 打开最近聊天
+```
+
+该启动器的工作区沿用 `--repo` 指定的目录（默认为安装仓库）。普通 Agent CLI 使用当前目录：
+
+```bash
+uv run agent resume
+uv run agent resume thread_<id>
+uv run agent chat --continue
+```
+
+聊天内也可输入 `/resume` 或 `/resume thread_<id>`。保存的人类消息和助手文本先回放到终端原生
+滚动历史，可原生拖选、复制和搜索；回放完整文本不受内存视窗保留上限影响。`/transcript` 已移除。
+回放读取压缩前的原始 Items；下一条消息通过 `Agent.session(thread_id=...)` 打开原 Session，
+`Session.submit` 在同一 Thread 创建新 Turn，`RolloutContextManager` 从原始 Items 和已保存的
+上下文压缩重建模型请求，包含需要的旧工具结果而不执行它们。会话保存的模型选择、知识库和
+工具策略继续生效；`/model` 可为下一条消息切换模型。`chat --last` 保留为隐藏的 `--continue` 兼容别名。
+
+暂停或中断的会话先只读回放，并在同一个聊天中显示原来的确认、补充问题或重试选项；
+直接回复即可继续原 Turn，随后新的消息创建新 Turn。打开历史本身不会恢复或取消原任务。
+若另一进程仍在执行，显示“处理中”，不重复执行；完成后直接发送新消息，或 `/new` 开始新聊天。
+Praxis 当前不支持跨进程实时接管正在执行的终端。
+原 CLI 的 `resume TURN_ID --action ...` 已改名为 `recover`，旧命令不会被悄悄解释为任务恢复：
+
+```bash
+praxis recover turn_<id>                   # 查看任务恢复选项，复用保存的密钥
+praxis recover turn_<id> --action continue # 明确继续原 Turn
+uv run agent recover turn_<id> --action allow_once
+```
+
+底层 SDK `Agent.resume` / `Session.resume` 保留“恢复同一个 Turn”的语义和原冻结绑定。
 
 ### 启动本地 MLX 模型与 Agent
 
@@ -387,7 +432,7 @@ uv run agent run \
 
 Risky tool calls are presented for approval in an interactive terminal. A
 non-interactive run pauses instead of silently approving them and prints the
-`agent resume` command for the pending Turn.
+`agent recover` command for the pending Turn.
 
 ### Python API
 
@@ -533,7 +578,7 @@ or `0600`. Supply the file path, never the key itself:
 uv run agent run "Find primary sources about Python task cancellation" \
   --allow-web-tools --no-require-workspace-change \
   --web-search-key-file /absolute/private/path/search.key
-uv run agent resume --last --action allow_once \
+uv run agent recover --last --action allow_once \
   --web-search-key-file /absolute/private/path/search.key
 
 # Tavily: explicitly select the service so its key is never sent to Brave.
@@ -547,7 +592,7 @@ the existing default remains Bing with no key and Brave with a key. Explicit
 Tavily/Brave selection requires a key file; Bing rejects a supplied key. Invalid
 configuration fails before model requests rather than falling back to another service.
 `PRAXIS_WEB_SEARCH_PROVIDER` and `PRAXIS_WEB_SEARCH_KEY_FILE` are alternative CLI
-configuration, including for `run`, `chat`, and `resume`. Resuming a paused Turn
+configuration, including for `run`, `chat`, `resume`, and `recover`. Resuming a paused Turn
 requires the original search service and its credential; a key is not stored in checkpoints.
 
 Tavily uses its official `POST https://api.tavily.com/search` endpoint with Bearer
