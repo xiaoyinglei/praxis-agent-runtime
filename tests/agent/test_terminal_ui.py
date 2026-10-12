@@ -416,6 +416,88 @@ def test_markdown_inline_and_fenced_code_do_not_force_background_colors():
     assert all("bg:" not in style for style, *_ in fragments)
 
 
+def test_web_references_keep_clickable_targets_without_visible_control_bytes():
+    from agent_runtime.terminal_app import _markdown
+
+    url = "https://docs.example.org/research?id=123"
+    fragments = _markdown(f"A claim from [Original report]({url}).\n\nAgain [the report]({url}).", 80, True)
+    visible = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" not in style)
+    controls = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" in style)
+    assert "Original report" in visible and "网页引用" in visible and "docs.example.org" in visible
+    assert visible.count("[1]") == 1 and "[2]" not in visible
+    assert "id=" not in visible and "\x1b" not in visible and url not in visible
+    assert url in controls and "\x1b]8;" in controls
+
+
+@pytest.mark.parametrize("target", ["file:///tmp/report", "javascript:alert(1)", "mailto:user@example.org"])
+def test_non_web_destinations_are_never_terminal_hyperlinks(target):
+    from agent_runtime.terminal_app import _markdown
+
+    fragments = _markdown(f"[Readable label]({target})", 80, True)
+    assert "Readable label" in "".join(text for _, text, *_ in fragments)
+    assert not any("[ZeroWidthEscape]" in style for style, *_ in fragments)
+
+
+def test_links_in_code_blocks_are_not_presented_as_cited_sources():
+    from agent_runtime.terminal_app import _markdown
+
+    fragments = _markdown("```md\n[example](https://example.org)\n```", 80, False)
+    assert "网页引用" not in "".join(text for _, text, *_ in fragments)
+    assert not any("[ZeroWidthEscape]" in style for style, *_ in fragments)
+
+
+def test_reference_controls_do_not_pollute_mouse_selection_text():
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    ui = TerminalChatApp(model="test", workspace="/tmp", output=DummyOutput())
+    ui.view.message("Read [Source](https://example.org/report).")
+    ui.fragments()
+    assert "网页引用" in "\n".join(ui._plain_lines)
+    assert all("\x1b" not in line and "id=" not in line for line in ui._plain_lines)
+
+
+@pytest.mark.anyio
+async def test_all_slash_commands_complete_before_enter_can_submit():
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.terminal_app import TerminalChatApp
+    from agent_runtime.terminal_input import CHAT_COMMANDS
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="test", workspace="/tmp", input=pipe, output=DummyOutput())
+        submitted = []
+
+        async def conversation():
+            for _command in CHAT_COMMANDS:
+                submitted.append(await ui.prompt())
+
+        task = asyncio.create_task(ui.run(conversation))
+
+        async def wait_for(condition):
+            for _ in range(100):
+                if condition():
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError("Completion state did not become ready")
+
+        for index, command in enumerate(CHAT_COMMANDS):
+            await wait_for(lambda index=index: ui.waiting and len(submitted) == index)
+            pipe.send_text(command[:-1])
+            await wait_for(lambda: ui.editor.buffer.complete_state is not None)
+            pipe.send_text("\r")
+            await wait_for(lambda command=command:
+                           ui.editor.text == command and ui.editor.buffer.complete_state is None)
+            assert len(submitted) == index
+            pipe.send_text("\r")
+        await asyncio.wait_for(task, 3)
+        assert submitted == list(CHAT_COMMANDS)
+
+
 @pytest.mark.anyio
 async def test_native_mouse_and_idle_prompt_preserve_multiline_paste():
     import asyncio

@@ -15,6 +15,19 @@ DEFAULT_HISTORY_ENTRIES = 100
 DEFAULT_HISTORY_BYTES = 64 * 1024
 _GRAPHEME = regex.compile(r"\X")
 
+# Shared by help and completion so every supported command uses the same menu.
+CHAT_COMMANDS = {
+    "/help": "显示帮助",
+    "/status": "查看模型、会话、工作区和上下文预算",
+    "/new": "开始空上下文的新聊天",
+    "/clear": "开始空上下文的新聊天（/new 别名）",
+    "/model": "选择模型；也支持 current、list、switch <id>",
+    "/verbose": "切换详细输出",
+    "/copy": "复制最近回答的原始 Markdown",
+    "/resume": "选择旧聊天；也可输入完整会话 ID",
+    "/exit": "退出",
+}
+
 
 def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
     """Translate terminal shortcuts only into choices offered by this request."""

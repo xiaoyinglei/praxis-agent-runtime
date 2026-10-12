@@ -6,12 +6,14 @@ import asyncio
 import base64
 import io
 import os
+import re
 import sys
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import redirect_stdout, suppress
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from typing import Any
+from urllib.parse import urlsplit
 
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.clipboard import ClipboardData
@@ -21,9 +23,10 @@ from prompt_toolkit.filters import Condition, has_focus
 from prompt_toolkit.formatted_text import ANSI, StyleAndTextTuples, to_formatted_text
 from prompt_toolkit.input import Input
 from prompt_toolkit.key_binding import ConditionalKeyBindings, KeyBindings, KeyPressEvent, merge_key_bindings
-from prompt_toolkit.layout import ConditionalContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.layout.dimension import Dimension
+from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from prompt_toolkit.output import Output
 from prompt_toolkit.renderer import print_formatted_text
@@ -31,24 +34,73 @@ from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import TextArea
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.style import Style as RichStyle
+from rich.text import Text
 from rich.theme import Theme
 
 from agent_runtime.result import AgentPause
-from agent_runtime.terminal_input import _COMPOSER_BINDINGS, BoundedPromptHistory, resolve_pause_choice
+from agent_runtime.terminal_input import _COMPOSER_BINDINGS, CHAT_COMMANDS, BoundedPromptHistory, resolve_pause_choice
 from agent_runtime.terminal_render import display_rows, safe_terminal_text
 from agent_runtime.terminal_ui import Block, Conversation, ConversationEventDisplay
+
+_LINK_ESCAPE = re.compile(r"\x1b\]8;[^\x1b\x07]*(?:\x1b\\|\x07)")
+
+
+def _web_link(url: str) -> bool:
+    """Only render control-free HTTP(S) hyperlinks; never run a server-side opener."""
+    if any(char.isspace() or ord(char) < 32 or 127 <= ord(char) <= 159 for char in url):
+        return False
+    try:
+        parsed = urlsplit(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.hostname) and not parsed.username
+    except ValueError:
+        return False
 
 
 @lru_cache(maxsize=128)
 def _markdown(text: str, width: int, color: bool) -> StyleAndTextTuples:
+    markdown = Markdown(safe_terminal_text(text), code_theme="ansi_light")
+    sources: dict[str, str] = {}
+    for block in markdown.parsed:
+        children = block.children or []
+        for index, token in enumerate(children):
+            if token.type == "image":
+                if not _web_link(str(token.attrs.get("src", ""))):
+                    token.attrs["src"] = ""
+            if token.type != "link_open":
+                continue
+            url = str(token.attrs.get("href", ""))
+            if not _web_link(url):
+                token.attrs["href"] = ""
+                continue
+            label = []
+            for child in children[index + 1:]:
+                if child.type == "link_close":
+                    break
+                if child.type in {"text", "code_inline"}:
+                    label.append(child.content)
+            title = "".join(label).strip()
+            sources.setdefault(url, title if title and title != url else str(urlsplit(url).hostname))
     stream = io.StringIO()
     console = Console(
         file=stream, width=width, force_terminal=True, no_color=not color,
         theme=Theme({"markdown.code": "bold", "markdown.code_block": "none",
-                     "markdown.link": "underline", "markdown.link_url": "none"}),
+                     "markdown.link": "underline", "markdown.link_url": "underline"}),
     )
-    console.print(Markdown(text, code_theme="ansi_light"), end="")
-    return list(to_formatted_text(ANSI(stream.getvalue().rstrip("\n"))))
+    console.print(markdown, end="")
+    if sources:
+        console.print(Text("\n网页引用", style="bold"))
+        for index, (url, title) in enumerate(sources.items(), 1):
+            source = Text(f"  [{index}] ")
+            source.append(title, style=RichStyle(link=url, underline=True))
+            domain = str(urlsplit(url).hostname)
+            if title != domain:
+                source.append(f" · {domain}", style="dim")
+            console.print(source)
+    # ANSI only understands CSI styling. Pass renderer-generated OSC 8 links as
+    # zero-width escapes so their URL/id bytes never become visible characters.
+    rendered = _LINK_ESCAPE.sub(lambda match: "\001" + match.group() + "\002", stream.getvalue().rstrip("\n"))
+    return list(to_formatted_text(ANSI(rendered)))
 
 
 class _ConversationOutput(io.TextIOBase):
@@ -133,8 +185,7 @@ class TerminalChatApp:
             height=lambda: Dimension(min=3, preferred=min(8, self.editor.document.line_count + 1), max=8),
             style="class:input",
             history=BoundedPromptHistory(),
-            completer=WordCompleter(["/help", "/status", "/new", "/clear", "/model", "/verbose",
-                                     "/copy", "/resume", "/exit"]),
+            completer=WordCompleter(list(CHAT_COMMANDS), sentence=True, meta_dict=CHAT_COMMANDS),
             complete_while_typing=Condition(lambda: self.editor.text.startswith("/")),
         )
         self.approval_body = TextArea(
@@ -220,6 +271,12 @@ class TerminalChatApp:
 
         @keys.add("enter", filter=has_focus(self.editor))
         def send(event: KeyPressEvent) -> None:
+            if self.editor.buffer.complete_state is not None:
+                if self.editor.buffer.complete_state.complete_index is None:
+                    self.editor.buffer.go_to_completion(0)
+                self.editor.buffer.complete_state = None
+                self.invalidate()
+                return
             if self.waiting and self.editor.text.strip():
                 value = self.editor.text
                 self.editor.buffer.append_to_history()
@@ -234,10 +291,19 @@ class TerminalChatApp:
         def newline(event: KeyPressEvent) -> None:
             self.editor.buffer.insert_text("\n")
 
+        @keys.add("escape", filter=has_focus(self.editor) & Condition(
+            lambda: self.editor.buffer.complete_state is not None,
+        ))
+        def dismiss_completion(event: KeyPressEvent) -> None:
+            self.editor.buffer.cancel_completion()
+
         @keys.add("tab", filter=has_focus(self.editor))
         def focus_records(event: KeyPressEvent) -> None:
             if self.editor.text.startswith("/"):
-                self.editor.buffer.complete_next()
+                if self.editor.buffer.complete_state is None:
+                    self.editor.buffer.start_completion(select_first=True)
+                else:
+                    self.editor.buffer.complete_next()
                 return
             event.app.layout.focus(self.body)
             self._show_history = True
@@ -347,8 +413,20 @@ class TerminalChatApp:
                 Window(FormattedTextControl(self._footer), height=1),
             ]
         )
+        completion_styles = {
+            "completion-menu": "bg:default fg:default",
+            "completion-menu.completion": "bg:default fg:default",
+            "completion-menu.completion.current": "bg:default fg:default reverse",
+            "completion-menu.meta.completion": "bg:default fg:default",
+            "completion-menu.meta.completion.current": "bg:default fg:default reverse",
+        }
         self.app: Application[None] = Application(
-            layout=Layout(layout, focused_element=self.editor),
+            layout=Layout(FloatContainer(
+                content=layout,
+                floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(
+                    max_height=8, scroll_offset=1, extra_filter=has_focus(self.editor) & ~approving,
+                ))],
+            ), focused_element=self.editor),
             key_bindings=merge_key_bindings(
                 [
                     ConditionalKeyBindings(_COMPOSER_BINDINGS, has_focus(self.editor)),
@@ -379,10 +457,11 @@ class TerminalChatApp:
                     "approval-cancel": "ansibrightblack",
                     "approval-selected": "reverse bold",
                     "input": "",
+                    **completion_styles,
                 }
             )
             if "NO_COLOR" not in os.environ
-            else Style.from_dict({}),
+            else Style.from_dict(completion_styles),
         )
         self.app.key_processor.before_key_press += self._advance_input
 
@@ -484,7 +563,7 @@ class TerminalChatApp:
         self._line_count = max(1, line)
         self._layout_key = key
         self._fragments = fragments
-        self._plain_lines = "".join(t for _, t, *_ in fragments).split("\n")
+        self._plain_lines = "".join(t for s, t, *_ in fragments if "[ZeroWidthEscape]" not in s).split("\n")
         return self._highlight_selection(fragments)
 
     def _selection_bounds(self) -> tuple[Point, Point] | None:
@@ -520,6 +599,9 @@ class TerminalChatApp:
         x = y = 0
         for fragment in fragments:
             style, text = fragment[0], fragment[1]
+            if "[ZeroWidthEscape]" in style:
+                output.append(fragment)
+                continue
             handler = fragment[2] if len(fragment) == 3 else None
             # Keep whole unaffected spans, especially large historical answers.
             last_y = y + text.count("\n")

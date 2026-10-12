@@ -39,7 +39,7 @@ from agent_runtime.models import (
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
-from agent_runtime.terminal_input import TerminalComposer, resolve_pause_choice
+from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
 from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
@@ -582,19 +582,14 @@ def _print_startup_banner(model_id: str) -> None:
 
 def _print_chat_help() -> None:
     print("交互命令:")
-    print("  /help              显示本帮助")
-    print("  /status            显示当前 Turn、模型和工作区")
-    print("  /new, /clear       下一条消息不继承当前上下文")
-    print("  /model [current|list|switch <id>]")
+    for command, description in CHAT_COMMANDS.items():
+        print(f"  {command:<18}{description}")
     print("  /model             交互终端内用 ↑↓ 选择模型，Enter 确认，Esc 取消")
-    print("  /verbose           切换详细输出")
-    print("  /copy              复制最近回答，并输出原始 Markdown 到终端滚动历史")
-    print("  /resume [会话ID]   打开当前工作区的旧聊天，回放历史后继续")
+    print("  输入 / 自动显示命令；继续输入前缀筛选；↑↓ 选择，Tab 补全，Enter 确认候选后再按一次执行")
     print("  执行记录：Ctrl+O 切换最近记录；Tab 进入记录，方向键移动，Enter 切换")
     print("  Ctrl+J / Alt+Enter 换行；PageUp/PageDown 滚动记录；Ctrl+End 回到底部；Ctrl+C 取消")
     print("  默认使用终端原生拖选、复制和粘贴（macOS：⌘C / ⌘V）；多行粘贴后按 Enter 发送")
     print("  F2 可开启鼠标交互，再按 F2 恢复终端原生选择")
-    print("  /exit              退出")
 
 
 def _chat_session_label(session: ChatSessionSummary) -> str:

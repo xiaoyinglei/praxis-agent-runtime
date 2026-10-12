@@ -190,6 +190,8 @@ Errors remain visible even when their execution group is collapsed.
 | Terminal Paste / `Cmd+V` on macOS | Paste into the composer; bracketed multiline paste never sends automatically |
 | `/copy` | Request clipboard copy of the latest answer as raw Markdown; also put the full answer in native scrollback |
 | `/resume [THREAD_ID]` | Reopen a saved workspace conversation; choose a chat when the ID is omitted |
+| `/` then a command prefix | Show all commands, then filter by any prefix; arrows select, Tab completes, Esc dismisses |
+| `Enter` while suggestions are shown | Confirm a completion; press Enter again to execute the completed command |
 | `F2` | Opt into application mouse interaction, or return to native terminal selection |
 | Click `▸` / `▾` in F2 mouse mode | Expand / collapse the execution group or individual tool |
 | `Ctrl+O` | Toggle the latest execution group without leaving the composer |
@@ -201,12 +203,26 @@ Errors remain visible even when their execution group is collapsed.
 | `Ctrl+C` | Copy a selection first; otherwise cancel execution, clear input, or exit if empty |
 | `Ctrl+D` at an empty prompt | Exit |
 
-Typing `/` offers command completion. Input editing preserves complete Chinese
+Typing `/` offers every command with a short description; continuing with any
+prefix filters the same shared command list used by `/help`. Completion does not
+apply to command arguments or ordinary chat text. Input editing preserves complete Chinese
 characters and emoji, and bracketed multiline paste stays in the composer until
 you send it. Approval questions use the same composer and show the permitted
 choices. Cancelling waits for execution cleanup; existing file changes are not
 rolled back. Mouse interaction requires a terminal with mouse reporting and
 cursor-position reports; keyboard folding is also available.
+
+Markdown web references retain their short labels and appear together below the
+answer as numbered sources with a title and website domain; repeated URLs share
+one source entry. The full HTTP(S) URL remains in the terminal hyperlink target,
+without exposing hyperlink control bytes as text. In a terminal that supports
+OSC 8 links, use its normal link-opening gesture (often Cmd-click on macOS or
+Ctrl-click) to open the page in the client's browser, including over SSH. The
+server never launches a browser. Terminals without hyperlink support can use
+`/copy` to retrieve the original Markdown with full URLs. Historical answers use
+the same rendering; their saved text is unchanged. Code examples are not treated
+as cited sources, and non-web destinations are not emitted as active hyperlinks.
+
 Unchanged history reuses its layout when scrolling or refreshing the status bar.
 An idle prompt has no periodic redraw to disturb native selection. Resizing or
 receiving new content invalidates the layout. `/copy` uses `pbcopy` only on a local
