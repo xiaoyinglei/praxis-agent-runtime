@@ -281,6 +281,105 @@ class RolloutStore:
     def close(self) -> None:
         self._connection.close()
 
+    def read_memory_state(self, workspace: Path, *, version: int | None = None) -> dict[str, Any]:
+        """Read workspace memory; old/read-only databases need no schema migration."""
+        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        if version == 0:
+            return {"version": 0, "entries": [], "processed": {}, "deleted_keys": [],
+                    "deleted_sources": [], "use_memories": False, "generate_memories": False}
+        if version is not None and version > 0:
+            key += f":version:{version}"
+        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            if version is not None and version > 0:
+                raise KeyError("unknown workspace memory version")
+            return {"version": 0, "entries": [], "processed": {}, "deleted_keys": [],
+                    "deleted_sources": [], "use_memories": False, "generate_memories": False}
+        envelope = json.loads(row["value"])
+        state = envelope["state"]
+        if hashlib.sha256(_canonical_json(state).encode()).hexdigest() != envelope["sha256"]:
+            raise RuntimeError("workspace memory integrity mismatch")
+        return dict(state)
+
+    def commit_memory_state(
+        self, workspace: Path, *, expected_version: int, state: Mapping[str, Any],
+        claim_owner: str | None = None, job_thread_id: str | None = None,
+        job_state: Mapping[str, Any] | None = None, job_revision: int | None = None,
+    ) -> dict[str, Any]:
+        """CAS commit; keep immutable versions for inspection and crash recovery."""
+        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        with self._transaction():
+            if claim_owner is not None:
+                self._assert_memory_claim(workspace, claim_owner)
+            if job_thread_id is not None and job_state is not None:
+                self.write_memory_job(workspace, job_thread_id, job_state, owner=claim_owner,
+                                      expected_revision=job_revision)
+            if self.read_memory_state(workspace)["version"] != expected_version:
+                raise ContextSourceChangedError("workspace memory changed before commit")
+            committed = _json_object({**state, "version": expected_version + 1}, field="memory state")
+            value = _canonical_json({"state": committed,
+                                     "sha256": hashlib.sha256(_canonical_json(committed).encode()).hexdigest()})
+            self._connection.execute("INSERT INTO store_metadata(key, value) VALUES (?, ?)",
+                                     (f"{key}:version:{expected_version + 1}", value))
+            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)", (key, value))
+        return committed
+
+    def read_memory_jobs(self, workspace: Path) -> dict[str, Any]:
+        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+        return {} if row is None else dict(json.loads(row["value"]))
+
+    def write_memory_job(
+        self, workspace: Path, thread_id: str, state: Mapping[str, Any], *,
+        owner: str | None = None, expected_revision: int | None = None,
+    ) -> dict[str, Any]:
+        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        with self._transaction():
+            if owner is not None:
+                self._assert_memory_claim(workspace, owner)
+            jobs = self.read_memory_jobs(workspace)
+            revision = jobs.get(thread_id, {}).get("revision", 0)
+            if expected_revision is not None and revision != expected_revision:
+                raise ContextSourceChangedError("memory job changed before commit")
+            job = _json_object({**state, "revision": revision + 1}, field="memory job")
+            jobs[thread_id] = job
+            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)",
+                                     (key, _canonical_json(jobs)))
+        return job
+
+    def enqueue_memory_job(self, workspace: Path, thread_id: str) -> None:
+        with self._transaction():
+            if Path(self.read_thread(thread_id).workspace).resolve() != workspace.resolve():
+                raise ValueError("memory job belongs to a different workspace")
+            job = self.read_memory_jobs(workspace).get(thread_id, {})
+            if job.get("status") in {"pending", "running", "needs_reconciliation", "failed"}:
+                return
+            self.write_memory_job(workspace, thread_id, {"status": "pending", "turn_ids": []})
+
+    def _assert_memory_claim(self, workspace: Path, owner: str) -> None:
+        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+        claim = {} if row is None else json.loads(row["value"])
+        if claim.get("owner") != owner or claim.get("expires_at", 0) <= time.time():
+            raise ContextSourceChangedError("memory workspace lease is no longer owned")
+
+    def claim_memory_job(self, workspace: Path, *, owner: str, now: float, lease_seconds: float) -> bool:
+        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        with self._transaction():
+            row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+            if row is not None and json.loads(row["value"])["expires_at"] > now:
+                return False
+            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)",
+                                     (key, _canonical_json({"owner": owner, "expires_at": now + lease_seconds})))
+        return True
+
+    def release_memory_job(self, workspace: Path, *, owner: str) -> None:
+        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        with self._transaction():
+            row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+            if row is not None and json.loads(row["value"])["owner"] == owner:
+                self._connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
+
     def _assert_writable(self) -> None:
         if self._read_only:
             raise sqlite3.OperationalError("attempt to write a readonly database")

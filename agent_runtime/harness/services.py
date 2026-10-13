@@ -141,6 +141,15 @@ if TYPE_CHECKING:
     from agent_runtime.harness.session import Session
 
 
+def _memory_tools(session: Session) -> tuple[Tool, ...]:
+    if not session.memory_config.use_memories:
+        return ()
+    from agent_runtime.harness.memory import create_memory_tool
+    from agent_runtime.harness.memory_management import create_memory_management_tool
+
+    return (create_memory_tool(session.store), create_memory_management_tool(session.store))
+
+
 def configure_services(
     session: Session,
     *,
@@ -269,6 +278,7 @@ def configure_services(
     registry = build_tool_registry(
         tuple((tools or {}).values()),
         create_context_recall_tool(store),
+        _memory_tools(session),
         knowledge_tools,
         skill_tools,
         (

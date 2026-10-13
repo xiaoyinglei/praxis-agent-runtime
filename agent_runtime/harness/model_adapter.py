@@ -85,9 +85,9 @@ class GatewayHarnessModel:
         self._instructions = instructions
 
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
-        if request.purpose not in {"agent_step", "context_summary"}:
+        if request.purpose not in {"agent_step", "context_summary", "memory_extract", "memory_consolidate"}:
             raise ValueError("unsupported model request purpose")
-        if request.purpose == "context_summary" and request.tools:
+        if request.purpose != "agent_step" and request.tools:
             raise ValueError("internal summary requests must not expose tools")
         for name in ("input_token_limit", "output_token_limit"):
             limit = getattr(request, name)
@@ -128,7 +128,7 @@ class GatewayHarnessModel:
                     "unresolved questions and next steps. "
                     "Do not perform the task or call tools. Never invent missing facts.",
                 )
-                if request.purpose == "context_summary"
+                if request.purpose != "agent_step"
                 else self._instructions
             ),
             frozen_run_context=(
@@ -153,8 +153,9 @@ class GatewayHarnessModel:
             and isinstance(policy.get("max_parallel_calls"), int)
         ):
             settings = replace(settings, parallel_tool_calls=policy["max_parallel_calls"] > 1)
-        stage = LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP
-        if request.purpose == "context_summary":
+        stage = (LLMCallStage.LLM_SUMMARIZE if request.purpose.startswith("memory_") else
+                 LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP)
+        if request.purpose != "agent_step":
             options = dict(settings.provider_options)
             if "thinking" in options:
                 options["thinking"] = {"type": "disabled"}

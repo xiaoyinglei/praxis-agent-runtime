@@ -39,6 +39,8 @@ def list_chat_sessions(database: Path, *, workspace: Path) -> tuple[ChatSessionS
             # Child runs have a durable parent binding, unlike user conversation forks.
             if turns[0].binding_manifest.get("budget_parent_turn_id") is not None:
                 continue
+            if turns[0].binding_manifest.get("memory_maintenance"):
+                continue
             first = next((item.payload.get("text") for item in store.list_items(turns[0].turn_id)
                           if item.kind == "user_message"), "")
             latest = store.read_turn(thread.active_turn_id or thread.head_turn_id or turns[-1].turn_id)

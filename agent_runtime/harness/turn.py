@@ -233,6 +233,11 @@ class TurnExecutor:
             pressure = budget_pressure
         if messages is None:
             messages = self._context_manager.build(turn_context.turn_id)
+        snapshot = turn_context.binding_manifest.get("memory_snapshot")
+        if snapshot is not None:
+            from agent_runtime.harness.memory import memory_navigation
+
+            messages = (HarnessMessage(role="context", content=memory_navigation(snapshot)), *messages)
         if pressure:
             messages = (
                 *messages,
@@ -263,6 +268,8 @@ class TurnExecutor:
             "budget_parent_turn_id",
             "web_limits",
             "context_capacity_policy",
+            "memory_snapshot",
+            "memory_generation_allowed",
         ):
             if name in turn_context.binding_manifest:
                 binding[name] = turn_context.binding_manifest[name]
@@ -277,6 +284,9 @@ class TurnExecutor:
             tools=tools,
             model_token_budget_remaining=state.remaining("tokens"),
             budget_pressure=pressure,
+            purpose=turn_context.binding_manifest.get("maintenance_purpose", "agent_step"),
+            input_token_limit=turn_context.binding_manifest.get("memory_input_tokens"),
+            output_token_limit=turn_context.binding_manifest.get("memory_output_tokens"),
         )
 
     def _budget_status(self, turn: TurnContext) -> dict[str, Any]:

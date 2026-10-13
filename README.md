@@ -286,6 +286,51 @@ definition in durable history. `agent recover` therefore continues that Turn's
 original model even after the model ID is updated, removed, or selected differently
 for later Turns.
 
+### 工作区跨聊天记忆
+
+记忆默认关闭，与文档 RAG 独立。开启后，Session 启动时后台处理一份符合条件、已结束的聊天，
+通过无工具权限、有独立预算的模型调用提取和整理记忆。只有允许贡献的聊天会成为输入；
+旧聊天不会因开启工作区默认设置而自动获得贡献授权。
+提取和整理复用 Agent 选定的主模型，项目默认是云端 `deepseek-flash`，也可通过 `--model` 明确选择。
+每次处理一份聊天中的一个最多 32 KB 的批次；超大的单个 Item 以带原始来源 ID 的连续片段处理。
+处理游标与记忆在同一事务提交，未处理部分留到下次，已有的超限跳过记录也会重新进入增量处理。
+单批模型输出最多 32 条、单条最多 2000 字符；完整记忆库可以超过 32 条。新 Turn 只固定最多 32 条标题索引
+和不可变版本，`read_memory` 可查询该版本的完整详情，包括未出现在启动索引中的条目。
+
+```bash
+uv run agent memory configure --use --generate
+uv run agent memory status
+uv run agent memory update
+uv run agent memory delete --key <key>
+uv run agent memory remember --key test-command --title "Test command" --text "uv run pytest" --kind preference
+uv run agent memory edit --key test-command --text "make test"
+uv run agent memory explain --key test-command
+uv run agent memory configure --no-generate   # 保留读取，停止后续生成
+uv run agent memory configure --no-use --no-generate
+```
+
+上述命令使用当前工作区；`--workspace` 和 `--checkpoint-db` 可明确指定范围和数据库。
+`status` 不调用模型、不创建数据库；`update` 显式执行一次有限处理并报告来源、版本和维护 Turn ID。
+每个允许贡献的终态 Turn 会登记持久维护任务；启动时执行一批，`update` 的 `has_more` 表示该来源仍有待处理部分。
+Session 关闭会取消尚未结束的计算，已提交的游标与任务记录保留。已完成的提取可复用，失败按任务退避，
+同一批的重试累计使用预算，耗尽后报告 `budget_exhausted`，其他安全任务仍可继续。
+请求结果未确认时报告 `needs_reconciliation` 并保留维护 Turn ID，不会换新预算自动重复云端调用。
+
+Python SDK 可传入 `Agent(memory=MemoryConfig())`，或调用 `agent.configure_memory(...)` 设置工作区默认值。
+`agent.memories()` 检查内容与来源；`await agent.refresh_memory()` 更新；`agent.delete_memory(key)` 删除。
+每个新 Turn 固定记忆版本和标题导航；模型用 `read_memory` 按 key 或字面关键词分页读取该版本详情。
+`status` 的 `maintenance_jobs` 展示待处理、完成、失败或待核对任务；原有包含完整详情的 Turn 快照仍可恢复。
+显式管理入口还包括 `agent.remember_memory(...)`、`agent.edit_memory(...)` 和 `agent.explain_memory(key)`。
+条目记录 preference/fact/reference 类型、来源种类、更新时间和替代关系；显式保存或修改的条目不会被后台覆盖。
+`manage_memory` 工具支持当前用户要求的记住、修改、忘记和解释；写操作遵循现有写权限，要求 `expected_version`，
+来源取自当前主会话的用户消息，子智能体不能代替用户写入显式记忆。工具写入后，当前 Turn 的读取仍保持冻结，
+新 Turn 使用新值。CLI/SDK 管理不调用模型；事实与引用仍是历史信息，执行决策前需要核对当前权威来源。
+来源 ID 不授予其他聊天原文读取权限；当前用户指令和当前执行事实优先于记忆。
+删除不会修改正在恢复的 Turn 快照，也不会让旧来源重新生成被删条目。
+
+设计参考固定版本的 [Codex 分阶段记忆维护与持久任务](https://github.com/openai/codex/tree/12cca49c81c8aa6a37a5cc4e39964ee3b70f9458/codex-rs/memories/write)
+和 [Claude Code 的索引与详情按需读取](https://code.claude.com/docs/en/memory)，存储和调用仍使用本项目现有组件。
+
 ### 重新打开旧聊天
 
 退出程序或断开 SSH 后，已保存的聊天仍在工作区的 `.praxis/checkpoints.sqlite` 中。

@@ -255,7 +255,7 @@ def test_effective_catalog_layers_user_registry_with_provenance(
     assert first.origin("openai/gpt-oss-120b") == "builtin"
     assert first.origin("Qwen/Qwen3.5-9B") == "user"
     assert first.get("Qwen/Qwen3.5-9B").id == "Qwen/Qwen3.5-9B"
-    assert first.default_model_id == "openai/gpt-oss-120b"
+    assert first.default_model_id == "deepseek-flash"
     first_definition_revision = first.definition("Qwen/Qwen3.5-9B").definition_revision
     assert first.definition("Qwen/Qwen3.5-9B").provider == "openai_compatible"
     assert first.definition("Qwen/Qwen3.5-9B").generation.answer.max_tokens == 4096
@@ -364,16 +364,16 @@ def test_model_catalog_deep_copies_supplied_definitions() -> None:
     assert catalog.definition("kimi-k2.6").definition_revision == original_revision
 
 
-def test_bundled_default_chat_model_is_groq_control() -> None:
+def test_bundled_default_chat_model_is_deepseek_cloud() -> None:
     catalog = ModelCatalog.from_config_file(Path("configs/models.yaml"))
 
     spec = catalog.get(catalog.default_model_id)
 
-    assert catalog.default_model_id == "openai/gpt-oss-120b"
-    assert spec.provider == "groq"
-    assert spec.id == "openai/gpt-oss-120b"
+    assert catalog.default_model_id == "deepseek-flash"
+    assert spec.provider == "deepseek"
+    assert spec.id == "deepseek-flash"
     assert spec.location == "cloud"
-    assert spec.api_key_env == "GROQ_API_KEY"
+    assert spec.api_key_env == "DEEPSEEK_API_KEY"
 
 
 def test_bundled_kimi_k26_cloud_model_is_available_for_diagnostics() -> None:

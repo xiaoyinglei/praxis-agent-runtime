@@ -3,6 +3,7 @@
 from typing import TYPE_CHECKING
 
 from agent_runtime.harness.events import ReplayEvent
+from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.session import Session
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
@@ -39,6 +40,7 @@ __all__ = [
     "ItemStatus",
     "ModelNotAvailableError",
     "ModelSpec",
+    "MemoryConfig",
     "PlanEvent",
     "PlanStep",
     "RAGKnowledgeConfig",

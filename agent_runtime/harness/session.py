@@ -6,7 +6,7 @@ import asyncio
 import copy
 import hashlib
 import os
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +14,15 @@ from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
 from agent_runtime.budget import ResourceUsage
-from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate, ContextManager, ToolRouter, TurnResult
+from agent_runtime.harness.protocol import (
+    BoundHarnessModel,
+    CompletionDecision,
+    CompletionGate,
+    CompletionProposal,
+    ContextManager,
+    ToolRouter,
+    TurnResult,
+)
 from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.services import SessionBindingProvider, _tool_execution_policy_snapshot, configure_services
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
@@ -26,8 +34,14 @@ from agent_runtime.tools.tool import ToolEffect
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
+    from agent_runtime.harness.memory import MemoryConfig
     from agent_runtime.models import ModelControlPlane, ModelSpec
     from agent_runtime.tools.tool import Tool
+
+
+class _MemoryCompletion:
+    def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
+        return CompletionDecision("accept", "memory output ready for schema and source validation")
 
 
 class Session:
@@ -57,6 +71,9 @@ class Session:
     max_steps: int
     binding_provider: SessionBindingProvider
     event_dispatcher: TurnEventDispatcher
+    memory_config: MemoryConfig
+    _background_memory: bool
+    _memory_control_version: int
 
     def __init__(self) -> None:
         self._stack = AsyncExitStack()
@@ -69,6 +86,7 @@ class Session:
         self.model_control_plane = None
         self._ready_model_id: str | None = None
         self._service_options: dict[str, Any] = {}
+        self._memory_task: asyncio.Task[Any] | None = None
 
     @classmethod
     async def open(
@@ -83,6 +101,8 @@ class Session:
         thread_id: str | None = None,
         event_dispatcher: TurnEventDispatcher | None = None,
         event_sink: AgentEventSink | None = None,
+        memory: MemoryConfig | None = None,
+        _background_memory: bool = True,
         **service_options: Any,
     ) -> Self:
         self = cls()
@@ -103,6 +123,20 @@ class Session:
             self.database = Path(database)
             self.workspace_path = Path(workspace).resolve()
             self.store = self._stack.enter_context(RolloutStore(self.database))
+            from agent_runtime.harness.memory import MemoryConfig
+
+            configured_memory = agent.memory if agent is not None and agent.memory is not None else memory
+            state = self.store.read_memory_state(self.workspace_path)
+            self._memory_control_version = state.get("control_version", 0)
+            self.memory_config = configured_memory or MemoryConfig(
+                use_memories=state["use_memories"], generate_memories=state["generate_memories"],
+            )
+            self._background_memory = _background_memory
+            if frozen_turn_id is not None:
+                original = self.store.read_turn(frozen_turn_id).binding_manifest
+                self.memory_config = self.memory_config.model_copy(update={
+                    "use_memories": "memory_snapshot" in original,
+                })
             integrity = self.store.verify()
             if not integrity.valid:
                 raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(integrity.errors))
@@ -135,6 +169,13 @@ class Session:
                 thread = self.store.read_thread(thread_id)
                 if Path(thread.workspace).resolve() != self.workspace_path:
                     raise RuntimeError("thread belongs to a different workspace security domain")
+                if (configured_memory is None and frozen_turn_id is None
+                        and "memory_use_allowed" in thread.settings
+                        and thread.settings.get("memory_control_version") == self._memory_control_version):
+                    self.memory_config = MemoryConfig(
+                        use_memories=thread.settings["memory_use_allowed"],
+                        generate_memories=thread.settings["memory_generation_allowed"],
+                    )
             if agent is not None:
                 model, resource_options = await self._open_agent_resources(
                     agent,
@@ -170,6 +211,9 @@ class Session:
                 self._apply_tool_context()
                 if explicit_tool_context:
                     self._persist_settings()
+                elif (configured_memory is not None
+                      or settings.get("memory_control_version") != self._memory_control_version):
+                    self._persist_settings()
             else:
                 self._persist_settings()
             if agent is not None and agent._followup_model_id is not None:
@@ -182,6 +226,7 @@ class Session:
                 self._persist_settings()
             if self.model_control_plane is not None and not settings and frozen_turn_id is None:
                 await self._bootstrap_model_provider()
+            self._start_memory_update()
             return self
         except BaseException:
             await self._stack.aclose()
@@ -205,6 +250,9 @@ class Session:
         if self._active_task is asyncio.current_task() or asyncio.current_task() in self._child_calls:
             raise RuntimeError("cannot close Session from its active Turn")
         self._closing = True
+        if self._memory_task is not None:
+            self._memory_task.cancel()
+            await asyncio.gather(self._memory_task, return_exceptions=True)
         async with self._active_turn_lock:
             if not self._closed:
                 if self._child_calls:
@@ -273,13 +321,61 @@ class Session:
             binding["budget_root_turn_id"] = turn_id
             if self._agent is not None:
                 binding["web_limits"] = self._agent.web_limits.model_dump(mode="json")
+            binding["memory_generation_allowed"] = self.memory_config.generate_memories
+            if self.memory_config.use_memories:
+                from agent_runtime.harness.memory import memory_snapshot
+
+                binding["memory_snapshot"] = memory_snapshot(self.store, self.workspace_path, navigation_only=True)
             result = await self._executor().run(
                 turn_id=turn_id,
                 user_message=task,
                 binding_manifest=binding,
                 input_files=input_files,
             )
+            if (self.memory_config.generate_memories and result.status in {"completed", "failed", "cancelled"}
+                    and self.store.read_thread(self.thread_id).parent_thread_id is None):
+                self.store.enqueue_memory_job(self.workspace_path, self.thread_id)
             return AgentResult._from_harness(result, store=self.store, files=tuple(files or ()))
+
+    def _start_memory_update(self) -> None:
+        if not self.memory_config.generate_memories or not self._background_memory:
+            return
+        self._memory_task = asyncio.create_task(self.refresh_memory())
+
+    async def refresh_memory(self) -> dict[str, Any]:
+        """Explicit bounded maintenance; diagnostics include source, version and Turn IDs."""
+        from agent_runtime.harness.memory import update_memory
+
+        self._ensure_open()
+        if not self.memory_config.generate_memories:
+            return {"status": "disabled", "maintenance_turn_ids": []}
+        identity = f"turn_{uuid4().hex}"
+        binding = self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=identity)
+        return await update_memory(self.store, workspace=self.workspace_path, model=self.model,
+                                   binding=binding, exclude_thread_id=self.thread_id,
+                                   prepare_binding=self._prepare_step_binding)
+
+    @staticmethod
+    async def run_memory_turn(
+        store: RolloutStore, model: BoundHarnessModel, turn_id: str,
+        *, prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+    ) -> TurnResult:
+        """Compose a tool-free maintenance Turn through the same execution owner."""
+        from agent_runtime.harness.context import RolloutContextManager
+
+        executor = TurnExecutor(
+            thread_id=store.read_turn(turn_id).thread_id, store=store, model=model,
+            context_manager=RolloutContextManager(store), completion_gate=_MemoryCompletion(),
+            max_steps=1, prepare_binding=prepare_binding,
+        )
+        return await executor.run_turn(executor.restore_turn_context(turn_id), start_step=1)
+
+    def delete_memory(self, key: str) -> dict[str, Any]:
+        """Delete a committed workspace memory; existing Turn snapshots stay unchanged."""
+        from agent_runtime.harness.memory import delete_memory
+
+        self._ensure_open()
+        return delete_memory(self.store, self.workspace_path, key)
 
     def current_model(self) -> ModelSpec:
         if self.model_control_plane is None:
@@ -315,6 +411,9 @@ class Session:
                     None if self.model_control_plane is None else self.model_control_plane.state.selection_requester
                 ),
                 "tool_execution_policy": _tool_execution_policy_snapshot(self.tool_execution_context),
+                "memory_generation_allowed": self.memory_config.generate_memories,
+                "memory_use_allowed": self.memory_config.use_memories,
+                "memory_control_version": self._memory_control_version,
             },
         )
 

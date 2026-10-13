@@ -168,9 +168,9 @@ models:
 # Defaults: what to use when no explicit model is requested.
 # ---------------------------------------------------------------------------
 defaults:
-  # Product runs default to Groq so an omitted --model never starts a local
-  # MLX server. Benchmark release lanes remain explicit in their manifest.
-  primary_model: openai/gpt-oss-120b
+  # Product runs use the selected cloud model when --model is omitted.
+  # Benchmark release lanes remain explicit in their manifest.
+  primary_model: deepseek-flash
 
   embedding_model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
   reranker_model: Qwen/Qwen3-Reranker-4B

@@ -11,7 +11,7 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, TypedDict
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TypedDict, cast
 
 import click
 import typer
@@ -57,6 +57,70 @@ model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑定的本地信任域。")
 logger = logging.getLogger(__name__)
+
+
+@agent_app.command("memory")
+def agent_memory(
+    action: Annotated[Literal["status", "configure", "update", "delete", "remember", "edit", "explain"],
+                      typer.Argument()] = "status",
+    workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
+    checkpoint_db: Annotated[Path, typer.Option("--checkpoint-db")] = DEFAULT_CHECKPOINT_PATH,
+    use: Annotated[bool | None, typer.Option("--use/--no-use")] = None,
+    generate: Annotated[bool | None, typer.Option("--generate/--no-generate")] = None,
+    key: Annotated[str | None, typer.Option("--key")] = None,
+    text: Annotated[str | None, typer.Option("--text")] = None,
+    title: Annotated[str | None, typer.Option("--title")] = None,
+    kind: Annotated[Literal["preference", "fact", "reference"] | None, typer.Option("--kind")] = None,
+    expected_version: Annotated[int | None, typer.Option("--expected-version", min=0)] = None,
+    model: Annotated[str | None, typer.Option("--model")] = None,
+) -> None:
+    """工作区跨聊天记忆：检查、配置、有限更新或删除；默认不开启。"""
+    from agent_runtime import Agent, MemoryConfig
+
+    agent = Agent(workspace_path=workspace, checkpoint_db=checkpoint_db, model=model,
+                  model_session_path=None, enable_workspace_mcp=False)
+    if action == "status":
+        result = agent.memories()
+    elif action == "configure":
+        if use is None and generate is None:
+            raise typer.BadParameter("configure requires --use/--no-use or --generate/--no-generate")
+        with RolloutStore(checkpoint_db) as store:
+            state = store.read_memory_state(workspace)
+        config = MemoryConfig(use_memories=state["use_memories"] if use is None else use,
+                              generate_memories=state["generate_memories"] if generate is None else generate)
+        state = agent.configure_memory(config)
+        result = {"version": state["version"], **config.model_dump()}
+    elif action == "delete":
+        if key is None:
+            raise typer.BadParameter("delete requires --key")
+        try:
+            state = agent.delete_memory(key)
+        except KeyError:
+            raise typer.BadParameter("unknown memory key") from None
+        result = {"version": state["version"], "deleted_key": key}
+    elif action in {"remember", "edit", "explain"}:
+        if key is None:
+            raise typer.BadParameter(f"{action} requires --key")
+        try:
+            if action == "explain":
+                result = agent.explain_memory(key)
+            else:
+                if text is None:
+                    raise typer.BadParameter(f"{action} requires --text")
+                if action == "remember":
+                    state = agent.remember_memory(key, text, title=title, kind=kind or "fact",
+                                                  expected_version=expected_version)
+                else:
+                    state = agent.edit_memory(key, text, title=title, kind=kind, expected_version=expected_version)
+                entries = cast(Sequence[Mapping[str, object]], state["entries"])
+                result = {"version": state["version"], "entry": next(e for e in entries if e["key"] == key)}
+        except (KeyError, ValueError, RuntimeError) as exc:
+            raise typer.BadParameter(str(exc)) from None
+    else:
+        result = asyncio.run(agent.refresh_memory())
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    if result.get("status") == "failed":
+        raise typer.Exit(1)
 
 
 @agent_app.command("history")

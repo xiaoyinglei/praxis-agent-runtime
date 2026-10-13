@@ -9,9 +9,10 @@ import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
 
+from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -48,6 +49,7 @@ class Agent:
         workspace_path: Path | str | None = None,
         model_session_path: Path | None = DEFAULT_MODEL_SESSION_PATH,
         knowledge: RAGKnowledgeConfig | None = None,
+        memory: MemoryConfig | None = None,
         enable_workspace_mcp: bool = True,
         mcp_config_trust: MCPConfigTrustDecision | None = None,
         web_search_key_file: Path | str | None = None,
@@ -58,6 +60,8 @@ class Agent:
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
+        if memory is not None and not isinstance(memory, MemoryConfig):
+            raise TypeError("memory must be MemoryConfig or None")
         if not isinstance(enable_workspace_mcp, bool):
             raise TypeError("enable_workspace_mcp must be bool")
         if web_limits is not None and not isinstance(web_limits, WebLimits):
@@ -81,6 +85,7 @@ class Agent:
         self.workspace_path = (workspace.expanduser().resolve())
         self.model_session_path = model_session_path
         self.knowledge = knowledge
+        self.memory = memory
         self.enable_workspace_mcp = enable_workspace_mcp
         self.mcp_config_trust = mcp_config_trust
         self.web_search_key_file = None if web_search_key_file is None else Path(web_search_key_file)
@@ -156,6 +161,7 @@ class Agent:
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
         _frozen_turn_id: str | None = None,
+        _background_memory: bool = True,
     ) -> AsyncIterator[Session]:
         from agent_runtime.harness.session import Session
 
@@ -170,9 +176,80 @@ class Agent:
             max_steps=16 if step_budget is None else step_budget,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
+            _background_memory=_background_memory,
         )
         async with session:
             yield session
+
+    def memories(self) -> dict[str, object]:
+        """Inspect this workspace's memory without opening a model or creating state."""
+        from agent_runtime.harness.memory import memory_snapshot
+        from agent_runtime.harness.rollout import RolloutStore
+
+        database = self._harness_database()
+        if not database.exists():
+            return {"version": 0, "workspace": str(self.workspace_path), "entries": [],
+                    "use_memories": self.memory.use_memories if self.memory is not None else False,
+                    "generate_memories": self.memory.generate_memories if self.memory is not None else False}
+        with RolloutStore(database, read_only=True) as store:
+            state = store.read_memory_state(self.workspace_path)
+            return {**memory_snapshot(store, self.workspace_path),
+                    "maintenance_jobs": {key: {name: value for name, value in job.items() if name != "candidates"}
+                                         for key, job in store.read_memory_jobs(self.workspace_path).items()},
+                    "use_memories": self.memory.use_memories if self.memory is not None else state["use_memories"],
+                    "generate_memories": self.memory.generate_memories if self.memory is not None
+                    else state["generate_memories"]}
+
+    def configure_memory(self, config: MemoryConfig) -> dict[str, object]:
+        """Persist workspace defaults; independent use and contribution controls."""
+        from agent_runtime.harness.memory import configure_memory
+        from agent_runtime.harness.rollout import RolloutStore
+
+        if not isinstance(config, MemoryConfig):
+            raise TypeError("config must be MemoryConfig")
+        with RolloutStore(self._harness_database()) as store:
+            result = configure_memory(store, self.workspace_path, config)
+        self.memory = config
+        return result
+
+    def delete_memory(self, key: str) -> dict[str, object]:
+        from agent_runtime.harness.memory import delete_memory
+        from agent_runtime.harness.rollout import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            return delete_memory(store, self.workspace_path, key)
+
+    def remember_memory(self, key: str, text: str, *, title: str | None = None,
+                        kind: Literal["preference", "fact", "reference"] = "fact",
+                        expected_version: int | None = None) -> dict[str, object]:
+        from agent_runtime.harness.memory_management import remember_memory
+        from agent_runtime.harness.rollout import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            return remember_memory(store, self.workspace_path, key=key, title=title or key, text=text,
+                                   kind=kind, expected_version=expected_version)
+
+    def edit_memory(self, key: str, text: str, *, title: str | None = None,
+                    kind: Literal["preference", "fact", "reference"] | None = None,
+                    expected_version: int | None = None) -> dict[str, object]:
+        from agent_runtime.harness.memory_management import edit_memory
+        from agent_runtime.harness.rollout import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            return edit_memory(store, self.workspace_path, key=key, title=title, text=text,
+                               kind=kind, expected_version=expected_version)
+
+    def explain_memory(self, key: str, *, offset: int = 0, limit: int = 8) -> dict[str, object]:
+        from agent_runtime.harness.memory_management import explain_memory
+        from agent_runtime.harness.rollout import RolloutStore
+
+        with RolloutStore(self._harness_database(), read_only=True) as store:
+            return explain_memory(store, self.workspace_path, key=key, offset=offset, limit=limit)
+
+    async def refresh_memory(self) -> dict[str, object]:
+        """Run one bounded extraction/consolidation pass with the configured model."""
+        async with self.session(require_workspace_change=False, _background_memory=False) as session:
+            return await session.refresh_memory()
 
     async def resume(
         self,

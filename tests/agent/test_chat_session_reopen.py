@@ -94,7 +94,10 @@ def test_replay_keeps_original_messages_after_context_compaction_and_deduplicate
         following = store.start_turn(thread_id=thread.thread_id, user_message="follow up", binding_manifest={})
         store.record_context_compaction(
             turn_id=following.turn_id, covered_item_ids=tuple(item.item_id for item in store.list_items(turn.turn_id)),
-            summary="compressed summary", preserved_facts={}, context_version=1,
+            summary="compressed summary", preserved_facts={name: [] for name in (
+                "architecture_and_safety_constraints", "file_changes", "verification_results",
+                "unresolved_work", "uncertain_side_effects",
+            )}, context_version=1,
         )
         store.complete_turn(turn_id=following.turn_id, answer="second answer")
     before = records(database)
