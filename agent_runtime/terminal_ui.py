@@ -100,7 +100,7 @@ class Conversation:
             if block.in_scrollback and not include_scrollback:
                 continue
             if block.kind != "group":
-                prefix = "你 › " if block.kind == "user" else "● " if block.kind == "answer" else ""
+                prefix = "❯ " if block.kind == "user" else "● " if block.kind == "answer" else ""
                 rows.append((prefix + block.detail(), None, block.kind))
             else:
                 errors = sum(child.failed for child in block.children)

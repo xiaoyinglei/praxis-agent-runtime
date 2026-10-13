@@ -173,26 +173,55 @@ $ uv run agent chat
 已切换模型: another-model-id
 ```
 
-Interactive `agent chat` uses a live conversation viewport with Markdown answers,
-a multiline composer, and a model/status bar. Execution groups and individual
-tools expand and collapse **in place**, including while output is streaming.
-Native terminal selection, copy and paste are enabled by default, including over
-SSH. Before the next ordinary prompt, completed output is written once to native
-terminal scrollback and the live viewport shrinks to the remaining content. Use
-the terminal's wheel/trackpad to read earlier answers without a slash command.
+By default, interactive `agent chat` opens a fullscreen conversation viewport
+with Markdown answers and a multiline composer fixed at the bottom. Execution
+groups and individual tools expand and collapse **in place**, including while
+output is streaming. Completed answers stay in the application; use PageUp and
+PageDown or the mouse wheel to read history, and Ctrl+End to follow new output.
+Use `/copy` to request clipboard transfer, including over SSH, or F2 to toggle
+native terminal selection. Exiting restores the shell screen.
 The composer and Markdown code backgrounds use the terminal's own colors.
 Errors remain visible even when their execution group is collapsed.
+
+Start the default fullscreen interface, or choose inline scrolling:
+
+```bash
+# Offline preview: no model connection or saved chat state
+uv run python scripts/terminal_ui_demo.py
+
+# Real chat with the same layouts
+uv run agent chat
+
+# Optional native scrolling layout
+uv run agent chat --ui inline
+```
+
+`fullscreen` is the default. It opens an alternate screen, keeps the composer at the bottom, and
+returns to the shell on exit. Completed answers and replayed chat stay inside
+the application. Use PageUp/PageDown to inspect history, Ctrl+End to follow new
+output, and F2 to toggle application mouse handling. `/copy` requests clipboard
+transfer without publishing the answer into shell scrollback. The fullscreen
+inspection view uses the existing bounded conversation history (100 blocks,
+128 KiB per text block); persistent real chat remains in the rollout database.
+`inline` clears only the visible screen on entry, preserving the terminal's
+saved scrollback, and uses native scrolling and selection. You can also pass
+`--ui inline` or `--ui fullscreen` to the offline preview.
+The offline preview supports `/long`, `/copy`, and `/exit`.
+Both layouts use a warm terracotta brand accent, quiet gray tool records,
+`●` answer markers, and a composer between two thin horizontal separators.
+The welcome area hides in terminals shorter than 12 rows to leave room for
+approval controls.
 
 | Control | Action |
 | --- | --- |
 | `/model` | Open model picker; arrows select, Enter confirms, Esc cancels; clicking a model also selects it |
-| Drag over answer text | Native terminal selection; use the terminal's Copy command (`Cmd+C` on macOS) |
+| Drag over answer text | Inline: native selection and terminal Copy; fullscreen: application selection requests clipboard copy (F2 switches to native selection) |
 | Terminal Paste / `Cmd+V` on macOS | Paste into the composer; bracketed multiline paste never sends automatically |
-| `/copy` | Request clipboard copy of the latest answer as raw Markdown; also put the full answer in native scrollback |
+| `/copy` | Request clipboard copy of the latest answer as raw Markdown; inline also puts the full answer in native scrollback |
 | `/resume [THREAD_ID]` | Reopen a saved workspace conversation; choose a chat when the ID is omitted |
 | `/` then a command prefix | Show all commands, then filter by any prefix; arrows select, Tab completes, Esc dismisses |
 | `Enter` while suggestions are shown | Confirm a completion; press Enter again to execute the completed command |
-| `F2` | Opt into application mouse interaction, or return to native terminal selection |
+| `F2` | Toggle application mouse interaction and native selection; fullscreen starts with application mouse handling |
 | Click `▸` / `▾` in F2 mouse mode | Expand / collapse the execution group or individual tool |
 | `Ctrl+O` | Toggle the latest execution group without leaving the composer |
 | `Tab`, then arrows and `Enter` / Space | Navigate records and toggle the selected row |

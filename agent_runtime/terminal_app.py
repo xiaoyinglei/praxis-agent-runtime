@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from contextlib import redirect_stdout, suppress
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from prompt_toolkit.application import Application, run_in_terminal
@@ -106,6 +106,12 @@ def _markdown(text: str, width: int, color: bool) -> StyleAndTextTuples:
     return list(to_formatted_text(ANSI(rendered)))
 
 
+def _answer_fragments(text: str, width: int, color: bool) -> StyleAndTextTuples:
+    rendered = _markdown(text, max(1, width - 2), color)
+    return [("class:assistant", "● "),
+            *((style, value.replace("\n", "\n  ")) for style, value, *_ in rendered), ("", "\n")]
+
+
 class _ConversationOutput(io.TextIOBase):
     def __init__(self, view: Conversation) -> None:
         self.view = view
@@ -147,7 +153,11 @@ def _approval_label(choice: str | None) -> str:
 
 
 class TerminalChatApp:
-    def __init__(self, *, model: str, workspace: str, input: Input | None = None, output: Output | None = None) -> None:
+    def __init__(
+        self, *, model: str, workspace: str, ui_mode: Literal["inline", "fullscreen"] = "inline",
+        input: Input | None = None, output: Output | None = None,
+    ) -> None:
+        self.fullscreen = ui_mode == "fullscreen"
         self.model = model
         self.workspace = workspace
         self.status = "就绪"
@@ -170,8 +180,8 @@ class TerminalChatApp:
         self._selecting = False
         self._highlight_key: object = None
         self._highlighted: StyleAndTextTuples = []
-        # The client terminal owns selection and its clipboard, including over SSH.
-        self._mouse_enabled = False
+        # Inline leaves selection to the terminal; fullscreen scrolls its own history.
+        self._mouse_enabled = self.fullscreen
         self._model_choices: list[str] = []
         self._model_index = 0
         self._model_pending: asyncio.Future[str | None] | None = None
@@ -185,7 +195,8 @@ class TerminalChatApp:
             prompt="❯ ",
             multiline=True,
             wrap_lines=True,
-            height=lambda: Dimension(min=3, preferred=min(8, self.editor.document.line_count + 1), max=8),
+            height=Dimension(min=1, max=6),
+            dont_extend_height=True,
             style="class:input",
             history=BoundedPromptHistory(),
             completer=WordCompleter(list(CHAT_COMMANDS), sentence=True, meta_dict=CHAT_COMMANDS),
@@ -274,7 +285,7 @@ class TerminalChatApp:
 
         @keys.add("enter", filter=has_focus(self.editor))
         def send(event: KeyPressEvent) -> None:
-            if self.editor.buffer.complete_state is not None:
+            if self.editor.text.startswith("/") and self.editor.buffer.complete_state is not None:
                 if self.editor.buffer.complete_state.complete_index is None:
                     self.editor.buffer.go_to_completion(0)
                 self.editor.buffer.complete_state = None
@@ -387,14 +398,15 @@ class TerminalChatApp:
         body_window = Window(
             self.body,
             wrap_lines=False,
-            height=lambda: Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8)),
-            dont_extend_height=True,
+            height=lambda: (Dimension(min=1, weight=1) if self.fullscreen else
+                            Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8))),
+            dont_extend_height=not self.fullscreen,
         )
         layout = HSplit(
             [
                 Window(
                     FormattedTextControl(self._header),
-                    height=2,
+                    height=lambda: 3 if self.app.output.get_size().rows >= 12 else 0,
                 ),
                 body_window,
                 ConditionalContainer(
@@ -413,6 +425,7 @@ class TerminalChatApp:
                     ]), filter=approving,
                 ),
                 ConditionalContainer(self.editor, filter=~approving),
+                ConditionalContainer(Window(height=1, char="─", style="class:dim"), filter=~approving),
                 Window(FormattedTextControl(self._footer), height=1),
             ]
         )
@@ -427,7 +440,9 @@ class TerminalChatApp:
             layout=Layout(FloatContainer(
                 content=layout,
                 floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(
-                    max_height=8, scroll_offset=1, extra_filter=has_focus(self.editor) & ~approving,
+                    max_height=8, scroll_offset=1, extra_filter=has_focus(self.editor) & ~approving & Condition(
+                        lambda: self.waiting and self.editor.text.startswith("/"),
+                    ),
                 ))],
             ), focused_element=self.editor),
             key_bindings=merge_key_bindings(
@@ -437,7 +452,7 @@ class TerminalChatApp:
                 ]
             ),
             mouse_support=Condition(lambda: self._mouse_enabled),
-            full_screen=False,
+            full_screen=self.fullscreen,
             input=input,
             output=output,
             # Repainting an idle prompt can clear the terminal's native selection.
@@ -445,12 +460,12 @@ class TerminalChatApp:
             min_redraw_interval=0.05,
             style=Style.from_dict(
                 {
-                    "header": "bold ansiblue",
-                    "assistant": "bold",
-                    "user": "bold ansiblue",
-                    "group": "bold",
+                    "header": "bold #d97757",
+                    "assistant": "#d97757",
+                    "user": "",
+                    "group": "#888888",
                     "tool": "",
-                    "dim": "ansibrightblack",
+                    "dim": "#888888",
                     "error": "ansired",
                     "added": "ansigreen",
                     "removed": "ansired",
@@ -542,13 +557,10 @@ class TerminalChatApp:
         self._fold_rows = {}
         for text, block, style in self.view.rows(include_scrollback=history):
             if style == "answer" and text.strip():
-                rendered = _markdown(text.removeprefix("● "), max(1, width - 2), "NO_COLOR" not in os.environ)
+                rendered = _answer_fragments(text.removeprefix("● "), width, "NO_COLOR" not in os.environ)
                 handler = self._handler(None, line)
-                fragments.append(("class:assistant", "Praxis\n", handler))
-                fragments.append(("", "  ", handler))
-                fragments.extend((s, t.replace("\n", "\n  "), handler) for s, t, *_ in rendered)
-                fragments.append(("", "\n", handler))
-                line += sum(t.count("\n") for _, t, *_ in rendered) + 2
+                fragments.extend((s, t, handler) for s, t, *_ in rendered)
+                line += sum(t.count("\n") for _, t, *_ in rendered)
                 continue
             for value in text.split("\n"):
                 for row in display_rows(value, width=width):
@@ -673,21 +685,28 @@ class TerminalChatApp:
         self.invalidate()
 
     async def show_text(self, text: str) -> None:
-        """Write above the UI into native scrollback, bypassing redirected stdout."""
+        """Route text to the fullscreen view or native terminal scrollback."""
+        if self.fullscreen:
+            self.view.message(text + "\n", "notice")
+            return
         await run_in_terminal(lambda: print_formatted_text(
             self.app.output, [("", safe_terminal_text(text) + "\n")], self.app.style or Style.from_dict({}),
         ))
 
     async def replay_messages(self, messages: Sequence[tuple[str, str]]) -> None:
-        """Publish saved messages in native scrollback; retain a bounded inspection view."""
+        """Replay saved messages using the mode's transcript destination."""
+        if self.fullscreen:
+            for kind, text in messages:
+                self.view.message(text + "\n", kind)
+            self._follow = True
+            return
         await self.flush_scrollback()
         for kind, text in messages:
             width = max(4, self.app.output.get_size().columns - 1)
             fragments: StyleAndTextTuples = (
-                [("class:user", "你 › " + safe_terminal_text(text) + "\n\n")]
+                [("class:user", "❯ " + safe_terminal_text(text) + "\n\n")]
                 if kind == "user" else
-                [("class:assistant", "Praxis\n"),
-                 *_markdown(safe_terminal_text(text), width, "NO_COLOR" not in os.environ), ("", "\n\n")]
+                [*_answer_fragments(safe_terminal_text(text), width, "NO_COLOR" not in os.environ), ("", "\n")]
             )
             await run_in_terminal(partial(
                 print_formatted_text, self.app.output, fragments, self.app.style or Style.from_dict({}),
@@ -699,7 +718,9 @@ class TerminalChatApp:
         self.view.invalidate()
 
     async def flush_scrollback(self) -> None:
-        """Commit stable output once; keep the viewport for streaming and inspection."""
+        """Commit stable inline output once; fullscreen retains it in the viewport."""
+        if self.fullscreen:
+            return
         pending = [block for block in self.view.blocks if not block.in_scrollback]
         if not pending:
             return
@@ -707,9 +728,7 @@ class TerminalChatApp:
         fragments: StyleAndTextTuples = []
         for text, _, style in self.view.rows(include_scrollback=False):
             if style == "answer" and text.strip():
-                fragments.append(("class:assistant", "Praxis\n"))
-                fragments.extend(_markdown(text.removeprefix("● "), width, "NO_COLOR" not in os.environ))
-                fragments.append(("", "\n"))
+                fragments.extend(_answer_fragments(text.removeprefix("● "), width, "NO_COLOR" not in os.environ))
             else:
                 fragments.append((f"class:{style}" if style else "", text + "\n"))
         for block in pending:
@@ -731,7 +750,8 @@ class TerminalChatApp:
 
     async def copy_answer(self, text: str) -> None:
         # Native scrollback is available even when the client rejects OSC 52.
-        await self.show_text("最近回答（原始 Markdown，可在终端滚动历史中选取）\n\n" + text + "\n")
+        if not self.fullscreen:
+            await self.show_text("最近回答（原始 Markdown，可在终端滚动历史中选取）\n\n" + text + "\n")
         await self._write_clipboard(text)
         self.view.message(self.status + "\n", "notice")
 
@@ -741,10 +761,10 @@ class TerminalChatApp:
 
     def _header(self) -> StyleAndTextTuples:
         width = max(1, self.app.output.get_size().columns - 2)
-        title = display_rows(f" PRAXIS  ·  {safe_terminal_text(self.model)}  ·  {self.status}", width=width)[0]
+        title = display_rows(" ✳ Praxis", width=width)[0]
         workspace = os.path.basename(self.workspace.rstrip("/")) or self.workspace
-        return [("class:header", title + "\n"),
-                ("class:dim", f" 工作区 {safe_terminal_text(workspace)} · /status 查看完整路径")]
+        context = display_rows(f"   {safe_terminal_text(self.model)} · {safe_terminal_text(workspace)}", width=width)[0]
+        return [("class:header", title + "\n"), ("class:dim", context + "\n")]
 
     def _resolve_approval(self, state: _ApprovalState, choice: str | None) -> None:
         if self._approval is state and not state.future.done() and (choice is None or choice in state.options):
@@ -860,11 +880,12 @@ class TerminalChatApp:
         if self._model_pending is not None:
             return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
         activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
-        mouse_hint = "F2 原生菜单" if self._mouse_enabled else "拖选复制 · 右键菜单"
+        mouse_hint = "PgUp 历史 · F2 鼠标" if self.fullscreen else ""
+        hint = activity if self._operation else "/help 帮助"
         return [
             (
                 "class:dim",
-                f" {activity} · Enter 发送 · Ctrl+J 换行 · {mouse_hint}",
+                f" {hint} · Enter 发送 · Ctrl+J 换行" + (f" · {mouse_hint}" if mouse_hint else ""),
             )
         ]
 
@@ -915,6 +936,11 @@ class TerminalChatApp:
 
         def start() -> None:
             nonlocal worker
+            if not self.fullscreen:
+                # Clear only the visible screen; preserve the client's saved scrollback.
+                self.app.output.cursor_goto(0, 0)
+                self.app.output.erase_screen()
+                self.app.output.flush()
             worker = asyncio.create_task(work())
 
         try:

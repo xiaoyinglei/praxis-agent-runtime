@@ -729,13 +729,14 @@ async def _chat_facade_loop(
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
     allow_web_tools: bool = False,
+    ui_mode: Literal["inline", "fullscreen"] = "fullscreen",
     _ui: TerminalChatApp | None = None,
 ) -> None:
     if _ui is None and _is_tty(sys.stdin) and _is_tty(sys.stdout) and os.environ.get("TERM") != "dumb":
         from agent_runtime.terminal_app import TerminalChatApp
 
         initial_model = "历史聊天" if resume_thread_id is not None else facade.current_model().id
-        ui = TerminalChatApp(model=initial_model, workspace=str(facade.workspace_path or Path.cwd()))
+        ui = TerminalChatApp(model=initial_model, workspace=str(facade.workspace_path or Path.cwd()), ui_mode=ui_mode)
         await ui.run(lambda: _chat_facade_loop(
             facade, max_tokens_total=max_tokens_total, max_turns=max_turns,
             previous_turn_id=previous_turn_id, allow_write_tools=allow_write_tools,
@@ -789,7 +790,7 @@ async def _chat_facade_loop(
                 await _ui.replay_messages(messages)
             else:
                 for kind, text in messages:
-                    print(("你 › " if kind == "user" else "Praxis\n") + safe_terminal_text(text) + "\n")
+                    print(("❯ " if kind == "user" else "Praxis\n") + safe_terminal_text(text) + "\n")
             pending = (await facade.read_result(selected.active_turn_id)
                        if selected.active_turn_id and selected.status in {"paused", "interrupted"} else None)
             _print_chat_recovery(selected, pending)
@@ -1558,6 +1559,10 @@ def _project_abortable_cli_turn(
 
 @agent_app.command(name="chat")
 def agent_chat(
+    ui_mode: Annotated[
+        Literal["inline", "fullscreen"],
+        typer.Option("--ui", help="终端界面：inline 清屏后原生滚动；fullscreen 全屏固定输入框"),
+    ] = "fullscreen",
     previous_turn_id: Annotated[
         str | None,
         typer.Option(
@@ -1685,6 +1690,7 @@ def agent_chat(
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
+            ui_mode=ui_mode,
         )
     )
 
