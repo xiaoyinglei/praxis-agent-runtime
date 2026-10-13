@@ -1194,3 +1194,28 @@ def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path
     assert str(tmp_path) in text
     assert "working_dir" in text
     assert "Current model ID for this turn:" in text
+
+
+def test_runtime_clock_is_visible_and_stable_when_repreparing_saved_request():
+    clock = {"current_time": "2032-03-04T23:55:00+09:00", "current_date": "2032-03-04",
+             "timezone": "Asia/Tokyo", "utc_offset": "+09:00"}
+    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
+                                instructions=("Answer directly.",))
+    request = HarnessModelRequest(thread_id="thread", turn_id="turn",
+                                  messages=(HarnessMessage(role="user", content="Explain yesterday's results."),),
+                                  binding_manifest={"model_id": "test-model", "runtime_clock": clock})
+    first = model.prepare(request)
+    repeated = model.prepare(request)
+    wire = str(serialize_openai_request(first.dispatch_payload.request))
+    assert clock["current_time"] in wire and clock["timezone"] in wire
+    assert first.wire_hash == repeated.wire_hash
+    assert first.context_hash == repeated.context_hash
+
+
+def test_legacy_request_does_not_acquire_a_new_clock_when_reprepared():
+    model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
+                                instructions=("Answer directly.",))
+    prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
+                             messages=(HarnessMessage(role="user", content="hello"),),
+                             binding_manifest={"model_id": "test-model"}))
+    assert "Current runtime clock facts:" not in str(serialize_openai_request(prepared.dispatch_payload.request))

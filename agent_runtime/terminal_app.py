@@ -97,6 +97,9 @@ def _markdown(text: str, width: int, color: bool) -> StyleAndTextTuples:
             if title != domain:
                 source.append(f" · {domain}", style="dim")
             console.print(source)
+            # Keep one logical URL in native scrollback for clients that detect
+            # visible URLs but do not support OSC 8 labels. Never crop the target.
+            console.print(Text("      " + url, style=RichStyle(link=url, dim=True)), soft_wrap=True)
     # ANSI only understands CSI styling. Pass renderer-generated OSC 8 links as
     # zero-width escapes so their URL/id bytes never become visible characters.
     rendered = _LINK_ESCAPE.sub(lambda match: "\001" + match.group() + "\002", stream.getvalue().rstrip("\n"))
@@ -513,7 +516,12 @@ class TerminalChatApp:
                     self._follow = False
                     self.view.toggle(block)
             elif event.event_type == MouseEventType.MOUSE_UP and event.button == MouseButton.RIGHT:
-                self.app.create_background_task(self._paste_text())
+                # A remote TUI cannot display the client's native context menu.
+                # Release mouse reporting; the next right-click belongs to it.
+                self._mouse_enabled = False
+                self._selecting = False
+                self._selection_start = self._selection_end = None
+                self.status = "已恢复终端菜单，请再次右键网址"
             else:
                 return None
             self.invalidate()
@@ -627,38 +635,6 @@ class TerminalChatApp:
                 output.append((run_style, run_text, handler) if handler else (run_style, run_text))
         self._highlight_key, self._highlighted = key, output
         return output
-
-    async def _paste_text(self) -> None:
-        # A server's clipboard (or our kill ring) is not the SSH client's clipboard.
-        if sys.platform != "darwin" or os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY"):
-            self.status = "请用终端粘贴快捷键；F2 可恢复原生右键菜单"
-            self.invalidate()
-            return
-        try:
-            process = await asyncio.create_subprocess_exec("pbpaste", stdout=asyncio.subprocess.PIPE)
-            try:
-                data, _ = await asyncio.wait_for(process.communicate(), 3)
-            except (TimeoutError, asyncio.CancelledError) as exc:
-                if process.returncode is None:
-                    with suppress(ProcessLookupError):
-                        process.kill()
-                await process.communicate()
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                self.status = "剪贴板读取超时，请用终端粘贴快捷键"
-                return
-            if process.returncode != 0:
-                self.status = "请用终端粘贴快捷键"
-                return
-            text = data.decode("utf-8", errors="replace")
-        except OSError:
-            self.status = "请用终端粘贴快捷键"
-            return
-        finally:
-            self.invalidate()
-        self.app.layout.focus(self.editor)
-        self.editor.buffer.insert_text(text)
-        self.invalidate()
 
     def _copy_text(self, text: str) -> None:
         self.app.clipboard.set_data(ClipboardData(text))
@@ -884,7 +860,7 @@ class TerminalChatApp:
         if self._model_pending is not None:
             return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
         activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
-        mouse_hint = "F2 原生选择" if self._mouse_enabled else "拖选复制"
+        mouse_hint = "F2 原生菜单" if self._mouse_enabled else "拖选复制 · 右键菜单"
         return [
             (
                 "class:dim",

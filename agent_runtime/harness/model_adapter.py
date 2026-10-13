@@ -110,6 +110,16 @@ class GatewayHarnessModel:
         if any(message.role != "context" for message in leading):
             raise ValueError("Harness model context may only place context fragments before the first user message")
         first = messages[first_user_index]
+        clock_blocks: tuple[ContextBlock, ...] = ()
+        clock = request.binding_manifest.get("runtime_clock")
+        if request.purpose == "agent_step" and isinstance(clock, Mapping):
+            clock_blocks = (ContextBlock(
+                name="runtime_clock",
+                content="Current runtime clock facts:\n" + json.dumps(dict(clock), sort_keys=True) +
+                "\nUse these facts when interpreting relative dates and whether dates are past or future. "
+                "Saved messages describe their original time; do not treat their dates as current. "
+                "When the intended date or year is ambiguous, clarify it rather than silently moving it.",
+            ),)
         context = build_stable_context(
             instructions=(
                 (
@@ -127,6 +137,7 @@ class GatewayHarnessModel:
                     content=f"Current model ID for this turn: {self._model_id}.",
                 ),
             )
+            + clock_blocks
             + tuple(
                 ContextBlock(name=f"harness_prefix_{index}", content=message.content)
                 for index, message in enumerate(leading, start=1)

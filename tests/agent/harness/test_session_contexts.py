@@ -36,7 +36,14 @@ class _ChangingRouter:
         return ()
 
 
-def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path) -> None:
+def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, monkeypatch) -> None:
+    clocks = iter((
+        {"current_time": "2031-12-31T23:59:59+00:00", "current_date": "2031-12-31",
+         "timezone": "UTC", "utc_offset": "+00:00"},
+        {"current_time": "2032-01-01T00:00:01+00:00", "current_date": "2032-01-01",
+         "timezone": "UTC", "utc_offset": "+00:00"},
+    ))
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: next(clocks))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
@@ -76,8 +83,16 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path) ->
         assert request.step == 1
         assert request.messages is step_context.messages
         assert request.tools is step_context.tools
-        assert request.binding_manifest == turn_context.binding_manifest
+        clock = request.binding_manifest["runtime_clock"]
+        assert clock["current_date"] == clock["current_time"][:10]
+        assert clock["timezone"] and clock["utc_offset"]
+        assert {key: value for key, value in request.binding_manifest.items() if key != "runtime_clock"} == (
+            dict(turn_context.binding_manifest)
+        )
         assert request.binding_manifest is step_context.binding_manifest
+        next_step = session.capture_step_context(turn_context, step=2)
+        assert next_step.binding_manifest["runtime_clock"]["current_date"] == "2032-01-01"
+        assert request.binding_manifest["runtime_clock"]["current_date"] == "2031-12-31"
 
 
 def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:

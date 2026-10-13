@@ -39,6 +39,7 @@ from agent_runtime.models import (
 )
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
+from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
 from agent_runtime.tools.web_limits import WebLimits
@@ -776,6 +777,8 @@ async def _chat_facade_loop(
                 print(f"Previous Turn: {current_turn_id or '(none)'}")
                 print(f"模型: {model_id}")
                 print(f"工作区: {chat_workspace}")
+                clock = capture_runtime_clock()
+                print(f"当前时间: {clock['current_time']} · {clock['timezone']}")
                 print(f"详细输出: {'开' if verbose else '关'}")
                 print("网页网络: " + ("可信代理（上游解析域名，NO_PROXY 命中时严格直连）"
                                       if getattr(facade, "web_proxy_url", None) else "严格直连"))

@@ -214,13 +214,17 @@ cursor-position reports; keyboard folding is also available.
 
 Markdown web references retain their short labels and appear together below the
 answer as numbered sources with a title and website domain; repeated URLs share
-one source entry. The full HTTP(S) URL remains in the terminal hyperlink target,
-without exposing hyperlink control bytes as text. In a terminal that supports
-OSC 8 links, use its normal link-opening gesture (often Cmd-click on macOS or
-Ctrl-click) to open the page in the client's browser, including over SSH. The
-server never launches a browser. Terminals without hyperlink support can use
-`/copy` to retrieve the original Markdown with full URLs. Historical answers use
-the same rendering; their saved text is unchanged. Code examples are not treated
+one source entry. Each entry also prints the full HTTP(S) URL on a separate
+logical line without truncation, so the client's native URL detection works
+without OSC 8 support. Mac Terminal opens a visible URL with Cmd-double-click;
+Ghostty on macOS uses Cmd-click. OSC 8 labels remain available in compatible
+terminals. Pages open in the client's browser, including over SSH; the server
+never launches a browser. `/copy` also retrieves the original Markdown.
+Right-click uses the client's native context menu by default. Ghostty's
+`right-click-action = context-menu` enables its context menu if it was customized.
+Available link actions and browser choices belong to the client terminal;
+opening a link normally uses the system's default browser.
+Historical answers use the same rendering; their saved text is unchanged. Code examples are not treated
 as cited sources, and non-web destinations are not emitted as active hyperlinks.
 
 Unchanged history reuses its layout when scrolling or refreshing the status bar.
@@ -229,8 +233,9 @@ receiving new content invalidates the layout. `/copy` uses `pbcopy` only on a lo
 Mac; elsewhere it sends an OSC 52 clipboard request for answers up to 64 KiB.
 Client terminals may reject that request, so the full answer is also printed above
 the application for native copy. The server never reads the client's clipboard;
-use the terminal's normal Paste command. In F2 mode, right-click paste is available
-only on a local Mac; over SSH, return to native mouse mode for the terminal's menu.
+use the terminal's normal Paste command. In F2 mode, right-click releases mouse
+reporting and asks you to right-click again for the client's native menu. It never
+pastes text. F2 also returns directly to native mouse mode.
 Completed output remains in terminal scrollback independently of the bounded
 application view. The terminal itself controls its scrollback limit. While a
 response is streaming, `PageUp` (usually `Fn+Up` on a Mac) inspects the application
@@ -252,6 +257,12 @@ successful recovery of the same call, or unmeasured external effects reset it.
 The check uses committed history, including after a process restart. A missing
 file reports `file_not_found`, rather than a generic retryable runner failure.
 Model context includes the actual workspace and the model ID frozen for that Turn.
+Each new agent step also captures the host's current date, time, timezone and UTC
+offset. Those facts travel with its saved request: recovering an already prepared
+request preserves its original clock, while the next new step reads a fresh one.
+Historical messages remain unchanged. The model uses these facts for relative
+and past/future dates; ambiguous date intentions still require clarification.
+`/status` displays the current host time and timezone for inspection.
 
 OpenAI-compatible streams request and preserve provider usage, including a
 usage-only trailing chunk. Token estimates include full tool descriptions and

@@ -425,7 +425,7 @@ def test_web_references_keep_clickable_targets_without_visible_control_bytes():
     controls = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" in style)
     assert "Original report" in visible and "网页引用" in visible and "docs.example.org" in visible
     assert visible.count("[1]") == 1 and "[2]" not in visible
-    assert "id=" not in visible and "\x1b" not in visible and url not in visible
+    assert "\x1b" not in visible and "]8;id=" not in visible and url in visible
     assert url in controls and "\x1b]8;" in controls
 
 
@@ -576,7 +576,13 @@ async def test_ssh_copy_requests_client_clipboard_without_claiming_success(monke
     assert "完整的回答" in stream.getvalue()  # Native scrollback fallback, no stdout redirection.
     assert "已请求" in ui.status and ui.status != "已复制"
     ui.app.clipboard.set_text("old kill ring")
-    await ui._paste_text()
+    from prompt_toolkit.data_structures import Point
+    from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
+    ui._mouse_enabled = True
+    ui._handler(None, 0)(MouseEvent(Point(0, 0), MouseEventType.MOUSE_UP, MouseButton.RIGHT, frozenset()))
+    assert not ui.app.mouse_support()  # The next right-click belongs to the client menu.
+    assert "再次右键" in ui.status
     assert ui.editor.text == ""  # Never silently paste the server's kill ring instead.
 
 
@@ -773,3 +779,13 @@ async def test_vt100_drag_paste_and_native_mouse_toggle(monkeypatch):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+
+def test_long_reference_url_remains_complete_in_native_scrollback():
+    from agent_runtime.terminal_app import _markdown
+
+    url = "https://example.org/" + "long-path/" * 30 + "?record=id123"
+    fragments = _markdown(f"Read [Source]({url}).", 40, False)
+    visible = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" not in style)
+    assert url in visible
+    assert "\x1b" not in visible

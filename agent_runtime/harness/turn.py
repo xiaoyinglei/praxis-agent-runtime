@@ -51,6 +51,7 @@ from agent_runtime.harness.tool_orchestrator import (
     ToolOrchestrator,
 )
 from agent_runtime.modeling.contracts import context_capacity_policy
+from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     TurnItemKind,
@@ -265,6 +266,9 @@ class TurnExecutor:
         ):
             if name in turn_context.binding_manifest:
                 binding[name] = turn_context.binding_manifest[name]
+        # Freeze clock facts in the saved step, just like its messages and tools.
+        # Repreparing/recovering this request must not read a different clock.
+        binding["runtime_clock"] = capture_runtime_clock()
         return StepContext(
             turn=turn_context,
             step=step,
