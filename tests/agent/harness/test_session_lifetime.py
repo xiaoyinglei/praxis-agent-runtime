@@ -163,12 +163,23 @@ async def test_close_waits_for_active_turn_and_rejects_competing_submit(tmp_path
 async def test_mcp_process_lives_across_submissions_and_exits_on_close(tmp_path, monkeypatch):
     from contextlib import asynccontextmanager
 
+    import anyio
+
     from agent_runtime.runtime import mcp as mcp_runtime
     from agent_runtime.runtime.mcp import decide_mcp_config_trust
     from tests.agent.test_mcp_e2e import _MCP_SERVER_SCRIPT
 
     pid_logs = []
+    processes = []
     original_stdio = mcp_runtime.stdio_client
+    original_open_process = anyio.open_process
+
+    async def capture_host_process(*args, **kwargs):
+        process = await original_open_process(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(anyio, "open_process", capture_host_process)
 
     @asynccontextmanager
     async def capture_pid_log(params):
@@ -210,8 +221,13 @@ async def test_mcp_process_lives_across_submissions_and_exits_on_close(tmp_path,
         assert pid_log.is_relative_to(tmp_path / ".praxis/runtime/scratch")
         pids = pid_log.read_text().splitlines()
         assert len(pids) == 1
-        pid = int(pids[0])
+        # Linux MCP runs in a PID namespace. Its logged PID is local to that
+        # namespace; the SDK process carries the actual host lifecycle identity.
+        [process] = processes
+        pid = process.pid
+        assert process.returncode is None
         os.kill(pid, 0)
+    assert process.returncode is not None
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 

@@ -1,5 +1,6 @@
 import json
 
+from typer.main import get_command
 from typer.testing import CliRunner
 
 from agent_runtime.cli import agent_app
@@ -30,10 +31,13 @@ def test_permissions_inspection_and_denial_need_no_model(tmp_path):
 
 def test_public_cli_exposes_policy_for_new_and_recovered_work():
     runner = CliRunner()
+    group = get_command(agent_app)
     for command in ("run", "chat", "resume", "recover"):
         result = runner.invoke(agent_app, [command, "--help"])
         assert result.exit_code == 0
-        assert "--permissions" in result.output
+        # Rich can truncate option labels at narrow terminal widths. Inspect
+        # the real Click option rather than the width-dependent projection.
+        assert any("--permissions" in parameter.opts for parameter in group.commands[command].params)
 
 
 def test_invalid_policy_fails_before_execution(tmp_path):
