@@ -41,6 +41,7 @@ from agent_runtime.models import (
 from agent_runtime.result import AgentDiagnostic, AgentResult
 from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.runtime_clock import capture_runtime_clock
+from agent_runtime.setup_cli import setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
 from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
 from agent_runtime.tools.web_limits import WebLimits
@@ -57,6 +58,7 @@ model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
+agent_app.command("setup")(setup)
 
 
 @agent_app.command("permissions")

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, fields
@@ -37,6 +36,7 @@ from agent_runtime.model_config_io import (
     exclusive_config_lock,
     file_fingerprint,
 )
+from agent_runtime.model_credentials import resolve_model_credential
 from agent_runtime.model_definition import (
     ModelExecutionDefinition,
     RuntimeDefinition,
@@ -859,7 +859,7 @@ class ModelControlPlane:
             spec
         )
         revision = reviewed.definition_revision
-        credential = os.environ.get(spec.api_key_env, "").strip() if spec.api_key_env else ""
+        credential = self._model_credential(spec) or ""
         credential_revision = hashlib.sha256(credential.encode()).hexdigest()
         cache_key = (revision, credential_revision)
         if cache_key not in self._resolved_bindings:
@@ -1109,9 +1109,7 @@ class ModelControlPlane:
         spec: ModelSpec,
     ) -> None:
         if spec.api_key_env:
-            value = os.environ.get(
-                spec.api_key_env
-            )
+            value = self._model_credential(spec)
 
             if (
                 not isinstance(value, str)
@@ -1119,12 +1117,16 @@ class ModelControlPlane:
             ):
                 raise ModelNotAvailableError(
                     f"Model {spec.id!r} is unavailable "
-                    "because environment variable "
-                    f"{spec.api_key_env} is not set. "
-                    "Export it or add it to .env; "
+                    f"because environment variable {spec.api_key_env} is not set "
+                    "and no saved credential is configured. "
+                    "Run agent setup, export it, or add it to .env; "
                     "use AGENT_ENV_FILE to select "
                     "a different env file"
                 )
+
+    @staticmethod
+    def _model_credential(spec: ModelSpec) -> str | None:
+        return resolve_model_credential(spec.api_key_env, spec.base_url)
             
 def _load_session_state(
     *,

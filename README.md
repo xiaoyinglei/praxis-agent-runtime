@@ -114,8 +114,24 @@ conservative fallback for models without an available tokenizer.
 
 ### Connect and switch models
 
+For a first-run walkthrough, select a model, enter its API key without terminal
+echo, and optionally connect read-only GitHub MCP:
+
+```bash
+uv run agent setup
+uv run agent chat
+```
+
+The wizard validates the model using the existing full probe before saving a
+new key or changing the project's selection. It reuses existing environment
+credentials by default. macOS stores new keys in Keychain; other POSIX systems
+use a private file outside the workspace, denied to Agent tools and sandboxes.
+See [first-run setup](docs/setup.md) for custom endpoints, repeat runs, and
+credential precedence.
+
 Praxis accepts a secret-free model definition and reads any credential through
-the named environment variable at runtime. For full Agent behavior, an endpoint
+the named environment variable or the endpoint-bound personal credential store
+at runtime. For full Agent behavior, an endpoint
 must provide:
 
 - an OpenAI-compatible model-discovery and chat interface that advertises the

@@ -9,8 +9,25 @@ from typing import Annotated
 import typer
 
 from agent_runtime import mcp_admin
+from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 
 mcp_app = typer.Typer(no_args_is_help=True)
+
+
+async def check_mcp_connection(name: str, workspace: Path) -> dict[str, object]:
+    """Check one personal connection without invoking a model or MCP tool."""
+    from agent_runtime.permission_policy import resolve_permission_sources
+    from agent_runtime.runtime.mcp import decide_mcp_config_trust, open_trusted_product_mcp_tools
+
+    config = mcp_admin.user_mcp_config()
+    policy = resolve_permission_sources(workspace)
+    trust = decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=False)
+    diagnostics: list[RuntimeDiagnostic] = []
+    async with open_trusted_product_mcp_tools(
+        config, trust=trust, permissions=policy, diagnostics=diagnostics, server_names=frozenset({name}),
+    ) as tools:
+        return {"name": name, "connected": bool(tools), "tools": [tool.definition.name for tool in tools],
+                "diagnostics": [item.model_dump(mode="json") for item in diagnostics]}
 
 
 @mcp_app.command("add")
@@ -64,26 +81,10 @@ def check(
     workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
 ) -> None:
     """验证认证和工具发现；不调用模型或修改远程数据。"""
-    from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
-    from agent_runtime.permission_policy import resolve_permission_sources
-    from agent_runtime.runtime.mcp import decide_mcp_config_trust, open_trusted_product_mcp_tools
-
-    config = mcp_admin.user_mcp_config()
     try:
-        policy = resolve_permission_sources(workspace)
-        trust = decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=False)
+        result = asyncio.run(check_mcp_connection(name, workspace))
     except (OSError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
-
-    async def inspect() -> dict[str, object]:
-        diagnostics: list[RuntimeDiagnostic] = []
-        async with open_trusted_product_mcp_tools(
-            config, trust=trust, permissions=policy, diagnostics=diagnostics, server_names=frozenset({name}),
-        ) as tools:
-            return {"name": name, "connected": bool(tools), "tools": [tool.definition.name for tool in tools],
-                    "diagnostics": [item.model_dump(mode="json") for item in diagnostics]}
-
-    result = asyncio.run(inspect())
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["connected"]:
         raise typer.Exit(1)

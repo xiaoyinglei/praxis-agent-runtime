@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -12,6 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
+from agent_runtime.core.llm_config import normalize_model_endpoint
 from agent_runtime.core.llm_registry import ModelRegistry, ResolvedModel
 from agent_runtime.core.model_request import (
     ModelRequest,
@@ -20,6 +20,7 @@ from agent_runtime.core.model_request import (
     build_model_request,
     build_stable_context,
 )
+from agent_runtime.model_credentials import resolve_model_credential
 from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import LLMGateway, ProviderDelta, ProviderDeltaChannel
@@ -77,7 +78,9 @@ class ModelProbe:
             raise TypeError("level must be a ProbeLevel")
         credential_name = definition.api_key_env
         if credential_name is not None:
-            credential = os.environ.get(credential_name)
+            endpoint = normalize_model_endpoint(provider=definition.provider, base_url=definition.base_url,
+                                               location=definition.location)
+            credential = resolve_model_credential(credential_name, endpoint.base_url)
             if not isinstance(credential, str) or not credential.strip():
                 raise ModelProbeError(
                     phase="authentication",
