@@ -24,9 +24,15 @@ from agent_runtime.harness.protocol import (
     TurnResult,
 )
 from agent_runtime.harness.rollout import RolloutStore
-from agent_runtime.harness.services import SessionBindingProvider, _tool_execution_policy_snapshot, configure_services
+from agent_runtime.harness.services import (
+    SessionBindingProvider,
+    _tool_execution_policy_snapshot,
+    configure_services,
+    restore_tool_policy,
+)
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
 from agent_runtime.harness.turn import TurnExecutor
+from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ResolvedPermissions
 from agent_runtime.result import AgentResult
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -182,6 +188,11 @@ class Session:
                     allow_write_tools=service_options.pop("allow_write_tools", False),
                     allow_execute_tools=service_options.pop("allow_execute_tools", False),
                     allow_web_tools=service_options.pop("allow_web_tools", False),
+                    initial_tool_context=service_options.get("tool_execution_context"),
+                    saved_tool_policy=(thread.settings.get("tool_execution_policy")
+                                       if thread_id is not None and not explicit_tool_context else None),
+                    discovery_ceiling=(original.get("tool_execution_policy", {}).get("permissions")
+                                       if frozen_turn_id is not None else None),
                 )
                 service_options.update(resource_options)
             if model is None:
@@ -197,11 +208,10 @@ class Session:
             self.head_turn_id = thread.head_turn_id
             settings = thread.settings
             if settings:
-                policy = dict(settings["tool_execution_policy"])
-                policy.setdefault("allow_web_tools", False)
-                policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
                 if not explicit_tool_context:
-                    self.tool_execution_context = replace(self.tool_execution_context, **policy)
+                    self.tool_execution_context = restore_tool_policy(
+                        self.tool_execution_context, settings["tool_execution_policy"], restore_session_grants=True,
+                    )
                 if self.model_control_plane is not None and settings.get("model_id"):
                     self.model_control_plane.state = replace(
                         self.model_control_plane.state,
@@ -421,6 +431,65 @@ class Session:
         if self.tool_orchestrator is not None:
             self.tool_orchestrator.update_execution_context(self.tool_execution_context)
 
+    def permissions(self) -> ResolvedPermissions:
+        """Return current effective authority, including administrator ceilings."""
+        self._ensure_open()
+        return self.tool_execution_context.effective_permissions or PermissionPolicy().resolve(self.workspace_path)
+
+    def update_permissions(self, policy: PermissionPolicy | Path | str) -> None:
+        """Explicit user/host control; the model has no tool to widen authority."""
+        self._ensure_open()
+        if not isinstance(policy, (PermissionPolicy, Path, str)):
+            raise TypeError("policy must be PermissionPolicy or a policy file path")
+        previous = self.tool_execution_context
+        previous_agent_policy = None if self._agent is None else self._agent.permissions
+        if self._agent is not None:
+            self._agent.permissions = policy
+        try:
+            from agent_runtime.permission_policy import load_permission_policy
+
+            effective = (self._agent.effective_permissions() if self._agent is not None else
+                         policy.resolve(self.workspace_path) if isinstance(policy, PermissionPolicy) else
+                         load_permission_policy(policy, self.workspace_path))
+            self.tool_execution_context = replace(previous, permissions=effective)
+            self._persist_settings()
+        except BaseException:
+            self.tool_execution_context = previous
+            if self._agent is not None:
+                self._agent.permissions = previous_agent_policy
+            raise
+        self._apply_tool_context()
+
+    def _resource_permissions(self) -> ResolvedPermissions:
+        # Resident tools are borrowed by child Sessions. The active Step supplies
+        # the child's frozen ceiling while the parent supplies live revocations.
+        effective = self.permissions()
+        network_denied = ToolEffect.NETWORK in self.tool_execution_context.deny_effects
+        binding = current_tool_binding()
+        if binding is not None:
+            saved_policy = binding.get("tool_execution_policy", {})
+            network_denied = network_denied or ToolEffect.NETWORK.value in saved_policy.get("deny_effects", ())
+            saved = saved_policy.get("permissions")
+            if saved is not None:
+                effective = effective.intersection(ResolvedPermissions.model_validate(saved))
+        if network_denied:
+            effective = effective.model_copy(update={"network": NetworkPolicy(decision="deny")})
+        return effective
+
+    def reload_permissions(self) -> None:
+        """Accept newly granted source authority for future calls after user reload."""
+        self._ensure_open()
+        if self._agent is None:
+            raise ValueError("reload requires an Agent-configured Session")
+        previous = self.tool_execution_context
+        self.tool_execution_context = replace(previous, permissions=self._agent.effective_permissions())
+        try:
+            self._persist_settings()
+        except BaseException:
+            self.tool_execution_context = previous
+            raise
+        self._apply_tool_context()
+
     def update_tool_policy(
         self,
         *,
@@ -462,6 +531,9 @@ class Session:
         allow_write_tools: bool,
         allow_execute_tools: bool,
         allow_web_tools: bool,
+        initial_tool_context: ToolExecutionContext | None = None,
+        saved_tool_policy: Mapping[str, Any] | None = None,
+        discovery_ceiling: Mapping[str, Any] | None = None,
     ) -> tuple[BoundHarnessModel, dict[str, Any]]:
         from agent_runtime.agent import _close_owned_sync_resource
         from agent_runtime.runtime.mcp import (
@@ -478,6 +550,35 @@ class Session:
         from agent_runtime.workspace import open_workspace
 
         workspace = open_workspace(agent._workspace_path(), create=True)
+        # Discovery can invoke permission providers before service assembly.
+        self.tool_execution_context = ToolExecutionContext(
+            workspace_root=workspace.root, cwd=workspace.root,
+            allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
+            allow_web_tools=allow_web_tools, permissions=agent.effective_permissions(),
+            permission_provider=agent.effective_permissions,
+        )
+        if initial_tool_context is not None:
+            if (initial_tool_context.workspace_root is not None
+                    and Path(initial_tool_context.workspace_root).resolve() != workspace.root):
+                raise ValueError("tool context belongs to a different workspace security domain")
+            current = self.tool_execution_context.effective_permissions
+            assert current is not None
+            supplied = initial_tool_context.effective_permissions
+            def current_permissions() -> ResolvedPermissions:
+                live = agent.effective_permissions()
+                supplied_live = initial_tool_context.effective_permissions
+                return live if supplied_live is None else live.intersection(supplied_live)
+
+            self.tool_execution_context = replace(
+                initial_tool_context, workspace_root=workspace.root,
+                permissions=current if supplied is None else current.intersection(supplied),
+                permission_provider=current_permissions,
+            )
+        elif saved_tool_policy is not None:
+            self.tool_execution_context = restore_tool_policy(
+                self.tool_execution_context, saved_tool_policy, restore_session_grants=True,
+            )
+        workspace.permission_provider = self._resource_permissions
         self.model_control_plane = agent._get_model_control_plane()
         self._stack.push_async_callback(
             _close_owned_sync_resource,
@@ -506,8 +607,13 @@ class Session:
         from agent_runtime.tools.web_http import PublicWebClient, PublicWebError
         from agent_runtime.tools.web_limits import WebLimits
 
-        web_client = (PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy)
-                      if agent.web_proxy_url is not None else PublicWebClient())
+        def authorize_web_url(url: str) -> None:
+            if self._resource_permissions().network_decision(url) == "deny":
+                raise PublicWebError("network_policy_denied", "destination denied by current permission policy")
+
+        web_client = (PublicWebClient(proxy_url=agent.web_proxy_url, no_proxy=agent.web_no_proxy,
+                                     authorize_url=authorize_web_url)
+                      if agent.web_proxy_url is not None else PublicWebClient(authorize_url=authorize_web_url))
         self._stack.push_async_callback(web_client.aclose)
 
         def save_web_source(content: bytes) -> str:
@@ -653,7 +759,15 @@ class Session:
             knowledge_runner = provider.search_knowledge
             knowledge_revision = "rag_" + hashlib.sha256(agent.knowledge.model_dump_json().encode()).hexdigest()[:16]
 
-        config_path = resolve_product_mcp_config(workspace.root) if agent.enable_workspace_mcp else None
+        startup_ceiling = None if discovery_ceiling is None else ResolvedPermissions.model_validate(discovery_ceiling)
+
+        def mcp_permissions() -> ResolvedPermissions:
+            current = self._resource_permissions()
+            return current if startup_ceiling is None else current.intersection(startup_ceiling)
+
+        policy = mcp_permissions()
+        mcp_allowed = policy.tool_decision("mcp__*") != "deny"
+        config_path = resolve_product_mcp_config(workspace.root) if agent.enable_workspace_mcp and mcp_allowed else None
         mcp_tools: tuple[Tool, ...] = ()
         mcp_trust_binding: Mapping[str, object] | None = None
         if config_path is not None:
@@ -662,7 +776,9 @@ class Session:
                 workspace_root=workspace.root,
                 trust_workspace=False,
             )
-            mcp_tools = await self._stack.enter_async_context(open_trusted_product_mcp_tools(config_path, trust=trust))
+            mcp_tools = await self._stack.enter_async_context(open_trusted_product_mcp_tools(
+                config_path, trust=trust, permissions=policy, permission_provider=mcp_permissions,
+            ))
             mcp_trust_binding = {
                 "config_path": str(trust.config_path),
                 "config_source": trust.source,
@@ -684,13 +800,7 @@ class Session:
         )
         return model, dict(
             tools=tools,
-            tool_execution_context=ToolExecutionContext(
-                workspace_root=workspace.root,
-                cwd=workspace.root,
-                allow_write_tools=allow_write_tools,
-                allow_execute_tools=allow_execute_tools,
-                allow_web_tools=allow_web_tools,
-            ),
+            tool_execution_context=self.tool_execution_context,
             knowledge_runner=knowledge_runner if callable(knowledge_runner) else None,
             knowledge_revision=knowledge_revision,
             knowledge_config=None if agent.knowledge is None else agent.knowledge.model_dump(mode="json"),
@@ -900,14 +1010,13 @@ class Session:
             policy_value = source_binding["tool_execution_policy"]
             if not isinstance(policy_value, Mapping):
                 raise RuntimeError("source Step has no tool execution policy")
-            policy = dict(policy_value)
-            policy.setdefault("allow_web_tools", False)
-            binding["tool_execution_policy"] = dict(policy)
-            policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
+            binding["tool_execution_policy"] = dict(policy_value)
             child_options = {
                 **self._service_options,
                 "model_binding": source_binding,
-                "tool_execution_context": replace(self.tool_execution_context, **policy),
+                "tool_execution_context": restore_tool_policy(
+                    self.tool_execution_context, policy_value, restore_session_grants=True,
+                ),
             }
             # Borrow providers through the source binding, independent of the parent's next selection.
             await self._prepare_step_binding(source_binding)

@@ -253,6 +253,7 @@ class ToolApprovalProfile(StrEnum):
 
     RESTRICTED_READ_ONLY_PROCESS = "restricted_read_only_process"
     PUBLIC_WEB_READ = "public_web_read"
+    MCP_ACTION = "mcp_action"
 
 
 @dataclass(frozen=True, slots=True)

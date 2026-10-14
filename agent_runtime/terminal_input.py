@@ -22,6 +22,7 @@ CHAT_COMMANDS = {
     "/new": "开始空上下文的新聊天",
     "/clear": "开始空上下文的新聊天（/new 别名）",
     "/model": "选择模型；也支持 current、list、switch <id>",
+    "/permissions": "查看有效权限；load <文件>、profile <名称>、reload 更新当前策略",
     "/verbose": "切换详细输出",
     "/copy": "复制最近回答的原始 Markdown",
     "/resume": "选择旧聊天；也可输入完整会话 ID",

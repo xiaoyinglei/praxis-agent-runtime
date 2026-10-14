@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
 
+from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.tool import (
     CancellationMode,
     JsonValue,
@@ -57,8 +58,45 @@ class ToolExecutionContext:
     require_confirmation_for: frozenset[str] = frozenset()
     denied_tool_names: frozenset[str] = frozenset()
     auto_approve_sandboxed: bool = False
+    permissions: ResolvedPermissions | None = None
+    permission_provider: Callable[[], ResolvedPermissions] | None = None
+    context_provider: Callable[[], ToolExecutionContext] | None = None
+
+    def refreshed(self) -> ToolExecutionContext:
+        if self.context_provider is None:
+            return self
+        live = self.context_provider()
+        effective = self.effective_permissions
+        current = live.effective_permissions
+        if effective is not None and current is not None:
+            effective = effective.intersection(current)
+        elif current is not None:
+            effective = current
+        return replace(
+            self,
+            permissions=effective,
+            permission_provider=live.permission_provider,
+            allow_write_tools=self.allow_write_tools and live.allow_write_tools,
+            allow_execute_tools=self.allow_execute_tools and live.allow_execute_tools,
+            allow_web_tools=self.allow_web_tools and live.allow_web_tools,
+            auto_approve_sandboxed=self.auto_approve_sandboxed and live.auto_approve_sandboxed,
+            deny_effects=self.deny_effects | live.deny_effects,
+            denied_tool_names=self.denied_tool_names | live.denied_tool_names,
+            require_confirmation_for=self.require_confirmation_for | live.require_confirmation_for,
+        )
+
+    @property
+    def effective_permissions(self) -> ResolvedPermissions | None:
+        current = None if self.permission_provider is None else self.permission_provider()
+        if current is None:
+            return self.permissions
+        return current if self.permissions is None else current.intersection(self.permissions)
 
     def __post_init__(self) -> None:
+        if self.permissions is not None and not isinstance(self.permissions, ResolvedPermissions):
+            raise TypeError("permissions must be ResolvedPermissions or None")
+        if self.permission_provider is not None and not callable(self.permission_provider):
+            raise TypeError("permission_provider must be callable")
         for name in (
             "allow_write_tools",
             "allow_execute_tools",
@@ -117,6 +155,60 @@ def can_use_tool(
 ) -> CanUseToolResult:
     """Return allow/ask/deny from resolved facts without performing approval."""
 
+    permissions = context.effective_permissions
+    if permissions is None:
+        return _default_tool_decision(tool, args, resolved, context)
+    name = tool.definition.name
+    rule = permissions.tool_decision(name)
+    if rule == "deny":
+        return CanUseToolResult(UseToolDecision.DENY, f"permission rule denies tool: {name}")
+    for target in resolved.targets:
+        if target.kind == "workspace_path":
+            write = ToolEffect.WRITE_WORKSPACE in resolved.effects
+            if not permissions.path_access(target.value, write=write):
+                return CanUseToolResult(UseToolDecision.DENY, permissions.path_reason(target.value, write=write))
+    if permissions.read_only and (resolved.effects & {
+        ToolEffect.WRITE_WORKSPACE, ToolEffect.DESTRUCTIVE,
+    } or tool.approval_profile is ToolApprovalProfile.MCP_ACTION):
+        return CanUseToolResult(UseToolDecision.DENY, "read-only permission profile forbids mutation")
+    network_decision = None
+    if ToolEffect.NETWORK in resolved.effects:
+        urls = [target.value for target in resolved.targets if target.kind == "public_web"]
+        outcomes = ([permissions.network_decision(url) for url in urls] if urls else
+                    [permissions.command_network_allowed()])
+        network_decision = "deny" if "deny" in outcomes else "ask" if "ask" in outcomes else "allow"
+        if network_decision == "deny":
+            return CanUseToolResult(UseToolDecision.DENY, "network destination denied by permission policy")
+    # A policy grant never bypasses explicit runtime denies or hard effect floors.
+    decision = _default_tool_decision(
+        tool, args, resolved, context, network_preapproved=network_decision == "allow",
+    )
+    if decision.decision is UseToolDecision.DENY:
+        return decision
+    if rule == "ask":
+        decision = CanUseToolResult(UseToolDecision.ASK, f"permission rule requires approval: {name}")
+    elif (rule == "allow" and ToolEffect.DESTRUCTIVE not in resolved.effects
+          and name not in context.require_confirmation_for
+          and tool.approval_profile is not ToolApprovalProfile.MCP_ACTION):
+        decision = CanUseToolResult(UseToolDecision.ALLOW, f"permission rule allows tool: {name}")
+    preapproved_web = (context.allow_web_tools and tool.approval_profile is ToolApprovalProfile.PUBLIC_WEB_READ
+                      and name in {"web_search", "web_fetch"})
+    if network_decision == "ask" and decision.decision is UseToolDecision.ALLOW and not preapproved_web:
+        decision = CanUseToolResult(UseToolDecision.ASK, "permission policy requires network approval", "network")
+    if permissions.effective_approval == "never" and decision.decision is UseToolDecision.ASK:
+        return CanUseToolResult(UseToolDecision.DENY, "approval is required but permission policy disables prompts")
+    return decision
+
+
+def _default_tool_decision(
+    tool: Tool,
+    args: Mapping[str, JsonValue],
+    resolved: ResolvedToolUse,
+    context: ToolExecutionContext,
+    *,
+    network_preapproved: bool = False,
+) -> CanUseToolResult:
+
     del args
     tool_name = tool.definition.name
     if tool_name in context.denied_tool_names:
@@ -131,7 +223,7 @@ def can_use_tool(
             UseToolDecision.DENY,
             f"effects denied by runtime policy: {names}",
         )
-    if tool_name in context.require_confirmation_for:
+    if tool_name in context.require_confirmation_for or tool.approval_profile is ToolApprovalProfile.MCP_ACTION:
         return CanUseToolResult(
             UseToolDecision.ASK,
             f"runtime policy requires confirmation for tool: {tool_name}",
@@ -181,9 +273,11 @@ def can_use_tool(
     separate_network_approval = (
         ToolEffect.NETWORK in resolved.effects
         and ToolEffect.EXECUTE_PROCESS in resolved.effects
+        and not network_preapproved
     )
     if (
         ToolEffect.NETWORK in resolved.effects
+        and not network_preapproved
         and not separate_network_approval
     ):
         approval_reasons.append("network access")
@@ -234,12 +328,14 @@ def enforce_hard_guards(
                 "workspace_root_unavailable",
                 "workspace target cannot be checked without a workspace root",
             )
-        _enforce_containment(
-            target.value,
-            root=Path(context.workspace_root),
-            code="workspace_escape",
-            label="workspace",
-        )
+        permissions = context.effective_permissions
+        if permissions is None:
+            _enforce_containment(target.value, root=Path(context.workspace_root),
+                                 code="workspace_escape", label="workspace")
+        elif not permissions.path_access(target.value, write=ToolEffect.WRITE_WORKSPACE in resolved.effects):
+            raise ToolGuardError("filesystem_denied", permissions.path_reason(
+                target.value, write=ToolEffect.WRITE_WORKSPACE in resolved.effects,
+            ))
 
     cwd_targets = [target for target in resolved.targets if target.kind == "cwd_path"]
     if ToolEffect.EXECUTE_PROCESS in resolved.effects and context.cwd is None:

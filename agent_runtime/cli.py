@@ -24,6 +24,7 @@ from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeError
+from agent_runtime.mcp_cli import mcp_app
 from agent_runtime.model_admin import (
     ModelAdminService,
     ModelDefinitionArguments,
@@ -55,6 +56,37 @@ agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
+agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
+
+
+@agent_app.command("permissions")
+def agent_permissions(
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="权限策略 JSON/TOML 文件")] = None,
+    workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
+    path: Annotated[Path | None, typer.Option("--path", help="解释路径访问权限")] = None,
+    write: Annotated[bool, typer.Option("--write", help="检查写入权限")] = False,
+    tool: Annotated[str | None, typer.Option("--tool", help="解释工具匹配规则")] = None,
+    url: Annotated[str | None, typer.Option("--url", help="解释网络目标规则")] = None,
+) -> None:
+    """查看有效权限、配置来源和规则决策；不调用模型或执行工具。"""
+    from agent_runtime.permission_policy import resolve_permission_sources
+
+    if sum(value is not None for value in (path, tool, url)) > 1:
+        raise typer.BadParameter("--path、--tool、--url 只能选择一个")
+    try:
+        effective = resolve_permission_sources(workspace, permissions)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error), param_hint="--permissions") from None
+    result = effective.explain()
+    if path is not None:
+        result.update(decision="allow" if effective.path_access(path, write=write) else "deny",
+                      reason=effective.path_reason(path, write=write))
+    elif tool is not None:
+        result.update(decision=effective.tool_decision(tool) or "default",
+                      reason="tool rule; actual effects and targets are checked at execution")
+    elif url is not None:
+        result.update(decision=effective.network_decision(url), reason="network destination rule")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 model_app.add_typer(model_trust_app, name="trust", help="管理冻结模型绑定的本地信任域。")
 logger = logging.getLogger(__name__)
 
@@ -142,6 +174,14 @@ def agent_history(
     except (OSError, ValueError, KeyError, sqlite3.Error):
         raise typer.BadParameter("历史数据库或指定记录不可读取；请检查路径和 ID。") from None
     typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+class _PermissionOptions(TypedDict, total=False):
+    permissions: Path
+
+
+def _permission_options(path: Path | None) -> _PermissionOptions:
+    return {} if path is None else {"permissions": path}
 
 
 class _WebOptions(TypedDict, total=False):
@@ -462,6 +502,7 @@ def _create_agent_facade(
     web_search_provider: str | None = None,
     web_proxy_url: str | None = None,
     web_limits_file: Path | None = None,
+    permissions: Path | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
@@ -478,6 +519,7 @@ def _create_agent_facade(
             web_search_provider=web_search_provider,
             web_proxy_url=web_proxy_url,
             web_limits=_load_web_limits(web_limits_file),
+            **_permission_options(permissions),
             _selection_requester=_selection_requester,
         )
     except ValueError as error:
@@ -836,6 +878,40 @@ async def _chat_facade_loop(
                 return
             if query == "/help":
                 _print_chat_help()
+                continue
+            if query == "/permissions" or query.startswith("/permissions "):
+                from agent_runtime.permission_policy import PermissionPolicy
+
+                parts = query.split(maxsplit=2)
+                try:
+                    if len(parts) == 3 and parts[1] == "load":
+                        policy_path = Path(parts[2]).expanduser()
+                        if session is not None:
+                            session.update_permissions(policy_path)
+                        else:
+                            old = facade.permissions
+                            facade.permissions = policy_path
+                            try:
+                                facade.effective_permissions()
+                            except BaseException:
+                                facade.permissions = old
+                                raise
+                        facade.permissions = policy_path
+                    elif len(parts) == 3 and parts[1] == "profile":
+                        policy = PermissionPolicy.model_validate({"profile": parts[2]})
+                        if session is not None:
+                            session.update_permissions(policy)
+                        facade.permissions = policy
+                    elif len(parts) == 2 and parts[1] == "reload":
+                        if session is not None:
+                            session.reload_permissions()
+                    elif query != "/permissions":
+                        print("用法: /permissions [load <文件> | profile <workspace|read-only|trusted-local> | reload]")
+                        continue
+                    effective = session.permissions() if session is not None else facade.effective_permissions()
+                    print(json.dumps(effective.explain(), ensure_ascii=False, indent=2))
+                except (OSError, ValueError) as error:
+                    print("权限配置失败: " + safe_terminal_text(str(error)))
                 continue
             if query == "/status":
                 print(f"会话: {selected_chat.thread_id if selected_chat else getattr(session, 'thread_id', '(new)')}")
@@ -1631,6 +1707,7 @@ def agent_chat(
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
                                  help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
     if sum((previous_turn_id is not None, last or continue_chat, resume_thread_id is not None)) > 1:
@@ -1677,6 +1754,7 @@ def agent_chat(
         workspace_path=facade_workspace,
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
         knowledge=facade_knowledge,
+        **_permission_options(permissions),
         _selection_requester="user",
         **web_options,
     )
@@ -1796,6 +1874,7 @@ def agent_run(
             help="隔离运行：不发现或启动工作区中的 MCP 服务。",
         ),
     ] = False,
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
     if previous_turn_id is not None and last:
@@ -1822,6 +1901,7 @@ def agent_run(
         workspace_path=Path.cwd(),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
+        **_permission_options(permissions),
         enable_workspace_mcp=not disable_workspace_mcp,
         web_search_key_file=web_search_key_file,
         web_search_provider=web_search_provider,
@@ -1892,11 +1972,13 @@ def agent_resume(
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
                                  help="bing | brave | tavily"),
     ] = None,
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
 ) -> None:
     """重新打开旧聊天：只读回放历史，下一条消息创建新 Turn。原任务恢复使用 recover。"""
     agent_chat(resume_thread_id=thread_id or "", checkpoint_db=checkpoint_db,
                web_proxy_url=web_proxy_url, web_limits_file=web_limits_file,
-               web_search_key_file=web_search_key_file, web_search_provider=web_search_provider)
+               web_search_key_file=web_search_key_file, web_search_provider=web_search_provider,
+               **_permission_options(permissions))
 
 
 @agent_app.command(name="recover")
@@ -1945,6 +2027,7 @@ def agent_recover(
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
                                  help="bing | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
     if turn_id is not None and last:
@@ -1992,6 +2075,7 @@ def agent_recover(
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
+        **_permission_options(permissions),
         **web_options,
     )
     event_display = _CLIToolEventDisplay()

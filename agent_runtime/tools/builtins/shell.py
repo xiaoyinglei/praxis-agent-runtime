@@ -18,6 +18,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -49,6 +50,7 @@ _SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec"
 _BWRAP_PATH = "/usr/bin/bwrap"
 _SANDBOX_PLATFORM = sys.platform
 _PROTECTED_VERIFICATION_DIRECTORIES = frozenset({".venv", "node_modules"})
+_PROTECTED_PERMISSION_DIRECTORIES = frozenset({".git", ".agents", ".codex", ".aws"})
 
 
 class RunCommandInput(BaseModel):
@@ -87,8 +89,8 @@ class RunCommandInput(BaseModel):
         description=(
             "Request write access to the workspace. The workspace is read-only "
             "by default; enabling writes is destructive and requires explicit "
-            "approval. .git paths always remain read-only, and .git symlink "
-            "aliases are refused."
+            "approval. .git, .agents, .codex, and .aws paths remain read-only; "
+            "aliases that bypass these restrictions are refused."
         ),
     )
 
@@ -136,7 +138,7 @@ class ManagedPythonInput(BaseModel):
         default_factory=list,
         max_length=20,
         description=(
-            "Workspace-relative files the code intends to create or replace. "
+            "Workspace-relative or explicitly authorized absolute files to create or replace. "
             "Required when workspace_write=true so the runtime can attest the "
             "generated artifacts."
         ),
@@ -262,7 +264,7 @@ def create_run_command_tool(
                 "workspace-relative directory. The workspace is read-only by default "
                 "and a private temporary directory is writable. Set "
                 "workspace_write=true to request destructive workspace write access; "
-                ".git, .venv, and node_modules remain read-only. Host environment "
+                ".git, .agents, .codex, .aws, .venv, and node_modules remain read-only. Host environment "
                 "variables and network access are disabled. Set network=true to "
                 "request a separate network approval. Timeout or cancellation "
                 "terminates and reaps the complete process group. Commands fail "
@@ -290,7 +292,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v7-linux-read-only",
+        execution_revision="builtin-run-command-v8-permission-policy",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -353,7 +355,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v3-observed-assertions",
+        execution_revision="builtin-execute-python-v4-permission-policy",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -378,7 +380,10 @@ async def _run_command(
         raise NotADirectoryError(f"workspace working directory not found: {request.working_dir}")
 
     started_at = time.monotonic()
-    sandbox_issue = _sandbox_availability_issue(request)
+    permissions = workspace.permissions
+    sandbox_issue = (
+        _permission_sandbox_issue(permissions, network=request.network) or _sandbox_availability_issue(request)
+    )
     if sandbox_issue is not None:
         return RunCommandOutput(
             stdout="",
@@ -414,12 +419,18 @@ async def _run_command(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
         )
-        sandbox_argv = _sandbox_argv(
-            workspace_root=workspace.root,
-            temporary_root=temporary_root,
-            allow_network=request.network,
-            allow_workspace_write=request.workspace_write,
-        )
+        try:
+            sandbox_argv = _sandbox_argv(
+                workspace_root=workspace.root,
+                temporary_root=temporary_root,
+                allow_network=request.network,
+                allow_workspace_write=request.workspace_write,
+                permissions=permissions,
+            )
+        except ValueError as error:
+            return RunCommandOutput(stdout="", stderr=str(error), exit_code=-1, timed_out=False,
+                                    truncated=False, duration_ms=(time.monotonic() - started_at) * 1000,
+                                    sandbox_error="sandbox_policy_unsupported")
         process = await asyncio.create_subprocess_exec(
             *sandbox_argv,
             "/bin/sh",
@@ -516,7 +527,10 @@ async def _execute_managed_python(
         raise NotADirectoryError(f"workspace working directory not found: {request.working_dir}")
 
     started_at = time.monotonic()
-    sandbox_issue = _sandbox_availability_issue(request)
+    permissions = workspace.permissions
+    sandbox_issue = (
+        _permission_sandbox_issue(permissions, network=request.network) or _sandbox_availability_issue(request)
+    )
     if sandbox_issue is not None:
         return _python_sandbox_error(
             started_at=started_at,
@@ -550,13 +564,17 @@ async def _execute_managed_python(
             temporary_root=temporary_root,
         )
         environment["PYTHONNOUSERSITE"] = "1"
-        sandbox_argv = _sandbox_argv(
-            workspace_root=workspace.root,
-            temporary_root=temporary_root,
-            allow_network=request.network,
-            allow_workspace_write=request.workspace_write,
-            additional_read_roots=_runtime_python_read_roots(),
-        )
+        try:
+            sandbox_argv = _sandbox_argv(
+                workspace_root=workspace.root,
+                temporary_root=temporary_root,
+                allow_network=request.network,
+                allow_workspace_write=request.workspace_write,
+                additional_read_roots=_runtime_python_read_roots(),
+                permissions=permissions,
+            )
+        except ValueError as error:
+            return _python_sandbox_error(started_at=started_at, message=str(error), code="sandbox_policy_unsupported")
         process = await asyncio.create_subprocess_exec(
             *sandbox_argv,
             sys.executable,
@@ -750,6 +768,106 @@ def _sandbox_availability_issue(
     return None
 
 
+def _permission_sandbox_issue(
+    permissions: ResolvedPermissions | None, *, network: bool,
+) -> tuple[str, str] | None:
+    if permissions is not None and network and permissions.command_network_allowed() == "deny":
+        return (
+            "sandbox_network_denied",
+            "Permission policy denies command network access; domain filters require an enforcing proxy. "
+            "No command was executed.",
+        )
+    return None
+
+
+def _seatbelt_permission_rules(
+    permissions: ResolvedPermissions | None, *, temporary_root: os.PathLike[str] | str, allow_write: bool,
+) -> tuple[str, str]:
+    """Render disjoint subtree regions so a parent deny cannot shadow child grants."""
+    if permissions is None:
+        return "", ""
+    rules = permissions.sandbox_filesystem
+    broad_root_read = any(rule.path == "/" and rule.access != "deny" for rule in rules)
+    if broad_root_read and allow_write:
+        raise ValueError(
+            "A broad host-root read grant cannot safely combine with subprocess writes: "
+            "Seatbelt resolves host symlink aliases. Use path tools or scoped filesystem grants for edits."
+        )
+    _validate_permission_aliases(permissions, allow_write=allow_write)
+    temporary = _escape_seatbelt_string(os.path.realpath(temporary_root))
+    reads = []
+    policies = []
+    for rule in rules:
+        path = Path(rule.path)
+        if path.resolve() != path:
+            raise ValueError("Seatbelt cannot represent a symlink policy boundary")
+        escaped = _escape_seatbelt_string(rule.path)
+        children = [child for child in rules if child.path != rule.path and Path(child.path).is_relative_to(path)]
+        exclusions = "".join(
+            f'    (require-not (subpath "{_escape_seatbelt_string(child.path)}"))\n' for child in children
+        )
+        region = f'(require-all (subpath "{escaped}")\n{exclusions}'
+        region += f'    (require-not (subpath "{temporary}")))'
+        if rule.access != "deny":
+            reads.append(f"  {region}\n")
+            if path != Path("/"):
+                policies.append(f'(allow file-read-metadata file-test-existence (path-ancestors "{escaped}"))\n')
+        elif path != Path("/"):
+            policies.append(f"(deny file-read* {region})\n")
+        if allow_write and rule.access == "write":
+            policies.append(f"(allow file-write* {region})\n")
+        elif path != Path("/"):
+            policies.append(f"(deny file-write* {region})\n")
+    # Renaming an ancestor would replace a protected configuration namespace
+    # without writing its file. Protect directory identity, not sibling content.
+    ancestors = {parent for source in permissions.sources if Path(source).is_absolute()
+                 for parent in Path(source).parents if parent != Path("/")}
+    for parent in sorted(ancestors):
+        escaped = _escape_seatbelt_string(str(parent))
+        policies.append(f'(deny file-write-unlink (literal "{escaped}"))\n')
+    return "".join(reads), "".join(policies)
+
+
+def _validate_permission_aliases(permissions: ResolvedPermissions, *, allow_write: bool) -> None:
+    """Refuse symlink and hardlink aliases that erase a lexical restriction."""
+    rules = permissions.sandbox_filesystem
+    broad_root_read = any(rule.path == "/" and rule.access != "deny" for rule in rules)
+    for rule in rules:
+        path = Path(rule.path)
+        if rule.access != "deny" and path.is_file() and path.stat().st_nlink > 1:
+            raise ValueError(f"sandbox cannot safely expose a hardlinked file grant: {path}")
+    roots = {
+        Path(rule.path) for rule in rules if Path(rule.path) != Path("/") and (
+            (rule.access == "deny" if broad_root_read else rule.access != "deny") or (not broad_root_read and any(
+                parent.access != "deny" and Path(rule.path).is_relative_to(parent.path) for parent in rules
+            ))
+        )
+    }
+    roots = {root for root in roots if root.is_dir() and not root.is_symlink()}
+    roots = {root for root in roots if not any(root != parent and root.is_relative_to(parent) for parent in roots)}
+    for root in roots:
+        if root != Path(permissions.workspace):
+            issue = _workspace_sandbox_preflight_issue(root, allow_workspace_write=allow_write)
+            if issue is not None:
+                raise ValueError(f"external sandbox permission grant rejected: {issue[1]}")
+
+        def scan_error(error: OSError) -> None:
+            raise ValueError(f"cannot validate sandbox permission aliases: {error.filename}") from error
+
+        for directory, directories, files in os.walk(root, followlinks=False, onerror=scan_error):
+            for name in (*directories, *files):
+                alias = Path(directory) / name
+                if not alias.is_symlink():
+                    continue
+                try:
+                    target = alias.resolve()
+                except (OSError, RuntimeError) as error:
+                    raise ValueError("cannot resolve a sandbox permission alias") from error
+                for write in (False, True) if allow_write else (False,):
+                    if not permissions.path_access(alias, write=write) and permissions.path_access(target, write=write):
+                        raise ValueError(f"sandbox cannot enforce lexical permission restriction on symlink: {alias}")
+
+
 def _sandbox_argv(
     *,
     workspace_root: os.PathLike[str] | str,
@@ -757,12 +875,14 @@ def _sandbox_argv(
     allow_network: bool,
     allow_workspace_write: bool = False,
     additional_read_roots: Sequence[os.PathLike[str] | str] = (),
+    permissions: ResolvedPermissions | None = None,
 ) -> list[str]:
     if _SANDBOX_PLATFORM == "linux":
         return _linux_sandbox_argv(
             workspace_root=workspace_root,
             temporary_root=temporary_root,
             additional_read_roots=additional_read_roots,
+            permissions=permissions,
         )
     return [
         _SANDBOX_EXEC_PATH,
@@ -773,6 +893,7 @@ def _sandbox_argv(
             allow_network=allow_network,
             allow_workspace_write=allow_workspace_write,
             additional_read_roots=additional_read_roots,
+            permissions=permissions,
         ),
     ]
 
@@ -782,12 +903,16 @@ def _linux_sandbox_argv(
     workspace_root: os.PathLike[str] | str,
     temporary_root: os.PathLike[str] | str,
     additional_read_roots: Sequence[os.PathLike[str] | str],
+    permissions: ResolvedPermissions | None = None,
 ) -> list[str]:
     """Expose only the runtime, a read-only workspace and private scratch.
 
     Do not bind the host root or home directory. Network namespaces also
     isolate abstract Unix sockets; pathname sockets in the workspace are
     rejected by preflight because read-only mounts do not block connect().
+    Explicit external grants are read-only; denies inside exposed roots and
+    broad host-root grants fail closed because their exact semantics cannot
+    be represented by these bind mounts.
     """
     workspace = os.path.realpath(workspace_root)
     temporary = os.path.realpath(temporary_root)
@@ -828,6 +953,33 @@ def _linux_sandbox_argv(
             temporary,
         )
     )
+    if permissions is not None:
+        _validate_permission_aliases(permissions, allow_write=False)
+        permission_rules = permissions.sandbox_filesystem
+        for rule in permission_rules:
+            path = Path(rule.path)
+            if path == Path("/"):
+                if rule.access != "deny":
+                    raise ValueError("Linux cannot represent a host root read grant")
+                continue
+            if path.resolve() != path:
+                raise ValueError("Linux cannot represent a symlink policy boundary")
+            if not path.exists() or path.is_relative_to(temporary):
+                continue
+            if rule.access == "deny":
+                # A fresh namespace has nothing at unexposed outside paths.
+                exposed = path.is_relative_to(workspace) or any(path.is_relative_to(root) for root in roots)
+                exposed = exposed or any(
+                    parent.access != "deny" and path.is_relative_to(parent.path)
+                    for parent in permission_rules
+                )
+                exposed = exposed or any(path.is_relative_to(root) for root in ("/usr", "/bin", "/sbin", "/lib"))
+                if exposed:
+                    raise ValueError("Linux cannot enforce a filesystem deny inside an exposed subtree")
+            else:
+                argv.extend(("--ro-bind", str(path), str(path)))
+        # Restored child grants must not restore a writable temporary root's parent.
+        argv.extend(("--bind", temporary, temporary))
     return argv
 
 
@@ -838,6 +990,7 @@ def _build_command_sandbox_profile(
     allow_network: bool,
     allow_workspace_write: bool = False,
     additional_read_roots: Sequence[os.PathLike[str] | str] = (),
+    permissions: ResolvedPermissions | None = None,
 ) -> str:
     workspace = _escape_seatbelt_string(str(os.path.realpath(workspace_root)))
     temporary = _escape_seatbelt_string(str(os.path.realpath(temporary_root)))
@@ -848,7 +1001,11 @@ def _build_command_sandbox_profile(
     trusted_toolchains = tuple(_escape_seatbelt_string(str(path)) for path in sorted(trusted_roots, key=str))
     trusted_toolchain_reads = "".join(f'  (subpath "{path}")\n' for path in trusted_toolchains)
     trusted_toolchain_ancestors = "".join(f'  (path-ancestors "{path}")\n' for path in trusted_toolchains)
-    workspace_write_policy = f'  (subpath "{workspace}")\n' if allow_workspace_write else ""
+    policy_reads, policy_rules = _seatbelt_permission_rules(
+        permissions, temporary_root=temporary_root, allow_write=allow_workspace_write,
+    )
+    workspace_reads = f'  (subpath "{workspace}")\n' if permissions is None else policy_reads
+    workspace_write_policy = f'  (subpath "{workspace}")\n' if allow_workspace_write and permissions is None else ""
     network_policy = (
         # DNS is the only approved AF_UNIX endpoint; local service and Docker
         # sockets remain denied even when IP networking is approved.
@@ -887,7 +1044,7 @@ def _build_command_sandbox_profile(
         "(allow mach-lookup\n"
         '  (global-name "com.apple.system.opendirectoryd.libinfo"))\n'
         "(allow file-read* file-test-existence\n"
-        f'  (subpath "{workspace}")\n'
+        f"{workspace_reads}"
         f'  (subpath "{temporary}")\n'
         f"{trusted_toolchain_reads}"
         '  (literal "/")\n'
@@ -930,6 +1087,7 @@ def _build_command_sandbox_profile(
         f"{workspace_write_policy}"
         f'  (subpath "{temporary}")\n'
         '  (literal "/dev/null"))\n'
+        f"{policy_rules}"
         "(deny file-write*\n"
         "  (require-all\n"
         f'    (subpath "{workspace}")\n'
@@ -944,6 +1102,10 @@ def _build_command_sandbox_profile(
         f'    (subpath "{workspace}")\n'
         '    (regex #"/[nN][oO][dD][eE]_[mM][oO][dD][uU][lL][eE][sS]'
         '($|/)")))\n'
+        '(deny file-write* (require-all\n'
+        f'  (require-not (subpath "{temporary}"))\n'
+        '  (regex #"/[.]([gG][iI][tT]|[aA][gG][eE][nN][tT][sS]|'
+        '[cC][oO][dD][eE][xX]|[aA][wW][sS])($|/)")))\n'
         f"{network_policy}\n"
     )
 
@@ -1036,7 +1198,9 @@ def _workspace_sandbox_preflight_issue(
                         "workspace_scan_failed",
                         f"workspace containment scan failed at {relative}",
                     )
-                entry_is_git_metadata = directory_is_git_metadata or entry.name.casefold() == ".git"
+                entry_is_git_metadata = (
+                    directory_is_git_metadata or entry.name.casefold() in _PROTECTED_PERMISSION_DIRECTORIES
+                )
                 entry_is_verification_toolchain = bool(
                     directory_is_verification_toolchain or entry.name.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
                 )
@@ -1319,7 +1483,7 @@ def _resolve_managed_python_use(
         for raw_path in output_paths:
             if not isinstance(raw_path, str):
                 raise ValueError("output path must be a string")
-            target = workspace.ensure_within_workspace(workspace.resolve_path(raw_path))
+            target = workspace.ensure_writable(workspace.resolve_path(raw_path))
             output_targets.append(ToolTarget(kind="workspace_path", value=str(target)))
     else:
         output_targets.append(ToolTarget(kind="workspace_path", value=str(workspace.root)))

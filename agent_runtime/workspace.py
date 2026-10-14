@@ -7,8 +7,13 @@ import os
 import shutil
 import stat
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agent_runtime.permission_policy import ResolvedPermissions
 
 _SNAPSHOT_IGNORED_DIRECTORIES = frozenset(
     {
@@ -45,6 +50,38 @@ class WorkspaceRuntime:
 
     root: Path
     is_temporary: bool
+    permission_provider: Callable[[], ResolvedPermissions] | None = None
+
+    @property
+    def permissions(self) -> ResolvedPermissions | None:
+        return None if self.permission_provider is None else self.permission_provider()
+
+    def ensure_readable(self, path: Path) -> Path:
+        return self._ensure_access(path, write=False)
+
+    def ensure_writable(self, path: Path) -> Path:
+        return self._ensure_access(path, write=True)
+
+    def _ensure_access(self, path: Path, *, write: bool) -> Path:
+        permissions = self.permissions
+        if permissions is None:
+            return self.ensure_within_workspace(path)
+        if not permissions.path_access(path, write=write):
+            raise WorkspacePathError(permissions.path_reason(path, write=write))
+        return path.resolve()
+
+    def is_readable(self, path: Path) -> bool:
+        try:
+            self.ensure_readable(path)
+        except (WorkspacePathError, OSError):
+            return False
+        return True
+
+    def path_label(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.root.resolve()).as_posix()
+        except ValueError:
+            return str(path)
 
     @property
     def runtime_root(self) -> Path:
@@ -92,8 +129,9 @@ class WorkspaceRuntime:
 
     def resolve_path(self, relative: str | Path) -> Path:
         """Resolve a relative path against the workspace root (returns absolute)."""
-        resolved = (self.root / relative).resolve()
-        return resolved
+        # Keep the lexical spelling until authorization checks both it and the
+        # resolved target; resolving a symlink here would erase a denied alias.
+        return Path(os.path.abspath(self.root / Path(relative).expanduser()))
 
     def ensure_within_workspace(self, path: Path) -> Path:
         """Ensure a path is within the workspace root; raise if it escapes."""

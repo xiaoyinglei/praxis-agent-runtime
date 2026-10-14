@@ -21,6 +21,9 @@ def isolate_user_model_registry(
 ) -> None:
     """Keep every Agent test independent of the developer's real registry."""
 
+    # Product MCP and permissions must not use real developer connections or
+    # credentials, including in CLI subprocesses that inherit the test environment.
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "isolated-user-config"))
     monkeypatch.setenv(
         "PRAXIS_MODEL_REGISTRY_PATH",
         str(

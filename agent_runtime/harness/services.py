@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
@@ -15,6 +16,7 @@ from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_conte
 from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchInput,
     create_knowledge_tools,
@@ -28,7 +30,7 @@ from agent_runtime.tools.integrations.subagent import (
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import build_tool_registry
 from agent_runtime.tools.selection import create_find_tools_tool, find_tools
-from agent_runtime.tools.tool import JsonValue, Tool
+from agent_runtime.tools.tool import JsonValue, Tool, ToolEffect
 from agent_runtime.workspace import open_workspace
 
 
@@ -50,7 +52,7 @@ class HarnessSkillRuntime(Protocol):
 def _tool_execution_policy_snapshot(
     context: ToolExecutionContext,
 ) -> dict[str, object]:
-    return {
+    snapshot: dict[str, object] = {
         "allow_write_tools": context.allow_write_tools,
         "allow_execute_tools": context.allow_execute_tools,
         "allow_web_tools": context.allow_web_tools,
@@ -61,6 +63,36 @@ def _tool_execution_policy_snapshot(
         "denied_tool_names": sorted(context.denied_tool_names),
         "auto_approve_sandboxed": context.auto_approve_sandboxed,
     }
+    if context.effective_permissions is not None:
+        snapshot["permissions"] = context.effective_permissions.model_dump(mode="json")
+    return snapshot
+
+
+def restore_tool_policy(
+    context: ToolExecutionContext, saved: Mapping[str, Any], *, restore_session_grants: bool = False,
+) -> ToolExecutionContext:
+    """Restore historical grants subject to current resource and runtime limits."""
+    policy = dict(saved)
+    policy.setdefault("allow_web_tools", False)
+    if "deny_effects" in policy:
+        policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
+    snapshot = policy.pop("permissions", None)
+    current = context.effective_permissions
+    historical = None if snapshot is None else ResolvedPermissions.model_validate(snapshot)
+    if current is not None and historical is not None:
+        policy["permissions"] = current.intersection(historical)
+    elif current is not None:
+        policy["permissions"] = current
+    elif historical is not None:
+        policy["permissions"] = historical
+    # Revoked effect/tool grants take precedence over a recorded Step.
+    for key in ("deny_effects", "denied_tool_names", "require_confirmation_for"):
+        policy[key] = frozenset(policy.get(key, ())) | getattr(context, key)
+    if not restore_session_grants:
+        for key in ("allow_write_tools", "allow_execute_tools", "allow_web_tools", "auto_approve_sandboxed"):
+            if key in policy:
+                policy[key] = policy[key] and getattr(context, key)
+    return replace(context, **policy)
 
 
 class SessionBindingProvider:
@@ -340,6 +372,10 @@ def configure_services(
     )
     resolved_completion_gate = completion_gate or DeliveryCompletionGate(store)
 
+    execution_context = replace(
+        execution_context,
+        context_provider=execution_context.context_provider or (lambda: session.tool_execution_context),
+    )
     session.tool_orchestrator = ToolOrchestrator(
         store=store,
         tools=tool_snapshot,

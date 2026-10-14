@@ -161,14 +161,39 @@ async def test_close_waits_for_active_turn_and_rejects_competing_submit(tmp_path
 
 @pytest.mark.anyio
 async def test_mcp_process_lives_across_submissions_and_exits_on_close(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    import anyio
+
+    from agent_runtime.runtime import mcp as mcp_runtime
     from agent_runtime.runtime.mcp import decide_mcp_config_trust
     from tests.agent.test_mcp_e2e import _MCP_SERVER_SCRIPT
 
-    pid_log = tmp_path / "server-pids.txt"
+    pid_logs = []
+    processes = []
+    original_stdio = mcp_runtime.stdio_client
+    original_open_process = anyio.open_process
+
+    async def capture_host_process(*args, **kwargs):
+        process = await original_open_process(*args, **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(anyio, "open_process", capture_host_process)
+
+    @asynccontextmanager
+    async def capture_pid_log(params):
+        assert params.env is not None
+        pid_logs.append(Path(params.env["TMPDIR"]) / "server-pids.txt")
+        async with original_stdio(params) as streams:
+            yield streams
+
+    monkeypatch.setattr(mcp_runtime, "stdio_client", capture_pid_log)
     script = tmp_path / "server.py"
     script.write_text(
         "import os\nfrom pathlib import Path\n"
-        f"with Path({str(pid_log)!r}).open('a') as log: log.write(str(os.getpid()) + '\\n')\n" + _MCP_SERVER_SCRIPT,
+        "with (Path(os.environ['TMPDIR']) / 'server-pids.txt').open('a') as log: "
+        "log.write(str(os.getpid()) + '\\n')\n" + _MCP_SERVER_SCRIPT,
     )
     config = tmp_path / "configs" / "mcp_servers.yaml"
     config.parent.mkdir()
@@ -191,10 +216,18 @@ async def test_mcp_process_lives_across_submissions_and_exits_on_close(tmp_path,
         assert "version: 1.0.0" in str(first_reply)
         assert "status: 1.0.0" in str(second_reply)
         assert session.tools[tool.definition.name] is tool
+        assert len(pid_logs) == 1
+        [pid_log] = pid_logs
+        assert pid_log.is_relative_to(tmp_path / ".praxis/runtime/scratch")
         pids = pid_log.read_text().splitlines()
         assert len(pids) == 1
-        pid = int(pids[0])
+        # Linux MCP runs in a PID namespace. Its logged PID is local to that
+        # namespace; the SDK process carries the actual host lifecycle identity.
+        [process] = processes
+        pid = process.pid
+        assert process.returncode is None
         os.kill(pid, 0)
+    assert process.returncode is not None
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 

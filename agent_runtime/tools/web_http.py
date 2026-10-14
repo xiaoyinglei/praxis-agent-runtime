@@ -335,6 +335,11 @@ class _PublicTransport(httpx.AsyncBaseTransport):
         await self._pool.aclose()
 
 
+def public_http_transport() -> httpx.AsyncBaseTransport:
+    """Public-only, DNS-pinned transport for host-owned HTTP integrations."""
+    return _PublicTransport()
+
+
 def public_origin_referer(value: str, target: httpx.URL) -> str | None:
     """Preserve only a public source origin; never disclose URL paths or downgrade HTTPS."""
     source = validate_public_url(value)
@@ -362,6 +367,7 @@ class PublicWebClient:
         max_redirects: int = 5,
         proxy_url: str | None = None,
         no_proxy: str = "",
+        authorize_url: Callable[[str], None] | None = None,
     ) -> None:
         if max_bytes < 1 or timeout_seconds <= 0 or max_redirects < 0:
             raise ValueError("HTTP limits must be positive and redirect limits nonnegative.")
@@ -370,6 +376,7 @@ class PublicWebClient:
         self._max_redirects = max_redirects
         self._proxy_url = None if proxy_url is None else validate_proxy_url(proxy_url)
         self._no_proxy = no_proxy
+        self._authorize_url = authorize_url
         self._transport = transport if transport is not None else _PublicTransport()
         self._proxy_transport = (
             _PublicTransport(self._proxy_url) if self._proxy_url is not None and transport is None else transport
@@ -444,6 +451,8 @@ class PublicWebClient:
     ) -> FetchedResponse:
         wire_bytes = 0
         for redirects in range(self._max_redirects + 1):
+            if self._authorize_url is not None:
+                self._authorize_url(str(target))
             if request_budget is not None:
                 request_budget()
             # Own redirects and raw decoding rather than using HTTPX's client,

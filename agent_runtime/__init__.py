@@ -7,6 +7,7 @@ from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.session import Session
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import ModelNotAvailableError, ModelSpec
+from agent_runtime.permission_policy import NetworkPolicy, NetworkRule, PathRule, PermissionPolicy, ToolRule
 from agent_runtime.planning import AgentPlan, PlanEvent, PlanStep
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.streaming.events import (
@@ -41,6 +42,10 @@ __all__ = [
     "ModelNotAvailableError",
     "ModelSpec",
     "MemoryConfig",
+    "NetworkPolicy",
+    "NetworkRule",
+    "PathRule",
+    "PermissionPolicy",
     "PlanEvent",
     "PlanStep",
     "RAGKnowledgeConfig",
@@ -48,4 +53,5 @@ __all__ = [
     "StreamEvent",
     "Session",
     "TurnItemKind",
+    "ToolRule",
 ]
