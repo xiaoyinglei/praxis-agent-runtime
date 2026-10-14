@@ -47,8 +47,9 @@ def coding_instructions(workspace: Path) -> tuple[str, ...]:
     return (
         GENERIC_SYSTEM_PROMPT,
         f"Current workspace root and default tool working directory: {root}. "
-        "Use paths relative to this root. Omit working_dir or use '.' for the default directory. "
-        "Tool working_dir and declared output_paths must resolve inside this workspace.",
+        "Relative file paths resolve against this root; absolute paths require resource-policy authorization. "
+        "Omit working_dir or use '.' for the default directory. Tool working_dir stays inside this workspace. "
+        "Declared output_paths require write permission. Runtime permission decisions are authoritative.",
     )
 
 

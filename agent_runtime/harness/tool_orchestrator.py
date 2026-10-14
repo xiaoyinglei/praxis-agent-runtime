@@ -225,11 +225,10 @@ class ToolOrchestrator:
         revisions = {item["name"]: item["revision"] for item in snapshot["tools"]}
         if call.tool_name in revisions:
             self.restore_tools({call.tool_name: revisions[call.tool_name]})
-        policy = dict(snapshot["binding_manifest"].get("tool_execution_policy", {}))
-        policy.setdefault("allow_web_tools", False)
-        if "deny_effects" in policy:
-            policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
-        return self._context_for_turn(turn_id, base=replace(self._execution_context, **policy))
+        from agent_runtime.harness.services import restore_tool_policy
+
+        policy = snapshot["binding_manifest"].get("tool_execution_policy", {})
+        return self._context_for_turn(turn_id, base=restore_tool_policy(self._execution_context, policy))
 
     def restore_tools(self, revisions: Mapping[str, str]) -> tuple[Tool, ...]:
         restored = []
@@ -1158,6 +1157,8 @@ def _policy_revision(context: ToolExecutionContext, tool: Tool, execution: ToolE
     effects = frozenset(execution.trace.effects)
     targets = execution.trace.targets
     payload = {
+        "permissions_revision": (None if context.effective_permissions is None
+                                 else context.effective_permissions.revision),
         "workspace_root": (None if context.workspace_root is None else str(context.workspace_root)),
         "cwd": None if context.cwd is None else str(context.cwd),
         "allow_write_tools": context.allow_write_tools if ToolEffect.WRITE_WORKSPACE in effects else None,

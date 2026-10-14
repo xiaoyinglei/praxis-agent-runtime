@@ -181,6 +181,8 @@ class _PreparedExecution:
     workspace_root: Path | None
     workspace_tree_before_sha256: str | None
     workspace_file_before_sha256: tuple[tuple[str, str], ...]
+    permissions_revision: str | None
+    context: ToolExecutionContext
 
 
 class _CancelledTimeoutError(Exception):
@@ -352,6 +354,7 @@ class ToolExecutor:
         preflight_sink: PreflightSink | None,
         started_at: float,
     ) -> _PreparedExecution | ToolExecution:
+        context = context.refreshed()
         if call.tool_call_id.endswith(_NETWORK_APPROVAL_SUFFIX):
             return await self._finish(
                 call=call,
@@ -582,7 +585,18 @@ class ToolExecutor:
             ToolEffect.NETWORK in resolved.effects
             and ToolEffect.EXECUTE_PROCESS in resolved.effects
             and not (decision.decision is UseToolDecision.ASK and decision.approval_scope == "network")
+            and not (context.effective_permissions is not None
+                     and context.effective_permissions.command_network_allowed() == "allow")
         ):
+            if (context.effective_permissions is not None
+                    and context.effective_permissions.effective_approval == "never"):
+                return await self._finish(
+                    call=call,
+                    result=_error_result(call, code="tool_denied", retryable=False,
+                                         message="network approval required but prompts are disabled"),
+                    record=None, started_at=started_at, resolved=resolved, boundary=boundary,
+                    decision=UseToolDecision.DENY,
+                )
             network_decision = CanUseToolResult(
                 UseToolDecision.ASK,
                 "approval required for network access",
@@ -639,6 +653,10 @@ class ToolExecutor:
             workspace_root=workspace_root,
             workspace_tree_before_sha256=workspace_tree_before_sha256,
             workspace_file_before_sha256=workspace_file_before_sha256,
+            permissions_revision=(
+                None if context.effective_permissions is None else context.effective_permissions.revision
+            ),
+            context=context,
         )
 
     async def _require_approval(
@@ -736,6 +754,34 @@ class ToolExecutor:
                 prepared=prepared,
             )
         prepared = replace(prepared, record=started_record)
+        if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
+            try:
+                current = prepared.context.refreshed()
+                self._hard_guard(prepared.tool, prepared.arguments, prepared.resolved, current)
+                decision = self._permission_decider(prepared.tool, prepared.arguments, prepared.resolved, current)
+                revision = None if current.effective_permissions is None else current.effective_permissions.revision
+                changed = (decision.decision is not prepared.decision.decision
+                           or revision != prepared.permissions_revision)
+                if decision.decision is UseToolDecision.DENY or changed:
+                    code = "tool_denied" if decision.decision is UseToolDecision.DENY else "permission_changed"
+                    message = decision.reason if decision.decision is UseToolDecision.DENY else (
+                        "permissions changed after preparation; retry under the current policy"
+                    )
+                    return await self._finish(
+                        call=prepared.call,
+                        result=_error_result(prepared.call, code=code, message=message, retryable=False),
+                        record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=code),
+                        prepared=replace(prepared, decision=decision),
+                    )
+            except Exception as error:
+                return await self._finish(
+                    call=prepared.call,
+                    result=_error_result(prepared.call, code="permission_recheck_failed", error=error,
+                                         message="live permission recheck failed closed", retryable=False),
+                    record=replace(prepared.record, status=ExecutionStatus.FAILED,
+                                   error_code="permission_recheck_failed"),
+                    prepared=prepared,
+                )
         try:
             raw = await _run_with_timeout(
                 prepared.tool,
@@ -967,6 +1013,11 @@ class ToolExecutor:
             metadata = {
                 key: value for key, value in result.metadata.items() if key not in _PROTECTED_WORKSPACE_METADATA_KEYS
             }
+            metadata.update({
+                "permission_decision": prepared.decision.decision.value,
+                "permission_reason": prepared.decision.reason,
+                "permissions_revision": prepared.permissions_revision,
+            })
             if prepared.workspace_root is not None:
                 after_sha256 = await asyncio.to_thread(
                     workspace_tree_sha256,

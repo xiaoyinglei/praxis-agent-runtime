@@ -902,7 +902,25 @@ uv run --extra rag rag --help
 
 See the runbook (local-only) for service and private-document workflows.
 
+## MCP connections
+
+Register the official read-only GitHub remote connection using your existing GitHub CLI login:
+
+```bash
+agent mcp add github
+agent mcp check github
+agent chat
+```
+
+Other Streamable HTTP services use `agent mcp add NAME --url URL --bearer-token-env-var ENV`.
+See [MCP connection setup](docs/mcp.md) for credentials, permissions, and supported platforms.
+
 ## Safety and limitations
+
+Configure filesystem read/write/deny rules, tool approvals, network destinations,
+administrator ceilings, and live session revocation through the shared CLI/SDK
+[permission policy](docs/permissions.md). Inspect without a model using
+`agent permissions`, or select a policy with `agent chat --permissions FILE`.
 
 Praxis targets a **trusted-local macOS/Python workspace**. Its controls reduce
 accidental or unapproved effects; they do not turn hostile code, a malicious

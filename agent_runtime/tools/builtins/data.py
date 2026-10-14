@@ -160,7 +160,7 @@ def _inspect_data_file(
     workspace: WorkspaceRuntime,
     request: InspectDataFileInput,
 ) -> InspectDataFileOutput:
-    target = workspace.ensure_within_workspace(
+    target = workspace.ensure_readable(
         workspace.resolve_path(request.path)
     )
     if not target.is_file():
@@ -523,9 +523,7 @@ def _resolve_inspect_use(
     workspace: WorkspaceRuntime,
     arguments: Mapping[str, JsonValue],
 ) -> ResolvedToolUse:
-    target = workspace.ensure_within_workspace(
-        workspace.resolve_path(str(arguments["path"]))
-    )
+    target = workspace.resolve_path(str(arguments["path"]))
     return ResolvedToolUse(
         effects=frozenset({ToolEffect.READ_WORKSPACE}),
         targets=(ToolTarget(kind="workspace_path", value=str(target)),),

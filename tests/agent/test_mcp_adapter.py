@@ -209,3 +209,21 @@ def test_mcp_integration_does_not_own_client_or_session_lifecycle() -> None:
     assert "ClientSession" not in source
     assert "connect(" not in source
     assert "disconnect(" not in source
+
+
+def test_embedded_text_resource_reaches_agent_as_content():
+    from mcp.types import CallToolResult, EmbeddedResource, TextResourceContents
+    from pydantic import AnyUrl
+
+    tool = create_mcp_tools((_descriptor(read_only_hint=True),), lambda *_args: {})[0]
+    raw = CallToolResult(content=[EmbeddedResource(
+        type="resource", resource=TextResourceContents(
+            uri=AnyUrl("repo://owner/project/README.md"), mimeType="text/markdown", text="# Actual README\nfile facts",
+        ),
+    )])
+    normalized = tool.normalize_output(raw)
+    assert len(normalized.content) == 1
+    block = normalized.content[0]
+    assert block.type == "text"
+    assert block.data["text"] == "# Actual README\nfile facts"
+    assert block.data["resource_uri"] == "repo://owner/project/README.md"

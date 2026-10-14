@@ -3,17 +3,20 @@
 # Default: all servers are disabled.
 
 servers:
+  # Preferred setup: agent mcp add github (personal connection + Keychain).
+  # This disabled example shows the generic HTTP configuration with env auth.
   - name: github
-    transport: stdio
-    command: npx
-    args: ["-y", "@modelcontextprotocol/server-github"]
-    env:
-      GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+    transport: http
+    url: https://api.githubcopilot.com/mcp/readonly
+    bearer_token_env_var: GITHUB_TOKEN
+    headers:
+      X-MCP-Readonly: "true"
+    read_only: true
     tools_allowlist:
       - search_repositories
       - get_file_contents
-      - list_issues
-      - create_issue
+      - issue_read
+      - pull_request_read
     enabled: false
 
   - name: postgres

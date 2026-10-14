@@ -4,24 +4,36 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
-from collections.abc import AsyncIterator, Mapping
+import tempfile
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
+import httpx
 import yaml
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
+from agent_runtime.permission_policy import ResolvedPermissions
+from agent_runtime.tools.builtins import shell
 from agent_runtime.tools.integrations.mcp import (
     MCPToolDescriptor,
+    canonical_mcp_name,
     create_mcp_tools,
+    normalize_mcp_name,
 )
 from agent_runtime.tools.tool import JsonValue, Tool
+from agent_runtime.tools.web_http import PublicWebError, public_http_transport, validate_public_url
+from agent_runtime.user_config import user_config_directory
+from agent_runtime.workspace import WorkspaceRuntime
 
 logger = logging.getLogger(__name__)
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -40,9 +52,22 @@ class _StdioServerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class _HTTPServerConfig:
+    name: str
+    url: str
+    headers: Mapping[str, str]
+    bearer_token_env_var: str | None
+    keychain: bool
+    read_only: bool
+    tools_allowlist: frozenset[str]
+    allow_all_tools: bool
+    startup_timeout_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
 class MCPConfigTrustDecision:
     config_path: Path
-    source: Literal["product", "workspace", "external"]
+    source: Literal["product", "workspace", "external", "user"]
     config_sha256: str
 
 
@@ -72,8 +97,16 @@ def decide_mcp_config_trust(
         Path(candidate).expanduser().resolve()
         for candidate in trusted_external_configs
     }
-    if path.is_relative_to(product_root):
-        source: Literal["product", "workspace", "external"] = "product"
+    source: Literal["product", "workspace", "external", "user"]
+    personal = user_config_directory() / "mcp_servers.yaml"
+    if path == personal:
+        for target in (path, path.parent):
+            metadata = target.stat()
+            if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+                raise PermissionError("personal MCP configuration must be user-owned and not group/world writable")
+        source = "user"
+    elif path.is_relative_to(product_root):
+        source = "product"
     elif workspace is not None and path.is_relative_to(workspace):
         if not trust_workspace:
             raise PermissionError(
@@ -98,6 +131,9 @@ async def open_trusted_product_mcp_tools(
     trust: MCPConfigTrustDecision,
     diagnostics: list[RuntimeDiagnostic] | None = None,
     close_timeout_seconds: float = 5.0,
+    permissions: ResolvedPermissions | None = None,
+    permission_provider: Callable[[], ResolvedPermissions] | None = None,
+    server_names: frozenset[str] | None = None,
 ) -> AsyncIterator[tuple[Tool, ...]]:
     """Verify a prior trust decision, then and only then start MCP servers."""
     path = Path(config_path).expanduser().resolve()
@@ -110,6 +146,8 @@ async def open_trusted_product_mcp_tools(
         path,
         diagnostics=diagnostics,
         close_timeout_seconds=close_timeout_seconds,
+        permissions=permissions,
+        permission_provider=permission_provider, server_names=server_names,
     ) as tools:
         yield tools
 
@@ -120,46 +158,80 @@ async def open_product_mcp_tools(
     *,
     diagnostics: list[RuntimeDiagnostic] | None = None,
     close_timeout_seconds: float = 5.0,
+    permissions: ResolvedPermissions | None = None,
+    permission_provider: Callable[[], ResolvedPermissions] | None = None,
+    server_names: frozenset[str] | None = None,
 ) -> AsyncIterator[tuple[Tool, ...]]:
-    """Open enabled stdio MCP servers and project them into ordinary Tools."""
+    """Open configured stdio or Streamable HTTP servers through the same tool adapter.
+
+    Product callers supply live permissions: stdio has a read-only OS sandbox;
+    HTTP requires a preauthorized public HTTPS endpoint for every request.
+    Without permissions this remains a host-owned transport utility. Changes to
+    config or live policy require reconnecting before another tool call.
+    """
 
     if config_path is None or not config_path.is_file():
         yield ()
         return
-    configs = _load_enabled_servers(config_path)
+    configs = _load_enabled_servers(config_path, server_names=server_names)
     if not configs:
         yield ()
         return
 
+    config_revision = hashlib.sha256(config_path.read_bytes()).hexdigest()
     stack = AsyncExitStack()
     sessions: dict[str, ClientSession] = {}
+    start_revisions: dict[str, str] = {}
+    start_policies: dict[str, ResolvedPermissions] = {}
     descriptors: list[MCPToolDescriptor] = []
     try:
         for config in configs:
             server_stack = AsyncExitStack()
-            params = StdioServerParameters(
-                command=config.command,
-                args=list(config.args),
-                env=dict(config.env) or None,
-                cwd=config.cwd,
-            )
             try:
-                streams = await asyncio.wait_for(
-                    server_stack.enter_async_context(stdio_client(params)),
-                    timeout=config.startup_timeout_seconds,
-                )
-                session = await asyncio.wait_for(
-                    server_stack.enter_async_context(ClientSession(*streams)),
-                    timeout=config.startup_timeout_seconds,
-                )
-                initialized = await asyncio.wait_for(
-                    session.initialize(),
-                    timeout=config.startup_timeout_seconds,
-                )
-                listed = await asyncio.wait_for(
-                    session.list_tools(),
-                    timeout=config.startup_timeout_seconds,
-                )
+                current = permissions if permission_provider is None else permission_provider()
+                effective = current
+                if current is not None and permissions is not None and current.revision != permissions.revision:
+                    effective = permissions.intersection(current)
+                if effective is not None:
+                    server_name = f"mcp__{normalize_mcp_name(config.name)}__*"
+                    if effective.tool_decision(server_name) == "deny" or (
+                        not config.allow_all_tools and all(
+                            effective.tool_decision(canonical_mcp_name(config.name, name)) == "deny"
+                            for name in config.tools_allowlist
+                        )
+                    ):
+                        raise PermissionError(f"permission policy denies MCP server: {config.name}")
+                if isinstance(config, _HTTPServerConfig):
+                    if effective is not None and effective.network_decision(config.url) != "allow":
+                        raise PermissionError("remote MCP discovery requires network allow for its destination")
+                    connection = await server_stack.enter_async_context(_http_mcp_connection(
+                        config, config_path, permissions, permission_provider, close_timeout_seconds,
+                    ))
+                    session, initialized, listed, credential_revision = connection
+                else:
+                    if effective is not None:
+                        params = _sandboxed_mcp_parameters(config, effective, server_stack)
+                    else:
+                        params = StdioServerParameters(
+                            command=config.command, args=list(config.args),
+                            env=dict(config.env) or None, cwd=config.cwd,
+                        )
+                    streams = await asyncio.wait_for(
+                        server_stack.enter_async_context(stdio_client(params)),
+                        timeout=config.startup_timeout_seconds,
+                    )
+                    session = await asyncio.wait_for(
+                        server_stack.enter_async_context(ClientSession(streams[0], streams[1])),
+                        timeout=config.startup_timeout_seconds,
+                    )
+                    initialized = await asyncio.wait_for(
+                        session.initialize(),
+                        timeout=config.startup_timeout_seconds,
+                    )
+                    listed = await asyncio.wait_for(
+                        session.list_tools(),
+                        timeout=config.startup_timeout_seconds,
+                    )
                 listed_names = {item.name for item in listed.tools}
                 missing = config.tools_allowlist - listed_names
                 if missing:
@@ -177,7 +249,20 @@ async def open_product_mcp_tools(
                         and item.name not in config.tools_allowlist
                     ):
                         continue
+                    if effective is not None and effective.tool_decision(
+                        canonical_mcp_name(config.name, item.name)
+                    ) == "deny":
+                        continue
                     annotations = item.annotations
+                    if (isinstance(config, _HTTPServerConfig) and config.read_only
+                            and not getattr(annotations, "readOnlyHint", False)):
+                        continue
+                    connection = ({"transport": "http", "url": config.url, "headers": dict(config.headers),
+                                   "read_only": config.read_only, "auth": config.bearer_token_env_var,
+                                   "keychain": config.keychain, "credential_revision": credential_revision}
+                                  if isinstance(config, _HTTPServerConfig) else
+                                  {"transport": "stdio", "command": config.command, "args": config.args,
+                                   "env": dict(config.env), "cwd": None if config.cwd is None else str(config.cwd)})
                     server_descriptors.append(
                         MCPToolDescriptor(
                             server_name=config.name,
@@ -196,10 +281,13 @@ async def open_product_mcp_tools(
                             idempotent_hint=bool(
                                 getattr(annotations, "idempotentHint", False)
                             ),
+                            endpoint_url=config.url if isinstance(config, _HTTPServerConfig) else None,
+                            require_action_approval=(isinstance(config, _HTTPServerConfig)
+                                                     and not getattr(annotations, "readOnlyHint", False)),
                             execution_revision="mcp_" + hashlib.sha256(json.dumps({
-                                "server": config.name, "command": config.command, "args": config.args,
-                                "env": dict(config.env), "cwd": None if config.cwd is None else str(config.cwd),
+                                "server": config.name, "connection": connection,
                                 "version": version, "tool": item.model_dump(mode="json"),
+                                "permissions": None if effective is None else effective.revision,
                             }, sort_keys=True).encode()).hexdigest(),
                         )
                     )
@@ -226,6 +314,9 @@ async def open_product_mcp_tools(
 
             await stack.enter_async_context(server_stack)
             sessions[config.name] = session
+            if current is not None and effective is not None:
+                start_revisions[config.name] = current.revision
+                start_policies[config.name] = effective
             descriptors.extend(server_descriptors)
 
         async def call_tool(
@@ -233,9 +324,18 @@ async def open_product_mcp_tools(
             tool_name: str,
             arguments: Mapping[str, JsonValue],
         ) -> object:
+            if hashlib.sha256(config_path.read_bytes()).hexdigest() != config_revision:
+                raise PermissionError("MCP config changed; reconnect before using it")
             session = sessions.get(server_name)
             if session is None:
                 raise RuntimeError(f"MCP session is not active: {server_name}")
+            current = permissions if permission_provider is None else permission_provider()
+            if current is not None:
+                if current.revision != start_revisions.get(server_name):
+                    raise PermissionError("MCP permissions changed after startup; restart the server before calling it")
+                name = canonical_mcp_name(server_name, tool_name)
+                if current.tool_decision(name) == "deny" or start_policies[server_name].tool_decision(name) == "deny":
+                    raise PermissionError(f"permission policy denies MCP tool: {name}")
             return await session.call_tool(tool_name, arguments=dict(arguments))
 
         yield create_mcp_tools(descriptors, call_tool)
@@ -245,6 +345,155 @@ async def open_product_mcp_tools(
             timeout_seconds=close_timeout_seconds,
             label="runtime",
         )
+
+
+
+def validate_http_mcp_url(value: str) -> str:
+    """Remote MCP accepts a public HTTPS endpoint without URL credentials."""
+    try:
+        raw = httpx.URL(value)
+        if raw.fragment or raw.query:
+            raise ValueError
+        parsed = validate_public_url(value)
+        if parsed.scheme != "https":
+            raise ValueError
+        return str(parsed)
+    except (PublicWebError, ValueError):
+        raise ValueError("remote MCP requires a public HTTPS URL without credentials, query, or fragment") from None
+
+
+class _MCPHTTPTransport(httpx.AsyncBaseTransport):
+    def __init__(self, config: _HTTPServerConfig, config_path: Path,
+                 permissions: ResolvedPermissions | None,
+                 provider: Callable[[], ResolvedPermissions] | None) -> None:
+        self.inner = public_http_transport()
+        self.config = config
+        self.config_path = config_path
+        self.config_revision = hashlib.sha256(config_path.read_bytes()).hexdigest()
+        self.permissions = permissions
+        self.provider = provider
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if str(request.url) != self.config.url:
+            raise PermissionError("MCP request cannot change its configured endpoint")
+        validate_http_mcp_url(str(request.url))
+        if request.headers.get("host", "").casefold() != request.url.netloc.decode("ascii").casefold():
+            raise PermissionError("MCP HTTP Host authority must match its configured endpoint")
+        if hashlib.sha256(self.config_path.read_bytes()).hexdigest() != self.config_revision:
+            raise PermissionError("MCP config changed; reconnect before using it")
+        current = self.permissions if self.provider is None else self.provider()
+        if current is not None and self.permissions is not None:
+            current = current.intersection(self.permissions)
+        if current is not None:
+            if current.network_decision(str(request.url)) != "allow":
+                raise PermissionError("remote MCP destination is not preauthorized by current network policy")
+            if current.tool_decision(f"mcp__{normalize_mcp_name(self.config.name)}__*") == "deny":
+                raise PermissionError("MCP server denied by current permission policy")
+        response = await self.inner.handle_async_request(request)
+        if response.is_redirect:
+            await response.aclose()
+            raise PermissionError("MCP HTTP redirects are refused; credentials stay at the configured endpoint")
+        if response.status_code in {401, 403}:
+            status = response.status_code
+            await response.aclose()
+            raise PermissionError(f"remote MCP authentication or authorization failed (HTTP {status})")
+        return response
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
+@asynccontextmanager
+async def _http_mcp_streams(config: _HTTPServerConfig, config_path: Path,
+                            permissions: ResolvedPermissions | None,
+                            provider: Callable[[], ResolvedPermissions] | None) -> AsyncIterator[Any]:
+    headers = dict(_environment(config.headers, server_name=config.name))
+    if config.bearer_token_env_var is not None:
+        token = os.environ.get(config.bearer_token_env_var, "")
+        if not token:
+            raise ValueError(f"missing MCP credential environment variable: {config.bearer_token_env_var}")
+        headers["Authorization"] = "Bearer " + token
+    if config.keychain:
+        from agent_runtime.mcp_admin import load_mcp_credential
+        headers["Authorization"] = "Bearer " + load_mcp_credential(config.name, config.url)
+    transport = _MCPHTTPTransport(config, config_path, permissions, provider)
+    async with httpx.AsyncClient(
+        transport=transport, headers=headers, timeout=httpx.Timeout(config.startup_timeout_seconds, read=300),
+        trust_env=False, follow_redirects=False,
+    ) as client:
+        async with streamable_http_client(config.url, http_client=client) as streams:
+            yield streams, hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()
+
+
+@asynccontextmanager
+async def _http_mcp_connection(config: _HTTPServerConfig, config_path: Path,
+                               permissions: ResolvedPermissions | None,
+                               provider: Callable[[], ResolvedPermissions] | None,
+                               close_timeout: float) -> AsyncIterator[Any]:
+    # MCP SDK contexts use task-local AnyIO cancel scopes. The owning task must
+    # enter and leave them, including when discovery fails or shutdown is bounded.
+    ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+    stop = asyncio.Event()
+
+    async def serve() -> None:
+        try:
+            async with _http_mcp_streams(config, config_path, permissions, provider) as connection:
+                streams, credential_revision = connection
+                async with ClientSession(streams[0], streams[1], read_timeout_seconds=timedelta(
+                    seconds=config.startup_timeout_seconds,
+                )) as session:
+                    async with asyncio.timeout(config.startup_timeout_seconds):
+                        initialized = await session.initialize()
+                        listed = await session.list_tools()
+                    ready.set_result((session, initialized, listed, credential_revision))
+                    await stop.wait()
+        except BaseException as error:
+            if not ready.done():
+                ready.set_exception(error)
+            elif not isinstance(error, asyncio.CancelledError):
+                logger.warning("MCP HTTP connection %s closed: %s", config.name, type(error).__name__)
+
+    task = asyncio.create_task(serve(), name=f"mcp-http:{config.name}")
+    try:
+        yield await ready
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), close_timeout)
+        except TimeoutError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+def _sandboxed_mcp_parameters(
+    config: _StdioServerConfig, permissions: ResolvedPermissions, stack: AsyncExitStack,
+) -> StdioServerParameters:
+    workspace = WorkspaceRuntime(root=Path(permissions.workspace), is_temporary=False)
+    cwd = workspace.root if config.cwd is None else config.cwd
+    workspace.ensure_within_workspace(cwd)
+    if not permissions.path_access(cwd):
+        raise PermissionError(permissions.path_reason(cwd))
+    allow_network = permissions.command_network_allowed() == "allow"
+    issue = shell._sandbox_availability_issue(shell.RunCommandInput(command=config.command, network=allow_network))
+    issue = issue or shell._workspace_sandbox_preflight_issue(workspace.root, allow_workspace_write=False)
+    if issue is not None:
+        raise RuntimeError(f"{issue[0]}: {issue[1]}")
+    workspace.scratch.mkdir(parents=True, exist_ok=True)
+    temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="mcp-server-", dir=workspace.scratch))
+    environment = shell._command_environment(workspace_root=workspace.root, temporary_root=temporary)
+    sandbox_argv = shell._sandbox_argv(
+        workspace_root=workspace.root, temporary_root=temporary, allow_network=allow_network,
+        allow_workspace_write=False, additional_read_roots=shell._runtime_python_read_roots(), permissions=permissions,
+    )
+    # stdio_client merges a few default host variables into params.env. Reset the
+    # actual server environment *inside* the sandbox; explicit trusted values
+    # must never affect sandbox-exec itself (for example dynamic-loader settings).
+    server_env = {**environment, **config.env}
+    return StdioServerParameters(
+        command=sandbox_argv[0],
+        args=[*sandbox_argv[1:], "/usr/bin/env", "-i", *(f"{key}={value}" for key, value in sorted(server_env.items())),
+              config.command, *config.args],
+        env=environment, cwd=cwd,
+    )
 
 
 async def _close_mcp_stack(
@@ -272,25 +521,28 @@ def resolve_product_mcp_config(workspace_root: Path | None) -> Path | None:
         if not path.is_file():
             raise FileNotFoundError(f"MCP config does not exist: {path}")
         return path
-    candidates: list[Path] = []
+    candidates: list[Path] = [user_config_directory() / "mcp_servers.yaml"]
     if workspace_root is not None:
         candidates.append(workspace_root / "configs" / "mcp_servers.yaml")
     candidates.append(Path(__file__).resolve().parents[2] / "configs" / "mcp_servers.yaml")
     return next((path for path in candidates if path.is_file()), None)
 
 
-def _load_enabled_servers(config_path: Path) -> tuple[_StdioServerConfig, ...]:
+def _load_enabled_servers(config_path: Path, *, server_names: frozenset[str] | None = None
+                          ) -> tuple[_StdioServerConfig | _HTTPServerConfig, ...]:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     if not isinstance(payload, Mapping):
         raise ValueError("MCP config must be a mapping")
     raw_servers = payload.get("servers", ())
     if not isinstance(raw_servers, list):
         raise ValueError("MCP config servers must be a list")
-    configs: list[_StdioServerConfig] = []
+    configs: list[_StdioServerConfig | _HTTPServerConfig] = []
     names: set[str] = set()
     for raw in raw_servers:
         if not isinstance(raw, Mapping):
             raise ValueError("MCP server entries must be mappings")
+        if server_names is not None and raw.get("name") not in server_names:
+            continue
         if not _boolean(raw, "enabled", default=False):
             continue
         name = _required_text(raw, "name")
@@ -298,13 +550,10 @@ def _load_enabled_servers(config_path: Path) -> tuple[_StdioServerConfig, ...]:
             raise ValueError(f"duplicate enabled MCP server: {name}")
         names.add(name)
         transport = str(raw.get("transport", "stdio"))
-        if transport != "stdio":
+        if transport not in {"stdio", "http"}:
             raise ValueError(
                 f"unsupported MCP transport for {name}: {transport}"
             )
-        command = _required_text(raw, "command")
-        args = _string_sequence(raw.get("args", ()), field="args")
-        env = _environment(raw.get("env", {}), server_name=name)
         allowlist = frozenset(
             _string_sequence(
                 raw.get("tools_allowlist", ()),
@@ -331,14 +580,34 @@ def _load_enabled_servers(config_path: Path) -> tuple[_StdioServerConfig, ...]:
         ):
             raise ValueError("startup_timeout_seconds must be numeric")
         timeout = float(timeout_value)
-        if timeout <= 0:
+        if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("startup_timeout_seconds must be positive")
+        if transport == "http":
+            url = validate_http_mcp_url(_required_text(raw, "url"))
+            headers = raw.get("headers", {})
+            if not isinstance(headers, Mapping) or any(
+                not isinstance(key, str) or not isinstance(value, str) for key, value in headers.items()
+            ):
+                raise ValueError("MCP HTTP headers must map strings to strings")
+            token_env = raw.get("bearer_token_env_var")
+            if token_env is not None and (not isinstance(token_env, str)
+                                          or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env)):
+                raise ValueError("bearer_token_env_var must name an environment variable")
+            keychain = _boolean(raw, "keychain", default=False)
+            if token_env is not None and keychain:
+                raise ValueError("choose one bearer credential source")
+            configs.append(_HTTPServerConfig(
+                name=name, url=url, headers=dict(headers), bearer_token_env_var=token_env,
+                keychain=keychain, read_only=_boolean(raw, "read_only", default=True),
+                tools_allowlist=allowlist, allow_all_tools=allow_all, startup_timeout_seconds=timeout,
+            ))
+            continue
         configs.append(
             _StdioServerConfig(
                 name=name,
-                command=command,
-                args=args,
-                env=env,
+                command=_required_text(raw, "command"),
+                args=_string_sequence(raw.get("args", ()), field="args"),
+                env=_environment(raw.get("env", {}), server_name=name),
                 cwd=cwd,
                 tools_allowlist=allowlist,
                 allow_all_tools=allow_all,

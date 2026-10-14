@@ -59,7 +59,7 @@ class SearchTextInput(BaseModel):
     path: str = Field(
         default=".",
         max_length=4096,
-        description="Workspace-relative file or directory to search.",
+        description="Workspace-relative or authorized absolute file or directory to search.",
     )
     glob: str | None = Field(
         default=None,
@@ -151,7 +151,7 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 ToolTarget(
                     kind="workspace_path",
                     value=str(
-                        workspace.resolve_path(str(arguments["path"]) or ".").resolve()
+                        workspace.resolve_path(str(arguments["path"]) or ".")
                     ),
                 ),
             ),
@@ -213,7 +213,8 @@ def _search_text(
             raw = raw[:_MAX_SEARCH_FILE_BYTES]
             truncated = True
         lines = raw.decode("utf-8", errors="replace").splitlines()
-        relative = path.relative_to(workspace.root).as_posix()
+        workspace.ensure_readable(path)
+        relative = workspace.path_label(path)
         if exact_file_target is not None and path == exact_file_target:
             searched_file_path = relative
         file_match_count = 0
@@ -281,7 +282,7 @@ def _exact_file_search_target(
 ) -> Path | None:
     lexical = workspace.resolve_path(value or ".")
     try:
-        target = workspace.ensure_within_workspace(lexical)
+        target = workspace.ensure_readable(lexical)
     except (OSError, ValueError):
         return None
     if lexical.is_symlink() or not target.is_file():
@@ -297,8 +298,8 @@ def _searchable_files(
     glob: str | None,
 ) -> tuple[Path, ...]:
     lexical = workspace.resolve_path(value or ".")
-    target = workspace.ensure_within_workspace(lexical)
-    relative_target = target.relative_to(workspace.root.resolve())
+    target = workspace.ensure_readable(lexical)
+    relative_target = Path(workspace.path_label(target))
     if relative_target.parts and relative_target.parts[0] == _INTERNAL_DIRECTORY:
         raise PermissionError("agent memory is not searchable")
     if lexical.is_symlink():
@@ -319,10 +320,11 @@ def _searchable_files(
             for name in directory_names
             if name not in _DEFAULT_IGNORED_DIRECTORIES
             and not (current / name).is_symlink()
+            and workspace.is_readable(current / name)
         )
         for name in sorted(file_names):
             path = current / name
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or not workspace.is_readable(path):
                 continue
             if _matches_glob(workspace, path, glob):
                 files.append(path)
@@ -341,7 +343,7 @@ def _matches_glob(
 ) -> bool:
     if glob is None:
         return True
-    relative = path.relative_to(workspace.root).as_posix()
+    relative = workspace.path_label(path)
     return fnmatch.fnmatch(path.name, glob) or fnmatch.fnmatch(relative, glob)
 
 
@@ -353,7 +355,7 @@ def _search_file_priority(
     workspace: WorkspaceRuntime,
     path: Path,
 ) -> tuple[int, str]:
-    relative = path.relative_to(workspace.root).as_posix()
+    relative = workspace.path_label(path)
     parts = set(Path(relative).parts[:-1])
     if "docs" in parts:
         group = 3

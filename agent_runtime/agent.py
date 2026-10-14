@@ -20,6 +20,7 @@ from agent_runtime.models import (
     ModelSwitchRequester,
     validate_model_switch_requester,
 )
+from agent_runtime.permission_policy import PermissionPolicy, ResolvedPermissions, resolve_permission_sources
 from agent_runtime.result import AgentPause, AgentResult
 from agent_runtime.streaming.events import StreamEvent
 from agent_runtime.streaming.sink import TurnEventDispatcher
@@ -56,6 +57,8 @@ class Agent:
         web_search_provider: str | None = None,
         web_proxy_url: str | None = None,
         web_limits: WebLimits | None = None,
+        permissions: PermissionPolicy | Path | str | None = None,
+        managed_permissions: PermissionPolicy | Path | str | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
@@ -83,6 +86,12 @@ class Agent:
     
         workspace = (Path.cwd() if workspace_path is None else Path(workspace_path))
         self.workspace_path = (workspace.expanduser().resolve())
+        for value in (permissions, managed_permissions):
+            if value is not None and not isinstance(value, (PermissionPolicy, Path, str)):
+                raise TypeError("permissions must be PermissionPolicy, a policy file path, or None")
+        self.permissions = permissions
+        self.managed_permissions = managed_permissions
+        self.effective_permissions()  # Reject invalid configuration before model/provider setup.
         self.model_session_path = model_session_path
         self.knowledge = knowledge
         self.memory = memory
@@ -414,6 +423,10 @@ class Agent:
 
     def _workspace_path(self) -> Path:
         return self.workspace_path
+
+    def effective_permissions(self) -> ResolvedPermissions:
+        """Reload trusted sources; saved conversation grants cannot widen them."""
+        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions)
 
     def _stage_harness_files(
         self,

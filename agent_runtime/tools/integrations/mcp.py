@@ -6,6 +6,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import cast
 
+from pydantic import AnyUrl
+
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -13,6 +15,7 @@ from agent_runtime.tools.tool import (
     NormalizedToolOutput,
     ResolvedToolUse,
     Tool,
+    ToolApprovalProfile,
     ToolContentBlock,
     ToolDefinition,
     ToolEffect,
@@ -45,6 +48,8 @@ class MCPToolDescriptor:
     idempotent_hint: bool = False
     timeout_seconds: float = 30.0
     execution_revision: str = "server-v1"
+    endpoint_url: str | None = None
+    require_action_approval: bool = False
 
     def __post_init__(self) -> None:
         canonical_mcp_name(self.server_name, self.tool_name)
@@ -58,6 +63,7 @@ class MCPToolDescriptor:
             "read_only_hint",
             "destructive_hint",
             "idempotent_hint",
+            "require_action_approval",
         ):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f"{name} must be a bool")
@@ -140,9 +146,13 @@ def _create_mcp_tool(
         normalize_output=lambda raw: _normalize_mcp_output(raw, descriptor),
         output_schema=None,
         static_effects=frozenset(effects),
+        approval_profile=(ToolApprovalProfile.MCP_ACTION if descriptor.require_action_approval else None),
         resolve_use=lambda _arguments: ResolvedToolUse(
             effects=frozenset(effects),
-            targets=(ToolTarget(kind="mcp_tool", value=name),),
+            targets=(ToolTarget(kind="mcp_tool", value=name),) + (
+                () if descriptor.endpoint_url is None else
+                (ToolTarget(kind="public_web", value=descriptor.endpoint_url),)
+            ),
         ),
         execution_revision=(
             f"integration-mcp-v1:{descriptor.execution_revision}"
@@ -257,14 +267,20 @@ def _content_block(raw: object) -> ToolContentBlock | None:
                 payload["mime_type"] = media_type[:200]
             return ToolContentBlock(type="image", data=payload)
     if block_type == "resource":
+        resource = _field(raw, "resource", default={})
         uri = _field(raw, "uri", default=None)
         if uri is None:
-            resource = _field(raw, "resource", default={})
             uri = _field(resource, "uri", default="")
-        if isinstance(uri, str):
+        text = _field(resource, "text", default=None)
+        if isinstance(text, str):
+            return ToolContentBlock(type="text", data={
+                "text": text[:_MAX_TEXT_CHARS], "resource_uri": str(uri)[:4096],
+                "truncated": len(text) > _MAX_TEXT_CHARS,
+            })
+        if isinstance(uri, (str, AnyUrl)):
             return ToolContentBlock(
                 type="resource",
-                data={"uri": uri[:4096]},
+                data={"uri": str(uri)[:4096]},
             )
     return None
 

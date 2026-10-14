@@ -53,7 +53,7 @@ class ListFilesInput(BaseModel):
 
     path: str = Field(
         default=".",
-        description="Workspace-relative directory to list.",
+        description="Workspace-relative or authorized absolute directory to list.",
         max_length=4096,
     )
     glob: str | None = Field(
@@ -92,7 +92,7 @@ class ReadFileInput(BaseModel):
     path: str = Field(
         min_length=1,
         max_length=4096,
-        description="Workspace-relative file path.",
+        description="Workspace-relative or authorized absolute file path.",
     )
     encoding: str = Field(
         default="utf-8",
@@ -185,7 +185,7 @@ class ApplyPatchInput(BaseModel):
     file_path: str = Field(
         min_length=1,
         max_length=4096,
-        description="Workspace-relative path of the file to create or edit.",
+        description="Workspace-relative or authorized absolute path of the file to create or edit.",
     )
     old_string: str | None = Field(
         default=None,
@@ -387,7 +387,9 @@ def _list_files(
     for path in sorted(directory.iterdir(), key=lambda item: item.name):
         if path.name in _DEFAULT_HIDDEN_DIRECTORIES:
             continue
-        relative = path.relative_to(workspace.root).as_posix()
+        if not workspace.is_readable(path):
+            continue
+        relative = workspace.path_label(path)
         if request.glob and not (fnmatch.fnmatch(path.name, request.glob) or fnmatch.fnmatch(relative, request.glob)):
             continue
         if len(entries) >= request.limit:
@@ -609,8 +611,8 @@ def _apply_patch(
         raise PermissionError(
             "apply_patch cannot modify the verification toolchain"
         )
-    target = _checked_path(workspace, request.file_path)
-    relative = target.relative_to(workspace.root.resolve())
+    target = _checked_path(workspace, request.file_path, write=True)
+    relative = Path(workspace.path_label(target))
     if (
         relative.parts
         and any(
@@ -812,18 +814,17 @@ def _workspace_use(
     *,
     effects: frozenset[ToolEffect],
 ) -> ResolvedToolUse:
-    target = workspace.resolve_path(value or ".").resolve()
+    target = workspace.resolve_path(value or ".")
     return ResolvedToolUse(
         effects=effects,
         targets=(ToolTarget(kind="workspace_path", value=str(target)),),
     )
 
 
-def _checked_path(workspace: WorkspaceRuntime, value: str) -> Path:
-    target = workspace.ensure_within_workspace(
-        workspace.resolve_path(value or "."),
-    )
-    relative = target.relative_to(workspace.root.resolve())
+def _checked_path(workspace: WorkspaceRuntime, value: str, *, write: bool = False) -> Path:
+    checker = workspace.ensure_writable if write else workspace.ensure_readable
+    target = checker(workspace.resolve_path(value or "."))
+    relative = Path(workspace.path_label(target))
     if relative.parts and relative.parts[0] == _INTERNAL_DIRECTORY:
         raise PermissionError("agent memory is not exposed as a workspace file")
     return target
