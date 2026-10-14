@@ -574,7 +574,7 @@ def _chat_provider_config(spec: ModelSpec) -> ChatProviderConfig:
     if spec.provider in {ModelProvider.MLX, ModelProvider.OPENAI_COMPATIBLE}:
         return ChatProviderConfig(
             base_url=endpoint.base_url,
-            api_key=_api_key_from_env(spec.api_key_env),
+            api_key=_api_key_from_env(spec.api_key_env, endpoint.base_url),
         )
     raise ValueError(f"Unsupported provider: {spec.provider}")
 
@@ -830,11 +830,17 @@ def _reject_unknown_keys(
         raise ValueError(f"{where} contains unknown fields: {', '.join(unknown)}")
 
 
-def _api_key_from_env(name: str | None) -> str | None:
+def _api_key_from_env(name: str | None, endpoint: str | None = None) -> str | None:
     if not name:
         return None
     value = os.environ.get(name)
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if endpoint is not None:
+        from agent_runtime.model_credentials import load_model_credential
+
+        return load_model_credential(name, endpoint)
+    return None
 
 
 def user_model_registry_path() -> Path:

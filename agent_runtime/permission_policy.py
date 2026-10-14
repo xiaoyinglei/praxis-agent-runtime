@@ -160,6 +160,7 @@ class ResolvedPermissions(_FrozenModel):
     tools: tuple[ToolRule, ...] = ()
     network: NetworkPolicy = NetworkPolicy()
     sources: tuple[str, ...] = ("default",)
+    private_paths: tuple[str, ...] = ()
     ceilings: tuple[ResolvedPermissions, ...] = ()
 
     @property
@@ -171,6 +172,7 @@ class ResolvedPermissions(_FrozenModel):
             value = policy.model_dump(mode="json", exclude={"ceilings", "sources"})
             for key in ("filesystem", "tools"):
                 value[key] = sorted(value[key], key=lambda rule: json.dumps(rule, sort_keys=True))
+            value["private_paths"] = sorted(value["private_paths"])
             for key in ("allowed_domains", "denied_domains"):
                 value["network"][key] = sorted(value["network"][key])
             value["network"]["rules"] = sorted(value["network"]["rules"],
@@ -190,14 +192,16 @@ class ResolvedPermissions(_FrozenModel):
             ceiling.effective_approval == "never" for ceiling in self.ceilings
         ) else "on-request"
 
-    @field_validator("filesystem", "tools", "sources", "ceilings", mode="before")
+    @field_validator("filesystem", "tools", "sources", "private_paths", "ceilings", mode="before")
     @classmethod
     def sequence(cls, value: Any) -> Any:
         return tuple(value) if isinstance(value, list) else value
 
     @model_validator(mode="after")
     def absolute_paths(self) -> ResolvedPermissions:
-        if not Path(self.workspace).is_absolute() or any(not Path(rule.path).is_absolute() for rule in self.filesystem):
+        if (not Path(self.workspace).is_absolute()
+                or any(not Path(rule.path).is_absolute() for rule in self.filesystem)
+                or any(not Path(path).is_absolute() for path in self.private_paths)):
             raise ValueError("resolved permissions require absolute filesystem paths")
         return self
 
@@ -211,6 +215,7 @@ class ResolvedPermissions(_FrozenModel):
         """
         boundaries = {rule.path for rule in self.filesystem}
         boundaries.update(source for source in self.sources if Path(source).is_absolute())
+        boundaries.update(self.private_paths)
         for ceiling in self.ceilings:
             boundaries.update(rule.path for rule in ceiling.sandbox_filesystem)
         return tuple(PathRule(
@@ -228,6 +233,8 @@ class ResolvedPermissions(_FrozenModel):
         if write and self.profile == "read-only":
             return "read-only profile denies writes"
         for candidate in dict.fromkeys((lexical, real)):
+            if any(_under_path(candidate, Path(private)) for private in self.private_paths):
+                return "host credential directory is private"
             if write and any(Path(source).is_absolute() and (
                     _under_path(candidate, Path(source)) or _same_path(candidate, Path(source)))
                              for source in self.sources):
@@ -413,4 +420,8 @@ def resolve_permission_sources(
     # absent higher-priority slots. Tools must not install next-session policy.
     automatic_directories = (user_config_directory(), Path("/etc/praxis"))
     protected = [str(directory.resolve()) for directory in automatic_directories]
-    return effective.model_copy(update={"sources": tuple(dict.fromkeys((*effective.sources, *protected)))})
+    private = user_config_directory() / "credentials"
+    return effective.model_copy(update={
+        "sources": tuple(dict.fromkeys((*effective.sources, *protected))),
+        "private_paths": tuple(dict.fromkeys((*effective.private_paths, str(private), str(private.resolve())))),
+    })

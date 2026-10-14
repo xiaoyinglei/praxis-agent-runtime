@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections.abc import (
     Awaitable,
     Callable,
@@ -11,6 +10,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from agent_runtime.core.llm_registry import ModelNotAvailableError
+from agent_runtime.model_credentials import resolve_model_credential
 
 if TYPE_CHECKING:
     from agent_runtime.models import ModelSpec
@@ -72,7 +72,8 @@ class LocalProviderProbe:
                 health_port = health.port if health.port is not None else default_ports.get(health.scheme)
                 same_origin = (base.scheme, base.hostname, base_port) == (health.scheme, health.hostname, health_port)
                 key_name = getattr(spec, "api_key_env", None)
-                api_key = os.environ.get(key_name) if same_origin and key_name else None
+                api_key = (resolve_model_credential(key_name, str(getattr(spec, "base_url", "")))
+                           if same_origin else None)
                 payload = await _request_json(str(health_url), 5.0, api_key=api_key)
             else:
                 payload = await self._request_json(str(health_url), 5.0)
