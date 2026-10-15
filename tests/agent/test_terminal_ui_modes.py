@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
+import sys
 from contextlib import suppress
 
 import pytest
@@ -16,6 +18,112 @@ from typer.testing import CliRunner
 from agent_runtime import cli
 from agent_runtime.cli import agent_app
 from agent_runtime.terminal_app import TerminalChatApp
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["inline", "fullscreen"])
+@pytest.mark.parametrize("configured_handler", [False, True, "dynamic"])
+async def test_background_errors_stay_in_conversation_without_overwriting_composer(
+    mode, configured_handler, monkeypatch,
+):
+    terminal = io.StringIO()
+    stderr = sys.stderr
+    logger = logging.Logger("terminal-background-warning")
+    monkeypatch.setitem(logging.Logger.manager.loggerDict, logger.name, logger)
+    handler = logging.StreamHandler(stderr)
+    if configured_handler == "dynamic":
+        handler = logging.lastResort
+    if configured_handler:
+        logger.addHandler(handler)
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(
+            model="preview", workspace="/tmp", ui_mode=mode, input=pipe,
+            output=Vt100_Output(terminal, lambda: Size(rows=24, columns=100), enable_cpr=False),
+        )
+        emit = asyncio.Event()
+
+        async def conversation():
+            await emit.wait()
+            print("background stderr diagnostic", file=sys.stderr)
+            logger.warning("MCP server notion is unavailable: simulated connection failure")
+            await ui.prompt()
+
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            async with asyncio.timeout(3):
+                while ui.app.renderer._last_screen is None:
+                    await asyncio.sleep(0.01)
+                ui.editor.text = "unfinished 中文 question"
+                emit.set()
+                while not ui.waiting:
+                    await asyncio.sleep(0.01)
+            assert "background stderr diagnostic" in ui.view.plain_text()
+            assert ui.view.plain_text().count("MCP server notion is unavailable") == 1
+            assert ui.editor.text == "unfinished 中文 question"
+            ui.invalidate()
+            await asyncio.sleep(0.08)
+            screen = ui.app.renderer._last_screen
+            rows = ["".join(row[x].char for x in sorted(row)) for _, row in sorted(screen.data_buffer.items())]
+            assert sum("/help" in row for row in rows) == 1
+            assert "unfinished 中文 question" in "\n".join(rows)
+            pipe.send_text("\r")
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+        assert sys.stderr is stderr
+        assert handler.stream is stderr
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("finish", ["exception", "cancel"])
+async def test_diagnostic_streams_restore_after_abnormal_exit(finish, monkeypatch, tmp_path):
+    stderr, stdout = sys.stderr, sys.stdout
+    logger = logging.Logger("terminal-restore-warning")
+    monkeypatch.setitem(logging.Logger.manager.loggerDict, logger.name, logger)
+    console = logging.StreamHandler(stderr)
+    log_path = tmp_path / "agent.log"
+    file_handler = logging.FileHandler(log_path)
+    custom_stream = io.StringIO()
+    custom_handler = logging.StreamHandler(custom_stream)
+    for handler in (console, file_handler, custom_handler):
+        logger.addHandler(handler)
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="preview", workspace="/tmp", input=pipe,
+                             output=Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=80), enable_cpr=False))
+        ready = asyncio.Event()
+
+        async def conversation():
+            logger.warning("diagnostic before exit")
+            ready.set()
+            if finish == "exception":
+                raise RuntimeError("simulated failure")
+            await asyncio.Future()
+
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            await asyncio.wait_for(ready.wait(), 3)
+            if finish == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(RuntimeError, match="simulated failure"):
+                    await asyncio.wait_for(task, 3)
+            assert sys.stderr is stderr and sys.stdout is stdout
+            assert console.stream is stderr
+            assert custom_handler.stream is custom_stream
+            assert log_path.read_text() == "diagnostic before exit\n"
+            assert custom_stream.getvalue() == "diagnostic before exit\n"
+            assert ui.view.plain_text().count("diagnostic before exit") == 1
+        finally:
+            if not task.done():
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+            file_handler.close()
 
 
 @pytest.mark.anyio

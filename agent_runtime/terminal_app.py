@@ -5,13 +5,17 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import os
 import re
 import sys
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
-from contextlib import redirect_stdout, suppress
+import threading
+import webbrowser
+from collections.abc import Awaitable, Callable, Coroutine, Iterator, Sequence
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout, suppress
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -38,6 +42,7 @@ from rich.style import Style as RichStyle
 from rich.text import Text
 from rich.theme import Theme
 
+from agent_runtime.connection_manager import ConnectionServer
 from agent_runtime.result import AgentPause
 from agent_runtime.terminal_input import _COMPOSER_BINDINGS, CHAT_COMMANDS, BoundedPromptHistory, resolve_pause_choice
 from agent_runtime.terminal_render import display_rows, safe_terminal_text
@@ -124,6 +129,31 @@ class _ConversationOutput(io.TextIOBase):
         pass
 
 
+@contextmanager
+def _conversation_output(view: Conversation) -> Iterator[None]:
+    """Keep terminal diagnostics inside the renderer, including existing loggers."""
+    console_streams = (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__)
+    output = _ConversationOutput(view)
+    loggers = [logging.getLogger(), *logging.Logger.manager.loggerDict.values()]
+    handlers = {handler for logger in loggers if isinstance(logger, logging.Logger) for handler in logger.handlers}
+    with ExitStack() as stack:
+        # StreamHandler retains its original stream, so redirect_stderr alone
+        # only covers print() and logging's dynamic lastResort handler.
+        for handler in handlers:
+            stream_property = getattr(type(handler), "stream", None)
+            if isinstance(stream_property, property) and stream_property.fset is None:
+                # Dynamic handlers (including stdlib _StderrHandler) follow
+                # redirect_stderr already and do not allow setStream().
+                continue
+            if (isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler)
+                    and any(handler.stream is stream for stream in console_streams)):
+                previous = handler.setStream(output)
+                stack.callback(handler.setStream, previous)
+        stack.enter_context(redirect_stdout(output))
+        stack.enter_context(redirect_stderr(output))
+        yield
+
+
 class _ConversationControl(FormattedTextControl):
     def __init__(self, owner: TerminalChatApp) -> None:
         self.owner = owner
@@ -167,6 +197,9 @@ class TerminalChatApp:
         self._approval: _ApprovalState | None = None
         self._input_sequence = 0
         self._operation: asyncio.Task[Any] | None = None
+        self._connection_server: ConnectionServer | None = None
+        self._connection_thread: threading.Thread | None = None
+        self._opening_connections = False
         self._row = 0
         self._follow = True
         self._show_history = False
@@ -210,6 +243,10 @@ class TerminalChatApp:
         self.approval_buttons = FormattedTextControl(self._approval_fragments, focusable=True)
         approving = Condition(lambda: self._approval is not None)
         keys = KeyBindings()
+
+        @keys.add("f3", filter=Condition(lambda: self.display.connection_required))
+        def open_connections(event: KeyPressEvent) -> None:
+            self.app.create_background_task(self.open_connections())
 
         @keys.add("y", filter=approving, eager=True)
         @keys.add("Y", filter=approving, eager=True)
@@ -426,6 +463,10 @@ class TerminalChatApp:
                 ),
                 ConditionalContainer(self.editor, filter=~approving),
                 ConditionalContainer(Window(height=1, char="─", style="class:dim"), filter=~approving),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self._connection_fragments), height=1),
+                    filter=Condition(lambda: self.display.connection_required),
+                ),
                 Window(FormattedTextControl(self._footer), height=1),
             ]
         )
@@ -693,6 +734,34 @@ class TerminalChatApp:
             self.app.output, [("", safe_terminal_text(text) + "\n")], self.app.style or Style.from_dict({}),
         ))
 
+    def _connection_fragments(self) -> StyleAndTextTuples:
+        def click(event: MouseEvent) -> None:
+            if event.event_type == MouseEventType.MOUSE_UP and event.button == MouseButton.LEFT:
+                self.app.create_background_task(self.open_connections())
+        return [("underline", " [ 打开连接管理 · F3 ]  登录或检查连接后，发送下一条消息重试。", click)]
+
+    async def open_connections(self) -> None:
+        """Human-only action: open the local manager; OAuth still requires a click."""
+        if self._opening_connections:
+            return
+        self._opening_connections = True
+        try:
+            if self._connection_server is None:
+                server = ConnectionServer(Path(self.workspace))
+                self._connection_server = server
+                self._connection_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                self._connection_thread.start()
+            url = self._connection_server.browser_url
+            if not await asyncio.to_thread(webbrowser.open, url):
+                await self.show_text("请在本机浏览器打开连接管理：" + url)
+            self.display.connection_required = False
+            self.status = "请在连接管理页面完成登录并检查连接，然后发送下一条消息。"
+        except (OSError, webbrowser.Error):
+            self.view.message("无法打开本机连接管理；可另开终端运行 uv run agent connections。\n", "error")
+        finally:
+            self._opening_connections = False
+            self.invalidate()
+
     async def replay_messages(self, messages: Sequence[tuple[str, str]]) -> None:
         """Replay saved messages using the mode's transcript destination."""
         if self.fullscreen:
@@ -927,7 +996,7 @@ class TerminalChatApp:
 
         async def work() -> None:
             try:
-                with redirect_stdout(_ConversationOutput(self.view)):
+                with _conversation_output(self.view):
                     await conversation()
             except Exception as exc:
                 self.app.exit(exception=exc)
@@ -951,3 +1020,8 @@ class TerminalChatApp:
                     worker.cancel()
                 with suppress(asyncio.CancelledError):
                     await worker
+            if self._connection_server is not None:
+                await asyncio.to_thread(self._connection_server.shutdown)
+                self._connection_server.server_close()
+                if self._connection_thread is not None:
+                    await asyncio.to_thread(self._connection_thread.join, 2)

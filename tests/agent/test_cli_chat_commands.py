@@ -94,6 +94,57 @@ async def test_chat_model_picker_switches_session_without_provider_request(tmp_p
     assert facade.selected == ui.model == "second"
 
 
+@pytest.mark.anyio
+async def test_connections_command_reopens_changed_tools_between_turns_with_same_history(tmp_path):
+    from agent_runtime.terminal_app import TerminalChatApp
+    commands = iter(["first", "/connections", "second", "/exit"])
+    opened = []
+    closed = []
+    state = {"changed": False}
+    results = [_result(), _result()]
+
+    class Session:
+        def __init__(self, index):
+            self.index = index
+
+        def current_model(self):
+            return _model_spec("test")
+
+        def connections_changed(self):
+            return state["changed"]
+
+        async def close(self):
+            closed.append(self.index)
+
+        async def submit(self, query, **kwargs):
+            return results[self.index]
+
+    class Facade:
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        @asynccontextmanager
+        async def session(self, **kwargs):
+            session = Session(len(opened))
+            opened.append(kwargs)
+            state["changed"] = False
+            yield session
+
+    class UI(TerminalChatApp):
+        async def prompt(self, **kwargs):
+            return next(commands)
+
+        async def open_connections(self):
+            state["changed"] = True  # Host finished a check; active Turn tools were not changed.
+
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
+    assert closed == [0]
+    assert len(opened) == 2
+    assert opened[1]["previous_turn_id"] == results[0].turn_id
+
+
 
 def _result(*, turn_id: str | None = None, answer: str = "bounded") -> AgentResult:
     return AgentResult(

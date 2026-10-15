@@ -138,6 +138,8 @@ async def open_trusted_product_mcp_tools(
     permissions: ResolvedPermissions | None = None,
     permission_provider: Callable[[], ResolvedPermissions] | None = None,
     server_names: frozenset[str] | None = None,
+    lazy: bool = False,
+    cache_catalog: bool = False,
 ) -> AsyncIterator[tuple[Tool, ...]]:
     """Verify a prior trust decision, then and only then start MCP servers."""
     path = Path(config_path).expanduser().resolve()
@@ -151,7 +153,7 @@ async def open_trusted_product_mcp_tools(
         diagnostics=diagnostics,
         close_timeout_seconds=close_timeout_seconds,
         permissions=permissions,
-        permission_provider=permission_provider, server_names=server_names,
+        permission_provider=permission_provider, server_names=server_names, lazy=lazy, cache_catalog=cache_catalog,
     ) as tools:
         yield tools
 
@@ -165,6 +167,9 @@ async def open_product_mcp_tools(
     permissions: ResolvedPermissions | None = None,
     permission_provider: Callable[[], ResolvedPermissions] | None = None,
     server_names: frozenset[str] | None = None,
+    lazy: bool = False,
+    cache_catalog: bool = False,
+    catalog: list[MCPToolDescriptor] | None = None,
 ) -> AsyncIterator[tuple[Tool, ...]]:
     """Open configured stdio or Streamable HTTP servers through the same tool adapter.
 
@@ -172,6 +177,8 @@ async def open_product_mcp_tools(
     HTTP requires a preauthorized public HTTPS endpoint for every request.
     Without permissions this remains a host-owned transport utility. Changes to
     config or live policy require reconnecting before another tool call.
+    lazy=True uses checked local metadata for HTTP tools and connects on use;
+    cache_catalog=True records metadata during an explicit host connection check.
     """
 
     if config_path is None or not config_path.is_file():
@@ -180,6 +187,15 @@ async def open_product_mcp_tools(
     configs = _load_enabled_servers(config_path, server_names=server_names)
     if not configs:
         yield ()
+        return
+
+    if lazy:
+        from agent_runtime.runtime.mcp_catalog import open_lazy_mcp_tools
+        async with open_lazy_mcp_tools(
+            config_path, configs=configs, permissions=permissions, permission_provider=permission_provider,
+            close_timeout_seconds=close_timeout_seconds,
+        ) as tools:
+            yield tools
         return
 
     config_revision = hashlib.sha256(config_path.read_bytes()).hexdigest()
@@ -289,6 +305,9 @@ async def open_product_mcp_tools(
                             endpoint_url=config.url if isinstance(config, _HTTPServerConfig) else None,
                             require_action_approval=(isinstance(config, _HTTPServerConfig)
                                                      and not getattr(annotations, "readOnlyHint", False)),
+                            connection_revision=hashlib.sha256(json.dumps({
+                                "connection": connection, "version": version,
+                            }, sort_keys=True).encode()).hexdigest(),
                             execution_revision="mcp_" + hashlib.sha256(json.dumps({
                                 "server": config.name, "connection": connection,
                                 "version": version, "tool": item.model_dump(mode="json"),
@@ -343,6 +362,13 @@ async def open_product_mcp_tools(
                     raise PermissionError(f"permission policy denies MCP tool: {name}")
             return await session.call_tool(tool_name, arguments=dict(arguments))
 
+        if catalog is not None:
+            catalog.extend(descriptors)
+        if cache_catalog:
+            from agent_runtime.runtime.mcp_catalog import write_catalog
+            if hashlib.sha256(config_path.read_bytes()).hexdigest() != config_revision:
+                raise PermissionError("MCP config changed during discovery; check the connection again")
+            write_catalog(config_path, descriptors, server_names=frozenset(sessions))
         yield create_mcp_tools(descriptors, call_tool)
     finally:
         await _close_mcp_stack(
@@ -462,8 +488,10 @@ async def _http_mcp_streams(config: _HTTPServerConfig, config_path: Path,
         trust_env=False, follow_redirects=False,
     ) as client:
         async with streamable_http_client(config.url, http_client=client) as streams:
-            credential_state = {"headers": headers, "oauth": None if auth is None else auth.storage.read()}
-            yield streams, hashlib.sha256(json.dumps(credential_state, sort_keys=True).encode()).hexdigest()
+            def credential_revision() -> str:
+                credential_state = {"headers": headers, "oauth": None if auth is None else auth.storage.read()}
+                return hashlib.sha256(json.dumps(credential_state, sort_keys=True).encode()).hexdigest()
+            yield streams, credential_revision
 
 
 @asynccontextmanager
@@ -486,7 +514,9 @@ async def _http_mcp_connection(config: _HTTPServerConfig, config_path: Path,
                     async with asyncio.timeout(config.startup_timeout_seconds):
                         initialized = await session.initialize()
                         listed = await session.list_tools()
-                    ready.set_result((session, initialized, listed, credential_revision))
+                    # Initialization may silently refresh OAuth. Bind the actual
+                    # authenticated identity after that refresh has completed.
+                    ready.set_result((session, initialized, listed, credential_revision()))
                     await stop.wait()
         except BaseException as error:
             if not ready.done():

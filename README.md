@@ -1,588 +1,112 @@
 # Praxis
 
-> **a trusted-local workspace agent runtime**
+**让 AI 在你的项目里完成工作，而不止于回答问题。**
 
-[![Python 3.12](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](pyproject.toml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Distribution: source only](https://img.shields.io/badge/distribution-source%20checkout-555)](#quickstart)
+[![CI](https://github.com/xiaoyinglei/praxis-agent-runtime/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaoyinglei/praxis-agent-runtime/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?logo=python&logoColor=white)](pyproject.toml)
+[![MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-Praxis turns a model's plan into controlled work on files, code, data, documents,
-and private knowledge. For default modification tasks, the runtime requires a real
-workspace change and post-change verification before accepting completion.
-Read-only tasks explicitly opt out of that mutation contract and may answer
-directly. Praxis is designed for one person operating a trusted local workspace,
-with `agent` as the CLI and `agent_runtime.Agent` as the Python API.
+Praxis 是面向个人本机和可信服务器工作区的开源 AI Agent。它可以阅读项目、修改代码、处理数据与文档、查询网页和连接外部服务，并将工具执行、权限审批和聊天历史保存在同一套运行时中。
 
-Generate the optional local demo with `scripts/render_praxis_demo.py`.
+以 `agent` 命令行为主要入口，也提供 `agent_runtime.Agent` Python SDK。你选择模型和项目，Praxis 负责把请求推进为可检查的行动与结果。
 
-**DETERMINISTIC DEMO · FAKE MODEL — NOT MODEL QUALITY EVIDENCE.** Every frame is
-generated from the tested public Agent path. The scripted model inspects a file,
-applies a patch, runs verification, and completes. It demonstrates runtime wiring
-without credentials; real-model evidence is tracked separately.
+[快速开始](#快速开始) · [使用指南](docs/guide.md) · [开发指南](docs/development.md) · [Ubuntu 部署](DEPLOY_UBUNTU.md)
 
-## Why Praxis
+## 为什么做 Praxis
 
-Useful agent work is more than producing an answer:
+把模型接进项目后，真正困难的是后面的工作：它能读取哪些文件，哪些操作需要确认，中断后怎样继续，以及“已经完成”究竟有什么依据。
 
-```text
-workspace knowledge -> controlled action -> verifiable result
-```
+Praxis 把这些事情放进执行流程。模型根据观察规划下一步；文件、命令、网页和集成服务通过明确的工具接口使用；需要授权的动作在执行前暂停。修改类任务默认要求工作区确实发生变化，并在最后一次修改后完成检查。
 
-Praxis keeps that path visible. The model can inspect the workspace, propose and
-execute bounded tool calls, pause at approval boundaries, and continue from
-durable state. Default modification turns finish against diff and verification
-evidence. A read-only turn using `--no-require-workspace-change`, or the SDK with
-`require_workspace_change=False`, may return analysis without manufacturing a
-change. Runtime completion is separate from validation: `AgentResult.validation_status`
-is `not_evaluated`, `passed`, or `failed`, and `validation_scope` names the check.
-The built-in delivery gate checks `workspace_change` evidence only. Read-only
-answers and legacy gates without an explicit validation result are `not_evaluated`;
-ending a turn does not certify answer correctness. RAG is an optional private-knowledge capability, not the product's default
-execution path.
+这是一套服务真实任务的运行时，也是一份可以阅读、调试和扩展的 Agent 工程实现。
 
-## Runtime architecture
+![Praxis 执行过程演示](docs/assets/praxis-demo.gif)
 
-```text
-CLI / Python SDK
-       |
-       v
-Turn -> Loop -> ACI / ToolExecutor -> workspace
-  |       |             |
-  |       |             +-> approval before risky effects
-  |       +-> model observation and bounded next step
-  +-> checkpoint / resume / previous_turn_id
-                       |
-                       +-> verification and acceptance evidence
-```
+*演示使用固定模型响应，展示真实执行链路中的读取、修改和验证，不代表真实模型的任务能力。可通过 `scripts/render_praxis_demo.py` 重新生成。*
 
-- **Turn** — one user request with one public `turn_id`; a later Turn may point
-  to it through `previous_turn_id`.
-- **Loop** — the bounded model/tool cycle that plans, observes results, and
-  decides whether to continue, pause, fail, or finish.
-- **ACI** — typed, documented tool contracts for files, structured data,
-  managed Python, search, patching, commands, plans, knowledge, skills, and
-  integrations.
-- **Approval** — write and execute capabilities remain distinct and can pause
-  before a destructive effect.
-- **Checkpoint** — pending and interrupted Turns persist so the same operation
-  can resume instead of being replayed as a new task.
-- **Verification** — a claimed workspace change is checked against the real diff
-  and verification performed after the final mutation.
+## 快速开始
 
-The runtime deliberately uses one Agent loop rather than a chain of role-playing
-agents. Deeper lifecycle details are in the
-Harness architecture contract (local-only).
-
-## Current evidence
-
-The public repository includes runtime tests, CLI and fake-model delivery smoke,
-and package installation checks. These validate execution boundaries; they do
-not establish real-model task quality. Infrastructure failures are reported as
-**INCONCLUSIVE**, never converted into a model score.
-
-Reference checkouts, documentation, generated artifacts and live evaluation
-records are local-only material. They are not required to build or use Praxis
-and are not bundled with a fresh clone. Real-model results must be checked
-against the corresponding local run, rather than inferred from unit-test counts.
-
-## Quickstart
-
-### Install from a source checkout
-
-The distribution name `praxis-agent-runtime` is local build metadata. This
-project is **not published to PyPI**: use a source checkout or build a wheel
-locally. There is no package-index install command implied by this README.
+需要 Python **3.12 或 3.13**、Git 和 [uv](https://docs.astral.sh/uv/)。当前支持 macOS 和 Linux；命令执行还需要对应平台的沙箱后端。
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
 cd praxis-agent-runtime
-uv sync --locked
-```
+uv sync --locked --link-mode copy
 
-The default install includes the Agent and its document/data tools. Private
-knowledge backends and local MLX inference are separate extras:
-
-```bash
-uv sync --locked --extra rag
-uv sync --locked --extra local-mlx  # Local inference on Apple Silicon
-```
-
-Use `uv run --extra rag` or `uv run --extra local-mlx` for commands that need
-those capabilities. `transformers` tokenizers are available in either extra;
-the default install retains the bundled DeepSeek tokenizer, tiktoken, and the
-conservative fallback for models without an available tokenizer.
-
-### Connect and switch models
-
-For a first-run walkthrough, select a model, enter its API key without terminal
-echo, and optionally connect read-only GitHub MCP:
-
-```bash
 uv run agent setup
 uv run agent chat
 ```
 
-For a browser-based connection catalog and OAuth login, run:
+`setup` 会引导你选择或接入模型，验证连接，并保存当前项目的选择。你可以使用云端 API，也可以连接自己启动的兼容模型服务。验证会产生少量真实模型用量。
+
+API Key 在终端中隐藏输入。macOS 使用系统 Keychain，Linux 使用个人配置目录中的私有凭据文件；配置文件保存模型定义与凭据变量名。其他用户下载项目后，配置自己的模型和账号即可使用。
+
+项目目前通过**源码安装**分发，尚未发布到 PyPI。安装过程、模型要求和本地 MLX 的启动方式见[使用指南](docs/guide.md#安装与首次配置)。
+
+## 用它完成什么
+
+| 场景 | 你可以提出的任务 | 执行方式 |
+| --- | --- | --- |
+| 理解与修改项目 | “梳理这个项目的入口，修复超时处理并验证。” | 阅读与搜索文件、补丁、命令执行、变更检查 |
+| 数据与文档 | “整理这份表格，生成统计图并检查输出文件。” | 结构检查、受限 Python、文件生成与结果回读 |
+| 公网检索 | “查阅官方文档，比较这两个方案并给出来源。” | 搜索、网页读取、可选 Chromium 渲染、来源快照 |
+| 外部服务 | “查看这个仓库的 Issue，或查找 Notion 中的文档。” | GitHub、Notion、Linear 与自定义远程 MCP |
+| 长期项目 | “继续上次的工作，沿用我确认过的项目约定。” | 聊天恢复、可选工作区记忆、可选私有知识库 RAG |
+
+工作区以启动命令时所在的目录为准。处理其他项目时，先进入项目目录，再指定 Praxis 的源码位置：
 
 ```bash
-uv run agent connections
+cd /path/to/my-project
+uv run --project /path/to/praxis-agent-runtime agent setup
+uv run --project /path/to/praxis-agent-runtime agent chat
 ```
 
-Choose GitHub, Notion, Linear, or add a custom remote MCP URL. The local page can
-authorize, check, and remove connections. OAuth credentials stay in host storage;
-the Agent runtime refreshes them without opening login pages during a task.
-
-The wizard validates the model using the existing full probe before saving a
-new key or changing the project's selection. It reuses existing environment
-credentials by default. macOS stores new keys in Keychain; other POSIX systems
-use a private file outside the workspace, denied to Agent tools and sandboxes.
-See [first-run setup](docs/setup.md) for custom endpoints, repeat runs, and
-credential precedence.
-
-Project `.env` files supply only credentials named by validated model definitions
-(`api_key_env`). Configure model catalogs, personal permissions, MCP settings,
-and the execution environment through host environment variables. SDK callers
-may explicitly select an env file outside both the workspace and worktree for
-host configuration. This requires a canonical path without symlinks and a file
-without hard-link aliases; linked paths supply credentials only.
-Existing environment variables take precedence;
-`PRAXIS_DISABLE_DOTENV=1` disables dotenv loading.
-
-Praxis accepts a secret-free model definition and reads any credential through
-the named environment variable or the endpoint-bound personal credential store
-at runtime. For full Agent behavior, an endpoint
-must provide:
-
-- an OpenAI-compatible model-discovery and chat interface that advertises the
-  configured model identity;
-- a real streamed text delta followed by an authoritative completion;
-- a schema-valid forced tool call when `supports_tools` is enabled, without
-  Praxis executing the probe tool;
-- valid structured output when `supports_structured_output` is enabled; and
-- bounded timeouts and cancellable streaming.
-
-Built-in model IDs remain read-only. User registrations live in the versioned
-user registry. Agent startup automatically initializes the local binding trust
-domain on first use and reuses it afterward. Inspect or register exact model IDs
-through the CLI. No manual trust initialization is required. `--provider` selects the provider
-adapter and transport; the same `MODEL_ID` is sent to that provider:
+在聊天中直接描述目标即可。工具记录可以展开查看，写入和执行授权会单独呈现。需要一次性执行任务时：
 
 ```bash
-uv run agent model list --source
-uv run agent model current
-export MODEL_ID=provider-model-id
-export PROVIDER_BASE_URL=https://provider.example/v1
-export PROVIDER_CREDENTIAL_ENV=MY_PROVIDER_TOKEN
-export MY_PROVIDER_TOKEN=replace-with-provider-token
-
-uv run agent model add "$MODEL_ID" \
-  --provider openai_compatible \
-  --context-window-tokens 131072 \
-  --base-url "$PROVIDER_BASE_URL" \
-  --api-key-env "$PROVIDER_CREDENTIAL_ENV"
-
-uv run agent model show "$MODEL_ID"
-uv run agent model probe "$MODEL_ID" --level full
-uv run agent model update "$MODEL_ID" --timeout-seconds 90
-uv run agent model switch "$MODEL_ID"
-uv run agent model remove "$MODEL_ID"
-```
-
-`agent model add` and `update` run the full probe before their compare-and-swap
-registry commit. Probe failure or cancellation writes nothing. Advanced typed
-definitions can use `--from <one-model.yaml>`; `--skip-probe` is an explicit
-offline escape hatch and reports the model ID as unverified. Registry files store
-only the environment variable name, never its resolved value.
-
-The session selection is mutable, both outside and inside interactive chat:
-
-```text
-$ uv run agent chat
-> /model
-当前模型: current-model-id
-可用模型:
-* current-model-id  ...
-  another-model-id  ...
-切换: /model <model_id>
-> /model another-model-id
-已切换模型: another-model-id
-```
-
-By default, interactive `agent chat` opens a fullscreen conversation viewport
-with Markdown answers and a multiline composer fixed at the bottom. Execution
-groups and individual tools expand and collapse **in place**, including while
-output is streaming. Completed answers stay in the application; use PageUp and
-PageDown or the mouse wheel to read history, and Ctrl+End to follow new output.
-Use `/copy` to request clipboard transfer, including over SSH, or F2 to toggle
-native terminal selection. Exiting restores the shell screen.
-The composer and Markdown code backgrounds use the terminal's own colors.
-Errors remain visible even when their execution group is collapsed.
-
-Start the default fullscreen interface, or choose inline scrolling:
-
-```bash
-# Offline preview: no model connection or saved chat state
-uv run python scripts/terminal_ui_demo.py
-
-# Real chat with the same layouts
-uv run agent chat
-
-# Optional native scrolling layout
-uv run agent chat --ui inline
-```
-
-`fullscreen` is the default. It opens an alternate screen, keeps the composer at the bottom, and
-returns to the shell on exit. Completed answers and replayed chat stay inside
-the application. Use PageUp/PageDown to inspect history, Ctrl+End to follow new
-output, and F2 to toggle application mouse handling. `/copy` requests clipboard
-transfer without publishing the answer into shell scrollback. The fullscreen
-inspection view uses the existing bounded conversation history (100 blocks,
-128 KiB per text block); persistent real chat remains in the rollout database.
-`inline` clears only the visible screen on entry, preserving the terminal's
-saved scrollback, and uses native scrolling and selection. You can also pass
-`--ui inline` or `--ui fullscreen` to the offline preview.
-The offline preview supports `/long`, `/copy`, and `/exit`.
-Both layouts use a warm terracotta brand accent, quiet gray tool records,
-`●` answer markers, and a composer between two thin horizontal separators.
-The welcome area hides in terminals shorter than 12 rows to leave room for
-approval controls.
-
-| Control | Action |
-| --- | --- |
-| `/model` | Open model picker; arrows select, Enter confirms, Esc cancels; clicking a model also selects it |
-| Drag over answer text | Inline: native selection and terminal Copy; fullscreen: application selection requests clipboard copy (F2 switches to native selection) |
-| Terminal Paste / `Cmd+V` on macOS | Paste into the composer; bracketed multiline paste never sends automatically |
-| `/copy` | Request clipboard copy of the latest answer as raw Markdown; inline also puts the full answer in native scrollback |
-| `/resume [THREAD_ID]` | Reopen a saved workspace conversation; choose a chat when the ID is omitted |
-| `/` then a command prefix | Show all commands, then filter by any prefix; arrows select, Tab completes, Esc dismisses |
-| `Enter` while suggestions are shown | Confirm a completion; press Enter again to execute the completed command |
-| `F2` | Toggle application mouse interaction and native selection; fullscreen starts with application mouse handling |
-| Click `▸` / `▾` in F2 mouse mode | Expand / collapse the execution group or individual tool |
-| `Ctrl+O` | Toggle the latest execution group without leaving the composer |
-| `Tab`, then arrows and `Enter` / Space | Navigate records and toggle the selected row |
-| `Tab` / `Esc` while navigating records | Return to the composer |
-| `PageUp` / `PageDown` (or mouse wheel in F2 mode) | Inspect and scroll retained conversation history inside the application |
-| `Ctrl+End` | Leave history inspection and follow the latest output again |
-| `Enter` / `Ctrl+J` or `Alt+Enter` | Send / insert a newline |
-| `Ctrl+C` | Copy a selection first; otherwise cancel execution, clear input, or exit if empty |
-| `Ctrl+D` at an empty prompt | Exit |
-
-Typing `/` offers every command with a short description; continuing with any
-prefix filters the same shared command list used by `/help`. Completion does not
-apply to command arguments or ordinary chat text. Input editing preserves complete Chinese
-characters and emoji, and bracketed multiline paste stays in the composer until
-you send it. Approval questions use the same composer and show the permitted
-choices. Cancelling waits for execution cleanup; existing file changes are not
-rolled back. Mouse interaction requires a terminal with mouse reporting and
-cursor-position reports; keyboard folding is also available.
-
-Markdown web references retain their short labels and appear together below the
-answer as numbered sources with a title and website domain; repeated URLs share
-one source entry. Each entry also prints the full HTTP(S) URL on a separate
-logical line without truncation, so the client's native URL detection works
-without OSC 8 support. Mac Terminal opens a visible URL with Cmd-double-click;
-Ghostty on macOS uses Cmd-click. OSC 8 labels remain available in compatible
-terminals. Pages open in the client's browser, including over SSH; the server
-never launches a browser. `/copy` also retrieves the original Markdown.
-Right-click uses the client's native context menu by default. Ghostty's
-`right-click-action = context-menu` enables its context menu if it was customized.
-Available link actions and browser choices belong to the client terminal;
-opening a link normally uses the system's default browser.
-Historical answers use the same rendering; their saved text is unchanged. Code examples are not treated
-as cited sources, and non-web destinations are not emitted as active hyperlinks.
-
-Unchanged history reuses its layout when scrolling or refreshing the status bar.
-An idle prompt has no periodic redraw to disturb native selection. Resizing or
-receiving new content invalidates the layout. `/copy` uses `pbcopy` only on a local
-Mac; elsewhere it sends an OSC 52 clipboard request for answers up to 64 KiB.
-Client terminals may reject that request, so the full answer is also printed above
-the application for native copy. The server never reads the client's clipboard;
-use the terminal's normal Paste command. In F2 mode, right-click releases mouse
-reporting and asks you to right-click again for the client's native menu. It never
-pastes text. F2 also returns directly to native mouse mode.
-Completed output remains in terminal scrollback independently of the bounded
-application view. The terminal itself controls its scrollback limit. While a
-response is streaming, `PageUp` (usually `Fn+Up` on a Mac) inspects the application
-history; `Ctrl+End` returns to the current output. Pending approval panels are not
-committed into scrollback until the interaction has finished.
-
-Context capacity, compaction thresholds and budget counters appear only in
-`/status` or detailed output (`/verbose`). A compaction produces a short progress
-notice. Ordinary chat no longer prints `not_evaluated` validation messages;
-explicit verification results, errors and approval requests remain visible.
-
-Tool calls rejected before execution (for example, invalid arguments or an
-out-of-workspace path) also appear in the execution records, marked as not
-executed. Whitespace-only model chunks do not start a visible answer. Three
-tool results with the same tool, arguments, and deterministic error without
-observed progress stop the Turn with `repeated_tool_failure`. Read-only calls
-and proven no-op writes do not hide the streak; actual workspace changes,
-successful recovery of the same call, or unmeasured external effects reset it.
-The check uses committed history, including after a process restart. A missing
-file reports `file_not_found`, rather than a generic retryable runner failure.
-Model context includes the actual workspace and the model ID frozen for that Turn.
-Each new agent step also captures the host's current date, time, timezone and UTC
-offset. Those facts travel with its saved request: recovering an already prepared
-request preserves its original clock, while the next new step reads a fresh one.
-Historical messages remain unchanged. The model uses these facts for relative
-and past/future dates; ambiguous date intentions still require clarification.
-`/status` displays the current host time and timezone for inspection.
-
-OpenAI-compatible streams request and preserve provider usage, including a
-usage-only trailing chunk. Token estimates include full tool descriptions and
-schemas when provider usage is absent. An incomplete stream pauses with
-`model_retry` and offers `retry` / `abort`; retry creates a new model attempt
-without replaying tools from the unfinished response.
-
-The live viewport retains up to 100 conversation blocks and 256 tools per
-execution group, with bounded tool details (2,000 display rows and 131,072
-characters per block; 8,388,608 text characters across the viewport). Display omissions are explicitly marked; folding never
-changes durable history. Tool/ACI truncation is reported separately. `/verbose`
-also opens or closes retained execution details. Redirected input/output and
-`TERM=dumb` retain the plain-text chat path; `agent run` and `agent recover` retain
-their existing command-line output.
-
-The next message keeps the current conversation history and creates a new Turn
-bound to the selected model ID; no restart or `/new` is required. An invalid ID
-prints the available IDs, keeps the previous model, and does not contact a
-provider. Each completed or paused Turn retains an authenticated, immutable
-definition in durable history. `agent recover` therefore continues that Turn's
-original model even after the model ID is updated, removed, or selected differently
-for later Turns.
-
-### 工作区跨聊天记忆
-
-记忆默认关闭，与文档 RAG 独立。开启后，Session 启动时后台处理一份符合条件、已结束的聊天，
-通过无工具权限、有独立预算的模型调用提取和整理记忆。只有允许贡献的聊天会成为输入；
-旧聊天不会因开启工作区默认设置而自动获得贡献授权。
-提取和整理复用 Agent 选定的主模型，项目默认是云端 `deepseek-flash`，也可通过 `--model` 明确选择。
-每次处理一份聊天中的一个最多 32 KB 的批次；超大的单个 Item 以带原始来源 ID 的连续片段处理。
-处理游标与记忆在同一事务提交，未处理部分留到下次，已有的超限跳过记录也会重新进入增量处理。
-单批模型输出最多 32 条、单条最多 2000 字符；完整记忆库可以超过 32 条。新 Turn 只固定最多 32 条标题索引
-和不可变版本，`read_memory` 可查询该版本的完整详情，包括未出现在启动索引中的条目。
-
-```bash
-uv run agent memory configure --use --generate
-uv run agent memory status
-uv run agent memory update
-uv run agent memory delete --key <key>
-uv run agent memory remember --key test-command --title "Test command" --text "uv run pytest" --kind preference
-uv run agent memory edit --key test-command --text "make test"
-uv run agent memory explain --key test-command
-uv run agent memory configure --no-generate   # 保留读取，停止后续生成
-uv run agent memory configure --no-use --no-generate
-```
-
-上述命令使用当前工作区；`--workspace` 和 `--checkpoint-db` 可明确指定范围和数据库。
-`status` 不调用模型、不创建数据库；`update` 显式执行一次有限处理并报告来源、版本和维护 Turn ID。
-每个允许贡献的终态 Turn 会登记持久维护任务；启动时执行一批，`update` 的 `has_more` 表示该来源仍有待处理部分。
-Session 关闭会取消尚未结束的计算，已提交的游标与任务记录保留。已完成的提取可复用，失败按任务退避，
-同一批的重试累计使用预算，耗尽后报告 `budget_exhausted`，其他安全任务仍可继续。
-请求结果未确认时报告 `needs_reconciliation` 并保留维护 Turn ID，不会换新预算自动重复云端调用。
-
-Python SDK 可传入 `Agent(memory=MemoryConfig())`，或调用 `agent.configure_memory(...)` 设置工作区默认值。
-`agent.memories()` 检查内容与来源；`await agent.refresh_memory()` 更新；`agent.delete_memory(key)` 删除。
-每个新 Turn 固定记忆版本和标题导航；模型用 `read_memory` 按 key 或字面关键词分页读取该版本详情。
-`status` 的 `maintenance_jobs` 展示待处理、完成、失败或待核对任务；原有包含完整详情的 Turn 快照仍可恢复。
-显式管理入口还包括 `agent.remember_memory(...)`、`agent.edit_memory(...)` 和 `agent.explain_memory(key)`。
-条目记录 preference/fact/reference 类型、来源种类、更新时间和替代关系；显式保存或修改的条目不会被后台覆盖。
-`manage_memory` 工具支持当前用户要求的记住、修改、忘记和解释；写操作遵循现有写权限，要求 `expected_version`，
-来源取自当前主会话的用户消息，子智能体不能代替用户写入显式记忆。工具写入后，当前 Turn 的读取仍保持冻结，
-新 Turn 使用新值。CLI/SDK 管理不调用模型；事实与引用仍是历史信息，执行决策前需要核对当前权威来源。
-来源 ID 不授予其他聊天原文读取权限；当前用户指令和当前执行事实优先于记忆。
-删除不会修改正在恢复的 Turn 快照，也不会让旧来源重新生成被删条目。
-
-设计参考固定版本的 [Codex 分阶段记忆维护与持久任务](https://github.com/openai/codex/tree/12cca49c81c8aa6a37a5cc4e39964ee3b70f9458/codex-rs/memories/write)
-和 [Claude Code 的索引与详情按需读取](https://code.claude.com/docs/en/memory)，存储和调用仍使用本项目现有组件。
-
-### 重新打开旧聊天
-
-退出程序或断开 SSH 后，已保存的聊天仍在工作区的 `.praxis/checkpoints.sqlite` 中。
-`resume` 统一表示打开一个聊天 Thread；浏览与回放只读数据库，不调用模型或执行旧工具。
-会话选择器显示首条提问摘要、最后活动时间、最新状态和完整会话 ID，按最近活动排序，
-只列当前工作区的会话（排除运行时子智能体的 Thread）。交互终端用 ↑↓ / Enter / Esc；
-纯文本终端用编号或完整 ID，空行取消。
-
-服务器既有 `praxis` 启动器会继续读取保存的密钥和搜索服务配置，无需重新配置：
-
-```bash
-praxis --resume                  # 选择旧聊天
-praxis --resume thread_<id>      # 直接打开稳定会话 ID
-praxis --continue                # 打开最近聊天
-```
-
-该启动器的工作区沿用 `--repo` 指定的目录（默认为安装仓库）。普通 Agent CLI 使用当前目录：
-
-```bash
-uv run agent resume
-uv run agent resume thread_<id>
-uv run agent chat --continue
-```
-
-聊天内也可输入 `/resume` 或 `/resume thread_<id>`。保存的人类消息和助手文本先回放到终端原生
-滚动历史，可原生拖选、复制和搜索；回放完整文本不受内存视窗保留上限影响。`/transcript` 已移除。
-回放读取压缩前的原始 Items；下一条消息通过 `Agent.session(thread_id=...)` 打开原 Session，
-`Session.submit` 在同一 Thread 创建新 Turn，`RolloutContextManager` 从原始 Items 和已保存的
-上下文压缩重建模型请求，包含需要的旧工具结果而不执行它们。会话保存的模型选择、知识库和
-工具策略继续生效；`/model` 可为下一条消息切换模型。`chat --last` 保留为隐藏的 `--continue` 兼容别名。
-
-暂停或中断的会话先只读回放，并在同一个聊天中显示原来的确认、补充问题或重试选项；
-直接回复即可继续原 Turn，随后新的消息创建新 Turn。打开历史本身不会恢复或取消原任务。
-若另一进程仍在执行，显示“处理中”，不重复执行；完成后直接发送新消息，或 `/new` 开始新聊天。
-Praxis 当前不支持跨进程实时接管正在执行的终端。
-原 CLI 的 `resume TURN_ID --action ...` 已改名为 `recover`，旧命令不会被悄悄解释为任务恢复：
-
-```bash
-praxis recover turn_<id>                   # 查看任务恢复选项，复用保存的密钥
-praxis recover turn_<id> --action continue # 明确继续原 Turn
-uv run agent recover turn_<id> --action allow_once
-```
-
-底层 SDK `Agent.resume` / `Session.resume` 保留“恢复同一个 Turn”的语义和原冻结绑定。
-
-### 启动本地 MLX 模型与 Agent
-
-以下命令在项目根目录执行。Praxis 不会自动启动或关闭 MLX 服务；
-先启动模型服务，再启动 Agent。下载模型权重不会自动把模型加入 Agent 目录。
-当前内置的本地聊天模型为：
-
-- `mlx-community/Qwen3.5-9B-4bit`
-- `mlx-community/gemma-4-26b-a4b-it-4bit`
-
-#### 双窗口运行
-
-窗口 1：启动 Qwen，保持服务运行。首次加载可能需要等待权重下载或加载完成。
-
-```bash
-uv run --extra local-mlx python -m mlx_lm.server \
-  --model mlx-community/Qwen3.5-9B-4bit \
-  --host 127.0.0.1 --port 8080
-```
-
-窗口 2：启动 Agent。首次启动自动创建本地 trust 密钥，后续启动复用。
-启动后可用 `uv run agent model trust status` 查看状态；如果已有历史绑定却丢失密钥，
-程序会报错要求恢复原密钥，不会自动生成替代密钥。
-
-```bash
-uv run agent chat --model mlx-community/Qwen3.5-9B-4bit
-```
-
-运行 Gemma 时，先在模型窗口按 Ctrl+C 停止旧服务，再执行：
-
-```bash
-uv run --extra local-mlx python -m mlx_lm.server \
-  --model mlx-community/gemma-4-26b-a4b-it-4bit \
-  --host 127.0.0.1 --port 8080
-```
-
-在另一个窗口启动对应的 Agent：
-
-```bash
-uv run agent chat --model mlx-community/gemma-4-26b-a4b-it-4bit
-```
-
-#### 单窗口运行
-
-先确保没有其他模型服务占用 `8080`。下面在后台启动模型，等待接口就绪后进入
-Agent；日志写入 `/tmp/praxis-mlx.log`。切换启动模型时，只需修改第一行的模型 ID。
-
-```bash
-praxis_model_id=mlx-community/Qwen3.5-9B-4bit
-
-uv run --extra local-mlx python -m mlx_lm.server \
-  --model "$praxis_model_id" \
-  --host 127.0.0.1 --port 8080 \
-  > /tmp/praxis-mlx.log 2>&1 &
-praxis_mlx_pid=$!
-
-until curl --max-time 2 -fsS http://127.0.0.1:8080/v1/models >/dev/null 2>&1; do
-  if ! kill -0 "$praxis_mlx_pid" 2>/dev/null; then
-    tail -40 /tmp/praxis-mlx.log
-    break
-  fi
-  sleep 2
-done
-
-if kill -0 "$praxis_mlx_pid" 2>/dev/null; then
-  uv run agent chat --model "$praxis_model_id"
-fi
-```
-
-在聊天中输入 `/exit` 退出 Agent，随后在同一个终端关闭此次后台启动的模型：
-
-```bash
-kill "$praxis_mlx_pid"
-```
-
-需要查看模型启动日志时执行：
-
-```bash
-tail -40 /tmp/praxis-mlx.log
-```
-
-#### 查看与切换模型
-
-在 Agent 聊天输入框中输入（不是终端命令）：
-
-```text
-/model
-/model current
-/model mlx-community/Qwen3.5-9B-4bit
-/model mlx-community/gemma-4-26b-a4b-it-4bit
-```
-
-以上两条切换命令按需选一条。`/model` 只更新 Agent 的模型选择，不负责重启 MLX。
-两个本地模型共用 `8080`，切换前需要先在模型窗口停止旧服务、启动目标模型；
-下一条聊天消息会使用新选择并保留对话历史。
-
-也可以在终端保存模型选择，再进入聊天：
-
-```bash
-uv run agent model list --source
-uv run agent model switch mlx-community/Qwen3.5-9B-4bit
-uv run agent chat
-```
-
-手工修改模型目录后，需要退出并重新启动 Agent 才能刷新列表。
-
-### Run a task
-
-Run a read-only task explicitly:
-
-```bash
-uv run agent run \
-  "Read pyproject.toml and explain the public entry points." \
+# 只做分析，不要求修改工作区
+uv run agent run "阅读 pyproject.toml，解释项目入口和模块职责。" \
   --no-require-workspace-change
+
+# 修改类任务：完成变更后检查实际结果
+uv run agent run "修复配置加载中的异常处理，更新相关测试并验证。"
 ```
 
-Read-only tasks can answer directly because `--no-require-workspace-change`
-disables only the mutation requirement; it does not invent a verification claim.
+常用聊天命令集中在 `/help` 中：
 
-For a task that may edit files or run verification, describe the outcome instead
-of scripting tool names:
+| 命令 | 用途 |
+| --- | --- |
+| `/model` | 选择模型，下一条消息生效并保留历史 |
+| `/permissions` | 查看或调整当前权限 |
+| `/connections` | 打开本机服务连接管理 |
+| `/resume` | 选择并打开已保存的聊天 |
+| `/new` | 开始空上下文的新聊天 |
+| `/copy` | 复制最近回答的原始 Markdown |
 
-```bash
-uv run agent run \
-  "Add a typed timeout to the public API, update its tests, and verify the change."
+## 过程可见，权限可控
+
+Praxis 以 Thread 保存聊天，以 Turn 表示一次请求，以 Step 推进模型与工具交互。执行事件、工具结果和恢复状态写入持久记录，界面只是这些记录的呈现。
+
+```text
+用户请求 → 模型规划与观察 → 工具执行 → 结果检查与回复
+                  ↑           │
+                  └─ 工具结果 ─┘
+                       │
+               权限检查 · 人工审批 · 持久记录
 ```
 
-Risky tool calls are presented for approval in an interactive terminal. A
-non-interactive run pauses instead of silently approving them and prints the
-`agent recover` command for the pending Turn.
+文件读取、工作区写入、命令执行和网络访问分别约束。可以只允许读取某个外部资料目录，也可以选择只读模式；个人授权仍受管理员策略上限限制。
 
-### Python API
+- **命令与 Python：**macOS 使用 Seatbelt，Linux 使用 Bubblewrap。默认只读、禁网络；额外的联网或工作区写入需要授权。Linux 写入先进入私有候选工作区，成功并通过检查后才发布变更。
+- **外部服务：**通过 `uv run agent connections` 管理账号。个人远程 MCP 在需要调用时连接；缺少认证或工具目录时才显示连接提示，点击后由你选择登录，不会在普通聊天中自动弹授权页。
+- **聊天与记忆：**`agent resume` 打开历史聊天；可选记忆按工作区隔离、默认关闭，来源与修改可检查。记忆生成与 RAG 是独立能力。
+- **结果与验证：**运行结束不等于答案已经证实。`AgentResult.validation_status` 区分未评估、通过和失败，`validation_scope` 说明实际检查范围；只读分析可以直接回答，不制造修改证据。
 
-Execution budgets count model/tool steps within a Turn: use SDK `max_steps` or
-CLI `--max-steps`. The old `max_turns` / `--max-turns` names remain compatible;
-conflicting SDK values are rejected before dispatch. CLI `--rollout-db` names the
-complete SQLite event/projection store; `--checkpoint-db` remains an alias.
+操作方法和配置示例见[使用指南](docs/guide.md)。
 
-Managed Python reports assertions actually executed. Those counts establish
-neither changed-file coverage nor task correctness and cannot alone pass the
-delivery gate. Inspect changed artifacts or run the relevant project checks
-after writing. The gate re-evaluates saved verification against its bound tool
-call/result using current rules; historical classification mistakes do not
-automatically become new completion evidence.
+## Python SDK
+
+CLI 与 SDK 使用同一套运行时。在已有模型配置的项目中，可以直接嵌入你的 Python 程序：
 
 ```python
 import asyncio
@@ -592,469 +116,43 @@ from agent_runtime import Agent
 
 
 async def main() -> None:
-    agent = Agent(
-        model="<model-id>",
-        workspace_path=Path("."),
-    )
+    agent = Agent(workspace_path=Path.cwd())
     result = await agent.run(
-        "Read pyproject.toml and summarize the package boundaries.",
+        "阅读当前项目，解释主要模块的职责。",
         require_workspace_change=False,
     )
-
     print(result.answer)
-    print(result.turn_id)
+    print(result.validation_status)
 
 
 asyncio.run(main())
 ```
 
-The Python SDK execution surface is async-only. Use `await agent.run(...)` for a
-new Turn, `await agent.resume(...)` only for an existing paused or interrupted
-Turn, `await agent.read_result(...)` / `await agent.pending_input(...)` for durable
-state reads, and `async for event in agent.stream(...): ...` for live events.
-Standalone scripts may create the event loop once at their application boundary
-with `asyncio.run(main())`; async applications should directly `await` the Agent.
+多轮聊天使用 `async with agent.session()` 和 `session.submit()`；实时事件使用 `agent.stream()`。恢复一个暂停的 Turn 使用 `agent.resume()`，与打开历史聊天的 CLI `agent resume` 语义不同。[查看 SDK 与扩展方式](docs/guide.md#python-sdk-与扩展)。
 
-## Capability map
+## 适用范围与项目状态
 
-| Capability | Public route | Typical work |
-| --- | --- | --- |
-| **Files and code** | `agent` / `agent_runtime.Agent` | Discover, read, search, patch, inspect diffs, run bounded verification |
-| **Data and documents** | `inspect_data_file` + sandboxed `execute_python` | Inspect CSV/TSV/JSON/XLSX/XLSM/PDF inputs; calculate, transform, chart, and structurally verify generated artifacts without a workspace `.venv` |
-| **Private knowledge** | Explicit `RAGKnowledgeConfig` | Retrieve cited evidence from a configured local knowledge index |
-| **Public internet** | `web_search` + `web_fetch` | Search for sources; read public websites, documentation and source files; continue saved content offline |
-| **Extensions** | Workspace Skills, configured MCP servers, and bounded subagent delegation | Add installed ACI capabilities without replacing the core loop |
+Praxis 适合个人本机开发、可信服务器上的项目工作，以及 Agent 运行时的学习与二次开发。当前版本为 `0.1.0`，接口仍在演进，尚不提供多租户远程执行服务，也不承诺隔离任意恶意仓库或不可信操作者。
 
-Capabilities are assembled for the current workspace. Availability does not
-grant permission: tool visibility, write authority, command execution, network
-access, and approval are separate controls.
+macOS 沙箱依赖 `/usr/bin/sandbox-exec`，Linux 依赖 `/usr/bin/bwrap`；需要命令联网时还依赖 libseccomp。后端缺失或无法表达当前策略时会拒绝执行，不降级为无约束进程。Linux 子进程的外部目录写入暂不支持，Windows 尚未完成支持。
 
-## Public web research
+CI 覆盖类型、导入边界、回归测试、沙箱和浏览器检查、安装包及公共入口。测试桩只验证测试流程，不能代替真实沙箱验证；历史评估不代表当前版本或任意任务的模型质量。任务效果还取决于模型、权限和输入资料。
 
-`web_fetch` opens public HTTP(S) URLs on Linux and macOS. It reads HTML,
-UTF-8 text/Markdown/source code and JSON; PDF text extraction is available on Linux
-with worker memory limits, up to 20 pages. A GitHub page or raw file is one
-possible source. Results report actual extraction errors, truncation, source
-identity and read mode. Bounded responses are saved before extraction, so failed
-extractions remain inspectable through `view="raw"`.
+## 文档与参与开发
 
-HTML extraction preserves the declared `main`, `role="main"`, `article` and
-`itemprop="articleBody"` regions in document order, including their siblings
-inside a declared main region. Without these standard markers it retains the
-cleaned body rather than guessing a single region from paragraph density or
-class names. Unmarked pages can therefore include unrelated text; use outlines,
-links and literal `find` to locate evidence. The frozen quality corpus requires
-all source facts to survive. For body fallbacks, residual noise and first-window
-placement are diagnostic metrics; they do not authorize discarding text.
-
-URL fetches default to `render="auto"`: read HTTP first, then try isolated
-Chromium once if HTML extraction reports `web_content_empty`. The received HTTP
-response seeds the browser without a duplicate document fetch. Static text,
-non-HTML responses and other failures do not trigger rendering. Use `render=false`
-for HTTP only or `render=true` to render immediately. Raw-view URL reads default
-to HTTP only, and saved-source reads never render or refetch. Automatic recovery
-returns the actual browser error when rendering is unavailable or fails;
-`static_source_id` retains the original HTTP snapshot for inspection. Failed
-network or browser attempts can be retried by a new call. The whole fetch tool
-has a 75-second cap, covering HTTP, both parsing stages and the bounded renderer.
-Install with
-`uv sync --extra browser` and `uv run --extra browser playwright install --only-shell chromium`.
-Linux also needs `bwrap`, working unprivileged namespaces and Chromium's native
-shared libraries. The Playwright installer can install those system libraries
-with `playwright install --with-deps --only-shell chromium`; this changes system
-packages and is a separate environment setup step. The renderer denies
-direct IP networking and brokers public GETs through the existing HTTP client;
-it blocks POST, service workers, WebSockets, popups and downloads. Text snapshots
-skip image, font and media resources. Rendering has
-a 30-second overall deadline, 64 HTTP requests, 8 MB network/decode limits and a
-2 MB DOM limit. Script resources may use the total 8 MB response budget;
-documents retain the ordinary HTTP response limit. Missing or incompatible
-isolation returns `web_browser_unavailable`.
-Failed or blocked public script, style and data subrequests preserve an acquired
-DOM with concrete diagnostics. Main-document, isolation and worker-protocol
-failures remain errors. Cross-origin reads retain the server's bounded CORS
-headers and remain subject to Chromium's CORS checks.
-Public subrequests carry only the origin of Chromium's actual Referer, with
-paths and queries removed. Real redirect responses and bounded Referrer-Policy
-headers go back to Chromium so it applies the source policy at each hop; each
-hop still passes the public URL, address and resource budget checks.
-macOS reports unavailability before starting a browser because Chromium cannot
-start inside the required outer network sandbox. Verify Linux installation with
-the explicit integration tests below; dependency installation alone does not
-establish working dynamic-page support. This is a snapshot reader, not
-an interactive browser or a login capability.
-
-Direct reads validate every DNS answer, then try at most eight distinct public
-addresses when TCP or TLS setup fails. DNS, TCP, TLS, redirects and response
-reading share the request deadline; each TCP/TLS candidate receives at most
-three seconds within that budget. TLS still verifies the origin hostname and
-certificate. Failed connections are closed, and an HTTP request that has begun
-is never replayed by IP failover. Structured failures distinguish DNS resolution
-and address validation, TCP connection, TLS handshake, HTTP sending and response
-reading through `failure_stage`, with the route in `connection_mode`.
+| 文档 | 内容 |
+| --- | --- |
+| [使用指南](docs/guide.md) | 安装、模型、聊天、连接、权限、记忆、检索与 SDK |
+| [开发指南](docs/development.md) | 代码结构、设计原则、检查命令与贡献流程 |
+| [Ubuntu 部署](DEPLOY_UBUNTU.md) | Linux 沙箱、依赖安装和运行环境 |
 
 ```bash
-uv run agent run "Read https://docs.python.org/3/library/asyncio.html and explain cancellation" \
-  --no-require-workspace-change
-uv run agent chat
+uv run ruff check .
+uv run mypy
+uv run lint-imports
+uv run pytest -q
 ```
 
-CLI search and URL reading are enabled by default. Ask naturally in chat;
-`--no-web-tools` restores approval before each network call. With no search key,
-`web_search` uses Bing's public search page on Linux and macOS. This requires
-no search API key, but results depend on the upstream service's availability,
-relevance and limits. Verification pages and unexpected markup return clear
-failures; the Agent never solves verification challenges or treats them as results.
+欢迎通过 Issue 描述问题或提交 PR。问题报告请附平台、Python 版本、启动命令和脱敏错误信息；运行与恢复日志也应先检查是否含有个人资料。
 
-General search can also use Tavily or Brave Search. Provision the chosen service's API key in a protected regular
-file outside the workspace, owned by the current user or root with mode `0400`
-or `0600`. Supply the file path, never the key itself:
-
-```bash
-uv run agent run "Find primary sources about Python task cancellation" \
-  --allow-web-tools --no-require-workspace-change \
-  --web-search-key-file /absolute/private/path/search.key
-uv run agent recover --last --action allow_once \
-  --web-search-key-file /absolute/private/path/search.key
-
-# Tavily: explicitly select the service so its key is never sent to Brave.
-uv run agent chat --model deepseek-flash \
-  --web-search-provider tavily \
-  --web-search-key-file /absolute/private/path/tavily.key
-```
-
-`--web-search-provider` accepts `bing`, `brave`, or `tavily`. Without this option,
-the existing default remains Bing with no key and Brave with a key. Explicit
-Tavily/Brave selection requires a key file; Bing rejects a supplied key. Invalid
-configuration fails before model requests rather than falling back to another service.
-`PRAXIS_WEB_SEARCH_PROVIDER` and `PRAXIS_WEB_SEARCH_KEY_FILE` are alternative CLI
-configuration, including for `run`, `chat`, `resume`, and `recover`. Resuming a paused Turn
-requires the original search service and its credential; a key is not stored in checkpoints.
-
-Tavily uses its official `POST https://api.tavily.com/search` endpoint with Bearer
-authentication. Each uncached request selects `search_depth=basic` (1 API credit)
-and disables automatic parameter selection, generated answers, raw content and
-images. Results map to the same title/URL/snippet contract; private URLs and
-credential-echoing responses are rejected or omitted. Freshness maps to Tavily's
-day/week/month/year preference and does not verify publication dates. Requests
-reuse the public DNS checks, proxy selection, 20-second deadline and 2 MB wire/decoded
-response limits. Authenticated API redirects are rejected. This API POST capability
-is not exposed as a page action: `web_fetch` and its browser broker remain GET-only.
-Authentication, quota and other HTTP failures report the actual status, with no
-automatic retry or switch to Bing/Brave. See [Tavily search](https://docs.tavily.com/documentation/api-reference/endpoint/search)
-and [credits](https://docs.tavily.com/documentation/api-credits).
-
-In the SDK, configure
-`Agent(web_search_provider="tavily", web_search_key_file="/absolute/private/path/tavily.key")`
-and pass
-`allow_web_tools=True` to `run`, `stream`, or `session`; read-only research also
-uses `require_workspace_change=False`.
-
-For the direct Ubuntu launcher, export only the service and credential **path**
-before starting; `start-deepseek-chat.py` preserves these settings:
-
-```bash
-export PRAXIS_WEB_SEARCH_PROVIDER=tavily
-export PRAXIS_WEB_SEARCH_KEY_FILE=/home/admin/.config/praxis/credentials/tavily.key
-python3 scripts/ubuntu/start-deepseek-chat.py --repo .
-```
-
-The model receives extracted main text, source URLs, hashes and immutable
-`source_id` snapshots. `published_at` is an optional page-declared publication
-date; `fetched_at` is retrieval time. Neither a successful fetch nor a search
-freshness preference establishes that a source is the latest available news.
-Search preserves the backend query and leads without judging semantic relevance.
-Identical title/URL/snippet lists across queries report `previous_query`.
-
-The default excerpt budget is 12,000 bytes (`max_bytes=4096..16000`), with at most
-8 links. Full extracted text stays in the artifact. Numbered lines wrap long
-lines at 512 characters; they are snapshot lines, not original HTML/source-code
-line numbers. Use `source_id` and `start_line=next_line` to continue, or `find`
-for literal text search. Context elision preserves the source metadata and moves
-`next_line` to the first omitted line; `fetch_next_line` records the original
-excerpt boundary. A tool-message `item_id` belongs to `read_context` and must
-never be converted into a webpage `source_id`.
-
-Saved sources remain readable after a restart within the same workspace and
-checkpoint store, with hash verification. Within an active Turn, repeated URLs
-reuse a snapshot; `refresh=true` explicitly refetches. Repeated searches reuse
-results, and identical results across query variants retain the leads with a
-`previous_query` reference. HTTP and rendered snapshots use distinct cache entries.
-This URL/query cache is local to the active Session;
-cross-process continuation uses the persisted `source_id`. `source_truncated`
-means the extraction limit was reached; continuation cannot recover discarded
-content. Link labels and snippets are discovery leads until the linked body is
-read. The query is passed unchanged to the backend; tools do not parse query
-language or classify pages by login/loading text or navigation proportions.
-Received bounded responses are archived before parsing. Extraction errors retain
-a source ID for `view=raw` inspection, and empty extracted text reports only
-that fact. Legacy quality labels remain parseable but do not control reads.
-Context references preserve source identity, cursors, read mode, archive item ID
-and actual errors. Upstream search ranking and unfamiliar DOM layouts remain
-limitations.
-
-Run `uv run python scripts/agent_web_quality.py` for the fixed-page extraction,
-model-output budget, evidence-retention and continuation acceptance checks,
-including raw evidence after extraction failure and query/page counterexamples.
-These deterministic checks do not establish real-model task completion.
-Manual paired real-model trials use the public SDK and reuse the code benchmark's
-subprocess cleanup, diffs and redacted logs. They are separate from its frozen
-manifest and fast CI. Prepare a local baseline snapshot, then run:
-
-```bash
-git archive HEAD agent_runtime rag configs scripts | tar -x -C /absolute/baseline-snapshot
-uv run python scripts/agent_web_task_trials.py --baseline /absolute/baseline-snapshot \
-  --output /absolute/trial-results --trials 2
-```
-
-Create the baseline directory first. The runner uses configured `deepseek-flash`,
-fixed permissions and budgets, and controlled HTTP fixtures with a real model.
-It checks actual output values and code behavior independently, records runtime
-budget exhaustion separately from provider/network failure, and preserves source
-hashes and checkpoints. macOS dynamic rendering is recorded as unavailable.
-These trials do not establish open-internet search quality or Linux browser task
-completion with a real model. Search backends require separate live inspection.
-CI runs this acceptance separately from the deterministic SDK smoke.
-Rendering reports concrete blocked subactions and resource counts while retaining
-an acquired DOM, including when a load-state deadline expires. Missing main
-documents, invalid worker messages and unavailable isolation remain failures.
-The overall deadline kills the worker and its descendants. Request and byte
-limits remain fixed. Browser requests do not forward cookies, authorization or
-Origin headers; bounded server CORS response headers are preserved as received.
-No CORS permission is fabricated. A server requiring an Origin request header
-may therefore behave differently from an ordinary browser.
-Run browser isolation/integration tests explicitly with
-`PRAXIS_TEST_BROWSER=1 uv run --extra browser pytest -q tests/agent/test_web_browser.py`.
-
-Authorization applies to these two built-in tools. With `--no-web-tools`, or
-without SDK authorization, network calls
-pause for approval before DNS or HTTP; shell and MCP permissions are separate.
-Each Turn permits at most 32 network tool attempts; each fetch has a 20-second
-network deadline, five redirects, and 2 MB encoded/decoded body limits. In direct
-mode, public addresses are checked at each connection and redirect. TLS remains verified.
-Queries and URL parameters leave the machine. External pages are untrusted
-evidence; granting web access is not protection against all prompt injection or
-private-data disclosure.
-
-Web proxy configuration is read once when `Agent` is created. Precedence is
-`--web-proxy` / `Agent(web_proxy_url=...)`, `PRAXIS_WEB_PROXY`, `https_proxy`,
-`HTTPS_PROXY`, `http_proxy`, then `HTTP_PROXY`. Without a configured proxy the
-client retains strict direct connections. `NO_PROXY` (lowercase takes precedence)
-accepts comma/space-separated hosts, domain suffixes, optional ports, or `*`;
-matching URLs use strict direct connections, including after redirects.
-SOCKS/`ALL_PROXY` is not supported. Proxy endpoints must use HTTP(S), with no
-credentials, path, query or fragment. Workspace files cannot configure the proxy.
-
-```bash
-uv run agent chat --model deepseek-chat --web-proxy http://127.0.0.1:7892
-uv run agent chat --model deepseek-chat --web-proxy direct
-```
-
-The explicit proxy endpoint may be local, but private literal target URLs and
-invalid redirects remain blocked. **Trusted proxy mode delegates hostname
-resolution and final destination-IP enforcement to the upstream proxy.** A
-public-looking hostname can still resolve privately there; ordinary URL checks
-do not establish public-only egress. Use an upstream with destination-IP controls
-when that boundary is required. Direct DNS pinning is not claimed for proxy mode.
-Proxy failures never silently fall back to direct access. Approval, tool budgets,
-TLS verification, body limits and snapshot continuation use the same canonical
-tool path in both modes. Tool results identify `connection_mode` and
-`failure_stage` without exposing the proxy endpoint. `nonpublic_address` means
-direct DNS validation failed before a website response, not that a repository is
-private, nonexistent or misspelled. Restart the CLI to pick up changed proxy
-environment variables; resumed sessions use the new caller's network configuration.
-
-Web reads save a versioned snapshot containing the bounded original response,
-its SHA-256 hash, extracted text, positioned links and a heading index. Existing
-version-1 snapshots remain readable; they have no raw response or link positions.
-HTML semantic documents retain code, tables and image alt text. Pages without a
-semantic document use structural selection and Trafilatura with a paragraph
-retention check. Markdown is parsed with CommonMark for navigation while its
-source text remains unchanged. These transformations are not a guarantee that
-all page information was recovered; `view="raw"` can inspect original UTF-8 text.
-
-`web_fetch` accepts `view="outline"` with `start_section` / `next_section` for
-heading navigation, `section_id` for bounded section reads, and `view="links"`
-with `start_link` / `next_link` to browse saved links. Links carry stable IDs;
-HTML `[label][L1]` markers correspond to `links.id=1`. Excerpt links come from
-actual occurrences, not text-label matching. `links_truncated` reports omitted
-excerpt links. Continue content with `start_line=next_line`; preserve `section_id`
-or `view="raw"` when continuing those reads. Numbered lines belong to the saved
-view, wrap at 512 characters, and must not be cited as original source-file lines.
-The navigation map is limited to 200 links; `source_links_truncated` distinguishes
-that extraction limit from an excerpt's shorter link list.
-
-`max_tokens` (default 6,000, range 1,000–16,000) bounds the complete model tool
-message, including its JSON envelope, links and headings. `token_count_source`
-identifies the bundled reference tokenizer estimate, not provider billing; if
-that tokenizer is unavailable, UTF-8 bytes are counted conservatively. The
-existing `max_bytes` and network/parser limits remain separate resource bounds.
-Canonical results retain diagnostic metadata; successful model messages omit
-network counters and empty error fields. A too-small budget returns an explicit
-error rather than silently advancing past unread lines. The raw response is kept
-in the existing artifact store and is never injected into model context by default.
-
-## Optional RAG
-
-Install the knowledge dependencies with `uv sync --locked --extra rag`.
-
-The `rag` package and CLI handle ingestion, retrieval, storage, and diagnostics.
-They are an optional provider boundary beneath Praxis—not an alternate Agent API.
-An ordinary `agent run` does not initialize embedding, reranking, vector storage,
-or knowledge services.
-
-Attach private knowledge explicitly with a lazy provider:
-
-```python
-import asyncio
-
-from agent_runtime import Agent, RAGKnowledgeConfig
-
-
-async def main() -> None:
-    knowledge = RAGKnowledgeConfig(
-        storage_root="data/indexes/private_docs_v1",
-        vector_backend="milvus",
-        vector_collection_prefix="private_docs_v1",
-    )
-    agent = Agent(workspace_path=".", knowledge=knowledge)
-    result = await agent.run(
-        "Find the relevant policy evidence and summarize it.",
-        require_workspace_change=False,
-    )
-    print(result.answer)
-
-
-asyncio.run(main())
-```
-
-The RAG runtime initializes only when the model first calls the knowledge tool.
-Index maintenance stays on the optional `rag` command:
-
-```bash
-uv run --extra rag rag --help
-```
-
-See the runbook (local-only) for service and private-document workflows.
-
-## MCP connections
-
-Register the official read-only GitHub remote connection using your existing GitHub CLI login:
-
-```bash
-agent mcp add github
-agent mcp check github
-agent chat
-```
-
-Other Streamable HTTP services use `agent mcp add NAME --url URL --bearer-token-env-var ENV`.
-See [MCP connection setup](docs/mcp.md) for credentials, permissions, and supported platforms.
-
-## Safety and limitations
-
-Configure filesystem read/write/deny rules, tool approvals, network destinations,
-administrator ceilings, and live session revocation through the shared CLI/SDK
-[permission policy](docs/permissions.md). Inspect without a model using
-`agent permissions`, or select a policy with `agent chat --permissions FILE`.
-
-Praxis targets a **trusted-local macOS/Python workspace**. Its controls reduce
-accidental or unapproved effects; they do not turn hostile code, a malicious
-repository, or an untrusted operator into a safe workload.
-
-- Read/execute and workspace-write capabilities are distinct. Writes and command
-  execution can require approval; `.git` mutations remain outside the default
-  workspace-write boundary.
-- On macOS, `run_command` and `execute_python` use `/usr/bin/sandbox-exec`
-  with a Seatbelt profile. On Linux they use `/usr/bin/bwrap` (Bubblewrap),
-  read-only and disconnected by default. Approved `network=true` uses libseccomp
-  to retain local IPC isolation. Approved `workspace_write=true` runs in a private
-  candidate workspace; only a successful command whose entire diff passes current
-  permissions, protected-path and concurrency checks publishes its edits.
-  Candidate ordinary-file content is limited to 64 MiB; protected metadata and
-  dependency trees remain read-only. Linux external writes and unrepresentable
-  policies fail closed. See [Ubuntu deployment](DEPLOY_UBUNTU.md) and
-  [server model credentials and startup](SERVER_MODELS.md).
-  Missing backends are unavailable (`sandbox_unavailable`); setup failures
-  never fall back to unrestricted execution. The fake sandbox fixtures are
-  test-only and are not safety evidence.
-- `inspect_data_file` returns bounded previews, structural validity, and a
-  runtime-computed SHA-256. That proves which artifact was inspected; it does
-  not by itself prove that a formula, statistical method, or business conclusion
-  is semantically correct.
-- RAG evidence quality depends on parsing, indexing, retrieval configuration, and
-  the source documents. A citation is traceability, not automatic truth.
-- Model and provider availability is external infrastructure. Timeouts, quota,
-  authentication failures, and malformed responses are reported separately from
-  task quality.
-- Checkpoints may contain bounded task metadata and sanitized tool observations;
-  they are local state and should be protected like the workspace.
-- This repository is not a multi-tenant remote execution service, and the current
-  evidence does not establish that deployment boundary.
-
-## Development gates and deeper documentation
-
-The repository's local and CI gates check formatting, types, imports, tests,
-buildability, installed-wheel behavior, public CLI/SDK smoke paths, and the
-deterministic demo. Run the same entry points from the checkout:
-
-```bash
-uv sync --locked --all-extras
-uv run --all-extras ruff check .
-uv run --all-extras mypy
-uv run --all-extras lint-imports
-uv run --all-extras pytest -q
-uv build
-uv run python scripts/agent_public_path_benchmark.py validate
-uv run python scripts/agent_model_quality_gate.py validate
-```
-
-Public-path scenarios and the measured model-quality baseline are maintained in
-`tests/agent/fixtures/`. CI requires both validations; a missing asset fails the
-check. These commands validate stored inputs and observations without calling a
-model. The baseline is historical evidence, not acceptance of today's source.
-
-For current real-model public CLI/SDK acceptance, freeze the actual candidate
-(including uncommitted source) outside the checkout and run that snapshot:
-
-```bash
-uv run python scripts/agent_public_path_benchmark.py freeze \
-  --destination /absolute/candidate
-PYTHONPATH=/absolute/candidate .venv/bin/python \
-  /absolute/candidate/scripts/agent_public_path_benchmark.py run \
-  --model deepseek-flash --env-file /absolute/checkout/.env \
-  --artifacts-root /absolute/acceptance-results --evidence-artifact evidence.json \
-  --max-turns 12 --timeout-seconds 180
-```
-
-Use new candidate/results directories for each run. The snapshot excludes the
-credential file and private evaluation output; execution loads credentials in
-the parent process. Evidence records source/fixture hashes, dirty Git provenance,
-model definition, platform, explicit process budgets and independent checks of
-the final files. It verifies snapshot contents before and after execution.
-Each of five scenarios runs three times, including approval and crash recovery.
-Successful fixed scenarios do not establish arbitrary task or model quality.
-
-Measure history performance without model calls:
-
-```bash
-uv run python scripts/agent_history_benchmark.py --sizes 10 100 1000 5000 \
-  --output /absolute/history-performance.json
-```
-
-`--runtime-root` selects an explicit source snapshot for before/after comparison.
-Per-event metadata uses a versioned canonical-record prefix hash instead of
-serializing all historical projections. Old projection-hash metadata upgrades
-only after full integrity verification and in the same transaction as the new
-event. `projection_hashes()` exposes these versioned metadata digests; a digest
-alone is not proof of projection correctness. `verify()` and Session startup
-still replay canonical records, compare all projection rows and check artifacts.
-Full verification and returning an entire context remain proportional to history.
-
-Local-only material is intentionally excluded from Git: `learn-claude-code/`,
-`docs/`, `artifacts/`, `evals/` and `CLAUDE.md`. Existing local copies remain
-usable. Tests that require those documents or frozen evaluation assets run when
-the assets exist and report explicit skips in a fresh clone; runtime and build
-checks remain required. The maintained acceptance fixtures above are part of the
-source tree and never depend on those local-only directories.
-
-Praxis is available under the [MIT](LICENSE) license.
+采用 [MIT](LICENSE) 许可证。

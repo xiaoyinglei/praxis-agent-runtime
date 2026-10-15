@@ -93,6 +93,21 @@ class Session:
         self._ready_model_id: str | None = None
         self._service_options: dict[str, Any] = {}
         self._memory_task: asyncio.Task[Any] | None = None
+        self._mcp_config_path: Path | None = None
+        self._mcp_catalog_revision: str | None = None
+
+    def connections_changed(self) -> bool:
+        """Report host setup changes; never mutate the tools of an active Turn."""
+        if self._agent is None or not self._agent.enable_workspace_mcp:
+            return False
+        if self._resource_permissions().tool_decision("mcp__*") == "deny":
+            return False
+        from agent_runtime.runtime.mcp import resolve_product_mcp_config
+        from agent_runtime.runtime.mcp_catalog import catalog_revision
+        path = resolve_product_mcp_config(self.workspace_path)
+        return path != self._mcp_config_path or (
+            path is not None and catalog_revision(path) != self._mcp_catalog_revision
+        )
 
     @classmethod
     async def open(
@@ -778,7 +793,11 @@ class Session:
             )
             mcp_tools = await self._stack.enter_async_context(open_trusted_product_mcp_tools(
                 config_path, trust=trust, permissions=policy, permission_provider=mcp_permissions,
+                lazy=True,
             ))
+            from agent_runtime.runtime.mcp_catalog import catalog_revision
+            self._mcp_config_path = config_path
+            self._mcp_catalog_revision = catalog_revision(config_path)
             mcp_trust_binding = {
                 "config_path": str(trust.config_path),
                 "config_source": trust.source,

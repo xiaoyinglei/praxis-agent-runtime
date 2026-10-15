@@ -14,17 +14,21 @@ from agent_runtime.core.runtime_diagnostics import RuntimeDiagnostic
 mcp_app = typer.Typer(no_args_is_help=True)
 
 
-async def check_mcp_connection(name: str, workspace: Path) -> dict[str, object]:
-    """Check one personal connection without invoking a model or MCP tool."""
+async def check_mcp_connection(name: str, workspace: Path, *, config_path: Path | None = None) -> dict[str, object]:
+    """Check one connection; an explicit config path is a host trust decision."""
     from agent_runtime.permission_policy import resolve_permission_sources
     from agent_runtime.runtime.mcp import decide_mcp_config_trust, open_trusted_product_mcp_tools
 
-    config = mcp_admin.user_mcp_config()
+    config = (mcp_admin.user_mcp_config() if config_path is None else config_path).expanduser().resolve()
     policy = resolve_permission_sources(workspace)
-    trust = decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=False)
+    trust = decide_mcp_config_trust(
+        config, workspace_root=workspace, trust_workspace=config_path is not None,
+        trusted_external_configs=() if config_path is None else (config,),
+    )
     diagnostics: list[RuntimeDiagnostic] = []
     async with open_trusted_product_mcp_tools(
         config, trust=trust, permissions=policy, diagnostics=diagnostics, server_names=frozenset({name}),
+        cache_catalog=True,
     ) as tools:
         return {"name": name, "connected": bool(tools), "tools": [tool.definition.name for tool in tools],
                 "diagnostics": [item.model_dump(mode="json") for item in diagnostics]}
@@ -102,10 +106,11 @@ def login(
 def check(
     name: Annotated[str, typer.Argument()],
     workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
+    config: Annotated[Path | None, typer.Option("--config", help="显式信任并检查此 MCP 配置文件")] = None,
 ) -> None:
     """验证认证和工具发现；不调用模型或修改远程数据。"""
     try:
-        result = asyncio.run(check_mcp_connection(name, workspace))
+        result = asyncio.run(check_mcp_connection(name, workspace, config_path=config))
     except (OSError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
     print(json.dumps(result, ensure_ascii=False, indent=2))
