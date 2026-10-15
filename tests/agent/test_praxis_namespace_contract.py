@@ -47,7 +47,9 @@ def _active_contract_files() -> Iterator[Path]:
                 yield path
 
     yield ROOT / "README.md"
-    for optional in (CODING_REFERENCE, ROOT / "docs/RUNBOOK.md"):
+    yield ROOT / "docs/guide.md"
+    yield ROOT / "docs/development.md"
+    for optional in (CODING_REFERENCE,):
         if optional.is_file():
             yield optional
     yield ROOT / "pyproject.toml"
@@ -117,7 +119,8 @@ def test_context_evaluation_runners_remain_active_contracts() -> None:
     active = set(_active_contract_files())
     assert set(_CONTEXT_EVALS.glob("*.py")) <= active
     assert _CONTEXT_EVALS / "README.md" in active
-    assert ROOT / "docs/RUNBOOK.md" in active
+    assert ROOT / "docs/guide.md" in active
+    assert ROOT / "docs/development.md" in active
 
 
 @pytest.mark.skipif(not CODING_REFERENCE.is_file(), reason="Local-only coding reference absent")

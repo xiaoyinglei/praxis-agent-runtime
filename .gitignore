@@ -30,9 +30,14 @@ data/eval/diagnostics/
 brath-claude-code
 docs/superpowers/
 
-# Local-only references, documentation and evaluation material.
+# Local-only references, design history and evaluation material.
 /learn-claude-code/
-/docs/
+/docs/*
+!/docs/guide.md
+!/docs/development.md
+!/docs/assets/
+/docs/assets/*
+!/docs/assets/praxis-demo.gif
 /artifacts/
 /evals/
 /CLAUDE.md

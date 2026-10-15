@@ -12,13 +12,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 README = ROOT / "README.md"
 LICENSE = ROOT / "LICENSE"
+GUIDE = ROOT / "docs" / "guide.md"
 BENCHMARK = ROOT / "docs" / "benchmark.md"
 RUN_RECORD = ROOT / "docs" / "runs" / "deepseek-v4-flash.md"
 MODEL_QUALITY_REPORT = (
     ROOT / "evals" / "model_quality" / "runs" / "2026-08-06-deepseek-v4-flash.json"
 )
 MODEL_QUALITY_RENDERER = ROOT / "scripts" / "render_model_quality_report.py"
-RUNBOOK = ROOT / "docs" / "RUNBOOK.md"
 
 
 def _read(path: Path) -> str:
@@ -28,188 +28,87 @@ def _read(path: Path) -> str:
 
 def test_readme_leads_with_the_approved_praxis_identity_and_demo() -> None:
     readme = _read(README)
-
     assert readme.startswith("# Praxis\n")
-    assert "a trusted-local workspace agent runtime" in readme
+    assert "agent_runtime.Agent" in readme
     assert "scripts/render_praxis_demo.py" in readme
-    assert "DETERMINISTIC DEMO" in readme
-    assert "FAKE MODEL" in readme
+    assert "固定模型响应" in readme
+    assert "不代表真实模型的任务能力" in readme
+    assert "docs/assets/praxis-demo.gif" in readme
 
 
 def test_readme_follows_the_public_product_story() -> None:
     readme = _read(README)
-    ordered_sections = (
-        "## Why Praxis",
-        "## Runtime architecture",
-        "## Current evidence",
-        "## Quickstart",
-        "## Capability map",
-        "## Optional RAG",
-        "## Safety and limitations",
-        "## Development gates and deeper documentation",
-    )
-
-    positions = [readme.index(section) for section in ordered_sections]
-    assert positions == sorted(positions)
-    for concept in ("Turn", "Loop", "ACI", "approval", "checkpoint", "verification"):
+    guide = _read(GUIDE)
+    assert "docs/guide.md" in readme
+    assert "docs/development.md" in readme
+    assert "uv run agent setup" in readme
+    assert "uv run agent chat" in readme
+    for concept in ("Thread", "Turn", "Step", "权限", "审批", "验证"):
         assert concept in readme
-    assert "agent_runtime.Agent" in readme
-    assert "uv run agent" in readme
-    for capability in ("Files and code", "Data and documents", "Private knowledge", "Extensions"):
-        assert capability in readme
-    assert "lazy" in readme.lower()
-    assert "provider boundary" in readme.lower()
     assert "[MIT](LICENSE)" in readme
+    for capability in ("数据与文档", "公网检索", "外部服务", "记忆", "RAG"):
+        assert capability in readme
+    assert "提供方边界按需初始化" in guide
 
 
 def test_readme_scopes_completion_evidence_and_runtime_extensions_truthfully() -> None:
     readme = _read(README)
-    unsupported_extension = "registered " + "tools"
-
-    assert "default modification tasks" in readme
-    assert "Read-only tasks" in readme
+    guide = _read(GUIDE)
+    assert "修改类任务默认要求工作区确实发生变化" in readme
+    assert "只读分析可以直接回答" in readme
     assert "--no-require-workspace-change" in readme
     assert "require_workspace_change=False" in readme
-    assert "Workspace Skills" in readme
-    assert "configured MCP" in readme
-    assert "bounded subagent" in readme
-    assert unsupported_extension not in readme
+    assert "Skills" in guide and "MCP" in guide and "子智能体" in guide
+    assert "预算、权限约束" in guide
 
 
 def test_readme_states_the_real_run_command_platform_boundary() -> None:
     readme = _read(README)
-
-    for boundary in (
-        "/usr/bin/sandbox-exec",
-        "Seatbelt",
-        "fail closed",
-        "unavailable",
-        "fake sandbox",
-        "test-only",
-        "not safety evidence",
-    ):
+    for boundary in ("/usr/bin/sandbox-exec", "Seatbelt", "/usr/bin/bwrap", "Bubblewrap",
+                     "libseccomp", "拒绝执行", "测试桩", "不能代替真实沙箱验证"):
         assert boundary in readme
 
 
 def test_readme_sdk_examples_use_the_real_public_facade() -> None:
-    readme = _read(README)
-    unsupported_result_field = "result." + "final_answer"
-    unsupported_config_loader = "RAGKnowledgeConfig." + "from_file"
-
-    assert "print(result.answer)" in readme
-    assert "RAGKnowledgeConfig(" in readme
-    assert unsupported_result_field not in readme
-    assert unsupported_config_loader not in readme
-    snippets = re.findall(r"```python\n(.*?)```", readme, flags=re.DOTALL)
-    assert len(snippets) == 2
+    documentation = _read(README) + "\n" + _read(GUIDE)
+    assert "print(result.answer)" in documentation
+    assert "RAGKnowledgeConfig(" in documentation
+    assert "result." + "final_answer" not in documentation
+    assert "RAGKnowledgeConfig." + "from_file" not in documentation
+    snippets = re.findall(r"```python\n(.*?)```", documentation, flags=re.DOTALL)
+    assert snippets
     for index, snippet in enumerate(snippets):
-        compile(snippet, f"README.md:python-example-{index}", "exec")
+        compile(snippet, f"public-docs:python-example-{index}", "exec")
 
 
-@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
 def test_model_integration_docs_cover_requirements_registration_and_switching_only() -> None:
-    readme = _read(README)
-    runbook = _read(RUNBOOK)
-    readme_section = readme.split("### Connect and switch models", 1)[1].split(
-        "\n### ",
-        1,
-    )[0]
-    runbook_section = runbook.split("## 接入和切换 chat 模型", 1)[1].split(
-        "## RAG 服务准备",
-        1,
-    )[0]
-
-    required_commands = (
-        "agent model list --source",
-        "agent model show",
-        "agent model add",
-        "agent model update",
-        "agent model probe",
-        "agent model remove",
-        "agent model switch",
-        "--from",
-        "--skip-probe",
-    )
-    for section in (readme_section, runbook_section):
-        assert "agent model trust init" not in section
-        for command in required_commands:
-            assert command in section
-        for requirement in (
-            "OpenAI-compatible",
-            "text delta",
-            "authoritative completion",
-            "tool call",
-            "structured output",
-            "environment variable",
-            "Turn",
-        ):
-            assert requirement in section
-        for model_family in ("Qwen", "Kimi", "DeepSeek"):
-            assert model_family not in section
-        assert "API_KEY=" not in section
-
-    assert "automatically initializes" in readme_section
-    assert "无需手工初始化" in runbook_section
-
-    for section in (readme_section, runbook_section):
-        assert "MODEL_ID" in section
-        assert "MODEL_ALIAS" not in section
-        assert "PROVIDER_MODEL_ID" not in section
-        assert "--provider-model" not in section
-        assert "--context-window-tokens" in section
-        assert section.index("agent model add") < section.index("agent model show")
-        assert section.index("agent model show") < section.index("agent model probe")
+    guide = _read(GUIDE)
+    section = guide.split("## 接入模型", 1)[1].split("### 本地 MLX", 1)[0]
+    for command in ("agent model list --source", "agent model show", "agent model add",
+                    "agent model update", "agent model probe", "agent model remove",
+                    "agent model switch", "--from", "--skip-probe"):
+        assert command in section
+    for requirement in ("OpenAI-compatible", "流式文本增量", "完成状态", "工具调用",
+                        "结构化输出", "环境变量", "Turn"):
+        assert requirement in section
+    assert "无需手工初始化" in section
+    assert "MODEL_ID" in section and "--context-window-tokens" in section
+    assert "MODEL_ALIAS" not in section and "--provider-model" not in section
+    assert section.index("agent model add") < section.index("agent model show")
+    assert section.index("agent model show") < section.index("agent model probe")
+    for model_family in ("Qwen", "Kimi", "DeepSeek"):
+        assert model_family not in section
+    assert "API_KEY=" not in section
 
 
 def test_readme_describes_a_source_only_distribution_without_unearned_claims() -> None:
     readme = _read(README)
-    old_repository = "Private" + "-RAG-Agent"
-    old_import = "rag" + ".agent"
-    old_path = "rag" + "/agent"
-    readiness_claim = "production" + "-ready"
-    personal_path = "/Users/" + "leixiaoying"
-    old_distribution = "`agent-" + "runtime`"
-
     assert "praxis-agent-runtime" in readme
     assert "git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git" in readme
-    assert "source checkout" in readme
-    assert "local build metadata" in readme
-    assert "not published to PyPI" in readme
-    for forbidden in (
-        old_repository,
-        old_import,
-        old_path,
-        readiness_claim,
-        personal_path,
-        old_distribution,
-    ):
+    assert "源码安装" in readme and "尚未发布到 PyPI" in readme
+    for forbidden in ("Private" + "-RAG-Agent", "rag" + ".agent", "rag" + "/agent",
+                      "production" + "-ready", "/Users/" + "leixiaoying", "`agent-" + "runtime`"):
         assert forbidden not in readme
-    unearned_suite_verdict = "30-task suite: " + "PASS"
-    assert unearned_suite_verdict not in readme
-
-
-@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
-def test_runbook_uses_the_praxis_source_checkout_without_personal_paths() -> None:
-    runbook = _read(RUNBOOK)
-    personal_path = "/Users/" + "leixiaoying"
-
-    assert runbook.startswith("# Praxis 运行手册\n")
-    assert "praxis-agent-runtime" in runbook
-    assert "source checkout" in runbook
-    assert "未发布到 PyPI" in runbook
-    assert "cd /path/to/praxis-agent-runtime" in runbook
-    assert personal_path not in runbook
-
-
-@pytest.mark.skipif(not RUNBOOK.is_file(), reason="Local-only documentation or evaluation fixture absent")
-def test_runbook_keeps_builtins_read_only_and_user_models_cli_managed() -> None:
-    runbook = _read(RUNBOOK)
-
-    assert "无需手工编辑 `configs/models.yaml`" in runbook
-    assert "内置模型 ID 是只读层" in runbook
-    assert "版本化的用户注册表" in runbook
-    assert "compare-and-swap" in runbook
-    assert "不保存解析后的值" in runbook
 
 
 @pytest.mark.skipif(
@@ -278,7 +177,7 @@ def test_license_and_live_evidence_pages_are_explicit() -> None:
 
     assert license_text.startswith("MIT License\n")
     assert "Copyright (c) 2026 xiaoyinglei" in license_text
-    assert "records are local-only material" in readme
+    assert "历史评估不代表当前版本" in readme
     assert f"Overall verdict: **{verdict}**" in benchmark
     assert benchmark.startswith("# Agent tool-use reliability benchmark\n")
     assert "not a general coding or reasoning benchmark" in benchmark
