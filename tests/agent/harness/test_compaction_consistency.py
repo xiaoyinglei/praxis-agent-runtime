@@ -63,8 +63,14 @@ def test_single_turn_compacts_and_dispatches(tmp_path: Path):
         )
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
-        assert len([r for r in gateway.requests if ":context-summary:" not in r.request_id]) == 1
+        agent_requests = [r for r in gateway.requests if ":context-summary:" not in r.request_id]
+        assert len(agent_requests) == 1
         assert any(i.kind == "context_compaction" for i in store.list_items(turn.turn_id))
+        provider_input = "\n".join(message.content for message in agent_requests[0].messages)
+        assert "Fix the package; preserve public API." in provider_input
+        assert "Context compaction:" in provider_input
+        assert "x" * 3000 not in provider_input
+        assert any("x" * 3000 in str(item.payload) for item in store.list_context_items(turn.turn_id))
 
 
 def test_durable_boundary_preserves_tool_group(tmp_path: Path):
@@ -426,8 +432,14 @@ def test_retained_successful_tool_result_is_not_clipped(tmp_path: Path):
         assert all(value == content for value in results)
 
 
-def test_resume_after_compaction_commit_does_not_repeat_it(tmp_path: Path):
+@pytest.mark.parametrize("save_prepared_request", [False, True])
+def test_resume_after_compaction_commit_does_not_repeat_it(
+    tmp_path: Path, monkeypatch, save_prepared_request: bool
+):
     database = tmp_path / "r.db"
+    clock = {"current_time": "2031-12-31T23:59:59+00:00", "current_date": "2031-12-31",
+             "timezone": "UTC", "utc_offset": "+00:00"}
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: clock)
     model, gateway = model_for()
     with RolloutStore(database) as store:
         thread, turn = start(store, tmp_path)
@@ -436,17 +448,35 @@ def test_resume_after_compaction_commit_does_not_repeat_it(tmp_path: Path):
         candidate = list(
             manager.compaction_candidates(turn.turn_id, summary="Test summary of the completed findings.")
         )[-1]
-        prepared = model.prepare(
-            HarnessModelRequest(
-                thread_id=thread.thread_id,
-                turn_id=turn.turn_id,
-                messages=candidate.messages,
-                binding_manifest={"model_id": "test-model"},
-            )
+        runner = TurnExecutor(
+            thread_id=thread.thread_id,
+            store=store,
+            model=model,
+            context_manager=manager,
+            completion_gate=Accept(),
         )
+        # Use the execution request boundary, including its frozen clock facts.
+        step = runner.capture_step_context(
+            runner.restore_turn_context(turn.turn_id), step=1, messages=candidate.messages
+        )
+        prepared = asyncio.run(runner._prepare_step(step))
         manager.commit_compaction(candidate)
-        # Simulate process loss after the durable transition, before model preparation is recorded.
+        if save_prepared_request:
+            store.prepare_model_operation(
+                turn_id=turn.turn_id,
+                request_hash=prepared.request_hash,
+                context_hash=prepared.context_hash,
+                tool_hash=prepared.tool_hash,
+                wire_hash=prepared.wire_hash,
+                request_ref=prepared.request_ref,
+            )
+            monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {
+                **clock, "current_time": "2032-01-01T00:00:01+00:00", "current_date": "2032-01-01"
+            })
+        # Process loss after compaction, either before or after saving the Step.
     with RolloutStore(database) as store:
+        assert RolloutContextManager(store).build(turn.turn_id) == candidate.messages
+        model, gateway = model_for()
         runner = TurnExecutor(
             thread_id=thread.thread_id,
             store=store,
@@ -455,11 +485,23 @@ def test_resume_after_compaction_commit_does_not_repeat_it(tmp_path: Path):
             completion_gate=Accept(),
             worker_id="recovered-worker",
         )
-        result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
+        result = asyncio.run(
+            runner.recover_prepared_model(turn_id=turn.turn_id)
+            if save_prepared_request
+            else runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1)
+        )
         assert result.status == "completed"
         assert len([r for r in gateway.requests if ":context-summary:" not in r.request_id]) == 1
         assert sum(i.kind == "context_compaction" for i in store.list_items(turn.turn_id)) == 1
-        assert store.list_model_operations(turn.turn_id)[0].wire_hash == prepared.wire_hash
+        operation = store.list_model_operations(turn.turn_id)[0]
+        assert (operation.request_hash, operation.context_hash, operation.tool_hash, operation.wire_hash) == (
+            prepared.request_hash, prepared.context_hash, prepared.tool_hash, prepared.wire_hash
+        )
+        provider_input = "\n".join(message.content for message in gateway.requests[0].messages)
+        assert "Test summary of the completed findings." in provider_input
+        assert "x" * 3000 not in provider_input
+        assert clock["current_time"] in provider_input
+        assert any("x" * 3000 in str(item.payload) for item in store.list_context_items(turn.turn_id))
 
 
 def test_mid_turn_summary_follows_current_user_in_projection_and_provider_wire(tmp_path: Path):

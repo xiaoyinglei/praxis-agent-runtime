@@ -225,7 +225,7 @@ class ToolOrchestrator:
         revisions = {item["name"]: item["revision"] for item in snapshot["tools"]}
         if call.tool_name in revisions:
             self.restore_tools({call.tool_name: revisions[call.tool_name]})
-        from agent_runtime.harness.services import restore_tool_policy
+        from agent_runtime.tools.permissions import restore_tool_policy
 
         policy = snapshot["binding_manifest"].get("tool_execution_policy", {})
         return self._context_for_turn(turn_id, base=restore_tool_policy(self._execution_context, policy))

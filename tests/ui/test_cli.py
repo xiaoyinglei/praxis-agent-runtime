@@ -359,6 +359,8 @@ def test_agent_run_help_exposes_clean_one_shot_options() -> None:
 
 
 def test_agent_resume_help_uses_persisted_runtime_metadata() -> None:
+    from typer.main import get_command
+
     result = runner.invoke(agent_app, ["resume", "--help"], env={"COLUMNS": "240"})
 
     assert result.exit_code == 0
@@ -366,7 +368,13 @@ def test_agent_resume_help_uses_persisted_runtime_metadata() -> None:
     assert "--agent" not in output
     assert "--model" not in output
     assert "--checkpoint-db" in output
-    assert "Turn ID" in output
+    # Reopening a chat uses its stable thread identity; recovery resumes a Turn.
+    commands = get_command(agent_app).commands
+    resume_params = {param.name: param for param in commands["resume"].params}
+    recover_params = {param.name: param for param in commands["recover"].params}
+    assert "thread_id" in resume_params and "turn_id" not in resume_params
+    assert "会话 ID" in resume_params["thread_id"].help
+    assert "turn_id" in recover_params and "Turn ID" in recover_params["turn_id"].help
 
 
 def test_cli_benchmark_help_defaults_to_new_milvus_backend() -> None:

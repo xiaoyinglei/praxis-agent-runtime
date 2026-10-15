@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -690,6 +691,161 @@ def test_from_env_loads_dotenv_before_resolving_model_config(
 
     os.environ.pop("RAG_AGENT_MODELS_PATH", None)
     os.environ.pop("MIMO_API_KEY", None)
+
+
+@pytest.mark.parametrize("source", ["default", "workspace", "worktree", "default-outside"])
+def test_project_dotenv_loads_only_declared_model_credentials(tmp_path: Path, monkeypatch, source: str) -> None:
+    workspace = tmp_path / "worktree" / "workspace"
+    workspace.mkdir(parents=True)
+    worktree = workspace.parent
+    config_path = tmp_path / "host-models.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "models": {"trusted-model": {"capability": "chat", "provider": "openai_compatible",
+                                       "protocol": "openai_compatible", "base_url": "http://127.0.0.1:19999/v1",
+                                       "context_window_tokens": 8192, "api_key_env": "DECLARED_MODEL_TOKEN"}},
+        "defaults": {"primary_model": "trusted-model"},
+    }))
+    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(config_path))
+    for name in ("PATH", "PRAXIS_CONFIG_DIR", "PRAXIS_MODEL_REGISTRY_PATH", "RAG_AGENT_MODELS",
+                 "DECLARED_MODEL_TOKEN", "UNRELATED_SETTING", "PRAXIS_DISABLE_DOTENV"):
+        monkeypatch.delenv(name, raising=False)
+    marker = tmp_path / "git.marker"
+    bin_path = tmp_path / "bin"
+    bin_path.mkdir()
+    git = bin_path / "git"
+    git.write_text(f"#!/bin/sh\nprintf synthetic > '{marker}'\nprintf '%s\\n' '{worktree}'\n")
+    git.chmod(0o700)
+    parent = tmp_path if source == "default-outside" else worktree if source == "worktree" else workspace
+    env_path = parent / ("custom.env" if source in {"workspace", "worktree"} else ".env")
+    env_path.write_text(
+        f"PATH={bin_path}\nPRAXIS_CONFIG_DIR={workspace / 'planted-personal'}\n"
+        f"PRAXIS_MODEL_REGISTRY_PATH={workspace / 'planted-models.yaml'}\n"
+        f"RAG_AGENT_MODELS={json.dumps(_make_config().model_dump(mode='json'))}\n"
+        "DECLARED_MODEL_TOKEN=synthetic-credential\nUNRELATED_SETTING=ignored\n"
+    )
+    monkeypatch.chdir(parent)
+    registry = ModelRegistry.from_env(
+        **({} if source.startswith("default") else {"env_path": str(env_path)}),
+        workspace=workspace,
+        worktree=worktree if source == "worktree" else None,
+    )
+    assert not marker.exists()
+    assert registry.default_model == "trusted-model"
+    assert os.environ["DECLARED_MODEL_TOKEN"] == "synthetic-credential"
+    assert all(name not in os.environ for name in (
+        "PATH", "PRAXIS_CONFIG_DIR", "PRAXIS_MODEL_REGISTRY_PATH", "RAG_AGENT_MODELS", "UNRELATED_SETTING"
+    ))
+
+
+@pytest.mark.parametrize("disabled, exported", [(False, True), (True, False)])
+def test_project_credential_loading_preserves_host_environment_and_disable_switch(
+    tmp_path: Path, monkeypatch, disabled: bool, exported: bool
+) -> None:
+    config = _make_config()
+    config.models["main"].api_key_env = "DECLARED_MODEL_TOKEN"
+    monkeypatch.setenv("RAG_AGENT_MODELS", config.model_dump_json())
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("DECLARED_MODEL_TOKEN", raising=False)
+    monkeypatch.delenv("PRAXIS_DISABLE_DOTENV", raising=False)
+    if exported:
+        monkeypatch.setenv("DECLARED_MODEL_TOKEN", "host-credential")
+    if disabled:
+        monkeypatch.setenv("PRAXIS_DISABLE_DOTENV", "1")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("DECLARED_MODEL_TOKEN=project-credential\n")
+    ModelRegistry.from_env(workspace=tmp_path, worktree=tmp_path)
+    assert os.environ.get("DECLARED_MODEL_TOKEN") == ("host-credential" if exported else None)
+
+
+def test_public_sdk_project_dotenv_cannot_reclassify_personal_policy_or_mcp(tmp_path: Path, monkeypatch) -> None:
+    from agent_runtime import Agent
+    from agent_runtime.permission_policy import PermissionPolicy
+    from agent_runtime.runtime.mcp import decide_mcp_config_trust
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "host-home"
+    personal = home / ".config" / "praxis"
+    personal.mkdir(parents=True)
+    (personal / "permissions.json").write_text(json.dumps({"profile": "read-only", "network": {"decision": "deny"}}))
+    planted = workspace / "planted-personal"
+    planted.mkdir(mode=0o700)
+    (planted / "permissions.json").write_text(json.dumps({"profile": "trusted-local", "approval": "never",
+                                                         "network": {"decision": "allow"}}))
+    planted_mcp = planted / "mcp_servers.yaml"
+    planted_mcp.write_text("servers: []\n")
+    planted_mcp.chmod(0o600)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setenv("RAG_AGENT_MODELS", _make_config().model_dump_json())
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("PRAXIS_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("PRAXIS_DISABLE_DOTENV", raising=False)
+    (workspace / ".env").write_text(f"PRAXIS_CONFIG_DIR={planted}\nUNRELATED_SETTING=ignored\n")
+    monkeypatch.delenv("UNRELATED_SETTING", raising=False)
+    agent = Agent(workspace_path=workspace, model_session_path=None, managed_permissions=PermissionPolicy())
+    assert agent.effective_permissions().read_only
+    assert [model.id for model in agent.models()] == ["main"]
+    assert [model.id for model in agent.models()] == ["main"]
+    assert agent.effective_permissions().read_only
+    assert agent.effective_permissions().network_decision("https://synthetic.example.invalid") == "deny"
+    assert os.environ.get("PRAXIS_CONFIG_DIR") is None
+    assert os.environ.get("UNRELATED_SETTING") is None
+    with pytest.raises(PermissionError, match="workspace MCP config is not trusted"):
+        decide_mcp_config_trust(planted_mcp, workspace_root=workspace, trust_workspace=False)
+
+
+@pytest.mark.parametrize("alias", ["direct", "directory", "file-chain"])
+def test_explicit_project_env_symlink_does_not_become_host_configuration(
+    tmp_path: Path, monkeypatch, alias: str
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    host_file = tmp_path / "host.env"
+    host_file.write_text("UNRELATED_SETTING=ignored\nDECLARED_MODEL_TOKEN=synthetic-credential\n")
+    (workspace / "custom.env").symlink_to(host_file)
+    selected_directory = workspace
+    if alias == "directory":
+        selected_directory = tmp_path / "workspace-alias"
+        selected_directory.symlink_to(workspace, target_is_directory=True)
+    selected_env = selected_directory / "custom.env"
+    if alias == "file-chain":
+        selected_env = tmp_path / "alias.env"
+        selected_env.symlink_to(workspace / "custom.env")
+    config = _make_config()
+    config.models["main"].api_key_env = "DECLARED_MODEL_TOKEN"
+    monkeypatch.setenv("RAG_AGENT_MODELS", config.model_dump_json())
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    for name in ("UNRELATED_SETTING", "DECLARED_MODEL_TOKEN", "PRAXIS_DISABLE_DOTENV"):
+        monkeypatch.delenv(name, raising=False)
+    ModelRegistry.from_env(env_path=str(selected_env), workspace=workspace, worktree=workspace)
+    assert os.environ.get("UNRELATED_SETTING") is None
+    assert os.environ.get("DECLARED_MODEL_TOKEN") == "synthetic-credential"
+
+
+@pytest.mark.parametrize("alias", ["hardlink", "case"])
+def test_project_env_filesystem_aliases_remain_credential_only(tmp_path: Path, monkeypatch, alias: str) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    project_env = workspace / "custom.env"
+    project_env.write_text("UNRELATED_SETTING=ignored\nDECLARED_MODEL_TOKEN=synthetic-credential\n")
+    if alias == "hardlink":
+        selected_env = tmp_path / "host.env"
+        selected_env.hardlink_to(project_env)
+    else:
+        selected_env = tmp_path / "WORKSPACE" / "custom.env"
+        if not selected_env.exists():
+            pytest.skip("Filesystem has no case alias for this project path")
+        assert selected_env.samefile(project_env)
+    config = _make_config()
+    config.models["main"].api_key_env = "DECLARED_MODEL_TOKEN"
+    monkeypatch.setenv("RAG_AGENT_MODELS", config.model_dump_json())
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    for name in ("UNRELATED_SETTING", "DECLARED_MODEL_TOKEN", "PRAXIS_DISABLE_DOTENV"):
+        monkeypatch.delenv(name, raising=False)
+    ModelRegistry.from_env(env_path=str(selected_env), workspace=workspace, worktree=workspace)
+    assert os.environ.get("UNRELATED_SETTING") is None
+    assert os.environ.get("DECLARED_MODEL_TOKEN") == "synthetic-credential"
 
 
 class TestModelRegistryProperties:

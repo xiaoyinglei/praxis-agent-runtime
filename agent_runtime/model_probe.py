@@ -76,6 +76,7 @@ class ModelProbe:
     ) -> ModelProbeEvidence:
         if not isinstance(level, ProbeLevel):
             raise TypeError("level must be a ProbeLevel")
+        self._registry.load_definition_credentials(definition)
         credential_name = definition.api_key_env
         if credential_name is not None:
             endpoint = normalize_model_endpoint(provider=definition.provider, base_url=definition.base_url,

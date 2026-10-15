@@ -199,6 +199,26 @@ def test_ordinary_chat_hides_unevaluated_status_but_keeps_real_verification(caps
 
 
 @pytest.mark.anyio
+async def test_status_retains_unevaluated_result_after_quiet_chat(tmp_path, monkeypatch, capsys):
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return SimpleNamespace(id="fake-model")
+
+        async def submit(self, message, **kwargs):
+            return _result(answer="ordinary answer")
+
+    commands = iter(["hello", "/status", "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None)
+    output = capsys.readouterr().out
+    assert "ordinary answer" in output
+    assert output.count("验证状态: not_evaluated") == 1
+    assert "任务验收尚未评估" not in output
+
+
+@pytest.mark.anyio
 async def test_chat_loop_reuses_one_session_for_all_submissions(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,
@@ -417,16 +437,20 @@ async def test_invalid_model_id_keeps_current_lists_ids_and_starts_no_turn(
 
 @pytest.mark.anyio
 async def test_new_session_still_cleans_display_after_submit_failure(tmp_path, monkeypatch):
-    class Display:
+    class Display(cli._CLIToolEventDisplay):
         active = False
 
-        def begin_turn(self):
+        def begin_turn(self, *, reset=True):
+            assert not self._context_status  # /new clears the previous chat before submission.
+            super().begin_turn(reset=reset)
             self.active = True
 
         def finish(self):
+            super().finish()
             self.active = False
 
-    display = Display()
+    display = Display(interactive=False)
+    display._render_context_status("previous-chat", "stale context")
 
     class Facade(_SessionFactory):
         workspace_path = tmp_path
@@ -443,6 +467,7 @@ async def test_new_session_still_cleans_display_after_submit_failure(tmp_path, m
     with pytest.raises(RuntimeError, match="submit failed"):
         await cli._chat_facade_loop(Facade(), max_tokens_total=None)
     assert not display.active
+    assert display._started_at is None
 
 
 @pytest.mark.anyio

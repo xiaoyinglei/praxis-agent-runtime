@@ -95,6 +95,7 @@ async def test_completed_answers_enter_native_scrollback_once_and_remain_inspect
 @pytest.mark.anyio
 async def test_saved_messages_replay_in_full_even_when_inspection_view_is_bounded():
     import io
+    import re
 
     from prompt_toolkit.data_structures import Size
     from prompt_toolkit.output.vt100 import Vt100_Output
@@ -111,7 +112,9 @@ async def test_saved_messages_replay_in_full_even_when_inspection_view_is_bounde
     await ui.replay_messages((("user", "saved question"), ("answer", text)))
     rendered = stream.getvalue()
     assert "saved question" in rendered and "begin saved answer" in rendered and "end saved answer" in rendered
-    assert rendered.count("middle saved line") == text.count("middle saved line")
+    # Markdown soft breaks and terminal wrapping may split a phrase across rows.
+    plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", rendered)
+    assert " ".join(plain.split()).count("middle saved line") == text.count("middle saved line")
     assert ui.view.blocks[-1].omitted > 0
     assert all(block.in_scrollback for block in ui.view.blocks)
     await ui.flush_scrollback()
@@ -416,9 +419,12 @@ def test_markdown_inline_and_fenced_code_do_not_force_background_colors():
     assert all("bg:" not in style for style, *_ in fragments)
 
 
-def test_web_references_keep_clickable_targets_without_visible_control_bytes():
+@pytest.mark.parametrize("term", ["xterm-256color", "dumb"])
+def test_web_references_keep_clickable_targets_without_visible_control_bytes(monkeypatch, term):
     from agent_runtime.terminal_app import _markdown
 
+    monkeypatch.setenv("TERM", term)
+    _markdown.cache_clear()
     url = "https://docs.example.org/research?id=123"
     fragments = _markdown(f"A claim from [Original report]({url}).\n\nAgain [the report]({url}).", 80, True)
     visible = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" not in style)
@@ -426,7 +432,10 @@ def test_web_references_keep_clickable_targets_without_visible_control_bytes():
     assert "Original report" in visible and "网页引用" in visible and "docs.example.org" in visible
     assert visible.count("[1]") == 1 and "[2]" not in visible
     assert "\x1b" not in visible and "]8;id=" not in visible and url in visible
-    assert url in controls and "\x1b]8;" in controls
+    if term == "dumb":
+        assert not controls
+    else:
+        assert url in controls and "\x1b]8;" in controls
 
 
 @pytest.mark.parametrize("target", ["file:///tmp/report", "javascript:alert(1)", "mailto:user@example.org"])
