@@ -15,8 +15,6 @@ import pytest
 ROOT = Path(__file__).parents[2]
 SCRIPT_PATH = ROOT / "scripts" / "agent_harness_acceptance.py"
 CASE_RUNNER_PATH = ROOT / "scripts" / "run_harness_acceptance_case.py"
-MANIFEST_PATH = ROOT / "evals" / "harness" / "acceptance_v1.json"
-CONTRACT_PATH = ROOT / "docs" / "design" / "praxis_harness_architecture.md"
 
 
 def _load_module():
@@ -91,11 +89,9 @@ def acceptance_assets(tmp_path: Path) -> AcceptanceAssets:
     return AcceptanceAssets(contract, manifest, repository)
 
 
-@pytest.mark.skipif(not MANIFEST_PATH.is_file(), reason="Local-only documentation or evaluation fixture absent")
-def test_harness_acceptance_entrypoint_and_manifest_exist() -> None:
+def test_harness_acceptance_entrypoints_exist() -> None:
     assert SCRIPT_PATH.is_file()
     assert CASE_RUNNER_PATH.is_file()
-    assert MANIFEST_PATH.is_file()
 
 
 def test_case_runner_writes_evidence_only_after_exact_command_succeeds(

@@ -25,6 +25,7 @@ CHAT_COMMANDS = {
     "/permissions": "查看有效权限；load <文件>、profile <名称>、reload 更新当前策略",
     "/verbose": "切换详细输出",
     "/copy": "复制最近回答的原始 Markdown",
+    "/connections": "打开本机连接管理，由你选择服务并登录",
     "/resume": "选择旧聊天；也可输入完整会话 ID",
     "/exit": "退出",
 }

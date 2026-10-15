@@ -48,6 +48,7 @@ class MCPToolDescriptor:
     idempotent_hint: bool = False
     timeout_seconds: float = 30.0
     execution_revision: str = "server-v1"
+    connection_revision: str = "server-v1"
     endpoint_url: str | None = None
     require_action_approval: bool = False
 

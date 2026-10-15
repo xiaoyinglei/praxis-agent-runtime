@@ -843,7 +843,13 @@ async def _chat_facade_loop(
             return True
 
         async def open_session() -> Session:
-            nonlocal session, model_id
+            nonlocal session, model_id, previous_turn_id
+            changed = getattr(session, "connections_changed", None)
+            if session is not None and callable(changed) and changed():
+                facade.model = session.current_model().id
+                previous_turn_id = current_turn_id
+                await session.close()
+                session = None
             if session is not None:
                 return session
             if selected_chat is not None:
@@ -916,6 +922,12 @@ async def _chat_facade_loop(
                     print(json.dumps(effective.explain(), ensure_ascii=False, indent=2))
                 except (OSError, ValueError) as error:
                     print("权限配置失败: " + safe_terminal_text(str(error)))
+                continue
+            if query == "/connections":
+                if _ui:
+                    await _ui.open_connections()
+                else:
+                    print("请另开终端运行 uv run agent connections，在页面中选择服务并登录。")
                 continue
             if query == "/status":
                 print(f"会话: {selected_chat.thread_id if selected_chat else getattr(session, 'thread_id', '(new)')}")

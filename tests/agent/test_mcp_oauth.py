@@ -291,10 +291,11 @@ async def test_runtime_oauth_discovers_calls_refreshes_and_reconnects(oauth, tmp
 
     monkeypatch.setattr(runtime, "public_http_transport", Transport)
     async with server.session_manager.run():
-        for _ in range(2):
+        for attempt in range(3):
             diagnostics = []
             async with runtime.open_product_mcp_tools(
-                mcp_admin.user_mcp_config(), permissions=resolve_permission_sources(tmp_path), diagnostics=diagnostics
+                mcp_admin.user_mcp_config(), permissions=resolve_permission_sources(tmp_path), diagnostics=diagnostics,
+                cache_catalog=attempt == 0, lazy=attempt == 2,
             ) as tools:
                 assert len(tools) == 1, diagnostics
                 result = await tools[0].run({"message": "connected"})

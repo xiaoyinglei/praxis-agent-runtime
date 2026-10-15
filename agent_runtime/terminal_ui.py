@@ -153,6 +153,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._target: Block | None = None
         self._tool_blocks: dict[tuple[str, str], Block] = {}
         self.turn_id: str | None = None
+        self.connection_required = False
         self._new_answer = True
 
     def begin_turn(self, *, reset: bool = True) -> None:
@@ -199,6 +200,8 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
                 code = result.get("error_code") if isinstance(result, dict) else event.data.get("error_code")
                 if isinstance(code, str) and code:
                     self._target.title += " · " + safe_terminal_text(code)
+                if code == "mcp_connection_required":
+                    self.connection_required = True
                 self._target.title += " · 点击查看记录"
         finally:
             self._target = None
