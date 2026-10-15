@@ -5,7 +5,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.tool import (
@@ -145,6 +145,32 @@ class ToolGuardError(ValueError):
         self.code = code
         self.reason = " ".join(reason.split())[:512]
         super().__init__(self.reason)
+
+
+def restore_tool_policy(
+    context: ToolExecutionContext, saved: Mapping[str, Any], *, restore_session_grants: bool = False,
+) -> ToolExecutionContext:
+    """Restore historical grants subject to current resource and runtime limits."""
+    policy = dict(saved)
+    policy.setdefault("allow_web_tools", False)
+    if "deny_effects" in policy:
+        policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
+    snapshot = policy.pop("permissions", None)
+    current = context.effective_permissions
+    historical = None if snapshot is None else ResolvedPermissions.model_validate(snapshot)
+    if current is not None and historical is not None:
+        policy["permissions"] = current.intersection(historical)
+    elif current is not None:
+        policy["permissions"] = current
+    elif historical is not None:
+        policy["permissions"] = historical
+    for key in ("deny_effects", "denied_tool_names", "require_confirmation_for"):
+        policy[key] = frozenset(policy.get(key, ())) | getattr(context, key)
+    if not restore_session_grants:
+        for key in ("allow_write_tools", "allow_execute_tools", "allow_web_tools", "auto_approve_sandboxed"):
+            if key in policy:
+                policy[key] = policy[key] and getattr(context, key)
+    return replace(context, **policy)
 
 
 def can_use_tool(

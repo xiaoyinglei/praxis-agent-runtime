@@ -199,10 +199,11 @@ async def test_rendered_approval_keeps_buttons_visible_scrolls_and_accepts_mouse
 
 
 @pytest.mark.anyio
-async def test_arrow_selection_and_enter_work_when_mouse_is_disabled():
+@pytest.mark.parametrize("mode", ["inline", "fullscreen"])
+async def test_arrow_selection_and_enter_work_when_mouse_is_disabled(mode):
     selected = []
     with create_pipe_input() as pipe:
-        ui = TerminalChatApp(model="fake", workspace="/tmp", input=pipe, output=DummyOutput())
+        ui = TerminalChatApp(model="fake", workspace="/tmp", ui_mode=mode, input=pipe, output=DummyOutput())
 
         async def conversation():
             selected.append(await ui.choose_approval(pause()))
@@ -210,7 +211,9 @@ async def test_arrow_selection_and_enter_work_when_mouse_is_disabled():
         task = asyncio.create_task(ui.run(conversation))
         try:
             await wait_for(lambda: ui.status == "等待确认")
-            pipe.send_text("\x1bOQ\x1b[A\r")  # F2 disables mouse; Up selects allow, Enter confirms.
+            assert ui.app.mouse_support() == (mode == "fullscreen")
+            # Inline already uses native mouse selection; F2 releases fullscreen reporting.
+            pipe.send_text(("\x1bOQ" if mode == "fullscreen" else "") + "\x1b[A\r")
             await asyncio.wait_for(task, 3)
         finally:
             if not task.done():

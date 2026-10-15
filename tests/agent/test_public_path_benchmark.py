@@ -157,20 +157,43 @@ def test_direct_scenario_uses_public_cli_and_verifies_the_real_workspace_diff(
 
 def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from agent_runtime.harness import RolloutStore
+
     module = _load_module()
-    monkeypatch.setattr(module, "_approval_is_allowed", lambda **_kwargs: True)
     fake_agent = tmp_path / "fake_approval_agent.py"
     fake_agent.write_text(
         "import sys\n"
         "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from agent_runtime.harness import RolloutStore\n"
+        "checkpoint = Path(sys.argv[sys.argv.index('--checkpoint-db') + 1])\n"
         "if sys.argv[1] == 'run':\n"
+        "    assert not Path('approved.txt').exists()\n"
+        "    with RolloutStore(checkpoint) as store:\n"
+        "        thread = store.create_thread(workspace=Path.cwd())\n"
+        "        turn = store.start_turn(thread_id=thread.thread_id, user_message='write after approval',\n"
+        "                                binding_manifest={}, turn_id='turn-approval-1')\n"
+        "        store.request_tool_approval(turn_id=turn.turn_id, operation_id='write-1',\n"
+        "            tool_call_id='call-1', tool_name='write_file', arguments_digest='fixture-digest',\n"
+        "            execution_revision='fixture-v1', idempotent=False, request={}, effects=('write_workspace',))\n"
         "    print('Turn: turn-approval-1')\n"
         "    print('状态: paused')\n"
         "    raise SystemExit(2)\n"
-        "assert sys.argv[1:3] == ['resume', 'turn-approval-1']\n"
-        "Path('approved.txt').write_text('approved-content\\n')\n"
+        "assert sys.argv[1:3] == ['recover', 'turn-approval-1']\n"
+        "assert sys.argv[sys.argv.index('--action') + 1] == 'allow_once'\n"
+        "assert not Path('approved.txt').exists()\n"
+        "with RolloutStore(checkpoint) as store:\n"
+        "    assert len(store.list_turns()) == 1\n"
+        "    assert store.read_turn(sys.argv[2]).status == 'paused'\n"
+        "    store.resolve_tool_approval(turn_id=sys.argv[2], decision='approve')\n"
+        "    operation = store.claim_tool_operation(operation_id='write-1', worker_id='fixture', lease_seconds=30)\n"
+        "    Path('approved.txt').write_text('approved-content\\n')\n"
+        "    assert store.commit_tool_operation_result(turn_id=sys.argv[2], operation_id=operation.operation_id,\n"
+        "        claim_generation=operation.claim_generation, fencing_token=operation.fencing_token,\n"
+        "        status='succeeded', attempt_count=operation.attempt_count, error_code=None,\n"
+        "        requires_reconciliation=False, result={'text': 'written'})\n"
+        "    store.complete_turn(turn_id=sys.argv[2], answer='written')\n"
         "print('Turn: turn-approval-1')\n"
         "print('状态: done')\n",
         encoding="utf-8",
@@ -188,7 +211,7 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
         required_changes=("approved.txt",),
     )
 
-    result, _result_path = module.run_scenario(
+    result, result_path = module.run_scenario(
         scenario,
         repetition=1,
         model="real-model",
@@ -199,6 +222,19 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     assert result["status"] == "passed"
     assert result["turn_id"] == "turn-approval-1"
     assert result["approval_count"] == 1
+    stdout = (result_path.parent / "agent.stdout").read_text(encoding="utf-8")
+    assert stdout.count("Turn: turn-approval-1") == 2
+    assert "状态: paused" in stdout
+    assert "状态: done" in stdout
+    with RolloutStore(result_path.parent / "rollout.sqlite3") as store:
+        assert len(store.list_turns()) == 1
+        assert store.read_turn("turn-approval-1").status == "completed"
+        [approval] = store.list_approvals("turn-approval-1")
+        assert approval.status == "approved"
+        [operation] = store.list_tool_operations("turn-approval-1")
+        assert operation.status == "succeeded"
+        assert operation.attempt_count == 1
+        assert store.verify().valid
 
 
 def test_resume_does_not_approve_a_pause_outside_the_allowed_effects(

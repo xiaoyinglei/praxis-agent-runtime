@@ -129,6 +129,15 @@ use a private file outside the workspace, denied to Agent tools and sandboxes.
 See [first-run setup](docs/setup.md) for custom endpoints, repeat runs, and
 credential precedence.
 
+Project `.env` files supply only credentials named by validated model definitions
+(`api_key_env`). Configure model catalogs, personal permissions, MCP settings,
+and the execution environment through host environment variables. SDK callers
+may explicitly select an env file outside both the workspace and worktree for
+host configuration. This requires a canonical path without symlinks and a file
+without hard-link aliases; linked paths supply credentials only.
+Existing environment variables take precedence;
+`PRAXIS_DISABLE_DOTENV=1` disables dotenv loading.
+
 Praxis accepts a secret-free model definition and reads any credential through
 the named environment variable or the endpoint-bound personal credential store
 at runtime. For full Agent behavior, an endpoint

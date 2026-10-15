@@ -22,7 +22,12 @@ from agent_runtime.core.llm_config import (
     ModelSpec,
     normalize_model_endpoint,
 )
-from agent_runtime.model_config_io import discover_git_worktree, load_model_yaml
+from agent_runtime.model_config_io import (
+    UntrustedConfigPathError,
+    discover_git_worktree,
+    load_model_yaml,
+    validate_user_config_path,
+)
 from agent_runtime.model_definition import (
     ModelCapabilities,
     ModelExecutionDefinition,
@@ -129,6 +134,7 @@ class ModelRegistry:
             str,
             ResolvedModel,
         ] = {}
+        self._credential_env_path: Path | None = None
 
     @property
     def default_model(self) -> str:
@@ -189,11 +195,30 @@ class ModelRegistry:
         workspace: Path | None = None,
         worktree: Path | None = None,
     ) -> ModelRegistry:
-        _load_env_file(Path(env_path))
+        # Establish host paths before a project file can contribute credentials.
         resolved_workspace = (workspace or Path.cwd()).expanduser().resolve()
         resolved_worktree = (
             discover_git_worktree(resolved_workspace) if worktree is None else worktree.expanduser().resolve()
         )
+        selected_env_path = Path(env_path).expanduser().absolute()
+        resolved_env_path = selected_env_path.resolve()
+        # Host configuration requires a directly selected file, without links
+        # that could cross project-controlled intermediate paths.
+        host_env = Path(env_path) != Path(".env") and not any(
+            path.is_symlink() for path in (selected_env_path, *selected_env_path.parents)
+        )
+        if host_env:
+            try:
+                validate_user_config_path(
+                    selected_env_path, workspace=resolved_workspace, worktree=resolved_worktree
+                )
+            except UntrustedConfigPathError:
+                host_env = False
+            else:
+                host_env = not selected_env_path.is_file() or selected_env_path.stat().st_nlink == 1
+        if host_env:
+            # An explicitly selected host file may provide configuration overrides.
+            _load_env_file(resolved_env_path)
         config, origins = cls._load_effective_config(
             workspace=resolved_workspace,
             worktree=resolved_worktree,
@@ -208,7 +233,25 @@ class ModelRegistry:
                     "fallback_model": default_model,
                 }
             )
-        return cls(config, origins=origins)
+        registry = cls(config, origins=origins)
+        registry._credential_env_path = resolved_env_path
+        if not host_env:
+            _load_env_file(resolved_env_path, allowed_names=frozenset(
+                definition.api_key_env for definition in registry._definitions.values()
+                if definition.api_key_env is not None
+            ))
+        return registry
+
+    def load_definition_credentials(self, definition: ModelExecutionDefinition) -> None:
+        """Load only the credential named by a host-provided, validated candidate.
+
+        A registration candidate may not yet be in the catalog. Its declaration
+        authorizes this one credential without promoting the selected project
+        env file into a source of process or personal configuration.
+        """
+        normalized = ModelExecutionDefinition.model_validate(definition.model_dump(mode="python", exclude_none=False))
+        if self._credential_env_path is not None and normalized.api_key_env is not None:
+            _load_env_file(self._credential_env_path, allowed_names=frozenset({normalized.api_key_env}))
 
     @classmethod
     def _load_effective_config(
@@ -858,7 +901,7 @@ def _user_definition_to_model_spec(
     return ModelSpec.model_validate(definition.model_dump(mode="python", exclude_none=True))
 
 
-def _load_env_file(path: Path) -> None:
+def _load_env_file(path: Path, *, allowed_names: frozenset[str] | None = None) -> None:
     if os.environ.get("PRAXIS_DISABLE_DOTENV") == "1":
         return
     if not path.is_file():
@@ -869,7 +912,7 @@ def _load_env_file(path: Path) -> None:
             continue
         key, raw_value = stripped.split("=", maxsplit=1)
         key = key.strip()
-        if not key or key in os.environ:
+        if not key or key in os.environ or (allowed_names is not None and key not in allowed_names):
             continue
         os.environ[key] = _parse_env_value(raw_value.strip())
 

@@ -130,22 +130,29 @@ def _done_result():
     )
 
 
-def test_nonverbose_cli_shows_unvalidated_research_even_after_streaming(capsys):
+def test_streamed_cli_keeps_unevaluated_status_in_verbose_output(capsys):
     _display_agent_result(_done_result(), verbose=False, answer_streamed=True)
+    assert "not_evaluated" not in capsys.readouterr().out
+    _display_agent_result(_done_result(), verbose=True, answer_streamed=True)
     assert "not_evaluated" in capsys.readouterr().out
 
 
-def test_terminal_chat_retains_unvalidated_status_when_execution_is_hidden():
+def test_terminal_chat_retains_verbose_validation_when_execution_is_hidden():
     view = Conversation()
     with redirect_stdout(_ConversationOutput(view)):
         _display_agent_result(_done_result(), verbose=False, answer_streamed=True, show_execution=False)
+    assert "not_evaluated" not in view.plain_text()
+    with redirect_stdout(_ConversationOutput(view)):
+        _display_agent_result(_done_result(), verbose=True, answer_streamed=True, show_execution=False)
     assert "not_evaluated" in view.plain_text()
 
 
-def test_cli_names_the_narrow_passed_scope(capsys):
+@pytest.mark.parametrize("validation_status", ["passed", "failed"])
+@pytest.mark.parametrize("answer_streamed", [False, True])
+def test_cli_always_names_explicit_validation_and_scope(capsys, validation_status, answer_streamed):
     from dataclasses import replace
-    result = replace(_done_result(), validation_status="passed", validation_scope="workspace_change")
-    _display_agent_result(result, verbose=False)
+    result = replace(_done_result(), validation_status=validation_status, validation_scope="workspace_change")
+    _display_agent_result(result, verbose=False, answer_streamed=answer_streamed)
     output = capsys.readouterr().out
-    assert "passed" in output
+    assert validation_status in output
     assert "workspace_change" in output

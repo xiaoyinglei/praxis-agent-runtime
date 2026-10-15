@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +17,7 @@ from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, Mode
 from agent_runtime.core.llm_registry import ModelRegistry
 from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.model_probe import ModelProbe, ModelProbeError, ProbeLevel
+from agent_runtime.model_registry import UserModelDefinition
 
 
 @dataclass
@@ -425,3 +429,50 @@ async def test_probe_cancellation_closes_the_provider_stream_promptly(
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=0.5)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("disabled, exported", [(False, False), (False, True), (True, False)])
+async def test_probe_candidate_authorizes_only_its_credential_in_selected_project_env(
+    tmp_path: Path, monkeypatch, disabled: bool, exported: bool
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = AgentModelsConfig(models={"existing": ModelSpec(provider=ModelProvider.OLLAMA,
+                                                           context_window_tokens=8192)}, default_model="existing")
+    monkeypatch.setenv("RAG_AGENT_MODELS", config.model_dump_json())
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("CANDIDATE_MODEL_TOKEN", raising=False)
+    monkeypatch.delenv("UNDECLARED_PROBE_SETTING", raising=False)
+    monkeypatch.delenv("PRAXIS_DISABLE_DOTENV", raising=False)
+    env_path = workspace / "custom.env"
+    env_path.write_text("CANDIDATE_MODEL_TOKEN=project-credential\nUNDECLARED_PROBE_SETTING=ignored\n")
+    registry = ModelRegistry.from_env(env_path=str(env_path), workspace=workspace, worktree=workspace)
+    assert os.environ.get("CANDIDATE_MODEL_TOKEN") is None
+    if exported:
+        monkeypatch.setenv("CANDIDATE_MODEL_TOKEN", "host-credential")
+    if disabled:
+        monkeypatch.setenv("PRAXIS_DISABLE_DOTENV", "1")
+    execution = registry.execution_definition_for_user_model("candidate", UserModelDefinition(
+        provider=ModelProvider.OPENAI_COMPATIBLE, base_url="http://127.0.0.1:19999/v1",
+        context_window_tokens=8192, api_key_env="CANDIDATE_MODEL_TOKEN",
+    ))
+    credentials = []
+
+    def resolve(definition):
+        credentials.append(os.environ.get(definition.api_key_env))
+        return SimpleNamespace(generator=SimpleNamespace(list_models=lambda: ["candidate"]))
+
+    monkeypatch.setattr(registry, "resolve_definition", resolve)
+    monkeypatch.setattr(
+        "agent_runtime.model_probe.resolve_model_credential", lambda name, endpoint: os.environ.get(name)
+    )
+    if disabled:
+        with pytest.raises(ModelProbeError, match="authentication"):
+            await ModelProbe(registry).run(execution, level=ProbeLevel.CONNECTIVITY)
+        assert not credentials
+    else:
+        evidence = await ModelProbe(registry).run(execution, level=ProbeLevel.CONNECTIVITY)
+        assert evidence.connectivity_ok
+        assert credentials == ["host-credential" if exported else "project-credential"]
+    assert os.environ.get("UNDECLARED_PROBE_SETTING") is None
