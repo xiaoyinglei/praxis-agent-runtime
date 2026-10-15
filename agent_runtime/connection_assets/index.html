@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Praxis · 连接服务</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<header><a class="brand" href="/">praxis<span>连接服务</span></a><span class="local">● 本机管理</span></header>
+<main>
+<section class="intro"><span class="eyebrow">把工作连接起来</span><h1>你的服务，<br>现在触手可及。</h1>
+<p>连接常用工具，让 Agent 在你授权的范围内访问资料。账号授权在服务商页面完成。</p></section>
+<div id="notice" role="status" aria-live="polite" hidden></div>
+<section aria-labelledby="catalog-title"><div class="section-head"><h2 id="catalog-title">选择服务</h2><span>默认只读 · 随时移除</span></div>
+<div id="catalog" class="catalog"></div></section>
+<section aria-labelledby="connected-title"><div class="section-head"><h2 id="connected-title">已添加的连接</h2><button id="refresh" class="quiet">刷新列表</button></div>
+<div id="connections" class="connections"><p class="muted">正在读取连接…</p></div></section>
+<section class="custom" aria-labelledby="custom-title"><div><span class="eyebrow">更多可能</span><h2 id="custom-title">添加其他 MCP 服务</h2><p>已经有远程服务地址？直接添加连接，无需修改 Agent 代码。</p></div>
+<form id="custom-form">
+<div class="form-row"><label>连接名称<input name="name" placeholder="例如：team_docs" required pattern="[a-z][a-z0-9_]*" maxlength="80"></label>
+<label>服务地址<input name="url" type="url" placeholder="https://mcp.example.com/mcp" required maxlength="2048"></label></div>
+<label>认证方式<select name="auth"><option value="oauth">浏览器登录 OAuth</option><option value="environment">已有 Token 环境变量</option><option value="none">无需认证</option></select></label>
+<label id="token-field" hidden>Token 环境变量名<input name="bearer_token_env_var" placeholder="例如：DOCS_TOKEN"><small>填写变量名；请在启动 Agent 的终端提供实际 Token。</small></label>
+<details id="oauth-options"><summary>OAuth 高级选项</summary><label>Client ID（服务商要求时填写）<input name="oauth_client_id"></label>
+<label>本机回调端口（0 自动选择）<input name="oauth_callback_port" type="number" min="0" max="65535" value="0"><small>预先登记 Client ID 时，可将 http://127.0.0.1:端口/callback 登记为回调地址。</small></label>
+<label>授权范围（空格分隔）<input name="oauth_scopes" placeholder="例如：read"></label>
+<label>额外认证域名（逗号分隔）<input name="oauth_allowed_domains" placeholder="例如：auth.example.com"><small>仅在服务将认证委托给其他域名时填写。</small></label></details>
+<label class="check"><input name="allow_actions" type="checkbox">允许服务动作；非只读工具仍须单独审批</label>
+<button type="submit" class="primary">添加并连接 <span aria-hidden="true">↗</span></button>
+</form></section>
+<footer>连接保存在这台电脑的个人配置中。移除本机连接不会撤销服务商侧授权；可前往服务商设置撤销。</footer>
+</main></body></html>

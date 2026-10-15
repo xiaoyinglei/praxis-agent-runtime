@@ -378,3 +378,91 @@ async def test_real_policy_namespace_cannot_be_replaced_by_ancestor_rename(tmp_p
         command="printf ok > ordinary-output", workspace_write=True), termination_grace_seconds=0.1)
     assert ordinary.exit_code == 0, ordinary.stderr
     assert (workspace.root / "ordinary-output").read_text() == "ok"
+
+
+def test_linux_write_grants_respect_revocation_and_external_boundaries(tmp_path: Path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = configured_workspace(tmp_path, filesystem=(PathRule(path=str(external), access="write"),))
+    ceiling = PermissionPolicy(filesystem=(PathRule(path=str(external), access="read"),)).resolve(workspace.root)
+    effective = workspace.permissions.intersection(ceiling)
+    argv = shell._linux_sandbox_argv(
+        workspace_root=workspace.root, temporary_root=workspace.scratch,
+        additional_read_roots=(), allow_workspace_write=True, permissions=effective)
+    mounts = [tuple(argv[i:i + 3]) for i, arg in enumerate(argv) if arg in {"--bind", "--ro-bind"}]
+    assert ("--ro-bind", str(workspace.root), str(workspace.root)) in mounts
+    assert ("--ro-bind", str(external), str(external)) in mounts
+    assert ("--bind", str(external), str(external)) not in mounts
+
+
+def test_linux_readonly_ceiling_overrides_explicit_write(tmp_path: Path):
+    workspace = configured_workspace(tmp_path)
+    effective = workspace.permissions.intersection(PermissionPolicy(profile="read-only").resolve(workspace.root))
+    argv = shell._linux_sandbox_argv(
+        workspace_root=workspace.root, temporary_root=workspace.scratch,
+        additional_read_roots=(), allow_workspace_write=True, permissions=effective)
+    assert ["--bind", str(workspace.root), str(workspace.root)] not in [argv[i:i + 3] for i in range(len(argv))]
+
+
+def test_linux_candidate_publish_rechecks_revoked_permissions(tmp_path: Path):
+    workspace = configured_workspace(tmp_path)
+    before = workspace.permissions
+    (workspace.root / "original.txt").write_text("before")
+    view = tmp_path / "view"
+    initial, protected = shell._prepare_linux_workspace_view(workspace, view)
+    (view / "original.txt").write_text("after")
+    workspace.permission_provider = lambda: PermissionPolicy(profile="read-only").resolve(workspace.root)
+    with pytest.raises(ValueError, match="permission"):
+        shell._commit_linux_workspace_view(workspace, view, initial, protected, before)
+    assert (workspace.root / "original.txt").read_text() == "before"
+
+
+def test_linux_external_write_request_fails_closed(tmp_path: Path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = configured_workspace(tmp_path, filesystem=(PathRule(path=str(external), access="write"),))
+    with pytest.raises(ValueError, match="outside the workspace"):
+        shell._linux_sandbox_argv(
+            workspace_root=workspace.root, temporary_root=workspace.scratch,
+            additional_read_roots=(), allow_workspace_write=True, permissions=workspace.permissions)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux Bubblewrap")
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed_python", [False, True])
+async def test_real_linux_external_read_grant_survives_workspace_view(tmp_path: Path, managed_python: bool):
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "data.txt").write_text("authorized")
+    workspace = configured_workspace(tmp_path, filesystem=(PathRule(path=str(external), access="read"),))
+    code = f'from pathlib import Path; Path("result.txt").write_text(Path({str(external / "data.txt")!r}).read_text())'
+    if managed_python:
+        result = await shell._execute_managed_python(
+            workspace, shell.ManagedPythonInput(code=code, workspace_write=True, output_paths=["result.txt"]),
+            termination_grace_seconds=0.1)
+    else:
+        result = await shell._run_command(
+            workspace, shell.RunCommandInput(command="python3 -c " + shlex.quote(code), workspace_write=True),
+            termination_grace_seconds=0.1)
+    assert result.exit_code == 0, result.stderr
+    assert (workspace.root / "result.txt").read_text() == "authorized"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires real Linux Bubblewrap")
+@pytest.mark.anyio
+@pytest.mark.parametrize("managed_python", [False, True])
+async def test_real_linux_readonly_ceiling_blocks_candidate_publication(tmp_path: Path, managed_python: bool):
+    workspace = configured_workspace(tmp_path)
+    policy = workspace.permissions.intersection(PermissionPolicy(profile="read-only").resolve(workspace.root))
+    workspace.permission_provider = lambda: policy
+    code = 'from pathlib import Path; Path("forbidden").write_text("forbidden")'
+    if managed_python:
+        result = await shell._execute_managed_python(
+            workspace, shell.ManagedPythonInput(code=code, workspace_write=True, output_paths=["forbidden"]),
+            termination_grace_seconds=0.1)
+    else:
+        result = await shell._run_command(
+            workspace, shell.RunCommandInput(command="python3 -c " + shlex.quote(code), workspace_write=True),
+            termination_grace_seconds=0.1)
+    assert result.sandbox_error == "sandbox_publish_denied", result.stderr
+    assert not (workspace.root / "forbidden").exists()

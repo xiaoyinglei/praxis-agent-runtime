@@ -18,6 +18,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
+from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
@@ -59,6 +60,7 @@ model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
 agent_app.command("setup")(setup)
+agent_app.command("connections")(connections_command)
 
 
 @agent_app.command("permissions")

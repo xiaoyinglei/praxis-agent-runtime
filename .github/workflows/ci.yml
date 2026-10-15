@@ -18,7 +18,7 @@ jobs:
       - name: Prepare Linux sandbox
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap apparmor python3-venv python3-pip
+          sudo apt-get install -y bubblewrap apparmor libseccomp2 python3-venv python3-pip
           if ! /usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true; then
             if sudo grep -R -q '/usr/bin/bwrap' /etc/apparmor.d; then
               echo 'Existing bwrap AppArmor policy blocks the namespace probe; refusing a second profile.' >&2
@@ -46,7 +46,7 @@ jobs:
         run: |
           uv sync --locked --all-extras
           uv run --all-extras playwright install --with-deps --only-shell chromium
-          PRAXIS_TEST_BROWSER=1 uv run --all-extras pytest -q tests/agent/test_web_browser.py
+          PRAXIS_TEST_BROWSER=1 uv run --all-extras pytest -q tests/agent/test_web_browser.py tests/agent/test_connection_manager_browser.py
       - name: Model service isolation smoke
         run: |
           smoke_wheels="$RUNNER_TEMP/praxis-model-wheels"
@@ -86,11 +86,14 @@ jobs:
           cd "$smoke_root"
           "$smoke_venv/bin/agent" --help
           "$smoke_venv/bin/agent" run --help
+          "$smoke_venv/bin/agent" connections --help
           "$smoke_venv/bin/python" - <<'PY'
           from importlib.metadata import distributions
+          from importlib.resources import files
           import pandas, openpyxl, fitz, scipy, matplotlib
           forbidden = {"docling", "flagembedding", "torch", "transformers", "mlx-lm", "pymilvus"}
           assert forbidden.isdisjoint({d.metadata["Name"].lower() for d in distributions()})
+          assert "连接服务" in files("agent_runtime").joinpath("connection_assets/index.html").read_text()
           PY
           PRAXIS_MODEL_REGISTRY_PATH="$smoke_root/models.yaml" \
             "$smoke_venv/bin/python" "$GITHUB_WORKSPACE/scripts/agent_delivery_smoke.py" --fake-model

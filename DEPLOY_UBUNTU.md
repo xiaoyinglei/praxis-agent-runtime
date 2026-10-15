@@ -1,17 +1,24 @@
 # Ubuntu deployment
 
-The Linux command backend uses `/usr/bin/bwrap` (Bubblewrap). Both
-`run_command` and `execute_python` support **read-only, network-disabled**
-execution. Their private temporary directory is writable. Requests for
-`workspace_write=true` or `network=true` return `sandbox_policy_unsupported`
-before starting the command. Use the dedicated workspace file tools for edits.
-Python computations work; Python-generated workspace artifacts are not yet
-supported on Linux. This is not full parity with the macOS backend.
+The Linux command backend uses `/usr/bin/bwrap` (Bubblewrap). `run_command` and
+`execute_python` default to read-only, disconnected execution with writable
+private scratch. `network=true` requires policy authorization and command-network
+approval, plus `libseccomp.so.2`; its syscall filter blocks Unix IPC, host listeners
+and io_uring sockets while permitting outbound IPv4/IPv6. A domain-filtered policy
+still refuses arbitrary command networking.
 
-This restriction preserves the existing contract: read-only bind mounts cannot
-prevent creation of new reserved `.git`/`.venv` paths in an otherwise writable
-workspace, and sharing the host network would expose more than outbound IP
-connections. Do not bypass the sandbox with a shell wrapper or silent fallback.
+Approved `workspace_write=true` uses a private candidate workspace at the same
+absolute working path. A successful command publishes its validated diff only
+after protected-path, current-permission, alias and host-version checks. Failed,
+timed-out or cancelled commands discard candidate writes. Ordinary input/output
+content is bounded to 64 MiB. Protected metadata, dependencies and Agent state
+remain read-only; new protected paths cannot be published. File replacement is
+atomic, but multi-file publication is not a filesystem transaction. External
+subprocess writes remain unsupported. See [permission semantics](docs/permissions.md).
+
+Missing sandbox/filter support or unrepresentable policies fail closed; no shell
+wrapper or unrestricted fallback is used. Local stdio MCP remains read-only and
+network-disabled on Linux.
 
 ## Optional native Codex patch tool
 
@@ -52,7 +59,8 @@ local workspace contract, not a transactional multiwriter filesystem.
 Native failures can leave earlier valid edits, as on macOS; the result reports
 an error and actual workspace changes. Timeout or cancellation discards the
 private view. Invalid output boundaries are rejected before any host commit.
-The general Linux command/Python sandbox policy remains read-only.
+The general command/Python write path uses the separately validated candidate
+workspace described above.
 
 ## Host preparation
 
@@ -60,7 +68,7 @@ Use a regular user, Python 3.12 or 3.13, Git, uv, and Bubblewrap:
 
 ```bash
 sudo apt-get update
-sudo apt-get install bubblewrap
+sudo apt-get install bubblewrap libseccomp2
 ```
 
 Ubuntu 24.04 may block user namespaces via AppArmor even with bwrap installed.

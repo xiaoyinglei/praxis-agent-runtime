@@ -37,11 +37,21 @@ def add(
     bearer_token_env_var: Annotated[str | None, typer.Option("--bearer-token-env-var")] = None,
     tools: Annotated[list[str] | None, typer.Option("--tool", help="可重复指定工具白名单")] = None,
     read_only: Annotated[bool, typer.Option("--read-only/--allow-actions")] = True,
+    oauth: Annotated[bool, typer.Option("--oauth", help="使用标准浏览器 OAuth 登录")] = False,
+    oauth_client_id: Annotated[str | None, typer.Option("--oauth-client-id")] = None,
+    oauth_callback_port: Annotated[int, typer.Option("--oauth-callback-port", min=0, max=65535)] = 0,
+    oauth_scopes: Annotated[list[str] | None, typer.Option("--oauth-scope")] = None,
+    oauth_domains: Annotated[
+        list[str] | None, typer.Option("--oauth-domain", help="授权 OAuth 使用的额外精确域名"),
+    ] = None,
 ) -> None:
     """注册远程服务及其域名授权；github 默认使用现有 gh 登录。"""
     try:
         config = mcp_admin.register_remote_mcp(name, url=url, bearer_token_env_var=bearer_token_env_var,
-                                               tools=tuple(tools or ()), read_only=read_only)
+                                               tools=tuple(tools or ()), read_only=read_only, oauth=oauth,
+                                               oauth_client_id=oauth_client_id, oauth_scopes=tuple(oauth_scopes or ()),
+                                               oauth_allowed_domains=tuple(oauth_domains or ()),
+                                               oauth_callback_port=oauth_callback_port)
     except (OSError, ValueError) as error:
         raise typer.BadParameter(str(error)) from None
     print(json.dumps({"registered": name, "config": str(config), "read_only": read_only}, ensure_ascii=False))
@@ -51,19 +61,32 @@ def add(
 @mcp_app.command("list")
 def list_connections() -> None:
     """显示个人连接；不读取凭据、不连接远程服务。"""
-    keys = ("name", "transport", "url", "enabled", "read_only", "bearer_token_env_var", "keychain")
+    keys = ("name", "transport", "url", "enabled", "read_only", "bearer_token_env_var", "keychain",
+            "oauth", "oauth_client_id", "oauth_scopes", "oauth_allowed_domains", "oauth_callback_port")
     print(json.dumps([{key: entry[key] for key in keys if key in entry}
                       for entry in mcp_admin.mcp_connections()], ensure_ascii=False, indent=2))
 
 
 @mcp_app.command("login")
-def login(name: Annotated[str, typer.Argument()], from_gh: Annotated[bool, typer.Option("--from-gh")] = False) -> None:
-    """更新 Keychain 凭据；Token 在本机终端隐藏输入，不写入配置。"""
+def login(
+    name: Annotated[str, typer.Argument()],
+    from_gh: Annotated[bool, typer.Option("--from-gh")] = False,
+    callback_port: Annotated[int | None, typer.Option("--callback-port", min=0, max=65535)] = None,
+) -> None:
+    """打开 OAuth 浏览器登录，或隐藏输入并更新本机令牌。"""
     try:
+        entries = [entry for entry in mcp_admin.mcp_connections() if entry["name"] == name]
+        if entries and entries[0].get("oauth"):
+            if from_gh:
+                raise ValueError("OAuth connections cannot use --from-gh")
+            from agent_runtime.mcp_oauth import login_mcp_oauth
+            asyncio.run(login_mcp_oauth(name, callback_port=callback_port))
+            print(f"已完成 {name} OAuth 登录；后续会话自动刷新凭据。")
+            return
         with mcp_admin.configuration_lock():
             entries = [entry for entry in mcp_admin.mcp_connections() if entry["name"] == name]
             if not entries or entries[0].get("transport") != "http" or not entries[0].get("keychain"):
-                raise ValueError("服务须已注册并使用 Keychain 凭据")
+                raise ValueError("服务须已注册并使用本机令牌凭据")
             if from_gh and name != "github":
                 raise ValueError("--from-gh is available for the GitHub connection")
             if from_gh:
@@ -88,3 +111,13 @@ def check(
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not result["connected"]:
         raise typer.Exit(1)
+
+
+@mcp_app.command("remove")
+def remove(name: Annotated[str, typer.Argument()]) -> None:
+    """移除个人连接及其本机凭据；保留可能共享的网络域名授权。"""
+    try:
+        mcp_admin.remove_mcp_connection(name)
+    except (OSError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from None
+    print(f"已移除 {name} 连接及本机凭据。")
