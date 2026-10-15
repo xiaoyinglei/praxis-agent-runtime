@@ -122,6 +122,16 @@ uv run agent setup
 uv run agent chat
 ```
 
+For a browser-based connection catalog and OAuth login, run:
+
+```bash
+uv run agent connections
+```
+
+Choose GitHub, Notion, Linear, or add a custom remote MCP URL. The local page can
+authorize, check, and remove connections. OAuth credentials stay in host storage;
+the Agent runtime refreshes them without opening login pages during a task.
+
 The wizard validates the model using the existing full probe before saving a
 new key or changing the project's selection. It reuses existing environment
 credentials by default. macOS stores new keys in Keychain; other POSIX systems
@@ -955,11 +965,14 @@ repository, or an untrusted operator into a safe workload.
   execution can require approval; `.git` mutations remain outside the default
   workspace-write boundary.
 - On macOS, `run_command` and `execute_python` use `/usr/bin/sandbox-exec`
-  with a Seatbelt profile. On Linux they use `/usr/bin/bwrap` (Bubblewrap) for
-  read-only, network-disabled execution. Linux requests for workspace writes
-  or network access fail closed with `sandbox_policy_unsupported`; Python
-  artifact generation is not yet supported there. Dedicated file tools can
-  still edit workspace files. See [Ubuntu deployment](DEPLOY_UBUNTU.md) and
+  with a Seatbelt profile. On Linux they use `/usr/bin/bwrap` (Bubblewrap),
+  read-only and disconnected by default. Approved `network=true` uses libseccomp
+  to retain local IPC isolation. Approved `workspace_write=true` runs in a private
+  candidate workspace; only a successful command whose entire diff passes current
+  permissions, protected-path and concurrency checks publishes its edits.
+  Candidate ordinary-file content is limited to 64 MiB; protected metadata and
+  dependency trees remain read-only. Linux external writes and unrepresentable
+  policies fail closed. See [Ubuntu deployment](DEPLOY_UBUNTU.md) and
   [server model credentials and startup](SERVER_MODELS.md).
   Missing backends are unavailable (`sandbox_unavailable`); setup failures
   never fall back to unrestricted execution. The fake sandbox fixtures are

@@ -58,6 +58,10 @@ class _HTTPServerConfig:
     headers: Mapping[str, str]
     bearer_token_env_var: str | None
     keychain: bool
+    oauth: bool
+    oauth_client_id: str | None
+    oauth_scopes: tuple[str, ...]
+    oauth_allowed_domains: tuple[str, ...]
     read_only: bool
     tools_allowlist: frozenset[str]
     allow_all_tools: bool
@@ -259,7 +263,8 @@ async def open_product_mcp_tools(
                         continue
                     connection = ({"transport": "http", "url": config.url, "headers": dict(config.headers),
                                    "read_only": config.read_only, "auth": config.bearer_token_env_var,
-                                   "keychain": config.keychain, "credential_revision": credential_revision}
+                                   "keychain": config.keychain, "oauth": config.oauth,
+                                   "credential_revision": credential_revision}
                                   if isinstance(config, _HTTPServerConfig) else
                                   {"transport": "stdio", "command": config.command, "args": config.args,
                                    "env": dict(config.env), "cwd": None if config.cwd is None else str(config.cwd)})
@@ -379,25 +384,28 @@ class _MCPHTTPTransport(httpx.AsyncBaseTransport):
         validate_http_mcp_url(str(request.url))
         if request.headers.get("host", "").casefold() != request.url.netloc.decode("ascii").casefold():
             raise PermissionError("MCP HTTP Host authority must match its configured endpoint")
+        self.check_permissions()
+        response = await self.inner.handle_async_request(request)
+        if response.is_redirect:
+            await response.aclose()
+            raise PermissionError("MCP HTTP redirects are refused; credentials stay at the configured endpoint")
+        if response.status_code in {401, 403} and not self.config.oauth:
+            status = response.status_code
+            await response.aclose()
+            raise PermissionError(f"remote MCP authentication or authorization failed (HTTP {status})")
+        return response
+
+    def check_permissions(self) -> None:
         if hashlib.sha256(self.config_path.read_bytes()).hexdigest() != self.config_revision:
             raise PermissionError("MCP config changed; reconnect before using it")
         current = self.permissions if self.provider is None else self.provider()
         if current is not None and self.permissions is not None:
             current = current.intersection(self.permissions)
         if current is not None:
-            if current.network_decision(str(request.url)) != "allow":
+            if current.network_decision(self.config.url) != "allow":
                 raise PermissionError("remote MCP destination is not preauthorized by current network policy")
             if current.tool_decision(f"mcp__{normalize_mcp_name(self.config.name)}__*") == "deny":
                 raise PermissionError("MCP server denied by current permission policy")
-        response = await self.inner.handle_async_request(request)
-        if response.is_redirect:
-            await response.aclose()
-            raise PermissionError("MCP HTTP redirects are refused; credentials stay at the configured endpoint")
-        if response.status_code in {401, 403}:
-            status = response.status_code
-            await response.aclose()
-            raise PermissionError(f"remote MCP authentication or authorization failed (HTTP {status})")
-        return response
 
     async def aclose(self) -> None:
         await self.inner.aclose()
@@ -416,13 +424,46 @@ async def _http_mcp_streams(config: _HTTPServerConfig, config_path: Path,
     if config.keychain:
         from agent_runtime.mcp_admin import load_mcp_credential
         headers["Authorization"] = "Bearer " + load_mcp_credential(config.name, config.url)
-    transport = _MCPHTTPTransport(config, config_path, permissions, provider)
+    transport: httpx.AsyncBaseTransport = _MCPHTTPTransport(config, config_path, permissions, provider)
+    auth = None
+    if config.oauth:
+        from agent_runtime.mcp_oauth import OAuthHTTPTransport, create_oauth_provider
+        auth = create_oauth_provider({
+            "name": config.name, "url": config.url, "oauth_client_id": config.oauth_client_id,
+            "oauth_scopes": config.oauth_scopes, "oauth_allowed_domains": config.oauth_allowed_domains,
+        })
+        # OAuth has its own endpoint checks. MCP calls still pass through the
+        # existing policy/config-drift guard before reaching the public socket.
+        mcp_transport = cast(_MCPHTTPTransport, transport)
+        def check_oauth_destination(url: str) -> None:
+            mcp_transport.check_permissions()
+            current = permissions if provider is None else provider()
+            if current is not None and permissions is not None:
+                current = current.intersection(permissions)
+            if current is not None and current.network_decision(url) == "deny":
+                raise PermissionError("Current network policy denies OAuth destination")
+
+        auth.destination_check = check_oauth_destination
+        class DispatchTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                if str(request.url) == config.url:
+                    return await mcp_transport.handle_async_request(request)
+                return await oauth_transport.handle_async_request(request)
+
+            async def aclose(self) -> None:
+                await mcp_transport.aclose()
+                await oauth_transport.aclose()
+
+        oauth_transport = OAuthHTTPTransport(auth, public_http_transport())
+        transport = DispatchTransport()
     async with httpx.AsyncClient(
-        transport=transport, headers=headers, timeout=httpx.Timeout(config.startup_timeout_seconds, read=300),
+        transport=transport, headers=headers, auth=auth,
+        timeout=httpx.Timeout(config.startup_timeout_seconds, read=300),
         trust_env=False, follow_redirects=False,
     ) as client:
         async with streamable_http_client(config.url, http_client=client) as streams:
-            yield streams, hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()
+            credential_state = {"headers": headers, "oauth": None if auth is None else auth.storage.read()}
+            yield streams, hashlib.sha256(json.dumps(credential_state, sort_keys=True).encode()).hexdigest()
 
 
 @asynccontextmanager
@@ -594,11 +635,25 @@ def _load_enabled_servers(config_path: Path, *, server_names: frozenset[str] | N
                                           or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env)):
                 raise ValueError("bearer_token_env_var must name an environment variable")
             keychain = _boolean(raw, "keychain", default=False)
-            if token_env is not None and keychain:
-                raise ValueError("choose one bearer credential source")
+            oauth = _boolean(raw, "oauth", default=False)
+            if sum((token_env is not None, keychain, oauth)) > 1:
+                raise ValueError("choose one MCP credential source")
+            if oauth and any(key.casefold() == "authorization" for key in headers):
+                raise ValueError("OAuth cannot be combined with an Authorization header")
+            from agent_runtime.mcp_oauth import validate_oauth_domains
+            oauth_domains = validate_oauth_domains(_string_sequence(
+                raw.get("oauth_allowed_domains", ()), field="oauth_allowed_domains",
+            ))
+            oauth_scopes = _string_sequence(raw.get("oauth_scopes", ()), field="oauth_scopes")
+            client_id = raw.get("oauth_client_id")
+            if client_id is not None and (not isinstance(client_id, str) or not client_id
+                                          or any(ord(c) < 32 for c in client_id)):
+                raise ValueError("oauth_client_id must be nonempty single-line text")
             configs.append(_HTTPServerConfig(
                 name=name, url=url, headers=dict(headers), bearer_token_env_var=token_env,
-                keychain=keychain, read_only=_boolean(raw, "read_only", default=True),
+                keychain=keychain, oauth=oauth, oauth_client_id=client_id,
+                oauth_scopes=oauth_scopes, oauth_allowed_domains=oauth_domains,
+                read_only=_boolean(raw, "read_only", default=True),
                 tools_allowlist=allowlist, allow_all_tools=allow_all, startup_timeout_seconds=timeout,
             ))
             continue

@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import ctypes
+import errno
 import json
 import math
 import os
 import platform
+import secrets
 import shutil
 import signal
+import socket
 import stat
 import sys
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -51,6 +56,11 @@ _BWRAP_PATH = "/usr/bin/bwrap"
 _SANDBOX_PLATFORM = sys.platform
 _PROTECTED_VERIFICATION_DIRECTORIES = frozenset({".venv", "node_modules"})
 _PROTECTED_PERMISSION_DIRECTORIES = frozenset({".git", ".agents", ".codex", ".aws"})
+_LINUX_VIEW_PROTECTED = _PROTECTED_PERMISSION_DIRECTORIES | _PROTECTED_VERIFICATION_DIRECTORIES | {
+    ".praxis", ".agent_memory",
+}
+_LINUX_VIEW_MAX_BYTES = 64 * 1024 * 1024
+_LinuxSnapshot = dict[str, tuple[int, bytes | str, tuple[int, int]]]
 
 
 class RunCommandInput(BaseModel):
@@ -259,7 +269,11 @@ def create_run_command_tool(
         definition=ToolDefinition(
             name="run_command",
             description=(
-                "On Linux, only network=false and workspace_write=false are supported. "
+                "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
+                "Only exit 0 with all path, permission and host-change checks passing publishes changes; "
+                "failure, timeout and cancellation discard them. External writes are unsupported. "
+                "Linux network access requires libseccomp and blocks host Unix/local IPC; "
+                "anonymous stream socketpairs remain available for async event loops. "
                 "Run one shell command inside a restricted OS sandbox from a "
                 "workspace-relative directory. The workspace is read-only by default "
                 "and a private temporary directory is writable. Set "
@@ -292,7 +306,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v8-permission-policy",
+        execution_revision="builtin-run-command-v9-linux-capabilities",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -329,7 +343,11 @@ def create_execute_python_tool(
         definition=ToolDefinition(
             name="execute_python",
             description=(
-                "On Linux, only network=false and workspace_write=false are supported. "
+                "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
+                "Only exit 0 with all path, permission and host-change checks passing publishes changes; "
+                "failure, timeout and cancellation discard them. External writes are unsupported. "
+                "Linux network access requires libseccomp and blocks host Unix/local IPC; "
+                "anonymous stream socketpairs remain available for async event loops. "
                 "Run plain Python source with the managed Praxis interpreter in "
                 "a restricted OS sandbox. Unlike run_command, this works when the "
                 "task workspace has no .venv and does not use shell heredocs. Use "
@@ -355,7 +373,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v4-permission-policy",
+        execution_revision="builtin-execute-python-v5-linux-capabilities",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -414,20 +432,33 @@ async def _run_command(
     with tempfile.TemporaryDirectory(
         prefix="run-command-",
         dir=workspace.scratch,
-    ) as temporary_root:
+    ) as temporary_root, ExitStack() as resources:
         environment = _command_environment(
             workspace_root=workspace.root,
             temporary_root=temporary_root,
         )
+        view = None
+        initial: _LinuxSnapshot = {}
+        protected: set[str] = set()
+        network_filter = None
         try:
+            if _SANDBOX_PLATFORM == "linux":
+                if request.network:
+                    network_filter = resources.enter_context(_linux_network_filter_file())
+                if request.workspace_write:
+                    view = Path(temporary_root) / "workspace-view"
+                    initial, protected = _prepare_linux_workspace_view(workspace, view)
             sandbox_argv = _sandbox_argv(
                 workspace_root=workspace.root,
                 temporary_root=temporary_root,
                 allow_network=request.network,
                 allow_workspace_write=request.workspace_write,
                 permissions=permissions,
+                network_filter_fd=None if network_filter is None else network_filter.fileno(),
+                workspace_view=view,
+                protected_view_paths=sorted(protected),
             )
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             return RunCommandOutput(stdout="", stderr=str(error), exit_code=-1, timed_out=False,
                                     truncated=False, duration_ms=(time.monotonic() - started_at) * 1000,
                                     sandbox_error="sandbox_policy_unsupported")
@@ -441,6 +472,7 @@ async def _run_command(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            pass_fds=() if network_filter is None else (network_filter.fileno(),),
         )
         if process.stdout is None or process.stderr is None:
             raise RuntimeError("command process pipes were not created")
@@ -495,20 +527,28 @@ async def _run_command(
             await asyncio.gather(communication, return_exceptions=True)
             raise
 
+        publish_error = None
+        if view is not None and process.returncode == 0 and not timed_out:
+            try:
+                _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+            except (OSError, ValueError) as error:
+                publish_error = str(error)
         stdout, stdout_truncated = _bounded_stream(stdout_bytes)
         stderr, stderr_truncated = _bounded_stream(stderr_bytes)
+        if publish_error is not None:
+            stderr += ("\n" if stderr else "") + publish_error
         if timed_out and not stderr:
             stderr = "command timed out and its process group was terminated"
         output = RunCommandOutput(
             stdout=stdout,
             stderr=stderr,
-            exit_code=(process.returncode if process.returncode is not None else -1),
+            exit_code=(process.returncode if process.returncode is not None and publish_error is None else -1),
             timed_out=timed_out,
             truncated=stdout_truncated or stderr_truncated,
             duration_ms=(time.monotonic() - started_at) * 1000,
             network_enabled=request.network,
             sandbox_error=(
-                "sandbox_start_failed"
+                "sandbox_publish_denied" if publish_error is not None else "sandbox_start_failed"
                 if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")
                 else None
             ),
@@ -553,7 +593,7 @@ async def _execute_managed_python(
     with tempfile.TemporaryDirectory(
         prefix="run-python-",
         dir=workspace.scratch,
-    ) as temporary_root:
+    ) as temporary_root, ExitStack() as resources:
         script_path = Path(temporary_root) / "praxis_task.py"
         script_path.write_text(request.code, encoding="utf-8")
         runner_path = Path(temporary_root) / "praxis_python_runner.py"
@@ -564,7 +604,17 @@ async def _execute_managed_python(
             temporary_root=temporary_root,
         )
         environment["PYTHONNOUSERSITE"] = "1"
+        view = None
+        initial: _LinuxSnapshot = {}
+        protected: set[str] = set()
+        network_filter = None
         try:
+            if _SANDBOX_PLATFORM == "linux":
+                if request.network:
+                    network_filter = resources.enter_context(_linux_network_filter_file())
+                if request.workspace_write:
+                    view = Path(temporary_root) / "workspace-view"
+                    initial, protected = _prepare_linux_workspace_view(workspace, view)
             sandbox_argv = _sandbox_argv(
                 workspace_root=workspace.root,
                 temporary_root=temporary_root,
@@ -572,8 +622,11 @@ async def _execute_managed_python(
                 allow_workspace_write=request.workspace_write,
                 additional_read_roots=_runtime_python_read_roots(),
                 permissions=permissions,
+                network_filter_fd=None if network_filter is None else network_filter.fileno(),
+                workspace_view=view,
+                protected_view_paths=sorted(protected),
             )
-        except ValueError as error:
+        except (OSError, ValueError) as error:
             return _python_sandbox_error(started_at=started_at, message=str(error), code="sandbox_policy_unsupported")
         process = await asyncio.create_subprocess_exec(
             *sandbox_argv,
@@ -588,6 +641,7 @@ async def _execute_managed_python(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            pass_fds=() if network_filter is None else (network_filter.fileno(),),
         )
         communication = asyncio.create_task(process.communicate())
         timed_out = False
@@ -614,8 +668,16 @@ async def _execute_managed_python(
                 pass
             raise
 
+        publish_error = None
+        if view is not None and process.returncode == 0 and not timed_out:
+            try:
+                _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+            except (OSError, ValueError) as error:
+                publish_error = str(error)
         stdout, stdout_truncated = _bounded_stream(stdout_bytes)
         stderr, stderr_truncated = _bounded_stream(stderr_bytes)
+        if publish_error is not None:
+            stderr += ("\n" if stderr else "") + publish_error
         if timed_out and not stderr:
             stderr = "Python code timed out and its process group was terminated"
         verification = None
@@ -628,7 +690,7 @@ async def _execute_managed_python(
         return ManagedPythonOutput(
             stdout=stdout,
             stderr=stderr,
-            exit_code=(process.returncode if process.returncode is not None else -1),
+            exit_code=(process.returncode if process.returncode is not None and publish_error is None else -1),
             timed_out=timed_out,
             truncated=stdout_truncated or stderr_truncated,
             duration_ms=(time.monotonic() - started_at) * 1000,
@@ -636,7 +698,7 @@ async def _execute_managed_python(
             network_enabled=request.network,
             verification=verification,
             sandbox_error=(
-                "sandbox_start_failed"
+                "sandbox_publish_denied" if publish_error is not None else "sandbox_start_failed"
                 if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")
                 else None
             ),
@@ -759,12 +821,6 @@ def _sandbox_availability_issue(
             f"restricted sandbox is unavailable ({executable}; "
             "Linux requires bubblewrap); refusing unsandboxed execution",
         )
-    if _SANDBOX_PLATFORM == "linux" and (request.network or request.workspace_write):
-        return (
-            "sandbox_policy_unsupported",
-            "Linux currently requires network=false and workspace_write=false; "
-            "use dedicated workspace file tools for edits. No command was executed.",
-        )
     return None
 
 
@@ -876,6 +932,9 @@ def _sandbox_argv(
     allow_workspace_write: bool = False,
     additional_read_roots: Sequence[os.PathLike[str] | str] = (),
     permissions: ResolvedPermissions | None = None,
+    network_filter_fd: int | None = None,
+    workspace_view: Path | None = None,
+    protected_view_paths: Sequence[str] = (),
 ) -> list[str]:
     if _SANDBOX_PLATFORM == "linux":
         return _linux_sandbox_argv(
@@ -883,6 +942,11 @@ def _sandbox_argv(
             temporary_root=temporary_root,
             additional_read_roots=additional_read_roots,
             permissions=permissions,
+            allow_network=allow_network,
+            allow_workspace_write=allow_workspace_write,
+            network_filter_fd=network_filter_fd,
+            workspace_view=workspace_view,
+            protected_view_paths=protected_view_paths,
         )
     return [
         _SANDBOX_EXEC_PATH,
@@ -904,15 +968,19 @@ def _linux_sandbox_argv(
     temporary_root: os.PathLike[str] | str,
     additional_read_roots: Sequence[os.PathLike[str] | str],
     permissions: ResolvedPermissions | None = None,
+    allow_network: bool = False,
+    allow_workspace_write: bool = False,
+    network_filter_fd: int | None = None,
+    workspace_view: Path | None = None,
+    protected_view_paths: Sequence[str] = (),
 ) -> list[str]:
-    """Expose only the runtime, a read-only workspace and private scratch.
+    """Keep host grants read-only; optional writes target a private candidate.
 
-    Do not bind the host root or home directory. Network namespaces also
-    isolate abstract Unix sockets; pathname sockets in the workspace are
-    rejected by preflight because read-only mounts do not block connect().
-    Explicit external grants are read-only; denies inside exposed roots and
-    broad host-root grants fail closed because their exact semantics cannot
-    be represented by these bind mounts.
+    Sharing networking requires a seccomp filter which allows only IPv4/IPv6
+    sockets, permits only anonymous Unix stream socketpairs for self-pipes,
+    denies io_uring and listeners, and rejects other syscall ABIs.
+    Without it abstract Unix sockets would expose host IPC through --share-net.
+    Denies inside exposed trees and external writes remain fail-closed.
     """
     workspace = os.path.realpath(workspace_root)
     temporary = os.path.realpath(temporary_root)
@@ -926,6 +994,10 @@ def _linux_sandbox_argv(
         "--cap-drop",
         "ALL",
     ]
+    if allow_network:
+        if network_filter_fd is None:
+            raise ValueError("Linux networking requires a seccomp IPC filter")
+        argv.extend(("--share-net", "--seccomp", str(network_filter_fd)))
     for name in ("usr", "bin", "sbin", "lib", "lib64"):
         path = Path("/") / name
         if path.is_symlink():
@@ -935,6 +1007,10 @@ def _linux_sandbox_argv(
     for name in ("/etc/ld.so.cache", "/etc/alternatives", "/etc/ssl/certs"):
         if Path(name).exists():
             argv.extend(("--ro-bind", name, name))
+    if allow_network:
+        for name in ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf"):
+            if Path(name).is_file():
+                argv.extend(("--ro-bind", name, name))
     argv.extend(("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"))
     roots = set(_trusted_toolchain_roots(workspace_root))
     roots.update(Path(root).resolve() for root in additional_read_roots)
@@ -954,10 +1030,12 @@ def _linux_sandbox_argv(
         )
     )
     if permissions is not None:
-        _validate_permission_aliases(permissions, allow_write=False)
+        _validate_permission_aliases(permissions, allow_write=allow_workspace_write)
         permission_rules = permissions.sandbox_filesystem
         for rule in permission_rules:
             path = Path(rule.path)
+            if allow_workspace_write and rule.access == "write" and not path.is_relative_to(workspace):
+                raise ValueError("Linux subprocess writes outside the workspace are unsupported")
             if path == Path("/"):
                 if rule.access != "deny":
                     raise ValueError("Linux cannot represent a host root read grant")
@@ -980,7 +1058,317 @@ def _linux_sandbox_argv(
                 argv.extend(("--ro-bind", str(path), str(path)))
         # Restored child grants must not restore a writable temporary root's parent.
         argv.extend(("--bind", temporary, temporary))
+    if workspace_view is not None:
+        argv.extend(("--bind", str(workspace_view), workspace))
+        for relative in protected_view_paths:
+            protected_path = str(Path(workspace) / relative)
+            argv.extend(("--ro-bind", protected_path, protected_path))
+        # The real command scratch must remain visible after overlaying workspace.
+        argv.extend(("--bind", temporary, temporary))
     return argv
+
+
+def _linux_network_filter_file() -> BinaryIO:
+    """Export a native-ABI libseccomp filter for bwrap; never install it here."""
+    class Comparison(ctypes.Structure):
+        _fields_ = [("arg", ctypes.c_uint), ("op", ctypes.c_int),
+                    ("datum_a", ctypes.c_uint64), ("datum_b", ctypes.c_uint64)]
+
+    try:
+        library = ctypes.CDLL("libseccomp.so.2")
+    except OSError as error:
+        raise ValueError("Linux network isolation requires libseccomp.so.2") from error
+    library.seccomp_init.argtypes = [ctypes.c_uint32]
+    library.seccomp_init.restype = ctypes.c_void_p
+    library.seccomp_release.argtypes = [ctypes.c_void_p]
+    library.seccomp_syscall_resolve_name.argtypes = [ctypes.c_char_p]
+    library.seccomp_syscall_resolve_name.restype = ctypes.c_int
+    library.seccomp_rule_add_array.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
+                                              ctypes.c_uint, ctypes.POINTER(Comparison)]
+    library.seccomp_export_bpf.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    context = library.seccomp_init(0x7FFF0000)  # SCMP_ACT_ALLOW; bad architectures are killed.
+    if not context:
+        raise ValueError("cannot allocate Linux seccomp IPC filter")
+    output = tempfile.TemporaryFile()
+    try:
+        def deny(name: bytes, comparison: Comparison | None = None) -> None:
+            number = library.seccomp_syscall_resolve_name(name)
+            if number == -1:
+                raise ValueError(f"libseccomp cannot resolve required syscall {name.decode()}")
+            result = library.seccomp_rule_add_array(
+                context, 0x00050000 | errno.EPERM, number, 0 if comparison is None else 1,
+                None if comparison is None else ctypes.pointer(comparison))
+            if result != 0:
+                raise ValueError(f"cannot build Linux seccomp IPC rule for {name.decode()}: {result}")
+
+        # Socket domains 2 and 10 are AF_INET and AF_INET6. Reject every other
+        # domain, including future ones, AF_UNIX, AF_VSOCK, AF_NETLINK and PACKET.
+        deny(b"socket", Comparison(0, 2, 2, 0))  # SCMP_CMP_LT
+        deny(b"socket", Comparison(0, 6, 10, 0))  # SCMP_CMP_GT
+        for domain in range(3, 10):
+            deny(b"socket", Comparison(0, 4, domain, 0))  # SCMP_CMP_EQ
+        # asyncio uses an anonymous, already-connected AF_UNIX stream pair.
+        # It cannot reconnect to host IPC; bind/listen remain denied. Datagram
+        # pairs can change their peer and must remain blocked. Permit exactly
+        # SOCK_STREAM with only the two known descriptor flags, protocol zero.
+        deny(b"socketpair", Comparison(0, 1, int(socket.AF_UNIX), 0))  # SCMP_CMP_NE
+        deny(b"socketpair", Comparison(2, 1, 0, 0))
+        allowed_type_bits = (int(socket.SOCK_STREAM) | int(getattr(socket, "SOCK_NONBLOCK"))
+                             | int(getattr(socket, "SOCK_CLOEXEC")))
+        deny(b"socketpair", Comparison(1, 7, int(socket.SOCK_STREAM), 0))  # SCMP_CMP_MASKED_EQ
+        for bit in range(64):
+            mask = 1 << bit
+            if not allowed_type_bits & mask:
+                deny(b"socketpair", Comparison(1, 7, mask, mask))
+        for name in (b"bind", b"listen", b"accept", b"accept4"):
+            deny(name)
+        # io_uring socket operations do not pass through socket() seccomp rules.
+        deny(b"io_uring_setup")
+        if library.seccomp_export_bpf(context, output.fileno()) != 0:
+            raise ValueError("cannot export Linux seccomp IPC filter")
+        output.seek(0)
+        return output
+    except BaseException:
+        output.close()
+        raise
+    finally:
+        library.seccomp_release(context)
+
+
+def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
+    snapshot: _LinuxSnapshot = {}
+    remaining = _LINUX_VIEW_MAX_BYTES
+
+    def walk(descriptor: int, prefix: Path) -> None:
+        nonlocal remaining
+        with os.scandir(descriptor) as entries:
+            names = sorted(entry.name for entry in entries)
+        for name in names:
+            relative = (prefix / name).as_posix()
+            if relative in protected:
+                continue
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            mode = metadata.st_mode
+            identity = (metadata.st_dev, metadata.st_ino)
+            if stat.S_ISDIR(mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+                try:
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != identity:
+                        raise ValueError("workspace directory changed during Linux snapshot")
+                    snapshot[relative] = (mode, "", identity)
+                    walk(child, prefix / name)
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(mode):
+                child = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+                with os.fdopen(child, "rb") as stream:
+                    opened = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != identity:
+                        raise ValueError("workspace file changed during Linux snapshot")
+                    if opened.st_nlink != 1:
+                        raise ValueError("Linux candidate workspace refuses hardlinked files")
+                    if opened.st_size > remaining:
+                        raise ValueError("Linux candidate workspace exceeds the 64 MiB file data limit")
+                    data = stream.read(remaining + 1)
+                remaining -= len(data)
+                if remaining < 0:
+                    raise ValueError("Linux candidate workspace exceeds the 64 MiB file data limit")
+                snapshot[relative] = (mode, data, identity)
+            elif stat.S_ISLNK(mode):
+                snapshot[relative] = (mode, os.readlink(name, dir_fd=descriptor), identity)
+            else:
+                raise ValueError("Linux candidate workspace refuses nonregular files")
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        walk(descriptor, Path())
+    finally:
+        os.close(descriptor)
+    return snapshot
+
+
+def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tuple[_LinuxSnapshot, set[str]]:
+    """Copy ordinary files; metadata, dependencies and agent state stay host RO."""
+    protected: set[str] = set()
+    for directory, directories, files in os.walk(workspace.root, followlinks=False):
+        for name in (*directories, *files):
+            path = Path(directory) / name
+            if name.casefold() in _LINUX_VIEW_PROTECTED or path == workspace.scratch:
+                protected.add(path.relative_to(workspace.root).as_posix())
+                if name in directories:
+                    directories.remove(name)
+    initial = _linux_view_snapshot(workspace.root, protected)
+    view.mkdir()
+    for relative, (mode, content, _identity) in initial.items():
+        target = view / relative
+        if stat.S_ISDIR(mode):
+            target.mkdir(parents=True, exist_ok=True)
+        elif stat.S_ISLNK(mode):
+            target.symlink_to(str(content))
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            assert isinstance(content, bytes)
+            target.write_bytes(content)
+            target.chmod(stat.S_IMODE(mode))
+    for relative in protected:
+        host = workspace.root / relative
+        target = view / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if host.is_dir():
+            target.mkdir(exist_ok=True)
+        else:
+            target.touch()
+    for relative, (mode, _content, _identity) in reversed(tuple(initial.items())):
+        if stat.S_ISDIR(mode):
+            (view / relative).chmod(stat.S_IMODE(mode))
+    return initial, protected
+
+
+def _commit_linux_workspace_view(
+    workspace: WorkspaceRuntime, view: Path, initial: _LinuxSnapshot, protected: set[str],
+    permissions: ResolvedPermissions | None,
+) -> None:
+    """Validate all changes before publishing any host mutation.
+
+    Each replacement is atomic. A multi-file commit is not a filesystem
+    transaction; concurrent host writers must not modify the workspace.
+    """
+    if view.is_symlink() or not view.is_dir():
+        raise ValueError("Linux candidate workspace root is invalid")
+    resulting = _linux_view_snapshot(view, protected)
+    changes = {name for name in initial.keys() | resulting.keys()
+               if initial.get(name, ())[:2] != resulting.get(name, ())[:2]}
+    current_permissions = workspace.permissions
+    effective = (permissions.intersection(current_permissions) if permissions is not None
+                 and current_permissions is not None else permissions or current_permissions)
+    for name in sorted(changes):
+        relative = Path(name)
+        if any(part.casefold() in _LINUX_VIEW_PROTECTED for part in relative.parts):
+            raise ValueError(f"Linux candidate changed a protected path: {name}")
+        if any(Path(path).is_relative_to(relative) for path in protected):
+            raise ValueError(f"Linux candidate changed a protected directory ancestor: {name}")
+        host = workspace.root / relative
+        if effective is not None and not effective.path_access(host, write=True):
+            raise ValueError(f"Linux candidate write denied by permission policy: {name}")
+        workspace.ensure_writable(host)
+        for parent in (host, *host.parents):
+            if parent == workspace.root:
+                break
+            if parent.is_symlink():
+                raise ValueError(f"Linux candidate cannot publish through a symlink: {name}")
+        after = resulting.get(name)
+        before = initial.get(name)
+        if (after is not None and not (stat.S_ISREG(after[0]) or stat.S_ISDIR(after[0]))) or (
+            before is not None and stat.S_ISLNK(before[0])
+        ):
+            raise ValueError(f"Linux candidate cannot publish symlink changes: {name}")
+        if before is not None and after is not None and stat.S_IFMT(before[0]) != stat.S_IFMT(after[0]):
+            raise ValueError(f"Linux candidate cannot change path type: {name}")
+    if _linux_view_snapshot(workspace.root, protected) != initial:
+        raise ValueError("workspace changed while Linux command was running; inspect and retry")
+
+    def recheck(name: str, parent_fd: int) -> None:
+        target = workspace.root / name
+        current = workspace.permissions
+        if ((permissions is not None and not permissions.path_access(target, write=True))
+                or (current is not None and not current.path_access(target, write=True))):
+            raise ValueError(f"Linux publish permission changed before commit: {name}")
+        workspace.ensure_writable(target)
+        before = initial.get(name)
+        try:
+            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            metadata = None
+        if before is None:
+            if metadata is not None:
+                raise ValueError(f"workspace target changed before commit: {name}")
+            return
+        if (metadata is None or metadata.st_mode != before[0]
+                or (metadata.st_dev, metadata.st_ino) != before[2]):
+            raise ValueError(f"workspace target identity changed before commit: {name}")
+        if stat.S_ISREG(metadata.st_mode):
+            descriptor = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
+            with os.fdopen(descriptor, "rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (opened.st_dev, opened.st_ino) != before[2] or opened.st_nlink != 1:
+                    raise ValueError(f"workspace target identity changed before commit: {name}")
+                assert isinstance(before[1], bytes)
+                if stream.read(len(before[1]) + 1) != before[1]:
+                    raise ValueError(f"workspace target content changed before commit: {name}")
+
+    # Every host mutation is relative to pinned directory descriptors. Path
+    # validation alone cannot prevent an ancestor becoming a symlink between
+    # validation and replace/mkdir/unlink. O_NOFOLLOW applies at every component.
+    with ExitStack() as publishing:
+        root_fd = os.open(workspace.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        publishing.callback(os.close, root_fd)
+        created_directories: dict[str, tuple[int, int]] = {}
+
+        def open_parent(name: str, resources: ExitStack) -> int:
+            descriptor = root_fd
+            parts = Path(name).parts[:-1]
+            for index, component in enumerate(parts):
+                descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                     dir_fd=descriptor)
+                resources.callback(os.close, descriptor)
+                metadata = os.fstat(descriptor)
+                relative = Path(*parts[:index + 1]).as_posix()
+                expected = initial[relative][2] if relative in initial else created_directories.get(relative)
+                if expected is None or (metadata.st_dev, metadata.st_ino) != expected:
+                    raise ValueError(f"workspace parent identity changed before commit: {name}")
+            return descriptor
+
+        # Validate first, remove leaves before parents, create parents before leaves.
+        for name in sorted(changes, key=lambda value: (-len(Path(value).parts), value)):
+            if name in resulting:
+                continue
+            with ExitStack() as parents:
+                parent_fd = open_parent(name, parents)
+                recheck(name, parent_fd)
+                if stat.S_ISDIR(initial[name][0]):
+                    os.rmdir(Path(name).name, dir_fd=parent_fd)
+                else:
+                    os.unlink(Path(name).name, dir_fd=parent_fd)
+        for name in sorted(changes, key=lambda value: (len(Path(value).parts), value)):
+            after = resulting.get(name)
+            if after is None:
+                continue
+            with ExitStack() as parents:
+                parent_fd = open_parent(name, parents)
+                recheck(name, parent_fd)
+                mode, content, _identity = after
+                leaf = Path(name).name
+                if stat.S_ISDIR(mode):
+                    if name not in initial:
+                        os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
+                    descriptor = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+                    parents.callback(os.close, descriptor)
+                    metadata = os.fstat(descriptor)
+                    if name in initial and (metadata.st_dev, metadata.st_ino) != initial[name][2]:
+                        raise ValueError(f"workspace directory identity changed before chmod: {name}")
+                    os.fchmod(descriptor, stat.S_IMODE(mode) & 0o777)
+                    created_directories[name] = (metadata.st_dev, metadata.st_ino)
+                else:
+                    assert isinstance(content, bytes)
+                    temporary = ".praxis-publish-" + secrets.token_hex(12)
+                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                         mode=0o600, dir_fd=parent_fd)
+                    try:
+                        with os.fdopen(descriptor, "wb") as output:
+                            output.write(content)
+                            output.flush()
+                            os.fchmod(output.fileno(), stat.S_IMODE(mode) & 0o777)
+                        recheck(name, parent_fd)
+                        if name in initial:
+                            os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                        else:
+                            os.link(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+                                    follow_symlinks=False)
+                    finally:
+                        try:
+                            os.unlink(temporary, dir_fd=parent_fd)
+                        except FileNotFoundError:
+                            pass
 
 
 def _build_command_sandbox_profile(

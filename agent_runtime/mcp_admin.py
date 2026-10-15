@@ -1,4 +1,4 @@
-"""Host-controlled MCP registration and endpoint-bound macOS credentials."""
+"""Host-controlled MCP registration and endpoint-bound personal credentials."""
 from __future__ import annotations
 
 import json
@@ -35,9 +35,20 @@ def _credential_service(name: str) -> str:
     return "praxis.mcp." + normalized
 
 
+def _bearer_storage(name: str) -> Any:
+    from agent_runtime.mcp_oauth import MCPOAuthStorage
+    _credential_service(name)
+    # Manual credentials remain name-addressable; their payload binds the exact
+    # remote URL before load_mcp_credential returns any token.
+    return MCPOAuthStorage(name, "urn:praxis:mcp:bearer:" + name)
+
+
 def _read_keychain(name: str) -> str:
     if sys.platform != "darwin":
-        raise ValueError("Keychain credentials require macOS; use --bearer-token-env-var on other platforms")
+        value = _bearer_storage(name).read().get("bearer")
+        if not isinstance(value, str):
+            raise ValueError(f"MCP credential missing: run agent mcp login {name}")
+        return value
     completed = subprocess.run(
         ["/usr/bin/security", "find-generic-password", "-a", "praxis", "-s", _credential_service(name), "-w"],
         capture_output=True, text=True, timeout=15, check=False,
@@ -63,7 +74,8 @@ def load_mcp_credential(name: str, url: str) -> str:
 
 def _write_keychain(name: str, value: str) -> None:
     if sys.platform != "darwin":
-        raise ValueError("Keychain credentials require macOS; use an environment variable")
+        _bearer_storage(name).update({"bearer": value})
+        return
     # security's interactive input keeps credentials out of the process argv.
     command = "add-generic-password -U -a praxis -s " + shlex.quote(_credential_service(name))
     command += " -w " + shlex.quote(value) + "\n"
@@ -76,6 +88,9 @@ def _write_keychain(name: str, value: str) -> None:
 
 
 def _delete_keychain(name: str) -> None:
+    if sys.platform != "darwin":
+        _bearer_storage(name).clear()
+        return
     completed = subprocess.run(
         ["/usr/bin/security", "delete-generic-password", "-a", "praxis", "-s", _credential_service(name)],
         capture_output=True, timeout=15, check=False,
@@ -169,8 +184,22 @@ def _policy_toml(policy: PermissionPolicy) -> str:
 
 def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_var: str | None = None,
                         tools: tuple[str, ...] = (), read_only: bool = True,
-                        workspace: Path | None = None) -> Path:
+                        workspace: Path | None = None, oauth: bool = False,
+                        oauth_client_id: str | None = None, oauth_scopes: tuple[str, ...] = (),
+                        oauth_allowed_domains: tuple[str, ...] = (), oauth_callback_port: int = 0) -> Path:
     _credential_service(name)
+    from agent_runtime.mcp_oauth import validate_oauth_domains
+    oauth_allowed_domains = validate_oauth_domains(oauth_allowed_domains)
+    if type(oauth_callback_port) is not int or not 0 <= oauth_callback_port <= 65535:
+        raise ValueError("OAuth callback port must be an integer from 0 to 65535")
+    if oauth and bearer_token_env_var is not None:
+        raise ValueError("Choose OAuth or a bearer-token environment variable")
+    if not oauth and (oauth_client_id is not None or oauth_scopes or oauth_allowed_domains or oauth_callback_port):
+        raise ValueError("OAuth client settings require oauth=True")
+    if oauth_client_id is not None and (not oauth_client_id or any(ord(c) < 32 for c in oauth_client_id)):
+        raise ValueError("OAuth client ID must be nonempty single-line text")
+    if any(not scope or any(c.isspace() or ord(c) < 32 for c in scope) for scope in oauth_scopes):
+        raise ValueError("OAuth scopes must be nonempty individual scope names")
     if name == "github" and url is None:
         url = GITHUB_READONLY_URL if read_only else "https://api.githubcopilot.com/mcp/"
         tools = tools or ("search_repositories", "get_file_contents", "issue_read", "pull_request_read")
@@ -216,7 +245,14 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
     if name == "github" and read_only:
         entry["headers"] = {"X-MCP-Readonly": "true"}
     previous_credential: str | None = None
-    use_gh = bearer_token_env_var is None and name == "github"
+    use_gh = bearer_token_env_var is None and name == "github" and not oauth
+    if oauth:
+        entry["oauth"] = True
+        entry["oauth_allowed_domains"] = list(oauth_allowed_domains)
+        entry["oauth_scopes"] = list(oauth_scopes)
+        entry["oauth_callback_port"] = oauth_callback_port
+        if oauth_client_id is not None:
+            entry["oauth_client_id"] = oauth_client_id
     if bearer_token_env_var:
         entry["bearer_token_env_var"] = bearer_token_env_var
     elif use_gh:
@@ -251,7 +287,28 @@ def _register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_
 
 def register_remote_mcp(name: str, *, url: str | None = None, bearer_token_env_var: str | None = None,
                         tools: tuple[str, ...] = (), read_only: bool = True,
-                        workspace: Path | None = None) -> Path:
+                        workspace: Path | None = None, oauth: bool = False,
+                        oauth_client_id: str | None = None, oauth_scopes: tuple[str, ...] = (),
+                        oauth_allowed_domains: tuple[str, ...] = (), oauth_callback_port: int = 0) -> Path:
     with configuration_lock():
         return _register_remote_mcp(name, url=url, bearer_token_env_var=bearer_token_env_var,
-                                    tools=tools, read_only=read_only, workspace=workspace)
+                                    tools=tools, read_only=read_only, workspace=workspace, oauth=oauth,
+                                    oauth_client_id=oauth_client_id, oauth_scopes=oauth_scopes,
+                                    oauth_allowed_domains=oauth_allowed_domains,
+                                    oauth_callback_port=oauth_callback_port)
+
+
+def remove_mcp_connection(name: str) -> None:
+    """Remove a personal connection and credentials, retaining shared network rules."""
+    with configuration_lock():
+        entries = mcp_connections()
+        selected = next((entry for entry in entries if entry["name"] == name), None)
+        if selected is None:
+            raise ValueError("MCP connection is not registered")
+        if selected.get("oauth"):
+            from agent_runtime.mcp_oauth import clear_oauth_credentials
+            clear_oauth_credentials(name, selected["url"])
+        if selected.get("keychain"):
+            _delete_keychain(name)
+        remaining = {"servers": [entry for entry in entries if entry["name"] != name]}
+        _atomic_write(user_mcp_config(), yaml.safe_dump(remaining, sort_keys=False, allow_unicode=True))
