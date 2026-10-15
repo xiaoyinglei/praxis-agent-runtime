@@ -1113,8 +1113,8 @@ def _linux_network_filter_file() -> BinaryIO:
         # SOCK_STREAM with only the two known descriptor flags, protocol zero.
         deny(b"socketpair", Comparison(0, 1, int(socket.AF_UNIX), 0))  # SCMP_CMP_NE
         deny(b"socketpair", Comparison(2, 1, 0, 0))
-        allowed_type_bits = (int(socket.SOCK_STREAM) | int(getattr(socket, "SOCK_NONBLOCK"))
-                             | int(getattr(socket, "SOCK_CLOEXEC")))
+        allowed_type_bits = (int(socket.SOCK_STREAM) | int(getattr(socket, "SOCK_NONBLOCK", 0))
+                             | int(getattr(socket, "SOCK_CLOEXEC", 0)))
         deny(b"socketpair", Comparison(1, 7, int(socket.SOCK_STREAM), 0))  # SCMP_CMP_MASKED_EQ
         for bit in range(64):
             mask = 1 << bit
