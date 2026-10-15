@@ -32,6 +32,7 @@ from mcp.shared.auth import (
     ProtectedResourceMetadata,
 )
 from mcp.shared.auth_utils import check_resource_allowed, resource_url_from_server_url
+from mcp.types import LATEST_PROTOCOL_VERSION
 from pydantic import AnyUrl
 
 from agent_runtime.model_config_io import atomic_replace_bytes, exclusive_config_lock, file_fingerprint
@@ -515,8 +516,31 @@ async def login_mcp_oauth(
                 follow_redirects=False,
                 timeout=30,
             ) as client:
-                response = await client.get(entry["url"])
-                if response.status_code in {401, 403} or await provider.storage.get_tokens() is None:
+                # A successful GET may be a never-ending SSE stream. Login only
+                # needs the final authentication status, so close after headers.
+                async with client.stream("GET", entry["url"]) as response:
+                    status = response.status_code
+                if status == 405 or (status < 400 and await provider.storage.get_tokens() is None):
+                    # Streamable HTTP permits servers to omit GET/SSE support.
+                    # initialize is a protocol handshake, without tools or any
+                    # workspace context, and obtains the POST auth challenge.
+                    async with client.stream(
+                        "POST",
+                        entry["url"],
+                        headers={"Accept": "application/json, text/event-stream"},
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": LATEST_PROTOCOL_VERSION,
+                                "capabilities": {},
+                                "clientInfo": {"name": "praxis-oauth-login", "version": "0.1.0"},
+                            },
+                        },
+                    ) as response:
+                        status = response.status_code
+                if status >= 400 or await provider.storage.get_tokens() is None:
                     raise ValueError("OAuth authorization was not accepted")
             with mcp_admin.configuration_lock():
                 if hashlib.sha256(mcp_admin.user_mcp_config().read_bytes()).hexdigest() != revision:

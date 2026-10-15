@@ -131,12 +131,33 @@ def test_job_error_does_not_return_secret_exception_messages(tmp_path, monkeypat
         assert "unrecognized-private-key" not in json.dumps(job)
 
 
-def test_cli_exposes_local_connection_manager():
+def test_cli_exposes_local_connection_manager(tmp_path, monkeypatch):
     from agent_runtime.cli import agent_app
 
     result = CliRunner().invoke(agent_app, ["connections", "--help"])
     assert result.exit_code == 0
-    assert "--no-open" in result.stdout
+    observed = []
+
+    class Server:
+        browser_url = "http://127.0.0.1:4567/#test-session"
+
+        def __init__(self, workspace, *, port):
+            observed.append((workspace, port))
+
+        def serve_forever(self, *, poll_interval):
+            observed.append("served")
+
+        def server_close(self):
+            observed.append("closed")
+
+    monkeypatch.setattr("agent_runtime.connection_manager.ConnectionServer", Server)
+    monkeypatch.setattr("agent_runtime.connection_manager.webbrowser.open", lambda *_: pytest.fail("--no-open ignored"))
+    result = CliRunner().invoke(agent_app, [
+        "connections", "--no-open", "--workspace", str(tmp_path), "--port", "4567",
+    ])
+    assert result.exit_code == 0
+    assert observed == [(tmp_path, 4567), "served", "closed"]
+    assert "127.0.0.1:4567" in result.stdout
 
 
 def test_oauth_job_exposes_authorization_link_then_shutdown_cancels_callback(tmp_path, monkeypatch):

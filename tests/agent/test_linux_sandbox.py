@@ -493,9 +493,15 @@ print("network-boundary-ok")
 async def test_real_linux_workspace_writes_and_protected_boundaries(tmp_path, python, write):
     import shlex
 
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
     workspace = open_workspace(tmp_path / "workspace", create=True)
     outside = tmp_path / "outside.txt"
     outside.write_text("private")
+    readonly = tmp_path / "readonly.txt"
+    readonly.write_text("authorized-read")
+    permissions = PermissionPolicy(filesystem=(PathRule(path=str(readonly), access="read"),)).resolve(workspace.root)
+    workspace.permission_provider = lambda: permissions
     (workspace.root / "original.txt").write_text("before")
     for name in (".git", ".agents", ".codex", ".aws", ".venv", "node_modules"):
         (workspace.root / name).mkdir()
@@ -508,10 +514,22 @@ for name in (".git", ".agents", ".codex", ".aws", ".venv", "node_modules"):
         Path(name, "config").write_text("forbidden")
     except OSError: pass
     else: raise AssertionError("protected write escaped: " + name)
+# The host sibling is absent from the namespace. The same absolute pathname
+# can be created in bwrap's private /tmp without touching the host inode.
+private_name = Path({str(outside)!r})
 try:
-    Path({str(outside)!r}).write_text("forbidden")
+    private_name.read_text()
 except OSError: pass
-else: raise AssertionError("outside write escaped")
+else: raise AssertionError("ungranted host sibling became readable")
+private_name.write_text("namespace-only")
+assert private_name.read_text() == "namespace-only"
+# In contrast, this host inode is explicitly mounted read-only and must reject writes.
+readonly_name = Path({str(readonly)!r})
+assert readonly_name.read_text() == "authorized-read"
+try:
+    readonly_name.write_text("forbidden")
+except OSError: pass
+else: raise AssertionError("external read-only host grant became writable")
 try:
     Path("original.txt").write_text("after")
     Path("nested").mkdir()
@@ -531,10 +549,12 @@ print("write-boundary-ok")
         result = await shell._run_command(
             workspace, shell.RunCommandInput(command="python3 -c " + shlex.quote(code), workspace_write=write),
             termination_grace_seconds=0.1)
+    # Check host evidence even when an assertion inside the child fails.
+    assert outside.read_text() == "private"
+    assert readonly.read_text() == "authorized-read"
     assert result.exit_code == 0, result.stderr
     assert (workspace.root / "original.txt").read_text() == ("after" if write else "before")
     assert (workspace.root / "nested/new.bin").exists() is write
-    assert outside.read_text() == "private"
     for name in (".git", ".agents", ".codex", ".aws", ".venv", "node_modules"):
         assert (workspace.root / name / "config").read_text() == "protected"
 

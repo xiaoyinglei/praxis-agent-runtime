@@ -477,3 +477,53 @@ async def test_preconfigured_client_uses_registered_callback_port_and_path(oauth
 
     await oauth.login_mcp_oauth("remote", workspace=tmp_path, redirect_handler=browser)
     assert authority.forms[0]["redirect_uri"] == [f"http://127.0.0.1:{port}/callback"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("get_unsupported", [False, True])
+async def test_login_closes_sse_without_reading_and_handles_post_only_mcp(
+    oauth,
+    tmp_path,
+    monkeypatch,
+    get_unsupported,
+):
+    authority = Authority()
+    streams = []
+
+    class HeaderOnlyStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.closed = False
+
+        async def __aiter__(self):
+            raise AssertionError("login must not consume a potentially infinite MCP stream")
+            yield b""  # pragma: no cover
+
+        async def aclose(self):
+            self.closed = True
+
+    def respond(request):
+        if request.url.path == "/mcp" and request.method == "GET" and get_unsupported:
+            authority.requests.append(request)
+            return httpx.Response(405, headers={"Allow": "POST"})
+        if request.url.path == "/mcp" and request.headers.get("authorization") == "Bearer access-secret":
+            authority.requests.append(request)
+            stream = HeaderOnlyStream()
+            streams.append(stream)
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, stream=stream)
+        return authority.respond(request)
+
+    monkeypatch.setattr(oauth, "public_http_transport", lambda: httpx.MockTransport(respond))
+    register(tmp_path)
+    await oauth.login_mcp_oauth("remote", workspace=tmp_path, redirect_handler=authority.browser, timeout_seconds=3)
+    assert streams and all(stream.closed for stream in streams)
+    tokens = await oauth.MCPOAuthStorage("remote", "https://mcp.example.com/mcp").get_tokens()
+    assert tokens.access_token == "access-secret"
+    probes = [request for request in authority.requests if request.url.path == "/mcp"]
+    if get_unsupported:
+        assert probes[0].method == "GET"
+        assert all(request.method == "POST" for request in probes[1:])
+        for request in probes[1:]:
+            body = json.loads(request.content)
+            assert body["method"] == "initialize"
+            assert body["params"]["capabilities"] == {}
+            assert str(tmp_path) not in str(body)
