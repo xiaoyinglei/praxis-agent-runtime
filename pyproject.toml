@@ -3,10 +3,11 @@ requires = ["hatchling>=1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
-name = "praxis-agent-runtime"
+name = "praxis-agent"
 version = "0.1.0"
 description = "Praxis — a trusted-local workspace agent runtime for files, code, data, and private knowledge."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.12,<3.14"
 dependencies = [
   "beautifulsoup4>=4.13.3",
@@ -37,6 +38,11 @@ dependencies = [
   "markdown-it-py>=3,<5",
   "markdownify>=1.2.3,<2",
 ]
+
+[project.urls]
+Homepage = "https://github.com/xiaoyinglei/praxis-agent-runtime"
+Documentation = "https://github.com/xiaoyinglei/praxis-agent-runtime/blob/main/docs/guide.md"
+Issues = "https://github.com/xiaoyinglei/praxis-agent-runtime/issues"
 
 [project.optional-dependencies]
 browser = ["playwright>=1.48,<2"]
@@ -74,6 +80,9 @@ dev = [
 [project.scripts]
 agent = "agent_runtime.cli:agent_app"
 rag = "rag.cli:app"
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.agents", "/.claude", "/.vscode", "/.import_linter_cache"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["agent_runtime", "rag"]

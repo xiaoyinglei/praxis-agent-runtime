@@ -153,8 +153,9 @@ async def test_public_result_exposes_durable_incomplete_model_diagnostic(
 
     assert result.status == "failed"
     assert result.answer is None
-    assert result.usage.model_calls == 1
-    assert result.usage.total_tokens == 40
+    # A new Turn retries one known output-limit response, then fails durably.
+    assert result.usage.model_calls == 2
+    assert result.usage.total_tokens == 80
     assert len(result.diagnostics) == 1
     diagnostic = result.diagnostics[0]
     assert diagnostic.code == "model_response_incomplete"

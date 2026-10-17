@@ -60,7 +60,13 @@ _LINUX_VIEW_PROTECTED = _PROTECTED_PERMISSION_DIRECTORIES | _PROTECTED_VERIFICAT
     ".praxis", ".agent_memory",
 }
 _LINUX_VIEW_MAX_BYTES = 64 * 1024 * 1024
-_LinuxSnapshot = dict[str, tuple[int, bytes | str, tuple[int, int]]]
+_LinuxSnapshot = dict[str, tuple[int, bytes | str, tuple[int, int], int]]
+_FAILURE_PUBLICATION_DESCRIPTION = (
+    "Linux only: with workspace_write=true, publish validated workspace changes even after "
+    "nonzero exit or timeout, so incremental builds can resume from their files. "
+    "The command still fails; cancellation discards changes. Default false. "
+    "All path, permission and host-change checks still apply."
+)
 
 
 class RunCommandInput(BaseModel):
@@ -103,6 +109,7 @@ class RunCommandInput(BaseModel):
             "aliases that bypass these restrictions are refused."
         ),
     )
+    publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
 
     @field_validator("timeout_seconds")
     @classmethod
@@ -126,6 +133,7 @@ class RunCommandOutput(BaseModel):
     execution_mode: Literal["restricted_sandbox"] = "restricted_sandbox"
     network_enabled: bool = False
     sandbox_error: str | None = None
+    workspace_published: bool | None = None
 
 
 class ManagedPythonInput(BaseModel):
@@ -180,6 +188,8 @@ class ManagedPythonInput(BaseModel):
     def normalize_timeout_milliseconds(cls, value: float) -> float:
         return RunCommandInput.normalize_timeout_milliseconds(value)
 
+    publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
+
 
 class ManagedPythonOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -194,6 +204,7 @@ class ManagedPythonOutput(BaseModel):
     python_version: str
     network_enabled: bool = False
     sandbox_error: str | None = None
+    workspace_published: bool | None = None
     verification: dict[str, JsonValue] | None = None
 
 
@@ -270,8 +281,11 @@ def create_run_command_tool(
             name="run_command",
             description=(
                 "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
-                "Only exit 0 with all path, permission and host-change checks passing publishes changes; "
-                "failure, timeout and cancellation discard them. External writes are unsupported. "
+                "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
+                "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
+                "Cancellation discards them. Internal relative symlinks are supported; external/absolute links "
+                "and protected targets are refused. File mtimes are preserved for incremental builds. "
+                "External writes are unsupported. "
                 "Linux network access requires libseccomp and blocks host Unix/local IPC; "
                 "anonymous stream socketpairs remain available for async event loops. "
                 "Run one shell command inside a restricted OS sandbox from a "
@@ -306,7 +320,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v9-linux-capabilities",
+        execution_revision="builtin-run-command-v10-linux-publication",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -344,8 +358,11 @@ def create_execute_python_tool(
             name="execute_python",
             description=(
                 "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
-                "Only exit 0 with all path, permission and host-change checks passing publishes changes; "
-                "failure, timeout and cancellation discard them. External writes are unsupported. "
+                "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
+                "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
+                "Cancellation discards them. Internal relative symlinks are supported; external/absolute links "
+                "and protected targets are refused. File mtimes are preserved for incremental builds. "
+                "External writes are unsupported. "
                 "Linux network access requires libseccomp and blocks host Unix/local IPC; "
                 "anonymous stream socketpairs remain available for async event loops. "
                 "Run plain Python source with the managed Praxis interpreter in "
@@ -373,7 +390,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v5-linux-capabilities",
+        execution_revision="builtin-execute-python-v6-linux-publication",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -528,9 +545,13 @@ async def _run_command(
             raise
 
         publish_error = None
-        if view is not None and process.returncode == 0 and not timed_out:
+        workspace_published = False if view is not None else None
+        startup_failed = _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr_bytes.startswith(b"bwrap:")
+        if (view is not None and not startup_failed
+                and (request.publish_on_failure or process.returncode == 0 and not timed_out)):
             try:
                 _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+                workspace_published = True
             except (OSError, ValueError) as error:
                 publish_error = str(error)
         stdout, stdout_truncated = _bounded_stream(stdout_bytes)
@@ -547,6 +568,7 @@ async def _run_command(
             truncated=stdout_truncated or stderr_truncated,
             duration_ms=(time.monotonic() - started_at) * 1000,
             network_enabled=request.network,
+            workspace_published=workspace_published,
             sandbox_error=(
                 "sandbox_publish_denied" if publish_error is not None else "sandbox_start_failed"
                 if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")
@@ -669,9 +691,13 @@ async def _execute_managed_python(
             raise
 
         publish_error = None
-        if view is not None and process.returncode == 0 and not timed_out:
+        workspace_published = False if view is not None else None
+        startup_failed = _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr_bytes.startswith(b"bwrap:")
+        if (view is not None and not startup_failed
+                and (request.publish_on_failure or process.returncode == 0 and not timed_out)):
             try:
                 _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+                workspace_published = True
             except (OSError, ValueError) as error:
                 publish_error = str(error)
         stdout, stdout_truncated = _bounded_stream(stdout_bytes)
@@ -696,6 +722,7 @@ async def _execute_managed_python(
             duration_ms=(time.monotonic() - started_at) * 1000,
             python_version=platform.python_version(),
             network_enabled=request.network,
+            workspace_published=workspace_published,
             verification=verification,
             sandbox_error=(
                 "sandbox_publish_denied" if publish_error is not None else "sandbox_start_failed"
@@ -1156,7 +1183,7 @@ def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
                     opened = os.fstat(child)
                     if (opened.st_dev, opened.st_ino) != identity:
                         raise ValueError("workspace directory changed during Linux snapshot")
-                    snapshot[relative] = (mode, "", identity)
+                    snapshot[relative] = (mode, "", identity, 0)
                     walk(child, prefix / name)
                 finally:
                     os.close(child)
@@ -1174,9 +1201,9 @@ def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
                 remaining -= len(data)
                 if remaining < 0:
                     raise ValueError("Linux candidate workspace exceeds the 64 MiB file data limit")
-                snapshot[relative] = (mode, data, identity)
+                snapshot[relative] = (mode, data, identity, opened.st_mtime_ns)
             elif stat.S_ISLNK(mode):
-                snapshot[relative] = (mode, os.readlink(name, dir_fd=descriptor), identity)
+                snapshot[relative] = (mode, os.readlink(name, dir_fd=descriptor), identity, 0)
             else:
                 raise ValueError("Linux candidate workspace refuses nonregular files")
     descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -1199,7 +1226,7 @@ def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tu
                     directories.remove(name)
     initial = _linux_view_snapshot(workspace.root, protected)
     view.mkdir()
-    for relative, (mode, content, _identity) in initial.items():
+    for relative, (mode, content, _identity, mtime_ns) in initial.items():
         target = view / relative
         if stat.S_ISDIR(mode):
             target.mkdir(parents=True, exist_ok=True)
@@ -1210,6 +1237,7 @@ def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tu
             assert isinstance(content, bytes)
             target.write_bytes(content)
             target.chmod(stat.S_IMODE(mode))
+            os.utime(target, ns=(mtime_ns, mtime_ns))
     for relative in protected:
         host = workspace.root / relative
         target = view / relative
@@ -1218,10 +1246,48 @@ def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tu
             target.mkdir(exist_ok=True)
         else:
             target.touch()
-    for relative, (mode, _content, _identity) in reversed(tuple(initial.items())):
+    for relative, (mode, _content, _identity, _mtime_ns) in reversed(tuple(initial.items())):
         if stat.S_ISDIR(mode):
             (view / relative).chmod(stat.S_IMODE(mode))
     return initial, protected
+
+
+def _validate_linux_symlink(
+    name: str, snapshot: _LinuxSnapshot, protected: set[str], workspace: WorkspaceRuntime,
+    permissions: ResolvedPermissions | None,
+) -> None:
+    """Resolve the candidate graph, never the untrusted host/view pathname.
+
+    Relative dangling links inside the workspace are useful to build systems.
+    Absolute links, escapes, cycles and protected targets fail before mutation.
+    """
+    pending = list(reversed(Path(name).parts))
+    resolved: list[str] = []
+    followed = 0
+    while pending:
+        component = pending.pop()
+        if component == "..":
+            if not resolved:
+                raise ValueError(f"Linux candidate symlink escapes workspace: {name}")
+            resolved.pop()
+            continue
+        if component == ".":
+            continue
+        resolved.append(component)
+        relative = Path(*resolved).as_posix()
+        if component.casefold() in _LINUX_VIEW_PROTECTED or relative in protected:
+            raise ValueError(f"Linux candidate symlink targets a protected path: {name}")
+        entry = snapshot.get(relative)
+        if entry is not None and stat.S_ISLNK(entry[0]):
+            content = str(entry[1])
+            followed += 1
+            if Path(content).is_absolute() or followed > 40:
+                raise ValueError(f"Linux candidate symlink is absolute or cyclic: {name}")
+            resolved.pop()
+            pending.extend(reversed(Path(content).parts))
+    target = workspace.root.joinpath(*resolved)
+    if permissions is not None and not permissions.path_access(target):
+        raise ValueError(f"Linux candidate symlink target denied by permission policy: {name}")
 
 
 def _commit_linux_workspace_view(
@@ -1237,7 +1303,8 @@ def _commit_linux_workspace_view(
         raise ValueError("Linux candidate workspace root is invalid")
     resulting = _linux_view_snapshot(view, protected)
     changes = {name for name in initial.keys() | resulting.keys()
-               if initial.get(name, ())[:2] != resulting.get(name, ())[:2]}
+               if (initial.get(name, ())[:2], initial.get(name, ())[3:])
+               != (resulting.get(name, ())[:2], resulting.get(name, ())[3:])}
     current_permissions = workspace.permissions
     effective = (permissions.intersection(current_permissions) if permissions is not None
                  and current_permissions is not None else permissions or current_permissions)
@@ -1251,17 +1318,15 @@ def _commit_linux_workspace_view(
         if effective is not None and not effective.path_access(host, write=True):
             raise ValueError(f"Linux candidate write denied by permission policy: {name}")
         workspace.ensure_writable(host)
-        for parent in (host, *host.parents):
+        for parent in host.parents:
             if parent == workspace.root:
                 break
             if parent.is_symlink():
                 raise ValueError(f"Linux candidate cannot publish through a symlink: {name}")
         after = resulting.get(name)
         before = initial.get(name)
-        if (after is not None and not (stat.S_ISREG(after[0]) or stat.S_ISDIR(after[0]))) or (
-            before is not None and stat.S_ISLNK(before[0])
-        ):
-            raise ValueError(f"Linux candidate cannot publish symlink changes: {name}")
+        if after is not None and stat.S_ISLNK(after[0]):
+            _validate_linux_symlink(name, resulting, protected, workspace, effective)
         if before is not None and after is not None and stat.S_IFMT(before[0]) != stat.S_IFMT(after[0]):
             raise ValueError(f"Linux candidate cannot change path type: {name}")
     if _linux_view_snapshot(workspace.root, protected) != initial:
@@ -1274,6 +1339,12 @@ def _commit_linux_workspace_view(
                 or (current is not None and not current.path_access(target, write=True))):
             raise ValueError(f"Linux publish permission changed before commit: {name}")
         workspace.ensure_writable(target)
+        after = resulting.get(name)
+        if after is not None and stat.S_ISLNK(after[0]):
+            latest = permissions.intersection(current) if permissions is not None and current is not None else (
+                permissions or current
+            )
+            _validate_linux_symlink(name, resulting, protected, workspace, latest)
         before = initial.get(name)
         try:
             metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1290,11 +1361,15 @@ def _commit_linux_workspace_view(
             descriptor = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
             with os.fdopen(descriptor, "rb") as stream:
                 opened = os.fstat(stream.fileno())
-                if (opened.st_dev, opened.st_ino) != before[2] or opened.st_nlink != 1:
+                if ((opened.st_dev, opened.st_ino) != before[2] or opened.st_nlink != 1
+                        or opened.st_mtime_ns != before[3]):
                     raise ValueError(f"workspace target identity changed before commit: {name}")
                 assert isinstance(before[1], bytes)
                 if stream.read(len(before[1]) + 1) != before[1]:
                     raise ValueError(f"workspace target content changed before commit: {name}")
+        elif stat.S_ISLNK(metadata.st_mode):
+            if os.readlink(target.name, dir_fd=parent_fd) != before[1]:
+                raise ValueError(f"workspace symlink changed before commit: {name}")
 
     # Every host mutation is relative to pinned directory descriptors. Path
     # validation alone cannot prevent an ancestor becoming a symlink between
@@ -1336,7 +1411,7 @@ def _commit_linux_workspace_view(
             with ExitStack() as parents:
                 parent_fd = open_parent(name, parents)
                 recheck(name, parent_fd)
-                mode, content, _identity = after
+                mode, content, _identity, mtime_ns = after
                 leaf = Path(name).name
                 if stat.S_ISDIR(mode):
                     if name not in initial:
@@ -1349,15 +1424,20 @@ def _commit_linux_workspace_view(
                     os.fchmod(descriptor, stat.S_IMODE(mode) & 0o777)
                     created_directories[name] = (metadata.st_dev, metadata.st_ino)
                 else:
-                    assert isinstance(content, bytes)
                     temporary = ".praxis-publish-" + secrets.token_hex(12)
-                    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                         mode=0o600, dir_fd=parent_fd)
                     try:
-                        with os.fdopen(descriptor, "wb") as output:
-                            output.write(content)
-                            output.flush()
-                            os.fchmod(output.fileno(), stat.S_IMODE(mode) & 0o777)
+                        if stat.S_ISLNK(mode):
+                            assert isinstance(content, str)
+                            os.symlink(content, temporary, dir_fd=parent_fd)
+                        else:
+                            assert isinstance(content, bytes)
+                            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                                 mode=0o600, dir_fd=parent_fd)
+                            with os.fdopen(descriptor, "wb") as output:
+                                output.write(content)
+                                output.flush()
+                                os.fchmod(output.fileno(), stat.S_IMODE(mode) & 0o777)
+                                os.utime(output.fileno(), ns=(mtime_ns, mtime_ns))
                         recheck(name, parent_fd)
                         if name in initial:
                             os.replace(temporary, leaf, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)

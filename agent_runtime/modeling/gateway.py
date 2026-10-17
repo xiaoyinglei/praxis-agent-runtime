@@ -360,7 +360,7 @@ class LLMGateway:
             tool_names: dict[str, str] = {}
             tool_arguments: dict[str, str] = {}
             completed_tool_ids: set[str] = set()
-            stop_reason = "end_turn"
+            stop_reason = "unknown"
             final_usage: LLMUsage | None = None
             async for chunk in chunks:
                 if chunk.type == "text_delta":
@@ -405,27 +405,27 @@ class LLMGateway:
                     tool_name = tool_names.get(tool_id, "")
                     if not tool_name or tool_id in completed_tool_ids:
                         continue
-                    calls.append(
-                        ToolCall(
-                            id=tool_id,
-                            name=tool_name,
-                            input=_tool_arguments(tool_arguments.get(tool_id, "")),
-                        )
-                    )
                     completed_tool_ids.add(tool_id)
                     if active_tool_id == tool_id:
                         active_tool_id = ""
                 elif chunk.type == "message_stop":
-                    stop_reason = chunk.stop_reason or stop_reason
+                    stop_reason = chunk.stop_reason or "unknown"
                     final_usage = chunk.usage
             if final_usage is None:
                 raise RuntimeError("canonical streaming call ended without usage")
+            # A block stop alone is not a completed model step. Wait for the
+            # authoritative terminal reason before decoding any tool fragments.
+            if stop_reason in {"tool_use", "tool_calls"}:
+                calls = [ToolCall(id=tool_id, name=name, input=_tool_arguments(tool_arguments[tool_id]))
+                         for tool_id, name in tool_names.items() if tool_id in completed_tool_ids]
             normalized_stop = (
-                StopReason.TOOL_USE
-                if calls or stop_reason in {"tool_use", "tool_calls"}
-                else StopReason.MAX_TOKENS
+                StopReason.MAX_TOKENS
                 if stop_reason == "max_tokens"
+                else StopReason.TOOL_USE
+                if stop_reason in {"tool_use", "tool_calls"}
                 else StopReason.END_TURN
+                if stop_reason in {"end_turn", "stop"}
+                else StopReason.INCOMPLETE
             )
             turn = ToolUseResult(
                 tool_calls=calls,
@@ -742,6 +742,11 @@ class LLMGateway:
                 await effective_ledger.refund(effective_lease_id)
             raise producer_error[0]
 
+        if final_stop is None:
+            if effective_ledger is not None:
+                await effective_ledger.refund(effective_lease_id)
+            raise ConnectionError("provider stream ended without a terminal stop")
+
         # 提交预算
         usage = reported_usage or normalize_llm_usage(
             input_tokens=input_tokens,
@@ -752,7 +757,7 @@ class LLMGateway:
         if effective_ledger is not None:
             await effective_ledger.commit(effective_lease_id, usage.total_tokens)
         yield replace(
-            final_stop or StreamChunk(type="message_stop", stop_reason="end_turn"),
+            final_stop,
             usage=usage,
         )
 
@@ -974,7 +979,8 @@ class LLMGateway:
                 turn = parse_openai_response(raw)
                 text = turn.text
                 reasoning_content = turn.reasoning_content or ""
-                stop_reason = turn.stop_reason.value
+                stop_reason = (turn.raw_stop_reason or "unknown" if turn.stop_reason is StopReason.INCOMPLETE
+                               else turn.stop_reason.value)
                 tool_calls_list = [
                     {
                         "id": call.id,

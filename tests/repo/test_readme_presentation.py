@@ -101,11 +101,14 @@ def test_model_integration_docs_cover_requirements_registration_and_switching_on
     assert "API_KEY=" not in section
 
 
-def test_readme_describes_a_source_only_distribution_without_unearned_claims() -> None:
+def test_readme_describes_pypi_and_source_installation_without_unearned_claims() -> None:
     readme = _read(README)
-    assert "praxis-agent-runtime" in readme
+    assert "`praxis-agent`" in readme
     assert "git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git" in readme
-    assert "源码安装" in readme and "尚未发布到 PyPI" in readme
+    assert "源码安装" in readme
+    assert "uv tool install --python 3.12 --link-mode copy praxis-agent\n" in readme
+    assert "https://pypi.org/project/praxis-agent/" in readme
+    assert "尚未发布到 PyPI" not in readme
     for forbidden in ("Private" + "-RAG-Agent", "rag" + ".agent", "rag" + "/agent",
                       "production" + "-ready", "/Users/" + "leixiaoying", "`agent-" + "runtime`"):
         assert forbidden not in readme

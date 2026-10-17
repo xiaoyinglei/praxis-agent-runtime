@@ -4,7 +4,18 @@
 
 ## 安装与首次配置
 
-需要 Git、uv、Python 3.12 或 3.13，以及 macOS 或 Linux。当前通过源码安装，未发布到 PyPI。
+需要 Git、uv、Python 3.12 或 3.13，以及 macOS 或 Linux。PyPI 安装包名为 [`praxis-agent`](https://pypi.org/project/praxis-agent/)，可以安装到独立工具环境：
+
+```bash
+uv tool install --python 3.12 --link-mode copy praxis-agent
+cd /path/to/my-project
+agent setup
+agent chat
+```
+
+后续示例中的 `uv run agent ...` 适用于源码安装；使用上面的 PyPI 安装方式时，直接运行 `agent ...`。
+
+参与开发或使用源码示例时：
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
@@ -101,7 +112,14 @@ uv run agent run "修复失败的边界条件并验证"
 
 `chat` 默认使用全屏终端界面；`--ui inline` 使用原生滚动历史。Ctrl+J 换行，Ctrl+C 取消当前执行；工具记录可以展开查看。F2 切换应用鼠标处理与终端原生选择，`/copy` 请求复制最近回答。
 
-修改类 `run` 默认要求实际变更和最后一次修改后的验证。只读分析使用 `--no-require-workspace-change`，SDK 对应 `require_workspace_change=False`。验证通过只说明声明的检查范围成立，不等于所有业务结论都正确。
+`run` 默认在模型结束时结束本轮，`validation_status=not_evaluated`，不据此声明任务验收通过。`--require-workspace-change` 只要求发生真实修改；需要机器验收时，使用 `--acceptance-command "uv run pytest -q"`，SDK 对应 `acceptance_command="uv run pytest -q"`。Runtime 只认用户指定命令在工作区根目录的真实执行：最新一次必须成功，之后再次修改须重新验收；其他测试或模型自述不能替代它。验收命令沿用普通工具权限与审批，不会自动获得写入或联网能力。新命令不会改写旧 Turn 的冻结验收规则。
+
+```bash
+uv run agent run "修复边界条件" --require-workspace-change \
+  --acceptance-command "uv run pytest -q" --allow-execute-tools
+```
+
+命令通过仅证明用户定义的检查通过，不能证明未覆盖的业务要求。验收脚本及其依赖应来自可信项目配置；命令文本的冻结不等于冻结所有依赖文件的内容。
 
 退出或断开 SSH 后，可以重新打开历史：
 
@@ -217,6 +235,11 @@ decision = "ask"
 禁止规则会在后续检查中收紧权限，新增授权需要显式接受。撤权不能回滚已经发生的写入或远程副作用。公网读取、Shell 网络与远程 MCP 权限分别约束，不是一个全局“联网开关”。
 
 macOS 子进程通过 `/usr/bin/sandbox-exec` 和 Seatbelt 隔离。Linux 通过 `/usr/bin/bwrap` 和 Bubblewrap 默认只读、禁网络；批准的联网要求 libseccomp，批准的工作区写入先在候选副本运行，通过检查后才发布。Linux 子进程外部目录写入暂不支持；缺少后端会明确报告不可用并拒绝执行。测试中的 fake sandbox 只用于流程验证，不是实际隔离证据。
+
+Linux 候选视图支持工作区内相对符号链接，保留普通文件 mtime，数据上限为 64 MiB。
+`run_command` / `execute_python` 的 `publish_on_failure=true` 可显式保留通过安全检查的失败或超时产物，
+方便后续命令增量续建；工具仍报告失败，`workspace_published` 说明是否发布。默认关闭，取消及沙箱启动失败不发布。
+它不增加写权限或取消 destructive 审批；不恢复已终止的进程。详见[输出与构建恢复契约](runtime-output-and-linux-repair.md)。
 
 ## 记忆与私有知识
 

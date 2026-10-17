@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 
 from agent_runtime.harness.protocol import CompletionDecision, CompletionProposal
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, ToolOperationSnapshot
@@ -19,6 +20,8 @@ class DeliveryCompletionGate:
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:
         turn = self._store.read_turn(proposal.turn_id)
         policy = turn.binding_manifest.get("completion_policy", {})
+        if isinstance(policy, Mapping) and policy.get("revision") == "completion-v2":
+            return self._evaluate_v2(proposal, policy)
         if not isinstance(policy, Mapping) or not policy.get("require_workspace_change", False):
             return CompletionDecision(
                 action="accept",
@@ -73,6 +76,171 @@ class DeliveryCompletionGate:
             validation_status="passed",
             validation_scope="workspace_change",
         )
+
+    def _evaluate_v2(self, proposal: CompletionProposal, policy: Mapping[str, object]) -> CompletionDecision:
+        """Keep lifecycle, recorded mutations and user-selected acceptance distinct."""
+        require_change = policy.get("require_workspace_change", False)
+        raw_command = policy.get("acceptance_command")
+        command = raw_command.strip() if isinstance(raw_command, str) else None
+
+        def reject(code: str, message: str, scope: str, **details: object) -> CompletionDecision:
+            feedback = {"reason_code": code, "message": message, **details}
+            if command:
+                feedback["command"] = command
+                feedback["working_dir"] = "."
+            return CompletionDecision(
+                action="continue", reason=json.dumps(feedback, ensure_ascii=False),
+                validation_status="failed", validation_scope=scope,
+            )
+
+        if not isinstance(require_change, bool) or (raw_command is not None and not command):
+            return reject("invalid_completion_policy", "The frozen completion policy is invalid.", "completion_policy")
+        if not require_change and command is None:
+            return CompletionDecision(
+                action="accept", reason="The model turn ended; task acceptance was not evaluated.",
+            )
+
+        records = self._trusted_v2_results(proposal.turn_id)
+        latest_change, result_order = self._v2_workspace_change_order(proposal.turn_id)
+        if require_change and not latest_change:
+            return reject(
+                "workspace_change_missing", "The requested workspace mutation has not been recorded.",
+                "workspace_change_recorded", next_action="Make the requested workspace change before finishing.",
+            )
+        if command is None:
+            return CompletionDecision(
+                action="accept",
+                reason="The requested workspace mutation was recorded; task acceptance was not evaluated.",
+                validation_status="passed", validation_scope="workspace_change_recorded",
+            )
+
+        turn = self._store.read_turn(proposal.turn_id)
+        workspace = Path(self._store.read_thread(turn.thread_id).workspace).resolve()
+        candidates = []
+        for item, operation, arguments in records:
+            actual_command = arguments.get("command")
+            if (
+                operation.tool_name != "run_command" or not isinstance(actual_command, str)
+                or actual_command.strip() != command or item.item_id not in result_order
+            ):
+                continue
+            working_dir = arguments.get("working_dir")
+            if working_dir is None or working_dir == "":
+                working_dir = "."
+            if not isinstance(working_dir, str):
+                continue
+            try:
+                if (workspace / working_dir).resolve() != workspace:
+                    continue
+            except (OSError, ValueError):
+                continue
+            candidates.append((item, operation))
+        if not candidates:
+            return reject(
+                "acceptance_command_missing",
+                "The configured acceptance command has no trusted execution in this workspace.",
+                "acceptance_command",
+                next_action="Run command exactly with run_command from working_dir and inspect its result.",
+            )
+        item, operation = max(candidates, key=lambda pair: result_order[pair[0].item_id])
+        result = item.payload.get("structured_content")
+        exit_code = result.get("exit_code") if isinstance(result, Mapping) else None
+        if (
+            operation.status != "succeeded" or item.payload.get("is_error") is not False
+            or not isinstance(result, Mapping) or not isinstance(exit_code, int) or isinstance(exit_code, bool)
+            or exit_code != 0 or result.get("timed_out") or result.get("sandbox_error")
+        ):
+            return reject(
+                "acceptance_command_failed", "The latest configured acceptance command did not complete successfully.",
+                "acceptance_command", tool_call_id=operation.tool_call_id,
+                next_action="Inspect that execution's output, resolve the failure, and rerun command from working_dir.",
+            )
+        # A user-selected verifier may produce build outputs itself. Its own
+        # attested mutation is part of that check; a subsequent operation's
+        # mutation still requires a fresh execution of the frozen command.
+        if result_order[item.item_id] < latest_change:
+            return reject(
+                "acceptance_command_stale", "The workspace changed after the configured acceptance command succeeded.",
+                "acceptance_command", tool_call_id=operation.tool_call_id,
+                next_action="Rerun command exactly with run_command from working_dir against the updated workspace.",
+            )
+        return CompletionDecision(
+            action="accept",
+            reason="The configured acceptance command completed successfully after the latest workspace mutation.",
+            validation_status="passed", validation_scope="acceptance_command",
+        )
+
+    def _v2_workspace_change_order(self, turn_id: str) -> tuple[int, dict[str, int]]:
+        """Order trusted shared-workspace mutations across durable descendants.
+
+        Item sequences belong to individual Turns. Rollout record IDs supply
+        the common commit order for parent checks and delegated mutations.
+        Allocation records, rather than a claimed binding field, establish
+        ancestry; unrelated work in the same workspace remains outside it.
+        """
+        turns = {turn.turn_id: turn for turn in self._store.list_turns()}
+        workspaces = {
+            thread.thread_id: Path(thread.workspace).resolve() for thread in self._store.list_threads()
+        }
+        workspace = workspaces[turns[turn_id].thread_id]
+        children: dict[str, list[str]] = {}
+        for child in turns.values():
+            if workspaces[child.thread_id] != workspace:
+                continue
+            try:
+                allocation = self._store.read_child_budget_allocation(child.turn_id)
+            except KeyError:
+                continue
+            children.setdefault(str(allocation["parent_turn_id"]), []).append(child.turn_id)
+        family: set[str] = set()
+        pending = [turn_id]
+        while pending:
+            current = pending.pop()
+            if current not in family:
+                family.add(current)
+                pending.extend(children.get(current, ()))
+        result_order = {
+            str(record.payload["item_id"]): record.record_id
+            for thread_id in {turns[current].thread_id for current in family}
+            for record in self._store.list_records(thread_id)
+            if record.turn_id in family and record.record_type == "item_completed" and record.producer == "tool"
+            and isinstance(record.payload.get("item_id"), str)
+        }
+        latest_change = max(
+            (result_order[item.item_id]
+             for current in family for item, operation, _arguments in self._trusted_v2_results(current)
+             if item.item_id in result_order and _is_workspace_change(item, operation)),
+            default=0,
+        )
+        return latest_change, result_order
+
+    def _trusted_v2_results(
+        self, turn_id: str,
+    ) -> tuple[tuple[ItemSnapshot, ToolOperationSnapshot, Mapping[str, object]], ...]:
+        items = {item.item_id: item for item in self._store.list_items(turn_id)}
+        calls = {
+            item.payload.get("tool_call_id"): item for item in items.values()
+            if item.kind == "tool_call" and item.status == "completed" and item.producer == "model"
+        }
+        trusted = []
+        for operation in self._store.list_tool_operations(turn_id):
+            if (
+                operation.status not in {"succeeded", "failed", "denied", "cancelled", "unknown"}
+                or operation.result_item_id is None
+            ):
+                continue
+            item = items.get(operation.result_item_id)
+            call = calls.get(operation.tool_call_id)
+            if (
+                item is None or call is None or item.kind != "tool_result" or item.status != "completed"
+                or item.producer != "tool" or call.payload.get("tool_name") != operation.tool_name
+                or item.payload.get("tool_name") != operation.tool_name
+                or item.payload.get("tool_call_id") != operation.tool_call_id or item.sequence <= call.sequence
+                or not isinstance(call.payload.get("arguments"), Mapping)
+            ):
+                continue
+            trusted.append((item, operation, call.payload["arguments"]))
+        return tuple(trusted)
 
     def _trusted_results(
         self,
@@ -135,7 +303,8 @@ class DeliveryCompletionGate:
             "reason_code": "verification_missing",
             "message": "No successful verification of the latest workspace change has been recorded.",
             "next_action": "Run the project's documented checks directly after the latest workspace change, "
-            "using a recognized test runner, static check, or explicit assertion.",
+            "using a recognized test runner or static check, or inspect the changed artifacts with "
+            "read_file or inspect_data_file.",
         }
         if candidates:
             item, operation = candidates[0]
@@ -152,6 +321,18 @@ class DeliveryCompletionGate:
                 code, message = (
                     "tool_failed",
                     "The tool operation failed; its output cannot attest successful verification.",
+                )
+            elif assessment.evidence is not None and assessment.evidence.kind == "assertion":
+                code, message = (
+                    "assertion_targets_unattested",
+                    "The managed interpreter observed successful assertions, but it did not attest which files "
+                    "they verified. Assertion execution alone does not satisfy workspace-change verification.",
+                )
+                feedback["attested_write_targets"] = [target[:500] for target in sorted(changed_resources)[:8]]
+                feedback["next_action"] = (
+                    "Run the project's documented checks directly with a recognized test runner or static check "
+                    "in run_command, or use read_file or inspect_data_file on attested_write_targets after the "
+                    "latest write. File inspection attests inspection, not task correctness."
                 )
             elif assessment.evidence is not None:
                 code, message = (

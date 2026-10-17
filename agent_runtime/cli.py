@@ -324,6 +324,10 @@ def _display_agent_result(
             print("本轮运行已结束；任务验收尚未评估。")
         elif result.validation_scope == "workspace_change":
             print("此状态仅表示工作区修改及修改后的验证检查。")
+        elif result.validation_scope == "workspace_change_recorded":
+            print("仅确认工作区发生了实际修改；任务验收尚未评估。")
+        elif result.validation_scope == "acceptance_command":
+            print("仅确认用户指定的验收命令执行成功。")
 
     if result.status == "paused" and result.pause is None and result.needs_user_input:
         print(f"\n暂停原因: {result.needs_user_input}")
@@ -336,27 +340,30 @@ def _display_agent_result(
 
     if verbose:
         usage = result.usage
+        def milliseconds(value: float | None) -> str:
+            return "unknown" if value is None else f"{value:.0f}ms"
+
         print(
             "\n调用统计: "
             f"native={usage.native_calls}"
             f"({usage.native_errors}err/"
-            f"{usage.native_latency_ms_total:.0f}ms) "
-            f"deferred={usage.deferred_calls} "
+            f"{milliseconds(usage.native_latency_ms_total)}) "
+            f"deferred={usage.deferred_calls if usage.deferred_calls is not None else 'unknown'} "
             f"mcp={usage.mcp_calls}"
             f"({usage.mcp_errors}err/"
-            f"{usage.mcp_latency_ms_total:.0f}ms)"
+            f"{milliseconds(usage.mcp_latency_ms_total)})"
         )
         print(
             "耗时: "
-            f"total={usage.latency_ms:.0f}ms "
-            f"startup={usage.startup_ms:.0f}ms "
-            f"build={usage.build_service_ms:.0f}ms "
-            f"model_ready={usage.model_ready_ms:.0f}ms "
-            f"model={usage.model_latency_ms:.0f}ms "
-            f"tool={usage.tool_latency_ms:.0f}ms "
-            f"finalize={usage.finalize_latency_ms:.0f}ms "
-            f"prompt_bytes={usage.prompt_bytes} "
-            f"tool_schema_bytes={usage.tool_schema_bytes}"
+            f"total={milliseconds(usage.latency_ms)} "
+            f"startup={milliseconds(usage.startup_ms)} "
+            f"build={milliseconds(usage.build_service_ms)} "
+            f"model_ready={milliseconds(usage.model_ready_ms)} "
+            f"model={milliseconds(usage.model_latency_ms)} "
+            f"tool={milliseconds(usage.tool_latency_ms)} "
+            f"finalize={milliseconds(usage.finalize_latency_ms)} "
+            f"prompt_bytes={usage.prompt_bytes if usage.prompt_bytes is not None else 'unknown'} "
+            f"tool_schema_bytes={usage.tool_schema_bytes if usage.tool_schema_bytes is not None else 'unknown'}"
         )
         if result.evidence:
             print(f"证据: {len(result.evidence)} 条")
@@ -609,7 +616,8 @@ async def _run_facade_command(
     max_tokens_total: int | None,
     interactive_approval: bool,
     max_turns: int | None = None,
-    require_workspace_change: bool = True,
+    require_workspace_change: bool = False,
+    acceptance_command: str | None = None,
     allow_write_tools: bool = False,
     allow_execute_tools: bool = False,
     allow_web_tools: bool = False,
@@ -626,6 +634,7 @@ async def _run_facade_command(
             max_turns=max_turns,
             max_tokens_total=max_tokens_total,
             require_workspace_change=require_workspace_change,
+            acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
@@ -1856,11 +1865,13 @@ def agent_run(
         typer.Option(
             "--require-workspace-change/--no-require-workspace-change",
             help=(
-                "默认仅在产生真实 workspace 变更，且在最后一次真实变更后"
-                "成功运行测试、lint、类型检查或构建时允许完成 Turn。"
+                "要求产生真实 workspace 变更；需要机器验收时另设 --acceptance-command"
             ),
         ),
-    ] = True,
+    ] = False,
+    acceptance_command: Annotated[
+        str | None, typer.Option("--acceptance-command", help="用户指定的验收命令；必须在最后修改后真实执行成功"),
+    ] = None,
     allow_execute_tools: Annotated[
         bool,
         typer.Option("--allow-execute-tools", help="预授权本次进程执行类调用"),
@@ -1937,6 +1948,7 @@ def agent_run(
             interactive_approval=interactive_approval,
             max_turns=max_turns,
             require_workspace_change=require_workspace_change,
+            acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,

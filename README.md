@@ -16,17 +16,28 @@ Praxis 是面向个人本机和可信服务器工作区的开源 AI Agent。它�
 
 把模型接进项目后，真正困难的是后面的工作：它能读取哪些文件，哪些操作需要确认，中断后怎样继续，以及“已经完成”究竟有什么依据。
 
-Praxis 把这些事情放进执行流程。模型根据观察规划下一步；文件、命令、网页和集成服务通过明确的工具接口使用；需要授权的动作在执行前暂停。修改类任务默认要求工作区确实发生变化，并在最后一次修改后完成检查。
+Praxis 把这些事情放进执行流程。模型根据观察规划下一步；文件、命令、网页和集成服务通过明确的工具接口使用；需要授权的动作在执行前暂停。运行结束与任务验收分别记录；需要机器验收时，由用户指定验收命令，Runtime 检查其真实执行结果。
 
 这是一套服务真实任务的运行时，也是一份可以阅读、调试和扩展的 Agent 工程实现。
 
 ![Praxis 执行过程演示](docs/assets/praxis-demo.gif)
 
-*演示使用固定模型响应，展示真实执行链路中的读取、修改和验证，不代表真实模型的任务能力。可通过 `scripts/render_praxis_demo.py` 重新生成。*
+*100 元打八折却算成了 -1900 元：读取代码 → 复现失败 → 修复公式 → 三项测试通过。演示使用固定模型响应，工具、文件修改与测试均真实执行；画面为执行过程回放，不代表真实模型的任务能力。可通过 `scripts/render_praxis_demo.py` 重新生成。*
 
 ## 快速开始
 
 需要 Python **3.12 或 3.13**、Git 和 [uv](https://docs.astral.sh/uv/)。当前支持 macOS 和 Linux；命令执行还需要对应平台的沙箱后端。
+
+从 PyPI 安装后，在你要处理的项目目录启动：
+
+```bash
+uv tool install --python 3.12 --link-mode copy praxis-agent
+cd /path/to/my-project
+agent setup
+agent chat
+```
+
+参与开发时也可以通过源码安装：
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
@@ -41,7 +52,7 @@ uv run agent chat
 
 API Key 在终端中隐藏输入。macOS 使用系统 Keychain，Linux 使用个人配置目录中的私有凭据文件；配置文件保存模型定义与凭据变量名。其他用户下载项目后，配置自己的模型和账号即可使用。
 
-项目目前通过**源码安装**分发，尚未发布到 PyPI。安装过程、模型要求和本地 MLX 的启动方式见[使用指南](docs/guide.md#安装与首次配置)。
+PyPI 安装包名为 [`praxis-agent`](https://pypi.org/project/praxis-agent/)。安装过程、模型要求和本地 MLX 的启动方式见[使用指南](docs/guide.md#安装与首次配置)。
 
 ## 用它完成什么
 
@@ -68,8 +79,9 @@ uv run --project /path/to/praxis-agent-runtime agent chat
 uv run agent run "阅读 pyproject.toml，解释项目入口和模块职责。" \
   --no-require-workspace-change
 
-# 修改类任务：完成变更后检查实际结果
-uv run agent run "修复配置加载中的异常处理，更新相关测试并验证。"
+# 修改类任务：要求实际变更，并运行用户指定的验收
+uv run agent run "修复配置加载中的异常处理，更新相关测试并验证。" \
+  --require-workspace-change --acceptance-command "uv run pytest -q"
 ```
 
 常用聊天命令集中在 `/help` 中：

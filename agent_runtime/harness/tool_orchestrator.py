@@ -90,9 +90,13 @@ def _operation_consumes_inspection_budget(operation: object) -> bool:
     )
 
 
-def _requires_workspace_change(store: RolloutStore, turn_id: str) -> bool:
+def _uses_legacy_inspection_budget(store: RolloutStore, turn_id: str) -> bool:
     policy = store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
-    return isinstance(policy, Mapping) and policy.get("require_workspace_change") is True
+    return (
+        isinstance(policy, Mapping)
+        and policy.get("revision") != "completion-v2"
+        and policy.get("require_workspace_change") is True
+    )
 
 
 def _has_committed_workspace_change(store: RolloutStore, turn_id: str) -> bool:
@@ -118,7 +122,7 @@ def _has_committed_workspace_change(store: RolloutStore, turn_id: str) -> bool:
 
 
 def inspection_tools_available(store: RolloutStore, turn_id: str) -> bool:
-    if not _requires_workspace_change(store, turn_id):
+    if not _uses_legacy_inspection_budget(store, turn_id):
         return True
     operations = tuple(
         operation for operation in store.list_tool_operations(turn_id) if operation.status == "succeeded"
@@ -437,7 +441,7 @@ class ToolOrchestrator:
         contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
         tools = tuple(self._tools.get(call.tool_name) for call in calls)
         inspection_fits = True
-        if _requires_workspace_change(self._store, turn_id) and not _has_committed_workspace_change(
+        if _uses_legacy_inspection_budget(self._store, turn_id) and not _has_committed_workspace_change(
             self._store, turn_id
         ):
             operations = self._store.list_tool_operations(turn_id)
@@ -618,6 +622,7 @@ class ToolOrchestrator:
                 attempt_count=record.attempt_count,
                 error_code=record.error_code,
                 requires_reconciliation=record.requires_reconciliation,
+                duration_ms=execution.trace.duration_ms,
                 result=_tool_result_payload(execution.result),
             )
         )

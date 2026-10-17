@@ -238,7 +238,9 @@ def _stream_stop_reason(value: str) -> str:
         return "tool_use"
     if value == "length":
         return "max_tokens"
-    return "end_turn"
+    if value in {"stop", "end_turn"}:
+        return "end_turn"
+    return value
 
 
 def _is_complete_chat_response(value: object) -> bool:
@@ -275,7 +277,7 @@ def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
         yield {"type": "content_block_stop", "tool_id": tool_id}
     yield {
         "type": "message_stop",
-        "stop_reason": _stream_stop_reason(str(choice.finish_reason or "stop")),
+        "stop_reason": _stream_stop_reason(str(choice.finish_reason or "unknown")),
         "usage": _openai_response_usage(response),
     }
 

@@ -152,10 +152,16 @@ def parse_openai_response(response: object) -> ToolUseResult:
         stop_reason = StopReason.TOOL_USE
     elif raw_stop_text == "length":
         stop_reason = StopReason.MAX_TOKENS
-    else:
+    elif raw_stop_text in {"stop", "end_turn"}:
         stop_reason = StopReason.END_TURN
+    else:
+        stop_reason = StopReason.INCOMPLETE
 
     raw_calls = _field(message, "tool_calls", default=())
+    if stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}:
+        # Neither complete-looking calls nor partial JSON from a truncated
+        # step are executable. Preserve the authoritative stop and usage.
+        raw_calls = ()
     if raw_calls is None:
         raw_calls = ()
     if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes)):

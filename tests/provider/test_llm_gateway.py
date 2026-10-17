@@ -12,6 +12,7 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
+from agent_runtime.core.messages import StopReason
 from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
@@ -916,6 +917,89 @@ async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
         ProviderDelta(ProviderDeltaChannel.PLAN, "read then answer"),
         ProviderDelta(ProviderDeltaChannel.TEXT, "stream answer"),
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("arguments", ['{"path":', '{"path":"file"}'])
+async def test_streaming_length_stop_has_priority_over_tool_fragments(arguments):
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {"type": "tool_use_start", "tool_id": "frag", "tool_name": "read_file"}
+            yield {"type": "tool_input_delta", "tool_id": "frag", "content": arguments}
+            yield {"type": "content_block_stop", "tool_id": "frag"}
+            yield {"type": "message_stop", "stop_reason": "max_tokens", "usage": LLMUsage(
+                input_tokens=10, output_tokens=20, total_tokens=30, source="provider",
+            )}
+
+    result = await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True, stream=True,
+    )
+    assert result.turn.stop_reason is StopReason.MAX_TOKENS
+    assert result.turn.tool_calls == []
+    assert result.usage.total_tokens == 30
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", ["content_filter", "unknown", None])
+async def test_streaming_unsuccessful_terminal_never_exposes_tool_calls(reason):
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {"type": "tool_use_start", "tool_id": "frag", "tool_name": "read_file"}
+            yield {"type": "tool_input_delta", "tool_id": "frag", "content": '{"path":"README.md"}'}
+            yield {"type": "content_block_stop", "tool_id": "frag"}
+            yield {"type": "message_stop", "stop_reason": reason, "usage": LLMUsage(
+                input_tokens=10, output_tokens=20, total_tokens=30, source="provider",
+            )}
+    result = await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True, stream=True,
+    )
+    assert result.turn.stop_reason is StopReason.INCOMPLETE
+    assert result.turn.tool_calls == []
+    assert result.turn.raw_stop_reason == (reason or "unknown")
+
+
+@pytest.mark.anyio
+async def test_stream_without_terminal_does_not_promote_tools_to_success():
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {"type": "tool_use_start", "tool_id": "frag", "tool_name": "read_file"}
+            yield {"type": "tool_input_delta", "tool_id": "frag", "content": '{"path":"README.md"}'}
+            yield {"type": "content_block_stop", "tool_id": "frag"}
+    with pytest.raises(ConnectionError, match="without a terminal stop"):
+        await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+            stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+            supports_native_tools=True, stream=True,
+        )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason, expected", [
+    ("length", StopReason.MAX_TOKENS), ("content_filter", StopReason.INCOMPLETE),
+    ("unrecognized", StopReason.INCOMPLETE), ("tool_calls", StopReason.TOOL_USE),
+])
+async def test_openai_sse_terminal_reaches_gateway_without_success_coercion(reason, expected):
+    from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
+
+    response = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason=reason,
+        delta=SimpleNamespace(content="prefix", tool_calls=[SimpleNamespace(
+            index=0, id="call", function=SimpleNamespace(name="read_file", arguments="{}"),
+        )]),
+    )], usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30})
+    generator = OpenAICompatibleChatGenerator.__new__(OpenAICompatibleChatGenerator)
+    generator.chat_model_name = "test-model"
+    generator._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: iter([response]),
+    )))
+    result = await _gateway(generator, max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True, stream=True,
+    )
+    assert result.turn.stop_reason is expected
+    assert len(result.turn.tool_calls) == (1 if expected is StopReason.TOOL_USE else 0)
+    assert result.usage.total_tokens == 30
 
 
 @pytest.mark.anyio

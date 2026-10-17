@@ -140,7 +140,8 @@ class Agent:
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
-        require_workspace_change: bool = True,
+        require_workspace_change: bool = False,
+        acceptance_command: str | None = None,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
@@ -150,6 +151,7 @@ class Agent:
         async with self.session(
             previous_turn_id=previous_turn_id,
             require_workspace_change=require_workspace_change,
+            acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
@@ -162,7 +164,8 @@ class Agent:
     @asynccontextmanager
     async def session(
         self, *, previous_turn_id: str | None = None, thread_id: str | None = None,
-        require_workspace_change: bool = True,
+        require_workspace_change: bool = False,
+        acceptance_command: str | None = None,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
         max_steps: int | None = None, max_turns: int | None = None, max_tokens_total: int | None = None,
@@ -174,12 +177,17 @@ class Agent:
     ) -> AsyncIterator[Session]:
         from agent_runtime.harness.session import Session
 
+        if acceptance_command is not None:
+            if not isinstance(acceptance_command, str) or not acceptance_command.strip():
+                raise ValueError("acceptance_command must be a non-empty string or None")
+            acceptance_command = acceptance_command.strip()
         if max_steps is not None and max_turns is not None and max_steps != max_turns:
             raise ValueError("max_steps and legacy max_turns must agree when both are provided")
         step_budget = max_steps if max_steps is not None else max_turns
         session = await Session.open(
             agent=self, previous_turn_id=previous_turn_id, frozen_turn_id=_frozen_turn_id, thread_id=thread_id,
             require_workspace_change=require_workspace_change,
+            acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
             max_steps=16 if step_budget is None else step_budget,
@@ -347,7 +355,8 @@ class Agent:
         max_turns: int | None = None,
         max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
-        require_workspace_change: bool = True,
+        require_workspace_change: bool = False,
+        acceptance_command: str | None = None,
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
@@ -365,6 +374,7 @@ class Agent:
                 max_tokens_total=max_tokens_total,
                 max_cost_micros=max_cost_micros,
                 require_workspace_change=require_workspace_change,
+                acceptance_command=acceptance_command,
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
                 allow_web_tools=allow_web_tools,

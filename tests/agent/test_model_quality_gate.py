@@ -5,6 +5,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,82 @@ import pytest
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "model_quality_cases.json"
 BASELINE_PATH = Path(__file__).parents[2] / "tests" / "agent" / "fixtures" / "model_quality_baseline_v1.json"
 SCRIPT_PATH = Path(__file__).parents[2] / "scripts" / "agent_model_quality_gate.py"
+
+
+@pytest.mark.anyio
+async def test_trial_report_preserves_unavailable_sdk_metrics(monkeypatch, tmp_path):
+    import agent_runtime
+    from agent_runtime import models
+    from agent_runtime.result import AgentUsage
+
+    module = _load_gate_module()
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, task, **kwargs):
+            return SimpleNamespace(
+                status="done", answer="complete", turn_id="turn-unknown-metrics", tool_calls=(),
+                usage=AgentUsage(model_calls=1, input_tokens=3, output_tokens=2),
+                stop_reason=None, diagnostics=(), needs_user_input=None, pause=None,
+            )
+
+    monkeypatch.setattr(agent_runtime, "Agent", FakeAgent)
+    monkeypatch.setattr(models.ModelControlPlane, "from_env", lambda **kwargs: SimpleNamespace(
+        current_model=lambda: SimpleNamespace(id="test-model", provider="test"),
+    ))
+    report = await module.run_model_trials(
+        model_id="test-model", trials=1, env_file=tmp_path / ".env",
+        cases=module.load_suite(FIXTURE_PATH)["cases"],
+    )
+    assert report["status"] == "completed"
+    trial = report["trials"][0]
+    assert trial["informational_metrics"] == {
+        "mean_input_tokens_per_case": 3.0, "mean_output_tokens_per_case": 2.0,
+        "mean_latency_ms_per_case": None, "mean_tool_schema_bytes_per_case": None,
+    }
+    serialized = json.loads(json.dumps(trial["cases"][0]["observation"]))
+    restored = module._observation_from_payload(serialized)
+    assert restored.latency_ms is None
+    assert restored.tool_schema_bytes is None
+
+
+def test_informational_means_propagate_missing_measurements_independently():
+    module = _load_gate_module()
+    payload = _inconclusive_model_report(module)["trials"][0]["cases"][0]["observation"]
+    known = replace(module._observation_from_payload(payload), latency_ms=20.0, tool_schema_bytes=400)
+    unknown = replace(known, latency_ms=None)
+    metrics = module.informational_metrics([known, unknown])
+    assert metrics["mean_latency_ms_per_case"] is None
+    assert metrics["mean_tool_schema_bytes_per_case"] == 400.0
+    zero = replace(known, latency_ms=0.0, tool_schema_bytes=0)
+    zero_metrics = module.informational_metrics([zero])
+    assert zero_metrics["mean_latency_ms_per_case"] == 0.0
+    assert zero_metrics["mean_tool_schema_bytes_per_case"] == 0.0
+
+
+@pytest.mark.anyio
+async def test_failed_live_case_keeps_unobserved_metrics_unknown(monkeypatch):
+    import agent_runtime
+
+    module = _load_gate_module()
+
+    class FailingAgent:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run(self, task, **kwargs):
+            raise RuntimeError("no result was produced")
+
+    monkeypatch.setattr(agent_runtime, "Agent", FailingAgent)
+    observation = await module.run_live_case(
+        model_id="test-model", control_plane=object(),
+        case={"id": "read", "capability": "file_tool_selection", "task": "Read"},
+    )
+    assert observation.status == "error"
+    assert observation.latency_ms is None
+    assert observation.tool_schema_bytes is None
 
 
 def _load_gate_module():

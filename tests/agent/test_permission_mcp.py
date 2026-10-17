@@ -307,7 +307,11 @@ async def test_reopened_session_applies_saved_permissions_before_mcp_startup(tmp
     ).replace("'write_blocked': write_blocked", "'startup_read': startup_read, 'write_blocked': write_blocked"))
     monkeypatch.setenv("AGENT_MCP_CONFIG", str(config))
     database = workspace / "rollout.db"
-    first_agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
+    trust = decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=True)
+    # Frozen recovery can narrow an enabled capability, never re-enable one
+    # disabled in the original Turn. Keep this case about permission ceilings.
+    first_agent = Agent(workspace_path=workspace, checkpoint_db=database,
+                        enable_workspace_mcp=anchor == "frozen_turn", mcp_config_trust=trust)
     monkeypatch.setattr(first_agent, "_model_factory", PublicHarnessModel)
     async with first_agent.session(require_workspace_change=False) as session:
         restricted = PermissionPolicy(filesystem=(PathRule(path=str(secret), access="deny"),))
@@ -318,7 +322,6 @@ async def test_reopened_session_applies_saved_permissions_before_mcp_startup(tmp
         thread_id = session.thread_id
         assert session.permissions().path_access(secret) == (anchor == "frozen_turn")
 
-    trust = decide_mcp_config_trust(config, workspace_root=workspace, trust_workspace=True)
     fresh_agent = Agent(workspace_path=workspace, checkpoint_db=database, mcp_config_trust=trust)
     monkeypatch.setattr(fresh_agent, "_model_factory", PublicHarnessModel)
     assert fresh_agent.effective_permissions().path_access(secret)

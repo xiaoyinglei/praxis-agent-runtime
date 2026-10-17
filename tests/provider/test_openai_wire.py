@@ -385,6 +385,30 @@ def test_openai_response_parser_accepts_sdk_null_tool_calls(
     assert turn.tool_calls == []
 
 
+@pytest.mark.parametrize("arguments", ['{"path":', '{"path":"file"}'])
+def test_length_stop_discards_tool_fragments_without_parsing(arguments):
+    turn = parse_openai_response({"choices": [{
+        "finish_reason": "length",
+        "message": {"content": "partial", "tool_calls": [{
+            "id": "fragment", "function": {"name": "read_file", "arguments": arguments},
+        }]},
+    }]})
+    assert turn.stop_reason is StopReason.MAX_TOKENS
+    assert turn.tool_calls == []
+
+
+@pytest.mark.parametrize("reason", ["content_filter", "unknown", None])
+def test_unsuccessful_finish_never_exposes_tool_calls(reason):
+    turn = parse_openai_response({"choices": [{
+        "finish_reason": reason,
+        "message": {"content": "partial", "tool_calls": [{
+            "id": "fragment", "function": {"name": "read_file", "arguments": '{"path":'},
+        }]},
+    }]})
+    assert turn.stop_reason is StopReason.INCOMPLETE
+    assert turn.tool_calls == []
+
+
 def test_openai_usage_treats_cached_tokens_as_part_of_total_input() -> None:
     usage = parse_openai_usage(
         {

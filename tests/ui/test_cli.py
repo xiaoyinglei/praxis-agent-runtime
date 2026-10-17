@@ -180,7 +180,7 @@ def test_cli_main_delegates_to_typer_app(monkeypatch: MonkeyPatch) -> None:
 def test_project_metadata_exposes_agent_as_primary_console_script() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text())
 
-    assert pyproject["project"]["name"] == "praxis-agent-runtime"
+    assert pyproject["project"]["name"] == "praxis-agent"
     assert pyproject["project"]["scripts"]["agent"] == "agent_runtime.cli:agent_app"
     assert pyproject["project"]["scripts"]["rag"] == "rag.cli:app"
 

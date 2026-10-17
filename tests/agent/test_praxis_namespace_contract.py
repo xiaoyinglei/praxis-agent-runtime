@@ -20,6 +20,8 @@ _HISTORICAL_EXCEPTIONS = {
 # Provider transcripts, generated workspaces, and offline replays retain the
 # original paths as evidence. They are not portable runtime contracts. Keep the
 # maintained runners and README in this directory under the ordinary checks.
+# Generated benchmark artifacts also preserve immutable source snapshots and
+# transcripts. Only their maintained runners are active contracts.
 _CONTEXT_EVALS = ROOT / "evals/context_management"
 _HISTORICAL_EXCEPTIONS.update(_CONTEXT_EVALS.glob("offline-*.json"))
 _HISTORICAL_EXCEPTIONS.update(_CONTEXT_EVALS.glob("semantic-live-*.json"))
@@ -42,7 +44,9 @@ def _active_contract_files() -> Iterator[Path]:
             if (
                 path.is_file()
                 and path.suffix in _SCANNED_SUFFIXES
+                and ".venv" not in path.relative_to(source_root).parts
                 and path not in _HISTORICAL_EXCEPTIONS
+                and not (source_root == ROOT / "evals" and "artifacts" in path.relative_to(source_root).parts[:-1])
             ):
                 yield path
 
@@ -58,7 +62,7 @@ def _active_contract_files() -> Iterator[Path]:
 
 def test_distribution_and_console_entrypoint_use_praxis_namespace() -> None:
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    assert config["project"]["name"] == "praxis-agent-runtime"
+    assert config["project"]["name"] == "praxis-agent"
     assert config["project"]["description"] == (
         "Praxis — a trusted-local workspace agent runtime for files, code, data, "
         "and private knowledge."
