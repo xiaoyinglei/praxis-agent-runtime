@@ -598,8 +598,12 @@ async def test_inspection_budget_counts_read_only_process_tools_by_effect(
 
 
 @pytest.mark.anyio
-async def test_read_only_turn_does_not_enforce_delivery_inspection_budget(
-    tmp_path: Path,
+@pytest.mark.parametrize("policy", [
+    {"require_workspace_change": False},
+    {"revision": "completion-v2", "require_workspace_change": True},
+])
+async def test_turns_without_legacy_delivery_policy_keep_inspection_available(
+    tmp_path: Path, policy,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -610,7 +614,7 @@ async def test_read_only_turn_does_not_enforce_delivery_inspection_budget(
             user_message="analyze the implementation",
             binding_manifest={
                 "model_id": "test-model",
-                "completion_policy": {"require_workspace_change": False},
+                "completion_policy": policy,
             },
         )
         tool = _read_tool(workspace=workspace)

@@ -184,6 +184,8 @@ def test_renderer_replays_public_runtime_into_deterministic_gif(
     assert any("[patch]" in line for line in first_artifact.trace_lines)
     assert any("[verify]" in line for line in first_artifact.trace_lines)
     assert first_artifact.trace_lines[-1].startswith("[complete]")
+    assert any("discount_percent / 100" in line for line in first_artifact.trace_lines)
+    assert first_artifact.frame_count == 6
     sanitized = "\n".join(first_artifact.trace_lines)
     assert str(tmp_path) not in sanitized
     assert "/Users/" not in sanitized
@@ -202,6 +204,10 @@ def _assert_bounded_gif(path: Path) -> None:
     with Image.open(path) as image:
         assert image.format == "GIF"
         assert image.n_frames >= 5
+        assert 12_000 <= sum(
+            (image.seek(index) or image.info.get("duration", 0))
+            for index in range(image.n_frames)
+        ) <= 20_000
         width, height = image.size
         assert width > 0
         assert height > 0

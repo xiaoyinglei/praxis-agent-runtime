@@ -773,7 +773,7 @@ def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> 
     assert "switch this session" in current.output
 
 
-def test_workspace_change_help_discloses_post_change_verification_gate() -> None:
+def test_help_separates_workspace_change_from_explicit_acceptance() -> None:
     result = CliRunner().invoke(
         agent_app,
         ["run", "--help"],
@@ -781,8 +781,9 @@ def test_workspace_change_help_discloses_post_change_verification_gate() -> None
     )
 
     assert result.exit_code == 0
-    assert "最后一次真实变更后" in result.output
-    assert "测试、lint、类型检查或构建" in result.output
+    assert "真实 workspace 变更" in result.output
+    assert "--acceptance-command" in result.output
+    assert "最后修改后真实执行成功" in result.output
 
 
 def test_agent_run_rejects_missing_input_without_internal_traceback(
@@ -946,17 +947,19 @@ def test_agent_run_forwards_workspace_change_contract(
         non_interactive=True,
     )
 
-    assert run_options[0]["require_workspace_change"] is True
+    assert run_options[0]["require_workspace_change"] is False
 
     cli_module.agent_run(
         task="Explain the implementation.",
         checkpoint_db=tmp_path / "checkpoints.sqlite",
         model_session_path=tmp_path / "model-session.json",
-        require_workspace_change=False,
+        require_workspace_change=True,
+        acceptance_command="test -f result.txt",
         non_interactive=True,
     )
 
-    assert run_options[1]["require_workspace_change"] is False
+    assert run_options[1]["require_workspace_change"] is True
+    assert run_options[1]["acceptance_command"] == "test -f result.txt"
 
 
 def _result(

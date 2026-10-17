@@ -19,16 +19,16 @@ from types import ModuleType
 
 from PIL import Image, ImageDraw, ImageFont
 
-DEMO_BANNER = "PRAXIS — DETERMINISTIC DEMO"
-FAKE_MODEL_BANNER = "FAKE MODEL — NOT MODEL QUALITY EVIDENCE"
+DEMO_BANNER = "Praxis"
+FAKE_MODEL_BANNER = "固定模型响应 · 工具与测试真实执行"
 TERMINAL_COMMAND = (
     "$ uv run python scripts/agent_delivery_smoke.py "
-    "--fake-model --case praxis_demo"
+    "--fake-model --case checkout_demo"
 )
-FRAME_SIZE = (960, 540)
+FRAME_SIZE = (1200, 760)
 BODY_FONT_SIZE = 17
-TERMINAL_TEXT_LEFT = 50
-TERMINAL_TEXT_RIGHT = 912
+TERMINAL_TEXT_LEFT = 482
+TERMINAL_TEXT_RIGHT = 1134
 MAX_VISIBLE_TRACE_LINES = 12
 _MINIMUM_FRAME_COUNT = 5
 _SENSITIVE_TRACE_TOKENS = (
@@ -88,7 +88,7 @@ def render_demo(output: Path) -> RenderedDemo:
         smoke.run_matrix(
             model="fake",
             fake_model=True,
-            only={"praxis_demo"},
+            only={"checkout_demo"},
         )
     )
     if len(results) != 1:
@@ -103,14 +103,16 @@ def render_demo(output: Path) -> RenderedDemo:
         workspace_diff=result.workspace_diff,
     )
     frame_texts = build_frame_texts(trace_lines)
-    frames = tuple(_render_frame(lines) for lines in frame_texts)
+    # Present six readable moments from the completed run, rather than racing
+    # through internal event logs. No timing or model reasoning is fabricated.
+    frames = tuple(_render_frame(frame_texts[-1], stage=stage) for stage in range(6))
     output.parent.mkdir(parents=True, exist_ok=True)
     frames[0].save(
         output,
         format="GIF",
         save_all=True,
         append_images=frames[1:],
-        duration=[950, *([650] * (len(frames) - 2)), 1400],
+        duration=[1800, 1800, 2400, 2800, 2200, 4000],
         loop=0,
         disposal=2,
         optimize=True,
@@ -147,62 +149,103 @@ def _presentation_trace(
     return tuple(trace)
 
 
-def _render_frame(lines: Sequence[str]) -> Image.Image:
-    image = Image.new("RGB", FRAME_SIZE, "#09111f")
+def _render_frame(lines: Sequence[str], *, stage: int = 5) -> Image.Image:
+    image = Image.new("RGB", FRAME_SIZE, "#101217")
     draw = ImageDraw.Draw(image)
-    title_font = _load_monospace_font(25)
-    label_font = _load_monospace_font(15)
+    title_font = _load_ui_font(35)
+    label_font = _load_ui_font(17)
     body_font = _load_monospace_font(BODY_FONT_SIZE)
+    ui_font = _load_ui_font(23)
+    muted, white, orange = "#9ca4b3", "#eeede8", "#edab86"
+    green, red = "#9bd4b3", "#f0a0a0"
 
-    draw.text((42, 28), lines[0], font=title_font, fill="#f5f7ff")
-    label_box = draw.textbbox((0, 0), lines[1], font=label_font)
-    label_width = label_box[2] - label_box[0]
-    draw.rounded_rectangle(
-        (42, 70, 66 + label_width, 101),
-        radius=8,
-        fill="#412b11",
-        outline="#f3a83b",
-        width=1,
-    )
-    draw.text((54, 77), lines[1], font=label_font, fill="#ffd58a")
+    draw.text((34, 24), "✳", font=_load_ui_font(34), fill=orange)
+    draw.text((78, 26), lines[0], font=_load_monospace_font(28), fill=orange)
+    draw.text((34, 76), "从一个问题，到一个验证过的修复。", font=title_font, fill=white)
+    draw.text((925, 39), "代码修复 / 执行回放", font=label_font, fill=muted)
 
-    draw.rounded_rectangle(
-        (32, 119, 928, 511),
-        radius=14,
-        fill="#101827",
-        outline="#2a3850",
-        width=2,
-    )
-    for x, color in (
-        (53, "#ff6b6b"),
-        (75, "#ffd166"),
-        (97, "#55d187"),
-    ):
-        draw.ellipse((x, 137, x + 11, 148), fill=color)
-    draw.text(
-        (124, 132),
-        "praxis-demo · public agent_runtime.Agent facade",
-        font=label_font,
-        fill="#8291a7",
-    )
-    draw.line((48, 160, 912, 160), fill="#26354b", width=1)
-    draw.text(
-        (TERMINAL_TEXT_LEFT, 174),
-        _fit_terminal_line(lines[2], font=body_font),
-        font=body_font,
-        fill="#8bd5ff",
-    )
+    draw.rounded_rectangle((32, 142, 1168, 687), radius=18, fill="#191d25", outline="#303641")
+    for x, color in ((53, "#e3827c"), (75, "#debc79"), (97, "#8cbe9c")):
+        draw.ellipse((x, 164, x + 10, 174), fill=color)
+    draw.text((128, 158), "praxis / checkout", font=body_font, fill=muted)
+    draw.text((988, 158), f"0{stage + 1} / 06", font=body_font, fill=orange)
+    draw.line((33, 194, 1167, 194), fill="#303641")
+    draw.line((434, 195, 434, 686), fill="#303641")
 
-    y = 209
-    for line in lines[3:]:
+    draw.text((59, 224), "你的任务", font=label_font, fill=orange)
+    for y, text in ((267, "100 元打八折应为 80 元。"), (304, "修复计算逻辑，并运行测试。")):
+        draw.text((59, y), text, font=ui_font, fill=white)
+
+    labels = ("复现问题", "修改实现", "检查结果")
+    details = ("读取代码，运行原有测试", "只修改折扣计算公式", "再次执行全部三项测试")
+    completed = (stage >= 2, stage >= 3, stage >= 4)
+    active = (stage in (0, 1, 2), stage == 3, stage >= 4)
+    for index, (label, detail) in enumerate(zip(labels, details, strict=True)):
+        y = 390 + index * 85
+        color = green if completed[index] else orange if active[index] else "#596171"
+        draw.rounded_rectangle((59, y, 88, y + 29), radius=8, fill="#262d36")
+        draw.text((66, y + 3), "✓" if completed[index] else str(index + 1), font=label_font, fill=color)
+        draw.text((103, y - 2), label, font=ui_font, fill=white if active[index] or completed[index] else muted)
+        draw.text((103, y + 33), detail, font=label_font, fill=muted)
+
+    headings = (
+        "先看清问题", "读取 pricing.py", "测试复现了错误",
+        "修复百分比换算", "重新运行测试", "修复完成，结果可检查",
+    )
+    draw.text((474, 223), headings[stage], font=_load_ui_font(27), fill=white)
+    draw.text((474, 272), "pricing.py", font=body_font, fill=muted)
+    draw.rounded_rectangle((470, 306, 1142, 423), radius=10, fill="#10151c")
+    draw.text((482, 323), "def total_after_discount(subtotal, discount_percent):", font=body_font, fill="#c3cfe4")
+    if stage < 3:
         draw.text(
-            (TERMINAL_TEXT_LEFT, y),
-            _fit_terminal_line(line, font=body_font),
-            font=body_font,
-            fill=_trace_color(line),
+            (482, 358), "    return round(subtotal * (1 - discount_percent), 2)",
+            font=body_font, fill=red if stage == 2 else white,
         )
-        y += 23
+    else:
+        # The displayed diff comes from the real workspace, not an illustration.
+        changed = [
+            line.removeprefix("[diff] ") for line in lines
+            if line.startswith(("[diff] -    return", "[diff] +    return"))
+        ]
+        if len(changed) != 2:
+            raise RuntimeError("checkout demo must include its actual two-line repair diff")
+        for y, text, color in zip((358, 389), changed, (red, green), strict=True):
+            draw.text((482, y), _fit_terminal_line(text, font=body_font), font=body_font, fill=color)
+
+    draw.text((474, 457), "$ python3 -m unittest -v", font=body_font, fill=orange)
+    if stage < 2:
+        draw.text((474, 503), "先复现问题，再开始修改。", font=ui_font, fill=muted)
+        draw.text((474, 548), "保留现有接口与测试。", font=label_font, fill=muted)
+    elif stage < 4:
+        draw.text((474, 502), "修复前：100 元 × 八折 → -1900 元", font=ui_font, fill=red)
+        draw.text((474, 550), "FAILED (failures=2)", font=body_font, fill=red)
+        draw.text((474, 591), "问题：把百分数 20 直接当成了折扣系数。", font=label_font, fill=muted)
+    else:
+        for y, label, value in (
+            (502, "✓  无折扣", "100 → 100"),
+            (540, "✓  八折", "100 → 80"),
+            (578, "✓  全额折扣", "100 → 0"),
+        ):
+            draw.text((474, y), label, font=ui_font, fill=green)
+            draw.text((661, y), value, font=ui_font, fill=green)
+        draw.text((474, 630), "Ran 3 tests · OK", font=body_font, fill=green)
+    draw.text((34, 715), lines[1], font=label_font, fill=muted)
+    draw.text((865, 715), "读取 → 复现 → 修改 → 验证", font=label_font, fill=orange)
     return image
+
+
+def _load_ui_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    """Prefer fonts with Chinese glyphs when producing the published asset."""
+    for candidate in (
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "C:/Windows/Fonts/msyh.ttc",
+    ):
+        if Path(candidate).is_file():
+            return ImageFont.truetype(candidate, size=size)
+    return _load_monospace_font(size)
 
 
 def _fit_terminal_line(
@@ -237,22 +280,6 @@ def _fit_terminal_line(
     return f"{value[:low]}{ellipsis}"
 
 
-def _trace_color(line: str) -> str:
-    if line.startswith("[inspect]"):
-        return "#8bd5ff"
-    if line.startswith("[patch]"):
-        return "#ffd166"
-    if line.startswith("[verify]"):
-        return "#c4a7ff"
-    if line.startswith("[complete]"):
-        return "#75e6a4"
-    if line.startswith("[diff] +"):
-        return "#75e6a4"
-    if line.startswith("[diff] -"):
-        return "#ff8b8b"
-    return "#b7c2d4"
-
-
 def _load_monospace_font(
     size: int,
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -277,7 +304,7 @@ def _load_monospace_font(
 
 
 def _validate_trace_line(value: str) -> str:
-    line = " ".join(str(value).split())
+    line = " ".join(str(value).splitlines()).strip()
     if not line:
         raise ValueError("demo trace contains an empty line")
     smoke = _load_delivery_smoke()

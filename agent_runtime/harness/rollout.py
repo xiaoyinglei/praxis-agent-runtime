@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -2525,7 +2526,7 @@ class RolloutStore:
         )
 
     def read_budget_state(self, turn_id: str) -> BudgetState:
-        """Derive the Turn budget from durable reservation projections."""
+        """Derive the Turn budget from durable reservations and tool executions."""
 
         turn = self.read_turn(turn_id)
         raw_limit = turn.binding_manifest.get("model_token_budget_total")
@@ -2572,6 +2573,20 @@ class RolloutStore:
                 if attempt.attempt_id in tracked_attempt_ids or attempt.status != "completed":
                     continue
                 used = used + resource_usage_from_model_usage(attempt.usage)
+
+        # Claims count execution attempts, including failed/unknown outcomes.
+        # Result Items can be replaced during reconciliation, so they are not
+        # counters. Fenced outcomes preserve each observed duration only once.
+        tool_ms = sum(
+            float(record.payload.get("duration_ms") or 0)
+            for record in self.list_records(turn.thread_id)
+            if record.turn_id == turn_id
+            and record.record_type == "tool_operation_outcome_committed"
+        )
+        used = used + ResourceUsage(
+            tool_calls=sum(operation.attempt_count for operation in self.list_tool_operations(turn_id)),
+            tool_ms=round(tool_ms),
+        )
 
         for row in self._connection.execute(
             "SELECT * FROM child_budget_allocations WHERE parent_turn_id = ? ORDER BY rowid",
@@ -3092,10 +3107,18 @@ class RolloutStore:
         attempt_count: int,
         error_code: str | None,
         requires_reconciliation: bool,
+        duration_ms: float | None = None,
         now: float | None = None,
     ) -> bool:
         if status not in {"succeeded", "failed", "unknown"}:
             raise ValueError(f"unsupported claimed tool outcome: {status}")
+        if duration_ms is not None and (
+            isinstance(duration_ms, bool)
+            or not isinstance(duration_ms, (int, float))
+            or not math.isfinite(duration_ms)
+            or duration_ms < 0
+        ):
+            raise ValueError("tool duration must be finite and non-negative")
         observed_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -3133,6 +3156,7 @@ class RolloutStore:
                     "requires_reconciliation": requires_reconciliation,
                     "observed_at": observed_at,
                     "public_item_id": public_item_id,
+                    "duration_ms": duration_ms,
                 },
             )
             if is_current and status == "unknown":
@@ -3181,6 +3205,7 @@ class RolloutStore:
         error_code: str | None,
         requires_reconciliation: bool,
         result: Mapping[str, Any],
+        duration_ms: float | None = None,
         now: float | None = None,
     ) -> bool:
         with self._transaction():
@@ -3192,6 +3217,7 @@ class RolloutStore:
                 attempt_count=attempt_count,
                 error_code=error_code,
                 requires_reconciliation=requires_reconciliation,
+                duration_ms=duration_ms,
                 now=now,
             )
             if not accepted:

@@ -623,6 +623,15 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
     if item.kind == "agent_message" and isinstance(text, str):
         return HarnessMessage(role="assistant", content=text)
     if item.kind == "model_response" and isinstance(text, str):
+        if item.payload.get("response_status") == "incomplete":
+            # Do not replay partial assistant text, reasoning, or a tool group
+            # for which no execution/result exists. This also survives compaction.
+            return HarnessMessage(role="context", content=(
+                "A previous model step was incomplete (output limit or another provider stop). "
+                "Its partial output was discarded; no tools from that step were executed. "
+                "Generate a complete next step from the completed history. Keep it concise; "
+                "do not repeat completed tool actions."
+            ))
         calls = item.payload.get("tool_calls")
         if isinstance(calls, (list, tuple)) and calls:
             return HarnessMessage(

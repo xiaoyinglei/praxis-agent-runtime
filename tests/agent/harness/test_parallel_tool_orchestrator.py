@@ -245,7 +245,8 @@ async def test_batch_remote_unknown_pauses_before_starting_later_calls(tmp_path:
 
 
 @pytest.mark.anyio
-async def test_batch_inspection_budget_cannot_be_overspent(tmp_path: Path):
+@pytest.mark.parametrize("revision", [None, "completion-v2"])
+async def test_batch_inspection_limit_is_only_part_of_the_legacy_contract(tmp_path: Path, revision):
     count = 0
 
     async def run(args):
@@ -257,16 +258,20 @@ async def test_batch_inspection_budget_cannot_be_overspent(tmp_path: Path):
     with store:
         # A separate Turn freezes the actual workspace-change completion policy.
         thread = store.create_thread(workspace=tmp_path)
+        policy = {"require_workspace_change": True}
+        if revision is not None:
+            policy["revision"] = revision
         turn = store.start_turn(
             thread_id=thread.thread_id,
             user_message="edit",
-            binding_manifest={"completion_policy": {"require_workspace_change": True}},
+            binding_manifest={"completion_policy": policy},
         )
         calls = tuple(replace(calls[0], tool_call_id=f"read-{i}") for i in range(15))
         results = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
-        assert count == 12
-        assert sum(not result.is_error for result in results) == 12
-        assert all(result.is_error for result in results[12:])
+        expected_count = 12 if revision is None else 15
+        assert count == expected_count
+        assert sum(not result.is_error for result in results) == expected_count
+        assert all(result.is_error for result in results[expected_count:])
         assert store.verify().valid
 
 

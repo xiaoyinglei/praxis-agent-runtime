@@ -53,6 +53,28 @@ class SmokeResult:
     error: str = ""
     validation_status: str = "not_evaluated"
     validation_scope: str | None = None
+    check_outputs: tuple[str, ...] = ()
+
+
+CHECKOUT_BEFORE = (
+    "def total_after_discount(subtotal, discount_percent):\n"
+    "    return round(subtotal * (1 - discount_percent), 2)\n"
+)
+CHECKOUT_AFTER = CHECKOUT_BEFORE.replace("1 - discount_percent", "1 - discount_percent / 100")
+CHECKOUT_TESTS = '''import unittest
+from pricing import total_after_discount
+
+class PricingTests(unittest.TestCase):
+    def test_no_discount(self):
+        self.assertEqual(total_after_discount(100, 0), 100)
+
+    def test_twenty_percent(self):
+        self.assertEqual(total_after_discount(100, 20), 80)
+
+    def test_full_discount(self):
+        self.assertEqual(total_after_discount(100, 100), 0)
+'''
+CHECKOUT_COMMAND = "python3 -m unittest -v"
 
 
 def build_cases() -> tuple[SmokeCase, ...]:
@@ -65,6 +87,11 @@ def build_cases() -> tuple[SmokeCase, ...]:
             name="praxis_demo",
             task="Inspect, patch, and verify fixture.py.",
             expected_tools=("read_file", "apply_patch", "read_file"),
+        ),
+        SmokeCase(
+            name="checkout_demo",
+            task="修复 pricing.py 中的折扣计算：100 元打八折应为 80 元。先复现，再修改并运行测试。",
+            expected_tools=("read_file", "run_command", "apply_patch", "run_command"),
         ),
     )
 
@@ -122,6 +149,21 @@ class _SmokeModel:
         step = int(prepared.request_ref["step"])
         if self.case.name == "direct_answer":
             return _response(text="4", step=step)
+        if self.case.name == "checkout_demo":
+            calls = {
+                1: HarnessToolCall(id="checkout-read", name="read_file", arguments={"path": "pricing.py"}),
+                2: HarnessToolCall(
+                    id="checkout-reproduce", name="run_command", arguments={"command": CHECKOUT_COMMAND},
+                ),
+                3: HarnessToolCall(id="checkout-patch", name="apply_patch", arguments={
+                    "file_path": "pricing.py", "old_string": CHECKOUT_BEFORE, "new_string": CHECKOUT_AFTER,
+                }),
+                4: HarnessToolCall(id="checkout-verify", name="run_command", arguments={"command": CHECKOUT_COMMAND}),
+            }
+            call = calls.get(step)
+            if call is not None:
+                return _response(text="", step=step, tool_calls=(call,))
+            return _response(text="折扣计算已修复，三项测试通过。", step=step)
         calls = {
             1: HarnessToolCall(
                 id="demo-read-before",
@@ -170,7 +212,11 @@ async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> Smo
         workspace.mkdir()
         if case.name == "praxis_demo":
             (workspace / "fixture.py").write_text("value = 'before'\n", encoding="utf-8")
-        before = (workspace / "fixture.py").read_text() if case.name == "praxis_demo" else ""
+        if case.name == "checkout_demo":
+            (workspace / "pricing.py").write_text(CHECKOUT_BEFORE, encoding="utf-8")
+            (workspace / "test_pricing.py").write_text(CHECKOUT_TESTS, encoding="utf-8")
+        filename = "pricing.py" if case.name == "checkout_demo" else "fixture.py"
+        before = (workspace / filename).read_text() if case.name != "direct_answer" else ""
         agent = Agent(
             checkpoint_db=root / "rollout.sqlite3",
             workspace_path=workspace,
@@ -181,25 +227,42 @@ async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> Smo
             case.task,
             allow_write_tools=True,
             require_workspace_change=case.name != "direct_answer",
+            acceptance_command=CHECKOUT_COMMAND if case.name == "checkout_demo" else None,
             max_turns=6,
         )
         while result.status == "paused":
             result = await agent.resume(result.turn_id, "allow_once")
-        after = (workspace / "fixture.py").read_text() if case.name == "praxis_demo" else ""
+        after = (workspace / filename).read_text() if case.name != "direct_answer" else ""
         tools = tuple(call.tool_name for call in result.tool_calls)
         expected_answer = "4" if case.name == "direct_answer" else "praxis demo complete"
+        if case.name == "checkout_demo":
+            expected_answer = "折扣计算已修复，三项测试通过。"
+        expected_after = CHECKOUT_AFTER if case.name == "checkout_demo" else "value = 'after'\n"
+        checks = tuple(
+            str(call.structured_output.get("stderr", ""))
+            for call in result.tool_calls
+            if call.tool_name == "run_command" and isinstance(call.structured_output, Mapping)
+        )
         passed = (
             result.status == "done"
             and result.answer == expected_answer
             and tools == case.expected_tools
             and (case.name == "direct_answer" or (
-                after == "value = 'after'\n" and after != before
-                and result.validation_status == "passed" and result.validation_scope == "workspace_change"
+                after == expected_after and after != before
+                and result.validation_status == "passed"
+                and result.validation_scope == (
+                    "acceptance_command" if case.name == "checkout_demo" else "workspace_change_recorded"
+                )
             ))
         )
+        if case.name == "checkout_demo":
+            passed = (
+                passed and len(checks) == 2 and "FAILED (failures=2)" in checks[0]
+                and "Ran 3 tests" in checks[1] and "\nOK\n" in checks[1]
+            )
         event_lines = _v2_event_lines(result)
         diff = "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
-                                          fromfile="a/fixture.py", tofile="b/fixture.py"))
+                                          fromfile=f"a/{filename}", tofile=f"b/{filename}"))
         return SmokeResult(
             name=case.name,
             passed=passed,
@@ -211,6 +274,7 @@ async def _run_case(case: SmokeCase, *, model: _SmokeModel | None = None) -> Smo
             error="" if passed else "public Harness result did not match the smoke contract",
             validation_status=result.validation_status,
             validation_scope=result.validation_scope,
+            check_outputs=checks,
         )
 
 

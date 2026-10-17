@@ -691,7 +691,10 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
         assert operation.status == "completed"
         assert attempt.status == "completed"
         assert attempt.provider_response_id == "response-1"
-        assert attempt.usage == {"input_tokens": 5, "output_tokens": 2}
+        assert attempt.usage["input_tokens"] == 5
+        assert attempt.usage["output_tokens"] == 2
+        assert attempt.usage["latency_ms"] >= 0
+        assert attempt.usage["model_ms"] == int(attempt.usage["latency_ms"])
         assert [item.kind for item in store.list_items(result.turn_id)] == [
             "user_message",
             "model_request",

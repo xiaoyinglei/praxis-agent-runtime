@@ -628,6 +628,11 @@ class RolloutEventReader:
                 "content": payload.get("text", payload.get("content", "")),
                 "tool_calls": payload.get("tool_calls", ()),
             }
+            if payload.get("response_status") == "incomplete":
+                status = ItemStatus.FAILED
+                error = f"Incomplete model response: {payload.get('incomplete_reason')}"
+                data["response_status"] = "incomplete"
+                data["incomplete_reason"] = payload.get("incomplete_reason")
         elif kind == "plan_state" and item_kind is TurnItemKind.PLAN:
             plan = payload.get("plan", {})
             if not isinstance(plan, Mapping):

@@ -323,21 +323,15 @@ class GatewayHarnessModel:
             raise
         if response.provider_wire_hash != payload.wire_hash:
             raise RuntimeError("provider wire changed between prepare and dispatch")
-        if response.turn.stop_reason is StopReason.MAX_TOKENS:
+        if response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}:
             return HarnessModelResponse(
                 text=response.turn.text,
                 provider_response_id=None,
                 usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
-                tool_calls=tuple(
-                    HarnessToolCall(
-                        id=call.id,
-                        name=call.name,
-                        arguments=call.input,
-                    )
-                    for call in response.turn.tool_calls
-                ),
+                tool_calls=(),
                 status="incomplete",
-                incomplete_reason="max_output_tokens",
+                incomplete_reason=("max_output_tokens" if response.turn.stop_reason is StopReason.MAX_TOKENS
+                                   else response.turn.raw_stop_reason or "unknown"),
                 reasoning_content=(response.turn.reasoning_content or "".join(streamed_content["reasoning"]) or None),
                 plan_content="".join(streamed_content["plan"]) or None,
             )

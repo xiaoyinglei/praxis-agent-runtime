@@ -156,8 +156,8 @@ class CaseObservation:
     model_calls: int
     input_tokens: int
     output_tokens: int
-    latency_ms: float
-    tool_schema_bytes: int
+    latency_ms: float | None
+    tool_schema_bytes: int | None
     approval_pause_observed: bool
     approval_kind: str | None
     approval_resumes: int
@@ -404,15 +404,21 @@ def score_trial(
 
 def informational_metrics(
     observations: Sequence[CaseObservation],
-) -> dict[str, float]:
+) -> dict[str, float | None]:
     count = len(observations)
     if not count:
         raise ValueError("quality observations must not be empty")
     return {
         "mean_input_tokens_per_case": sum(item.input_tokens for item in observations) / count,
         "mean_output_tokens_per_case": sum(item.output_tokens for item in observations) / count,
-        "mean_latency_ms_per_case": sum(item.latency_ms for item in observations) / count,
-        "mean_tool_schema_bytes_per_case": sum(item.tool_schema_bytes for item in observations) / count,
+        "mean_latency_ms_per_case": (
+            None if any(item.latency_ms is None for item in observations)
+            else sum(item.latency_ms for item in observations if item.latency_ms is not None) / count
+        ),
+        "mean_tool_schema_bytes_per_case": (
+            None if any(item.tool_schema_bytes is None for item in observations)
+            else sum(item.tool_schema_bytes for item in observations if item.tool_schema_bytes is not None) / count
+        ),
     }
 
 
@@ -604,8 +610,8 @@ async def run_live_case(
                 model_calls=0,
                 input_tokens=0,
                 output_tokens=0,
-                latency_ms=0.0,
-                tool_schema_bytes=0,
+                latency_ms=None,
+                tool_schema_bytes=None,
                 approval_pause_observed=pause_observed,
                 approval_kind=approval_kind,
                 approval_resumes=approval_resumes,
@@ -1464,8 +1470,10 @@ def _observation_from_payload(value: object) -> CaseObservation:
             raise ValueError(f"raw observation {name} must be boolean")
         return item
 
-    def number(name: str) -> float:
+    def number(name: str) -> float | None:
         item = payload.get(name)
+        if item is None:
+            return None
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             raise ValueError(f"raw observation {name} must be numeric")
         return float(item)
@@ -1480,7 +1488,7 @@ def _observation_from_payload(value: object) -> CaseObservation:
         input_tokens=_integer(payload.get("input_tokens"), label="input_tokens"),
         output_tokens=_integer(payload.get("output_tokens"), label="output_tokens"),
         latency_ms=number("latency_ms"),
-        tool_schema_bytes=_integer(
+        tool_schema_bytes=None if payload.get("tool_schema_bytes") is None else _integer(
             payload.get("tool_schema_bytes"),
             label="tool_schema_bytes",
         ),

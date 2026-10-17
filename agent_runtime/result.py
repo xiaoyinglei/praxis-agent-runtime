@@ -98,28 +98,28 @@ class AgentUsage:
     total_tokens: int = 0
     tool_calls: int = 0
     model_calls: int = 0
-    latency_ms: float = 0.0
+    latency_ms: float | None = None
     logical_input_tokens: int | None = None
     uncached_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
     cache_write_input_tokens: int | None = None
     usage_source: str | None = None
-    startup_ms: float = 0.0
-    build_service_ms: float = 0.0
-    model_ready_ms: float = 0.0
-    prepare_latency_ms: float = 0.0
-    model_latency_ms: float = 0.0
-    tool_latency_ms: float = 0.0
-    finalize_latency_ms: float = 0.0
-    prompt_bytes: int = 0
-    tool_schema_bytes: int = 0
+    startup_ms: float | None = None
+    build_service_ms: float | None = None
+    model_ready_ms: float | None = None
+    prepare_latency_ms: float | None = None
+    model_latency_ms: float | None = None
+    tool_latency_ms: float | None = None
+    finalize_latency_ms: float | None = None
+    prompt_bytes: int | None = None
+    tool_schema_bytes: int | None = None
     native_calls: int = 0
     native_errors: int = 0
-    native_latency_ms_total: float = 0.0
-    deferred_calls: int = 0
+    native_latency_ms_total: float | None = None
+    deferred_calls: int | None = None
     mcp_calls: int = 0
     mcp_errors: int = 0
-    mcp_latency_ms_total: float = 0.0
+    mcp_latency_ms_total: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,13 +156,34 @@ class AgentResult:
     ) -> AgentResult:
         turn = store.read_turn(result.turn_id)
         thread = store.read_thread(result.thread_id)
+        records = tuple(record for record in store.list_records(thread.thread_id) if record.turn_id == turn.turn_id)
+        dispatched_ids = {
+            record.payload["attempt_id"] for record in records if record.record_type == "model_attempt_dispatched"
+        }
         attempts = tuple(
             attempt
             for operation in store.list_model_operations(result.turn_id)
             for attempt in store.list_model_attempts(operation.operation_id)
-            if attempt.status == "completed"
+            if attempt.attempt_id in dispatched_ids or attempt.status == "completed"
         )
-        usage_values = tuple(attempt.usage for attempt in attempts)
+        usage_values = tuple(attempt.usage for attempt in attempts if attempt.status == "completed")
+        operations = store.list_tool_operations(result.turn_id)
+        native_operations = tuple(
+            op for op in operations if not op.execution_revision.startswith("integration-mcp-v1:")
+        )
+        mcp_operations = tuple(op for op in operations if op.execution_revision.startswith("integration-mcp-v1:"))
+        outcomes = tuple(record for record in records if record.record_type == "tool_operation_outcome_committed")
+        latency_by_call = {}
+        for operation in operations:
+            observed = [record.payload.get("duration_ms") for record in outcomes
+                        if record.payload["operation_id"] == operation.operation_id]
+            latency_by_call[operation.tool_call_id] = (
+                _observed_sum(observed) if len(observed) == operation.attempt_count else None
+            )
+        native_latency = _observed_sum([latency_by_call[op.tool_call_id] for op in native_operations])
+        mcp_latency = _observed_sum([latency_by_call[op.tool_call_id] for op in mcp_operations])
+        native_ids = {op.operation_id for op in native_operations}
+        mcp_ids = {op.operation_id for op in mcp_operations}
         sources = tuple(
             value
             for usage in usage_values
@@ -228,6 +249,7 @@ class AgentResult:
                     ),
                     retryable=payload.get("retryable") is True,
                     truncated=payload.get("truncated") is True,
+                    latency_ms=latency_by_call.get(tool_call_id),
                 )
             )
             if tool_name != "search_knowledge" or not isinstance(
@@ -387,7 +409,7 @@ class AgentResult:
                     code="model_response_incomplete",
                     component="model",
                     message=f"Model response was incomplete: {reason}.",
-                    severity="error",
+                    severity="error" if turn.terminal_reason_code == "model_response_incomplete" else "warning",
                     degraded=True,
                     error_type="IncompleteModelResponse",
                 )
@@ -425,9 +447,23 @@ class AgentResult:
             usage=AgentUsage(
                 input_tokens=sum(_usage_integer(usage, "input_tokens") for usage in usage_values),
                 output_tokens=sum(_usage_integer(usage, "output_tokens") for usage in usage_values),
-                total_tokens=sum(_usage_integer(usage, "total_tokens") for usage in usage_values),
-                tool_calls=len(projected_calls),
+                total_tokens=sum(
+                    _usage_integer(usage, "total_tokens") if "total_tokens" in usage
+                    else _usage_integer(usage, "input_tokens") + _usage_integer(usage, "output_tokens")
+                    for usage in usage_values
+                ),
+                tool_calls=sum(op.attempt_count for op in operations),
                 model_calls=len(attempts),
+                model_latency_ms=_observed_sum([attempt.usage.get("latency_ms") for attempt in attempts]),
+                tool_latency_ms=_observed_sum([native_latency, mcp_latency]),
+                native_calls=sum(op.attempt_count for op in native_operations),
+                native_errors=sum(record.payload["status"] != "succeeded" for record in outcomes
+                                  if record.payload["operation_id"] in native_ids),
+                native_latency_ms_total=native_latency,
+                mcp_calls=sum(op.attempt_count for op in mcp_operations),
+                mcp_errors=sum(record.payload["status"] != "succeeded" for record in outcomes
+                               if record.payload["operation_id"] in mcp_ids),
+                mcp_latency_ms_total=mcp_latency,
                 usage_source=(
                     None
                     if not sources
@@ -549,6 +585,13 @@ def _project_harness_plan(
 def _usage_integer(usage: Mapping[str, object], key: str) -> int:
     value = usage.get(key)
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _observed_sum(values: Sequence[object]) -> float | None:
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) or value < 0 for value in values):
+        return None
+    return sum(cast(float, value) for value in values)
 
 
 def _interaction_options(

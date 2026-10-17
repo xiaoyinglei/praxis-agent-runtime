@@ -2473,7 +2473,7 @@ wheels = [
 ]
 
 [[package]]
-name = "praxis-agent-runtime"
+name = "praxis-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

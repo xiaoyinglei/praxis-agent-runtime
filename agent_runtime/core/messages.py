@@ -25,6 +25,7 @@ class StopReason(StrEnum):
     TOOL_USE = "tool_use"
     END_TURN = "end_turn"
     MAX_TOKENS = "max_tokens"
+    INCOMPLETE = "incomplete"
 
 
 # ── Tool call ──

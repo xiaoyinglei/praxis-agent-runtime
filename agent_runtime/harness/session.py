@@ -179,9 +179,15 @@ class Session:
                     binding = turn.binding_manifest
                     if binding.get("legacy_resume_compatible") is False:
                         raise RuntimeError("incompatible legacy Turn cannot resume; abort the Turn explicitly")
+                    if (agent is not None
+                            and binding.get("mcp_policy", {}).get("workspace_discovery_enabled") is False):
+                        # Reconcile the frozen capability before discovery can
+                        # read configuration or open any server resources.
+                        agent.enable_workspace_mcp = False
                     completion = binding.get("completion_policy", {})
                     service_options.update(
                         require_workspace_change=completion.get("require_workspace_change") is True,
+                        acceptance_command=completion.get("acceptance_command"),
                         max_steps=binding.get("model_step_budget") or 16,
                         max_tokens_total=binding.get("model_token_budget_total"),
                         max_cost_micros=binding.get("model_cost_budget_total_micros"),
@@ -911,7 +917,10 @@ class Session:
             ):
                 response = self.store.read_item(model_operations[-1].response_item_id)
                 calls = response.payload.get("tool_calls")
-                recoverable_committed_response = bool(isinstance(calls, (list, tuple)) and calls)
+                recoverable_committed_response = bool(
+                    response.payload.get("response_status") == "incomplete"
+                    or isinstance(calls, (list, tuple)) and calls
+                )
             if len(pending) == 1 and pending[0].kind == "tool_approval":
                 decision = {
                     "allow_once": "approve",

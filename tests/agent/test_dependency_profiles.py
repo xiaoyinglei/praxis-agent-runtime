@@ -25,7 +25,7 @@ def test_default_dependency_profile_preserves_agent_data_capabilities_without_ra
 def test_reduced_server_profile_is_covered_by_default_locked_export() -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
     packages = {package["name"]: package for package in lock["package"]}
-    pending = ["praxis-agent-runtime"]
+    pending = ["praxis-agent"]
     default_names: set[str] = set()
     while pending:
         name = pending.pop()

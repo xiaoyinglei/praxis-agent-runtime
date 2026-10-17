@@ -71,7 +71,9 @@ async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) 
         assert binding["toolset_revision"] == toolset_revision_for_tools((create_context_recall_tool(runtime.store),))
         assert binding["tool_execution_revisions"] == {"read_context": "context-recall-v5"}
         assert binding["completion_policy"] == {
-            "require_workspace_change": False
+            "revision": "completion-v2",
+            "require_workspace_change": False,
+            "acceptance_command": None,
         }
         assert binding["mcp_policy"] == {
             "workspace_discovery_enabled": True

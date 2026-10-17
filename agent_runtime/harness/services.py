@@ -80,6 +80,7 @@ class SessionBindingProvider:
         workspace_mcp_enabled: bool,
         mcp_config_trust: Mapping[str, object] | None,
         require_workspace_change: bool,
+        acceptance_command: str | None,
         model_step_budget: int,
         model_token_budget_total: int | None,
         model_cost_budget_total_micros: int | None,
@@ -94,6 +95,7 @@ class SessionBindingProvider:
         self._workspace_mcp_enabled = workspace_mcp_enabled
         self._mcp_config_trust = None if mcp_config_trust is None else dict(mcp_config_trust)
         self._require_workspace_change = require_workspace_change
+        self._acceptance_command = acceptance_command
         self._model_step_budget = model_step_budget
         self._model_token_budget_total = model_token_budget_total
         self._model_cost_budget_total_micros = model_cost_budget_total_micros
@@ -132,7 +134,12 @@ class SessionBindingProvider:
         if self._mcp_config_trust is not None:
             mcp_policy.update(self._mcp_config_trust)
         binding["mcp_policy"] = mcp_policy
-        binding["completion_policy"] = {"require_workspace_change": self._require_workspace_change}
+        binding["completion_policy"] = {
+            "revision": "completion-v2",
+            "require_workspace_change": self._require_workspace_change,
+            "acceptance_command": self._acceptance_command,
+        }
+        binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["model_step_budget"] = self._model_step_budget
         binding["model_token_budget_total"] = self._model_token_budget_total
         binding["model_cost_budget_total_micros"] = self._model_cost_budget_total_micros
@@ -163,6 +170,7 @@ def configure_services(
     model_binding: Mapping[str, Any] | None = None,
     completion_gate: CompletionGate | None = None,
     require_workspace_change: bool = False,
+    acceptance_command: str | None = None,
     tools: Mapping[str, Tool] | None = None,
     tool_execution_context: ToolExecutionContext | None = None,
     knowledge_runner: Callable[..., object] | None = None,
@@ -177,6 +185,10 @@ def configure_services(
     max_tokens_total: int | None = None,
     max_cost_micros: int | None = None,
 ) -> None:
+    if acceptance_command is not None:
+        if not isinstance(acceptance_command, str) or not acceptance_command.strip():
+            raise ValueError("acceptance_command must be a non-empty string or None")
+        acceptance_command = acceptance_command.strip()
     if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
         raise ValueError("max_steps must be a positive integer")
     if max_tokens_total is not None and (
@@ -374,6 +386,7 @@ def configure_services(
         workspace_mcp_enabled=workspace_mcp_enabled,
         mcp_config_trust=mcp_config_trust,
         require_workspace_change=require_workspace_change,
+        acceptance_command=acceptance_command,
         model_step_budget=max_steps,
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,

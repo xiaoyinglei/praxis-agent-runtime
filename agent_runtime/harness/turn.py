@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from functools import partial
@@ -243,6 +244,18 @@ class TurnExecutor:
                 *messages,
                 HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
             )
+        completion = turn_context.binding_manifest.get("completion_policy", {})
+        if completion.get("revision") == "completion-v2" and completion.get("acceptance_command"):
+            messages = (*messages, HarnessMessage(
+                role="context", content=(
+                    "User-configured acceptance contract (immutable for this Turn):\n"
+                    + json.dumps(dict(completion), ensure_ascii=False, sort_keys=True)
+                    + "\nRun acceptance_command exactly via run_command in the workspace root. "
+                    "The latest execution must pass after the latest workspace change. "
+                    "Other commands or self-reported checks do not substitute for this contract. "
+                    "Normal tool permissions and approval still apply."
+                ),
+            ))
         if context_capacity_policy(turn_context.binding_manifest) is not None:
             messages = (*messages, HarnessMessage(role="context", content="Runtime budget status:\n" +
                          json.dumps(self._budget_status(turn_context), sort_keys=True)))
@@ -259,8 +272,11 @@ class TurnExecutor:
             if self._binding_provider is None
             else self._binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_context.turn_id)
         )
+        # Old Turns do not acquire recovery by reopening with new defaults.
+        binding.pop("model_response_recovery", None)
         for name in (
             "completion_policy",
+            "model_response_recovery",
             "model_step_budget",
             "model_token_budget_total",
             "model_cost_budget_total_micros",
@@ -584,6 +600,17 @@ class TurnExecutor:
             return await self.run_turn(turn_context, start_step=operation.request_ref["step_snapshot"]["step"])
         response_item = self._store.read_item(operation.response_item_id)
         response = _response_from_committed_item(response_item)
+        if response.status == "incomplete":
+            prepared = PreparedModelCall(
+                request_hash=operation.request_hash, context_hash=operation.context_hash,
+                tool_hash=operation.tool_hash, wire_hash=operation.wire_hash, request_ref=operation.request_ref,
+            )
+            handled = await self._handle_model_response(
+                thread_id=turn.thread_id, turn_id=turn_id, response=response, prepared=prepared,
+            )
+            return handled if handled is not None else await self.run_turn(
+                turn_context, start_step=self.agent_step_count(turn_id) + 1,
+            )
         if not response.tool_calls:
             raise RuntimeError("latest committed response has no pending tool calls")
         tool_operations = {
@@ -1102,7 +1129,10 @@ class TurnExecutor:
             candidate: ContextCompactionCandidate,
             plan: Mapping[str, Any] | None = None,
         ) -> tuple[StepContext, PreparedModelCall]:
-            context = self.capture_step_context(turn, step=step, messages=candidate.messages)
+            context = self.capture_step_context(
+                turn, step=step, messages=candidate.messages,
+                budget_pressure=True if trigger_reason == "turn_budget_pressure" else None,
+            )
             if plan is not None:
                 context = replace(
                     context,
@@ -1353,6 +1383,29 @@ class TurnExecutor:
                 # Preparation may request compaction, but it cannot rewrite the
                 # provider transcript itself. Session commits that transition.
                 prepared = await self._prepare_step(step_context)
+                normal_remaining = normal_token_remaining(self._store.read_budget_state(turn_id))
+                if normal_remaining is not None and prepared.resource_request.total_tokens * 2 > normal_remaining:
+                    # Admission to one request is insufficient for a tool loop:
+                    # its result (or Stop feedback) still needs another input
+                    # and output. Compact while that escape path is affordable,
+                    # independently of the provider's much larger context window.
+                    from agent_runtime.harness.context import RolloutContextManager
+
+                    step_context = self.capture_step_context(turn_context, step=step, budget_pressure=True)
+                    prepared = await self._prepare_step(step_context)
+                    if isinstance(self._context_manager, RolloutContextManager):
+                        try:
+                            step_context, prepared = await self._prepare_compacted_step(
+                                turn_context, step=step, trigger_reason="turn_budget_pressure",
+                                before_input_tokens=prepared.resource_request.input_tokens,
+                            )
+                        except (ContextBudgetExceededError, ContextSourceChangedError, PricingUnavailableError):
+                            # Proactive compaction is optional. Its planner must
+                            # admit the whole summary+continuation before I/O.
+                            # Keep originals and try an honest pressured answer
+                            # when no useful affordable summary can be produced.
+                            step_context = self.capture_step_context(turn_context, step=step, budget_pressure=True)
+                            prepared = await self._prepare_step(step_context)
                 if not step_context.budget_pressure:
                     normal_remaining = normal_token_remaining(self._store.read_budget_state(turn_id))
                     if normal_remaining is not None and prepared.resource_request.total_tokens > normal_remaining:
@@ -1362,6 +1415,8 @@ class TurnExecutor:
                             budget_pressure=True,
                         )
                         prepared = await self._prepare_step(step_context)
+            except _SummaryStoppedError as stopped:
+                return stopped.result
             except ContextBudgetExceededError as exc:
                 try:
                     step_context, prepared = await self._prepare_compacted_step(
@@ -1545,6 +1600,7 @@ class TurnExecutor:
                     )
                 )
 
+        dispatch_started = time.monotonic()
         try:
             response = await self._model.dispatch(
                 prepared,
@@ -1689,6 +1745,10 @@ class TurnExecutor:
                 reason_code="model_dispatch_rejected",
                 message=message,
             )
+        dispatch_ms = (time.monotonic() - dispatch_started) * 1000
+        response = replace(response, usage={
+            **response.usage, "latency_ms": dispatch_ms, "model_ms": int(dispatch_ms),
+        })
         accepted = await self._commit(
             lambda: self._store.complete_model_attempt(
                 operation_id=operation.operation_id,
@@ -1719,7 +1779,7 @@ class TurnExecutor:
         )
         if not accepted:
             raise RuntimeError("current model attempt lost its commit generation")
-        if response.status == "incomplete":
+        if response.status == "incomplete" and operation.request_ref.get("purpose") == "context_summary":
             return await self._fail_turn(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -1736,6 +1796,23 @@ class TurnExecutor:
         response: HarnessModelResponse,
         prepared: PreparedModelCall,
     ) -> TurnResult | None:
+        if response.status == "incomplete":
+            policy = self._store.read_turn(turn_id).binding_manifest.get("model_response_recovery", {})
+            # Count canonical committed outcomes, not process-local retries.
+            # One retry per Turn; summaries and unknown transport outcomes have
+            # separate recovery contracts. Every retry spends an ordinary step.
+            incomplete = sum(
+                item.kind == "model_response" and item.payload.get("response_status") == "incomplete"
+                for item in self._store.list_items(turn_id)
+            )
+            if (policy == {"revision": "restart-step-v1", "max_retries": 1}
+                    and response.incomplete_reason == "max_output_tokens" and incomplete <= 1):
+                return None
+            return await self._fail_turn(
+                thread_id=thread_id, turn_id=turn_id, reason_code="model_response_incomplete",
+                message=(f"Model returned an incomplete agent step: {response.incomplete_reason}; "
+                         "recovery unavailable or exhausted."),
+            )
         if response.tool_calls:
             if self._tool_orchestrator is None:
                 raise RuntimeError("model requested tools but no ToolOrchestrator exists")
