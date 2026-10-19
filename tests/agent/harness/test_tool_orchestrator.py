@@ -891,7 +891,9 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -
             "user",
             "assistant",
             "tool",
+            "context",
         ]
+        assert model.requests[1].messages[-1].content.startswith("Runtime budget status:")
         [tool_message] = [message for message in model.requests[1].messages if message.role == "tool"]
         assert tool_message.tool_call_id == "call-1"
         assert runtime.store.list_tool_operations(result.turn_id)[0].status == "succeeded"
@@ -1082,9 +1084,9 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
         else:
             assert result.status == "failed"
             assert result.stop_reason == "repeated_tool_failure"
-            assert len(model.requests) == 3
-            assert display.group is not None and len(display.group.children) == 3
-            assert display._tool_count == 3
+            assert len(model.requests) == 4
+            assert display.group is not None and len(display.group.children) == 4
+            assert display._tool_count == 4
             assert any(child.failed for child in display.group.children)
         assert session.store.verify().valid
 
@@ -1106,7 +1108,7 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
                                   completion_gate=AcceptToolAnswer()) as session:
         result = await session.submit("read the file")
         assert result.stop_reason == "repeated_tool_failure"
-        assert len(model.requests) == 5
+        assert len(model.requests) == 7
         assert session.store.verify().valid
 
 

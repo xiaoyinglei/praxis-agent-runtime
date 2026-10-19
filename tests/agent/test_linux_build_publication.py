@@ -312,3 +312,28 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
         assert results[0]["error_code"] == "command_failed"
         assert "workspace_published" in results[0]["model_content"]
         assert store.verify().valid
+
+
+def test_large_workspace_uses_streamed_file_fingerprints(tmp_path):
+    import hashlib
+    import tracemalloc
+
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    large = workspace.root / "large.bin"
+    with large.open("wb") as stream:
+        for _ in range(65):
+            stream.write(b"x" * 1024 * 1024)
+    tracemalloc.start()
+    try:
+        view = tmp_path / "view"
+        initial, protected = shell._prepare_linux_workspace_view(workspace, view)
+        assert (view / "large.bin").stat().st_size == 65 * 1024 * 1024
+        # Full file bytes must not be retained in either tree snapshot.
+        with large.open("rb") as stream:
+            assert initial["large.bin"][1] == hashlib.file_digest(stream, "sha256").digest()
+        (view / "small").write_text("changed")
+        shell._commit_linux_workspace_view(workspace, view, initial, protected, workspace.permissions)
+        assert (workspace.root / "small").read_text() == "changed"
+        assert tracemalloc.get_traced_memory()[1] < 12 * 1024 * 1024
+    finally:
+        tracemalloc.stop()

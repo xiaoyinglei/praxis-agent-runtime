@@ -20,7 +20,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from agent_runtime.user_config import user_config_directory
+from agent_runtime.user_config import command_state_directory, user_config_directory
 
 Decision = Literal["allow", "ask", "deny"]
 Access = Literal["read", "write", "deny"]
@@ -147,7 +147,9 @@ class PermissionPolicy(_FrozenModel):
             for name in sorted(_PROTECTED):
                 path = directory / name
                 rules.append(PathRule(path=str(path), access="read" if resolved.path_access(path) else "deny"))
-        return resolved.model_copy(update={"filesystem": tuple(rules)})
+        return resolved.model_copy(update={
+            "filesystem": tuple(rules), "private_paths": (str(command_state_directory()),),
+        })
 
 
 class ResolvedPermissions(_FrozenModel):

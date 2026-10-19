@@ -79,7 +79,8 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
         second = await session.submit("second")
         assert first.thread_id == second.thread_id == session.thread_id
         assert first.turn_id != second.turn_id
-        assert [(m.role, m.content) for m in model.requests[1].messages] == [
+        assert model.requests[1].messages[-1].content.startswith("Runtime budget status:")
+        assert [(m.role, m.content) for m in model.requests[1].messages[:-1]] == [
             ("user", "first"),
             ("assistant", "answer-1"),
             ("user", "second"),
@@ -117,8 +118,9 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
         async with await Session.open(**options, previous_turn_id=first.turn_id) as branch:
             result = await branch.submit("branch")
             assert result.thread_id != first.thread_id
+            assert model.requests[2].messages[-1].content.startswith("Runtime budget status:")
             assert branch.store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
-            assert [(m.role, m.content) for m in model.requests[2].messages] == [
+            assert [(m.role, m.content) for m in model.requests[2].messages[:-1]] == [
                 ("user", "first"),
                 ("assistant", "answer-1"),
                 ("user", "branch"),

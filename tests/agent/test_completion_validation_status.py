@@ -130,18 +130,18 @@ def _done_result():
     )
 
 
-def test_streamed_cli_keeps_unevaluated_status_in_verbose_output(capsys):
+def test_streamed_cli_shows_unevaluated_status_without_verbose(capsys):
     _display_agent_result(_done_result(), verbose=False, answer_streamed=True)
-    assert "not_evaluated" not in capsys.readouterr().out
+    assert "not_evaluated" in capsys.readouterr().out
     _display_agent_result(_done_result(), verbose=True, answer_streamed=True)
     assert "not_evaluated" in capsys.readouterr().out
 
 
-def test_terminal_chat_retains_verbose_validation_when_execution_is_hidden():
+def test_terminal_chat_retains_validation_when_execution_is_hidden():
     view = Conversation()
     with redirect_stdout(_ConversationOutput(view)):
         _display_agent_result(_done_result(), verbose=False, answer_streamed=True, show_execution=False)
-    assert "not_evaluated" not in view.plain_text()
+    assert "not_evaluated" in view.plain_text()
     with redirect_stdout(_ConversationOutput(view)):
         _display_agent_result(_done_result(), verbose=True, answer_streamed=True, show_execution=False)
     assert "not_evaluated" in view.plain_text()

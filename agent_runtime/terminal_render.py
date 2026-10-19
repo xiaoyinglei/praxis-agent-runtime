@@ -15,6 +15,8 @@ from wcwidth import wcswidth
 if TYPE_CHECKING:
     from rich.live import Live
 
+    from agent_runtime.result import AgentUsage
+
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
@@ -29,6 +31,17 @@ DEFAULT_COMMAND_HEAD_ROWS = 6
 DEFAULT_COMMAND_TAIL_ROWS = 3
 DEFAULT_PARTIAL_ROW_BYTES = 16 * 1024
 DEFAULT_PROGRESS_MESSAGES = 8
+
+
+def format_usage_summary(usage: AgentUsage) -> str:
+    """Render recorded Turn token usage regardless of verbosity."""
+    label = "本轮累计 Token" if usage.usage_complete else "本轮已记录 Token（用量不完整）"
+    parts = [f"输入 {usage.input_tokens:,}", f"输出 {usage.output_tokens:,}", f"总计 {usage.total_tokens:,}"]
+    if usage.cache_read_input_tokens is not None:
+        parts.append(f"缓存命中 {usage.cache_read_input_tokens:,}（计入输入）")
+    if usage.reasoning_tokens is not None:
+        parts.append(f"推理 {usage.reasoning_tokens:,}（计入输出）")
+    return label + ": " + " · ".join(parts)
 
 
 def web_error_message(code: object) -> str:
@@ -472,6 +485,25 @@ class TerminalToolEventDisplay:
                 f"消息 guard={policy.get('max_messages')}"
             )
         elif event.type is EventType.BUDGET_UPDATE:
+            settings = event.data.get("effective_settings")
+            if event.data.get("purpose") == "agent_step" and isinstance(settings, Mapping):
+                output = settings.get("max_output_tokens")
+                requested = settings.get("requested_output_tokens")
+                if isinstance(output, int) and isinstance(requested, int):
+                    effort = settings.get("reasoning_effort") or "未声明"
+                    line = f"思考强度={effort} · 单次输出上限={output:,}"
+                    if requested != output:
+                        reasons = {"model_max_output_tokens": "模型上限", "model_context_window": "上下文窗口",
+                                   "turn_output_token_limit": "本次执行剩余额度"}
+                        raw_constraints = settings.get("output_constraints", ())
+                        constraints = "、".join(
+                            reasons.get(str(reason), str(reason)) for reason in
+                            (raw_constraints if isinstance(raw_constraints, (list, tuple)) else ())
+                        )
+                        line += f"（申请 {requested:,}；受{constraints}限制）"
+                    if self._context_status.get("request_settings") != line:
+                        self._context_status["request_settings"] = line
+                        self._write_line(line)
             projection = event.data.get("context_projection", {})
             status = event.data.get("budget_status", {})
             if isinstance(projection, Mapping) and isinstance(status, Mapping):
@@ -635,6 +667,13 @@ class TerminalToolEventDisplay:
             and state.command_output_streamed
         )
         if event.status is ItemStatus.SUCCESS:
+            structured = result.get("structured_content")
+            if (name in {"run_command", "manage_command"} and isinstance(structured, Mapping)
+                    and structured.get("status") == "running"):
+                handle = safe_terminal_text(str(structured.get("session_id", "")))
+                self._write_line(f"→ {name}: 运行中 ({handle})")
+                self._write_result(structured)
+                return
             if event.item_kind is TurnItemKind.COMMAND or name == "run_command":
                 self._write_line(f"✓ {name}{self._command_suffix(result)}")
                 if not command_output_streamed:

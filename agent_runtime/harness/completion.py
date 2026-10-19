@@ -95,12 +95,40 @@ class DeliveryCompletionGate:
 
         if not isinstance(require_change, bool) or (raw_command is not None and not command):
             return reject("invalid_completion_policy", "The frozen completion policy is invalid.", "completion_policy")
+        records = self._trusted_v2_results(proposal.turn_id)
+        launches: dict[str, tuple[ItemSnapshot, Mapping[str, object]]] = {}
+        pending: set[str] = set()
+        command_results = []
+        for item, operation, arguments in sorted(records, key=lambda entry: entry[0].sequence):
+            output = item.payload.get("structured_content")
+            if not isinstance(output, Mapping):
+                continue
+            session_id = output.get("session_id")
+            if operation.tool_name == "run_command":
+                command_results.append((item, operation, arguments))
+                if isinstance(session_id, str) and operation.status == "succeeded":
+                    launches[session_id] = (item, arguments)
+                    if output.get("status") == "running":
+                        pending.add(session_id)
+                    else:
+                        pending.discard(session_id)
+            elif (operation.tool_name == "manage_command" and isinstance(session_id, str)
+                  and arguments.get("session_id") == session_id and session_id in launches):
+                launch, original_arguments = launches[session_id]
+                if item.sequence > launch.sequence:
+                    command_results.append((item, operation, original_arguments))
+                    if output.get("status") in {"completed", "cancelled"}:
+                        pending.discard(session_id)
+        if pending:
+            return reject(
+                "command_session_pending", "Observe the terminal command result with manage_command before finishing.",
+                "command_lifecycle", session_ids=sorted(pending),
+            )
         if not require_change and command is None:
             return CompletionDecision(
                 action="accept", reason="The model turn ended; task acceptance was not evaluated.",
             )
 
-        records = self._trusted_v2_results(proposal.turn_id)
         latest_change, result_order = self._v2_workspace_change_order(proposal.turn_id)
         if require_change and not latest_change:
             return reject(
@@ -117,10 +145,10 @@ class DeliveryCompletionGate:
         turn = self._store.read_turn(proposal.turn_id)
         workspace = Path(self._store.read_thread(turn.thread_id).workspace).resolve()
         candidates = []
-        for item, operation, arguments in records:
+        for item, operation, arguments in command_results:
             actual_command = arguments.get("command")
             if (
-                operation.tool_name != "run_command" or not isinstance(actual_command, str)
+                not isinstance(actual_command, str)
                 or actual_command.strip() != command or item.item_id not in result_order
             ):
                 continue
@@ -203,16 +231,27 @@ class DeliveryCompletionGate:
             str(record.payload["item_id"]): record.record_id
             for thread_id in {turns[current].thread_id for current in family}
             for record in self._store.list_records(thread_id)
-            if record.turn_id in family and record.record_type == "item_completed" and record.producer == "tool"
+            if record.turn_id in family and record.record_type == "item_completed"
+            and record.producer in {"tool", "runtime"}
             and isinstance(record.payload.get("item_id"), str)
         }
         latest_change = max(
             (result_order[item.item_id]
              for current in family for item, operation, _arguments in self._trusted_v2_results(current)
-             if item.item_id in result_order and _is_workspace_change(item, operation)),
+             if item.item_id in result_order and _is_workspace_change(item, self._write_origin(item, operation))),
             default=0,
         )
         return latest_change, result_order
+
+    def _write_origin(self, item: ItemSnapshot, operation: ToolOperationSnapshot) -> ToolOperationSnapshot:
+        metadata = item.payload.get("metadata")
+        origin_id = metadata.get("runtime_workspace_origin_operation_id") if isinstance(metadata, Mapping) else None
+        if isinstance(origin_id, str):
+            origin = next((candidate for candidate in self._store.list_tool_operations(operation.turn_id)
+                           if candidate.operation_id == origin_id), None)
+            if origin is not None and origin.result_item_id is not None:
+                return origin
+        return operation
 
     def _trusted_v2_results(
         self, turn_id: str,
@@ -240,6 +279,25 @@ class DeliveryCompletionGate:
             ):
                 continue
             trusted.append((item, operation, call.payload["arguments"]))
+        # A live owner can close while a Turn is paused. Its confirmed outcome
+        # remains available after process handles and the Session are gone.
+        launches = {operation.operation_id: (item, operation, arguments)
+                    for item, operation, arguments in trusted if operation.tool_name == "run_command"}
+        for item in items.values():
+            if item.kind != "tool_continuation" or item.producer != "runtime" or item.status != "completed":
+                continue
+            operation_id = item.payload.get("operation_id")
+            source = launches.get(operation_id) if isinstance(operation_id, str) else None
+            if source is None:
+                continue
+            launch, operation, arguments = source
+            initial = launch.payload.get("structured_content")
+            output = item.payload.get("structured_content")
+            if (item.payload.get("source_result_item_id") == launch.item_id
+                    and isinstance(initial, Mapping) and isinstance(output, Mapping)
+                    and item.payload.get("key") == initial.get("session_id") == output.get("session_id")
+                    and output.get("status") in {"completed", "cancelled"}):
+                trusted.append((item, operation, arguments))
         return tuple(trusted)
 
     def _trusted_results(

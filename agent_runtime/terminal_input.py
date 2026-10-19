@@ -21,6 +21,8 @@ CHAT_COMMANDS = {
     "/status": "查看模型、会话、工作区和上下文预算",
     "/new": "开始空上下文的新聊天",
     "/clear": "开始空上下文的新聊天（/new 别名）",
+    "/effort": "查看或设置模型支持的思考强度；default 重置，off 关闭（需要模型支持）",
+    "/output": "查看或设置单次输出额度；正整数或 default；包含思考 token",
     "/model": "选择模型；也支持 current、list、switch <id>",
     "/permissions": "查看有效权限；load <文件>、profile <名称>、reload 更新当前策略",
     "/verbose": "切换详细输出",

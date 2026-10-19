@@ -73,7 +73,7 @@ def read_chat_messages(
         items = store.list_conversation_items(anchor)
         final_answers = {item.turn_id: item.payload.get("text") for item in items
                          if item.kind == "agent_message" and item.status == "completed"}
-        committed_responses = {operation.response_item_id for turn_id in {item.turn_id for item in items}
+        committed_responses = {operation.response_item_id: operation for turn_id in {item.turn_id for item in items}
                                for operation in store.list_model_operations(turn_id)
                                if operation.status == "completed"
                                and operation.request_ref.get("purpose") != "context_summary"}
@@ -84,6 +84,11 @@ def read_chat_messages(
                 continue
             if item.kind == "user_message":
                 messages.append(("user", text))
+                if "input_revision" in item.payload:
+                    status = store.turn_input_status(item.item_id)
+                    label = {"pending": "已接收 · 待生效", "applied": "已生效（已进入模型请求）",
+                             "unconsumed": "本次执行已结束，补充尚未生效"}[status]
+                    messages.append(("notice", f"补充 {item.item_id}：{label}"))
             elif item.kind == "agent_message":
                 messages.append(("answer", text))
             elif item.kind == "model_response":
@@ -91,6 +96,11 @@ def read_chat_messages(
                     continue
                 if not item.payload.get("tool_calls") and text == final_answers.get(item.turn_id):
                     continue
+                operation = committed_responses[item.item_id]
+                revision = store.request_input_revision(item.turn_id, operation.request_ref)
+                if (not item.payload.get("tool_calls") and revision is not None
+                        and revision < store.user_input_revision(item.turn_id)):
+                    continue  # Retained in the ledger, superseded as a completion.
                 messages.append(("answer", text))
         return tuple(messages)
 

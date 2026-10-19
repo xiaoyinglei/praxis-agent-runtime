@@ -398,3 +398,27 @@ async def test_session_open_creates_and_reuses_trust_without_manual_init(
         original = trust_path.read_bytes()
     async with agent.session(require_workspace_change=False):
         assert trust_path.read_bytes() == original
+
+
+@pytest.mark.anyio
+async def test_command_cleanup_failure_does_not_mask_error_or_block_session_close(tmp_path):
+    from agent_runtime.harness import Session
+
+    session = await Session.open(database=tmp_path / "run.db", workspace=tmp_path,
+                                 model=PublicHarnessModel(), tools={})
+
+    async def fail_cleanup():
+        raise RuntimeError("injected command cleanup failure")
+
+    session._cancel_live_commands = fail_cleanup
+    try:
+        with pytest.raises(RuntimeError, match="injected command cleanup failure"):
+            async with session:
+                await session.submit("Answer")
+        assert session._active_task is None
+        assert session._closed
+    finally:
+        # Also clean resources when demonstrating the pre-fix error path.
+        session._active_task = None
+        session._cancel_live_commands = None
+        await session.close()

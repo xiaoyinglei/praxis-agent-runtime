@@ -9,10 +9,11 @@ import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from uuid import uuid4
 
 from agent_runtime.harness.memory import MemoryConfig
+from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -29,7 +30,9 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.harness import BoundHarnessModel, Session
+    from agent_runtime.harness.rollout import ItemSnapshot
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
+    from agent_runtime.tools.builtins.shell import RunCommandOutput
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
@@ -59,6 +62,8 @@ class Agent:
         web_limits: WebLimits | None = None,
         permissions: PermissionPolicy | Path | str | None = None,
         managed_permissions: PermissionPolicy | Path | str | None = None,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
@@ -105,12 +110,37 @@ class Agent:
         self._selection_requester = selection_requester
         self._followup_model_id: str | None = None
         self._model_factory: Callable[[], BoundHarnessModel] | None = None
+        self._request_overrides: dict[str, dict[str, Any]] = {}
+        self._pending_request_settings: dict[str, dict[str, Any]] = {}
+        self._request_settings_revision = 0
+        if reasoning_effort is not None or max_output_tokens is not None:
+            self.configure_request(reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens)
 
     def models(self) -> list[ModelSpec]:
         return self._get_model_control_plane().list_models()
 
     def current_model(self) -> ModelSpec:
         return self._get_model_control_plane().current_model()
+
+    def request_settings(self) -> dict[str, Any]:
+        return self._get_model_control_plane().request_settings()
+
+    def configure_request(
+        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+    ) -> dict[str, Any]:
+        plane = self._get_model_control_plane()
+        settings = plane.configure_request(
+            reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens,
+            persist=self.model_session_path is not None,
+        )
+        self._request_settings_revision = settings["revision"]
+        self._request_overrides[settings["model_id"]] = {
+            "model_id": settings["model_id"],
+            "options": {key: ("default" if value is None else value)
+                        for key, value in settings["preferences"].items()},
+        }
+        self._pending_request_settings[settings["model_id"]] = self._request_overrides[settings["model_id"]]
+        return settings
 
     def switch_model(self, model_id: str) -> ModelSpec:
         spec = self._get_model_control_plane().switch_model(
@@ -190,13 +220,33 @@ class Agent:
             acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
-            max_steps=16 if step_budget is None else step_budget,
+            max_steps=DEFAULT_MAX_STEPS if step_budget is None else step_budget,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
             _background_memory=_background_memory,
         )
         async with session:
             yield session
+
+    async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
+        """Persist guidance without opening a model; target must still be active."""
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            turn = store.read_turn(expected_turn_id)
+            if Path(store.read_thread(turn.thread_id).workspace).resolve() != self._workspace_path():
+                raise RuntimeError("Turn belongs to a different workspace security domain")
+            return store.receive_turn_input(thread_id=turn.thread_id, turn_id=expected_turn_id, text=text)
+
+    def input_status(self, item_id: str) -> str:
+        """Inspect a steering receipt without model I/O."""
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            item = store.read_item(item_id)
+            if Path(store.read_thread(item.thread_id).workspace).resolve() != self._workspace_path():
+                raise RuntimeError("input belongs to a different workspace security domain")
+            return store.turn_input_status(item_id)
 
     def memories(self) -> dict[str, object]:
         """Inspect this workspace's memory without opening a model or creating state."""
@@ -268,6 +318,16 @@ class Agent:
         async with self.session(require_workspace_change=False, _background_memory=False) as session:
             return await session.refresh_memory()
 
+    async def command(
+        self, turn_id: str, session_id: str, *, action: Literal["status", "wait", "cancel", "read"] = "status",
+        wait_seconds: float = 10, stream: Literal["stdout", "stderr"] = "stdout",
+        offset: int = 0, max_bytes: int = 16000,
+    ) -> RunCommandOutput:
+        """Control the original committed command without calling a model or rerunning it."""
+        from agent_runtime.harness.command_recovery import manage_command
+        return await manage_command(self, turn_id, session_id, action=action, wait_seconds=wait_seconds,
+                                    stream=stream, offset=offset, max_bytes=max_bytes)
+
     async def resume(
         self,
         turn_id: str,
@@ -286,6 +346,8 @@ class Agent:
                 thread = store.read_thread(turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
+                from agent_runtime.harness.command_recovery import cancel_commands
+                await cancel_commands(self, turn_id)
                 mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
                 cancelled = mutation.value
                 result = AgentResult._from_harness(
@@ -475,12 +537,21 @@ class Agent:
         session_path = self.model_session_path
         if session_path is not None and not session_path.is_absolute():
             session_path = workspace / session_path
-        return build_model_control_plane(
+        plane = build_model_control_plane(
             model_id=self.model,
             selection_requester=self._selection_requester,
             session_path=session_path,
             workspace=workspace,
         )
+        if self.model_session_path is None:
+            plane.state.request_settings_revision = self._request_settings_revision
+            for model_id, override in self._request_overrides.items():
+                from agent_runtime.core.generation_settings import ModelRequestPreferences
+
+                plane.state.request_preferences[model_id] = ModelRequestPreferences.model_validate({
+                    key: None if value == "default" else value for key, value in override["options"].items()
+                })
+        return plane
 
 
 async def _close_owned_sync_resource(resource: object, *, label: str) -> None:

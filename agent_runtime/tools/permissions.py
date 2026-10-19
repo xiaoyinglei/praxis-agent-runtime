@@ -14,6 +14,7 @@ from agent_runtime.tools.tool import (
     ResolvedToolUse,
     Tool,
     ToolApprovalProfile,
+    ToolCall,
     ToolEffect,
 )
 
@@ -61,6 +62,7 @@ class ToolExecutionContext:
     permissions: ResolvedPermissions | None = None
     permission_provider: Callable[[], ResolvedPermissions] | None = None
     context_provider: Callable[[], ToolExecutionContext] | None = None
+    invocation_guard: Callable[[ToolCall], None] | None = None
 
     def refreshed(self) -> ToolExecutionContext:
         if self.context_provider is None:
@@ -97,6 +99,8 @@ class ToolExecutionContext:
             raise TypeError("permissions must be ResolvedPermissions or None")
         if self.permission_provider is not None and not callable(self.permission_provider):
             raise TypeError("permission_provider must be callable")
+        if self.invocation_guard is not None and not callable(self.invocation_guard):
+            raise TypeError("invocation_guard must be callable")
         for name in (
             "allow_write_tools",
             "allow_execute_tools",

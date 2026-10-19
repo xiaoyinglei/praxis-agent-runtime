@@ -13,9 +13,10 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
 from agent_runtime.harness.context_recall import READ_CONTEXT_NAME, create_context_recall_tool
-from agent_runtime.harness.protocol import BoundHarnessModel, CompletionGate
+from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, BoundHarnessModel, CompletionGate
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_turn_id
 from agent_runtime.harness.tool_router import DurableToolRouter
+from agent_runtime.project_instructions import instruction_snapshot
 from agent_runtime.tools.integrations.knowledge import (
     KnowledgeSearchInput,
     create_knowledge_tools,
@@ -84,8 +85,11 @@ class SessionBindingProvider:
         model_step_budget: int,
         model_token_budget_total: int | None,
         model_cost_budget_total_micros: int | None,
+        project_instructions: Callable[[str], Mapping[str, Any] | None] | None = None,
         model_binding: Mapping[str, Any] | None = None,
+        request_settings: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
+        self._request_settings = request_settings
         self._model = model
         self._model_binding = model_binding
         self._tools = tuple(tools.values())
@@ -99,6 +103,7 @@ class SessionBindingProvider:
         self._model_step_budget = model_step_budget
         self._model_token_budget_total = model_token_budget_total
         self._model_cost_budget_total_micros = model_cost_budget_total_micros
+        self._project_instructions = project_instructions
 
     def snapshot(
         self,
@@ -122,10 +127,12 @@ class SessionBindingProvider:
             if observed is not None and observed != expected:
                 raise RuntimeError(f"model binding returned the wrong {field_name}")
             binding[field_name] = expected
-        binding.update(self._static_snapshot())
+        binding.update(self._static_snapshot(turn_id))
+        if self._request_settings is not None:
+            binding["request_settings"] = dict(self._request_settings())
         return binding
 
-    def _static_snapshot(self) -> dict[str, object]:
+    def _static_snapshot(self, turn_id: str) -> dict[str, object]:
         binding: dict[str, object] = {}
         binding["toolset_revision"] = toolset_revision_for_tools(self._tools)
         binding["tool_execution_revisions"] = {tool.definition.name: tool.execution_revision for tool in self._tools}
@@ -140,9 +147,18 @@ class SessionBindingProvider:
             "acceptance_command": self._acceptance_command,
         }
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
+        binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
+        binding["step_budget_policy"] = {"revision": "pressure-v1"}
+        binding["execution_context_policy"] = {
+            "revision": "working-context-v1", "finalization": "budget-admission-v1",
+        }
         binding["model_step_budget"] = self._model_step_budget
         binding["model_token_budget_total"] = self._model_token_budget_total
         binding["model_cost_budget_total_micros"] = self._model_cost_budget_total_micros
+        if self._project_instructions is not None:
+            instructions = self._project_instructions(turn_id)
+            if instructions is not None:
+                binding["project_instructions"] = dict(instructions)
         if self._knowledge_revision is not None:
             binding["knowledge_revision"] = self._knowledge_revision
             binding["knowledge_config"] = self._knowledge_config
@@ -181,7 +197,7 @@ def configure_services(
     mcp_config_trust: Mapping[str, object] | None = None,
     enable_subagents: bool = False,
     skill_runtime: HarnessSkillRuntime | None = None,
-    max_steps: int = 16,
+    max_steps: int = DEFAULT_MAX_STEPS,
     max_tokens_total: int | None = None,
     max_cost_micros: int | None = None,
 ) -> None:
@@ -376,6 +392,12 @@ def configure_services(
     session.max_steps = max_steps
     session.tools = tool_snapshot
 
+    def project_instructions_for_turn(turn_id: str) -> Mapping[str, Any] | None:
+        try:
+            return store.read_turn(turn_id).binding_manifest.get("project_instructions")
+        except KeyError:
+            return instruction_snapshot(session.tool_execution_context)
+
     session.binding_provider = SessionBindingProvider(
         model=model,
         model_binding=model_binding,
@@ -390,4 +412,7 @@ def configure_services(
         model_step_budget=max_steps,
         model_token_budget_total=max_tokens_total,
         model_cost_budget_total_micros=max_cost_micros,
+        project_instructions=project_instructions_for_turn,
+        request_settings=(None if session.model_control_plane is None else
+                          session.model_control_plane.request_settings),
     )

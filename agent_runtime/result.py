@@ -120,6 +120,8 @@ class AgentUsage:
     mcp_calls: int = 0
     mcp_errors: int = 0
     mcp_latency_ms_total: float | None = None
+    reasoning_tokens: int | None = None
+    usage_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,10 @@ class AgentResult:
             if attempt.attempt_id in dispatched_ids or attempt.status == "completed"
         )
         usage_values = tuple(attempt.usage for attempt in attempts if attempt.status == "completed")
+        usage_complete = bool(attempts) and len(usage_values) == len(attempts) and all(
+            _optional_usage_sum((usage,), key) is not None
+            for usage in usage_values for key in ("input_tokens", "output_tokens")
+        )
         operations = store.list_tool_operations(result.turn_id)
         native_operations = tuple(
             op for op in operations if not op.execution_revision.startswith("integration-mcp-v1:")
@@ -435,7 +441,8 @@ class AgentResult:
             )
         diagnostics = tuple(projected_diagnostics)
         return cls(
-            answer=result.answer,
+            answer=(result.answer or turn.terminal_message
+                    if turn.terminal_reason_code == "model_step_budget_exhausted" else result.answer),
             status={
                 "completed": "done",
                 "paused": "paused",
@@ -452,6 +459,16 @@ class AgentResult:
                     else _usage_integer(usage, "input_tokens") + _usage_integer(usage, "output_tokens")
                     for usage in usage_values
                 ),
+                logical_input_tokens=_optional_usage_sum(usage_values, "logical_input_tokens"),
+                uncached_input_tokens=_optional_usage_sum(usage_values, "uncached_input_tokens"),
+                cache_read_input_tokens=_optional_usage_sum(
+                    usage_values, "cache_read_input_tokens", "cached_input_tokens",
+                ),
+                cache_write_input_tokens=_optional_usage_sum(
+                    usage_values, "cache_write_input_tokens", "cache_write_tokens",
+                ),
+                reasoning_tokens=_optional_usage_sum(usage_values, "reasoning_tokens"),
+                usage_complete=usage_complete,
                 tool_calls=sum(op.attempt_count for op in operations),
                 model_calls=len(attempts),
                 model_latency_ms=_observed_sum([attempt.usage.get("latency_ms") for attempt in attempts]),
@@ -585,6 +602,18 @@ def _project_harness_plan(
 def _usage_integer(usage: Mapping[str, object], key: str) -> int:
     value = usage.get(key)
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _optional_usage_sum(values: Sequence[Mapping[str, object]], *keys: str) -> int | None:
+    if not values:
+        return None
+    total = 0
+    for usage in values:
+        value = next((usage[key] for key in keys if key in usage), None)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        total += value
+    return total
 
 
 def _observed_sum(values: Sequence[object]) -> float | None:

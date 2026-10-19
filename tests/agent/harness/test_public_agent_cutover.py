@@ -612,7 +612,7 @@ async def test_public_agent_freezes_and_durably_enforces_model_budget(
     )
 
     assert result.status == "failed"
-    assert result.answer is None
+    assert result.answer and "尚未完成" in result.answer
     with RolloutStore(database) as store:
         turn = store.read_turn(result.turn_id)
         assert turn.status == "failed"
@@ -1241,13 +1241,13 @@ async def test_public_result_projects_plan_from_committed_tool_items(
     assert result.answer == "planned answer"
     assert result.plan is not None
     assert result.plan.objective == "plan this answer"
-    assert result.plan.status == "complete"
+    assert result.plan.status == "needs_replan"
     assert [step.step_id for step in result.plan.steps] == [
         "step_inspect",
         "step_verify",
     ]
-    assert all(step.status == "completed" for step in result.plan.steps)
+    assert [step.status for step in result.plan.steps] == ["in_progress", "pending"]
     assert [event.event_type for event in result.plan_events] == [
         "llm_update",
-        "completed",
+        "needs_replan",
     ]

@@ -111,6 +111,9 @@ class GatewayHarnessModel:
             raise ValueError("Harness model context may only place context fragments before the first user message")
         first = messages[first_user_index]
         clock_blocks: tuple[ContextBlock, ...] = ()
+        dynamic_context = (
+            request.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v1"
+        )
         clock = request.binding_manifest.get("runtime_clock")
         if request.purpose == "agent_step" and isinstance(clock, Mapping):
             clock_blocks = (ContextBlock(
@@ -137,15 +140,23 @@ class GatewayHarnessModel:
                     content=f"Current model ID for this turn: {self._model_id}.",
                 ),
             )
-            + clock_blocks
+            + (() if dynamic_context else clock_blocks)
             + tuple(
                 ContextBlock(name=f"harness_prefix_{index}", content=message.content)
                 for index, message in enumerate(leading, start=1)
             ),
             initial_user_task=first.content,
-            transcript=messages[first_user_index + 1 :],
+            transcript=(*messages[first_user_index + 1 :], *(
+                tuple(ModelMessage(role="context", content=cast(str, block.content)) for block in clock_blocks)
+                if dynamic_context else ()
+            )),
         )
         settings = _model_settings(self._resolved)
+        effective_settings = None
+        if request.purpose == "agent_step" and (
+            getattr(self._resolved.gateway, "agent_output_policy", None) == "model-aware-v1"
+        ):
+            settings, effective_settings = _request_settings(request, self._resolved, settings)
         policy = request.binding_manifest.get("tool_execution_policy", {})
         if (
             self._resolved.request_defaults.parallel_tool_calls is None
@@ -157,11 +168,18 @@ class GatewayHarnessModel:
                  LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP)
         if request.purpose != "agent_step":
             options = dict(settings.provider_options)
-            if "thinking" in options:
+            reasoning = self._resolved.capabilities.reasoning
+            legacy = getattr(self._resolved.gateway, "agent_output_policy", None) is None
+            if ((reasoning is not None and reasoning.thinking_toggle == "thinking")
+                    or (legacy and reasoning is None and "thinking" in options)):
                 options["thinking"] = {"type": "disabled"}
             template = options.get("chat_template_kwargs")
-            if isinstance(template, Mapping) and "enable_thinking" in template:
-                options["chat_template_kwargs"] = {**template, "enable_thinking": False}
+            if ((reasoning is not None and reasoning.thinking_toggle == "chat_template_kwargs")
+                    or (legacy and reasoning is None and isinstance(template, Mapping)
+                        and "enable_thinking" in template)):
+                options["chat_template_kwargs"] = {
+                    **(dict(template) if isinstance(template, Mapping) else {}), "enable_thinking": False,
+                }
             settings = replace(settings, provider_options=options)
         effective_budget = getattr(self._resolved.gateway, "effective_stage_budget", None)
         if callable(effective_budget):
@@ -183,6 +201,10 @@ class GatewayHarnessModel:
                     request.output_token_limit,
                 ),
             )
+        if effective_settings is not None:
+            if settings.max_output_tokens != effective_settings["max_output_tokens"]:
+                effective_settings["output_constraints"].append("turn_output_token_limit")
+            effective_settings["max_output_tokens"] = settings.max_output_tokens
         context, canonical_request, context_projection = _budgeted_request(
             request_id=request.request_id or f"{request.turn_id}:step:{request.step}",
             context=context,
@@ -222,6 +244,7 @@ class GatewayHarnessModel:
             wire_hash=wire_hash,
             request_ref={
                 "model_id": self._model_id,
+                **({"effective_settings": effective_settings} if effective_settings is not None else {}),
                 "purpose": request.purpose,
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
@@ -534,6 +557,57 @@ def _model_messages(
     return tuple(converted)
 
 
+def _request_settings(
+    request: HarnessModelRequest, resolved: ResolvedModel, settings: ModelSettings,
+) -> tuple[ModelSettings, dict[str, Any]]:
+    from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
+
+    snapshot = request.binding_manifest.get("request_settings", {})
+    if snapshot.get("model_id", resolved.model_id) != resolved.model_id:
+        # A catalog alias can differ from the wire model ID. The snapshot is
+        # authenticated against the binding alias by the control plane.
+        if snapshot.get("model_id") != request.binding_manifest.get("model_id"):
+            raise ValueError("request settings belong to another model")
+    preferences = ModelRequestPreferences.model_validate(snapshot.get("preferences", {}))
+    defaults = resolved.request_defaults
+    reasoning = resolved.capabilities.reasoning or ReasoningCapabilities()
+    effort = preferences.reasoning_effort or defaults.reasoning_effort or reasoning.default_effort
+    reasoning.validate_effort(effort)
+    options = dict(settings.provider_options)
+    if effort == "off":
+        options.pop(reasoning.effort_parameter, None)
+    elif effort is not None:
+        options[reasoning.effort_parameter] = effort
+    if effort is not None and reasoning.thinking_toggle == "thinking":
+        options["thinking"] = {"type": "disabled" if effort == "off" else "enabled"}
+    elif effort is not None and reasoning.thinking_toggle == "chat_template_kwargs":
+        template = options.get("chat_template_kwargs", {})
+        options["chat_template_kwargs"] = {**(dict(template) if isinstance(template, Mapping) else {}),
+                                           "enable_thinking": effort != "off"}
+    fallback = resolved.gateway.stage_budget(LLMCallStage.AGENT_STEP).max_output_tokens
+    requested = preferences.max_output_tokens or defaults.max_output_tokens or fallback
+    output = requested
+    constraints = []
+    if resolved.capabilities.max_output_tokens is not None and output > resolved.capabilities.max_output_tokens:
+        output = resolved.capabilities.max_output_tokens
+        constraints.append("model_max_output_tokens")
+    window_limit = resolved.capabilities.context_window_tokens - resolved.gateway.stage_budget(
+        LLMCallStage.AGENT_STEP).safety_margin_tokens - 1
+    if output > window_limit:
+        output = window_limit
+        constraints.append("model_context_window")
+    return replace(settings, max_output_tokens=output, provider_options=options), {
+        "revision": snapshot.get("revision", 0),
+        "reasoning_effort": effort,
+        "reasoning_source": "user" if preferences.reasoning_effort else "model_default",
+        "requested_output_tokens": requested,
+        "max_output_tokens": output,
+        "output_source": ("user" if preferences.max_output_tokens else
+                          "model_default" if defaults.max_output_tokens else "conservative_fallback"),
+        "output_constraints": constraints,
+    }
+
+
 def _model_settings(resolved: ResolvedModel) -> ModelSettings:
     defaults = resolved.request_defaults
 
@@ -611,7 +685,8 @@ def _model_resource_request(
     if max_input_tokens is not None and input_tokens > max_input_tokens:
         raise ContextBudgetExceededError(
             "Committed model context cannot fit inside the effective provider "
-            f"boundary: {input_tokens} > {max_input_tokens} input tokens."
+            f"boundary: {input_tokens} > {max_input_tokens} input tokens.",
+            reason_code="model_context_window_exceeded",
         )
     estimated_cost = estimated_model_cost_micros(
         input_tokens=input_tokens,
@@ -743,5 +818,5 @@ def _budgeted_request(
     raise ContextCompactionRequiredError(
         input_tokens=input_tokens,
         max_input_tokens=max_input_tokens,
-        reason_code="token_threshold" if capacity_policy is not None else "context_budget_exhausted",
+        reason_code="token_threshold" if capacity_policy is not None else "model_context_window_exceeded",
     )

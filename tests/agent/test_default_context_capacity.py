@@ -56,7 +56,8 @@ def test_project_catalog_admits_complete_request_above_64k(project_registry):
     projection = prepared.request_ref["context_projection"]
     assert prepared.resource_request.input_tokens > 64000
     assert projection["explicit_input_cap"] is None
-    assert projection["effective_input_limit"] == 1015296
+    assert prepared.resource_request.output_tokens == 65536
+    assert projection["effective_input_limit"] == 1048576 - 65536 - 512
     assert projection["auto_compact_limit"] == 943718
     assert projection["post_compact_target"] == 754974
 

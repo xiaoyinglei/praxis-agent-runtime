@@ -225,7 +225,7 @@ def parse_openai_usage(response: object) -> LLMUsage | None:
     if cache_read is None:
         cache_read = _first_token_count(
             raw_usage,
-            ("cache_read_input_tokens",),
+            ("cache_read_input_tokens", "prompt_cache_hit_tokens"),
         )
     cache_write = _first_token_count(
         prompt_details,

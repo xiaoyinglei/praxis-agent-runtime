@@ -113,18 +113,18 @@ async def test_harness_update_plan_projects_public_result_and_rollout_truth(
     assert result.plan.objective == "Make update_plan durable."
     assert result.plan.summary == _PLAN_ARGUMENTS["explanation"]
     assert result.plan.revision == 2
-    assert result.plan.status == "complete"
+    assert result.plan.status == "needs_replan"
     assert [step.title for step in result.plan.steps] == [
         "Implement durable plan state",
         "Run integration verification",
     ]
     assert [step.status for step in result.plan.steps] == [
         "completed",
-        "completed",
+        "in_progress",
     ]
     assert [event.event_type for event in result.plan_events] == [
         "llm_update",
-        "completed",
+        "needs_replan",
     ]
 
     update_call = next(
@@ -154,6 +154,7 @@ async def test_harness_update_plan_persists_each_canonical_plan_transition(
     assert len(plan_items) == 2
     assert [item.payload["plan"]["revision"] for item in plan_items] == [1, 2]
     assert plan_items[0].payload["plan"]["status"] == "active"
+    assert [step["status"] for step in plan_items[0].payload["plan"]["steps"]] == ["completed", "in_progress"]
     assert plan_items[-1].payload["plan"] == result.plan.model_dump()
 
 

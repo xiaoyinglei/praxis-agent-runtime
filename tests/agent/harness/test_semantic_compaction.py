@@ -211,7 +211,7 @@ def test_second_provider_overflow_stops_without_retry_loop(tmp_path: Path):
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
         assert len(calls) == 2
-        assert store.read_turn(turn.turn_id).terminal_reason_code == "context_budget_exhausted"
+        assert store.read_turn(turn.turn_id).terminal_reason_code == "model_context_window_exceeded"
         assert store.verify().valid
 
 

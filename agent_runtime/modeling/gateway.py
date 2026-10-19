@@ -204,6 +204,8 @@ class LLMGateway:
         stage_budgets: Mapping[LLMCallStage, LLMStageBudget] | None = None,
         provider_quota_gate: ProviderQuotaGate | None = None,
         context_policy: ContextCapacityPolicy | None = _DEFAULT_CONTEXT_POLICY,
+        agent_output_policy: str | None = None,
+        model_max_output_tokens: int | None = None,
     ) -> None:
         if model_context_tokens <= 0:
             raise ValueError("model_context_tokens must be positive")
@@ -213,6 +215,8 @@ class LLMGateway:
         self._stage_budgets = dict(stage_budgets or DEFAULT_LLM_STAGE_BUDGETS)
         self._provider_quota_gate = provider_quota_gate
         self.context_policy = context_policy
+        self.agent_output_policy = agent_output_policy
+        self._model_max_output_tokens = model_max_output_tokens
 
     @property
     def model_context_tokens(self) -> int:
@@ -236,6 +240,13 @@ class LLMGateway:
             budget,
             kwargs=kwargs,
         )
+        if stage == LLMCallStage.AGENT_STEP and self.agent_output_policy == "model-aware-v1":
+            requested = (kwargs or {}).get("max_tokens")
+            if type(requested) is int and requested > 0:
+                max_output_tokens = requested
+            if self._model_max_output_tokens is not None:
+                max_output_tokens = min(max_output_tokens, self._model_max_output_tokens)
+            max_output_tokens = min(max_output_tokens, self._model_context_tokens - budget.safety_margin_tokens - 1)
         hard_input = self._model_context_tokens - max_output_tokens - budget.safety_margin_tokens
         max_input_tokens = hard_input if budget.max_input_tokens is None else min(budget.max_input_tokens, hard_input)
         if max_input_tokens <= 0:

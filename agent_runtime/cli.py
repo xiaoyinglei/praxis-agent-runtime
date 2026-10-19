@@ -18,6 +18,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
+from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
@@ -44,7 +45,12 @@ from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.setup_cli import setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
-from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
+from agent_runtime.terminal_render import (
+    TerminalToolEventDisplay,
+    format_usage_summary,
+    safe_terminal_text,
+    web_error_message,
+)
 from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
@@ -61,6 +67,7 @@ agent_app.add_typer(model_app, name="model", help="查看和切换当前模型�
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
 agent_app.command("setup")(setup)
 agent_app.command("connections")(connections_command)
+agent_app.command("commands")(commands)
 
 
 @agent_app.command("permissions")
@@ -267,7 +274,22 @@ def _failure_title(stop_reason: str | None) -> str:
     if stop_reason == "model_provider_failed":
         return "模型服务暂时无法完成请求，请检查模型配置或稍后重试。"
     if stop_reason == "model_step_budget_exhausted":
-        return "本次执行已达到尝试次数上限，任务尚未完成。"
+        return "本次执行已达到尝试次数上限，本轮未完成收尾。"
+    capacity_failures = {
+        "model_token_budget_exhausted": "本轮累计 Token 预算不足，无法继续执行或完成收尾。",
+        "model_context_window_exceeded": "模型单次请求超出上下文窗口，压缩恢复后仍无法继续。",
+        "context_summary_incomplete": "上下文摘要输出被截断，原始历史已保留；本轮无法完成必要压缩。",
+        "context_summary_invalid": "上下文摘要内容无效，原始历史已保留；本轮无法完成必要压缩。",
+        "summary_context_overflow": "模型拒绝摘要请求：摘要输入超出可用上下文。",
+        "byte_guard": "上下文达到配置的字节上限，本轮无法完成必要压缩。",
+        "message_guard": "上下文达到配置的消息数上限，本轮无法完成必要压缩。",
+        "context_source_changed": "上下文在压缩期间持续变化，本轮未能完成压缩。",
+        "context_compaction_failed": "上下文压缩失败，原始历史已保留。",
+        "no_compactable_context": "受保护的当前任务无法通过压缩历史缩小，本轮无法继续。",
+        "summary_unit_exceeds_context": "一个完整的历史工作单元超出摘要输入容量，原始历史已保留。",
+    }
+    if stop_reason in capacity_failures:
+        return capacity_failures[stop_reason]
     return "错误: Agent 运行失败"
 
 
@@ -314,7 +336,7 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if result.status == "done" and (verbose or result.validation_status != "not_evaluated"):
+    if result.status == "done":
         scope = (
             f"（范围: {safe_terminal_text(result.validation_scope)}）"
             if result.validation_scope is not None else ""
@@ -337,6 +359,8 @@ def _display_agent_result(
         print(plan_summary)
     if result.tool_calls and show_execution:
         print(_format_tool_summary(result))
+
+    print("\n" + format_usage_summary(result.usage))
 
     if verbose:
         usage = result.usage
@@ -514,6 +538,8 @@ def _create_agent_facade(
     web_proxy_url: str | None = None,
     web_limits_file: Path | None = None,
     permissions: Path | None = None,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
@@ -521,6 +547,8 @@ def _create_agent_facade(
     try:
         return Agent(
             model=model,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
             checkpoint_db=checkpoint_db,
             workspace_path=workspace_path,
             model_session_path=model_session_path,
@@ -538,6 +566,8 @@ def _create_agent_facade(
             raise typer.BadParameter(str(error), param_hint="--web-proxy / proxy environment") from None
         if str(error).startswith("Web search"):
             raise typer.BadParameter(str(error), param_hint="--web-search-provider / --web-search-key-file") from None
+        if reasoning_effort is not None or max_output_tokens is not None:
+            raise typer.BadParameter(str(error), param_hint="--effort / --max-output-tokens") from None
         raise
 
 
@@ -845,7 +875,8 @@ async def _chat_facade_loop(
                 await _ui.replay_messages(messages)
             else:
                 for kind, text in messages:
-                    print(("❯ " if kind == "user" else "Praxis\n") + safe_terminal_text(text) + "\n")
+                    prefix = "❯ " if kind == "user" else "Praxis\n" if kind == "answer" else ""
+                    print(prefix + safe_terminal_text(text) + "\n")
             pending = (await facade.read_result(selected.active_turn_id)
                        if selected.active_turn_id and selected.status in {"paused", "interrupted"} else None)
             _print_chat_recovery(selected, pending)
@@ -878,6 +909,22 @@ async def _chat_facade_loop(
             if _ui:
                 _ui.model = model_id
             return opened
+
+        if _ui is not None:
+            async def receive_input(text: str) -> str | None:
+                assert _ui is not None
+                if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
+                    _handle_request_settings_command(text, agent=session or facade)
+                    return None
+                turn_id = _ui.display.turn_id
+                if turn_id is None:
+                    raise RuntimeError("当前 Turn 尚未启动，请保留输入稍后发送")
+                receiver = session if session is not None else facade
+                receipt = await receiver.steer(text, expected_turn_id=turn_id)
+                return receipt.item_id
+
+            _ui.on_input = receive_input
+            _ui.input_status = lambda identity: facade.input_status(identity)
 
         if resume_thread_id is not None and not await reopen(resume_thread_id):
             return
@@ -995,6 +1042,12 @@ async def _chat_facade_loop(
                 if verbose:
                     event_display.show_context_status()
                 continue
+            if query.split(maxsplit=1)[0] in {"/effort", "/output"}:
+                try:
+                    _handle_request_settings_command(query, agent=session or facade)
+                except ValueError as error:
+                    print(f"设置未更改：{error}")
+                continue
             if query == "/model" or query.startswith("/model "):
                 model_control = session or facade
                 if _ui and query in {"/model", "/model list"}:
@@ -1078,8 +1131,13 @@ async def _chat_facade_loop(
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
+                print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
-                action = await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result)
+                pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
+                                        and any(facade.input_status(identity) == "pending"
+                                                for identity in _ui._input_receipts))
+                action = ("continue" if pending_steering
+                          else await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result))
                 if action is None:
                     result = await resume_driver.resume(result.turn_id, "abort")
                     print("已取消。")
@@ -1127,6 +1185,41 @@ def _print_model_menu(agent: Agent | Session) -> None:
     ):
         print(line)
     print("切换: /model <model_id>")
+
+
+class _RequestSettingsOptions(TypedDict, total=False):
+    reasoning_effort: str
+    max_output_tokens: int
+
+
+def _handle_request_settings_command(query: str, *, agent: Any) -> None:
+    parts = query.split()
+    if len(parts) not in (1, 2) or parts[0] not in {"/effort", "/output"}:
+        raise ValueError("用法：/effort <支持的强度|default|off>；/output <正整数|default>")
+    if len(parts) == 2:
+        if parts[0] == "/effort":
+            agent.configure_request(reasoning_effort=parts[1])
+        else:
+            value = parts[1]
+            if value != "default" and (not value.isascii() or not value.isdecimal() or int(value) < 1):
+                raise ValueError("输出额度必须为正整数或 default")
+            agent.configure_request(max_output_tokens=value if value == "default" else int(value))
+    snapshot = agent.request_settings()
+    spec = agent.current_model()
+    preferences = snapshot["preferences"]
+    defaults = snapshot["model_defaults"]
+    effort = preferences["reasoning_effort"] or defaults["reasoning_effort"]
+    requested = preferences["max_output_tokens"] or defaults["max_output_tokens"]
+    output = min(requested, spec.max_output_tokens) if spec.max_output_tokens is not None else requested
+    print(f"模型: {spec.id}；思考强度: {effort or '未声明'}；单次输出额度: {output:,}")
+    if spec.reasoning is not None and spec.reasoning.supported_efforts is not None:
+        print("支持强度: " + (", ".join(spec.reasoning.supported_efforts) or "不支持"))
+    else:
+        print("支持强度: 未知（需在模型声明中配置）")
+    if requested != output:
+        print(f"申请 {requested:,}，受模型上限限制为 {output:,}；请求时还会校验上下文和累计预算。")
+    if len(parts) == 2:
+        print("设置已保存，从下一次模型请求生效；已发出的请求和恢复重试保持原配置。")
 
 
 def _handle_model_slash_command(
@@ -1733,6 +1826,12 @@ def agent_chat(
                                  help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    reasoning_effort: Annotated[
+        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+    ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
     if sum((previous_turn_id is not None, last or continue_chat, resume_thread_id is not None)) > 1:
@@ -1773,7 +1872,13 @@ def agent_chat(
         web_options["web_search_provider"] = web_search_provider
     if web_proxy_url is not None:
         web_options["web_proxy_url"] = web_proxy_url
+    request_options: _RequestSettingsOptions = {}
+    if reasoning_effort is not None:
+        request_options["reasoning_effort"] = reasoning_effort
+    if max_output_tokens is not None:
+        request_options["max_output_tokens"] = max_output_tokens
     facade = _create_agent_facade(
+        **request_options,
         model=facade_model,
         checkpoint_db=checkpoint_db,
         workspace_path=facade_workspace,
@@ -1902,6 +2007,12 @@ def agent_run(
         ),
     ] = False,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    reasoning_effort: Annotated[
+        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+    ] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
     if previous_turn_id is not None and last:
@@ -1923,6 +2034,8 @@ def agent_run(
             "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     facade = _create_agent_facade(
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
         model=model,
         checkpoint_db=checkpoint_db,
         workspace_path=Path.cwd(),

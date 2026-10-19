@@ -627,6 +627,8 @@ def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
         "execution_revision": tool.execution_revision,
         "idempotent": tool.idempotent,
         "concurrency_safe": tool.concurrency_safe,
+        "continuation": tool.continuation is not None,
+        "after_commit": tool.after_commit is not None,
         "cancellation_mode": tool.cancellation_mode.value,
         "interrupt_behavior": tool.interrupt_behavior.value,
         "timeout_seconds": float(tool.timeout_seconds),

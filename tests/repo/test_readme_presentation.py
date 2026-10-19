@@ -54,8 +54,8 @@ def test_readme_follows_the_public_product_story() -> None:
 def test_readme_scopes_completion_evidence_and_runtime_extensions_truthfully() -> None:
     readme = _read(README)
     guide = _read(GUIDE)
-    assert "修改类任务默认要求工作区确实发生变化" in readme
-    assert "只读分析可以直接回答" in readme
+    assert "运行结束与任务验收分别记录" in readme
+    assert "--require-workspace-change --acceptance-command" in readme
     assert "--no-require-workspace-change" in readme
     assert "require_workspace_change=False" in readme
     assert "Skills" in guide and "MCP" in guide and "子智能体" in guide

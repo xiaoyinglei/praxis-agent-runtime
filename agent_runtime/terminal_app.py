@@ -197,6 +197,11 @@ class TerminalChatApp:
         self._approval: _ApprovalState | None = None
         self._input_sequence = 0
         self._operation: asyncio.Task[Any] | None = None
+        self.on_input: Callable[[str], Awaitable[str | None]] | None = None
+        self.input_status: Callable[[str], str] | None = None
+        self._input_tasks: set[asyncio.Task[None]] = set()
+        self._input_receipts: dict[str, Block] = {}
+        self._input_lock = asyncio.Lock()
         self._connection_server: ConnectionServer | None = None
         self._connection_thread: threading.Thread | None = None
         self._opening_connections = False
@@ -248,10 +253,10 @@ class TerminalChatApp:
         def open_connections(event: KeyPressEvent) -> None:
             self.app.create_background_task(self.open_connections())
 
-        @keys.add("y", filter=approving, eager=True)
-        @keys.add("Y", filter=approving, eager=True)
-        @keys.add("n", filter=approving, eager=True)
-        @keys.add("N", filter=approving, eager=True)
+        @keys.add("y", filter=approving & ~has_focus(self.editor), eager=True)
+        @keys.add("Y", filter=approving & ~has_focus(self.editor), eager=True)
+        @keys.add("n", filter=approving & ~has_focus(self.editor), eager=True)
+        @keys.add("N", filter=approving & ~has_focus(self.editor), eager=True)
         def approval_shortcut(event: KeyPressEvent) -> None:
             state = self._approval
             if state is not None:
@@ -285,6 +290,14 @@ class TerminalChatApp:
         @keys.add("tab", filter=approving)
         @keys.add("s-tab", filter=approving)
         def approval_focus(event: KeyPressEvent) -> None:
+            if self.on_input is not None:
+                if event.app.layout.has_focus(self.approval_buttons):
+                    event.app.layout.focus(self.editor)
+                elif event.app.layout.has_focus(self.editor):
+                    event.app.layout.focus(self.approval_body)
+                else:
+                    event.app.layout.focus(self.approval_buttons)
+                return
             event.app.layout.focus(self.approval_body if event.app.layout.has_focus(self.approval_buttons)
                                    else self.approval_buttons)
 
@@ -328,7 +341,21 @@ class TerminalChatApp:
                 self.editor.buffer.complete_state = None
                 self.invalidate()
                 return
-            if self.waiting and self.editor.text.strip():
+            if not self.editor.text.strip():
+                return
+            if self.on_input is not None and (self._operation is not None or self._approval is not None):
+                value = self.editor.text
+                if value.startswith("/"):
+                    self.status = "执行中请直接输入补充；Ctrl+C 停止后可使用命令"
+                    self.invalidate()
+                    return
+                self.editor.buffer.append_to_history()
+                self.editor.text = ""
+                submission = self.app.create_background_task(self._send_input(value))
+                self._input_tasks.add(submission)
+                submission.add_done_callback(self._input_tasks.discard)
+                return
+            if self._pending is not None and not self._pending.done():
                 value = self.editor.text
                 self.editor.buffer.append_to_history()
                 self.editor.text = ""
@@ -348,7 +375,7 @@ class TerminalChatApp:
         def dismiss_completion(event: KeyPressEvent) -> None:
             self.editor.buffer.cancel_completion()
 
-        @keys.add("tab", filter=has_focus(self.editor))
+        @keys.add("tab", filter=has_focus(self.editor) & ~approving)
         def focus_records(event: KeyPressEvent) -> None:
             if self.editor.text.startswith("/"):
                 if self.editor.buffer.complete_state is None:
@@ -461,7 +488,7 @@ class TerminalChatApp:
                                if self._approval is not None else 1),
                     ]), filter=approving,
                 ),
-                ConditionalContainer(self.editor, filter=~approving),
+                ConditionalContainer(self.editor, filter=~approving | Condition(lambda: self.on_input is not None)),
                 ConditionalContainer(Window(height=1, char="─", style="class:dim"), filter=~approving),
                 ConditionalContainer(
                     Window(FormattedTextControl(self._connection_fragments), height=1),
@@ -775,6 +802,8 @@ class TerminalChatApp:
             fragments: StyleAndTextTuples = (
                 [("class:user", "❯ " + safe_terminal_text(text) + "\n\n")]
                 if kind == "user" else
+                [("class:dim", safe_terminal_text(text) + "\n\n")]
+                if kind == "notice" else
                 [*_answer_fragments(safe_terminal_text(text), width, "NO_COLOR" not in os.environ), ("", "\n")]
             )
             await run_in_terminal(partial(
@@ -896,7 +925,10 @@ class TerminalChatApp:
         self.invalidate()
         try:
             choice = await state.future
-            history.title = "人工审批 · " + ("已取消" if choice is None else _approval_label(choice).split(" · ")[0])
+            history.title = "人工审批 · " + (
+                "任务已更新，原动作不再执行" if choice == "continue"
+                else "已取消" if choice is None else _approval_label(choice).split(" · ")[0]
+            )
             return choice
         finally:
             state.pressed = None
@@ -945,7 +977,8 @@ class TerminalChatApp:
                 hints.append("Y允许")
             if "deny" in self._approval.options:
                 hints.append("N拒绝")
-            return [("class:dim", " " + " · ".join([*hints, "Esc取消", "Tab详情"]))]
+            tab_hint = "Tab切换到补充输入/详情" if self.on_input is not None else "Tab详情"
+            return [("class:dim", " " + " · ".join([*hints, "Esc取消", tab_hint]))]
         if self._model_pending is not None:
             return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
         activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
@@ -959,6 +992,7 @@ class TerminalChatApp:
         ]
 
     async def prompt(self, *, approval: bool = False) -> str:
+        self._refresh_inputs()
         if not approval:
             await self.flush_scrollback()
         self.status = "等待确认" if approval else "就绪"
@@ -978,18 +1012,65 @@ class TerminalChatApp:
         self.status = "工作中"
         async def refresh() -> None:
             while True:
+                self._refresh_inputs()
                 self.invalidate()
                 await asyncio.sleep(0.2)
         refresh_task = asyncio.create_task(refresh())
         try:
             return await self._operation
         finally:
+            if self._input_tasks:
+                await asyncio.gather(*tuple(self._input_tasks))
+            self._refresh_inputs()
             refresh_task.cancel()
             with suppress(asyncio.CancelledError):
                 await refresh_task
             self._operation = None
             self.status = "就绪"
             self.invalidate()
+
+    async def _send_input(self, text: str) -> None:
+        async with self._input_lock:
+            try:
+                assert self.on_input is not None
+                identity = await self.on_input(text)
+            except Exception as exc:
+                self.editor.text = text + ("\n" + self.editor.text if self.editor.text else "")
+                self.view.message(f"补充未接收，草稿已保留：{exc}\n", "notice")
+                self.invalidate()
+                return
+            if identity is None:
+                self.invalidate()
+                return
+            self.view.message(text + "\n", "user")
+            block = self.view._add(Block("notice"))
+            block.append(f"补充 {identity}：已接收 · 待生效\n")
+            self._input_receipts[identity] = block
+            self._refresh_inputs()
+            if self._approval is not None:
+                state = self._approval
+                if not state.future.done():
+                    state.pressed = None
+                    state.future.set_result("continue")
+
+    def _refresh_inputs(self) -> None:
+        if self.input_status is None:
+            return
+        for identity, block in tuple(self._input_receipts.items()):
+            try:
+                status = self.input_status(identity)
+            except (KeyError, RuntimeError):
+                continue
+            if status == "pending":
+                continue
+            label = "已生效（已进入模型请求）" if status == "applied" else "本次执行已结束，补充尚未生效"
+            text = f"补充 {identity}：{label}\n"
+            if block.in_scrollback:
+                self.view.message(text, "notice")
+            else:
+                block.text = safe_terminal_text(text)
+            del self._input_receipts[identity]
+            self.view.invalidate()
 
     async def run(self, conversation: Callable[[], Awaitable[None]]) -> None:
         worker: asyncio.Task[None] | None = None

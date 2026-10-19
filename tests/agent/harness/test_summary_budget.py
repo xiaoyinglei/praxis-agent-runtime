@@ -24,6 +24,7 @@ def test_unfit_fixed_context_spends_no_summary_calls(tmp_path: Path):
         )
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
+        assert store.read_turn(turn.turn_id).terminal_reason_code == "byte_guard"
         assert not gateway.requests
         assert not store.list_model_operations(turn.turn_id)
         assert not any(i.kind == "context_compaction" for i in store.list_items(turn.turn_id))
@@ -74,6 +75,7 @@ def test_summary_is_not_dispatched_with_leftover_output_allowance(tmp_path, monk
                               completion_gate=Accept())
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
+        assert store.read_turn(turn.turn_id).terminal_reason_code == "model_token_budget_exhausted"
         assert not gateway.requests
         assert not store.list_model_operations(turn.turn_id)
         assert not any(i.kind == "context_compaction" for i in store.list_items(turn.turn_id))

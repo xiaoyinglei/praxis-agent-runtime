@@ -4,6 +4,7 @@ import asyncio
 import codecs
 import ctypes
 import errno
+import hashlib
 import json
 import math
 import os
@@ -15,13 +16,15 @@ import socket
 import stat
 import sys
 import tempfile
+import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
+from contextvars import ContextVar
 from pathlib import Path
-from typing import BinaryIO, Literal
+from typing import TYPE_CHECKING, BinaryIO, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.tool import (
@@ -42,11 +45,15 @@ from agent_runtime.tools.tool import (
     json_schema_output,
     pydantic_input,
 )
+from agent_runtime.user_config import command_state_directory
 from agent_runtime.workspace import WorkspaceRuntime
+
+if TYPE_CHECKING:
+    from agent_runtime.tools.builtins.command_sessions import CommandSessions
 
 _MAX_STREAM_BYTES = 16_000
 _MAX_COMMAND_TIMEOUT_SECONDS = 600.0
-_MILLISECONDS_PER_SECOND = 1_000.0
+_COPY_CANCEL: ContextVar[threading.Event | None] = ContextVar("linux_copy_cancel", default=None)
 _STREAM_TRUNCATION_MARKER = b"\n... output truncated; preserved head and tail ...\n"
 _MAX_DELTA_BYTES = 200_000
 _MAX_DELTA_CHUNKS = 512
@@ -59,7 +66,7 @@ _PROTECTED_PERMISSION_DIRECTORIES = frozenset({".git", ".agents", ".codex", ".aw
 _LINUX_VIEW_PROTECTED = _PROTECTED_PERMISSION_DIRECTORIES | _PROTECTED_VERIFICATION_DIRECTORIES | {
     ".praxis", ".agent_memory",
 }
-_LINUX_VIEW_MAX_BYTES = 64 * 1024 * 1024
+_LINUX_COPY_CHUNK_BYTES = 1024 * 1024
 _LinuxSnapshot = dict[str, tuple[int, bytes | str, tuple[int, int], int]]
 _FAILURE_PUBLICATION_DESCRIPTION = (
     "Linux only: with workspace_write=true, publish validated workspace changes even after "
@@ -82,15 +89,23 @@ class RunCommandInput(BaseModel):
         max_length=4096,
         description="Workspace-relative working directory.",
     )
-    timeout_seconds: float = Field(
+    timeout_seconds: float | None = Field(
         default=120.0,
         gt=0,
-        le=_MAX_COMMAND_TIMEOUT_SECONDS * _MILLISECONDS_PER_SECOND,
+        allow_inf_nan=False,
         description=(
-            "Per-command timeout in seconds before the whole process group is "
-            "terminated; use 120, not 120000. Values from 1000 through 600000 "
-            "are accepted as an unambiguous millisecond form and normalized to "
-            "seconds. The effective maximum is 600 seconds."
+            "Execution deadline in seconds, never milliseconds. Default 120. "
+            "Deadlines above 600 seconds, or null for no deadline, require yield_time_seconds. "
+            "A response wait expiring does not kill a background command."
+        ),
+    )
+    yield_time_seconds: float | None = Field(
+        default=None, gt=0, le=60,
+        description=(
+            "Live macOS/Linux Sessions: return after this many seconds with status=running and a session_id "
+            "if still executing. Use manage_command to wait, query or cancel the same process. "
+            "This is a response wait, not an execution deadline; timeout_seconds still applies unless null. "
+            "Omit to wait for completion with the existing bounded command timeout."
         ),
     )
     network: bool = Field(
@@ -111,14 +126,13 @@ class RunCommandInput(BaseModel):
     )
     publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
 
-    @field_validator("timeout_seconds")
-    @classmethod
-    def normalize_timeout_milliseconds(cls, value: float) -> float:
-        if value <= _MAX_COMMAND_TIMEOUT_SECONDS:
-            return value
-        if value < _MILLISECONDS_PER_SECOND:
-            raise ValueError("timeout_seconds must be at most 600 seconds; millisecond values must be at least 1000")
-        return value / _MILLISECONDS_PER_SECOND
+    @model_validator(mode="after")
+    def require_yield_for_unbounded_command(self) -> RunCommandInput:
+        if self.timeout_seconds is None and self.yield_time_seconds is None:
+            raise ValueError("timeout_seconds=null requires yield_time_seconds and a live Session")
+        if self.timeout_seconds is not None and self.timeout_seconds > 600 and self.yield_time_seconds is None:
+            raise ValueError("timeout_seconds above 600 requires yield_time_seconds; units are seconds")
+        return self
 
 
 class RunCommandOutput(BaseModel):
@@ -126,7 +140,7 @@ class RunCommandOutput(BaseModel):
 
     stdout: str
     stderr: str
-    exit_code: int
+    exit_code: int | None
     timed_out: bool
     truncated: bool
     duration_ms: float = Field(ge=0)
@@ -134,6 +148,22 @@ class RunCommandOutput(BaseModel):
     network_enabled: bool = False
     sandbox_error: str | None = None
     workspace_published: bool | None = None
+    status: Literal["running", "completed", "cancelled"] = "completed"
+    session_id: str | None = None
+    request_digest: str | None = None
+    log_chunk: str | None = None
+    log_next_offset: int | None = None
+    log_end_offset: int | None = None
+    log_truncated: bool = False
+
+    @model_validator(mode="after")
+    def validate_process_status(self) -> RunCommandOutput:
+        if self.status == "running":
+            if not self.session_id or self.exit_code is not None or self.timed_out or self.sandbox_error:
+                raise ValueError("running commands require a session_id and no terminal exit status")
+        elif self.exit_code is None:
+            raise ValueError("terminal commands require an exit_code")
+        return self
 
 
 class ManagedPythonInput(BaseModel):
@@ -164,10 +194,9 @@ class ManagedPythonInput(BaseModel):
     timeout_seconds: float = Field(
         default=120.0,
         gt=0,
-        le=_MAX_COMMAND_TIMEOUT_SECONDS * _MILLISECONDS_PER_SECOND,
+        le=_MAX_COMMAND_TIMEOUT_SECONDS, allow_inf_nan=False,
         description=(
-            "Execution timeout in seconds. Values from 1000 through 600000 are "
-            "accepted as an unambiguous millisecond form and normalized to seconds."
+            "Execution timeout in seconds, at most 600. Milliseconds are not accepted."
         ),
     )
     network: bool = Field(
@@ -182,11 +211,6 @@ class ManagedPythonInput(BaseModel):
             "read-only."
         ),
     )
-
-    @field_validator("timeout_seconds")
-    @classmethod
-    def normalize_timeout_milliseconds(cls, value: float) -> float:
-        return RunCommandInput.normalize_timeout_milliseconds(value)
 
     publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
 
@@ -249,7 +273,10 @@ def create_run_command_tool(
     *,
     hard_timeout_seconds: float = 605.0,
     termination_grace_seconds: float = 0.5,
+    command_sessions: CommandSessions | None = None,
 ) -> Tool:
+    if command_sessions is not None and command_sessions.workspace is not workspace:
+        raise ValueError("command session owner belongs to a different workspace runtime")
     if (
         isinstance(termination_grace_seconds, bool)
         or not isinstance(termination_grace_seconds, (int, float))
@@ -259,9 +286,20 @@ def create_run_command_tool(
         raise ValueError("termination_grace_seconds must be positive and finite")
 
     async def run(arguments: Mapping[str, JsonValue]) -> RunCommandOutput:
+        request = RunCommandInput.model_validate(arguments)
+        if request.yield_time_seconds is not None:
+            if command_sessions is None:
+                return RunCommandOutput(
+                    stdout="", stderr="command sessions require a live Agent Session",
+                    exit_code=-1, timed_out=False, truncated=False, duration_ms=0,
+                    sandbox_error="command_session_unavailable",
+                )
+            return await command_sessions.start(request)
+        if command_sessions is not None and command_sessions.running:
+            return command_sessions.busy_output()
         return await _run_command(
             workspace,
-            RunCommandInput.model_validate(arguments),
+            request,
             termination_grace_seconds=float(termination_grace_seconds),
         )
 
@@ -269,6 +307,10 @@ def create_run_command_tool(
         arguments: Mapping[str, JsonValue],
         progress_sink: ToolProgressSink,
     ) -> RunCommandOutput:
+        if arguments.get("yield_time_seconds") is not None or (
+            command_sessions is not None and command_sessions.running
+        ):
+            return await run(arguments)
         return await _run_command(
             workspace,
             RunCommandInput.model_validate(arguments),
@@ -280,7 +322,12 @@ def create_run_command_tool(
         definition=ToolDefinition(
             name="run_command",
             description=(
-                "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
+                "On macOS/Linux live Sessions, set yield_time_seconds to return a session_id while a command runs; "
+                "manage_command queries, waits or cancels it. timeout_seconds=null removes the execution "
+                "deadline only in this mode; closing the Session cancels its processes. One running command "
+                "per Session. macOS writes go directly to the workspace and remain after failure, timeout "
+                "or cancellation; publish_on_failure has no effect there. "
+                "On Linux, writes use a private candidate workspace with streaming copies and fingerprints. "
                 "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
                 "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
                 "Cancellation discards them. Internal relative symlinks are supported; external/absolute links "
@@ -320,7 +367,7 @@ def create_run_command_tool(
             }
         ),
         resolve_use=lambda arguments: _resolve_command_use(workspace, arguments),
-        execution_revision="builtin-run-command-v10-linux-publication",
+        execution_revision="builtin-run-command-v12-durable-sessions",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -329,6 +376,8 @@ def create_run_command_tool(
         max_model_output_bytes=150_000,
         stream=stream,
         approval_profile=ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS,
+        continuation=None if command_sessions is None else command_sessions.continuation,
+        after_commit=None if command_sessions is None else command_sessions.after_commit,
     )
 
 
@@ -357,7 +406,7 @@ def create_execute_python_tool(
         definition=ToolDefinition(
             name="execute_python",
             description=(
-                "On Linux, writes use a private candidate workspace (64 MiB ordinary file data limit). "
+                "On Linux, writes use a private candidate workspace with streaming copies and fingerprints. "
                 "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
                 "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
                 "Cancellation discards them. Internal relative symlinks are supported; external/absolute links "
@@ -390,7 +439,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v6-linux-publication",
+        execution_revision="builtin-execute-python-v8-declared-targets",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -407,6 +456,8 @@ async def _run_command(
     *,
     termination_grace_seconds: float,
     progress_sink: ToolProgressSink | None = None,
+    capture_output: Callable[[ToolProgressKind, bytes], None] | None = None,
+    authorize_publish: Callable[[], Awaitable[None]] | None = None,
 ) -> RunCommandOutput:
     cwd = workspace.ensure_within_workspace(
         workspace.resolve_path(request.working_dir or "."),
@@ -464,7 +515,7 @@ async def _run_command(
                     network_filter = resources.enter_context(_linux_network_filter_file())
                 if request.workspace_write:
                     view = Path(temporary_root) / "workspace-view"
-                    initial, protected = _prepare_linux_workspace_view(workspace, view)
+                    initial, protected = await _blocking_phase(_prepare_linux_workspace_view, workspace, view)
             sandbox_argv = _sandbox_argv(
                 workspace_root=workspace.root,
                 temporary_root=temporary_root,
@@ -500,6 +551,7 @@ async def _run_command(
                 kind=ToolProgressKind.STDOUT,
                 progress_sink=progress_sink,
                 progress_budget=progress_budget,
+                capture_output=capture_output,
             )
         )
         stderr_task = asyncio.create_task(
@@ -508,6 +560,7 @@ async def _run_command(
                 kind=ToolProgressKind.STDERR,
                 progress_sink=progress_sink,
                 progress_budget=progress_budget,
+                capture_output=capture_output,
             )
         )
         wait_task = asyncio.create_task(process.wait())
@@ -525,6 +578,10 @@ async def _run_command(
                     grace_seconds=termination_grace_seconds,
                 )
             stdout_bytes, stderr_bytes, _returncode = await communication
+            # A shell can exit while a background child has closed its pipes.
+            # Finishing the command also ends the rest of its process group.
+            if _SANDBOX_PLATFORM == "darwin" and not timed_out:
+                await _terminate_process_group(process, grace_seconds=termination_grace_seconds)
         except asyncio.CancelledError:
             await _terminate_process_group(
                 process,
@@ -550,7 +607,9 @@ async def _run_command(
         if (view is not None and not startup_failed
                 and (request.publish_on_failure or process.returncode == 0 and not timed_out)):
             try:
-                _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+                if authorize_publish is not None:
+                    await authorize_publish()
+                await _blocking_phase(_commit_linux_workspace_view, workspace, view, initial, protected, permissions)
                 workspace_published = True
             except (OSError, ValueError) as error:
                 publish_error = str(error)
@@ -636,7 +695,7 @@ async def _execute_managed_python(
                     network_filter = resources.enter_context(_linux_network_filter_file())
                 if request.workspace_write:
                     view = Path(temporary_root) / "workspace-view"
-                    initial, protected = _prepare_linux_workspace_view(workspace, view)
+                    initial, protected = await _blocking_phase(_prepare_linux_workspace_view, workspace, view)
             sandbox_argv = _sandbox_argv(
                 workspace_root=workspace.root,
                 temporary_root=temporary_root,
@@ -766,22 +825,40 @@ class _CommandProgressBudget:
             return claimed
 
 
+class _CommandStreamBuffer:
+    """Bounded head and rolling tail, including after progress events run out."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+
+    def append(self, chunk: bytes) -> None:
+        limit = _MAX_STREAM_BYTES + 1
+        self.data.extend(chunk)
+        if len(self.data) > limit:
+            head = limit // 2
+            del self.data[head:len(self.data) - (limit - head)]
+
+    def value(self) -> bytes:
+        return bytes(self.data)
+
+
 async def _read_command_stream(
     stream: asyncio.StreamReader,
     *,
     kind: ToolProgressKind,
     progress_sink: ToolProgressSink | None,
     progress_budget: _CommandProgressBudget,
+    capture_output: Callable[[ToolProgressKind, bytes], None] | None = None,
 ) -> bytes:
-    retained = bytearray()
+    retained = _CommandStreamBuffer()
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
         chunk = await stream.read(_DELTA_CHUNK_BYTES)
         if not chunk:
             break
-        retained_limit = _MAX_STREAM_BYTES + 1
-        if len(retained) < retained_limit:
-            retained.extend(chunk[: retained_limit - len(retained)])
+        retained.append(chunk)
+        if capture_output is not None:
+            capture_output(kind, chunk)
         if progress_sink is None:
             continue
         claimed = await progress_budget.claim(chunk)
@@ -794,7 +871,7 @@ async def _read_command_stream(
         final_content = decoder.decode(b"", final=True)
         if final_content:
             await progress_sink(ToolProgress(kind=kind, content=final_content))
-    return bytes(retained)
+    return retained.value()
 
 
 def _command_environment(
@@ -1072,6 +1149,8 @@ def _linux_sandbox_argv(
             if not path.exists() or path.is_relative_to(temporary):
                 continue
             if rule.access == "deny":
+                if path == command_state_directory():
+                    continue  # Explicit final namespace mask below all grants.
                 # A fresh namespace has nothing at unexposed outside paths.
                 exposed = path.is_relative_to(workspace) or any(path.is_relative_to(root) for root in roots)
                 exposed = exposed or any(
@@ -1092,6 +1171,10 @@ def _linux_sandbox_argv(
             argv.extend(("--ro-bind", protected_path, protected_path))
         # The real command scratch must remain visible after overlaying workspace.
         argv.extend(("--bind", temporary, temporary))
+    # The private supervisor journal must stay hidden even under a broad grant.
+    private = command_state_directory()
+    if private.exists():
+        argv.extend(("--tmpfs", str(private), "--remount-ro", str(private)))
     return argv
 
 
@@ -1162,15 +1245,40 @@ def _linux_network_filter_file() -> BinaryIO:
         library.seccomp_release(context)
 
 
+async def _blocking_phase[T](function: Callable[..., T], *arguments: object) -> T:
+    """Keep cancellation schedulable; never remove scratch while a thread uses it."""
+    cancelled = threading.Event()
+
+    def invoke() -> T:
+        token = _COPY_CANCEL.set(cancelled)
+        try:
+            return function(*arguments)
+        finally:
+            _COPY_CANCEL.reset(token)
+
+    task = asyncio.create_task(asyncio.to_thread(invoke))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        cancelled.set()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+def _check_copy_cancelled() -> None:
+    cancelled = _COPY_CANCEL.get()
+    if cancelled is not None and cancelled.is_set():
+        raise OSError("Linux workspace copy cancelled")
+
+
 def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
     snapshot: _LinuxSnapshot = {}
-    remaining = _LINUX_VIEW_MAX_BYTES
 
     def walk(descriptor: int, prefix: Path) -> None:
-        nonlocal remaining
         with os.scandir(descriptor) as entries:
             names = sorted(entry.name for entry in entries)
         for name in names:
+            _check_copy_cancelled()
             relative = (prefix / name).as_posix()
             if relative in protected:
                 continue
@@ -1195,12 +1303,7 @@ def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
                         raise ValueError("workspace file changed during Linux snapshot")
                     if opened.st_nlink != 1:
                         raise ValueError("Linux candidate workspace refuses hardlinked files")
-                    if opened.st_size > remaining:
-                        raise ValueError("Linux candidate workspace exceeds the 64 MiB file data limit")
-                    data = stream.read(remaining + 1)
-                remaining -= len(data)
-                if remaining < 0:
-                    raise ValueError("Linux candidate workspace exceeds the 64 MiB file data limit")
+                    data = _linux_file_digest(stream)
                 snapshot[relative] = (mode, data, identity, opened.st_mtime_ns)
             elif stat.S_ISLNK(mode):
                 snapshot[relative] = (mode, os.readlink(name, dir_fd=descriptor), identity, 0)
@@ -1212,6 +1315,42 @@ def _linux_view_snapshot(root: Path, protected: set[str]) -> _LinuxSnapshot:
     finally:
         os.close(descriptor)
     return snapshot
+
+
+def _linux_file_digest(stream: BinaryIO, output: BinaryIO | None = None) -> bytes:
+    """Hash/copy a regular file with bounded memory and a stable open identity."""
+    before = os.fstat(stream.fileno())
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise ValueError("Linux candidate workspace refuses hardlinked or nonregular files")
+    digest = hashlib.sha256()
+    while chunk := stream.read(_LINUX_COPY_CHUNK_BYTES):
+        _check_copy_cancelled()
+        digest.update(chunk)
+        if output is not None:
+            output.write(chunk)
+    after = os.fstat(stream.fileno())
+    if any(getattr(before, field) != getattr(after, field) for field in (
+        "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns", "st_nlink",
+    )):
+        raise ValueError("workspace file changed during Linux snapshot or copy")
+    return digest.digest()
+
+
+def _copy_linux_file(root: Path, name: str, expected: tuple[int, bytes | str, tuple[int, int], int],
+                     output: BinaryIO) -> None:
+    """Do not follow source ancestors or replace a verified file with another inode."""
+    with ExitStack() as sources:
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        sources.callback(os.close, descriptor)
+        for component in Path(name).parts[:-1]:
+            descriptor = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            sources.callback(os.close, descriptor)
+        child = os.open(Path(name).name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+        with os.fdopen(child, "rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if ((opened.st_dev, opened.st_ino) != expected[2] or opened.st_mode != expected[0]
+                    or opened.st_mtime_ns != expected[3] or _linux_file_digest(stream, output) != expected[1]):
+                raise ValueError("workspace source changed before Linux copy")
 
 
 def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tuple[_LinuxSnapshot, set[str]]:
@@ -1234,8 +1373,8 @@ def _prepare_linux_workspace_view(workspace: WorkspaceRuntime, view: Path) -> tu
             target.symlink_to(str(content))
         else:
             target.parent.mkdir(parents=True, exist_ok=True)
-            assert isinstance(content, bytes)
-            target.write_bytes(content)
+            with target.open("xb") as output:
+                _copy_linux_file(workspace.root, relative, initial[relative], output)
             target.chmod(stat.S_IMODE(mode))
             os.utime(target, ns=(mtime_ns, mtime_ns))
     for relative in protected:
@@ -1365,7 +1504,7 @@ def _commit_linux_workspace_view(
                         or opened.st_mtime_ns != before[3]):
                     raise ValueError(f"workspace target identity changed before commit: {name}")
                 assert isinstance(before[1], bytes)
-                if stream.read(len(before[1]) + 1) != before[1]:
+                if _linux_file_digest(stream) != before[1]:
                     raise ValueError(f"workspace target content changed before commit: {name}")
         elif stat.S_ISLNK(metadata.st_mode):
             if os.readlink(target.name, dir_fd=parent_fd) != before[1]:
@@ -1434,7 +1573,7 @@ def _commit_linux_workspace_view(
                             descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                                                  mode=0o600, dir_fd=parent_fd)
                             with os.fdopen(descriptor, "wb") as output:
-                                output.write(content)
+                                _copy_linux_file(view, name, after, output)
                                 output.flush()
                                 os.fchmod(output.fileno(), stat.S_IMODE(mode) & 0o777)
                                 os.utime(output.fileno(), ns=(mtime_ns, mtime_ns))
@@ -1575,6 +1714,7 @@ def _build_command_sandbox_profile(
         '  (regex #"/[.]([gG][iI][tT]|[aA][gG][eE][nN][tT][sS]|'
         '[cC][oO][dD][eE][xX]|[aA][wW][sS])($|/)")))\n'
         f"{network_policy}\n"
+        f'(deny file-read* file-write* (subpath "{_escape_seatbelt_string(str(command_state_directory()))}"))\n'
     )
 
 
@@ -1951,7 +2091,9 @@ def _resolve_managed_python_use(
         for raw_path in output_paths:
             if not isinstance(raw_path, str):
                 raise ValueError("output path must be a string")
-            target = workspace.ensure_writable(workspace.resolve_path(raw_path))
+            # Resolution declares intent. The executor owns permission checks
+            # and their structured, tool-independent denial feedback.
+            target = workspace.resolve_path(raw_path)
             output_targets.append(ToolTarget(kind="workspace_path", value=str(target)))
     else:
         output_targets.append(ToolTarget(kind="workspace_path", value=str(workspace.root)))
@@ -1973,6 +2115,13 @@ def _normalize_command_output(raw: object) -> NormalizedToolOutput:
         _COMMAND_OUTPUT_SCHEMA,
         validated.model_dump(mode="json"),
     )
+    if validated.status == "running":
+        return NormalizedToolOutput(structured_content=structured)
+    if validated.status == "cancelled":
+        return NormalizedToolOutput(
+            structured_content=structured, is_error=True, error_code="command_cancelled",
+            error_message=validated.stderr or "command cancelled and its process group was terminated",
+        )
     if validated.timed_out:
         return NormalizedToolOutput(
             structured_content=structured,

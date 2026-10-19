@@ -669,3 +669,35 @@ async def test_whitespace_only_model_steps_do_not_print_or_count_as_answer(capsy
     await display.emit(text_delta("\n\n"))
     assert capsys.readouterr().out == "    print(1)\n\n"
     assert display.answer_streamed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["run_command", "manage_command"])
+async def test_running_command_is_shown_as_running_with_handle(capsys, name):
+    display = TerminalToolEventDisplay(width=100)
+    await display.emit(item_completed(
+        turn_id="t", item_id="session-call", item_kind=TurnItemKind.TOOL, status=ItemStatus.SUCCESS,
+        data={"result": {"tool_name": name, "structured_content": {
+            "status": "running", "session_id": "cmd_live", "exit_code": None,
+        }}},
+    ))
+    output = capsys.readouterr().out
+    assert "→ " + name in output
+    assert "运行中" in output and "cmd_live" in output
+    assert "✓ " + name not in output
+
+
+@pytest.mark.anyio
+async def test_effective_request_settings_are_visible_and_changes_are_not_spammed(capsys):
+    from agent_runtime.streaming.events import EventType, StreamEvent
+    display = TerminalToolEventDisplay(width=120)
+    event = StreamEvent(type=EventType.BUDGET_UPDATE, turn_id='turn', data={
+        'purpose': 'agent_step', 'effective_settings': {'revision': 1, 'reasoning_effort': 'high',
+            'max_output_tokens': 65536, 'requested_output_tokens': 98304,
+            'output_constraints': ['model_max_output_tokens']},
+    })
+    await display.emit(event)
+    first = capsys.readouterr().out
+    assert 'high' in first and '65,536' in first and '98,304' in first
+    await display.emit(event)
+    assert '65,536' not in capsys.readouterr().out

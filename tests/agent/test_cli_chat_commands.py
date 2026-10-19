@@ -233,14 +233,14 @@ async def test_chat_slash_commands_do_not_reach_the_agent(
     assert turn_calls == []
 
 
-def test_ordinary_chat_hides_unevaluated_status_but_keeps_real_verification(capsys):
+def test_ordinary_chat_shows_validation_status_and_scope(capsys):
     from dataclasses import replace
 
     result = _result(answer="你好")
     cli._display_agent_result(result, verbose=False)
     output = capsys.readouterr().out
     assert "你好" in output
-    assert "not_evaluated" not in output and "任务验收" not in output
+    assert "not_evaluated" in output and "任务验收尚未评估" in output
     cli._display_agent_result(result, verbose=True)
     assert "not_evaluated" in capsys.readouterr().out
     cli._display_agent_result(replace(result, validation_status="passed", validation_scope="workspace_change"),
@@ -265,8 +265,8 @@ async def test_status_retains_unevaluated_result_after_quiet_chat(tmp_path, monk
     await cli._chat_facade_loop(Facade(), max_tokens_total=None)
     output = capsys.readouterr().out
     assert "ordinary answer" in output
-    assert output.count("验证状态: not_evaluated") == 1
-    assert "任务验收尚未评估" not in output
+    assert output.count("验证状态: not_evaluated") == 2
+    assert "任务验收尚未评估" in output
 
 
 @pytest.mark.anyio

@@ -20,6 +20,23 @@ from agent_runtime.modeling.contracts import (
 )
 
 
+@pytest.mark.parametrize("response_shape", ["mapping", "sdk_object"])
+def test_openai_compatible_usage_keeps_reported_prompt_cache_hits(response_shape) -> None:
+    from types import SimpleNamespace
+
+    from agent_runtime.modeling.openai_wire import parse_openai_usage
+
+    raw = {"prompt_tokens": 1000, "completion_tokens": 200,
+           "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
+    response = {"usage": raw} if response_shape == "mapping" else SimpleNamespace(usage=SimpleNamespace(**raw))
+    usage = parse_openai_usage(response)
+    assert usage is not None
+    assert usage.input_tokens == 1000
+    assert usage.cache_read_input_tokens == 900
+    assert usage.uncached_input_tokens == 100
+    assert usage.total_tokens == 1200
+
+
 def test_legacy_usage_construction_remains_backward_compatible() -> None:
     usage = LLMUsage(
         input_tokens=12,
