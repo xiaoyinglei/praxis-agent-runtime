@@ -251,7 +251,9 @@ class TurnExecutor:
 
             messages = (HarnessMessage(role="context", content=memory_navigation(snapshot)), *messages)
         execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
-        if execution_policy.get("revision") == "working-context-v1":
+        append_state = execution_policy.get("cache_continuity") == "append-v1"
+        clock = capture_runtime_clock()
+        if execution_policy.get("revision") == "working-context-v1" and not append_state:
             from agent_runtime.harness.context import RolloutContextManager
 
             if isinstance(self._context_manager, RolloutContextManager):
@@ -265,13 +267,14 @@ class TurnExecutor:
                         + "\nKeep this plan current as phases finish or constraints change. "
                         "A completed plan is not proof of task correctness."
                     )))
-        if pressure:
+        if pressure and not append_state:
             messages = (
                 *messages,
                 HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
             )
         completion = turn_context.binding_manifest.get("completion_policy", {})
-        if completion.get("revision") == "completion-v2" and completion.get("acceptance_command"):
+        if (not append_state and completion.get("revision") == "completion-v2"
+                and completion.get("acceptance_command")):
             messages = (*messages, HarnessMessage(
                 role="context", content=(
                     "User-configured acceptance contract (immutable for this Turn):\n"
@@ -283,10 +286,10 @@ class TurnExecutor:
                 ),
             ))
         step_policy = turn_context.binding_manifest.get("step_budget_policy") == {"revision": "pressure-v1"}
-        if context_capacity_policy(turn_context.binding_manifest) is not None or step_policy:
+        if not append_state and (context_capacity_policy(turn_context.binding_manifest) is not None or step_policy):
             messages = (*messages, HarnessMessage(role="context", content="Runtime budget status:\n" +
                          json.dumps(self._budget_status(turn_context), sort_keys=True)))
-        if step_policy:
+        if step_policy and not append_state:
             remaining_steps = min(self._max_steps, turn_context.binding_manifest["model_step_budget"]) - step + 1
             if remaining_steps <= 2:
                 messages = (*messages, HarnessMessage(role="context", content=(
@@ -294,6 +297,11 @@ class TurnExecutor:
                     "Converge using existing evidence. Return a final answer when justified; state any unfinished "
                     "work and blockers honestly. Do not claim unperformed verification or extend the budget."
                 )))
+        update = None
+        if append_state:
+            messages, update = self._append_runtime_state(
+                turn_context, messages, step=step, pressure=pressure, clock=clock,
+            )
         tools = (
             ()
             if self._tool_router is None
@@ -335,7 +343,10 @@ class TurnExecutor:
             binding["project_instructions"] = project_instructions
         # Freeze clock facts in the saved step, just like its messages and tools.
         # Repreparing/recovering this request must not read a different clock.
-        binding["runtime_clock"] = capture_runtime_clock()
+        binding["runtime_clock"] = clock
+        binding.pop("runtime_context_update", None)
+        if update is not None:
+            binding["runtime_context_update"] = update
         return StepContext(
             turn=turn_context,
             step=step,
@@ -349,6 +360,50 @@ class TurnExecutor:
             output_token_limit=turn_context.binding_manifest.get("memory_output_tokens"),
             input_revision=input_revision,
         )
+
+    def _append_runtime_state(
+        self, turn: TurnContext, messages: tuple[HarnessMessage, ...], *,
+        step: int, pressure: bool, clock: Mapping[str, Any],
+    ) -> tuple[tuple[HarnessMessage, ...], str | None]:
+        """Append changed facts; old updates are projected from durable request Items.
+
+        Compaction removes old updates with the rest of covered history. Rebuild
+        the baseline from visible messages so the first post-compaction update
+        contains every current fact. No speculative preparation mutates storage.
+        """
+        from agent_runtime.harness.context import RolloutContextManager
+        from agent_runtime.planning import model_visible_plan
+
+        marker = "Runtime state update (changed fields; latest value wins):\n"
+        previous: dict[str, Any] = {}
+        for message in messages:
+            if message.role == "context" and message.content.startswith(marker):
+                previous.update(json.loads(message.content[len(marker):].split("\n", 1)[0]))
+        plan = (self._context_manager.current_plan(turn.turn_id)
+                if isinstance(self._context_manager, RolloutContextManager) else None)
+        state: dict[str, Any] = {
+            "Current runtime clock facts": dict(clock),
+            "Runtime budget status": self._budget_status(turn),
+            "Current advisory plan": None if plan is None else model_visible_plan(plan.payload["plan"]),
+            "budget_pressure": pressure,
+            "requests_remaining_including_this": max(0, min(
+                self._max_steps, turn.binding_manifest.get("model_step_budget", self._max_steps),
+            ) - step + 1),
+        }
+        completion = turn.binding_manifest.get("completion_policy", {})
+        state["acceptance_contract"] = dict(completion) if completion.get("acceptance_command") else None
+        changed = {key: value for key, value in state.items() if key not in previous or previous[key] != value}
+        if not changed:
+            return messages, None
+        update = marker + json.dumps(changed, ensure_ascii=False, sort_keys=True)
+        if not previous:
+            update += ("\nUse the latest clock for relative dates; clarify ambiguous dates. "
+                       "Keep the advisory plan current; it is not execution proof. "
+                       "Under budget pressure or <=2 requests, converge and report unfinished work.")
+            if completion.get("acceptance_command"):
+                update += (" Run acceptance_contract.acceptance_command exactly via run_command in the workspace "
+                           "root after the latest change, subject to normal permissions and approval.")
+        return (*messages, HarnessMessage(role="context", content=update)), update
 
     def _budget_status(self, turn: TurnContext) -> dict[str, Any]:
         state = self._store.read_budget_state(turn.turn_id)
@@ -370,6 +425,13 @@ class TurnExecutor:
 
     async def _prepare_step(self, step: StepContext) -> PreparedModelCall:
         policy = context_capacity_policy(step.binding_manifest)
+        def fallback_summary(fork: StepContext) -> StepContext:
+            binding = dict(fork.binding_manifest)
+            fallback = binding.pop("summary_fork_fallback")
+            binding.pop("summary_cache_fork")
+            return replace(fork, binding_manifest=binding,
+                           messages=(HarnessMessage(role="user", content=fallback),), tools=())
+
         if policy is not None and step.purpose == "context_summary":
             # A large token window does not authorize an unbounded history
             # envelope. The planner splits complete work units before provider
@@ -377,15 +439,27 @@ class TurnExecutor:
             sizes = [len(message.content.encode("utf-8")) for message in step.messages]
             if (max(sizes, default=0) > policy.max_item_bytes
                     or sum(sizes) > policy.max_total_bytes):
+                if step.binding_manifest.get("summary_cache_fork"):
+                    return await self._prepare_step(fallback_summary(step))
                 raise ContextBudgetExceededError(
                     "byte_guard: Summary fragment exceeds its frozen materialization limit.",
                     reason_code="byte_guard",
                 )
         if self._prepare_binding is not None:
             await self._prepare_binding(step.binding_manifest)
-        prepared = self._model.prepare(step.model_request())
+        try:
+            prepared = self._model.prepare(step.model_request())
+        except ContextBudgetExceededError:
+            if not step.binding_manifest.get("summary_cache_fork"):
+                raise
+            # A fork is an optimization, never a reason to weaken admission.
+            # Keep the bounded legacy source in the frozen snapshot for fallback.
+            step = fallback_summary(step)
+            prepared = self._model.prepare(step.model_request())
         if (policy is not None and step.purpose == "context_summary"
                 and prepared.request_ref.get("serialized_input_bytes", 0) > policy.max_total_bytes):
+            if step.binding_manifest.get("summary_cache_fork"):
+                return await self._prepare_step(fallback_summary(step))
             raise ContextBudgetExceededError(
                 "byte_guard: Serialized summary request exceeds its frozen materialization limit.",
                 reason_code="byte_guard",
@@ -452,6 +526,8 @@ class TurnExecutor:
             prepared,
             request_ref={
                 **prepared.request_ref,
+                **({"runtime_context_update": step.binding_manifest["runtime_context_update"]}
+                   if step.purpose == "agent_step" and step.binding_manifest.get("runtime_context_update") else {}),
                 "purpose": step.purpose,
                 "input_revision": step.input_revision,
                 **({"request_id": step.request_id} if step.request_id else {}),
@@ -863,12 +939,49 @@ class TurnExecutor:
         if plan is not None and plan.get("policy_revision") == "context-capacity-v2":
             identity += f":context-capacity-v2:{plan['summary_input_limit']}"
         digest = hashlib.sha256(identity.encode()).hexdigest()
+        binding = turn.binding_manifest
+        messages: tuple[HarnessMessage, ...] = (HarnessMessage(role="user", content=prompt),)
+        tools: tuple[Tool, ...] = ()
+        summary_role = None
+        # Only a complete source can fork the parent. Tree fragments and merges
+        # retain the existing bounded, tool-free summarization protocol.
+        if (turn.binding_manifest.get("execution_context_policy", {}).get("cache_continuity") == "append-v1"
+                and plan is not None and plan.get("source_hash") == hashlib.sha256(source.encode()).hexdigest()):
+            parent = next((op for op in reversed(self._store.list_model_operations(turn.turn_id))
+                           if op.request_ref.get("purpose") == "agent_step"
+                           and op.status == "completed"), None)
+            if parent is not None:
+                original = self.restore_step_context(turn, parent)
+                input_update = parent.request_ref.get("runtime_input_update")
+                if isinstance(input_update, str):
+                    original = replace(original, messages=(*original.messages,
+                                       HarnessMessage(role="context", content=input_update)))
+                data = json.loads(source)
+                # Reuse every parent message byte for byte. Add only evidence
+                # not already present (including archival bodies after elision).
+                known = {json.dumps(asdict(m), sort_keys=True) for m in original.messages}
+                extra = [entry for entry in data.get("history", ()) if json.dumps(
+                    asdict(restore_harness_message(entry)), sort_keys=True,
+                ) not in known]
+                data = {**data, "history": extra}
+                instruction = prompt[:prompt.index("\nHISTORY:\n")] + (
+                    "\nSummarize the parent conversation above and this additional canonical evidence. "
+                    "Return only a checkpoint; do not continue the task or call tools.\nHISTORY:\n"
+                    + json.dumps(data, ensure_ascii=False, sort_keys=True)
+                )
+                binding = {**original.binding_manifest, "summary_cache_fork": True,
+                           "summary_fork_fallback": prompt}
+                messages = (*original.messages, HarnessMessage(role="user", content=instruction))
+                tools = original.tools
+                summary_role = original.continuation_summary_role
+                digest = hashlib.sha256((identity + parent.request_hash).encode()).hexdigest()
         return StepContext(
             turn=turn,
             step=step,
-            binding_manifest=turn.binding_manifest,
-            messages=(HarnessMessage(role="user", content=prompt),),
-            tools=(),
+            binding_manifest=binding,
+            messages=messages,
+            tools=tools,
+            continuation_summary_role=summary_role,
             model_token_budget_remaining=self._store.read_budget_state(turn.turn_id).remaining("tokens"),
             purpose="context_summary",
             request_id=f"{turn.turn_id}:context-summary:{digest}",

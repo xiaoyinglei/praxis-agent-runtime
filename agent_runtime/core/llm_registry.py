@@ -355,6 +355,7 @@ class ModelRegistry:
                 "context_window_tokens": entry.get("context_window_tokens"),
                 "max_output_tokens": entry.get("max_output_tokens"),
                 "reasoning": entry.get("reasoning"),
+                "supported_cache_parameters": entry.get("supported_cache_parameters", ()),
                 "timeout_seconds": entry.get(
                     "timeout_seconds",
                     120.0,
@@ -810,6 +811,7 @@ def _validate_raw_catalog(data: object) -> None:
                 "experimental",
                 "continuation_summary_role",
                 "reasoning",
+                "supported_cache_parameters",
             },
             where=f"chat model {model_id!r}",
         )

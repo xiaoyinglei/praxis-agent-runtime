@@ -151,6 +151,7 @@ class SessionBindingProvider:
         binding["step_budget_policy"] = {"revision": "pressure-v1"}
         binding["execution_context_policy"] = {
             "revision": "working-context-v1", "finalization": "budget-admission-v1",
+            "cache_continuity": "append-v1",
         }
         binding["model_step_budget"] = self._model_step_budget
         binding["model_token_budget_total"] = self._model_token_budget_total

@@ -229,6 +229,7 @@ class ModelSpec(BaseModel):
         default=True,
         strict=True,
     )
+    supported_cache_parameters: tuple[Literal["prompt_cache_key", "prompt_cache_retention"], ...] = ()
 
     location: Literal["local", "cloud"] | None = None
 

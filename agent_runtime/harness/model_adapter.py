@@ -50,7 +50,7 @@ from agent_runtime.modeling.gateway import (
     model_request_input_text,
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
-from agent_runtime.modeling.openai_wire import serialize_openai_request
+from agent_runtime.modeling.openai_wire import serialize_openai_request, stable_prompt_cache_key
 from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.tools.tool import JsonValue
@@ -87,7 +87,16 @@ class GatewayHarnessModel:
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         if request.purpose not in {"agent_step", "context_summary", "memory_extract", "memory_consolidate"}:
             raise ValueError("unsupported model request purpose")
-        if request.purpose != "agent_step" and request.tools:
+        summary_fork = (request.purpose == "context_summary"
+                        and request.binding_manifest.get("summary_cache_fork") is True)
+        # Keep the parent's tool choice as well as its schemas: providers can
+        # render a different prefix for "none". Summary responses are data only;
+        # TurnExecutor rejects any returned tool calls before orchestration.
+        append_state = (request.binding_manifest.get("execution_context_policy", {})
+                        .get("cache_continuity") == "append-v1")
+        if summary_fork and not self._resolved.capabilities.supports_native_tools:
+            raise ContextBudgetExceededError("Summary prefix forks require a native tool protocol.")
+        if request.purpose != "agent_step" and request.tools and not summary_fork:
             raise ValueError("internal summary requests must not expose tools")
         for name in ("input_token_limit", "output_token_limit"):
             limit = getattr(request, name)
@@ -115,7 +124,7 @@ class GatewayHarnessModel:
             request.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v1"
         )
         clock = request.binding_manifest.get("runtime_clock")
-        if request.purpose == "agent_step" and isinstance(clock, Mapping):
+        if request.purpose == "agent_step" and isinstance(clock, Mapping) and not append_state:
             clock_blocks = (ContextBlock(
                 name="runtime_clock",
                 content="Current runtime clock facts:\n" + json.dumps(dict(clock), sort_keys=True) +
@@ -131,7 +140,7 @@ class GatewayHarnessModel:
                     "unresolved questions and next steps. "
                     "Do not perform the task or call tools. Never invent missing facts.",
                 )
-                if request.purpose != "agent_step"
+                if request.purpose != "agent_step" and not summary_fork
                 else self._instructions
             ),
             frozen_run_context=(
@@ -153,7 +162,7 @@ class GatewayHarnessModel:
         )
         settings = _model_settings(self._resolved)
         effective_settings = None
-        if request.purpose == "agent_step" and (
+        if (request.purpose == "agent_step" or summary_fork) and (
             getattr(self._resolved.gateway, "agent_output_policy", None) == "model-aware-v1"
         ):
             settings, effective_settings = _request_settings(request, self._resolved, settings)
@@ -166,7 +175,7 @@ class GatewayHarnessModel:
             settings = replace(settings, parallel_tool_calls=policy["max_parallel_calls"] > 1)
         stage = (LLMCallStage.LLM_SUMMARIZE if request.purpose.startswith("memory_") else
                  LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP)
-        if request.purpose != "agent_step":
+        if request.purpose != "agent_step" and not summary_fork:
             options = dict(settings.provider_options)
             reasoning = self._resolved.capabilities.reasoning
             legacy = getattr(self._resolved.gateway, "agent_output_policy", None) is None
@@ -215,6 +224,8 @@ class GatewayHarnessModel:
             input_token_limit=request.input_token_limit,
             capacity_policy=context_capacity_policy(request.binding_manifest)
             or getattr(self._resolved.gateway, "context_policy", None),
+            append_state=append_state,
+            supported_cache_parameters=self._resolved.capabilities.supported_cache_parameters if append_state else (),
         )
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
@@ -246,6 +257,9 @@ class GatewayHarnessModel:
                 "model_id": self._model_id,
                 **({"effective_settings": effective_settings} if effective_settings is not None else {}),
                 "purpose": request.purpose,
+                **({"runtime_input_update": context.transcript[-1].content}
+                   if append_state and context.transcript
+                   and context.transcript[-1].content.startswith("Runtime input limits:\n") else {}),
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
                 "toolset_revision": canonical_request.toolset_revision,
@@ -729,14 +743,23 @@ def _budgeted_request(
     stage: LLMCallStage = LLMCallStage.AGENT_STEP,
     input_token_limit: int | None = None,
     capacity_policy: ContextCapacityPolicy | None = None,
+    append_state: bool = False,
+    supported_cache_parameters: tuple[str, ...] = (),
 ) -> tuple[StableModelContext, ModelRequest, Mapping[str, Any] | None]:
     def build(candidate: StableModelContext) -> ModelRequest:
-        return build_model_request(
+        canonical = build_model_request(
             request_id=request_id,
             context=candidate,
             selected_tools=selected_tools,  # type: ignore[arg-type]
             settings=settings,
         )
+        if "prompt_cache_key" in supported_cache_parameters:
+            canonical = build_model_request(
+                request_id=request_id, context=candidate,
+                selected_tools=selected_tools,  # type: ignore[arg-type]
+                settings=replace(settings, cache_parameters={"prompt_cache_key": stable_prompt_cache_key(canonical)}),
+            )
+        return canonical
 
     gateway = resolved.gateway
     accounting = resolved.token_accounting
@@ -785,14 +808,20 @@ def _budgeted_request(
         if stage == LLMCallStage.AGENT_STEP and input_token_limit is None:
             max_input_tokens = auto_limit
         if stage == LLMCallStage.AGENT_STEP:
+            input_status = "Runtime input limits:\n" + json.dumps({key: policy_fields[key] for key in (
+                "model_context_tokens", "explicit_input_cap", "effective_input_limit",
+                "auto_compact_limit", "post_compact_target",
+            )}, sort_keys=True)
+            previous_status = next((m.content for m in reversed(context.transcript)
+                                    if m.content.startswith("Runtime input limits:\n")), None)
+            append_input_status = not append_state or input_status != previous_status
+        else:
+            append_input_status = False
+        if append_input_status:
             context = build_stable_context(
                 instructions=context.instructions, frozen_run_context=context.frozen_run_context,
                 initial_user_task=context.initial_user_task,
-                transcript=(*context.transcript, ModelMessage(role="context", content="Runtime input limits:\n" +
-                    json.dumps({key: policy_fields[key] for key in (
-                        "model_context_tokens", "explicit_input_cap", "effective_input_limit",
-                        "auto_compact_limit", "post_compact_target",
-                    )}, sort_keys=True))),
+                transcript=(*context.transcript, ModelMessage(role="context", content=input_status)),
             )
     if input_token_limit is not None:
         max_input_tokens = min(max_input_tokens, input_token_limit)

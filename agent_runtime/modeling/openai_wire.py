@@ -65,7 +65,11 @@ def serialize_openai_request(
 
     if not isinstance(request, ModelRequest):
         raise TypeError("request must be a ModelRequest")
-    supported = _supported_parameter_names(supported_cache_parameters)
+    # Canonical parameters have already passed the frozen model capability
+    # boundary. Preparation, accounting and dispatch serialize the same bytes.
+    supported = _supported_parameter_names(supported_cache_parameters) | set(request.settings.cache_parameters)
+    if cache_parameters is None:
+        cache_parameters = request.settings.cache_parameters
     payload: dict[str, JsonValue] = {
     "model": request.settings.model,
     "messages": _message_payloads(request.messages),
@@ -102,7 +106,9 @@ def serialize_openai_request(
         payload[key] = value
 
     if "prompt_cache_key" in supported:
-        effective_cache_key = cache_key or request.prompt_revision
+        effective_cache_key = cache_key or request.settings.cache_parameters.get("prompt_cache_key")
+        if effective_cache_key is None:
+            effective_cache_key = stable_prompt_cache_key(request)
         if not isinstance(effective_cache_key, str) or not effective_cache_key:
             raise ValueError("cache_key must be a non-empty string")
         payload["prompt_cache_key"] = effective_cache_key
@@ -132,6 +138,16 @@ def serialize_openai_request(
         serialized_json=serialized,
         provider_wire_hash=wire_hash,
     )
+
+
+def stable_prompt_cache_key(request: ModelRequest) -> str:
+    """Route by static system/tools/model, independently of history and effort."""
+    return "praxis:" + canonical_hash({
+        "model": request.settings.model,
+        "system": request.messages[0].content if request.messages and request.messages[0].role == "system" else "",
+        "tools": tuple({"name": tool.name, "description": tool.description,
+                        "parameters": tool.input_schema} for tool in request.tools),
+    })[:48]
 
 
 def parse_openai_response(response: object) -> ToolUseResult:

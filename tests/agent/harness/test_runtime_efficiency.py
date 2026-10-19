@@ -353,8 +353,9 @@ async def test_visible_plan_round_trips_through_tool_schema_without_title_alias(
     agent._model_factory = lambda: model
     result = await agent.run("Inspect source", max_steps=8)
     assert result.status == "done"
-    visible = next(m.content for m in model.requests[1].messages if m.content.startswith("Current advisory plan"))
-    payload = json.loads(visible.split("\n")[1])
+    visible = next(m.content for m in reversed(model.requests[1].messages)
+                   if '"Current advisory plan": {' in m.content)
+    payload = json.loads(visible.split("\n")[1])["Current advisory plan"]
     UpdatePlanInput.model_validate({"plan": payload["plan"]})
     assert payload["plan"][0]["step"] == "Inspect source"
     assert "title" not in visible

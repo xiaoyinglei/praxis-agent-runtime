@@ -596,6 +596,10 @@ def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessM
             projected.append((item.item_id, replacement))
         if item.item_id not in suppressed and (message := _item_message(item)) is not None:
             projected.append((item.item_id, message))
+        if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
+            input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
+            if isinstance(input_update, str):
+                projected.append((item.item_id, HarnessMessage(role="context", content=input_update)))
     # Preserve receive order in the ledger; keep provider tool groups complete.
     ordered = []
     deferred = []
@@ -648,6 +652,10 @@ def _validate_tool_groups(messages: tuple[HarnessMessage, ...]) -> None:
 
 
 def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
+    if item.kind == "model_request" and item.producer == "runtime":
+        update = item.payload.get("request_ref", {}).get("runtime_context_update")
+        if isinstance(update, str):
+            return HarnessMessage(role="context", content=update)
     text = item.payload.get("text")
     if item.kind == "user_message" and isinstance(text, str):
         return HarnessMessage(role="user", content=text)

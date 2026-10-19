@@ -148,6 +148,7 @@ class ModelCapabilities:
     supports_native_tools: bool
     supports_structured_output: bool
     reasoning: ReasoningCapabilities | None = None
+    supported_cache_parameters: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0:
@@ -223,11 +224,14 @@ class ModelExecutionDefinition(BaseModel):
     continuation_summary_role: Literal["context", "assistant"] | None = None
     reasoning: ReasoningCapabilities | None = None
     agent_output_policy: Literal["model-aware-v1"] | None = None
+    supported_cache_parameters: tuple[Literal["prompt_cache_key", "prompt_cache_retention"], ...] = ()
 
     @model_serializer(mode="wrap")
     def serialize_definition(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         payload = handler(self)
         # Legacy archives and authenticated bindings must retain exact bytes.
+        if not self.supported_cache_parameters:
+            payload.pop("supported_cache_parameters", None)
         if self.context_capacity_policy is None:
             payload.pop("context_capacity_policy", None)
         if self.auto_compact_token_limit is None:
@@ -281,6 +285,7 @@ class ModelExecutionDefinition(BaseModel):
             context_window_tokens=(self.context_window_tokens),
             max_output_tokens=(self.max_output_tokens),
             reasoning=self.reasoning,
+            supported_cache_parameters=self.supported_cache_parameters,
             supports_native_tools=(self.supports_tools),
             supports_structured_output=(self.supports_structured_output),
         )
