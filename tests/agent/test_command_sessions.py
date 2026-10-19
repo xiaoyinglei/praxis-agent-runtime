@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
+import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -57,7 +60,9 @@ def command_backend(request, tmp_path):
 
 
 def python_command(code):
-    return "/Library/Developer/CommandLineTools/usr/bin/python3 -c " + shlex.quote(code)
+    # Real sandboxes expose the system interpreter; host virtualenvs may be private.
+    executable = shutil.which("python3", path=os.defpath) or sys.executable
+    return shlex.quote(executable) + " -c " + shlex.quote(code)
 
 
 async def start(sessions, command, **options):

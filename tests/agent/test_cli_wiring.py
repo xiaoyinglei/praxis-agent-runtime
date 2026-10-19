@@ -777,7 +777,9 @@ def test_help_separates_workspace_change_from_explicit_acceptance() -> None:
     result = CliRunner().invoke(
         agent_app,
         ["run", "--help"],
-        env={"COLUMNS": "240"},
+        env={"COLUMNS": "240", "FORCE_COLOR": None, "TERM": "dumb", "NO_COLOR": "1"},
+        terminal_width=240,
+        color=False,
     )
 
     assert result.exit_code == 0
