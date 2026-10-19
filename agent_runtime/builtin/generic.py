@@ -55,6 +55,8 @@ def coding_instructions(workspace: Path) -> tuple[str, ...]:
         GENERIC_SYSTEM_PROMPT,
         f"Current workspace root and default tool working directory: {root}. "
         "Relative file paths resolve against this root; absolute paths require resource-policy authorization. "
+        "Explicit local attachments are read-only references to original files, not required workspace copies. "
+        "The CLI accepts /attach <local file paths> or dragged path-only input lines; the SDK accepts files=[...]. "
         "Omit working_dir or use '.' for the default directory. Tool working_dir stays inside this workspace. "
         "Declared output_paths require write permission. Runtime permission decisions are authoritative.",
     )

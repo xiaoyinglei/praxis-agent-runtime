@@ -379,6 +379,9 @@ class TerminalToolEventDisplay:
         self._detail_lines: deque[str] = deque(maxlen=2000)
         self._details_omitted = 0
         self._context_status: dict[str, str] = {}
+        self._request_settings: Mapping[str, object] = {}
+        self._context_projection: Mapping[str, object] = {}
+        self._usage: AgentUsage | None = None
         self._live: Live | None = None
 
     def activity_text(self) -> str:
@@ -441,9 +444,89 @@ class TerminalToolEventDisplay:
     def show_context_status(self) -> None:
         for line in self._context_status.values():
             print(line)
+        if self._usage is not None:
+            print(format_usage_summary(self._usage))
 
     def clear_context_status(self) -> None:
         self._context_status.clear()
+        self._request_settings = {}
+        self._context_projection = {}
+        self._usage = None
+
+    def update_usage(self, usage: AgentUsage) -> None:
+        # AgentResult already aggregates durable model attempts, including summaries.
+        # Replace the snapshot: pauses, resumes and replay must never add it twice.
+        self._usage = usage
+
+    def update_request_settings(self, snapshot: Mapping[str, object]) -> None:
+        defaults = snapshot.get("model_defaults", {})
+        preferences = snapshot.get("preferences", {})
+        if isinstance(defaults, Mapping) and isinstance(preferences, Mapping):
+            self._context_status.pop("request_settings", None)
+            self._request_settings = {
+                "reasoning_effort": preferences.get("reasoning_effort") or defaults.get("reasoning_effort"),
+                "requested_output_tokens": preferences.get("max_output_tokens") or defaults.get("max_output_tokens"),
+            }
+
+    def status_lines(self, model: str, *, width: int | None = None) -> tuple[str, str]:
+        def compact_count(value: int | None) -> str:
+            if value is None:
+                return "未知"
+            for divisor, suffix in ((1_000_000_000, "G"), (1_000_000, "M"), (1_000, "k")):
+                if value >= divisor:
+                    return f"{value / divisor:.3g}{suffix}"
+            return str(value)
+
+        settings = self._request_settings
+        effort = safe_terminal_text(str(settings.get("reasoning_effort") or "未声明"))
+        model = safe_terminal_text(model).replace("\n", " ")
+        first = f"{model} · 思考 {effort}"
+        output = settings.get("max_output_tokens", settings.get("requested_output_tokens"))
+        if isinstance(output, int):
+            label = "输出上限" if "max_output_tokens" in settings else "申请输出"
+            first += f" · {label} {output:,}"
+        count = self._context_projection.get("input_tokens")
+        limit = self._context_projection.get("max_input_tokens")
+        context_source = self._context_projection.get("count_source")
+        if context_source == "utf8_bytes_conservative":
+            source_label, marker = "字节估算", "≈"
+        elif isinstance(context_source, str) and context_source.startswith(
+            ("tiktoken:", "tokenizers:", "transformers:")
+        ):
+            source_label, marker = "本地分词", "="
+        elif context_source == "external_counter":
+            source_label, marker = "外部计数", "="
+        else:
+            source_label, marker = "估算" if context_source == "tokenizer_estimate" else "来源未知", "≈"
+        if isinstance(count, int) and isinstance(limit, int):
+            first += f" · 上下文输入{marker}{count:,}/{limit:,}（{source_label}）"
+        if width is not None and wcswidth(first) > width:
+            suffix = f" {effort}"
+            if isinstance(output, int):
+                suffix += f" {'出限' if 'max_output_tokens' in settings else '申请出'}≈{compact_count(output)}"
+            if isinstance(count, int) and isinstance(limit, int):
+                short_source = "估" if marker == "≈" else "分词" if source_label == "本地分词" else "外部"
+                suffix += f" 上下文[{short_source}]≈{compact_count(count)}/{compact_count(limit)}"
+            model_width = max(1, width - wcswidth(suffix) - 1)
+            if wcswidth(model) > model_width:
+                model = display_rows(model, width=max(1, model_width - 1))[0] + "…"
+            first = model + suffix
+        usage = self._usage
+        if usage is None:
+            return first, "本轮累计 Token 待报告 · 缓存 未知 · 推理 未知"
+        label = "本轮累计" if usage.usage_complete else "本轮已记录（不完整）"
+        cached = "未知" if usage.cache_read_input_tokens is None else f"{usage.cache_read_input_tokens:,}（输入内）"
+        reasoning = "未知" if usage.reasoning_tokens is None else f"{usage.reasoning_tokens:,}（输出内）"
+        second = (
+            f"{label} 输入 {usage.input_tokens:,} · 输出 {usage.output_tokens:,} · 总计 {usage.total_tokens:,}"
+            f" · 缓存 {cached} · 推理 {reasoning}"
+        )
+        if width is not None and wcswidth(second) > width:
+            label = "本轮累计" if usage.usage_complete else "本轮不完整"
+            second = (f"{label}≈ 入{compact_count(usage.input_tokens)} 出{compact_count(usage.output_tokens)} "
+                      f"共{compact_count(usage.total_tokens)} 缓存入{compact_count(usage.cache_read_input_tokens)} "
+                      f"推理出{compact_count(usage.reasoning_tokens)}")
+        return first, second
 
     def _render_context_status(self, key: str, value: str) -> None:
         self._context_status[key] = value
@@ -501,12 +584,13 @@ class TerminalToolEventDisplay:
                             (raw_constraints if isinstance(raw_constraints, (list, tuple)) else ())
                         )
                         line += f"（申请 {requested:,}；受{constraints}限制）"
-                    if self._context_status.get("request_settings") != line:
-                        self._context_status["request_settings"] = line
-                        self._write_line(line)
+                    self._request_settings = dict(settings)
+                    self._context_status["request_settings"] = line
             projection = event.data.get("context_projection", {})
             status = event.data.get("budget_status", {})
             if isinstance(projection, Mapping) and isinstance(status, Mapping):
+                if event.data.get("purpose") == "agent_step" and projection:
+                    self._context_projection = dict(projection)
                 cap = projection.get("explicit_input_cap")
                 self._render_context_status(
                     "budget",
@@ -516,8 +600,7 @@ class TerminalToolEventDisplay:
                     f"剩余 agent 步骤={status.get('agent_steps_remaining', 'unknown')} · "
                     f"模型请求={status.get('model_requests_remaining', 'unset')} · "
                     f"Web 请求={status.get('web_requests_remaining', 'unset')} · "
-                    f"token={status.get('tokens_remaining', 'unset')} · "
-                    f"费用额度(micros)={status.get('cost_remaining_micros', 'unknown')}"
+                    f"token={status.get('tokens_remaining', 'unset')}"
                 )
         elif event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data:
             data = event.data
@@ -525,8 +608,7 @@ class TerminalToolEventDisplay:
                 "compaction",
                 f"语义压缩 {data['trigger_reason']}: 输入 {data.get('before_input_tokens', 'unknown')} → "
                 f"{data.get('after_input_tokens', 'unknown')} · 摘要请求={data.get('summary_calls', 'unknown')} · "
-                f"token={data.get('summary_tokens', 'unknown')} · "
-                f"费用(micros)={data.get('summary_cost_micros', 'unknown')}"
+                f"token={data.get('summary_tokens', 'unknown')}"
             )
             if not self._verbose:
                 self._write_line("已整理较早对话，继续执行。")
@@ -545,7 +627,10 @@ class TerminalToolEventDisplay:
         self._started_at = self._clock()
         self._activity_status = "等待模型"
         if reset:
-            self.clear_context_status()
+            self._usage = None
+            self._context_projection = {}
+            self._context_status = {key: value for key, value in self._context_status.items()
+                                    if key == "request_settings"}
             self._elapsed_seconds = 0.0
             self._tool_count = 0
             self._changed_files.clear()

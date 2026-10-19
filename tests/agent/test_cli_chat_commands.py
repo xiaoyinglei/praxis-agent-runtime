@@ -44,6 +44,62 @@ def test_local_provider_startup_failure_has_readable_message():
     assert "RAW" not in str(exc.value)
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("selection", ["low", None])
+async def test_effort_opens_model_supported_picker_without_provider_call(tmp_path, selection):
+    from dataclasses import replace
+
+    from agent_runtime.core.generation_settings import ReasoningCapabilities
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    changes = []
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+        def current_model(self):
+            return replace(_model_spec("test"), reasoning=ReasoningCapabilities(
+                supported_efforts=("low", "high"), default_effort="high", thinking_toggle="thinking"))
+        def request_settings(self):
+            return {"preferences": {"reasoning_effort": None, "max_output_tokens": None},
+                    "model_defaults": {"reasoning_effort": "high", "max_output_tokens": 4096}}
+        def configure_request(self, **options):
+            changes.append(options)
+        async def submit(self, *args, **kwargs):
+            pytest.fail("effort picker must not call the model")
+    class UI(TerminalChatApp):
+        commands = iter(["/effort", "/exit"])
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+        async def choose_menu(self, choices, *, title, current=""):
+            assert choices == ["default", "low", "high", "off"]
+            assert current == "default"
+            assert "思考强度" in title
+            return selection
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
+    assert changes == ([] if selection is None else [{"reasoning_effort": "low"}])
+
+
+@pytest.mark.anyio
+async def test_chat_dragged_path_becomes_pending_original_file_and_reaches_session(tmp_path):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    source = tmp_path / "客户 资料.csv"
+    source.write_text("name,value\na,1")
+    calls = []
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+        def current_model(self):
+            return _model_spec("test")
+        async def submit(self, query, **options):
+            calls.append((query, options.get("files")))
+            return _result()
+    class UI(TerminalChatApp):
+        commands = iter([str(source).replace(" ", "\\ "), "分析这个文件", "/exit"])
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
+    assert calls == [("分析这个文件", [str(source.resolve())])]
+
+
 def test_failure_details_are_available_only_in_verbose_output(capsys):
     from agent_runtime.result import AgentDiagnostic
 

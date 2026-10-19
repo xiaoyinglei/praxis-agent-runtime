@@ -25,6 +25,7 @@ from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
+from agent_runtime.local_files import parse_file_input, resolve_local_file
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeError
 from agent_runtime.mcp_cli import mcp_app
 from agent_runtime.model_admin import (
@@ -318,6 +319,7 @@ def _display_agent_result(
     verbose: bool,
     answer_streamed: bool = False,
     show_execution: bool = True,
+    show_usage: bool = True,
 ) -> None:
     if result.status == "failed":
         _display_failure(
@@ -360,7 +362,8 @@ def _display_agent_result(
     if result.tool_calls and show_execution:
         print(_format_tool_summary(result))
 
-    print("\n" + format_usage_summary(result.usage))
+    if show_usage:
+        print("\n" + format_usage_summary(result.usage))
 
     if verbose:
         usage = result.usage
@@ -622,18 +625,11 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
 def _resolve_cli_input_files(values: Sequence[str]) -> list[str]:
     resolved: list[str] = []
     for value in values:
-        path = Path(value).expanduser()
-        if not path.exists():
-            raise typer.BadParameter(
-                f"输入文件不存在: {value}",
-                param_hint="--file",
-            )
-        if not path.is_file():
-            raise typer.BadParameter(
-                f"输入路径不是文件: {value}",
-                param_hint="--file",
-            )
-        resolved.append(str(path.resolve()))
+        try:
+            path = resolve_local_file(value, base=Path.cwd(), resolve_symlinks=False)
+        except (OSError, ValueError) as error:
+            raise typer.BadParameter(str(error), param_hint="--file") from error
+        resolved.append(str(path))
     return resolved
 
 
@@ -836,6 +832,7 @@ async def _chat_facade_loop(
     last_answer = ""
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
+    pending_files: list[str] = []
     default_chat_knowledge = getattr(facade, "knowledge", None)
     chat_workspace = default_chat_workspace
     model_id = "历史聊天" if resume_thread_id is not None else facade.current_model().id
@@ -847,6 +844,14 @@ async def _chat_facade_loop(
         stack.callback(event_display.finish)
         session: Session | None = None
         selected_chat: ChatSessionSummary | None = None
+
+        def refresh_request_status(control: Agent | Session) -> None:
+            reader = getattr(control, "request_settings", None)
+            if callable(reader):
+                event_display.update_request_settings(reader())
+
+        if resume_thread_id is None:
+            refresh_request_status(facade)
 
         async def reopen(selector: str) -> bool:
             nonlocal session, selected_chat, current_turn_id, last_result, last_answer, model_id
@@ -867,6 +872,7 @@ async def _chat_facade_loop(
             last_result = None
             last_answer = next((text for kind, text in reversed(messages) if kind == "answer"), "")
             event_display.clear_context_status()
+            pending_files.clear()
             model_id = selected.model_id or "未选择模型"
             facade.model = selected.model_id
             facade._followup_model_id = None
@@ -882,7 +888,7 @@ async def _chat_facade_loop(
             _print_chat_recovery(selected, pending)
             return True
 
-        async def open_session() -> Session:
+        async def open_session(*, frozen_turn_id: str | None = None) -> Session:
             nonlocal session, model_id, previous_turn_id
             changed = getattr(session, "connections_changed", None)
             if session is not None and callable(changed) and changed():
@@ -898,8 +904,10 @@ async def _chat_facade_loop(
                     metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor)
                     facade.knowledge = metadata.runtime.knowledge
             opened = await stack.enter_async_context(facade.session(
-                previous_turn_id=previous_turn_id if selected_chat is None else None,
-                thread_id=selected_chat.thread_id if selected_chat is not None else None,
+                **({"_frozen_turn_id": frozen_turn_id} if frozen_turn_id is not None else {
+                    "previous_turn_id": previous_turn_id if selected_chat is None else None,
+                    "thread_id": selected_chat.thread_id if selected_chat is not None else None,
+                }),
                 max_turns=max_turns, max_tokens_total=max_tokens_total,
                 require_workspace_change=False, allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
@@ -908,19 +916,48 @@ async def _chat_facade_loop(
             model_id = opened.current_model().id
             if _ui:
                 _ui.model = model_id
+            refresh_request_status(opened)
             return opened
+
+        async def change_request_settings(query: str) -> None:
+            query = query.strip()
+            control = session or facade
+            if _ui and query == "/effort":
+                capability = control.current_model().reasoning
+                choices = ["default"]
+                if capability is not None:
+                    choices.extend(capability.supported_efforts or ())
+                    if capability.thinking_toggle is not None:
+                        choices.append("off")
+                if len(choices) == 1:
+                    print("当前模型未声明可选择的思考强度；设置未更改。")
+                    return
+                current = control.request_settings()["preferences"]["reasoning_effort"] or "default"
+                selected = await _ui.choose_menu(choices, title="选择思考强度", current=current)
+                if selected is None:
+                    return
+                query = f"/effort {selected}"
+            _handle_request_settings_command(query, agent=control)
+            refresh_request_status(control)
 
         if _ui is not None:
             async def receive_input(text: str) -> str | None:
                 assert _ui is not None
                 if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
-                    _handle_request_settings_command(text, agent=session or facade)
+                    await change_request_settings(text)
                     return None
                 turn_id = _ui.display.turn_id
                 if turn_id is None:
                     raise RuntimeError("当前 Turn 尚未启动，请保留输入稍后发送")
                 receiver = session if session is not None else facade
-                receipt = await receiver.steer(text, expected_turn_id=turn_id)
+                guidance, files = parse_file_input(text, base=Path(default_chat_workspace))
+                if files:
+                    if session is None:
+                        raise RuntimeError("当前操作尚无可接收附件的会话；输入已保留")
+                    receipt = await session.steer(guidance or "补充输入文件，请结合当前任务读取。",
+                                                  expected_turn_id=turn_id, files=files)
+                else:
+                    receipt = await receiver.steer(text, expected_turn_id=turn_id)
                 return receipt.item_id
 
             _ui.on_input = receive_input
@@ -944,6 +981,20 @@ async def _chat_facade_loop(
                 return
             if query == "/help":
                 _print_chat_help()
+                continue
+            if query == "/attach" or query.startswith("/attach "):
+                raw = query.removeprefix("/attach").strip()
+                if raw:
+                    remaining, files = parse_file_input(raw, base=Path(default_chat_workspace))
+                    if remaining or not files:
+                        print("附加失败：请输入存在的本地文件路径；含空格的多个路径请分别加引号。")
+                        continue
+                    pending_files[:] = list(dict.fromkeys((*pending_files, *files)))
+                print("待发送附件（原地只读，不复制）：" + ("\n" + "\n".join(pending_files) if pending_files else "无"))
+                continue
+            if query == "/detach":
+                pending_files.clear()
+                print("已清除待发送附件。")
                 continue
             if query == "/permissions" or query.startswith("/permissions "):
                 from agent_runtime.permission_policy import PermissionPolicy
@@ -1030,9 +1081,11 @@ async def _chat_facade_loop(
                 last_result = None
                 last_answer = ""
                 event_display.clear_context_status()
+                pending_files.clear()
                 chat_workspace = default_chat_workspace
                 if _ui:
                     _ui.model = model_id
+                refresh_request_status(facade)
                 print("下一条消息将使用空历史。")
                 continue
             if query == "/verbose":
@@ -1044,7 +1097,7 @@ async def _chat_facade_loop(
                 continue
             if query.split(maxsplit=1)[0] in {"/effort", "/output"}:
                 try:
-                    _handle_request_settings_command(query, agent=session or facade)
+                    await change_request_settings(query)
                 except ValueError as error:
                     print(f"设置未更改：{error}")
                 continue
@@ -1064,7 +1117,15 @@ async def _chat_facade_loop(
                 model_id = model_control.current_model().id
                 if _ui:
                     _ui.model = model_id
+                refresh_request_status(model_control)
                 continue
+            query, dropped = parse_file_input(query, base=Path(default_chat_workspace))
+            if dropped:
+                pending_files[:] = list(dict.fromkeys((*pending_files, *dropped)))
+                print(f"已附加 {len(pending_files)} 个本地文件（原地只读，不复制）。")
+                if not query:
+                    print("继续输入任务后发送；/attach 查看，/detach 清除待发送附件。")
+                    continue
             if query.startswith("/"):
                 print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
                 continue
@@ -1108,17 +1169,31 @@ async def _chat_facade_loop(
                         facade.knowledge = metadata.runtime.knowledge
             if saved_result is None:
                 session = await open_session()
-            resume_driver = session if saved_result is None and session is not None else facade
+            elif saved_action != "abort" and (_ui is not None or pending_files):
+                session = await open_session(frozen_turn_id=saved_result.turn_id)
+            resume_driver = session if session is not None else facade
             event_display.begin_turn()
             try:
                 if saved_result is not None:
                     assert saved_action is not None
-                    submission = facade.resume(saved_result.turn_id, saved_action,
-                                               user_input=saved_input, event_sink=event_display)
+                    if pending_files and saved_action != "abort":
+                        assert session is not None
+                        await session.steer("补充输入文件，请结合当前任务读取。",
+                                            expected_turn_id=saved_result.turn_id, files=list(pending_files))
+                    submission = resume_driver.resume(saved_result.turn_id, saved_action,
+                                                      user_input=saved_input, event_sink=event_display)
                 else:
                     assert session is not None
-                    submission = session.submit(query, event_sink=event_display)
+                    submission = session.submit(query, event_sink=event_display, **(
+                        {"files": list(pending_files)} if pending_files else {}
+                    ))
                 result = await _ui.operation(submission) if _ui else await submission
+                event_display.update_usage(result.usage)
+                if saved_result is None or saved_action != "abort":
+                    pending_files.clear()
+            except (OSError, ValueError) as error:
+                print("发送失败：" + safe_terminal_text(str(error)))
+                continue
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                     raise
@@ -1131,7 +1206,8 @@ async def _chat_facade_loop(
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
-                print("\n" + format_usage_summary(result.usage))
+                if not (_ui and _ui.fullscreen):
+                    print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
                 pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
                                         and any(facade.input_status(identity) == "pending"
@@ -1151,6 +1227,7 @@ async def _chat_facade_loop(
                     resumption = resume_driver.resume(result.turn_id, action, event_sink=event_display)
                 try:
                     result = await _ui.operation(resumption) if _ui else await resumption
+                    event_display.update_usage(result.usage)
                 except asyncio.CancelledError:
                     if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                         raise
@@ -1158,6 +1235,7 @@ async def _chat_facade_loop(
                     result = await resume_driver.resume(result.turn_id, "abort", event_sink=event_display)
                     print("已取消当前执行；已发生的文件修改不会回滚。")
             event_display.finish()
+            event_display.update_usage(result.usage)
             last_result = result
             last_answer = result.answer or ""
             _display_agent_result(
@@ -1165,6 +1243,7 @@ async def _chat_facade_loop(
                 verbose=verbose,
                 answer_streamed=event_display.answer_streamed,
                 show_execution=_ui is None,
+                show_usage=not (_ui and _ui.fullscreen),
             )
 
 

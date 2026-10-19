@@ -79,6 +79,23 @@ def test_composer_propagates_terminal_exit(error: BaseException) -> None:
         composer.prompt("> ")
 
 
+def test_composer_keeps_dragged_file_separate_from_already_typed_request(tmp_path):
+    import json
+    import shlex
+
+    source = tmp_path / "客户 资料.csv"
+    source.write_text("a,b\n1,2")
+    program = (
+        "import json\nfrom agent_runtime.terminal_input import TerminalComposer\n"
+        "value=TerminalComposer().prompt('> ')\nprint('RESULT='+json.dumps(value,ensure_ascii=True))\n"
+    )
+    pasted = shlex.quote(str(source))
+    output = _pty_exchange(program, typed_text="分析这个文件",
+                           edit_keys=b"\x1b[200~" + pasted.encode() + b"\x1b[201~\r", wait_for_raw_mode=True)
+    expected = "分析这个文件\n" + pasted + "\n"
+    assert "RESULT=" + json.dumps(expected, ensure_ascii=True) in output
+
+
 def _pty_exchange(
     program: str,
     *,

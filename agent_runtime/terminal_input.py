@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Protocol
 
 import regex
@@ -10,6 +11,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import History
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
+from prompt_toolkit.keys import Keys
+
+from agent_runtime.local_files import parse_file_input
 
 DEFAULT_HISTORY_ENTRIES = 100
 DEFAULT_HISTORY_BYTES = 64 * 1024
@@ -18,6 +22,8 @@ _GRAPHEME = regex.compile(r"\X")
 # Shared by help and completion so every supported command uses the same menu.
 CHAT_COMMANDS = {
     "/help": "显示帮助",
+    "/attach": "附加本地文件供下一条消息读取（原地只读，不复制）；无参数查看待发送附件",
+    "/detach": "清除待发送附件",
     "/status": "查看模型、会话、工作区和上下文预算",
     "/new": "开始空上下文的新聊天",
     "/clear": "开始空上下文的新聊天（/new 别名）",
@@ -49,6 +55,15 @@ def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
 
 
 _COMPOSER_BINDINGS = KeyBindings()
+
+
+@_COMPOSER_BINDINGS.add(Keys.BracketedPaste, eager=True)
+def _paste_with_file_boundaries(event: KeyPressEvent) -> None:
+    text = event.data.replace("\r\n", "\n").replace("\r", "\n")
+    remaining, files = parse_file_input(text, base=Path.cwd())
+    if files and not remaining:
+        text = "\n" + text.strip() + "\n"
+    event.current_buffer.insert_text(text)
 
 
 @_COMPOSER_BINDINGS.add("backspace", eager=True)

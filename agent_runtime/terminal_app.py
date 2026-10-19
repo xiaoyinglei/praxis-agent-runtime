@@ -242,7 +242,7 @@ class TerminalChatApp:
         )
         self.approval_body = TextArea(
             read_only=True, focusable=True, wrap_lines=True, scrollbar=True,
-            height=lambda: Dimension(min=1, preferred=min(6, max(1, self.app.output.get_size().rows - 8))),
+            height=lambda: Dimension(min=1, preferred=min(6, max(1, self.app.output.get_size().rows - 10))),
             style="class:approval-body",
         )
         self.approval_buttons = FormattedTextControl(self._approval_fragments, focusable=True)
@@ -345,8 +345,8 @@ class TerminalChatApp:
                 return
             if self.on_input is not None and (self._operation is not None or self._approval is not None):
                 value = self.editor.text
-                if value.startswith("/"):
-                    self.status = "执行中请直接输入补充；Ctrl+C 停止后可使用命令"
+                if value.startswith("/") and value.split(maxsplit=1)[0] not in {"/effort", "/output"}:
+                    self.status = "执行中支持 /effort、/output 或直接补充；其他命令请先 Ctrl+C 停止"
                     self.invalidate()
                     return
                 self.editor.buffer.append_to_history()
@@ -463,7 +463,7 @@ class TerminalChatApp:
             self.body,
             wrap_lines=False,
             height=lambda: (Dimension(min=1, weight=1) if self.fullscreen else
-                            Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8))),
+                            Dimension(min=0, max=max(0, self.app.output.get_size().rows - 10))),
             dont_extend_height=not self.fullscreen,
         )
         layout = HSplit(
@@ -494,6 +494,7 @@ class TerminalChatApp:
                     Window(FormattedTextControl(self._connection_fragments), height=1),
                     filter=Condition(lambda: self.display.connection_required),
                 ),
+                Window(FormattedTextControl(self._status_fragments), height=2, wrap_lines=False),
                 Window(FormattedTextControl(self._footer), height=1),
             ]
         )
@@ -969,6 +970,11 @@ class TerminalChatApp:
 
     async def choose_model(self, choices: list[str], current: str) -> str | None:
         return await self.choose_menu(choices, title="选择模型", current=current)
+
+    def _status_fragments(self) -> StyleAndTextTuples:
+        width = max(1, self.app.output.get_size().columns - 1)
+        settings, usage = self.display.status_lines(self.model, width=width)
+        return [("class:dim", " " + settings + "\n " + usage)]
 
     def _footer(self) -> StyleAndTextTuples:
         if self._approval is not None:

@@ -688,7 +688,7 @@ async def test_running_command_is_shown_as_running_with_handle(capsys, name):
 
 
 @pytest.mark.anyio
-async def test_effective_request_settings_are_visible_and_changes_are_not_spammed(capsys):
+async def test_effective_request_settings_stay_in_status_across_turns(capsys):
     from agent_runtime.streaming.events import EventType, StreamEvent
     display = TerminalToolEventDisplay(width=120)
     event = StreamEvent(type=EventType.BUDGET_UPDATE, turn_id='turn', data={
@@ -697,7 +697,84 @@ async def test_effective_request_settings_are_visible_and_changes_are_not_spamme
             'output_constraints': ['model_max_output_tokens']},
     })
     await display.emit(event)
-    first = capsys.readouterr().out
-    assert 'high' in first and '65,536' in first and '98,304' in first
+    assert capsys.readouterr().out == ''
+    first, _ = display.status_lines('demo')
+    assert 'high' in first and '65,536' in first
+    display.begin_turn()
+    assert display.status_lines('demo')[0] == first
     await display.emit(event)
-    assert '65,536' not in capsys.readouterr().out
+    display.finish()
+    assert capsys.readouterr().out == ''
+    display.show_context_status()
+    details = capsys.readouterr().out
+    assert '98,304' in details and '模型上限' in details
+    display.update_request_settings({
+        "preferences": {"reasoning_effort": "medium"}, "model_defaults": {"max_output_tokens": 8192},
+    })
+    display.show_context_status()
+    assert "high" not in capsys.readouterr().out
+
+
+@pytest.mark.anyio
+async def test_status_separates_request_context_from_authoritative_turn_usage(capsys):
+    from agent_runtime.result import AgentUsage
+    from agent_runtime.streaming.events import EventType, StreamEvent
+
+    display = TerminalToolEventDisplay(interactive=False)
+    display.update_request_settings({
+        "preferences": {"reasoning_effort": "high", "max_output_tokens": None},
+        "model_defaults": {"reasoning_effort": "medium", "max_output_tokens": 8192},
+    })
+    assert "high" in display.status_lines("demo")[0]
+    assert "待报告" in display.status_lines("demo")[1]
+    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
+        "purpose": "agent_step",
+        "context_projection": {"input_tokens": 1200, "max_input_tokens": 10000,
+                               "count_source": "tokenizer_estimate"},
+        "budget_status": {"cost_remaining_micros": 999},
+    }))
+    usage = AgentUsage(input_tokens=4000, output_tokens=500, total_tokens=4500,
+                       cache_read_input_tokens=3000, reasoning_tokens=100)
+    display.update_usage(usage)
+    display.update_usage(usage)  # Replaying a cumulative result must not add it twice.
+    settings, tokens = display.status_lines("demo")
+    assert "上下文输入≈1,200/10,000" in settings
+    assert "本轮累计" in tokens and "输入 4,000" in tokens and "输出 500" in tokens
+    assert "缓存 3,000（输入内）" in tokens and "推理 100（输出内）" in tokens
+    assert "4,500" in tokens
+    assert "费用" not in settings + tokens
+    display.set_verbose(True)
+    display.show_context_status()
+    details = capsys.readouterr().out
+    assert "费用" not in details
+    assert "本轮累计 Token" in details and "4,000" in details
+
+
+def test_status_reports_unknown_cache_and_partial_usage_without_assuming_zero():
+    from agent_runtime.result import AgentUsage
+
+    display = TerminalToolEventDisplay(interactive=False)
+    display.update_usage(AgentUsage(input_tokens=10, output_tokens=2, total_tokens=12, usage_complete=False))
+    _, tokens = display.status_lines("demo")
+    assert "不完整" in tokens and "缓存 未知" in tokens and "推理 未知" in tokens
+    display.begin_turn()
+    assert "待报告" in display.status_lines("demo")[1]
+    display.finish()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("source", "label", "approximate"), [
+    ("utf8_bytes_conservative", "字节估算", True),
+    ("tiktoken:cl100k_base", "本地分词", False),
+    ("external_counter", "外部计数", False),
+])
+async def test_context_status_identifies_count_source(source, label, approximate):
+    from agent_runtime.streaming.events import EventType, StreamEvent
+
+    display = TerminalToolEventDisplay(interactive=False)
+    await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
+        "purpose": "agent_step",
+        "context_projection": {"input_tokens": 1234, "max_input_tokens": 10000, "count_source": source},
+    }))
+    first, _ = display.status_lines("demo")
+    assert label in first and ("≈" in first) is approximate
