@@ -711,7 +711,10 @@ class RolloutStore:
         return sum(item.kind == "user_message" and item.status == "completed"
                    and item.sequence < request.sequence for item in items)
 
-    def receive_turn_input(self, *, thread_id: str, turn_id: str, text: str) -> ItemSnapshot:
+    def receive_turn_input(
+        self, *, thread_id: str, turn_id: str, text: str,
+        input_files: tuple[Mapping[str, Any], ...] = (),
+    ) -> ItemSnapshot:
         """Durably accept steering for exactly the expected active Turn."""
         if not isinstance(text, str) or not text.strip():
             raise ValueError("input must be non-empty")
@@ -736,6 +739,16 @@ class RolloutStore:
                 thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
                 payload={"item_id": item_id, "payload": {"text": text, "input_revision": revision}},
             )
+            for value in input_files:
+                file_id = f"item_{uuid4().hex}"
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
+                    payload={"item_id": file_id, "kind": "input_file"},
+                )
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
+                    payload={"item_id": file_id, "payload": _json_object(value, field="input file")},
+                )
         return self.read_item(item_id)
 
     def turn_input_status(self, item_id: str) -> str:

@@ -677,7 +677,7 @@ async def test_public_agent_binds_explicit_workspace_mcp_trust_to_the_turn(
 
 
 @pytest.mark.anyio
-async def test_public_agent_stages_files_as_canonical_input_items(
+async def test_public_agent_references_files_without_copying_as_canonical_input_items(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -707,10 +707,192 @@ async def test_public_agent_stages_files_as_canonical_input_items(
     with RolloutStore(database) as store:
         input_items = [item for item in store.list_items(result.turn_id) if item.kind == "input_file"]
         assert len(input_items) == 1
-        staged = workspace / str(input_items[0].payload["workspace_path"])
-        assert staged.read_text(encoding="utf-8") == "trusted attachment"
+        assert input_items[0].payload["path"] == str(source.resolve())
+        assert input_items[0].payload["storage"] == "reference"
+        assert not list((workspace / ".praxis/runtime/input_files").rglob("brief.txt"))
+        from agent_runtime.permission_policy import ResolvedPermissions
+
+        policy = ResolvedPermissions.model_validate(store.read_turn(result.turn_id).binding_manifest[
+            "tool_execution_policy"]["permissions"])
+        assert policy.path_access(source)
+        assert not policy.path_access(source, write=True)
+        assert not policy.path_access(source.with_name("unselected.txt"))
         assert input_items[0].payload["sha256"]
         assert store.verify().valid is True
+
+
+@pytest.mark.anyio
+async def test_attached_files_survive_session_reopen_but_do_not_change_agent_defaults(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "brief.txt"
+    source.write_text("original", encoding="utf-8")
+    agent = Agent(checkpoint_db=tmp_path / "rollout.sqlite3", workspace_path=workspace)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    async with agent.session(require_workspace_change=False) as session:
+        result = await session.submit("read", files=[str(source)])
+        assert session.permissions().path_access(source)
+        assert not session.permissions().path_access(source, write=True)
+    assert not agent.effective_permissions().path_access(source)
+    async with agent.session(thread_id=result.thread_id, require_workspace_change=False) as reopened:
+        assert reopened.permissions().path_access(source)
+        source.unlink()
+        source.mkdir()
+        assert not reopened.permissions().path_access(source / "new.txt")
+
+
+@pytest.mark.anyio
+async def test_attachment_cannot_bypass_explicit_deny_or_managed_ceiling(tmp_path, monkeypatch):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "secret.txt"
+    source.write_text("must not read", encoding="utf-8")
+    for options in (
+        {"permissions": PermissionPolicy(filesystem=(PathRule(path=str(source), access="deny"),))},
+        {"managed_permissions": PermissionPolicy()},
+    ):
+        agent = Agent(checkpoint_db=tmp_path / "deny.sqlite3", workspace_path=workspace, **options)
+        monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+        async with agent.session(require_workspace_change=False) as session:
+            with pytest.raises(PermissionError):
+                await session.submit("read", files=[str(source)])
+            assert session.store.list_turns() == ()
+
+
+@pytest.mark.anyio
+async def test_attachment_symlink_cannot_bypass_lexical_deny(tmp_path, monkeypatch):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "brief.txt"
+    source.write_text("private")
+    link = tmp_path / "forbidden.txt"
+    link.symlink_to(source)
+    agent = Agent(checkpoint_db=tmp_path / "denied.sqlite3", workspace_path=workspace,
+                  permissions=PermissionPolicy(filesystem=(PathRule(path=str(link), access="deny"),)))
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    async with agent.session(require_workspace_change=False) as session:
+        with pytest.raises(PermissionError):
+            await session.submit("read", files=[str(link)])
+
+
+@pytest.mark.anyio
+async def test_original_attachment_is_readable_by_real_tools_and_live_deny_revokes_it(tmp_path, monkeypatch):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("ORIGINAL_CONTENT_731")
+    second.write_text("SECOND_CONTENT_912")
+    class ReadingModel(CapturingPublicModel):
+        def prepare(self, request):
+            prepared = super().prepare(request)
+            from dataclasses import replace
+            return replace(prepared, request_ref={**prepared.request_ref,
+                "request_id": f"{request.turn_id}:{request.step}",
+                "toolset_revision": toolset_revision_for_tools(request.tools),
+                "exposed_tool_names": [tool.definition.name for tool in request.tools]})
+        async def dispatch(self, prepared, *, delta_sink=None):
+            if len(self.requests) == 1:
+                return HarnessModelResponse(text="", provider_response_id="read-response", usage={}, tool_calls=(
+                    HarnessToolCall(id="read-original", name="read_file", arguments={"path": str(first)}),
+                ))
+            return await super().dispatch(prepared, delta_sink=delta_sink)
+    model = ReadingModel()
+    agent = Agent(checkpoint_db=tmp_path / "read.sqlite3", workspace_path=workspace)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    async with agent.session(require_workspace_change=False) as session:
+        result = await session.submit("read original", files=[str(first)])
+        assert result.status == "done", (result.diagnostics, result.tool_calls)
+        assert any("ORIGINAL_CONTENT_731" in str(message.content) for message in model.requests[-1].messages)
+        assert result.tool_calls[0].tool_name == "read_file"
+        assert not result.tool_calls[0].is_error
+        await session.submit("also use second", files=[str(second)])
+        assert session.permissions().path_access(first)
+        assert session.permissions().path_access(second)
+        session.update_permissions(PermissionPolicy(filesystem=(PathRule(path=str(first), access="deny"),)))
+        assert not session.permissions().path_access(first)
+        assert session.permissions().path_access(second)
+    assert first.read_text() == "ORIGINAL_CONTENT_731"
+
+
+@pytest.mark.anyio
+async def test_failed_file_steering_does_not_leave_authority_without_receipt(tmp_path, monkeypatch):
+    from tests.agent.harness.test_steering import SteeringModel
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "external.txt"
+    source.write_text("attached")
+    model = SteeringModel()
+    agent = Agent(checkpoint_db=tmp_path / "steer.sqlite3", workspace_path=workspace)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    async with agent.session(require_workspace_change=False) as session:
+        task = asyncio.create_task(session.submit("wait for input"))
+        await asyncio.wait_for(model.started.wait(), 3)
+        active = session.store.read_thread(session.thread_id).active_turn_id
+        try:
+            with pytest.raises(ValueError, match="non-empty"):
+                await session.steer(" ", expected_turn_id=active, files=[str(source)])
+            assert not session.permissions().path_access(source)
+            assert not session.store.read_thread(session.thread_id).settings.get("input_read_files")
+            receipt = await session.steer("read attached", expected_turn_id=active, files=[str(source)])
+            assert receipt.kind == "user_message"
+            assert session.permissions().path_access(source)
+        finally:
+            model.release.set()
+            await task
+        assert any("external.txt" in message.content for message in model.requests[-1].messages
+                   if message.role == "context")
+        assert session.store.verify().valid
+
+
+@pytest.mark.anyio
+async def test_session_attachment_ceiling_is_checked_before_hashing_file(tmp_path, monkeypatch):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+    from agent_runtime.tools.permissions import ToolExecutionContext
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "forbidden.txt"
+    source.write_text("no read authority")
+    opened = []
+    real_open = Path.open
+    def track_open(path, *args, **kwargs):
+        if path == source:
+            opened.append(path)
+        return real_open(path, *args, **kwargs)
+    agent = Agent(checkpoint_db=tmp_path / "ceil.sqlite3", workspace_path=workspace)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    ceiling = PermissionPolicy(filesystem=(PathRule(path=str(source), access="deny"),)).resolve(workspace)
+    context = ToolExecutionContext(permissions=ceiling)
+    async with await Session.open(agent=agent, tool_execution_context=context) as session:
+        monkeypatch.setattr(Path, "open", track_open)
+        with pytest.raises(PermissionError):
+            await session.submit("read", files=[str(source)])
+    assert opened == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("task", ["", " ", None])
+async def test_invalid_task_cannot_persist_attachment_authority(tmp_path, monkeypatch, task):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = tmp_path / "external.txt"
+    source.write_text("original")
+    agent = Agent(checkpoint_db=tmp_path / "invalid.sqlite3", workspace_path=workspace)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    async with agent.session(require_workspace_change=False) as session:
+        with pytest.raises(ValueError, match="non-empty"):
+            await session.submit(task, files=[str(source)])
+        assert session.store.list_turns() == ()
+        assert not session.permissions().path_access(source)
+        assert not session.store.read_thread(session.thread_id).settings.get("input_read_files")
 
 
 @pytest.mark.anyio

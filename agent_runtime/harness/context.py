@@ -688,6 +688,13 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
             + _json(dict(item.payload))
         ))
     if item.kind == "input_file":
+        if item.payload.get("storage") == "reference" and isinstance(item.payload.get("path"), str):
+            return HarnessMessage(role="context", content=(
+                f"Attached input file (read-only original, not copied): {_json(item.payload['path'])}. "
+                f"SHA256 at attachment: {item.payload.get('sha256')}. "
+                "This is a live local file reference: read its current contents with file tools; "
+                "the original may change or be removed. Write derived outputs inside the workspace."
+            ))
         workspace_path = item.payload.get("workspace_path")
         sha256 = item.payload.get("sha256")
         if isinstance(workspace_path, str) and isinstance(sha256, str):

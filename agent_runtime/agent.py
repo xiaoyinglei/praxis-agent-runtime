@@ -10,7 +10,6 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
-from uuid import uuid4
 
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS
@@ -96,6 +95,7 @@ class Agent:
                 raise TypeError("permissions must be PermissionPolicy, a policy file path, or None")
         self.permissions = permissions
         self.managed_permissions = managed_permissions
+        self._input_read_files: tuple[str, ...] = ()
         self.effective_permissions()  # Reject invalid configuration before model/provider setup.
         self.model_session_path = model_session_path
         self.knowledge = knowledge
@@ -498,32 +498,45 @@ class Agent:
 
     def effective_permissions(self) -> ResolvedPermissions:
         """Reload trusted sources; saved conversation grants cannot widen them."""
-        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions)
+        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
+                                          read_files=self._input_read_files)
 
-    def _stage_harness_files(
+    def _reference_harness_files(
         self,
         files: Sequence[str],
+        *,
+        permission_ceiling: ResolvedPermissions | None = None,
     ) -> tuple[dict[str, object], ...]:
-        from agent_runtime.workspace import import_files, open_workspace
+        from agent_runtime.local_files import resolve_local_file
 
         if not files:
             return ()
-        workspace = open_workspace(self._workspace_path(), create=True)
-        staged = import_files(
-            workspace,
-            list(files),
-            namespace=f"turn_{uuid4().hex}",
-        )
+        originals = [resolve_local_file(value, base=self._workspace_path(), resolve_symlinks=False) for value in files]
+        paths = [path.resolve() for path in originals]
+        selected = tuple(dict.fromkeys((*self._input_read_files, *(str(path) for path in (*originals, *paths)))))
+        permissions = resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
+                                                 read_files=selected)
+        if permission_ceiling is not None:
+            permissions = permissions.intersection(permission_ceiling.with_read_files(selected))
+        for path in originals:
+            # Validate lexical denials as well as the canonical file reference.
+            lexical_permissions = permissions.with_read_files((str(path),))
+            if not lexical_permissions.path_access(path):
+                raise PermissionError(lexical_permissions.path_reason(path))
+        for path in paths:
+            if not permissions.path_access(path):
+                raise PermissionError(permissions.path_reason(path))
         values: list[dict[str, object]] = []
-        for original, path in zip(files, staged, strict=True):
+        for path in dict.fromkeys(paths):
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
             values.append(
                 {
-                    "original_path": str(Path(original).expanduser().resolve()),
-                    "workspace_path": path.relative_to(workspace.root).as_posix(),
+                    "original_path": str(path),
+                    "path": str(path),
+                    "storage": "reference",
                     "sha256": digest.hexdigest(),
                     "size_bytes": path.stat().st_size,
                 }

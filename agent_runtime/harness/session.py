@@ -208,6 +208,13 @@ class Session:
                         generate_memories=thread.settings["memory_generation_allowed"],
                     )
             if agent is not None:
+                if thread_id is not None:
+                    selected_files = thread.settings.get("input_read_files", ())
+                    if not isinstance(selected_files, (list, tuple)) or any(
+                        not isinstance(path, str) or not Path(path).is_absolute() for path in selected_files
+                    ):
+                        raise ValueError("invalid saved input file references")
+                    agent._input_read_files = tuple(selected_files)
                 model, resource_options = await self._open_agent_resources(
                     agent,
                     allow_write_tools=service_options.pop("allow_write_tools", False),
@@ -358,6 +365,8 @@ class Session:
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("user_message must be non-empty")
         async with self._active_turn(event_sink):
             if self.store.read_thread(self.thread_id).active_turn_id is not None:
                 raise RuntimeError("active Turn must be resumed or aborted before submit")
@@ -365,9 +374,7 @@ class Session:
                 await self._bootstrap_model_provider()
             input_files: tuple[dict[str, object], ...] = ()
             if files:
-                if self._agent is None:
-                    raise ValueError("file staging requires an Agent-configured Session")
-                input_files = self._agent._stage_harness_files(files)
+                input_files = self.attach_files(files)
             turn_id = f"turn_{uuid4().hex}"
             binding = dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
             binding["budget_root_turn_id"] = turn_id
@@ -389,7 +396,33 @@ class Session:
                 self.store.enqueue_memory_job(self.workspace_path, self.thread_id)
             return AgentResult._from_harness(result, store=self.store, files=tuple(files or ()))
 
-    async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
+    def attach_files(self, files: Sequence[str]) -> tuple[dict[str, object], ...]:
+        """Grant selected original files read access for this conversation, without copies."""
+        self._ensure_open()
+        if self._agent is None:
+            raise ValueError("file references require an Agent-configured Session")
+        values = self._agent._reference_harness_files(files, permission_ceiling=self.permissions())
+        selected = tuple(str(value["path"]) for value in values)
+        previous = self.tool_execution_context
+        previous_files = self._agent._input_read_files
+        self._agent._input_read_files = tuple(dict.fromkeys((*previous_files, *selected)))
+        try:
+            permissions = previous.permissions
+            self.tool_execution_context = replace(previous, permissions=(
+                None if permissions is None else permissions.with_read_files(selected)
+            ))
+            for path in selected:
+                if not self.permissions().path_access(path):
+                    raise PermissionError(self.permissions().path_reason(path))
+            self._persist_settings()
+        except BaseException:
+            self._agent._input_read_files = previous_files
+            self.tool_execution_context = previous
+            raise
+        self._apply_tool_context()
+        return values
+
+    async def steer(self, text: str, *, expected_turn_id: str, files: Sequence[str] | None = None) -> ItemSnapshot:
         """Receive guidance for the named active Turn without starting another loop.
 
         The returned Item is committed before acknowledgement. Running tools
@@ -397,9 +430,26 @@ class Session:
         the active submit task to cancel work. Text never grants tool approval.
         """
         self._ensure_open()
-        return await self._executor()._commit(lambda: self.store.receive_turn_input(
-            thread_id=self.thread_id, turn_id=expected_turn_id, text=text,
-        ))
+        def receive() -> ItemSnapshot:
+            previous = self.tool_execution_context
+            previous_files = () if self._agent is None else self._agent._input_read_files
+            try:
+                # Settings, input revision and file Items commit together. A rejected
+                # input must not leave an unacknowledged permission grant behind.
+                with self.store._transaction():
+                    if self.store.read_thread(self.thread_id).active_turn_id != expected_turn_id:
+                        raise RuntimeError("expected Turn is no longer active; input was not accepted")
+                    values = self.attach_files(files) if files else ()
+                    return self.store.receive_turn_input(
+                        thread_id=self.thread_id, turn_id=expected_turn_id, text=text, input_files=values,
+                    )
+            except BaseException:
+                self.tool_execution_context = previous
+                if self._agent is not None:
+                    self._agent._input_read_files = previous_files
+                self._apply_tool_context()
+                raise
+        return await self._executor()._commit(receive)
 
     def input_status(self, item_id: str) -> str:
         """pending/applied means received/dispatched, not model understanding."""
@@ -512,6 +562,7 @@ class Session:
                 "request_settings_revision": (0 if self.model_control_plane is None else
                                               self.model_control_plane.state.request_settings_revision),
                 "tool_execution_policy": _tool_execution_policy_snapshot(self.tool_execution_context),
+                "input_read_files": [] if self._agent is None else list(self._agent._input_read_files),
                 "memory_generation_allowed": self.memory_config.generate_memories,
                 "memory_use_allowed": self.memory_config.use_memories,
                 "memory_control_version": self._memory_control_version,

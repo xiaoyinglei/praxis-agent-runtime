@@ -260,6 +260,25 @@ class ResolvedPermissions(_FrozenModel):
     def path_access(self, path: str | Path, write: bool = False) -> bool:
         return not self.path_reason(path, write=write)
 
+    def with_read_files(self, paths: tuple[str, ...]) -> ResolvedPermissions:
+        """Add explicit user-selected files, preserving denials and all ceilings.
+
+        Only existing regular files qualify. Re-evaluate on each permission
+        refresh so replacing a selected file with a directory grants no subtree.
+        """
+        rules = list(self.filesystem)
+        for value in paths:
+            lexical = _lexical(value, Path(self.workspace))
+            real = lexical.resolve()
+            if not real.is_file():
+                continue
+            for path in dict.fromkeys((lexical, real)):
+                if any(rule.access == "deny" and _under_path(path, Path(rule.path)) for rule in self.filesystem):
+                    continue
+                if not self.path_access(path):
+                    rules.append(PathRule(path=str(path), access="read"))
+        return self.model_copy(update={"filesystem": tuple(dict.fromkeys(rules))})
+
     @property
     def read_only(self) -> bool:
         return self.profile == "read-only" or any(ceiling.read_only for ceiling in self.ceilings)
@@ -392,6 +411,8 @@ def resolve_permission_sources(
     workspace: Path,
     permissions: PermissionPolicy | Path | str | None = None,
     managed_permissions: PermissionPolicy | Path | str | None = None,
+    *,
+    read_files: tuple[str, ...] = (),
 ) -> ResolvedPermissions:
     """Resolve user defaults and independent administrator ceilings without services."""
     def resolve(value: PermissionPolicy | Path | str | None) -> ResolvedPermissions:
@@ -405,7 +426,7 @@ def resolve_permission_sources(
             if candidate.exists():
                 permissions = candidate
                 break
-    effective = resolve(permissions)
+    effective = resolve(permissions).with_read_files(read_files)
     if managed_permissions is None:
         for suffix in ("toml", "json"):
             candidate = Path("/etc/praxis") / f"permissions.{suffix}"
