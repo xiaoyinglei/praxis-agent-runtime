@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .venv/
+node_modules/
 .python-version
 __pycache__/
 *.py[cod]

@@ -338,12 +338,15 @@ class ToolCall:
     tool_name: str
     arguments: Mapping[str, JsonValue]
     origin: ToolCallOrigin
+    argument_error: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_string(self.tool_call_id, field_name="tool_call_id")
         _require_non_empty_string(self.tool_name, field_name="tool_name")
         if not isinstance(self.origin, ToolCallOrigin):
             raise TypeError("origin must be a ToolCallOrigin")
+        if self.argument_error is not None and not isinstance(self.argument_error, str):
+            raise TypeError("argument_error must be a string or None")
         object.__setattr__(
             self,
             "arguments",

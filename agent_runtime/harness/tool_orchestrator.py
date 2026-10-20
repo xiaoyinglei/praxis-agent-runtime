@@ -12,6 +12,7 @@ from stat import S_ISLNK
 from typing import Any, Literal
 from uuid import uuid4
 
+from agent_runtime.approval import CommandGrant, command_grant
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness.events import RolloutEventReader
@@ -463,6 +464,7 @@ class ToolOrchestrator:
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 arguments=_json_mapping(call.arguments),
+                argument_error=call.argument_error,
                 origin={
                     "request_id": call.origin.request_id,
                     "toolset_revision": call.origin.toolset_revision,
@@ -506,6 +508,7 @@ class ToolOrchestrator:
                         record=record,
                         tool=tool,
                         context=execution_context,
+                        arguments=call.arguments,
                     ),
                 )
             )
@@ -823,7 +826,10 @@ class ToolOrchestrator:
             retryable=False,
         )
 
-    async def resume_approval(self, *, turn_id: str, decision: str) -> ToolResult:
+    async def resume_approval(
+        self, *, turn_id: str, decision: str,
+        on_session_grant: Callable[[CommandGrant], None] | None = None,
+    ) -> ToolResult:
         pending = [
             interaction
             for interaction in self._store.list_interactions(turn_id)
@@ -846,6 +852,14 @@ class ToolOrchestrator:
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
         execution_context = self._context_for_turn(turn_id)
+        grant = None
+        if on_session_grant is not None:
+            arguments = tool.validate_input(call.arguments)
+            grant = command_grant(tool, arguments, tool.resolve_use(arguments), execution_context)
+            if (decision != "approve" or grant is None
+                    or interaction.request.get("approval_scope", "tool") != "tool"
+                    or interaction.request.get("session_grant") != grant.to_json()):
+                raise ValueError("this approval does not offer a current Session command grant")
         if decision == "approve":
             preflight_context = replace(
                 execution_context,
@@ -864,6 +878,7 @@ class ToolOrchestrator:
                 record=fresh_record,
                 tool=tool,
                 context=execution_context,
+                arguments=call.arguments,
             )
             if preflight.result.error_code != "approval_required" or _approval_scope(
                 interaction.request
@@ -900,9 +915,12 @@ class ToolOrchestrator:
                 execution_context.denied_tool_call_ids | (set() if approved else {call.tool_call_id})
             ),
         )
-        return await self._execute_approved_record(
+        result = await self._execute_approved_record(
             turn_id=turn_id, call=call, tool=tool, context=context, record=record,
         )
+        if on_session_grant is not None and grant is not None and not result.is_error:
+            on_session_grant(grant)
+        return result
 
     async def recover_resolved_approval(self, *, turn_id: str) -> ToolResult:
         """Execute one approved ready operation after a pre-execute crash."""
@@ -948,6 +966,7 @@ class ToolOrchestrator:
             record=fresh_record,
             tool=tool,
             context=execution_context,
+            arguments=call.arguments,
         )
         if preflight.result.error_code != "approval_required" or _approval_scope(
             interaction.request
@@ -1221,6 +1240,7 @@ class ToolOrchestrator:
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             arguments=arguments,
+            argument_error=payload.get("argument_error"),
             origin=ToolCallOrigin(
                 request_id=request_id,
                 toolset_revision=toolset_revision,
@@ -1289,8 +1309,11 @@ def _approval_request(
     record: ToolExecutionRecord,
     tool: Tool,
     context: ToolExecutionContext,
+    arguments: Mapping[str, JsonValue],
 ) -> dict[str, Any]:
-    return {
+    validated = tool.validate_input(arguments)
+    grant = command_grant(tool, validated, tool.resolve_use(validated), context)
+    request: dict[str, Any] = {
         "reason": execution.result.error_message or "approval required",
         "approval_scope": execution.result.metadata.get("approval_scope", "tool"),
         "effects": [effect.value for effect in execution.trace.effects],
@@ -1306,6 +1329,10 @@ def _approval_request(
         "execution_revision": tool.execution_revision,
         "policy_revision": _policy_revision(context, tool, execution),
     }
+    if grant is not None and request["approval_scope"] == "tool":
+        request["session_grant"] = grant.to_json()
+        request["session_grant_label"] = grant.label
+    return request
 
 
 def _approval_scope(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1326,6 +1353,7 @@ def _policy_revision(context: ToolExecutionContext, tool: Tool, execution: ToolE
     payload = {
         "permissions_revision": (None if context.effective_permissions is None
                                  else context.effective_permissions.revision),
+        "approval_mode": context.approval_mode,
         "workspace_root": (None if context.workspace_root is None else str(context.workspace_root)),
         "cwd": None if context.cwd is None else str(context.cwd),
         "allow_write_tools": context.allow_write_tools if ToolEffect.WRITE_WORKSPACE in effects else None,

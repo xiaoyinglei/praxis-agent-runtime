@@ -628,6 +628,8 @@ def _interaction_options(
     request: Mapping[str, object],
 ) -> tuple[str, ...]:
     if kind == "tool_approval":
+        if isinstance(request.get("session_grant"), Mapping):
+            return ("approve", "allow_session", "deny")
         return ("approve", "deny")
     if kind != "choice":
         return ()

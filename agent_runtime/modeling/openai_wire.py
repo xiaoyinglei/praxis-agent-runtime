@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
 
 from agent_runtime.core.messages import (
     ModelMessage,
@@ -11,6 +9,7 @@ from agent_runtime.core.messages import (
     ToolCall,
     ToolUseResult,
     canonical_json_text,
+    decode_tool_arguments,
     snapshot_model_message,
 )
 from agent_runtime.core.model_request import (
@@ -191,11 +190,11 @@ def parse_openai_response(response: object) -> ToolUseResult:
         if not isinstance(name, str) or not name:
             raise ValueError("tool call function name must be non-empty")
         raw_arguments = _field(function, "arguments", default={})
-        arguments = _parse_arguments(raw_arguments)
+        arguments, argument_error = decode_tool_arguments(raw_arguments)
         call_id = _field(raw_call, "id", default=None)
         if not isinstance(call_id, str) or not call_id:
             call_id = f"call_{index}"
-        calls.append(ToolCall(id=call_id, name=name, input=arguments))
+        calls.append(ToolCall(id=call_id, name=name, input=arguments, argument_error=argument_error))
 
     content = _field(message, "content", default="")
     if content is None:
@@ -340,24 +339,6 @@ def _tool_choice_payload(choice: ToolChoice) -> JsonValue:
             "function": {"name": choice.name},
         }
     return choice.mode.value
-
-
-def _parse_arguments(raw: object) -> dict[str, object]:
-    if isinstance(raw, Mapping):
-        parsed: object = raw
-    elif isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = {"_raw": raw[:20_000]}
-    else:
-        parsed = {"_raw": str(raw)[:20_000]}
-    if not isinstance(parsed, Mapping):
-        parsed = {"_raw": parsed}
-    frozen = json_schema_output(None, cast(JsonValue, parsed))
-    if not isinstance(frozen, Mapping):
-        raise TypeError("parsed tool arguments must be an object")
-    return {key: _thaw_json(value) for key, value in frozen.items()}
 
 
 def _first_token_count(

@@ -193,6 +193,48 @@ uv run agent mcp remove docs
 
 本地 stdio MCP 保留原有沙箱启动方式，Linux 下保持只读、禁网络。项目提供的是 MCP 连接目录，不会下载执行任意第三方插件。移除本机连接不会撤销服务商侧的账号授权。
 
+## 审批方式
+
+新聊天和 `agent run` 默认使用“帮我批准”。在聊天中输入 `/permissions`，会直接出现选择面板；用方向键或鼠标选择，Enter 确认，Esc 取消。终端底部持续显示当前模式。
+
+| 审批模式 | 行为 |
+| --- | --- |
+| 请求批准（`ask`） | 读取允许的文件；写入、进程执行和联网需要审批或已有明确授权 |
+| 帮我批准（`auto`） | 自动执行权限范围内的普通文件编辑、只读且断网的沙箱命令、公开网页读取；其他动作弹出审批 |
+| 完全访问（`full`） | 自动批准当前权限范围内的普通工具动作，包括命令的联网请求；明确拒绝、强制确认、管理员上限和沙箱保护仍有效 |
+
+需要确认时，面板提供“允许一次”“本会话允许同类命令”（符合条件时显示）和“拒绝”。直接选择即可，不需要输入字母指令。普通终端的单次 `run` 也使用选择对话框；非交互输出仍保留可恢复的暂停记录。
+
+同类命令授权保留完整命令的 token 前缀，只允许追加参数，面板会展示具体范围。例如批准 `git status` 后，可在相同目录执行 `git status --short`，不会批准 `git reset`、追加管道或 shell 替换、写入或联网升级。只有只读、断网沙箱里的简单命令提供该选项；复合 shell 和解释器脚本仍需单次审批。授权绑定工具版本、其他完整参数、目录及当前权限，不能突破权限上限。
+
+`/permissions grants` 查看临时命令授权，`/permissions revoke` 全部撤销。临时授权只属于当前打开的 Session，退出或重新打开聊天后失效；审批模式随聊天保存，切换聊天恢复其自己的模式。`/permissions show` 查看权限策略；原有 `load`、`profile`、`reload` 子命令继续可用。
+
+也可以在启动时选择模式；显式参数覆盖所打开聊天的保存模式：
+
+```bash
+uv run agent chat --approval-mode auto
+uv run agent run "检查项目测试" --approval-mode ask
+uv run agent resume <thread-id> --approval-mode ask
+```
+
+Python SDK 使用同一策略。省略模式时保留既有 SDK 默认行为；同一 `Session` 内的授权可以跨多轮请求使用：
+
+```python
+import asyncio
+from agent_runtime import Agent
+
+async def main():
+    agent = Agent(workspace_path=".", approval_mode="auto")
+    async with agent.session() as session:
+        result = await session.submit("检查项目测试")
+        print(result.answer)
+        # 暂停时由宿主界面展示 result.pause.options，再提交用户选择。
+        # await session.resume(result.turn_id, "approve")
+        # session.revoke_approval_grants()
+
+asyncio.run(main())
+```
+
 ## 权限与跨目录资料
 
 工作区决定默认范围，权限策略决定额外允许的范围。模型工具不能通过修改策略文件为自己授权。

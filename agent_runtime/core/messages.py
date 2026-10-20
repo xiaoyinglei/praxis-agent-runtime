@@ -42,6 +42,7 @@ class ToolCall:
     id: str
     name: str
     input: dict[str, Any]
+    argument_error: str | None = None
 
     @classmethod
     def create(cls, name: str, input: dict[str, Any]) -> ToolCall:
@@ -55,9 +56,27 @@ class ToolCall:
             id=self.id,
             name=self.name,
             input=cast(dict[str, Any], frozen_input),
+            argument_error=self.argument_error,
         )
         memo[id(self)] = copied
         return copied
+
+
+def decode_tool_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
+    """Decode an object without disguising syntax errors as schema errors."""
+    if isinstance(raw, Mapping):
+        parsed = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as error:
+            return {"_raw": raw}, f"Invalid tool arguments JSON: {error}"
+        if not isinstance(parsed, Mapping):
+            return {"_raw": raw}, "Invalid tool arguments JSON: expected an object"
+    else:
+        return {"_raw": str(raw)}, "Invalid tool arguments JSON: expected an object or JSON string"
+    frozen = json_schema_output(None, dict(parsed))
+    return cast(dict[str, Any], _thaw_json(frozen)), None
 
 
 # ── Model message ──
@@ -136,6 +155,7 @@ def snapshot_model_message(message: ModelMessage) -> ModelMessage:
                 id=call.id,
                 name=call.name,
                 input=cast(dict[str, Any], frozen_input),
+                argument_error=call.argument_error,
             )
         )
     return ModelMessage(

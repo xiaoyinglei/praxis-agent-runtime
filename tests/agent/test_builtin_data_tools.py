@@ -186,6 +186,33 @@ async def test_read_file_routes_pdf_and_xlsx_to_structured_inspection(
 
 @pytest.mark.anyio
 @pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_fresh_process_and_saved_script_share_interpreter(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path)
+    tool = _tools(workspace)["execute_python"]
+    (workspace.root / "probe.py").write_text(
+        "import os, sys, json, openpyxl\n"
+        "assert __name__ == '__main__'\n"
+        "print(json.dumps({'pid': os.getpid(), 'executable': sys.executable, 'package': openpyxl.__file__}))\n"
+    )
+    first = await _execute(tool, {"code": (
+        "import os, sys, json, openpyxl\nnonce = 42\n"
+        "print(json.dumps({'pid': os.getpid(), 'executable': sys.executable, 'package': openpyxl.__file__}))"
+    )}, workspace=workspace, approve=True)
+    second = await _execute(tool, {"code": (
+        "assert 'nonce' not in globals()\n"
+        "import runpy\nrunpy.run_path('probe.py', run_name='__main__')"
+    )}, workspace=workspace, approve=True)
+    assert not first.result.is_error, first.result.error_message
+    assert not second.result.is_error, second.result.error_message
+    before = json.loads(first.result.structured_content["stdout"])
+    after = json.loads(second.result.structured_content["stdout"])
+    assert before["pid"] != after["pid"]
+    assert before["executable"] == after["executable"]
+    assert before["package"] == after["package"]
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
 async def test_execute_python_uses_managed_runtime_and_attests_new_output(
     tmp_path: Path,
 ) -> None:

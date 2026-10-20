@@ -166,6 +166,29 @@ def _assert_one_trace(executor: ToolExecutor, call_id: str, code: str | None) ->
 
 
 @pytest.mark.anyio
+async def test_argument_decode_error_prevents_validation_and_execution():
+    events = []
+    tool = _tool(validate_input=lambda arguments: events.append("validate") or arguments,
+                 run=lambda arguments: events.append("run") or {})
+    executor = ToolExecutor({"demo": tool})
+    call = replace(_call(arguments={"_raw": '{"value":'}),
+                   argument_error="Invalid tool arguments JSON: Expecting value at line 1 column 10 (char 9)")
+    execution = await executor.execute(call, context=_context())
+    assert execution.result.error_code == "invalid_arguments"
+    assert execution.result.error_message == call.argument_error
+    assert execution.result.retryable is True
+    assert not events
+
+
+@pytest.mark.anyio
+async def test_valid_raw_field_does_not_trigger_argument_decode_error():
+    tool = _tool(validate_input=lambda arguments: arguments, run=lambda arguments: {"value": arguments["_raw"]})
+    executor = ToolExecutor({"demo": tool})
+    execution = await executor.execute(_call(arguments={"_raw": "business"}), context=_context())
+    assert not execution.result.is_error
+
+
+@pytest.mark.anyio
 async def test_executor_uses_the_exact_success_order() -> None:
     events: list[str] = []
 

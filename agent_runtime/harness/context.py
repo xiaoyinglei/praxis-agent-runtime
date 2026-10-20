@@ -796,7 +796,10 @@ def _tool_call(payload: Mapping[str, object]) -> HarnessToolCall:
     arguments = payload.get("arguments")
     if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
         raise RuntimeError("committed model tool call is malformed")
-    return HarnessToolCall(id=call_id, name=name, arguments=arguments)
+    argument_error = payload.get("argument_error")
+    if argument_error is not None and not isinstance(argument_error, str):
+        raise RuntimeError("committed model tool argument error is malformed")
+    return HarnessToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error)
 
 
 def _compaction_projection(

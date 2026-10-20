@@ -30,7 +30,7 @@ CHAT_COMMANDS = {
     "/effort": "查看或设置模型支持的思考强度；default 重置，off 关闭（需要模型支持）",
     "/output": "查看或设置单次输出额度；正整数或 default；包含思考 token",
     "/model": "选择模型；也支持 current、list、switch <id>",
-    "/permissions": "查看有效权限；load <文件>、profile <名称>、reload 更新当前策略",
+    "/permissions": "选择审批模式；mode ask|auto|full；grants 查看授权；revoke 撤销；show 查看权限",
     "/verbose": "切换详细输出",
     "/copy": "复制最近回答的原始 Markdown",
     "/connections": "打开本机连接管理，由你选择服务并登录",
@@ -48,6 +48,7 @@ def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
         "a": ("approve", "allow_once"),
         "y": ("approve", "allow_once"),
         "yes": ("approve", "allow_once"),
+        "s": ("allow_session",),
         "n": ("deny",), "no": ("deny",), "d": ("deny",),
         "c": ("continue",),
     }

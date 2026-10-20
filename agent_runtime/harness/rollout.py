@@ -2839,6 +2839,7 @@ class RolloutStore:
         tool_name: str,
         arguments: Mapping[str, Any],
         origin: Mapping[str, Any],
+        argument_error: str | None = None,
     ) -> ItemSnapshot:
         if not tool_call_id or not tool_name:
             raise ValueError("tool call identity must be non-empty")
@@ -2850,6 +2851,10 @@ class RolloutStore:
             "arguments": frozen_arguments,
             "origin": frozen_origin,
         }
+        if argument_error is not None:
+            if not isinstance(argument_error, str):
+                raise TypeError("argument_error must be a string or None")
+            expected_payload["argument_error"] = argument_error
         item_id: str | None = None
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)

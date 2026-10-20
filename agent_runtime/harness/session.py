@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
+from agent_runtime.approval import ApprovalMode, CommandGrant
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness.protocol import (
@@ -132,6 +133,7 @@ class Session:
     ) -> Self:
         self = cls()
         explicit_tool_context = "tool_execution_context" in service_options
+        approval_mode = service_options.pop("approval_mode", None)
         agent = copy.copy(agent) if agent is not None else None
         self._agent = agent
         self.event_dispatcher = event_dispatcher or TurnEventDispatcher()
@@ -262,6 +264,16 @@ class Session:
                     self._persist_settings()
             else:
                 self._persist_settings()
+            saved_mode = settings.get("tool_execution_policy", {}).get("approval_mode")
+            selected_mode = (approval_mode if approval_mode is not None
+                             else saved_mode if not explicit_tool_context else None)
+            if selected_mode is not None:
+                if approval_mode == "ask":
+                    self.update_tool_policy(approval_mode=selected_mode, allow_write_tools=False,
+                                            allow_execute_tools=False, allow_web_tools=False,
+                                            auto_approve_sandboxed=False)
+                else:
+                    self.update_tool_policy(approval_mode=selected_mode)
             if agent is not None and agent._followup_model_id is not None:
                 assert self.model_control_plane is not None
                 self.model_control_plane.switch_model(
@@ -314,6 +326,7 @@ class Session:
                 try:
                     await self._stack.aclose()
                 finally:
+                    self.tool_execution_context = replace(self.tool_execution_context, command_grants=())
                     self._closed = True
 
     @asynccontextmanager
@@ -647,6 +660,7 @@ class Session:
         denied_tool_names: frozenset[str] | None = None,
         deny_effects: frozenset[ToolEffect] | None = None,
         auto_approve_sandboxed: bool | None = None,
+        approval_mode: ApprovalMode | None = None,
     ) -> None:
         self._ensure_open()
         updates: dict[str, Any] = {
@@ -659,6 +673,7 @@ class Session:
                 "denied_tool_names": denied_tool_names,
                 "deny_effects": deny_effects,
                 "auto_approve_sandboxed": auto_approve_sandboxed,
+                "approval_mode": approval_mode,
             }.items()
             if value is not None
         }
@@ -670,6 +685,22 @@ class Session:
             self.tool_execution_context = previous
             raise
         self._apply_tool_context()
+
+    def approval_grants(self) -> tuple[CommandGrant, ...]:
+        """Current process-local grants; never restored from a checkpoint."""
+        self._ensure_open()
+        return self.tool_execution_context.command_grants
+
+    def revoke_approval_grants(self) -> None:
+        self._ensure_open()
+        self.tool_execution_context = replace(self.tool_execution_context, command_grants=())
+        self._apply_tool_context()
+
+    def _add_approval_grant(self, grant: CommandGrant) -> None:
+        grants = self.tool_execution_context.command_grants
+        if grant not in grants:
+            self.tool_execution_context = replace(self.tool_execution_context, command_grants=(*grants, grant))
+            self._apply_tool_context()
 
     async def _open_agent_resources(
         self,
@@ -1073,6 +1104,7 @@ class Session:
                 decision = {
                     "allow_once": "approve",
                     "approve": "approve",
+                    "allow_session": "approve",
                     "deny": "deny",
                 }.get(action)
                 if (decision is None and action == "continue" and model_operations
@@ -1081,10 +1113,11 @@ class Session:
                         != self.store.request_input_revision(turn_id, model_operations[-1].request_ref)):
                     decision = "deny"
                 if decision is None:
-                    raise ValueError("tool approval action must be allow_once, approve, or deny")
+                    raise ValueError("tool approval action must be allow_once, approve, allow_session, or deny")
                 internal = await executor.resume(
                     turn_id=turn_id,
                     decision=decision,
+                    on_session_grant=self._add_approval_grant if action == "allow_session" else None,
                 )
             elif len(pending) == 1 and pending[0].kind in {
                 "clarification",
@@ -1200,9 +1233,9 @@ class Session:
             child_options = {
                 **self._service_options,
                 "model_binding": source_binding,
-                "tool_execution_context": restore_tool_policy(
+                "tool_execution_context": replace(restore_tool_policy(
                     self.tool_execution_context, policy_value, restore_session_grants=True,
-                ),
+                ), command_grants=()),
             }
             # Borrow providers through the source binding, independent of the parent's next selection.
             await self._prepare_step_binding(source_binding)

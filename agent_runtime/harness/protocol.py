@@ -18,6 +18,7 @@ class HarnessToolCall:
     id: str
     name: str
     arguments: Mapping[str, JsonValue]
+    argument_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

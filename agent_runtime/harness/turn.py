@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
 
+from agent_runtime.approval import CommandGrant
 from agent_runtime.budget import (
     BudgetLimitExceededError,
     PricingUnavailableError,
@@ -252,8 +253,9 @@ class TurnExecutor:
             messages = (HarnessMessage(role="context", content=memory_navigation(snapshot)), *messages)
         execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
         append_state = execution_policy.get("cache_continuity") == "append-v1"
+        runtime_capacity = execution_policy.get("revision") == "working-context-v2"
         clock = capture_runtime_clock()
-        if execution_policy.get("revision") == "working-context-v1" and not append_state:
+        if execution_policy.get("revision") in {"working-context-v1", "working-context-v2"} and not append_state:
             from agent_runtime.harness.context import RolloutContextManager
 
             if isinstance(self._context_manager, RolloutContextManager):
@@ -270,7 +272,10 @@ class TurnExecutor:
         if pressure and not append_state:
             messages = (
                 *messages,
-                HarnessMessage(role="context", content=_BUDGET_PRESSURE_MESSAGE),
+                HarnessMessage(role="context", content=(
+                    "Resource budget is running low. Prioritize remaining required actions and verification. "
+                    "Report unfinished work honestly if the limit is reached."
+                    if runtime_capacity else _BUDGET_PRESSURE_MESSAGE)),
             )
         completion = turn_context.binding_manifest.get("completion_policy", {})
         if (not append_state and completion.get("revision") == "completion-v2"
@@ -286,7 +291,8 @@ class TurnExecutor:
                 ),
             ))
         step_policy = turn_context.binding_manifest.get("step_budget_policy") == {"revision": "pressure-v1"}
-        if not append_state and (context_capacity_policy(turn_context.binding_manifest) is not None or step_policy):
+        if (not append_state and not runtime_capacity
+                and (context_capacity_policy(turn_context.binding_manifest) is not None or step_policy)):
             messages = (*messages, HarnessMessage(role="context", content="Runtime budget status:\n" +
                          json.dumps(self._budget_status(turn_context), sort_keys=True)))
         if step_policy and not append_state:
@@ -390,6 +396,20 @@ class TurnExecutor:
                 self._max_steps, turn.binding_manifest.get("model_step_budget", self._max_steps),
             ) - step + 1),
         }
+        if turn.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v2":
+            remaining = state.pop("requests_remaining_including_this")
+            state.pop("Runtime budget status")
+            state.pop("budget_pressure")
+            reminder = (
+                "Resource budget is running low. Prioritize remaining required actions and verification. "
+                "Report unfinished work honestly if the limit is reached." if pressure else None
+            )
+            if remaining <= 2:
+                reminder = (
+                    f"At most {remaining} model request(s) remain including this one. "
+                    "Prioritize remaining required actions and verification; report unfinished work honestly."
+                )
+            state["resource_reminder"] = reminder
         completion = turn.binding_manifest.get("completion_policy", {})
         state["acceptance_contract"] = dict(completion) if completion.get("acceptance_command") else None
         changed = {key: value for key, value in state.items() if key not in previous or previous[key] != value}
@@ -398,8 +418,9 @@ class TurnExecutor:
         update = marker + json.dumps(changed, ensure_ascii=False, sort_keys=True)
         if not previous:
             update += ("\nUse the latest clock for relative dates; clarify ambiguous dates. "
-                       "Keep the advisory plan current; it is not execution proof. "
-                       "Under budget pressure or <=2 requests, converge and report unfinished work.")
+                       "Keep the advisory plan current; it is not execution proof.")
+            if "resource_reminder" not in state:
+                update += " Under budget pressure or <=2 requests, converge and report unfinished work."
             if completion.get("acceptance_command"):
                 update += (" Run acceptance_contract.acceptance_command exactly via run_command in the workspace "
                            "root after the latest change, subject to normal permissions and approval.")
@@ -465,7 +486,7 @@ class TurnExecutor:
                 reason_code="byte_guard",
             )
         remaining = step.model_token_budget_remaining
-        if (
+        while (
             step.purpose == "agent_step"
             and step.budget_pressure
             and step.compaction_plan is None
@@ -476,6 +497,8 @@ class TurnExecutor:
             # joint summary/continuation plans intact and leave the atomic
             # dispatch reservation authoritative. Reprepare so wire, hashes,
             # pricing and the durable snapshot all use the same output cap.
+            # Re-encoding may append changed input limits. Each pass must
+            # strictly reduce the positive output cap, so this local refinement terminates.
             output_limit = remaining - prepared.resource_request.input_tokens
             if output_limit < 1:
                 raise ContextBudgetExceededError(
@@ -483,11 +506,12 @@ class TurnExecutor:
                     f"remaining={remaining}, input_tokens={prepared.resource_request.input_tokens}.",
                     reason_code="model_token_budget_exhausted",
                 )
-            step = replace(step, output_token_limit=min(prepared.resource_request.output_tokens, output_limit))
+            previous_output = prepared.resource_request.output_tokens
+            step = replace(step, output_token_limit=min(previous_output, output_limit))
             prepared = self._model.prepare(step.model_request())
-            if prepared.resource_request.total_tokens > remaining:
+            if prepared.resource_request.output_tokens >= previous_output:
                 raise ContextBudgetExceededError(
-                    f"Capped request exceeds Turn cumulative token budget: "
+                    f"Model preparation did not reduce the output cap: "
                     f"required={prepared.resource_request.total_tokens}, remaining={remaining}.",
                     reason_code="model_token_budget_exhausted",
                 )
@@ -511,6 +535,8 @@ class TurnExecutor:
         budget_status = next((json.loads(message.content.removeprefix("Runtime budget status:\n"))
                               for message in reversed(step.messages)
                               if message.content.startswith("Runtime budget status:\n")), None)
+        if step.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v2":
+            budget_status = self._budget_status(step.turn)
         if context_capacity_policy(step.binding_manifest) is not None:
             if budget_status is None:
                 budget_status = self._budget_status(step.turn)
@@ -572,7 +598,10 @@ class TurnExecutor:
             input_revision=self._store.request_input_revision(turn.turn_id, operation.request_ref),
         )
 
-    async def resume(self, *, turn_id: str, decision: str) -> TurnResult:
+    async def resume(
+        self, *, turn_id: str, decision: str,
+        on_session_grant: Callable[[CommandGrant], None] | None = None,
+    ) -> TurnResult:
         if self._tool_orchestrator is None:
             raise RuntimeError("Turn has no ToolOrchestrator for approval resume")
         turn = self._store.read_turn(turn_id)
@@ -615,6 +644,7 @@ class TurnExecutor:
             await self._tool_orchestrator.resume_approval(
                 turn_id=turn_id,
                 decision=decision,
+                on_session_grant=on_session_grant,
             )
         except ToolApprovalInvalidatedError as invalidated:
             return TurnResult(
@@ -1700,25 +1730,6 @@ class TurnExecutor:
                             budget_pressure=True,
                         )
                         prepared = await self._prepare_step(step_context)
-                normal_remaining = normal_token_remaining(self._store.read_budget_state(turn_id))
-                execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
-                if (execution_policy.get("finalization") == "budget-admission-v1"
-                        and normal_remaining is not None
-                        and prepared.resource_request.total_tokens * 2 > normal_remaining):
-                    # There is capacity for an answer, but not another complete
-                    # tool/result/answer cycle. Enforce the budget phase in the
-                    # exposed toolset, rather than merely asking the model to stop.
-                    step_context = replace(
-                        step_context, tools=(), budget_pressure=True, compaction_plan=None,
-                        binding_manifest={**step_context.binding_manifest, "runtime_budget_phase": "final_answer"},
-                        messages=(*step_context.messages, HarnessMessage(role="context", content=(
-                            "The remaining token budget admits only a final response. Tools are unavailable "
-                            "because another execution cycle would leave insufficient answer capacity. "
-                            "Summarize actual work and verification from existing evidence. "
-                            "State unfinished work and blockers honestly; never invent completion or passed checks."
-                        ))),
-                    )
-                    prepared = await self._prepare_step(step_context)
             except _SummaryStoppedError as stopped:
                 return stopped.result
             except ContextBudgetExceededError as exc:
@@ -2088,6 +2099,7 @@ class TurnExecutor:
                         "id": call.id,
                         "name": call.name,
                         "arguments": dict(call.arguments),
+                        **({"argument_error": call.argument_error} if call.argument_error is not None else {}),
                     }
                     for call in response.tool_calls
                 ),
@@ -2406,6 +2418,7 @@ def _aci_tool_call(
         tool_call_id=call.id,
         tool_name=call.name,
         arguments=call.arguments,
+        argument_error=call.argument_error,
         origin=ToolCallOrigin(
             request_id=request_id,
             toolset_revision=toolset_revision,
@@ -2441,7 +2454,10 @@ def _response_from_committed_item(item: ItemSnapshot) -> HarnessModelResponse:
         arguments = raw_call.get("arguments")
         if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
             raise RuntimeError("canonical model tool call is malformed")
-        calls.append(HarnessToolCall(id=call_id, name=name, arguments=arguments))
+        argument_error = raw_call.get("argument_error")
+        if argument_error is not None and not isinstance(argument_error, str):
+            raise RuntimeError("canonical model tool argument error is malformed")
+        calls.append(HarnessToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error))
     return HarnessModelResponse(
         text=text,
         provider_response_id=provider_response_id,

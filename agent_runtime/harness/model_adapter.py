@@ -225,6 +225,8 @@ class GatewayHarnessModel:
             capacity_policy=context_capacity_policy(request.binding_manifest)
             or getattr(self._resolved.gateway, "context_policy", None),
             append_state=append_state,
+            include_input_status=(request.binding_manifest.get("execution_context_policy", {})
+                                  .get("revision") != "working-context-v2"),
             supported_cache_parameters=self._resolved.capabilities.supported_cache_parameters if append_state else (),
         )
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
@@ -387,6 +389,7 @@ class GatewayHarnessModel:
                     id=call.id,
                     name=call.name,
                     arguments=call.input,
+                    argument_error=call.argument_error,
                 )
                 for call in response.turn.tool_calls
             ),
@@ -562,6 +565,7 @@ def _model_messages(
                         id=call.id,
                         name=call.name,
                         input=dict(call.arguments),
+                        argument_error=call.argument_error,
                     )
                     for call in message.tool_calls
                 ),
@@ -744,6 +748,7 @@ def _budgeted_request(
     input_token_limit: int | None = None,
     capacity_policy: ContextCapacityPolicy | None = None,
     append_state: bool = False,
+    include_input_status: bool = True,
     supported_cache_parameters: tuple[str, ...] = (),
 ) -> tuple[StableModelContext, ModelRequest, Mapping[str, Any] | None]:
     def build(candidate: StableModelContext) -> ModelRequest:
@@ -807,7 +812,7 @@ def _budgeted_request(
         }
         if stage == LLMCallStage.AGENT_STEP and input_token_limit is None:
             max_input_tokens = auto_limit
-        if stage == LLMCallStage.AGENT_STEP:
+        if stage == LLMCallStage.AGENT_STEP and include_input_status:
             input_status = "Runtime input limits:\n" + json.dumps({key: policy_fields[key] for key in (
                 "model_context_tokens", "explicit_input_cap", "effective_input_limit",
                 "auto_compact_limit", "post_compact_target",

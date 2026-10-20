@@ -63,6 +63,7 @@ def _tool_execution_policy_snapshot(
         "require_confirmation_for": sorted(context.require_confirmation_for),
         "denied_tool_names": sorted(context.denied_tool_names),
         "auto_approve_sandboxed": context.auto_approve_sandboxed,
+        "approval_mode": context.approval_mode,
     }
     if context.effective_permissions is not None:
         snapshot["permissions"] = context.effective_permissions.model_dump(mode="json")
@@ -150,7 +151,7 @@ class SessionBindingProvider:
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
         binding["step_budget_policy"] = {"revision": "pressure-v1"}
         binding["execution_context_policy"] = {
-            "revision": "working-context-v1", "finalization": "budget-admission-v1",
+            "revision": "working-context-v2",
             "cache_continuity": "append-v1",
         }
         binding["model_step_budget"] = self._model_step_budget

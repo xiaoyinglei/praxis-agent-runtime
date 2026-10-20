@@ -300,8 +300,8 @@ def test_failed_optional_compaction_state_survives_restart_and_resets_with_windo
         assert store.verify().valid
 
 
-@pytest.mark.parametrize("budget,final_only", [(40000, True), (100000, False)])
-def test_last_affordable_round_reserves_a_final_answer_instead_of_more_tools(tmp_path, budget, final_only):
+@pytest.mark.parametrize("budget", [40000, 100000])
+def test_single_affordable_request_keeps_tools_without_reserving_two_maximum_rounds(tmp_path, budget):
     import asyncio
 
     from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
@@ -329,14 +329,9 @@ def test_last_affordable_round_reserves_a_final_answer_instead_of_more_tools(tmp
                               context_manager=RolloutContextManager(store), completion_gate=Accept())
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "completed"
-        assert bool(gateway.requests[-1].tools) is (not final_only)
+        assert gateway.requests[-1].tools
         operation = store.list_model_operations(turn.turn_id)[-1]
-        assert operation.request_ref.get("budget_finalization", False) is final_only
-        if final_only:
-            restored = runner.restore_step_context(runner.restore_turn_context(turn.turn_id), operation)
-            repeated = asyncio.run(runner._prepare_step(restored))
-            assert restored.tools == ()
-            assert repeated.wire_hash == operation.wire_hash
+        assert not operation.request_ref.get("budget_finalization", False)
         assert store.read_budget_state(turn.turn_id).used.total_tokens <= budget
         assert store.verify().valid
 

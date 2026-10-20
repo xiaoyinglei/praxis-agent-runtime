@@ -35,8 +35,8 @@ async def test_real_turn_appends_state_and_restores_identical_saved_wire(tmp_pat
     with RolloutStore(tmp_path / "rollout.db") as store:
         updates = [i.payload["request_ref"].get("runtime_context_update")
                    for i in store.list_items(result.turn_id) if i.kind == "model_request"]
-        assert len(updates) == len(wires) and all(updates)
-        assert "Current advisory plan" not in updates[2]  # unchanged plan is not copied every step
+        assert len(updates) == len(wires) and updates[0]
+        assert "Current advisory plan" not in (updates[2] or "")  # unchanged plan is not copied every step
         assert store.verify().valid
 
 
@@ -179,14 +179,26 @@ def test_declared_cache_parameters_reach_gateway_with_stable_routing_key():
 
 
 @pytest.mark.anyio
-async def test_provider_input_limits_are_persisted_once_and_keep_full_prefix(tmp_path, monkeypatch):
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, monkeypatch, legacy):
     from types import SimpleNamespace
 
     from agent_runtime import Agent
     from agent_runtime.core.messages import StopReason, ToolCall
     from agent_runtime.harness import RolloutContextManager, TurnExecutor
+    from agent_runtime.harness.services import SessionBindingProvider
     from tests.agent.harness.test_compaction_consistency import Accept
     from tests.agent.harness.test_model_adapter import BoundGatewayHarnessModel, BudgetAwareCapturingGateway
+
+    if legacy:
+        original = SessionBindingProvider._static_snapshot
+
+        def legacy_snapshot(self, turn_id):
+            binding = original(self, turn_id)
+            binding["execution_context_policy"]["revision"] = "working-context-v1"
+            return binding
+
+        monkeypatch.setattr(SessionBindingProvider, "_static_snapshot", legacy_snapshot)
 
     class ReadThenAnswer(BudgetAwareCapturingGateway):
         async def agenerate_model_request(self, **kwargs):
@@ -218,11 +230,19 @@ async def test_provider_input_limits_are_persisted_once_and_keep_full_prefix(tmp
     assert result.status == "done", result.diagnostics
     before, after = gateway.requests
     assert after.messages[:len(before.messages)] == before.messages
-    assert sum(m.content.startswith("Runtime input limits:\n") for m in after.messages) == 1
+    assert sum(m.content.startswith("Runtime input limits:\n") for m in after.messages) == int(legacy)
+    if not legacy:
+        assert "Runtime budget status" not in str(after.messages)
+        assert "requests_remaining_including_this" not in str(after.messages)
+        assert "effective_input_limit" not in str(after.messages)
     with RolloutStore(tmp_path / "rollout.db") as store:
         operations = store.list_model_operations(result.turn_id)
-        assert operations[0].request_ref["runtime_input_update"]
+        assert bool(operations[0].request_ref.get("runtime_input_update")) == legacy
         assert "runtime_input_update" not in operations[1].request_ref
+        for operation in operations:
+            assert operation.request_ref["context_projection"]["effective_input_limit"] > 0
+            if not legacy:
+                assert "tokens_remaining" in operation.request_ref["budget_status"]
         runner = TurnExecutor(thread_id=result.thread_id, store=store, model=model,
                               context_manager=RolloutContextManager(store), completion_gate=Accept())
         runner._tool_orchestrator = SimpleNamespace(restore_tools=lambda revisions: captured[0].tools)
@@ -234,6 +254,8 @@ async def test_provider_input_limits_are_persisted_once_and_keep_full_prefix(tmp
             prepared = await runner._prepare_step(restored)
             assert prepared.wire_hash == operation.wire_hash
             assert prepared.request_hash == operation.request_hash
+            assert prepared.context_hash == operation.context_hash
+            assert prepared.tool_hash == operation.tool_hash
         assert store.verify().valid
 
 

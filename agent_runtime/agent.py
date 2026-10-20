@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from agent_runtime.approval import MODE_ORDER, ApprovalMode
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS
 from agent_runtime.knowledge import RAGKnowledgeConfig
@@ -61,10 +62,14 @@ class Agent:
         web_limits: WebLimits | None = None,
         permissions: PermissionPolicy | Path | str | None = None,
         managed_permissions: PermissionPolicy | Path | str | None = None,
+        approval_mode: ApprovalMode | None = None,
         reasoning_effort: str | None = None,
         max_output_tokens: int | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
+        if approval_mode is not None and approval_mode not in MODE_ORDER:
+            raise ValueError("approval_mode must be ask, auto, or full")
+        self.approval_mode = approval_mode
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if memory is not None and not isinstance(memory, MemoryConfig):
@@ -175,6 +180,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AgentResult:
@@ -185,6 +191,7 @@ class Agent:
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
+            approval_mode=approval_mode,
             max_steps=max_steps, max_turns=max_turns, max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
             event_sink=event_sink, _event_dispatcher=_event_dispatcher,
@@ -198,6 +205,7 @@ class Agent:
         acceptance_command: str | None = None,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
         max_steps: int | None = None, max_turns: int | None = None, max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
         event_sink: AgentEventSink | None = None,
@@ -220,6 +228,7 @@ class Agent:
             acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
+            approval_mode=approval_mode if approval_mode is not None else self.approval_mode,
             max_steps=DEFAULT_MAX_STEPS if step_budget is None else step_budget,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
@@ -422,6 +431,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Yield committed durable events while the Turn is still running."""
 
@@ -440,6 +450,7 @@ class Agent:
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
                 allow_web_tools=allow_web_tools,
+                approval_mode=approval_mode,
                 _event_dispatcher=dispatcher,
             )
         )

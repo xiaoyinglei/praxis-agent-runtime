@@ -178,7 +178,7 @@ class SkillCatalog:
     ) -> str:
         """Render a budget-aware skill listing for the model prompt.
 
-        Rules (matches Claude Code pattern):
+        Listing rules:
         1. Sort by source priority: bundled > project > user
         2. Bundled skills always get full descriptions
         3. Non-bundled descriptions are proportionally truncated when the

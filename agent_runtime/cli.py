@@ -18,6 +18,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
+from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODES, ApprovalMode
 from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
@@ -190,10 +191,14 @@ def agent_history(
 
 class _PermissionOptions(TypedDict, total=False):
     permissions: Path
+    approval_mode: ApprovalMode
 
 
-def _permission_options(path: Path | None) -> _PermissionOptions:
-    return {} if path is None else {"permissions": path}
+def _permission_options(path: Path | None, approval_mode: ApprovalMode | None = None) -> _PermissionOptions:
+    options: _PermissionOptions = {} if path is None else {"permissions": path}
+    if approval_mode is not None:
+        options["approval_mode"] = approval_mode
+    return options
 
 
 class _WebOptions(TypedDict, total=False):
@@ -434,6 +439,26 @@ async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | No
         print(f"请输入: {', '.join(options)}；q 取消")
 
 
+async def _handle_cli_pause(result: AgentResult) -> str | None:
+    """TTY approval uses a selector; plain input remains available for pipes."""
+    request = result.pause
+    if request is not None and request.kind == "tool_approval" and request.options and _is_interactive_terminal():
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        details = [request.question]
+        details.extend(f"{call.tool_name}: {call.args_preview}" for call in request.tool_calls)
+        scope = request.context.get("session_grant_label")
+        if isinstance(scope, str):
+            details.append("本会话授权范围：" + scope)
+        return await radiolist_dialog(
+            title="操作审批", text=safe_terminal_text("\n".join(details)),
+            values=[(choice, APPROVAL_CHOICES.get(choice, choice)) for choice in request.options],
+            default="deny" if "deny" in request.options else request.options[0],
+            ok_text="确认", cancel_text="取消",
+        ).run_async()
+    return _handle_pause(result)
+
+
 def _handle_pause(
     result: AgentResult,
 ) -> str | None:
@@ -450,13 +475,20 @@ def _handle_pause(
             print(f"  {risk_mark} {tc.tool_name}: {tc.args_preview}")
             if tc.reason:
                 print(f"     原因: {tc.reason}")
+    grant_label = req.context.get("session_grant_label")
+    if "allow_session" in req.options and isinstance(grant_label, str):
+        print("  本会话授权范围: " + safe_terminal_text(grant_label))
 
     options = req.options
     text_answer = req.kind in {"clarification", "choice"}
     if not options and not text_answer:
         print("此暂停没有提供可选操作，已取消当前执行。")
         return None
-    print(f"  选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
+    if req.kind == "tool_approval":
+        for number, option in enumerate(options, 1):
+            print(f"  {number}. {APPROVAL_CHOICES.get(option, option)}")
+    else:
+        print(f"  选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
 
     while True:
         choice = input("> ").strip()
@@ -464,11 +496,13 @@ def _handle_pause(
             return None
         if text_answer:
             resolved = choice if choice and (not options or choice in options) else None
+        elif choice.isdecimal() and 1 <= int(choice) <= len(options):
+            resolved = options[int(choice) - 1]
         else:
             resolved = resolve_pause_choice(choice, options)
         if resolved is not None:
             return resolved
-        print(f"  请输入: {', '.join(options)} (或 Y=允许, N=拒绝, q=退出)")
+        print("  请选择选项编号；q 取消。" if not text_answer else "  请输入你的回答。")
 
 
 def _display_pending_recovery(
@@ -541,6 +575,7 @@ def _create_agent_facade(
     web_proxy_url: str | None = None,
     web_limits_file: Path | None = None,
     permissions: Path | None = None,
+    approval_mode: ApprovalMode | None = None,
     reasoning_effort: str | None = None,
     max_output_tokens: int | None = None,
     _selection_requester: ModelSwitchRequester = "system",
@@ -561,7 +596,7 @@ def _create_agent_facade(
             web_search_provider=web_search_provider,
             web_proxy_url=web_proxy_url,
             web_limits=_load_web_limits(web_limits_file),
-            **_permission_options(permissions),
+            **_permission_options(permissions, approval_mode),
             _selection_requester=_selection_requester,
         )
     except ValueError as error:
@@ -668,7 +703,7 @@ async def _run_facade_command(
         )
         while result.status == "paused" and interactive_approval:
             display.finish()
-            action = _handle_pause(result)
+            action = await _handle_cli_pause(result)
             if action is None:
                 break
             display.begin_turn()
@@ -791,9 +826,12 @@ def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | Non
             for call in request.tool_calls:
                 print(safe_terminal_text(f"  {call.tool_name}: {call.args_preview}"))
             if request.options:
-                print("可直接回复: " + ", ".join(request.options))
                 if request.kind == "tool_approval":
-                    print("Y 允许 · N 拒绝；/new 开始新聊天。")
+                    print("可选择: " + " / ".join(APPROVAL_CHOICES.get(choice, choice)
+                                               for choice in request.options))
+                    print("继续后会显示审批选择面板；/new 开始新聊天。")
+                else:
+                    print("可直接回复: " + ", ".join(request.options))
             else:
                 print("直接输入你的回答即可继续；/new 开始新聊天。")
         else:
@@ -832,6 +870,12 @@ async def _chat_facade_loop(
     last_answer = ""
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
+    startup_approval_mode = getattr(facade, "approval_mode", None)
+    chat_approval_mode = startup_approval_mode
+    if chat_approval_mode is None and resume_thread_id is None and previous_turn_id is None:
+        chat_approval_mode = "auto"
+    if _ui:
+        _ui.approval_mode = chat_approval_mode or "历史权限待加载"
     pending_files: list[str] = []
     default_chat_knowledge = getattr(facade, "knowledge", None)
     chat_workspace = default_chat_workspace
@@ -846,6 +890,9 @@ async def _chat_facade_loop(
         selected_chat: ChatSessionSummary | None = None
 
         def refresh_request_status(control: Agent | Session) -> None:
+            context = getattr(control, "tool_execution_context", None)
+            if _ui and context is not None:
+                _ui.approval_mode = context.approval_mode
             reader = getattr(control, "request_settings", None)
             if callable(reader):
                 event_display.update_request_settings(reader())
@@ -855,6 +902,7 @@ async def _chat_facade_loop(
 
         async def reopen(selector: str) -> bool:
             nonlocal session, selected_chat, current_turn_id, last_result, last_answer, model_id
+            nonlocal chat_approval_mode
             database = facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH
             selected = await _select_chat_session(
                 database, Path(default_chat_workspace), selector=selector, ui=_ui,
@@ -868,6 +916,8 @@ async def _chat_facade_loop(
             stack.callback(event_display.finish)
             session = None
             selected_chat = selected
+            chat_approval_mode = startup_approval_mode
+            facade.approval_mode = startup_approval_mode
             current_turn_id = selected.head_turn_id
             last_result = None
             last_answer = next((text for kind, text in reversed(messages) if kind == "answer"), "")
@@ -878,6 +928,7 @@ async def _chat_facade_loop(
             facade._followup_model_id = None
             if _ui:
                 _ui.model = model_id
+                _ui.approval_mode = "历史权限待加载"
                 await _ui.replay_messages(messages)
             else:
                 for kind, text in messages:
@@ -911,6 +962,7 @@ async def _chat_facade_loop(
                 max_turns=max_turns, max_tokens_total=max_tokens_total,
                 require_workspace_change=False, allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
+                **({"approval_mode": chat_approval_mode} if chat_approval_mode is not None else {}),
             ))
             session = opened
             model_id = opened.current_model().id
@@ -1001,6 +1053,51 @@ async def _chat_facade_loop(
 
                 parts = query.split(maxsplit=2)
                 try:
+                    mode = None
+                    if query == "/permissions":
+                        current_mode = (session.tool_execution_context.approval_mode if session
+                                        else chat_approval_mode or "ask")
+                        choices = list(APPROVAL_MODES.values())
+                        if _ui:
+                            chosen = await _ui.choose_menu(
+                                choices, title="选择审批模式", current=APPROVAL_MODES[current_mode],
+                            )
+                            if chosen is None:
+                                continue
+                            mode = list(APPROVAL_MODES)[choices.index(chosen)]
+                        else:
+                            for key, label in APPROVAL_MODES.items():
+                                print(f"  {key}: {label}")
+                            chosen = (await asyncio.to_thread(input, "审批模式 ask/auto/full（空行取消）: ")).strip()
+                            if not chosen:
+                                continue
+                            mode = chosen
+                    elif len(parts) == 3 and parts[1] == "mode":
+                        mode = parts[2]
+                    if mode is not None:
+                        if mode not in APPROVAL_MODES:
+                            raise ValueError("审批模式必须为 ask、auto 或 full")
+                        if session is not None:
+                            session.update_tool_policy(approval_mode=cast(ApprovalMode, mode),
+                                                       allow_write_tools=False, allow_execute_tools=False,
+                                                       allow_web_tools=False, auto_approve_sandboxed=False)
+                        chat_approval_mode = cast(ApprovalMode, mode)
+                        facade.approval_mode = chat_approval_mode
+                        if _ui:
+                            _ui.approval_mode = chat_approval_mode
+                        allow_write_tools = allow_execute_tools = allow_web_tools = False
+                        print("审批模式: " + APPROVAL_MODES[mode])
+                        continue
+                    if query == "/permissions grants":
+                        grants = session.approval_grants() if session is not None else ()
+                        print("当前会话授权：" + ("\n" + "\n".join(safe_terminal_text(grant.label) for grant in grants)
+                                             if grants else "无"))
+                        continue
+                    if query == "/permissions revoke":
+                        if session is not None:
+                            session.revoke_approval_grants()
+                        print("已撤销当前会话的全部命令授权。")
+                        continue
                     if len(parts) == 3 and parts[1] == "load":
                         policy_path = Path(parts[2]).expanduser()
                         if session is not None:
@@ -1022,8 +1119,9 @@ async def _chat_facade_loop(
                     elif len(parts) == 2 and parts[1] == "reload":
                         if session is not None:
                             session.reload_permissions()
-                    elif query != "/permissions":
-                        print("用法: /permissions [load <文件> | profile <workspace|read-only|trusted-local> | reload]")
+                    elif query != "/permissions show":
+                        print("用法: /permissions [mode ask|auto|full | grants | revoke | show | "
+                              "load <文件> | profile <名称> | reload]")
                         continue
                     effective = session.permissions() if session is not None else facade.effective_permissions()
                     print(json.dumps(effective.explain(), ensure_ascii=False, indent=2))
@@ -1213,7 +1311,7 @@ async def _chat_facade_loop(
                                         and any(facade.input_status(identity) == "pending"
                                                 for identity in _ui._input_receipts))
                 action = ("continue" if pending_steering
-                          else await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result))
+                          else await _handle_ui_pause(result, _ui) if _ui else await _handle_cli_pause(result))
                 if action is None:
                     result = await resume_driver.resume(result.turn_id, "abort")
                     print("已取消。")
@@ -1905,6 +2003,11 @@ def agent_chat(
                                  help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option(
+            "--approval-mode", help="ask 请求批准 | auto 帮我批准（新聊天默认）| full 范围内全自动",
+        ),
+    ] = None,
     reasoning_effort: Annotated[
         str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
     ] = None,
@@ -1913,6 +2016,8 @@ def agent_chat(
     ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
+    if approval_mode == "ask":
+        allow_write_tools = allow_execute_tools = allow_web_tools = False
     if sum((previous_turn_id is not None, last or continue_chat, resume_thread_id is not None)) > 1:
         raise typer.BadParameter("--previous-turn-id、--continue/--last 和 --resume 只能选择一个")
     effective_previous_turn_id = previous_turn_id
@@ -1963,7 +2068,7 @@ def agent_chat(
         workspace_path=facade_workspace,
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
         knowledge=facade_knowledge,
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         _selection_requester="user",
         **web_options,
     )
@@ -2086,6 +2191,9 @@ def agent_run(
         ),
     ] = False,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    approval_mode: Annotated[
+        ApprovalMode, typer.Option("--approval-mode", help="ask 请求批准 | auto 帮我批准 | full 权限范围内全自动"),
+    ] = "auto",
     reasoning_effort: Annotated[
         str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
     ] = None,
@@ -2094,6 +2202,8 @@ def agent_run(
     ] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
+    if approval_mode == "ask":
+        allow_write_tools = allow_execute_tools = allow_web_tools = False
     if previous_turn_id is not None and last:
         raise typer.BadParameter("--previous-turn-id 与 --last 不能同时使用")
     effective_previous_turn_id = previous_turn_id
@@ -2120,7 +2230,7 @@ def agent_run(
         workspace_path=Path.cwd(),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         enable_workspace_mcp=not disable_workspace_mcp,
         web_search_key_file=web_search_key_file,
         web_search_provider=web_search_provider,
@@ -2193,12 +2303,15 @@ def agent_resume(
                                  help="bing | brave | tavily"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option("--approval-mode", help="覆盖聊天保存的审批模式：ask | auto | full"),
+    ] = None,
 ) -> None:
     """重新打开旧聊天：只读回放历史，下一条消息创建新 Turn。原任务恢复使用 recover。"""
     agent_chat(resume_thread_id=thread_id or "", checkpoint_db=checkpoint_db,
                web_proxy_url=web_proxy_url, web_limits_file=web_limits_file,
                web_search_key_file=web_search_key_file, web_search_provider=web_search_provider,
-               **_permission_options(permissions))
+               **_permission_options(permissions, approval_mode))
 
 
 @agent_app.command(name="recover")
@@ -2248,6 +2361,9 @@ def agent_recover(
                                  help="bing | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option("--approval-mode", help="恢复时使用的当前审批模式：ask | auto | full"),
+    ] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
     if turn_id is not None and last:
@@ -2295,7 +2411,7 @@ def agent_recover(
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         **web_options,
     )
     event_display = _CLIToolEventDisplay()

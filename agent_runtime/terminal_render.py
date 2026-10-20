@@ -317,7 +317,7 @@ def bounded_result_lines(
     max_rows: int = DEFAULT_RESULT_ROWS,
     verbose: bool = False,
 ) -> list[str]:
-    """Format a result with Codex-style middle omission for terminal display."""
+    """Format a result with middle omission for terminal display."""
 
     if max_rows < 1:
         raise ValueError("result row budget must be positive")

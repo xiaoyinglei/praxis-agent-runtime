@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult, decode_tool_arguments
 from agent_runtime.core.model_request import ModelRequest
 from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
@@ -427,8 +427,10 @@ class LLMGateway:
             # A block stop alone is not a completed model step. Wait for the
             # authoritative terminal reason before decoding any tool fragments.
             if stop_reason in {"tool_use", "tool_calls"}:
-                calls = [ToolCall(id=tool_id, name=name, input=_tool_arguments(tool_arguments[tool_id]))
-                         for tool_id, name in tool_names.items() if tool_id in completed_tool_ids]
+                for tool_id, name in tool_names.items():
+                    if tool_id in completed_tool_ids:
+                        arguments, argument_error = decode_tool_arguments(tool_arguments[tool_id])
+                        calls.append(ToolCall(id=tool_id, name=name, input=arguments, argument_error=argument_error))
             normalized_stop = (
                 StopReason.MAX_TOKENS
                 if stop_reason == "max_tokens"
@@ -1128,16 +1130,6 @@ def _plain_wire_value(value: object) -> Any:
     if isinstance(value, tuple):
         return [_plain_wire_value(item) for item in value]
     return value
-
-
-def _tool_arguments(value: str) -> dict[str, Any]:
-    if not value:
-        return {}
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {"_raw": value[:20_000]}
-    return dict(parsed) if isinstance(parsed, Mapping) else {"_raw": parsed}
 
 
 def _account_messages(

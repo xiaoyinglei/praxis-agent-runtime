@@ -476,6 +476,13 @@ class ToolExecutor:
                 started_at=started_at,
             )
 
+        if call.argument_error is not None:
+            return await self._finish(
+                call=call,
+                result=_error_result(call, code="invalid_arguments", message=call.argument_error, retryable=True),
+                record=None,
+                started_at=started_at,
+            )
         try:
             arguments = tool.validate_input(call.arguments)
         except ToolValidationError as error:
@@ -614,6 +621,12 @@ class ToolExecutor:
                 resolved=resolved,
                 boundary=boundary,
             )
+        call_denied = call.tool_call_id in context.denied_tool_call_ids
+        network_denied = (ToolEffect.NETWORK in resolved.effects
+                          and _network_approval_id(call.tool_call_id) in context.denied_tool_call_ids)
+        if call_denied or network_denied:
+            decision = CanUseToolResult(UseToolDecision.DENY, "tool call was denied by the user",
+                                        "tool" if call_denied else "network")
         if decision.decision is UseToolDecision.DENY:
             return await self._finish(
                 call=call,
@@ -622,6 +635,7 @@ class ToolExecutor:
                     code="tool_denied",
                     message=decision.reason,
                     retryable=False,
+                    metadata=_approval_metadata(call, resolved, decision) if call_denied or network_denied else None,
                 ),
                 record=None,
                 started_at=started_at,
@@ -649,6 +663,7 @@ class ToolExecutor:
             and not (decision.decision is UseToolDecision.ASK and decision.approval_scope == "network")
             and not (context.effective_permissions is not None
                      and context.effective_permissions.command_network_allowed() == "allow")
+            and context.approval_mode != "full"
         ):
             if (context.effective_permissions is not None
                     and context.effective_permissions.effective_approval == "never"):

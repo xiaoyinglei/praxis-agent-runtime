@@ -1,8 +1,7 @@
 """macOS/Linux command handles; process execution and OS policy stay in shell.
 
-The yield/deadline split follows Codex unified_exec; see the source references
-in docs/macos-command-sessions.md. Independently
-implemented with asyncio; no upstream source code is copied.
+Yielding returns control while the process remains alive; the execution
+deadline bounds its lifetime across subsequent polls.
 """
 from __future__ import annotations
 
