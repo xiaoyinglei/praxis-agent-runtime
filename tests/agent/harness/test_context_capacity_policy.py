@@ -563,11 +563,19 @@ async def test_context_details_are_available_on_request_without_chat_noise(capsy
     assert "1015296" in rendered and "943718" in rendered
     assert "剩余 agent 步骤=14" in rendered and "剩余 agent 步骤=15" not in rendered
     display.set_verbose(True)
+    assert "剩余 agent 步骤=14" in view.plain_text()
+    assert "剩余 agent 步骤=15" not in view.plain_text()
     await display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="turn", data={
         "context_projection": {"effective_input_limit": 999}, "budget_status": {},
     }))
     assert "输入上限=999" in view.plain_text()
+    assert "输入上限=1015296" not in view.plain_text()
+    display.set_verbose(False)
+    assert "输入上限" not in view.plain_text()
+    display.set_verbose(True)
+    assert view.plain_text().count("输入上限=999") == 1
     display.clear_context_status()
+    assert "输入上限" not in view.plain_text()
     display.show_context_status()
     assert capsys.readouterr().out == ""
 

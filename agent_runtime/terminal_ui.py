@@ -197,6 +197,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._tool_blocks: dict[tuple[str, str], Block] = {}
         self._projected: dict[tuple[str, str, EventType], None] = {}
         self._receipt: Block | None = None
+        self._context_detail: Block | None = None
         self.turn_id: str | None = None
         self.connection_required = False
         self._new_answer = True
@@ -215,6 +216,10 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._activity_status = "等待模型响应"
         self._last_activity = self._clock()
         if reset:
+            if self._context_detail is not None:
+                self._context_detail.text = "\n".join(
+                    value for key, value in self._context_status.items() if key != "request_settings"
+                )
             self.group = None
             self._tool_blocks.clear()
             self._projected.clear()
@@ -411,6 +416,20 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
 
     def _render_context_status(self, key: str, value: str) -> None:
         self._context_status[key] = value
+        if self._context_detail is None or self._context_detail not in self.view.blocks:
+            self._context_detail = self.view._add(Block("diagnostic", title="上下文状态"))
+        self._context_detail.text = safe_terminal_text("\n".join(
+            line for name, line in self._context_status.items() if name != "request_settings"
+        ))
+        self._context_detail.trim(MAX_TEXT)
+        self.view.invalidate()
+
+    def clear_context_status(self) -> None:
+        super().clear_context_status()
+        if self._context_detail is not None and self._context_detail in self.view.blocks:
+            self.view.blocks.remove(self._context_detail)
+        self._context_detail = None
+        self.view.invalidate()
 
     def _write_line(self, value: str, *, record: bool = True) -> None:
         if record:
