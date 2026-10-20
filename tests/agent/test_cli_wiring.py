@@ -773,17 +773,22 @@ def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> 
     assert "switch this session" in current.output
 
 
-def test_help_separates_workspace_change_from_explicit_acceptance() -> None:
+def test_help_separates_workspace_change_from_explicit_acceptance(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Rich owns the layout width independently of Click's terminal_width/COLUMNS.
+    monkeypatch.setattr("typer.rich_utils.MAX_WIDTH", 240)
     result = CliRunner().invoke(
         agent_app,
         ["run", "--help"],
-        env={"COLUMNS": "240"},
+        env={"COLUMNS": "240", "FORCE_COLOR": None, "TERM": "xterm-256color", "NO_COLOR": "1"},
+        terminal_width=240,
+        color=False,
     )
 
     assert result.exit_code == 0
-    assert "真实 workspace 变更" in result.output
-    assert "--acceptance-command" in result.output
-    assert "最后修改后真实执行成功" in result.output
+    output = click.unstyle(result.output)
+    assert "真实 workspace 变更" in output
+    assert "--acceptance-command" in output
+    assert "最后修改后真实执行成功" in output
 
 
 def test_agent_run_rejects_missing_input_without_internal_traceback(

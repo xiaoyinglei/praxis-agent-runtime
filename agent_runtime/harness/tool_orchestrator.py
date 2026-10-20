@@ -12,6 +12,7 @@ from stat import S_ISLNK
 from typing import Any, Literal
 from uuid import uuid4
 
+from agent_runtime.approval import CommandGrant, command_grant
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness.events import RolloutEventReader
@@ -40,6 +41,7 @@ from agent_runtime.tools.tool import (
     ToolCall,
     ToolCallOrigin,
     ToolContentBlock,
+    ToolContinuation,
     ToolEffect,
     ToolProgress,
     ToolProgressKind,
@@ -165,6 +167,62 @@ class ToolReconciliationOutcome:
 class ToolOrchestrator:
     """Commit call/operation/result lifecycle while ToolExecutor enforces the ACI."""
 
+    async def restore_command_sessions(self, sessions: Any, turn_id: str, *, include_terminal: bool = False) -> None:
+        """Claim only jobs whose complete launch is in this Turn's trusted ledger."""
+        from agent_runtime.tools.builtins.shell import RunCommandInput
+        items = {item.item_id: item for item in self._store.list_items(turn_id)}
+        terminal: set[tuple[str, str]] = set()
+        operations = self._store.list_tool_operations(turn_id)
+        observed_results = {
+            operation.result_item_id for operation in operations
+            if operation.tool_name == "manage_command" and operation.status == "succeeded"
+        }
+        for evidence_item in items.values():
+            payload = evidence_item.payload
+            output = payload.get("structured_content")
+            metadata = payload.get("metadata", {})
+            origin = metadata.get("runtime_workspace_origin_operation_id")
+            if (evidence_item.kind == "tool_result" and evidence_item.producer == "tool"
+                    and evidence_item.item_id in observed_results and isinstance(origin, str)
+                    and isinstance(output, Mapping) and output.get("status") in {"completed", "cancelled"}):
+                key = output.get("session_id")
+                if isinstance(key, str):
+                    terminal.add((origin, key))
+            if (evidence_item.kind == "tool_continuation" and evidence_item.producer == "runtime"
+                    and isinstance(payload.get("key"), str) and isinstance(payload.get("operation_id"), str)
+                    and isinstance(output, Mapping) and output.get("session_id") == payload["key"]
+                    and output.get("status") in {"completed", "cancelled"}):
+                original = next((operation for operation in operations
+                                 if operation.operation_id == payload["operation_id"]), None)
+                if original is not None and original.result_item_id == payload.get("source_result_item_id"):
+                    terminal.add((original.operation_id, payload["key"]))
+        for operation in operations:
+            if operation.tool_name != "run_command" or operation.status != "succeeded":
+                continue
+            item = items.get(operation.result_item_id or "")
+            if item is None or item.producer != "tool":
+                continue
+            output = item.payload.get("structured_content")
+            if not isinstance(output, Mapping) or output.get("status") != "running":
+                continue
+            key, digest = output.get("session_id"), output.get("request_digest")
+            if (not isinstance(key, str) or not isinstance(digest, str)
+                    or ((operation.operation_id, key) in terminal and not include_terminal)):
+                continue
+            tool = self._tools.get("run_command")
+            if tool is None or operation.execution_revision != tool.execution_revision:
+                raise RuntimeError("command execution revision changed; reconcile the original job explicitly")
+            call = self._committed_tool_call(turn_id=turn_id, tool_call_id=operation.tool_call_id)
+            await sessions.restore(key, request=RunCommandInput.model_validate(dict(call.arguments)),
+                                   digest=digest, operation_id=operation.operation_id)
+            if (operation.operation_id, key) in terminal:
+                continue  # Terminal log inspection cannot attribute later host edits.
+            metadata = item.payload.get("metadata", {})
+            root = Path(sessions.workspace.root) if "write_workspace" in operation.effects else None
+            before = metadata.get("workspace_tree_after_sha256")
+            self._executor.restore_continuation(sessions, key, operation_id=operation.operation_id,
+                                               workspace_root=root, before_sha256=before)
+
     def __init__(
         self,
         *,
@@ -187,6 +245,8 @@ class ToolOrchestrator:
             str,
             tuple[tuple[str, ...], tuple[Mapping[str, Any], ...]],
         ] = {}
+        self._instruction_targets: dict[tuple[str, str], tuple[ToolTarget, ...]] = {}
+        self._instruction_snapshots: dict[str, Mapping[str, Any]] = {}
 
     def attach_event_dispatcher(
         self,
@@ -198,6 +258,19 @@ class ToolOrchestrator:
         """Drop transient execution bookkeeping after all Turn I/O has stopped."""
         self._resolved_scopes.clear()
         self._claims.clear()
+        self._instruction_targets.clear()
+        self._instruction_snapshots.clear()
+
+    async def close_continuation(
+        self, continuation: ToolContinuation, result: Mapping[str, JsonValue],
+    ) -> None:
+        metadata = await self._executor.observe_continuation(continuation)
+        operation_id = metadata.get("runtime_workspace_origin_operation_id")
+        if isinstance(operation_id, str):
+            await self._commit(lambda: self._store.record_tool_continuation(
+                operation_id=operation_id, key=continuation.key,
+                result={**dict(result), "metadata": dict(metadata)},
+            ))
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
         mutation = self._store.capture_mutation(operation)
@@ -218,7 +291,9 @@ class ToolOrchestrator:
                 snapshot = operation.request_ref.get("step_snapshot")
                 if not isinstance(snapshot, Mapping):
                     raise RuntimeError("model tool call has no durable Step snapshot")
-                return snapshot
+                return {**snapshot, "input_revision": self._store.request_input_revision(
+                    turn_id, operation.request_ref,
+                )}
         return None
 
     def _context_for_call(self, turn_id: str, call: ToolCall) -> ToolExecutionContext:
@@ -260,9 +335,69 @@ class ToolOrchestrator:
             status=ExecutionStatus.PREPARED,
         )
 
+    def input_superseded(self, turn_id: str, call: ToolCall) -> bool:
+        snapshot = self._step_snapshot(turn_id, call)
+        revision = None if snapshot is None else snapshot.get("input_revision")
+        return revision is not None and revision != self._store.user_input_revision(turn_id)
+
+    def _guard_input(self, turn_id: str, call: ToolCall) -> None:
+        if self.input_superseded(turn_id, call):
+            raise ExecutionStartRejectedError("input_superseded", "New user input superseded this unstarted action.")
+        from agent_runtime.project_instructions import extend_instructions, restored_instructions
+
+        snapshot = self._step_snapshot(turn_id, call)
+        binding = self._store.read_turn(turn_id).binding_manifest if snapshot is None else snapshot["binding_manifest"]
+        instructions = restored_instructions(binding, self._store.list_items(turn_id))
+        if instructions is None:
+            return
+        # Pre-execution guards run synchronously. Reserve discovered guidance
+        # before another parallel call reads it, so the shared byte bound holds.
+        instructions = self._instruction_snapshots.get(turn_id, instructions)
+        targets = self._instruction_targets.get((turn_id, call.tool_call_id), ())
+        paths = [Path(target.value) for target in targets if target.kind in {"workspace_path", "cwd_path"}]
+        try:
+            extended = extend_instructions(instructions, self._context_for_call(turn_id, call).refreshed(), paths)
+        except ValueError as error:
+            raise ExecutionStartRejectedError("project_instructions_unreadable", str(error)) from error
+        self._instruction_snapshots[turn_id] = extended
+        visible = binding.get("project_instructions", {})
+        if extended["entries"] != visible.get("entries", []):
+            raise ExecutionStartRejectedError(
+                "project_instructions_required",
+                "Action deferred: new scoped AGENTS instructions were discovered. Read the runtime guidance "
+                "in the next request, adjust the plan if needed, and retry this action.",
+                metadata={"runtime_project_instructions": extended, "execution_started": False},
+                retryable=True,
+            )
+
+    async def _discard_superseded(self, turn_id: str, call: ToolCall) -> ToolResult:
+        operation = next((op for op in self._store.list_tool_operations(turn_id)
+                          if op.tool_call_id == call.tool_call_id), None)
+        if operation is not None and operation.status in {"prepared", "ready"}:
+            if operation.status == "prepared":
+                record = self._pending_record(turn_id, call)
+                assert record is not None
+                await self._persist_execution_record(turn_id=turn_id, tool=self._tools[call.tool_name], record=record)
+            await self._commit(lambda: self._store.reject_ready_tool_operation(
+                operation_id=operation.operation_id, error_code="input_superseded",
+            ))
+        result = ToolResult(
+            tool_call_id=call.tool_call_id, tool_name=call.tool_name, is_error=True,
+            error_code="input_superseded", error_message="Action not executed: superseded by new user input.",
+            retryable=False, content=(), metadata={"execution_started": False},
+        )
+        await self._commit(lambda: self._store.record_tool_result(
+            turn_id=turn_id, operation_id=None if operation is None else operation.operation_id,
+            result=_tool_result_payload(result),
+        ))
+        return result
+
     async def execute(self, *, turn_id: str, call: ToolCall) -> ToolResult:
-        execution_context = self._context_for_call(turn_id, call)
         await self._record_call(turn_id, call)
+        if self.input_superseded(turn_id, call):
+            return await self._discard_superseded(turn_id, call)
+        execution_context = replace(self._context_for_call(turn_id, call),
+                                    invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
         inspection_block = self._inspection_budget_result(
             turn_id=turn_id,
             call=call,
@@ -304,6 +439,7 @@ class ToolOrchestrator:
             record: ToolExecutionRecord,
             resolved: ResolvedToolUse,
         ) -> None:
+            self._instruction_targets[(turn_id, call.tool_call_id)] = resolved.targets
             self._resolved_scopes[record.operation_id] = _durable_tool_scope(
                 resolved.effects,
                 resolved.targets,
@@ -328,6 +464,7 @@ class ToolOrchestrator:
                 tool_call_id=call.tool_call_id,
                 tool_name=call.tool_name,
                 arguments=_json_mapping(call.arguments),
+                argument_error=call.argument_error,
                 origin={
                     "request_id": call.origin.request_id,
                     "toolset_revision": call.origin.toolset_revision,
@@ -345,6 +482,9 @@ class ToolOrchestrator:
     ) -> None:
         tool = self._tools.get(call.tool_name)
         if execution.result.error_code == "approval_required":
+            if self.input_superseded(turn_id, call):
+                await self._discard_superseded(turn_id, call)
+                return
             if tool is None:
                 raise RuntimeError("unknown tool cannot request approval")
             record = ToolExecutionRecord.prepare(call, tool)
@@ -368,6 +508,7 @@ class ToolOrchestrator:
                         record=record,
                         tool=tool,
                         context=execution_context,
+                        arguments=call.arguments,
                     ),
                 )
             )
@@ -438,6 +579,8 @@ class ToolOrchestrator:
         return tuple(results)
 
     async def _execute_batch_segment(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
+        if any(self.input_superseded(turn_id, call) for call in calls):
+            return tuple([await self.execute(turn_id=turn_id, call=call) for call in calls])
         contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
         tools = tuple(self._tools.get(call.tool_name) for call in calls)
         inspection_fits = True
@@ -490,6 +633,7 @@ class ToolOrchestrator:
                 active[record.tool_call_id] = record
 
         def preflight(record: ToolExecutionRecord, resolved: ResolvedToolUse) -> None:
+            self._instruction_targets[(turn_id, record.tool_call_id)] = resolved.targets
             self._resolved_scopes[record.operation_id] = _durable_tool_scope(resolved.effects, resolved.targets)
 
         def progress_for(call: ToolCall) -> Callable[[ToolProgress], Awaitable[None]]:
@@ -508,7 +652,7 @@ class ToolOrchestrator:
         try:
             executions = await self._executor.execute_batch(
                 calls,
-                context=contexts[0],
+                context=replace(contexts[0], invocation_guard=lambda invoked: self._guard_input(turn_id, invoked)),
                 records={
                     call.tool_call_id: record
                     for call in calls
@@ -595,7 +739,8 @@ class ToolOrchestrator:
         claim = self._claims.get(record.operation_id)
         if claim is None:
             operation = self._store.read_tool_operation(record.operation_id)
-            if operation.status == "failed" and operation.error_code == record.error_code == "resource_busy":
+            if (operation.status == "failed" and operation.error_code == record.error_code
+                    and record.error_code in {"resource_busy", "input_superseded"}):
                 await self._commit(
                     lambda: self._store.record_tool_result(
                         turn_id=turn_id,
@@ -629,6 +774,9 @@ class ToolOrchestrator:
         if not accepted:
             raise RuntimeError("stale worker cannot commit tool operation outcome")
         self._claims.pop(record.operation_id, None)
+        tool = self._tools.get(call.tool_name)
+        if tool is not None and tool.after_commit is not None and not execution.result.is_error:
+            await tool.after_commit(call.arguments, execution.result.structured_content, record.operation_id)
         operation = self._store.read_tool_operation(record.operation_id)
         evidence = classify_tool_verification(
             tool_name=call.tool_name,
@@ -678,7 +826,10 @@ class ToolOrchestrator:
             retryable=False,
         )
 
-    async def resume_approval(self, *, turn_id: str, decision: str) -> ToolResult:
+    async def resume_approval(
+        self, *, turn_id: str, decision: str,
+        on_session_grant: Callable[[CommandGrant], None] | None = None,
+    ) -> ToolResult:
         pending = [
             interaction
             for interaction in self._store.list_interactions(turn_id)
@@ -694,10 +845,21 @@ class ToolOrchestrator:
             turn_id=turn_id,
             tool_call_id=operation.tool_call_id,
         )
+        if self.input_superseded(turn_id, call):
+            await self._commit(lambda: self._store.resolve_tool_approval(turn_id=turn_id, decision="deny"))
+            return await self._discard_superseded(turn_id, call)
         tool = self._tools.get(call.tool_name)
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
         execution_context = self._context_for_turn(turn_id)
+        grant = None
+        if on_session_grant is not None:
+            arguments = tool.validate_input(call.arguments)
+            grant = command_grant(tool, arguments, tool.resolve_use(arguments), execution_context)
+            if (decision != "approve" or grant is None
+                    or interaction.request.get("approval_scope", "tool") != "tool"
+                    or interaction.request.get("session_grant") != grant.to_json()):
+                raise ValueError("this approval does not offer a current Session command grant")
         if decision == "approve":
             preflight_context = replace(
                 execution_context,
@@ -716,6 +878,7 @@ class ToolOrchestrator:
                 record=fresh_record,
                 tool=tool,
                 context=execution_context,
+                arguments=call.arguments,
             )
             if preflight.result.error_code != "approval_required" or _approval_scope(
                 interaction.request
@@ -752,9 +915,12 @@ class ToolOrchestrator:
                 execution_context.denied_tool_call_ids | (set() if approved else {call.tool_call_id})
             ),
         )
-        return await self._execute_approved_record(
+        result = await self._execute_approved_record(
             turn_id=turn_id, call=call, tool=tool, context=context, record=record,
         )
+        if on_session_grant is not None and grant is not None and not result.is_error:
+            on_session_grant(grant)
+        return result
 
     async def recover_resolved_approval(self, *, turn_id: str) -> ToolResult:
         """Execute one approved ready operation after a pre-execute crash."""
@@ -781,6 +947,8 @@ class ToolOrchestrator:
             turn_id=turn_id,
             tool_call_id=operation.tool_call_id,
         )
+        if self.input_superseded(turn_id, call):
+            return await self._discard_superseded(turn_id, call)
         tool = self._tools.get(call.tool_name)
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
@@ -798,6 +966,7 @@ class ToolOrchestrator:
             record=fresh_record,
             tool=tool,
             context=execution_context,
+            arguments=call.arguments,
         )
         if preflight.result.error_code != "approval_required" or _approval_scope(
             interaction.request
@@ -839,6 +1008,11 @@ class ToolOrchestrator:
     ) -> ToolResult:
         """Execute and publish after the caller has validated its approval scope."""
         active_record: ToolExecutionRecord | None = None
+        context = replace(context, invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
+
+        def capture_preflight(updated: ToolExecutionRecord, resolved: ResolvedToolUse) -> None:
+            self._instruction_targets[(turn_id, call.tool_call_id)] = resolved.targets
+            self._resolved_scopes[updated.operation_id] = _durable_tool_scope(resolved.effects, resolved.targets)
 
         async def persist(updated: ToolExecutionRecord) -> None:
             nonlocal active_record
@@ -865,6 +1039,7 @@ class ToolOrchestrator:
             context=context,
             record=record,
             record_sink=persist,
+            preflight_sink=capture_preflight,
             progress_sink=publish_progress,
         )
         await self._commit_execution_result(
@@ -961,6 +1136,12 @@ class ToolOrchestrator:
             )
             return
         if record.status is ExecutionStatus.STARTED:
+            call = self._committed_tool_call(turn_id=turn_id, tool_call_id=record.tool_call_id)
+            if self.input_superseded(turn_id, call):
+                await self._commit(lambda: self._store.reject_ready_tool_operation(
+                    operation_id=record.operation_id, error_code="input_superseded",
+                ))
+                raise ExecutionStartRejectedError("input_superseded", "New user input superseded this action.")
             lease_seconds = max(
                 self._lease_seconds,
                 tool.timeout_seconds + _TOOL_LEASE_GRACE_SECONDS,
@@ -1059,6 +1240,7 @@ class ToolOrchestrator:
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             arguments=arguments,
+            argument_error=payload.get("argument_error"),
             origin=ToolCallOrigin(
                 request_id=request_id,
                 toolset_revision=toolset_revision,
@@ -1127,8 +1309,11 @@ def _approval_request(
     record: ToolExecutionRecord,
     tool: Tool,
     context: ToolExecutionContext,
+    arguments: Mapping[str, JsonValue],
 ) -> dict[str, Any]:
-    return {
+    validated = tool.validate_input(arguments)
+    grant = command_grant(tool, validated, tool.resolve_use(validated), context)
+    request: dict[str, Any] = {
         "reason": execution.result.error_message or "approval required",
         "approval_scope": execution.result.metadata.get("approval_scope", "tool"),
         "effects": [effect.value for effect in execution.trace.effects],
@@ -1144,6 +1329,10 @@ def _approval_request(
         "execution_revision": tool.execution_revision,
         "policy_revision": _policy_revision(context, tool, execution),
     }
+    if grant is not None and request["approval_scope"] == "tool":
+        request["session_grant"] = grant.to_json()
+        request["session_grant_label"] = grant.label
+    return request
 
 
 def _approval_scope(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -1164,6 +1353,7 @@ def _policy_revision(context: ToolExecutionContext, tool: Tool, execution: ToolE
     payload = {
         "permissions_revision": (None if context.effective_permissions is None
                                  else context.effective_permissions.revision),
+        "approval_mode": context.approval_mode,
         "workspace_root": (None if context.workspace_root is None else str(context.workspace_root)),
         "cwd": None if context.cwd is None else str(context.cwd),
         "allow_write_tools": context.allow_write_tools if ToolEffect.WRITE_WORKSPACE in effects else None,

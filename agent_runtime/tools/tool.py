@@ -338,12 +338,15 @@ class ToolCall:
     tool_name: str
     arguments: Mapping[str, JsonValue]
     origin: ToolCallOrigin
+    argument_error: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_string(self.tool_call_id, field_name="tool_call_id")
         _require_non_empty_string(self.tool_name, field_name="tool_name")
         if not isinstance(self.origin, ToolCallOrigin):
             raise TypeError("origin must be a ToolCallOrigin")
+        if self.argument_error is not None and not isinstance(self.argument_error, str):
+            raise TypeError("argument_error must be a string or None")
         object.__setattr__(
             self,
             "arguments",
@@ -1303,6 +1306,16 @@ _LOCAL_SIDE_EFFECTS = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
+class ToolContinuation:
+    """Trusted adapter's live handle identity, never model-provided metadata."""
+
+    owner: object
+    key: str
+    phase: Literal["start", "observe"]
+    terminal: bool
+
+
+@dataclass(frozen=True, slots=True)
 class Tool:
     definition: ToolDefinition
     validate_input: ValidateInput
@@ -1320,6 +1333,8 @@ class Tool:
     max_model_output_bytes: int
     approval_profile: ToolApprovalProfile | None = None
     stream: StreamingToolRunner | None = None
+    continuation: Callable[[Mapping[str, JsonValue], JsonValue | None], ToolContinuation | None] | None = None
+    after_commit: Callable[[Mapping[str, JsonValue], JsonValue | None, str], Awaitable[None]] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.definition, ToolDefinition):
@@ -1329,6 +1344,10 @@ class Tool:
                 raise TypeError(f"{field_name} must be callable")
         if self.stream is not None and not callable(self.stream):
             raise TypeError("stream must be callable when provided")
+        if self.continuation is not None and not callable(self.continuation):
+            raise TypeError("continuation must be callable when provided")
+        if self.after_commit is not None and not callable(self.after_commit):
+            raise TypeError("after_commit must be callable when provided")
 
         static_effects = frozenset(self.static_effects)
         if any(not isinstance(effect, ToolEffect) for effect in static_effects):

@@ -10,12 +10,15 @@ from typing import Any, Literal, Protocol
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.tools.tool import JsonValue, Tool
 
+DEFAULT_MAX_STEPS = 128
+
 
 @dataclass(frozen=True, slots=True)
 class HarnessToolCall:
     id: str
     name: str
     arguments: Mapping[str, JsonValue]
+    argument_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,9 +183,9 @@ class ContextManager(Protocol):
 
 
 class ContextBudgetExceededError(RuntimeError):
-    """Committed context cannot fit inside the configured provider boundary."""
+    """Context preparation failed; reason_code identifies the limiting resource or invalid data."""
 
-    def __init__(self, message: str, *, reason_code: str = "context_budget_exceeded") -> None:
+    def __init__(self, message: str, *, reason_code: str = "context_compaction_failed") -> None:
         self.reason_code = reason_code
         super().__init__(message)
 
@@ -214,7 +217,7 @@ class ContextCompactionRequiredError(ContextBudgetExceededError):
         input_tokens: int,
         max_input_tokens: int,
         retained_tail_messages: int = 0,
-        reason_code: str = "context_budget_exhausted",
+        reason_code: str = "model_context_window_exceeded",
     ) -> None:
         self.input_tokens = input_tokens
         self.max_input_tokens = max_input_tokens

@@ -354,6 +354,8 @@ class ModelRegistry:
                 "tokenizer_model": entry.get("tokenizer_model"),
                 "context_window_tokens": entry.get("context_window_tokens"),
                 "max_output_tokens": entry.get("max_output_tokens"),
+                "reasoning": entry.get("reasoning"),
+                "supported_cache_parameters": entry.get("supported_cache_parameters", ()),
                 "timeout_seconds": entry.get(
                     "timeout_seconds",
                     120.0,
@@ -398,6 +400,7 @@ class ModelRegistry:
                 "fallback_model": data.get("fallback_model", default_model),
                 "generation": _parse_generation_config(data.get("generation")),
                 "llm_stage_budgets": parse_llm_stage_budgets(data.get("llm_budgets")),
+                "auto_compact_token_limit": data.get("auto_compact_token_limit"),
             }
         )
 
@@ -497,6 +500,8 @@ class ModelRegistry:
                 model_context_tokens=capabilities.context_window_tokens,
                 stage_budgets=stage_budgets,
                 context_policy=definition.context_capacity_policy,
+                agent_output_policy=definition.agent_output_policy,
+                model_max_output_tokens=definition.max_output_tokens,
             ),
             model_id=definition.model_id,
             provider=resolved_provider,
@@ -769,6 +774,7 @@ def _validate_raw_catalog(data: object) -> None:
             "fallback_model",
             "generation",
             "llm_budgets",
+            "auto_compact_token_limit",
             "tokenizer",
         },
         where="model catalog",
@@ -804,6 +810,8 @@ def _validate_raw_catalog(data: object) -> None:
                 "runtime",
                 "experimental",
                 "continuation_summary_role",
+                "reasoning",
+                "supported_cache_parameters",
             },
             where=f"chat model {model_id!r}",
         )

@@ -210,16 +210,23 @@ async def test_fullscreen_restores_shell_on_cancel_and_keeps_input_at_bottom_aft
             async with asyncio.timeout(3):
                 while not ui.waiting or ui.app.renderer._last_screen is None:
                     await asyncio.sleep(0.01)
-            # The composer sits above the bottom separator and single-line footer.
-            assert ui.app.renderer._last_screen.visible_windows_to_write_positions[ui.editor.window].ypos == 21
+            # The composer sits above the separator, two status rows, and help row.
+            screen = ui.app.renderer._last_screen
+            assert screen.visible_windows_to_write_positions[ui.editor.window].ypos == size[0].rows - 5
+            rendered = ["".join(row[x].char for x in sorted(row)) for _, row in sorted(screen.data_buffer.items())]
+            assert "preview" in rendered[-3]
+            assert "待报告" in rendered[-2]
+            assert "Enter" in rendered[-1]
             size[0] = Size(rows=16, columns=40)
             ui.app._on_resize()
             await asyncio.sleep(0.08)
-            assert ui.app.renderer._last_screen.visible_windows_to_write_positions[ui.editor.window].ypos == 13
+            screen = ui.app.renderer._last_screen
+            assert screen.visible_windows_to_write_positions[ui.editor.window].ypos == size[0].rows - 5
             pipe.send_text("\x1b[200~首行\n尾行\x1b[201~")
             await asyncio.sleep(0.08)
             assert ui.editor.text == "首行\n尾行"
-            assert ui.app.renderer._last_screen.visible_windows_to_write_positions[ui.editor.window].ypos == 12
+            screen = ui.app.renderer._last_screen
+            assert screen.visible_windows_to_write_positions[ui.editor.window].ypos == size[0].rows - 6
         finally:
             task.cancel()
             with suppress(asyncio.CancelledError):

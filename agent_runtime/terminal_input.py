@@ -3,6 +3,7 @@ from __future__ import annotations
 import builtins
 import sys
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Protocol
 
 import regex
@@ -10,6 +11,9 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.document import Document
 from prompt_toolkit.history import History
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
+from prompt_toolkit.keys import Keys
+
+from agent_runtime.local_files import parse_file_input
 
 DEFAULT_HISTORY_ENTRIES = 100
 DEFAULT_HISTORY_BYTES = 64 * 1024
@@ -18,11 +22,15 @@ _GRAPHEME = regex.compile(r"\X")
 # Shared by help and completion so every supported command uses the same menu.
 CHAT_COMMANDS = {
     "/help": "显示帮助",
+    "/attach": "附加本地文件供下一条消息读取（原地只读，不复制）；无参数查看待发送附件",
+    "/detach": "清除待发送附件",
     "/status": "查看模型、会话、工作区和上下文预算",
     "/new": "开始空上下文的新聊天",
     "/clear": "开始空上下文的新聊天（/new 别名）",
+    "/effort": "查看或设置模型支持的思考强度；default 重置，off 关闭（需要模型支持）",
+    "/output": "查看或设置单次输出额度；正整数或 default；包含思考 token",
     "/model": "选择模型；也支持 current、list、switch <id>",
-    "/permissions": "查看有效权限；load <文件>、profile <名称>、reload 更新当前策略",
+    "/permissions": "选择审批模式；mode ask|auto|full；grants 查看授权；revoke 撤销；show 查看权限",
     "/verbose": "切换详细输出",
     "/copy": "复制最近回答的原始 Markdown",
     "/connections": "打开本机连接管理，由你选择服务并登录",
@@ -40,6 +48,7 @@ def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
         "a": ("approve", "allow_once"),
         "y": ("approve", "allow_once"),
         "yes": ("approve", "allow_once"),
+        "s": ("allow_session",),
         "n": ("deny",), "no": ("deny",), "d": ("deny",),
         "c": ("continue",),
     }
@@ -47,6 +56,15 @@ def resolve_pause_choice(value: str, options: tuple[str, ...]) -> str | None:
 
 
 _COMPOSER_BINDINGS = KeyBindings()
+
+
+@_COMPOSER_BINDINGS.add(Keys.BracketedPaste, eager=True)
+def _paste_with_file_boundaries(event: KeyPressEvent) -> None:
+    text = event.data.replace("\r\n", "\n").replace("\r", "\n")
+    remaining, files = parse_file_input(text, base=Path.cwd())
+    if files and not remaining:
+        text = "\n" + text.strip() + "\n"
+    event.current_buffer.insert_text(text)
 
 
 @_COMPOSER_BINDINGS.add("backspace", eager=True)

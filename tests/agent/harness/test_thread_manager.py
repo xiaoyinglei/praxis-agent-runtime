@@ -9,6 +9,7 @@ import pytest
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
+    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
@@ -72,18 +73,28 @@ class RotatingBindingProvider:
 
 
 @pytest.mark.anyio
-async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_history(tmp_path: Path) -> None:
+async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_history(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     model = EchoHistoryModel()
     async with await Session.open(database=tmp_path / "rollout.sqlite3", workspace=tmp_path, model=model) as session:
         first = await session.submit("first")
         second = await session.submit("second")
         assert first.thread_id == second.thread_id == session.thread_id
         assert first.turn_id != second.turn_id
-        assert [(m.role, m.content) for m in model.requests[1].messages] == [
-            ("user", "first"),
-            ("assistant", "answer-1"),
-            ("user", "second"),
-        ]
+        assert model.requests[0].messages[-1].content.startswith(
+            "Runtime state update (changed fields; latest value wins):")
+        state = json.loads(model.requests[0].messages[-1].content.splitlines()[1])
+        assert state["resource_reminder"] is None
+        assert "Runtime budget status" not in state
+        assert session.store.list_model_operations(first.turn_id)[0].request_ref["budget_status"][
+            "agent_steps_remaining"] > 0
+        assert model.requests[1].messages == (
+            *model.requests[0].messages,
+            HarnessMessage(role="assistant", content="answer-1"),
+            HarnessMessage(role="user", content="second"),
+        )
         assert session.store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
         assert session.store.read_turn(first.turn_id).binding_manifest["model_id"] == "model-v1"
         assert session.store.read_turn(second.turn_id).binding_manifest["model_id"] == "model-v2"
@@ -117,12 +128,14 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
         async with await Session.open(**options, previous_turn_id=first.turn_id) as branch:
             result = await branch.submit("branch")
             assert result.thread_id != first.thread_id
+            assert model.requests[0].messages[-1].content.startswith(
+                "Runtime state update (changed fields; latest value wins):")
             assert branch.store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
-            assert [(m.role, m.content) for m in model.requests[2].messages] == [
-                ("user", "first"),
-                ("assistant", "answer-1"),
-                ("user", "branch"),
-            ]
+            assert model.requests[2].messages == (
+                *model.requests[0].messages,
+                HarnessMessage(role="assistant", content="answer-1"),
+                HarnessMessage(role="user", content="branch"),
+            )
             assert source.store.read_thread(source.thread_id).head_turn_id == second.turn_id
 
 

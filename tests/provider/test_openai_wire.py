@@ -273,11 +273,12 @@ def test_openai_wire_hash_is_final_serialized_hash_and_cache_options_are_gated()
 
     assert first.provider_wire_hash == second.provider_wire_hash
     assert first.provider_wire_hash != without_cache.provider_wire_hash
-    assert first.payload["prompt_cache_key"] == request.prompt_revision
+    assert str(first.payload["prompt_cache_key"]).startswith("praxis:")
+    assert first.payload["prompt_cache_key"] != request.prompt_revision
     assert first.payload["prompt_cache_retention"] == "24h"
     assert "unsupported_cache_hint" not in first.payload
     assert first.serialized_json == second.serialized_json
-    assert json.loads(first.serialized_json)["prompt_cache_key"] == (request.prompt_revision)
+    assert json.loads(first.serialized_json)["prompt_cache_key"] == first.payload["prompt_cache_key"]
 
 
 def test_openai_wire_omits_unset_optional_generation_fields() -> None:

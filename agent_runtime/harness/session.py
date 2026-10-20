@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from uuid import uuid4
 
+from agent_runtime.approval import ApprovalMode, CommandGrant
 from agent_runtime.budget import ResourceUsage
+from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness.protocol import (
     BoundHarnessModel,
     CompletionDecision,
@@ -23,7 +25,7 @@ from agent_runtime.harness.protocol import (
     ToolRouter,
     TurnResult,
 )
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
 from agent_runtime.harness.services import (
     SessionBindingProvider,
     _tool_execution_policy_snapshot,
@@ -88,6 +90,7 @@ class Session:
         self._child_calls: dict[asyncio.Task[Any], asyncio.Event] = {}
         self._closed = False
         self._closing = False
+        self._persisted_request_revision = 0
         self._agent: Agent | None = None
         self.model_control_plane = None
         self._ready_model_id: str | None = None
@@ -95,6 +98,8 @@ class Session:
         self._memory_task: asyncio.Task[Any] | None = None
         self._mcp_config_path: Path | None = None
         self._mcp_catalog_revision: str | None = None
+        self._cancel_live_commands: Callable[[], Awaitable[None]] | None = None
+        self._command_sessions: Any = None
 
     def connections_changed(self) -> bool:
         """Report host setup changes; never mutate the tools of an active Turn."""
@@ -128,6 +133,7 @@ class Session:
     ) -> Self:
         self = cls()
         explicit_tool_context = "tool_execution_context" in service_options
+        approval_mode = service_options.pop("approval_mode", None)
         agent = copy.copy(agent) if agent is not None else None
         self._agent = agent
         self.event_dispatcher = event_dispatcher or TurnEventDispatcher()
@@ -204,6 +210,13 @@ class Session:
                         generate_memories=thread.settings["memory_generation_allowed"],
                     )
             if agent is not None:
+                if thread_id is not None:
+                    selected_files = thread.settings.get("input_read_files", ())
+                    if not isinstance(selected_files, (list, tuple)) or any(
+                        not isinstance(path, str) or not Path(path).is_absolute() for path in selected_files
+                    ):
+                        raise ValueError("invalid saved input file references")
+                    agent._input_read_files = tuple(selected_files)
                 model, resource_options = await self._open_agent_resources(
                     agent,
                     allow_write_tools=service_options.pop("allow_write_tools", False),
@@ -228,6 +241,7 @@ class Session:
             thread = self.store.read_thread(self.thread_id)
             self.head_turn_id = thread.head_turn_id
             settings = thread.settings
+            self._persisted_request_revision = settings.get("request_settings_revision", 0)
             if settings:
                 if not explicit_tool_context:
                     self.tool_execution_context = restore_tool_policy(
@@ -238,6 +252,9 @@ class Session:
                         self.model_control_plane.state,
                         current_model_id=settings["model_id"],
                         selection_requester=settings["model_selection_requester"],
+                        request_preferences={key: ModelRequestPreferences.model_validate(value)
+                                             for key, value in settings.get("request_preferences", {}).items()},
+                        request_settings_revision=settings.get("request_settings_revision", 0),
                     )
                 self._apply_tool_context()
                 if explicit_tool_context:
@@ -247,6 +264,16 @@ class Session:
                     self._persist_settings()
             else:
                 self._persist_settings()
+            saved_mode = settings.get("tool_execution_policy", {}).get("approval_mode")
+            selected_mode = (approval_mode if approval_mode is not None
+                             else saved_mode if not explicit_tool_context else None)
+            if selected_mode is not None:
+                if approval_mode == "ask":
+                    self.update_tool_policy(approval_mode=selected_mode, allow_write_tools=False,
+                                            allow_execute_tools=False, allow_web_tools=False,
+                                            auto_approve_sandboxed=False)
+                else:
+                    self.update_tool_policy(approval_mode=selected_mode)
             if agent is not None and agent._followup_model_id is not None:
                 assert self.model_control_plane is not None
                 self.model_control_plane.switch_model(
@@ -255,9 +282,17 @@ class Session:
                     persist=False,
                 )
                 self._persist_settings()
+            if agent is not None and agent._pending_request_settings:
+                pending = agent._pending_request_settings.get(self.current_model().id)
+                if pending is not None:
+                    self.configure_request(**pending["options"])
+                    agent._pending_request_settings.pop(self.current_model().id)
             if self.model_control_plane is not None and not settings and frozen_turn_id is None:
                 await self._bootstrap_model_provider()
             self._start_memory_update()
+            if self._command_sessions is not None and self.head_turn_id is not None:
+                assert self.tool_orchestrator is not None
+                await self.tool_orchestrator.restore_command_sessions(self._command_sessions, self.head_turn_id)
             return self
         except BaseException:
             await self._stack.aclose()
@@ -291,6 +326,7 @@ class Session:
                 try:
                     await self._stack.aclose()
                 finally:
+                    self.tool_execution_context = replace(self.tool_execution_context, command_grants=())
                     self._closed = True
 
     @asynccontextmanager
@@ -306,12 +342,17 @@ class Session:
             try:
                 yield
             finally:
-                if event_sink is not None:
-                    self.event_dispatcher.unsubscribe_controlling_sink(event_sink)
-                if self.tool_orchestrator is not None:
-                    self.tool_orchestrator.release_turn_state()
-                self.head_turn_id = self.store.read_thread(self.thread_id).head_turn_id
-                self._active_task = None
+                try:
+                    if event_sink is not None:
+                        self.event_dispatcher.unsubscribe_controlling_sink(event_sink)
+                    if self.tool_orchestrator is not None:
+                        self.tool_orchestrator.release_turn_state()
+                    self.head_turn_id = self.store.read_thread(self.thread_id).head_turn_id
+                    if (self._cancel_live_commands is not None and self.head_turn_id is not None
+                            and self.store.read_turn(self.head_turn_id).status in {"completed", "failed", "cancelled"}):
+                        await self._cancel_live_commands()
+                finally:
+                    self._active_task = None
 
     def _executor(self) -> TurnExecutor:
         executor = TurnExecutor(
@@ -337,6 +378,8 @@ class Session:
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("user_message must be non-empty")
         async with self._active_turn(event_sink):
             if self.store.read_thread(self.thread_id).active_turn_id is not None:
                 raise RuntimeError("active Turn must be resumed or aborted before submit")
@@ -344,9 +387,7 @@ class Session:
                 await self._bootstrap_model_provider()
             input_files: tuple[dict[str, object], ...] = ()
             if files:
-                if self._agent is None:
-                    raise ValueError("file staging requires an Agent-configured Session")
-                input_files = self._agent._stage_harness_files(files)
+                input_files = self.attach_files(files)
             turn_id = f"turn_{uuid4().hex}"
             binding = dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
             binding["budget_root_turn_id"] = turn_id
@@ -367,6 +408,69 @@ class Session:
                     and self.store.read_thread(self.thread_id).parent_thread_id is None):
                 self.store.enqueue_memory_job(self.workspace_path, self.thread_id)
             return AgentResult._from_harness(result, store=self.store, files=tuple(files or ()))
+
+    def attach_files(self, files: Sequence[str]) -> tuple[dict[str, object], ...]:
+        """Grant selected original files read access for this conversation, without copies."""
+        self._ensure_open()
+        if self._agent is None:
+            raise ValueError("file references require an Agent-configured Session")
+        values = self._agent._reference_harness_files(files, permission_ceiling=self.permissions())
+        selected = tuple(str(value["path"]) for value in values)
+        previous = self.tool_execution_context
+        previous_files = self._agent._input_read_files
+        self._agent._input_read_files = tuple(dict.fromkeys((*previous_files, *selected)))
+        try:
+            permissions = previous.permissions
+            self.tool_execution_context = replace(previous, permissions=(
+                None if permissions is None else permissions.with_read_files(selected)
+            ))
+            for path in selected:
+                if not self.permissions().path_access(path):
+                    raise PermissionError(self.permissions().path_reason(path))
+            self._persist_settings()
+        except BaseException:
+            self._agent._input_read_files = previous_files
+            self.tool_execution_context = previous
+            raise
+        self._apply_tool_context()
+        return values
+
+    async def steer(self, text: str, *, expected_turn_id: str, files: Sequence[str] | None = None) -> ItemSnapshot:
+        """Receive guidance for the named active Turn without starting another loop.
+
+        The returned Item is committed before acknowledgement. Running tools
+        finish at their safe boundary; use resume(..., 'abort') after stopping
+        the active submit task to cancel work. Text never grants tool approval.
+        """
+        self._ensure_open()
+        def receive() -> ItemSnapshot:
+            previous = self.tool_execution_context
+            previous_files = () if self._agent is None else self._agent._input_read_files
+            try:
+                # Settings, input revision and file Items commit together. A rejected
+                # input must not leave an unacknowledged permission grant behind.
+                with self.store._transaction():
+                    if self.store.read_thread(self.thread_id).active_turn_id != expected_turn_id:
+                        raise RuntimeError("expected Turn is no longer active; input was not accepted")
+                    values = self.attach_files(files) if files else ()
+                    return self.store.receive_turn_input(
+                        thread_id=self.thread_id, turn_id=expected_turn_id, text=text, input_files=values,
+                    )
+            except BaseException:
+                self.tool_execution_context = previous
+                if self._agent is not None:
+                    self._agent._input_read_files = previous_files
+                self._apply_tool_context()
+                raise
+        return await self._executor()._commit(receive)
+
+    def input_status(self, item_id: str) -> str:
+        """pending/applied means received/dispatched, not model understanding."""
+        self._ensure_open()
+        item = self.store.read_item(item_id)
+        if item.thread_id != self.thread_id or item.kind != "user_message" or "input_revision" not in item.payload:
+            raise ValueError("Item is not a steering receipt in this Session")
+        return self.store.turn_input_status(item_id)
 
     def _start_memory_update(self) -> None:
         if not self.memory_config.generate_memories or not self._background_memory:
@@ -431,6 +535,30 @@ class Session:
             raise
         return spec
 
+    def request_settings(self) -> dict[str, Any]:
+        self._ensure_open()
+        if self.model_control_plane is None:
+            raise RuntimeError("Session has no model control plane")
+        return self.model_control_plane.request_settings()
+
+    def configure_request(
+        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+    ) -> dict[str, Any]:
+        """Persist a user change before the next request captures its settings."""
+        self._ensure_open()
+        if self.model_control_plane is None:
+            raise RuntimeError("Session has no model control plane")
+        previous = copy.deepcopy(self.model_control_plane.state)
+        settings = self.model_control_plane.configure_request(
+            reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens, persist=False,
+        )
+        try:
+            self._persist_settings()
+        except BaseException:
+            self.model_control_plane.state = previous
+            raise
+        return settings
+
     def _persist_settings(self) -> None:
         self.store.update_session_settings(
             self.thread_id,
@@ -441,12 +569,21 @@ class Session:
                 "model_selection_requester": (
                     None if self.model_control_plane is None else self.model_control_plane.state.selection_requester
                 ),
+                "request_preferences": ({} if self.model_control_plane is None else {
+                    key: value.model_dump() for key, value in self.model_control_plane.state.request_preferences.items()
+                }),
+                "request_settings_revision": (0 if self.model_control_plane is None else
+                                              self.model_control_plane.state.request_settings_revision),
                 "tool_execution_policy": _tool_execution_policy_snapshot(self.tool_execution_context),
+                "input_read_files": [] if self._agent is None else list(self._agent._input_read_files),
                 "memory_generation_allowed": self.memory_config.generate_memories,
                 "memory_use_allowed": self.memory_config.use_memories,
                 "memory_control_version": self._memory_control_version,
             },
+            expected_request_revision=self._persisted_request_revision,
         )
+        self._persisted_request_revision = (0 if self.model_control_plane is None else
+                                            self.model_control_plane.state.request_settings_revision)
 
     def _apply_tool_context(self) -> None:
         if self.tool_orchestrator is not None:
@@ -484,7 +621,9 @@ class Session:
     def _resource_permissions(self) -> ResolvedPermissions:
         # Resident tools are borrowed by child Sessions. The active Step supplies
         # the child's frozen ceiling while the parent supplies live revocations.
-        effective = self.permissions()
+        # Resource cleanup still checks revocations after public Session access
+        # has closed. It must not call the public open-only permissions method.
+        effective = self.tool_execution_context.effective_permissions or PermissionPolicy().resolve(self.workspace_path)
         network_denied = ToolEffect.NETWORK in self.tool_execution_context.deny_effects
         binding = current_tool_binding()
         if binding is not None:
@@ -521,6 +660,7 @@ class Session:
         denied_tool_names: frozenset[str] | None = None,
         deny_effects: frozenset[ToolEffect] | None = None,
         auto_approve_sandboxed: bool | None = None,
+        approval_mode: ApprovalMode | None = None,
     ) -> None:
         self._ensure_open()
         updates: dict[str, Any] = {
@@ -533,6 +673,7 @@ class Session:
                 "denied_tool_names": denied_tool_names,
                 "deny_effects": deny_effects,
                 "auto_approve_sandboxed": auto_approve_sandboxed,
+                "approval_mode": approval_mode,
             }.items()
             if value is not None
         }
@@ -544,6 +685,22 @@ class Session:
             self.tool_execution_context = previous
             raise
         self._apply_tool_context()
+
+    def approval_grants(self) -> tuple[CommandGrant, ...]:
+        """Current process-local grants; never restored from a checkpoint."""
+        self._ensure_open()
+        return self.tool_execution_context.command_grants
+
+    def revoke_approval_grants(self) -> None:
+        self._ensure_open()
+        self.tool_execution_context = replace(self.tool_execution_context, command_grants=())
+        self._apply_tool_context()
+
+    def _add_approval_grant(self, grant: CommandGrant) -> None:
+        grants = self.tool_execution_context.command_grants
+        if grant not in grants:
+            self.tool_execution_context = replace(self.tool_execution_context, command_grants=(*grants, grant))
+            self._apply_tool_context()
 
     async def _open_agent_resources(
         self,
@@ -619,9 +776,33 @@ class Session:
                 "message": "Plan update recorded as a ToolResult.",
             }
 
+        from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions
+
+        command_sessions = DurableCommandSessions(workspace)
+        self._command_sessions = command_sessions
+
+        async def close_command_sessions(*, close: bool = True) -> None:
+            from agent_runtime.tools.builtins.shell import _normalize_command_output
+            outcomes = await (command_sessions.close_results() if close else command_sessions.cancel_results())
+            for continuation, output in outcomes:
+                if self.tool_orchestrator is not None:
+                    normalized = _normalize_command_output(output)
+                    await self.tool_orchestrator.close_continuation(continuation, {
+                        "structured_content": output.model_dump(mode="json"),
+                        "is_error": normalized.is_error,
+                        "error_code": normalized.error_code,
+                        "error_message": normalized.error_message,
+                    })
+
+        async def cancel_live_commands() -> None:
+            await close_command_sessions(close=False)
+
+        self._cancel_live_commands = cancel_live_commands
+        self._stack.push_async_callback(close_command_sessions)
         resident = create_resident_coding_tools(
             workspace,
             plan_updater=acknowledge_plan_update,
+            command_sessions=command_sessions,
         )
         from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
         from agent_runtime.tools.builtins.web import WEB_SOURCE_MEDIA_TYPE, create_web_tools, load_search_key
@@ -873,6 +1054,8 @@ class Session:
                 raise RuntimeError("Turn belongs to a different Session")
             executor = self._executor()
             if action == "abort":
+                if self._cancel_live_commands is not None:
+                    await self._cancel_live_commands()
                 cancelled = await executor._commit(lambda: self.store.cancel_turn(turn_id=turn_id))
                 return AgentResult._from_harness(
                     TurnResult(
@@ -916,22 +1099,25 @@ class Session:
                 and model_operations[-1].response_item_id is not None
             ):
                 response = self.store.read_item(model_operations[-1].response_item_id)
-                calls = response.payload.get("tool_calls")
-                recoverable_committed_response = bool(
-                    response.payload.get("response_status") == "incomplete"
-                    or isinstance(calls, (list, tuple)) and calls
-                )
+                recoverable_committed_response = response.kind == "model_response"
             if len(pending) == 1 and pending[0].kind == "tool_approval":
                 decision = {
                     "allow_once": "approve",
                     "approve": "approve",
+                    "allow_session": "approve",
                     "deny": "deny",
                 }.get(action)
+                if (decision is None and action == "continue" and model_operations
+                        and self.store.request_input_revision(turn_id, model_operations[-1].request_ref) is not None
+                        and self.store.user_input_revision(turn_id)
+                        != self.store.request_input_revision(turn_id, model_operations[-1].request_ref)):
+                    decision = "deny"
                 if decision is None:
-                    raise ValueError("tool approval action must be allow_once, approve, or deny")
+                    raise ValueError("tool approval action must be allow_once, approve, allow_session, or deny")
                 internal = await executor.resume(
                     turn_id=turn_id,
                     decision=decision,
+                    on_session_grant=self._add_approval_grant if action == "allow_session" else None,
                 )
             elif len(pending) == 1 and pending[0].kind in {
                 "clarification",
@@ -994,6 +1180,11 @@ class Session:
                 )
             elif not pending and recoverable_summary and action in {"continue", "retry"}:
                 internal = await executor.recover_committed_model_response(turn_id=turn_id)
+            elif (not pending and turn.status == "running" and action in {"continue", "retry"}
+                  and executor.pending_input_supersession(turn_id)):
+                internal = await executor.run_turn(
+                    executor.restore_turn_context(turn_id), start_step=executor.agent_step_count(turn_id) + 1,
+                )
             else:
                 raise RuntimeError("resume action does not match the Turn's durable pending state")
             return AgentResult._from_harness(internal, store=self.store)
@@ -1042,9 +1233,9 @@ class Session:
             child_options = {
                 **self._service_options,
                 "model_binding": source_binding,
-                "tool_execution_context": restore_tool_policy(
+                "tool_execution_context": replace(restore_tool_policy(
                     self.tool_execution_context, policy_value, restore_session_grants=True,
-                ),
+                ), command_grants=()),
             }
             # Borrow providers through the source binding, independent of the parent's next selection.
             await self._prepare_step_binding(source_binding)

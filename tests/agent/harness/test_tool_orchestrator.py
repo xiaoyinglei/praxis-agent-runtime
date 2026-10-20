@@ -867,7 +867,8 @@ class AcceptToolAnswer:
 
 
 @pytest.mark.anyio
-async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -> None:
+async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     model = ToolThenAnswerModel()
@@ -889,9 +890,14 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -
         assert len(model.requests) == 2
         assert [message.role for message in model.requests[1].messages] == [
             "user",
+            "context",
             "assistant",
             "tool",
         ]
+        assert "Runtime budget status" not in str(model.requests[1].messages)
+        assert runtime.store.list_model_operations(result.turn_id)[1].request_ref["budget_status"][
+            "agent_steps_remaining"] > 0
+        assert model.requests[1].messages[:len(model.requests[0].messages)] == model.requests[0].messages
         [tool_message] = [message for message in model.requests[1].messages if message.role == "tool"]
         assert tool_message.tool_call_id == "call-1"
         assert runtime.store.list_tool_operations(result.turn_id)[0].status == "succeeded"
@@ -908,8 +914,9 @@ async def test_candidate_sdk_runs_model_tool_result_model_loop(tmp_path: Path) -
 
 @pytest.mark.anyio
 async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-20"})
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
@@ -967,12 +974,15 @@ async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
     assert messages_after == messages_before
     assert [message.role for message in messages_after] == [
         "user",
+        "context",
         "assistant",
         "tool",
         "assistant",
     ]
-    assert messages_after[1].tool_calls[0].id == "call-1"
-    assert messages_after[2].tool_call_id == "call-1"
+    assert messages_after[1].content.startswith("Runtime state update (changed fields; latest value wins):")
+    assert "Runtime budget status" not in str(messages_after)
+    assert messages_after[2].tool_calls[0].id == "call-1"
+    assert messages_after[3].tool_call_id == "call-1"
     assert prepared_after.request_hash == prepared_before.request_hash
     assert prepared_after.context_hash == prepared_before.context_hash
     assert prepared_after.wire_hash == prepared_before.wire_hash
@@ -1082,9 +1092,9 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
         else:
             assert result.status == "failed"
             assert result.stop_reason == "repeated_tool_failure"
-            assert len(model.requests) == 3
-            assert display.group is not None and len(display.group.children) == 3
-            assert display._tool_count == 3
+            assert len(model.requests) == 4
+            assert display.group is not None and len(display.group.children) == 4
+            assert display._tool_count == 4
             assert any(child.failed for child in display.group.children)
         assert session.store.verify().valid
 
@@ -1106,7 +1116,7 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
                                   completion_gate=AcceptToolAnswer()) as session:
         result = await session.submit("read the file")
         assert result.stop_reason == "repeated_tool_failure"
-        assert len(model.requests) == 5
+        assert len(model.requests) == 7
         assert session.store.verify().valid
 
 

@@ -54,6 +54,7 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "context_summary_response",
         "context_message",
         "verification",
+        "tool_continuation",
         "resource_usage",
     }
 )
@@ -466,12 +467,16 @@ class RolloutEventReader:
             if kind == "model_request":
                 request_ref = payload.get("request_ref", {})
                 projection = request_ref.get("context_projection", {})
-                if (projection.get("policy_revision") == "context-capacity-v2"
-                        and context_capacity_policy(request_ref.get("step_snapshot", {}).get("binding_manifest", {}))
-                        is not None):
+                if (isinstance(request_ref.get("effective_settings"), Mapping) or (
+                    projection.get("policy_revision") == "context-capacity-v2"
+                    and context_capacity_policy(request_ref.get("step_snapshot", {}).get("binding_manifest", {}))
+                    is not None
+                )):
                     return (StreamEvent(type=EventType.BUDGET_UPDATE, turn_id=record.turn_id or "", data={
                         "purpose": request_ref.get("purpose"), "context_projection": dict(projection),
                         "budget_status": request_ref.get("budget_status", {}),
+                        **({"effective_settings": dict(request_ref["effective_settings"])}
+                           if isinstance(request_ref.get("effective_settings"), Mapping) else {}),
                     }),)
             if item_id in duplicate_answer_ids or kind in _SUPPRESSED_ITEM_KINDS:
                 return ()

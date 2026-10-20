@@ -49,7 +49,7 @@ def test_tool_plan_cannot_replace_runtime_owned_objective() -> None:
     assert events[0].event_type == "llm_update"
 
 
-def test_tool_plan_is_bounded_and_cannot_claim_completion() -> None:
+def test_tool_plan_is_bounded_and_retains_advisory_completion() -> None:
     plan = AgentPlan(
         objective="Implement and verify.",
         active_step_id="step_task",
@@ -72,17 +72,17 @@ def test_tool_plan_is_bounded_and_cannot_claim_completion() -> None:
 
     assert len(updated.steps) == 2
     assert [step.status for step in updated.steps] == [
-        "pending",
-        "pending",
+        "completed",
+        "completed",
     ]
-    assert updated.active_step_id == "step_0"
+    assert updated.active_step_id is None
+    assert updated.status == "complete"
     assert events[0].warnings == [
         "steps_truncated",
-        "unverified_completion_ignored",
     ]
 
 
-def test_runtime_completion_owns_final_plan_status() -> None:
+def test_runtime_completion_retains_unfinished_step_statuses() -> None:
     plan = AgentPlan(
         objective="Implement and verify.",
         active_step_id="step_implement",
@@ -106,16 +106,16 @@ def test_runtime_completion_owns_final_plan_status() -> None:
     )
 
     assert completed is not None
-    assert completed.status == "complete"
+    assert completed.status == "needs_replan"
     assert [step.status for step in completed.steps] == [
-        "completed",
-        "completed",
+        "in_progress",
+        "pending",
     ]
-    assert complete_events[0].event_type == "completed"
+    assert complete_events[0].event_type == "needs_replan"
     assert blocked is not None
     assert blocked.status == "blocked"
     assert [step.status for step in blocked.steps] == [
-        "blocked",
-        "blocked",
+        "in_progress",
+        "pending",
     ]
     assert blocked_events[0].event_type == "blocked"

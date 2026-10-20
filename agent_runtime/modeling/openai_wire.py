@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import cast
 
 from agent_runtime.core.messages import (
     ModelMessage,
@@ -11,6 +9,7 @@ from agent_runtime.core.messages import (
     ToolCall,
     ToolUseResult,
     canonical_json_text,
+    decode_tool_arguments,
     snapshot_model_message,
 )
 from agent_runtime.core.model_request import (
@@ -65,7 +64,11 @@ def serialize_openai_request(
 
     if not isinstance(request, ModelRequest):
         raise TypeError("request must be a ModelRequest")
-    supported = _supported_parameter_names(supported_cache_parameters)
+    # Canonical parameters have already passed the frozen model capability
+    # boundary. Preparation, accounting and dispatch serialize the same bytes.
+    supported = _supported_parameter_names(supported_cache_parameters) | set(request.settings.cache_parameters)
+    if cache_parameters is None:
+        cache_parameters = request.settings.cache_parameters
     payload: dict[str, JsonValue] = {
     "model": request.settings.model,
     "messages": _message_payloads(request.messages),
@@ -102,7 +105,9 @@ def serialize_openai_request(
         payload[key] = value
 
     if "prompt_cache_key" in supported:
-        effective_cache_key = cache_key or request.prompt_revision
+        effective_cache_key = cache_key or request.settings.cache_parameters.get("prompt_cache_key")
+        if effective_cache_key is None:
+            effective_cache_key = stable_prompt_cache_key(request)
         if not isinstance(effective_cache_key, str) or not effective_cache_key:
             raise ValueError("cache_key must be a non-empty string")
         payload["prompt_cache_key"] = effective_cache_key
@@ -132,6 +137,16 @@ def serialize_openai_request(
         serialized_json=serialized,
         provider_wire_hash=wire_hash,
     )
+
+
+def stable_prompt_cache_key(request: ModelRequest) -> str:
+    """Route by static system/tools/model, independently of history and effort."""
+    return "praxis:" + canonical_hash({
+        "model": request.settings.model,
+        "system": request.messages[0].content if request.messages and request.messages[0].role == "system" else "",
+        "tools": tuple({"name": tool.name, "description": tool.description,
+                        "parameters": tool.input_schema} for tool in request.tools),
+    })[:48]
 
 
 def parse_openai_response(response: object) -> ToolUseResult:
@@ -175,11 +190,11 @@ def parse_openai_response(response: object) -> ToolUseResult:
         if not isinstance(name, str) or not name:
             raise ValueError("tool call function name must be non-empty")
         raw_arguments = _field(function, "arguments", default={})
-        arguments = _parse_arguments(raw_arguments)
+        arguments, argument_error = decode_tool_arguments(raw_arguments)
         call_id = _field(raw_call, "id", default=None)
         if not isinstance(call_id, str) or not call_id:
             call_id = f"call_{index}"
-        calls.append(ToolCall(id=call_id, name=name, input=arguments))
+        calls.append(ToolCall(id=call_id, name=name, input=arguments, argument_error=argument_error))
 
     content = _field(message, "content", default="")
     if content is None:
@@ -225,7 +240,7 @@ def parse_openai_usage(response: object) -> LLMUsage | None:
     if cache_read is None:
         cache_read = _first_token_count(
             raw_usage,
-            ("cache_read_input_tokens",),
+            ("cache_read_input_tokens", "prompt_cache_hit_tokens"),
         )
     cache_write = _first_token_count(
         prompt_details,
@@ -324,24 +339,6 @@ def _tool_choice_payload(choice: ToolChoice) -> JsonValue:
             "function": {"name": choice.name},
         }
     return choice.mode.value
-
-
-def _parse_arguments(raw: object) -> dict[str, object]:
-    if isinstance(raw, Mapping):
-        parsed: object = raw
-    elif isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            parsed = {"_raw": raw[:20_000]}
-    else:
-        parsed = {"_raw": str(raw)[:20_000]}
-    if not isinstance(parsed, Mapping):
-        parsed = {"_raw": parsed}
-    frozen = json_schema_output(None, cast(JsonValue, parsed))
-    if not isinstance(frozen, Mapping):
-        raise TypeError("parsed tool arguments must be an object")
-    return {key: _thaw_json(value) for key, value in frozen.items()}
 
 
 def _first_token_count(

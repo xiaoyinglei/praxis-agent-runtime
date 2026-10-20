@@ -49,6 +49,7 @@ def test_old_definition_retains_canonical_bytes_and_revision() -> None:
     definition = ModelRegistry(config).get_model_definition("arbitrary")
     payload = definition.model_dump(mode="json")
     payload.pop("continuation_summary_role", None)
+    payload.pop("agent_output_policy", None)
     old = ModelExecutionDefinition.model_validate(payload)
     canonical = canonical_definition_json(old)
     assert b"continuation_summary_role" not in canonical

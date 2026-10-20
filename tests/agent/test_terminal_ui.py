@@ -798,3 +798,233 @@ def test_long_reference_url_remains_complete_in_native_scrollback():
     visible = "".join(text for style, text, *_ in fragments if "[ZeroWidthEscape]" not in style)
     assert url in visible
     assert "\x1b" not in visible
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("mode", ["inline", "fullscreen"])
+async def test_request_settings_and_usage_have_a_fixed_status_bar_without_transcript_notices(mode):
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.result import AgentUsage
+    from agent_runtime.streaming.events import EventType, StreamEvent
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="demo", workspace="/tmp", ui_mode=mode, input=pipe, output=DummyOutput())
+        ui.display.begin_turn()
+        await ui.display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
+            "purpose": "agent_step", "effective_settings": {"reasoning_effort": "high",
+                "max_output_tokens": 4096, "requested_output_tokens": 4096},
+        }))
+        ui.display.update_usage(AgentUsage(input_tokens=100, output_tokens=20, total_tokens=120,
+                                          cache_read_input_tokens=80))
+        ui.display.finish()
+        status = "".join(fragment[1] for fragment in ui._status_fragments())
+        assert "demo" in status and "high" in status
+        assert "本轮累计" in status and "缓存" in status and "80" in status
+        assert status.count("\n") == 1
+        assert "high" not in ui.view.plain_text()
+        assert "本轮累计" not in ui.view.plain_text()
+        assert "Enter" in "".join(fragment[1] for fragment in ui._footer())
+
+
+def test_usage_update_invalidates_retained_status_and_compact_status_keeps_cache():
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    from wcwidth import wcswidth
+
+    from agent_runtime.result import AgentUsage
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="demo", workspace="/tmp", input=pipe, output=Vt100_Output(
+            io.StringIO(), lambda: Size(rows=24, columns=80), enable_cpr=False))
+        invalidated = []
+        ui.view.invalidate = lambda: invalidated.append(True)
+        ui.display.update_usage(AgentUsage(input_tokens=4000, output_tokens=500, total_tokens=4500,
+                                          cache_read_input_tokens=3000, reasoning_tokens=100))
+        assert invalidated
+        lines = "".join(fragment[1] for fragment in ui._status_fragments()).splitlines()
+        assert all(wcswidth(line) <= 80 for line in lines)
+        assert "缓存" in lines[1] and "推理" in lines[1]
+
+
+@pytest.mark.anyio
+async def test_effort_menu_reuses_picker_and_preserves_status_on_selection_and_cancel():
+    import asyncio
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+
+    from agent_runtime.result import AgentUsage
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="demo", workspace="/tmp", ui_mode="fullscreen", input=pipe,
+            output=Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=100), enable_cpr=False))
+        ui.display.update_usage(AgentUsage(input_tokens=100, output_tokens=20, total_tokens=120))
+        selected = []
+        async def conversation():
+            selected.append(await ui.choose_menu(["default", "medium", "high"],
+                                                 title="选择思考强度", current="medium"))
+            selected.append(await ui.choose_menu(["default", "high"], title="选择思考强度", current="high"))
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            async with asyncio.timeout(3):
+                while ui._model_pending is None or ui.app.renderer._last_screen is None:
+                    await asyncio.sleep(.01)
+            assert ui._model_index == 1
+            assert "选择思考强度" in "".join(fragment[1] for fragment in ui._footer())
+            assert ui._model_choices == ["default", "medium", "high"]
+            assert "off" not in "".join(fragment[1] for fragment in ui._model_fragments())
+            pipe.send_text("\x1b[B\r")
+            async with asyncio.timeout(3):
+                while not selected or ui._model_choices != ["default", "high"]:
+                    await asyncio.sleep(.01)
+            pipe.send_text("\x1b")
+            await asyncio.wait_for(task, 3)
+            assert selected == ["high", None]
+            assert "120" in "".join(fragment[1] for fragment in ui._status_fragments())
+            assert "选择思考强度" not in ui.view.plain_text()
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("columns", [60, 80])
+async def test_large_token_status_keeps_model_effort_context_cache_and_reasoning_visible(columns):
+    import io
+
+    from prompt_toolkit.data_structures import Size
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output.vt100 import Vt100_Output
+    from wcwidth import wcswidth
+
+    from agent_runtime.result import AgentUsage
+    from agent_runtime.streaming.events import EventType, StreamEvent
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="深度思考模型👩‍💻-deepseek-flash", workspace="/tmp", input=pipe,
+            output=Vt100_Output(io.StringIO(), lambda: Size(rows=24, columns=columns), enable_cpr=False))
+        await ui.display.emit(StreamEvent(type=EventType.BUDGET_UPDATE, turn_id="t", data={
+            "purpose": "agent_step",
+            "effective_settings": {"reasoning_effort": "high", "max_output_tokens": 65536,
+                                   "requested_output_tokens": 65536},
+            "context_projection": {"input_tokens": 18456, "max_input_tokens": 120000,
+                                   "count_source": "utf8_bytes_conservative"},
+        }))
+        ui.display.update_usage(AgentUsage(input_tokens=2500000, output_tokens=1000000,
+            total_tokens=3500000, cache_read_input_tokens=1800000, reasoning_tokens=500000))
+        lines = "".join(fragment[1] for fragment in ui._status_fragments()).splitlines()
+        assert len(lines) == 2 and all(wcswidth(line) <= columns for line in lines)
+        assert "深" in lines[0] and "high" in lines[0] and "上下文" in lines[0]
+        assert "估" in lines[0]
+        assert "入" in lines[1] and "出" in lines[1] and "缓存" in lines[1] and "推理" in lines[1]
+        assert "3.5M" in lines[1] and "1.8M" in lines[1]
+        assert "≈" in lines[1]  # Scaled status values are rounded, never exact accounting.
+
+
+@pytest.mark.anyio
+async def test_bracketed_file_drop_after_existing_instruction_stays_in_its_own_line(tmp_path):
+    import asyncio
+    import shlex
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.local_files import parse_file_input
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    attachment = tmp_path / "季度 报告.txt"
+    attachment.write_text("source")
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="demo", workspace=str(tmp_path), input=pipe, output=DummyOutput())
+        submissions = []
+        async def conversation():
+            submissions.append(await ui.prompt())
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            async with asyncio.timeout(3):
+                while not ui.waiting:
+                    await asyncio.sleep(.01)
+            pipe.send_text("分析这个")
+            await asyncio.sleep(.03)
+            pipe.send_text("\x1b[200~" + shlex.quote(str(attachment)) + "\x1b[201~")
+            await asyncio.sleep(.08)
+            assert not task.done() and ui.waiting
+            guidance, files = parse_file_input(ui.editor.text, base=tmp_path)
+            assert guidance == "分析这个" and files == [str(attachment)]
+            pipe.send_text("继续解释")
+            await asyncio.sleep(.03)
+            guidance, files = parse_file_input(ui.editor.text, base=tmp_path)
+            assert guidance == "分析这个\n继续解释" and files == [str(attachment)]
+            pipe.send_text("\r")
+            await asyncio.wait_for(task, 3)
+            assert parse_file_input(submissions[0], base=tmp_path) == (guidance, files)
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+@pytest.mark.anyio
+async def test_busy_composer_delivers_request_settings_commands_and_keeps_other_slashes_in_draft():
+    import asyncio
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="demo", workspace="/tmp", input=pipe, output=DummyOutput())
+        finish = asyncio.Event()
+        received = []
+        async def on_input(text):
+            received.append(text)
+        ui.on_input = on_input
+        async def conversation():
+            await ui.operation(finish.wait())
+        task = asyncio.create_task(ui.run(conversation))
+        try:
+            async with asyncio.timeout(3):
+                while ui._operation is None:
+                    await asyncio.sleep(.01)
+            pipe.send_text("/model\r")
+            await asyncio.sleep(.08)
+            assert received == [] and ui.editor.text == "/model"
+            ui.editor.text = ""
+            pipe.send_text("/effort\r")
+            async with asyncio.timeout(3):
+                while received != ["/effort"]:
+                    await asyncio.sleep(.01)
+            pipe.send_text("/output 4096\r")
+            async with asyncio.timeout(3):
+                while len(received) != 2:
+                    await asyncio.sleep(.01)
+            assert received == ["/effort", "/output 4096"] and ui.editor.text == ""
+            assert not ui._input_receipts
+            finish.set()
+            await asyncio.wait_for(task, 3)
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass

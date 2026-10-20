@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 
 from agent_runtime.tools.builtins.codex_patch import create_codex_apply_patch_tool
+from agent_runtime.tools.builtins.command_sessions import CommandSessions, create_manage_command_tool
 from agent_runtime.tools.builtins.data import create_inspect_data_file_tool
 from agent_runtime.tools.builtins.filesystem import (
     create_apply_patch_tool,
@@ -25,6 +26,7 @@ RESIDENT_CODING_TOOL_NAMES = (
     "inspect_data_file",
     "apply_patch",
     "run_command",
+    "manage_command",
     "execute_python",
     "update_plan",
 )
@@ -35,6 +37,7 @@ def create_resident_coding_tools(
     *,
     plan_updater: PlanUpdater,
     command_hard_timeout_seconds: float = 605.0,
+    command_sessions: CommandSessions | None = None,
 ) -> tuple[Tool, ...]:
     """Build the fixed baseline as ordinary Tool values in product order."""
 
@@ -51,7 +54,9 @@ def create_resident_coding_tools(
         create_run_command_tool(
             workspace,
             hard_timeout_seconds=command_hard_timeout_seconds,
+            command_sessions=command_sessions,
         ),
+        create_manage_command_tool(workspace, command_sessions),
         create_execute_python_tool(
             workspace,
             hard_timeout_seconds=command_hard_timeout_seconds,

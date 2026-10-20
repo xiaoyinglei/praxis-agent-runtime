@@ -4,12 +4,13 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit
 
+from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
 from agent_runtime.core.llm_config import (
     ModelRuntimeConfig,
     normalize_model_endpoint,
@@ -106,6 +107,7 @@ class ModelSpec:
     input_cost_per_1m: float | None = None
     output_cost_per_1m: float | None = None
     runtime: ModelRuntimeSpec | None = None
+    reasoning: ReasoningCapabilities | None = None
 
 
 class ModelCatalog:
@@ -193,6 +195,8 @@ class ModelSessionState:
     selection_requester: ModelSwitchRequester = "system"
     file_revision: int = 0
     fingerprint: str = _MISSING_SESSION_FINGERPRINT
+    request_preferences: dict[str, ModelRequestPreferences] = field(default_factory=dict)
+    request_settings_revision: int = 0
 
     def __post_init__(self) -> None:
         _validate_selection_requester(self.selection_requester)
@@ -217,6 +221,8 @@ class ModelSessionState:
             self.current_model_id,
             expected=self.file_version,
             selection_requester=self.selection_requester,
+            request_preferences=self.request_preferences,
+            request_settings_revision=self.request_settings_revision,
         )
         self.file_revision = stored.file_revision
         self.fingerprint = stored.fingerprint
@@ -256,6 +262,10 @@ class ModelSessionStore:
             selection_requester="user",
             file_revision=0 if legacy else cast(int, document["revision"]),
             fingerprint=file_fingerprint(payload),
+            request_preferences={key: ModelRequestPreferences.model_validate(value)
+                                 for key, value in cast(dict[str, object],
+                                                        document.get("request_preferences", {})).items()},
+            request_settings_revision=cast(int, document.get("request_settings_revision", 0)),
         )
 
     def select(
@@ -264,6 +274,8 @@ class ModelSessionStore:
         *,
         expected: FileVersion,
         selection_requester: ModelSwitchRequester = "user",
+        request_preferences: dict[str, ModelRequestPreferences] | None = None,
+        request_settings_revision: int | None = None,
     ) -> ModelSessionState:
         selection_requester = validate_model_switch_requester(selection_requester)
         if not isinstance(model_id, str) or not model_id.strip() or model_id != model_id.strip():
@@ -280,6 +292,10 @@ class ModelSessionStore:
             encoded = _encode_session_document(
                 revision=revision,
                 current_model_id=model_id,
+                request_preferences=(observed.request_preferences if request_preferences is None
+                                     else request_preferences),
+                request_settings_revision=(observed.request_settings_revision if request_settings_revision is None
+                                           else request_settings_revision),
             )
             fingerprint = file_fingerprint(encoded)
             receipt = SessionMutationReceipt(
@@ -302,6 +318,10 @@ class ModelSessionStore:
             selection_requester=selection_requester,
             file_revision=revision,
             fingerprint=fingerprint,
+            request_preferences=dict(observed.request_preferences if request_preferences is None
+                                     else request_preferences),
+            request_settings_revision=(observed.request_settings_revision if request_settings_revision is None
+                                       else request_settings_revision),
         )
 
     def reconcile(self, receipt: SessionMutationReceipt) -> ModelSessionState:
@@ -343,12 +363,25 @@ def _parse_session_document(payload: bytes) -> tuple[dict[str, object], bool]:
     keys = set(value)
     if keys == {"current_model_id"}:
         legacy = True
-    elif keys == {"version", "revision", "current_model_id"}:
+    elif keys in ({"version", "revision", "current_model_id"},
+                  {"version", "revision", "current_model_id", "request_preferences", "request_settings_revision"}):
         legacy = False
         version = value["version"]
         revision = value["revision"]
-        if type(version) is not int or version != 1:
-            raise ValueError("model session version must be 1")
+        expected_version = 2 if "request_preferences" in value else 1
+        if type(version) is not int or version != expected_version:
+            raise ValueError(f"model session version must be {expected_version}")
+        if version == 2:
+            prefs = value["request_preferences"]
+            settings_revision = value["request_settings_revision"]
+            if type(settings_revision) is not int or settings_revision < 0:
+                raise ValueError("request_settings_revision must be a non-negative integer")
+            if not isinstance(prefs, dict) or any(
+                type(key) is not str or not key or key != key.strip() for key in prefs
+            ):
+                raise ValueError("request_preferences must be a mapping of model IDs")
+            for preference in prefs.values():
+                ModelRequestPreferences.model_validate(preference)
         if type(revision) is not int or revision < 0:
             raise ValueError("model session revision must be a non-negative integer")
     else:
@@ -359,11 +392,19 @@ def _parse_session_document(payload: bytes) -> tuple[dict[str, object], bool]:
     return cast(dict[str, object], value), legacy
 
 
-def _encode_session_document(*, revision: int, current_model_id: str) -> bytes:
+def _encode_session_document(
+    *, revision: int, current_model_id: str,
+    request_preferences: dict[str, ModelRequestPreferences] | None = None,
+    request_settings_revision: int = 0,
+) -> bytes:
+    extra = ({"request_preferences": {key: value.model_dump() for key, value in (request_preferences or {}).items()},
+              "request_settings_revision": request_settings_revision}
+             if request_preferences or request_settings_revision else {})
     return (
         json.dumps(
             {
-                "version": 1,
+                "version": 2 if extra else 1,
+                **extra,
                 "revision": revision,
                 "current_model_id": current_model_id,
             },
@@ -689,6 +730,53 @@ class ModelControlPlane:
     def current_model(self) -> ModelSpec:
         return self.catalog.get(self.state.current_model_id)
 
+    def request_settings(self) -> dict[str, Any]:
+        model_id = self.state.current_model_id
+        definition = self.catalog.definition(model_id)
+        return {
+            "model_defaults": {"reasoning_effort": definition.defaults.reasoning_effort or (
+                definition.reasoning.default_effort if definition.reasoning is not None else None),
+                "max_output_tokens": definition.defaults.max_output_tokens or
+                    definition.llm_stage_budgets["agent_step"].max_output_tokens},
+            "revision": self.state.request_settings_revision,
+            "model_id": model_id,
+            "preferences": self.state.request_preferences.get(model_id, ModelRequestPreferences()).model_dump(),
+        }
+
+    def configure_request(
+        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        model_id = self.state.current_model_id
+        # Review the selected identity and capabilities before touching any state.
+        self.policy.review_switch(catalog=self.catalog, target_model_id=model_id, requested_by="user")
+        definition = self.catalog.definition(model_id)
+        previous = self.state.request_preferences.get(model_id, ModelRequestPreferences())
+        values = previous.model_dump()
+        if reasoning_effort is not None:
+            values["reasoning_effort"] = None if reasoning_effort == "default" else reasoning_effort
+        if max_output_tokens is not None:
+            values["max_output_tokens"] = None if max_output_tokens == "default" else max_output_tokens
+        preference = ModelRequestPreferences.model_validate(values)
+        (definition.reasoning or ReasoningCapabilities()).validate_effort(preference.reasoning_effort)
+        preferences = {**self.state.request_preferences, model_id: preference}
+        revision = self.state.request_settings_revision + 1
+        if persist and self._session_store is not None:
+            try:
+                stored = self._session_store.select(
+                    model_id, expected=self.state.file_version,
+                    selection_requester=self.state.selection_requester,
+                    request_preferences=preferences, request_settings_revision=revision,
+                )
+            except SessionCommitOutcomeUnknown as error:
+                self._pending_session_receipt = error.receipt
+                raise
+            self.state.file_revision = stored.file_revision
+            self.state.fingerprint = stored.fingerprint
+        self.state.request_preferences = preferences
+        self.state.request_settings_revision = revision
+        return self.request_settings()
+
     def switch_model(
         self,
         model_id: str,
@@ -739,6 +827,8 @@ class ModelControlPlane:
         self.state.selection_requester = receipt.selection_requester
         self.state.file_revision = persisted.file_revision
         self.state.fingerprint = persisted.fingerprint
+        self.state.request_preferences = persisted.request_preferences
+        self.state.request_settings_revision = persisted.request_settings_revision
         self._pending_session_receipt = None
         return spec
 
@@ -1148,6 +1238,8 @@ def _load_session_state(
             selection_requester=initial_selection_requester,
             file_revision=persisted.file_revision,
             fingerprint=persisted.fingerprint,
+            request_preferences=dict(persisted.request_preferences),
+            request_settings_revision=persisted.request_settings_revision,
         )
     elif store is not None:
         state = store.read(default_model_id=catalog.default_model_id)
@@ -1222,6 +1314,7 @@ def _to_public_definition_spec(
         base_url=definition.base_url,
         api_key_env=definition.api_key_env,
         max_output_tokens=definition.max_output_tokens,
+        reasoning=definition.reasoning,
         input_cost_per_1m=definition.input_cost_per_1m,
         output_cost_per_1m=definition.output_cost_per_1m,
         runtime=_to_public_runtime_spec(runtime),
@@ -1249,6 +1342,7 @@ def _to_public_spec(
         base_url=endpoint.base_url,
         api_key_env=spec.api_key_env,
         max_output_tokens=spec.max_output_tokens,
+        reasoning=spec.reasoning,
         input_cost_per_1m=spec.input_cost_per_1m,
         output_cost_per_1m=spec.output_cost_per_1m,
         runtime=_to_public_runtime_spec(spec.runtime),

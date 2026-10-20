@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal, Self
+from typing import Any, Literal, Self
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, model_validator
@@ -67,6 +67,17 @@ class AgentPlan(BaseModel):
         self.active_step_id = _valid_active_step_id(self.active_step_id, self.steps)
         return self
 
+
+
+def model_visible_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Project history/SDK titles to the update_plan input vocabulary."""
+    return {
+        **{key: value for key, value in plan.items() if key != "steps"},
+        "plan": [
+            {"step_id": step["step_id"], "step": step["title"], "status": step["status"]}
+            for step in plan.get("steps", ())
+        ],
+    }
 
 
 class PlanEvent(BaseModel):
@@ -137,12 +148,6 @@ class PlanTracker:
             warnings.append("steps_truncated")
         bounded_steps: list[PlanStep] = []
         for step in steps[: self.max_steps]:
-            if step.status == "completed":
-                warnings.append("unverified_completion_ignored")
-                bounded_steps.append(
-                    step.model_copy(update={"status": "pending"})
-                )
-                continue
             bounded_steps.append(step)
         active_step_id = next(
             (
@@ -185,31 +190,29 @@ class PlanTracker:
     ) -> tuple[AgentPlan | None, list[PlanEvent]]:
         if plan is None:
             return None, []
-        target_status: PlanStatus = "blocked" if blocked else "complete"
+        target_status: PlanStatus = (
+            "blocked" if blocked else "complete"
+            if all(step.status in {"completed", "skipped"} for step in plan.steps) else "needs_replan"
+        )
         if plan.status == target_status:
             return plan, []
-        step_status: PlanStepStatus = "blocked" if blocked else "completed"
-        steps: list[PlanStep] = []
-        for step in plan.steps:
-            should_update = step.status in {"pending", "in_progress"}
-            steps.append(
-                step.model_copy(update={"status": step_status})
-                if should_update
-                else step
-            )
         updated = plan.model_copy(
             update={
                 "status": target_status,
                 "revision": plan.revision + 1,
-                "steps": steps,
             }
         )
-        event_type: PlanEventType = "blocked" if blocked else "completed"
+        event_type: PlanEventType = (
+            "blocked" if blocked else "completed" if target_status == "complete" else "needs_replan"
+        )
         return updated, [
             self._event(
                 event_type,
                 updated,
-                message="Plan blocked." if blocked else "Plan completed.",
+                message="Turn blocked; reported steps retained." if blocked else (
+                    "Plan completed as reported." if target_status == "complete"
+                    else "Turn ended with unfinished plan steps; review remaining work."
+                ),
                 related_step_id=updated.active_step_id,
             )
         ]

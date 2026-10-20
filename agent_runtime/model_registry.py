@@ -11,6 +11,7 @@ from typing import Any, Literal, Self
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agent_runtime.core.generation_settings import ReasoningCapabilities
 from agent_runtime.core.llm_config import (
     ModelGenerationDefaults,
     ModelProvider,
@@ -104,6 +105,7 @@ class UserModelDefinition(BaseModel):
     cache_write_cost_per_1m: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     runtime: ModelRuntimeDeclaration | None = None
     continuation_summary_role: Literal["context", "assistant"] = "context"
+    reasoning: ReasoningCapabilities | None = None
 
     @field_validator("tokenizer_model", "provider_name", "protocol")
     @classmethod

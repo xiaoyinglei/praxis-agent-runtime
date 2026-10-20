@@ -77,6 +77,7 @@ class ModelSettings:
     parallel_tool_calls: bool = True
     seed: int | None = None
     provider_options: Mapping[str, JsonValue] = field(default_factory=dict)
+    cache_parameters: Mapping[str, JsonValue] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         _require_non_empty_string(self.model, field_name="model")
@@ -116,6 +117,9 @@ class ModelSettings:
         if not isinstance(frozen_options, Mapping):
             raise TypeError("provider_options must be an object")
         object.__setattr__(self, "provider_options", frozen_options)
+        if set(self.cache_parameters) - {"prompt_cache_key", "prompt_cache_retention"}:
+            raise ValueError("unsupported canonical cache parameter")
+        object.__setattr__(self, "cache_parameters", freeze_json_mapping(self.cache_parameters))
 
 
 @dataclass(frozen=True, slots=True)
@@ -603,6 +607,7 @@ def model_settings_payload(settings: ModelSettings) -> Mapping[str, JsonValue]:
         "parallel_tool_calls": settings.parallel_tool_calls,
         "seed": settings.seed,
         "provider_options": settings.provider_options,
+        **({"cache_parameters": settings.cache_parameters} if settings.cache_parameters else {}),
     }
 
 
@@ -627,6 +632,8 @@ def _tool_contract_payload(tool: Tool) -> Mapping[str, JsonValue]:
         "execution_revision": tool.execution_revision,
         "idempotent": tool.idempotent,
         "concurrency_safe": tool.concurrency_safe,
+        "continuation": tool.continuation is not None,
+        "after_commit": tool.after_commit is not None,
         "cancellation_mode": tool.cancellation_mode.value,
         "interrupt_behavior": tool.interrupt_behavior.value,
         "timeout_seconds": float(tool.timeout_seconds),

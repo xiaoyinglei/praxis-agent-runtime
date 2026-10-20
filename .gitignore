@@ -1,6 +1,7 @@
 .DS_Store
 .env
 .venv/
+node_modules/
 .python-version
 __pycache__/
 *.py[cod]
@@ -38,6 +39,9 @@ docs/superpowers/
 !/docs/runtime-recovery.md
 !/docs/runtime-design-review.md
 !/docs/runtime-output-and-linux-repair.md
+!/docs/macos-command-sessions.md
+!/docs/interactive-steering.md
+!/docs/model-request-settings.md
 !/docs/assets/
 /docs/assets/*
 !/docs/assets/praxis-demo.gif

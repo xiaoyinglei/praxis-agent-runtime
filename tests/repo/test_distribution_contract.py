@@ -53,17 +53,71 @@ def test_wheel_contains_runtime_and_excludes_legacy_agent(tmp_path: Path) -> Non
     assert _entry_point(wheel, "agent") == "agent_runtime.cli:agent_app"
 
 
-def test_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
+def test_ci_keeps_native_linux_and_macos_checks_required() -> None:
+    config = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    jobs = config["jobs"]
+
+    assert {"linux", "macos"} <= jobs.keys(), "CI must exercise both supported OS backends"
+    assert jobs["linux"]["runs-on"] == "ubuntu-24.04"
+    assert jobs["macos"]["runs-on"] == "macos-14"
+    for name in ("linux", "macos"):
+        job = jobs[name]
+        assert not job.get("continue-on-error", False)
+        assert "if" not in job, f"{name} must run for every PR, including shared protocol changes"
+        assert all(not step.get("continue-on-error", False) for step in job["steps"])
+
+
+def test_macos_ci_runs_real_sandbox_command_file_and_terminal_regressions() -> None:
+    config = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+    job = config["jobs"].get("macos")
+    assert job is not None, "macOS must have a native regression job"
+    workflow = "\n".join(step.get("run", "") for step in job["steps"])
+    commands = re.sub(r"\s+", " ", workflow.replace("\\\n", " "))
+
+    assert "test -x /usr/bin/sandbox-exec" in commands
+    assert "/usr/bin/sandbox-exec -p" in commands
+    assert "uv sync --locked" in commands
+    assert "--all-extras" not in commands, "native regressions must not duplicate the heavy RAG/MLX install"
+    assert "uv run pytest -q" in commands
+    for path in (
+        "tests/agent/test_run_command_safety.py",
+        "tests/agent/test_command_sessions.py",
+        "tests/agent/test_command_recovery.py",
+        "tests/agent/harness/test_macos_command_sessions.py",
+        "tests/agent/harness/test_real_sandbox_path.py",
+        "tests/agent/test_permission_sandbox.py",
+        "tests/agent/test_permission_integration.py",
+        "tests/agent/test_file_manifest.py",
+        "tests/agent/test_local_files.py",
+        "tests/agent/test_cli_chat_commands.py",
+        "tests/agent/harness/test_public_agent_cutover.py",
+        "tests/agent/test_terminal_input.py",
+        "tests/agent/test_terminal_render.py",
+        "tests/agent/test_terminal_ui.py",
+        "tests/agent/test_terminal_ui_modes.py",
+        "tests/agent/test_terminal_approval.py",
+        "tests/agent/test_terminal_steering.py",
+        "tests/agent/test_terminal_connections.py",
+    ):
+        assert path in commands, f"missing native macOS regression: {path}"
+
+
+def test_linux_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
     config = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
     # Inspect executable step bodies rather than YAML formatting. Shell line
     # continuations and indentation do not change the installation contract.
-    workflow = "\n".join(step.get("run", "") for step in config["jobs"]["test"]["steps"])
+    workflow = "\n".join(step.get("run", "") for step in config["jobs"]["linux"]["steps"])
     commands = re.sub(r"\s+", " ", workflow.replace("\\\n", " "))
     ordered_commands = [
         "uv sync --locked --all-extras",
         "uv run --all-extras ruff check .",
         "uv run --all-extras mypy",
         "uv run --all-extras pytest -q",
+        "uv run --all-extras python scripts/agent_web_quality.py",
+        "uv run --all-extras playwright install --with-deps --only-shell chromium",
+        "PRAXIS_TEST_BROWSER=1 uv run --all-extras pytest -q tests/agent/test_web_browser.py "
+        "tests/agent/test_connection_manager_browser.py",
+        "sudo /usr/bin/python3 -I scripts/ubuntu/smoke-model-service.py --wheel-dir",
         "uv run --all-extras lint-imports",
         "uv build",
         "uv run --all-extras python scripts/agent_cli_smoke.py",
@@ -86,6 +140,9 @@ def test_ci_runs_full_gates_then_smokes_the_installed_wheel() -> None:
         cursor = commands.find(command, cursor + 1)
         assert cursor >= 0, f"missing or out-of-order CI command: {command}"
 
+    assert "sudo apt-get install -y bubblewrap apparmor libseccomp2" in commands
+    assert "/usr/bin/bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true" in commands
+    assert "python3 scripts/ubuntu/install-codex-patch.py --destination" in commands
     assert 'mktemp -d "$RUNNER_TEMP/praxis-wheel-smoke.XXXXXX"' in workflow
     assert "mapfile -d '' -t wheels" in workflow
     assert '"${#wheels[@]}" -ne 1' in workflow

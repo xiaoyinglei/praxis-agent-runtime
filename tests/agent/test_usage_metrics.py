@@ -215,3 +215,139 @@ async def test_mcp_adapter_observed_success_and_failure_project_separate_usage(t
     assert result.usage.native_latency_ms_total == 0
     assert result.usage.mcp_latency_ms_total == result.usage.tool_latency_ms
     assert result.usage.tool_latency_ms > 0
+
+
+class DetailedUsageReads(ReadTwiceThenAnswer):
+    async def dispatch(self, prepared, *, delta_sink=None):
+        response = await super().dispatch(prepared, delta_sink=delta_sink)
+        factor = 1 if prepared.request_ref["request_id"].endswith(":step:1") else 2
+        return replace(response, usage={
+            "input_tokens": 1000 * factor, "output_tokens": 100 * factor,
+            "total_tokens": 1100 * factor, "logical_input_tokens": 1000 * factor,
+            "uncached_input_tokens": 700 * factor, "cache_read_input_tokens": 300 * factor,
+            "cache_write_input_tokens": 0, "reasoning_tokens": 30 * factor,
+            "usage_source": "provider",
+        })
+
+
+@pytest.mark.anyio
+async def test_public_usage_projects_cache_and_reasoning_without_double_counting(tmp_path, monkeypatch):
+    (tmp_path / "present.txt").write_text("evidence")
+    database = tmp_path / "usage.sqlite"
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", DetailedUsageReads)
+    result = await agent.run("Read both files")
+    usage = result.usage
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (3000, 300, 3300)
+    assert usage.logical_input_tokens == 3000
+    assert usage.uncached_input_tokens == 2100
+    assert usage.cache_read_input_tokens == 900
+    assert usage.cache_write_input_tokens == 0
+    assert usage.reasoning_tokens == 90
+    assert usage.usage_complete is True
+    with RolloutStore(database) as store:
+        store.rebuild_projections()
+        assert store.verify().valid
+    assert (await agent.read_result(result.turn_id)).usage == usage
+
+
+@pytest.mark.anyio
+async def test_usage_displays_tokens_without_verbose(tmp_path, monkeypatch, capsys):
+    from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "usage.sqlite",
+                  enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
+    result = await agent.run("Answer")
+    assert result.usage.cache_read_input_tokens is None
+    _display_agent_result(result, verbose=False)
+    output = capsys.readouterr().out
+    assert "输入 4" in output and "输出 3" in output and "总计 7" in output
+    assert "费用" not in output
+
+
+@pytest.mark.anyio
+async def test_explicit_unknown_cache_usage_does_not_become_legacy_zero(tmp_path, monkeypatch):
+    from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
+
+    class UnknownCache(PublicHarnessModel):
+        async def dispatch(self, prepared, *, delta_sink=None):
+            return HarnessModelResponse(text="answer", provider_response_id=None, usage={
+                "input_tokens": 4, "output_tokens": 3, "cached_input_tokens": 0,
+                "cache_read_input_tokens": None,
+            })
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "cache.sqlite", enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", UnknownCache)
+    result = await agent.run("Answer")
+    assert result.usage.total_tokens == 7
+    assert result.usage.cache_read_input_tokens is None
+
+
+@pytest.mark.anyio
+async def test_unknown_model_outcome_marks_recorded_usage_incomplete(tmp_path, monkeypatch, capsys):
+    from tests.agent.harness.test_public_agent_cutover import FailingPublicHarnessModel
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "unknown-model.sqlite",
+                  enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", FailingPublicHarnessModel)
+    result = await agent.run("Answer")
+    assert result.status == "paused"
+    assert result.usage.usage_complete is False
+    _display_agent_result(result, verbose=False)
+    output = capsys.readouterr().out
+    assert "已记录" in output and "用量不完整" in output
+
+
+@pytest.mark.parametrize("status", ["done", "failed", "paused"])
+@pytest.mark.parametrize("renderer", ["plain", "chat"])
+def test_usage_summary_is_visible_for_every_result_status_without_verbose(tmp_path, capsys, status, renderer):
+    from agent_runtime.harness import TurnResult
+    from agent_runtime.result import AgentResult
+
+    with RolloutStore(tmp_path / "summary.sqlite") as store:
+        thread = store.create_thread(workspace=tmp_path)
+        turn = store.start_turn(thread_id=thread.thread_id, user_message="task", binding_manifest={})
+        result = AgentResult._from_harness(
+            TurnResult(thread_id=thread.thread_id, turn_id=turn.turn_id, status="running", answer=None),
+            store=store,
+        )
+    result = replace(result, status=status, usage=AgentUsage(
+        input_tokens=1000, output_tokens=200, total_tokens=1200, cache_read_input_tokens=800,
+        reasoning_tokens=50,
+    ))
+    if renderer == "chat":
+        from agent_runtime.terminal_app import _conversation_output
+        from agent_runtime.terminal_ui import Conversation
+
+        view = Conversation(lambda: None)
+        with _conversation_output(view):
+            _display_agent_result(result, verbose=False, show_execution=False)
+        output = view.plain_text()
+    else:
+        _display_agent_result(result, verbose=False, show_execution=False)
+        output = capsys.readouterr().out
+    assert "输入 1,000" in output and "输出 200" in output and "总计 1,200" in output
+    assert "缓存命中 800" in output and "推理 50" in output
+    assert "费用" not in output
+
+
+@pytest.mark.anyio
+async def test_incomplete_output_and_its_retry_are_both_in_the_usage_summary(tmp_path, monkeypatch):
+    from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
+
+    class Truncated(PublicHarnessModel):
+        async def dispatch(self, prepared, *, delta_sink=None):
+            return HarnessModelResponse(text="", provider_response_id=None,
+                                        status="incomplete", incomplete_reason="max_output_tokens",
+                                        usage={"input_tokens": 100, "output_tokens": 32,
+                                               "total_tokens": 132, "reasoning_tokens": 32})
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "truncated.sqlite",
+                  enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", Truncated)
+    result = await agent.run("Answer")
+    assert result.status == "failed"
+    assert result.usage.model_calls == 2
+    assert result.usage.total_tokens == 264
+    assert result.usage.reasoning_tokens == 64

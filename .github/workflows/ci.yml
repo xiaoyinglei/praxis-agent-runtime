@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  test:
+  linux:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -100,3 +100,40 @@ jobs:
           uv pip install --python "$smoke_venv/bin/python" \
             --constraint "$smoke_root/constraints.txt" "${wheel}[rag]"
           "$smoke_venv/bin/rag" --help
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Require native Seatbelt
+        run: |
+          test -x /usr/bin/sandbox-exec
+          /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
+      - name: Sync locked runtime and development environment
+        run: uv sync --locked
+      - name: Native command, file permission, and terminal regressions
+        run: |
+          uv run pytest -q \
+            tests/agent/test_run_command_safety.py \
+            tests/agent/test_command_sessions.py \
+            tests/agent/test_command_recovery.py \
+            tests/agent/harness/test_macos_command_sessions.py \
+            tests/agent/harness/test_real_sandbox_path.py \
+            tests/agent/test_permission_sandbox.py \
+            tests/agent/test_permission_integration.py \
+            tests/agent/test_file_manifest.py \
+            tests/agent/test_local_files.py \
+            tests/agent/test_cli_chat_commands.py \
+            tests/agent/harness/test_public_agent_cutover.py \
+            tests/agent/test_terminal_input.py \
+            tests/agent/test_terminal_render.py \
+            tests/agent/test_terminal_ui.py \
+            tests/agent/test_terminal_ui_modes.py \
+            tests/agent/test_terminal_approval.py \
+            tests/agent/test_terminal_steering.py \
+            tests/agent/test_terminal_connections.py

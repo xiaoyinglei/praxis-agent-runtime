@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from agent_runtime.core.generation_settings import ReasoningCapabilities
 from agent_runtime.core.llm_config import (
     AgentModelsConfig,
     ModelProvider,
@@ -126,6 +127,16 @@ class RequestDefaultsDefinition(BaseModel):
     )
 
     provider_options: ProviderOptionsDefinition | None = None
+    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
+    reasoning_effort: str | None = Field(default=None, min_length=1)
+
+    @model_serializer(mode="wrap")
+    def serialize_defaults(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload = handler(self)
+        for key in ("max_output_tokens", "reasoning_effort"):
+            if getattr(self, key) is None:
+                payload.pop(key, None)
+        return dict(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +147,8 @@ class ModelCapabilities:
     max_output_tokens: int | None
     supports_native_tools: bool
     supports_structured_output: bool
+    reasoning: ReasoningCapabilities | None = None
+    supported_cache_parameters: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.context_window_tokens, bool) or self.context_window_tokens <= 0:
@@ -207,16 +220,27 @@ class ModelExecutionDefinition(BaseModel):
     generation: GenerationDefinition
     llm_stage_budgets: dict[str, StageBudgetDefinition]
     context_capacity_policy: ContextCapacityPolicy | None = None
+    auto_compact_token_limit: int | None = Field(default=None, gt=0, strict=True)
     continuation_summary_role: Literal["context", "assistant"] | None = None
+    reasoning: ReasoningCapabilities | None = None
+    agent_output_policy: Literal["model-aware-v1"] | None = None
+    supported_cache_parameters: tuple[Literal["prompt_cache_key", "prompt_cache_retention"], ...] = ()
 
     @model_serializer(mode="wrap")
     def serialize_definition(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
         payload = handler(self)
         # Legacy archives and authenticated bindings must retain exact bytes.
+        if not self.supported_cache_parameters:
+            payload.pop("supported_cache_parameters", None)
         if self.context_capacity_policy is None:
             payload.pop("context_capacity_policy", None)
+        if self.auto_compact_token_limit is None:
+            payload.pop("auto_compact_token_limit", None)
         if self.continuation_summary_role is None:
             payload.pop("continuation_summary_role", None)
+        for key in ("reasoning", "agent_output_policy"):
+            if getattr(self, key) is None:
+                payload.pop(key, None)
         return dict(payload)
 
     @field_validator("base_url")
@@ -245,6 +269,8 @@ class ModelExecutionDefinition(BaseModel):
         if self.max_output_tokens is not None and self.max_output_tokens > self.context_window_tokens:
             raise ValueError("max_output_tokens must not exceed context_window_tokens")
 
+        (self.reasoning or ReasoningCapabilities()).validate_effort(self.defaults.reasoning_effort)
+
         _ = normalize_model_endpoint(
             provider=self.provider,
             base_url=self.base_url,
@@ -258,6 +284,8 @@ class ModelExecutionDefinition(BaseModel):
         return ModelCapabilities(
             context_window_tokens=(self.context_window_tokens),
             max_output_tokens=(self.max_output_tokens),
+            reasoning=self.reasoning,
+            supported_cache_parameters=self.supported_cache_parameters,
             supports_native_tools=(self.supports_tools),
             supports_structured_output=(self.supports_structured_output),
         )
@@ -292,6 +320,8 @@ def build_model_execution_definition(
             stage.value: budget.model_dump() for stage, budget in effective_stage_budgets(config=config).items()
         },
         context_capacity_policy=ContextCapacityPolicy(),
+        agent_output_policy="model-aware-v1",
+        auto_compact_token_limit=config.auto_compact_token_limit,
     )
     return ModelExecutionDefinition.model_validate(payload)
 

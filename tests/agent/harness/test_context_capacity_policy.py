@@ -491,7 +491,7 @@ def test_capacity_and_compaction_are_visible_in_replayed_events(tmp_path):
         assert "Runtime budget status:" in message["content"]
 
 
-def test_terminal_displays_capacity_compaction_and_unknown_cost(capsys):
+def test_terminal_displays_capacity_and_compaction_tokens_without_cost(capsys):
     import asyncio
 
     from agent_runtime.streaming.events import EventType, StreamEvent
@@ -541,7 +541,8 @@ def test_terminal_displays_capacity_compaction_and_unknown_cost(capsys):
     rendered = capsys.readouterr().out
     assert "1015296" in rendered and "943718" in rendered
     assert "message_guard" in rendered and "64000" in rendered and "3000" in rendered
-    assert "unknown" in rendered and "unset" in rendered
+    assert "unset" in rendered
+    assert "cost" not in rendered and "费用" not in rendered
 
 
 @pytest.mark.anyio

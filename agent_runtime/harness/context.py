@@ -80,6 +80,11 @@ class RolloutContextManager:
             tuple(message for _, message in self._projected_messages(turn_id)), turn_id=turn_id
         )
 
+    def current_plan(self, turn_id: str) -> ItemSnapshot | None:
+        """Read canonical advisory state, including after compaction or restart."""
+        return next((item for item in reversed(self._store.list_items(turn_id))
+                     if item.kind == "plan_state" and item.status == "completed"), None)
+
     def _validate_budget(
         self, projected: tuple[HarnessMessage, ...], *, turn_id: str | None = None
     ) -> tuple[HarnessMessage, ...]:
@@ -200,6 +205,11 @@ class RolloutContextManager:
             if cut == len(projected)
             else next(n for n, item in enumerate(items) if item.item_id == projected[cut][0])
         )
+        # A user input may precede the results in the ledger while following
+        # them in provider context. Cover the whole raw tool exchange, keeping
+        # all crossed user Items protected below.
+        raw_indices = {item.item_id: index for index, item in enumerate(items)}
+        raw_cut = max(raw_cut, max((raw_indices[identity] + 1 for identity, _ in projected[:cut]), default=0))
         if raw_cut == 0:
             raise ContextBudgetExceededError(
                 "No completed context is available for compaction.", reason_code="no_compactable_context"
@@ -210,8 +220,12 @@ class RolloutContextManager:
             # replay separately, so the next summary does not summarize it again.
             raw_cut = (len(items) if semantic_cut == len(projected)
                        else next(n for n, item in enumerate(items) if item.item_id == projected[semantic_cut][0]))
+            raw_cut = max(raw_cut, max((raw_indices[identity] + 1
+                                       for identity, _ in projected[:semantic_cut]), default=0))
         covered = items[:raw_cut]
-        protected_users = {latest_user}
+        protected_users = {latest_user} | {
+            item.item_id for item in items if item.turn_id == turn_id and item.kind == "user_message"
+        }
         first_tail_role = next((m.role for _, m in projected[cut:] if m.role != "context"), None)
         if first_tail_role not in {None, "user"}:
             anchor = next((item_id for item_id, m in reversed(projected[:cut]) if m.role == "user"), None)
@@ -582,7 +596,28 @@ def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessM
             projected.append((item.item_id, replacement))
         if item.item_id not in suppressed and (message := _item_message(item)) is not None:
             projected.append((item.item_id, message))
-    return tuple(projected)
+        if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
+            input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
+            if isinstance(input_update, str):
+                projected.append((item.item_id, HarnessMessage(role="context", content=input_update)))
+    # Preserve receive order in the ledger; keep provider tool groups complete.
+    ordered = []
+    deferred = []
+    pending: set[str] = set()
+    for entry in projected:
+        message = entry[1]
+        if pending and message.role == "user":
+            deferred.append(entry)
+            continue
+        ordered.append(entry)
+        pending.update(call.id for call in message.tool_calls)
+        if message.role == "tool":
+            pending.discard(message.tool_call_id or "")
+        if not pending:
+            ordered.extend(deferred)
+            deferred.clear()
+    ordered.extend(deferred)
+    return tuple(ordered)
 
 
 def _tool_safe_boundary(messages: tuple[HarnessMessage, ...], cut: int) -> int:
@@ -617,6 +652,10 @@ def _validate_tool_groups(messages: tuple[HarnessMessage, ...]) -> None:
 
 
 def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
+    if item.kind == "model_request" and item.producer == "runtime":
+        update = item.payload.get("request_ref", {}).get("runtime_context_update")
+        if isinstance(update, str):
+            return HarnessMessage(role="context", content=update)
     text = item.payload.get("text")
     if item.kind == "user_message" and isinstance(text, str):
         return HarnessMessage(role="user", content=text)
@@ -651,7 +690,19 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
             )
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
         return HarnessMessage(role="context", content=text)
+    if item.kind == "tool_continuation" and item.producer == "runtime":
+        return HarnessMessage(role="context", content=(
+            "The live command owner closed. Confirmed terminal outcome (the process is not reattached):\n"
+            + _json(dict(item.payload))
+        ))
     if item.kind == "input_file":
+        if item.payload.get("storage") == "reference" and isinstance(item.payload.get("path"), str):
+            return HarnessMessage(role="context", content=(
+                f"Attached input file (read-only original, not copied): {_json(item.payload['path'])}. "
+                f"SHA256 at attachment: {item.payload.get('sha256')}. "
+                "This is a live local file reference: read its current contents with file tools; "
+                "the original may change or be removed. Write derived outputs inside the workspace."
+            ))
         workspace_path = item.payload.get("workspace_path")
         sha256 = item.payload.get("sha256")
         if isinstance(workspace_path, str) and isinstance(sha256, str):
@@ -705,7 +756,9 @@ def _runtime_preserved_facts(
         for item in store.list_context_items(turn_id)
         if item.kind == "plan_state" and item.status == "completed" and isinstance(item.payload.get("plan"), Mapping)
     ]
-    unresolved_work = [] if not plan_items else [dict(plan_items[-1].payload["plan"])]
+    from agent_runtime.planning import model_visible_plan
+
+    unresolved_work = [] if not plan_items else [model_visible_plan(plan_items[-1].payload["plan"])]
     uncertain_side_effects = [
         {
             "operation_id": operation.operation_id,
@@ -743,7 +796,10 @@ def _tool_call(payload: Mapping[str, object]) -> HarnessToolCall:
     arguments = payload.get("arguments")
     if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
         raise RuntimeError("committed model tool call is malformed")
-    return HarnessToolCall(id=call_id, name=name, arguments=arguments)
+    argument_error = payload.get("argument_error")
+    if argument_error is not None and not isinstance(argument_error, str):
+        raise RuntimeError("committed model tool argument error is malformed")
+    return HarnessToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error)
 
 
 def _compaction_projection(

@@ -7,6 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+from agent_runtime.approval import MODE_ORDER, ApprovalMode, CommandGrant, command_grant
 from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.tool import (
     CancellationMode,
@@ -14,6 +15,7 @@ from agent_runtime.tools.tool import (
     ResolvedToolUse,
     Tool,
     ToolApprovalProfile,
+    ToolCall,
     ToolEffect,
 )
 
@@ -58,9 +60,12 @@ class ToolExecutionContext:
     require_confirmation_for: frozenset[str] = frozenset()
     denied_tool_names: frozenset[str] = frozenset()
     auto_approve_sandboxed: bool = False
+    approval_mode: ApprovalMode = "ask"
+    command_grants: tuple[CommandGrant, ...] = ()
     permissions: ResolvedPermissions | None = None
     permission_provider: Callable[[], ResolvedPermissions] | None = None
     context_provider: Callable[[], ToolExecutionContext] | None = None
+    invocation_guard: Callable[[ToolCall], None] | None = None
 
     def refreshed(self) -> ToolExecutionContext:
         if self.context_provider is None:
@@ -80,6 +85,8 @@ class ToolExecutionContext:
             allow_execute_tools=self.allow_execute_tools and live.allow_execute_tools,
             allow_web_tools=self.allow_web_tools and live.allow_web_tools,
             auto_approve_sandboxed=self.auto_approve_sandboxed and live.auto_approve_sandboxed,
+            approval_mode=min((self.approval_mode, live.approval_mode), key=MODE_ORDER.__getitem__),
+            command_grants=tuple(grant for grant in self.command_grants if grant in live.command_grants),
             deny_effects=self.deny_effects | live.deny_effects,
             denied_tool_names=self.denied_tool_names | live.denied_tool_names,
             require_confirmation_for=self.require_confirmation_for | live.require_confirmation_for,
@@ -93,10 +100,16 @@ class ToolExecutionContext:
         return current if self.permissions is None else current.intersection(self.permissions)
 
     def __post_init__(self) -> None:
+        if self.approval_mode not in MODE_ORDER:
+            raise ValueError("approval_mode must be ask, auto, or full")
+        if any(not isinstance(grant, CommandGrant) for grant in self.command_grants):
+            raise TypeError("command_grants must contain CommandGrant values")
         if self.permissions is not None and not isinstance(self.permissions, ResolvedPermissions):
             raise TypeError("permissions must be ResolvedPermissions or None")
         if self.permission_provider is not None and not callable(self.permission_provider):
             raise TypeError("permission_provider must be callable")
+        if self.invocation_guard is not None and not callable(self.invocation_guard):
+            raise TypeError("invocation_guard must be callable")
         for name in (
             "allow_write_tools",
             "allow_execute_tools",
@@ -152,6 +165,8 @@ def restore_tool_policy(
 ) -> ToolExecutionContext:
     """Restore historical grants subject to current resource and runtime limits."""
     policy = dict(saved)
+    # Mode is a live user control. Historical Steps must not undo a downgrade.
+    policy.pop("approval_mode", None)
     policy.setdefault("allow_web_tools", False)
     if "deny_effects" in policy:
         policy["deny_effects"] = frozenset(ToolEffect(value) for value in policy["deny_effects"])
@@ -217,9 +232,11 @@ def can_use_tool(
           and name not in context.require_confirmation_for
           and tool.approval_profile is not ToolApprovalProfile.MCP_ACTION):
         decision = CanUseToolResult(UseToolDecision.ALLOW, f"permission rule allows tool: {name}")
-    preapproved_web = (context.allow_web_tools and tool.approval_profile is ToolApprovalProfile.PUBLIC_WEB_READ
+    preapproved_web = ((context.allow_web_tools or context.approval_mode in {"auto", "full"})
+                      and tool.approval_profile is ToolApprovalProfile.PUBLIC_WEB_READ
                       and name in {"web_search", "web_fetch"})
-    if network_decision == "ask" and decision.decision is UseToolDecision.ALLOW and not preapproved_web:
+    if (network_decision == "ask" and decision.decision is UseToolDecision.ALLOW
+            and not preapproved_web and context.approval_mode != "full"):
         decision = CanUseToolResult(UseToolDecision.ASK, "permission policy requires network approval", "network")
     if permissions.effective_approval == "never" and decision.decision is UseToolDecision.ASK:
         return CanUseToolResult(UseToolDecision.DENY, "approval is required but permission policy disables prompts")
@@ -235,7 +252,6 @@ def _default_tool_decision(
     network_preapproved: bool = False,
 ) -> CanUseToolResult:
 
-    del args
     tool_name = tool.definition.name
     if tool_name in context.denied_tool_names:
         return CanUseToolResult(
@@ -254,8 +270,13 @@ def _default_tool_decision(
             UseToolDecision.ASK,
             f"runtime policy requires confirmation for tool: {tool_name}",
         )
+    if context.approval_mode == "full":
+        return CanUseToolResult(UseToolDecision.ALLOW, "user selected full approval within permission limits")
+    candidate = command_grant(tool, args, resolved, context) if context.command_grants else None
+    if candidate is not None and any(grant.matches(candidate) for grant in context.command_grants):
+        return CanUseToolResult(UseToolDecision.ALLOW, "command matches a current Session grant")
     if (
-        context.allow_web_tools
+        (context.allow_web_tools or context.approval_mode == "auto")
         and tool.approval_profile is ToolApprovalProfile.PUBLIC_WEB_READ
         and tool_name in {"web_search", "web_fetch"}
         and resolved.effects == frozenset({ToolEffect.NETWORK})
@@ -263,7 +284,7 @@ def _default_tool_decision(
     ):
         return CanUseToolResult(UseToolDecision.ALLOW, "public web reading is pre-approved by runtime policy")
     if (
-        context.auto_approve_sandboxed
+        (context.auto_approve_sandboxed or context.approval_mode == "auto")
         and (
             tool.approval_profile
             is ToolApprovalProfile.RESTRICTED_READ_ONLY_PROCESS
@@ -287,6 +308,7 @@ def _default_tool_decision(
     if (
         ToolEffect.WRITE_WORKSPACE in resolved.effects
         and not context.allow_write_tools
+        and context.approval_mode != "auto"
     ):
         approval_reasons.append("workspace write")
     if (

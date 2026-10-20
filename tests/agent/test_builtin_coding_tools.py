@@ -119,6 +119,7 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         "inspect_data_file",
         "apply_patch",
         "run_command",
+        "manage_command",
         "execute_python",
         "update_plan",
     )
@@ -180,30 +181,12 @@ def test_command_output_bound_preserves_diagnostic_head_and_tail() -> None:
     assert len(bounded.encode("utf-8")) <= shell_module._MAX_STREAM_BYTES
 
 
-def test_run_command_normalizes_unambiguous_millisecond_timeout(
-    tmp_path: Path,
-) -> None:
-    workspace = open_workspace(tmp_path, create=True)
-    command = _tools_by_name(workspace)["run_command"]
-
-    validated = command.validate_input(
-        {
-            "command": "uv run pytest -q tests/agent/test_agent_loop_runtime.py",
-            "timeout_seconds": 120_000,
-        }
-    )
-
-    assert validated["timeout_seconds"] == 120.0
-    timeout_schema = command.definition.input_schema["properties"]["timeout_seconds"]
-    assert isinstance(timeout_schema, Mapping)
-    assert timeout_schema["maximum"] == 600_000.0
-    with pytest.raises(ToolValidationError, match="timeout_seconds"):
-        command.validate_input(
-            {
-                "command": "uv run pytest -q",
-                "timeout_seconds": 601,
-            }
-        )
+def test_run_command_uses_seconds_and_requires_background_for_long_deadlines(tmp_path: Path) -> None:
+    command = _tools_by_name(open_workspace(tmp_path, create=True))["run_command"]
+    validated = command.validate_input({"command": "true", "timeout_seconds": 3600, "yield_time_seconds": 0.01})
+    assert validated["timeout_seconds"] == 3600
+    with pytest.raises(ToolValidationError):
+        command.validate_input({"command": "true", "timeout_seconds": 3600})
 
 
 def test_run_command_declares_requested_network_as_dynamic_effect(

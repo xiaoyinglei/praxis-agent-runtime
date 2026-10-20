@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
+from agent_runtime.result import AgentUsage
 from agent_runtime.streaming.events import EventType, StreamEvent, TurnItemKind
 from agent_runtime.terminal_render import TerminalToolEventDisplay, bounded_result_lines, safe_terminal_text
 
@@ -155,6 +156,14 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self.turn_id: str | None = None
         self.connection_required = False
         self._new_answer = True
+
+    def update_usage(self, usage: AgentUsage) -> None:
+        super().update_usage(usage)
+        self.view.invalidate()
+
+    def update_request_settings(self, snapshot: Mapping[str, object]) -> None:
+        super().update_request_settings(snapshot)
+        self.view.invalidate()
 
     def begin_turn(self, *, reset: bool = True) -> None:
         super().begin_turn(reset=reset)

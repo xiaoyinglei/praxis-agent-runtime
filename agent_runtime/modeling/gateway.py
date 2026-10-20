@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult, decode_tool_arguments
 from agent_runtime.core.model_request import ModelRequest
 from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
@@ -204,6 +204,8 @@ class LLMGateway:
         stage_budgets: Mapping[LLMCallStage, LLMStageBudget] | None = None,
         provider_quota_gate: ProviderQuotaGate | None = None,
         context_policy: ContextCapacityPolicy | None = _DEFAULT_CONTEXT_POLICY,
+        agent_output_policy: str | None = None,
+        model_max_output_tokens: int | None = None,
     ) -> None:
         if model_context_tokens <= 0:
             raise ValueError("model_context_tokens must be positive")
@@ -213,6 +215,8 @@ class LLMGateway:
         self._stage_budgets = dict(stage_budgets or DEFAULT_LLM_STAGE_BUDGETS)
         self._provider_quota_gate = provider_quota_gate
         self.context_policy = context_policy
+        self.agent_output_policy = agent_output_policy
+        self._model_max_output_tokens = model_max_output_tokens
 
     @property
     def model_context_tokens(self) -> int:
@@ -236,6 +240,13 @@ class LLMGateway:
             budget,
             kwargs=kwargs,
         )
+        if stage == LLMCallStage.AGENT_STEP and self.agent_output_policy == "model-aware-v1":
+            requested = (kwargs or {}).get("max_tokens")
+            if type(requested) is int and requested > 0:
+                max_output_tokens = requested
+            if self._model_max_output_tokens is not None:
+                max_output_tokens = min(max_output_tokens, self._model_max_output_tokens)
+            max_output_tokens = min(max_output_tokens, self._model_context_tokens - budget.safety_margin_tokens - 1)
         hard_input = self._model_context_tokens - max_output_tokens - budget.safety_margin_tokens
         max_input_tokens = hard_input if budget.max_input_tokens is None else min(budget.max_input_tokens, hard_input)
         if max_input_tokens <= 0:
@@ -416,8 +427,10 @@ class LLMGateway:
             # A block stop alone is not a completed model step. Wait for the
             # authoritative terminal reason before decoding any tool fragments.
             if stop_reason in {"tool_use", "tool_calls"}:
-                calls = [ToolCall(id=tool_id, name=name, input=_tool_arguments(tool_arguments[tool_id]))
-                         for tool_id, name in tool_names.items() if tool_id in completed_tool_ids]
+                for tool_id, name in tool_names.items():
+                    if tool_id in completed_tool_ids:
+                        arguments, argument_error = decode_tool_arguments(tool_arguments[tool_id])
+                        calls.append(ToolCall(id=tool_id, name=name, input=arguments, argument_error=argument_error))
             normalized_stop = (
                 StopReason.MAX_TOKENS
                 if stop_reason == "max_tokens"
@@ -1117,16 +1130,6 @@ def _plain_wire_value(value: object) -> Any:
     if isinstance(value, tuple):
         return [_plain_wire_value(item) for item in value]
     return value
-
-
-def _tool_arguments(value: str) -> dict[str, Any]:
-    if not value:
-        return {}
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError:
-        return {"_raw": value[:20_000]}
-    return dict(parsed) if isinstance(parsed, Mapping) else {"_raw": parsed}
 
 
 def _account_messages(

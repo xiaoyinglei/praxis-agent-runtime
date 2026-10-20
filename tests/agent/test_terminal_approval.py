@@ -28,6 +28,7 @@ async def wait_for(predicate):
     ("yes", ("approve", "deny"), "approve"),
     ("Y", ("allow_once", "deny"), "allow_once"),
     ("N", ("approve", "deny"), "deny"),
+    ("S", ("approve", "allow_session", "deny"), "allow_session"),
 ])
 def test_plain_approval_shortcut_matches_offered_option(monkeypatch, typed, options, expected):
     replies = iter([typed, "q"])
@@ -35,7 +36,7 @@ def test_plain_approval_shortcut_matches_offered_option(monkeypatch, typed, opti
     assert cli._handle_pause(SimpleNamespace(pause=pause(options))) == expected
 
 
-@pytest.mark.parametrize("invalid", ["Y", "y", "allow_once", "approve", "c"])
+@pytest.mark.parametrize("invalid", ["Y", "y", "allow_once", "approve", "c", "s"])
 def test_plain_approval_cannot_choose_unoffered_action(monkeypatch, invalid):
     replies = iter([invalid, "N", "q"])
     monkeypatch.setattr("builtins.input", lambda _: next(replies))
@@ -229,6 +230,50 @@ async def test_empty_options_never_synthesizes_permission():
     ui = TerminalChatApp(model="fake", workspace="/tmp", output=DummyOutput())
     assert await ui.choose_approval(pause(())) is None
     assert cli._handle_pause(SimpleNamespace(pause=pause(()))) is None
+
+
+@pytest.mark.anyio
+async def test_session_grant_selector_and_visible_scope():
+    selected = []
+    with create_pipe_input() as pipe:
+        ui = TerminalChatApp(model="fake", workspace="/tmp", input=pipe, output=DummyOutput())
+        request = AgentPause(request_id="scoped", kind="tool_approval", question="允许命令？",
+                             options=("approve", "allow_session", "deny"),
+                             context={"session_grant_label": "git status [可追加参数]；目录 /tmp；只读沙箱"})
+
+        async def conversation():
+            selected.append(await ui.choose_approval(request))
+
+        task = asyncio.create_task(ui.run(conversation))
+        await wait_for(lambda: ui.status == "等待确认")
+        assert "git status" in ui.approval_body.text
+        labels = "".join(fragment[1] for fragment in ui._approval_fragments())
+        assert "本会话" in labels
+        assert " · S" not in labels and " · Y" not in labels and " · N" not in labels
+        assert "Enter" in "".join(fragment[1] for fragment in ui._footer())
+        pipe.send_text("\x1b[A\r")  # Move from default deny to the grant option and confirm.
+        await asyncio.wait_for(task, 3)
+        assert selected == ["allow_session"]
+
+
+@pytest.mark.anyio
+async def test_run_approval_uses_selection_dialog_without_typed_answer(monkeypatch):
+    requests = []
+
+    class Dialog:
+        async def run_async(self):
+            return "approve"
+
+    def dialog(**kwargs):
+        requests.append(kwargs)
+        return Dialog()
+
+    monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("prompt_toolkit.shortcuts.radiolist_dialog", dialog)
+    monkeypatch.setattr("builtins.input", lambda _: pytest.fail("approval must use the selector"))
+    result = SimpleNamespace(pause=pause())
+    assert await cli._handle_cli_pause(result) == "approve"
+    assert requests[0]["values"] == [("approve", "允许一次"), ("deny", "拒绝")]
 
 
 def test_empty_option_clarification_remains_a_text_answer(monkeypatch):

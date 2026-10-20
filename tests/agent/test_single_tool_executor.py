@@ -166,6 +166,29 @@ def _assert_one_trace(executor: ToolExecutor, call_id: str, code: str | None) ->
 
 
 @pytest.mark.anyio
+async def test_argument_decode_error_prevents_validation_and_execution():
+    events = []
+    tool = _tool(validate_input=lambda arguments: events.append("validate") or arguments,
+                 run=lambda arguments: events.append("run") or {})
+    executor = ToolExecutor({"demo": tool})
+    call = replace(_call(arguments={"_raw": '{"value":'}),
+                   argument_error="Invalid tool arguments JSON: Expecting value at line 1 column 10 (char 9)")
+    execution = await executor.execute(call, context=_context())
+    assert execution.result.error_code == "invalid_arguments"
+    assert execution.result.error_message == call.argument_error
+    assert execution.result.retryable is True
+    assert not events
+
+
+@pytest.mark.anyio
+async def test_valid_raw_field_does_not_trigger_argument_decode_error():
+    tool = _tool(validate_input=lambda arguments: arguments, run=lambda arguments: {"value": arguments["_raw"]})
+    executor = ToolExecutor({"demo": tool})
+    execution = await executor.execute(_call(arguments={"_raw": "business"}), context=_context())
+    assert not execution.result.is_error
+
+
+@pytest.mark.anyio
 async def test_executor_uses_the_exact_success_order() -> None:
     events: list[str] = []
 
@@ -556,6 +579,7 @@ async def test_executor_attests_partial_change_when_write_runner_fails(
 @pytest.mark.anyio
 async def test_executor_strips_forged_workspace_attestation_from_read_tool() -> None:
     forged = {
+        "runtime_workspace_origin_operation_id": "unapproved-operation",
         "runtime_workspace_write": True,
         "runtime_workspace_file_changes": (
             {
@@ -683,6 +707,34 @@ async def test_permission_denial_never_runs_runner() -> None:
     assert execution.result.error_code == "tool_denied"
     assert runner_calls == 0
     _assert_one_trace(executor, "call_1", "tool_denied")
+
+
+@pytest.mark.anyio
+async def test_filesystem_denial_explains_resource_and_recovery_across_tools(tmp_path):
+    from agent_runtime.core.messages import tool_result_message
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+    from agent_runtime.tools.builtins.shell import create_execute_python_tool
+
+    workspace = open_workspace(tmp_path)
+    permissions = PermissionPolicy(filesystem=(PathRule(path="protected", access="read"),)).resolve(tmp_path)
+    workspace.permission_provider = lambda: permissions
+    path = str(tmp_path / "protected" / "new.py")
+    tool = _tool("write_file", static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+                 resolve_use=lambda _: ResolvedToolUse(effects=frozenset(), targets=(
+                     ToolTarget(kind="workspace_path", value=path),)))
+    python = create_execute_python_tool(workspace)
+    context = replace(_context(workspace_root=tmp_path, allow_write=True, allow_execute=True), permissions=permissions)
+    executor = ToolExecutor({"write_file": tool, "execute_python": python})
+    for name, arguments in (("write_file", {}), ("execute_python", {
+        "code": "pass", "working_dir": ".", "workspace_write": True, "output_paths": ["protected/new.py"],
+    })):
+        execution = await executor.execute(_call(name, call_id=name, arguments=arguments), context=context)
+        assert execution.result.error_code == "filesystem_denied"
+        recovery = execution.result.metadata["permission_constraint"]
+        assert [dict(resource) for resource in recovery["resources"]] == [{"path": path, "access": "write"}]
+        assert recovery["permissions_revision"] == permissions.revision
+        assert "Changing tools" in tool_result_message(execution.result).content
+    assert not Path(path).exists()
 
 
 @pytest.mark.anyio
@@ -1740,3 +1792,40 @@ def test_task3_modules_do_not_import_legacy_execution_paths() -> None:
     ):
         source = (root / relative).read_text(encoding="utf-8")
         assert not any(name in source for name in forbidden)
+
+
+@pytest.mark.anyio
+async def test_continuation_observes_between_calls_without_new_write_grant(tmp_path):
+    from agent_runtime.tools.tool import ToolContinuation
+
+    owner = object()
+    phase = "observe"
+    terminal = False
+    launch = replace(_tool(name="start_work", static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+                           resolve_use=lambda _args: ResolvedToolUse(
+                               effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+                               targets=(ToolTarget(kind="workspace_path", value=str(tmp_path)),),
+                           )),
+                     continuation=lambda _args, _out: ToolContinuation(owner, "handle", "start", False))
+    observe = replace(_tool(name="observe_work"), continuation=lambda _args, _out: (
+        ToolContinuation(owner, "handle", phase, terminal)
+    ))
+    executor = ToolExecutor({"start_work": launch, "observe_work": observe})
+    initial = await executor.execute(_call("start_work"), context=_context(workspace_root=tmp_path, allow_write=True))
+    assert not initial.result.is_error
+    assert not initial.result.metadata["workspace_tree_changed"]
+    (tmp_path / "later").write_text("between tool calls")
+    # No write or execute grant on observation; the original authorized job owns
+    # the baseline. The current observation does not acquire a write resource.
+    current = await executor.execute(_call("observe_work", call_id="poll-1"), context=_context(workspace_root=tmp_path))
+    assert not current.result.is_error
+    assert current.result.metadata["runtime_workspace_origin_operation_id"] == initial.record.operation_id
+    assert current.result.metadata["workspace_tree_changed"] is True
+    assert ToolEffect.WRITE_WORKSPACE not in current.trace.effects
+    again = await executor.execute(_call("observe_work", call_id="poll-2"), context=_context(workspace_root=tmp_path))
+    assert again.result.metadata["workspace_tree_changed"] is False
+    terminal = True
+    await executor.execute(_call("observe_work", call_id="poll-3"), context=_context(workspace_root=tmp_path))
+    (tmp_path / "later").write_text("unrelated change after job ended")
+    ended = await executor.execute(_call("observe_work", call_id="poll-4"), context=_context(workspace_root=tmp_path))
+    assert "runtime_workspace_origin_operation_id" not in ended.result.metadata

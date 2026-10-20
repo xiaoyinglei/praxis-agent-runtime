@@ -333,11 +333,17 @@ def test_linux_view_preserves_existing_directory_modes(tmp_path):
         name: entry[:2] for name, entry in initial.items()}
 
 
-def test_linux_view_file_data_limit_fails_closed(tmp_path, monkeypatch):
+def test_linux_view_refuses_source_change_between_snapshot_and_copy(tmp_path, monkeypatch):
     workspace = open_workspace(tmp_path / "workspace", create=True)
     (workspace.root / "large").write_bytes(b"1234")
-    monkeypatch.setattr(shell, "_LINUX_VIEW_MAX_BYTES", 3)
-    with pytest.raises(ValueError, match="64 MiB"):
+    copy = shell._copy_linux_file
+
+    def change_before_copy(root, name, expected, output):
+        (root / name).write_bytes(b"changed")
+        return copy(root, name, expected, output)
+
+    monkeypatch.setattr(shell, "_copy_linux_file", change_before_copy)
+    with pytest.raises(ValueError, match="changed"):
         shell._prepare_linux_workspace_view(workspace, tmp_path / "view")
 
 

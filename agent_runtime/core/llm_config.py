@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from agent_runtime.core.generation_settings import ReasoningCapabilities
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
@@ -118,6 +119,8 @@ class ModelGenerationDefaults(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0, allow_inf_nan=False)
     parallel_tool_calls: bool | None = Field(default=None, strict=True)
     seed: int | None = Field(default=None, ge=-(2**63), le=2**63 - 1, strict=True)
+    max_output_tokens: int | None = Field(default=None, gt=0, strict=True)
+    reasoning_effort: str | None = Field(default=None, min_length=1)
 
     @model_validator(mode="before")
     @classmethod
@@ -226,6 +229,7 @@ class ModelSpec(BaseModel):
         default=True,
         strict=True,
     )
+    supported_cache_parameters: tuple[Literal["prompt_cache_key", "prompt_cache_retention"], ...] = ()
 
     location: Literal["local", "cloud"] | None = None
 
@@ -252,6 +256,7 @@ class ModelSpec(BaseModel):
 
     runtime: ModelRuntimeConfig | None = None
     continuation_summary_role: Literal["context", "assistant"] = "context"
+    reasoning: ReasoningCapabilities | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -328,6 +333,7 @@ class AgentModelsConfig(BaseModel):
     models: dict[str, ModelSpec] = Field(default_factory=dict)
     default_model: str
     fallback_model: str | None = None
+    auto_compact_token_limit: int | None = Field(default=None, gt=0, strict=True)
     generation: GenerationConfig = Field(default_factory=GenerationConfig)
     llm_stage_budgets: dict[LLMCallStage, LLMStageBudget] = Field(
         default_factory=lambda: {stage: budget.model_copy() for stage, budget in DEFAULT_LLM_STAGE_BUDGETS.items()}

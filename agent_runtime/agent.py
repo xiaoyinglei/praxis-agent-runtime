@@ -9,10 +9,11 @@ import os
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
-from uuid import uuid4
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from agent_runtime.approval import MODE_ORDER, ApprovalMode
 from agent_runtime.harness.memory import MemoryConfig
+from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -29,7 +30,9 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.harness import BoundHarnessModel, Session
+    from agent_runtime.harness.rollout import ItemSnapshot
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
+    from agent_runtime.tools.builtins.shell import RunCommandOutput
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CLOSE_GRACE_SECONDS = 5.0
@@ -59,8 +62,14 @@ class Agent:
         web_limits: WebLimits | None = None,
         permissions: PermissionPolicy | Path | str | None = None,
         managed_permissions: PermissionPolicy | Path | str | None = None,
+        approval_mode: ApprovalMode | None = None,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
         _selection_requester: ModelSwitchRequester = "system",
     ) -> None:
+        if approval_mode is not None and approval_mode not in MODE_ORDER:
+            raise ValueError("approval_mode must be ask, auto, or full")
+        self.approval_mode = approval_mode
         if knowledge is not None and not isinstance(knowledge, RAGKnowledgeConfig):
             raise TypeError("knowledge must be RAGKnowledgeConfig or None")
         if memory is not None and not isinstance(memory, MemoryConfig):
@@ -91,6 +100,7 @@ class Agent:
                 raise TypeError("permissions must be PermissionPolicy, a policy file path, or None")
         self.permissions = permissions
         self.managed_permissions = managed_permissions
+        self._input_read_files: tuple[str, ...] = ()
         self.effective_permissions()  # Reject invalid configuration before model/provider setup.
         self.model_session_path = model_session_path
         self.knowledge = knowledge
@@ -105,12 +115,37 @@ class Agent:
         self._selection_requester = selection_requester
         self._followup_model_id: str | None = None
         self._model_factory: Callable[[], BoundHarnessModel] | None = None
+        self._request_overrides: dict[str, dict[str, Any]] = {}
+        self._pending_request_settings: dict[str, dict[str, Any]] = {}
+        self._request_settings_revision = 0
+        if reasoning_effort is not None or max_output_tokens is not None:
+            self.configure_request(reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens)
 
     def models(self) -> list[ModelSpec]:
         return self._get_model_control_plane().list_models()
 
     def current_model(self) -> ModelSpec:
         return self._get_model_control_plane().current_model()
+
+    def request_settings(self) -> dict[str, Any]:
+        return self._get_model_control_plane().request_settings()
+
+    def configure_request(
+        self, *, reasoning_effort: str | None = None, max_output_tokens: int | str | None = None,
+    ) -> dict[str, Any]:
+        plane = self._get_model_control_plane()
+        settings = plane.configure_request(
+            reasoning_effort=reasoning_effort, max_output_tokens=max_output_tokens,
+            persist=self.model_session_path is not None,
+        )
+        self._request_settings_revision = settings["revision"]
+        self._request_overrides[settings["model_id"]] = {
+            "model_id": settings["model_id"],
+            "options": {key: ("default" if value is None else value)
+                        for key, value in settings["preferences"].items()},
+        }
+        self._pending_request_settings[settings["model_id"]] = self._request_overrides[settings["model_id"]]
+        return settings
 
     def switch_model(self, model_id: str) -> ModelSpec:
         spec = self._get_model_control_plane().switch_model(
@@ -145,6 +180,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
         event_sink: AgentEventSink | None = None,
         _event_dispatcher: TurnEventDispatcher | None = None,
     ) -> AgentResult:
@@ -155,6 +191,7 @@ class Agent:
             allow_write_tools=allow_write_tools,
             allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
+            approval_mode=approval_mode,
             max_steps=max_steps, max_turns=max_turns, max_tokens_total=max_tokens_total,
             max_cost_micros=max_cost_micros,
             event_sink=event_sink, _event_dispatcher=_event_dispatcher,
@@ -168,6 +205,7 @@ class Agent:
         acceptance_command: str | None = None,
         allow_write_tools: bool = False, allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
         max_steps: int | None = None, max_turns: int | None = None, max_tokens_total: int | None = None,
         max_cost_micros: int | None = None,
         event_sink: AgentEventSink | None = None,
@@ -190,13 +228,34 @@ class Agent:
             acceptance_command=acceptance_command,
             allow_write_tools=allow_write_tools, allow_execute_tools=allow_execute_tools,
             allow_web_tools=allow_web_tools,
-            max_steps=16 if step_budget is None else step_budget,
+            approval_mode=approval_mode if approval_mode is not None else self.approval_mode,
+            max_steps=DEFAULT_MAX_STEPS if step_budget is None else step_budget,
             max_tokens_total=max_tokens_total, max_cost_micros=max_cost_micros,
             event_sink=event_sink, event_dispatcher=_event_dispatcher,
             _background_memory=_background_memory,
         )
         async with session:
             yield session
+
+    async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
+        """Persist guidance without opening a model; target must still be active."""
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            turn = store.read_turn(expected_turn_id)
+            if Path(store.read_thread(turn.thread_id).workspace).resolve() != self._workspace_path():
+                raise RuntimeError("Turn belongs to a different workspace security domain")
+            return store.receive_turn_input(thread_id=turn.thread_id, turn_id=expected_turn_id, text=text)
+
+    def input_status(self, item_id: str) -> str:
+        """Inspect a steering receipt without model I/O."""
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database()) as store:
+            item = store.read_item(item_id)
+            if Path(store.read_thread(item.thread_id).workspace).resolve() != self._workspace_path():
+                raise RuntimeError("input belongs to a different workspace security domain")
+            return store.turn_input_status(item_id)
 
     def memories(self) -> dict[str, object]:
         """Inspect this workspace's memory without opening a model or creating state."""
@@ -268,6 +327,16 @@ class Agent:
         async with self.session(require_workspace_change=False, _background_memory=False) as session:
             return await session.refresh_memory()
 
+    async def command(
+        self, turn_id: str, session_id: str, *, action: Literal["status", "wait", "cancel", "read"] = "status",
+        wait_seconds: float = 10, stream: Literal["stdout", "stderr"] = "stdout",
+        offset: int = 0, max_bytes: int = 16000,
+    ) -> RunCommandOutput:
+        """Control the original committed command without calling a model or rerunning it."""
+        from agent_runtime.harness.command_recovery import manage_command
+        return await manage_command(self, turn_id, session_id, action=action, wait_seconds=wait_seconds,
+                                    stream=stream, offset=offset, max_bytes=max_bytes)
+
     async def resume(
         self,
         turn_id: str,
@@ -286,6 +355,8 @@ class Agent:
                 thread = store.read_thread(turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
+                from agent_runtime.harness.command_recovery import cancel_commands
+                await cancel_commands(self, turn_id)
                 mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
                 cancelled = mutation.value
                 result = AgentResult._from_harness(
@@ -360,6 +431,7 @@ class Agent:
         allow_write_tools: bool = False,
         allow_execute_tools: bool = False,
         allow_web_tools: bool = False,
+        approval_mode: ApprovalMode | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Yield committed durable events while the Turn is still running."""
 
@@ -378,6 +450,7 @@ class Agent:
                 allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools,
                 allow_web_tools=allow_web_tools,
+                approval_mode=approval_mode,
                 _event_dispatcher=dispatcher,
             )
         )
@@ -436,32 +509,45 @@ class Agent:
 
     def effective_permissions(self) -> ResolvedPermissions:
         """Reload trusted sources; saved conversation grants cannot widen them."""
-        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions)
+        return resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
+                                          read_files=self._input_read_files)
 
-    def _stage_harness_files(
+    def _reference_harness_files(
         self,
         files: Sequence[str],
+        *,
+        permission_ceiling: ResolvedPermissions | None = None,
     ) -> tuple[dict[str, object], ...]:
-        from agent_runtime.workspace import import_files, open_workspace
+        from agent_runtime.local_files import resolve_local_file
 
         if not files:
             return ()
-        workspace = open_workspace(self._workspace_path(), create=True)
-        staged = import_files(
-            workspace,
-            list(files),
-            namespace=f"turn_{uuid4().hex}",
-        )
+        originals = [resolve_local_file(value, base=self._workspace_path(), resolve_symlinks=False) for value in files]
+        paths = [path.resolve() for path in originals]
+        selected = tuple(dict.fromkeys((*self._input_read_files, *(str(path) for path in (*originals, *paths)))))
+        permissions = resolve_permission_sources(self.workspace_path, self.permissions, self.managed_permissions,
+                                                 read_files=selected)
+        if permission_ceiling is not None:
+            permissions = permissions.intersection(permission_ceiling.with_read_files(selected))
+        for path in originals:
+            # Validate lexical denials as well as the canonical file reference.
+            lexical_permissions = permissions.with_read_files((str(path),))
+            if not lexical_permissions.path_access(path):
+                raise PermissionError(lexical_permissions.path_reason(path))
+        for path in paths:
+            if not permissions.path_access(path):
+                raise PermissionError(permissions.path_reason(path))
         values: list[dict[str, object]] = []
-        for original, path in zip(files, staged, strict=True):
+        for path in dict.fromkeys(paths):
             digest = hashlib.sha256()
             with path.open("rb") as stream:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                     digest.update(chunk)
             values.append(
                 {
-                    "original_path": str(Path(original).expanduser().resolve()),
-                    "workspace_path": path.relative_to(workspace.root).as_posix(),
+                    "original_path": str(path),
+                    "path": str(path),
+                    "storage": "reference",
                     "sha256": digest.hexdigest(),
                     "size_bytes": path.stat().st_size,
                 }
@@ -475,12 +561,21 @@ class Agent:
         session_path = self.model_session_path
         if session_path is not None and not session_path.is_absolute():
             session_path = workspace / session_path
-        return build_model_control_plane(
+        plane = build_model_control_plane(
             model_id=self.model,
             selection_requester=self._selection_requester,
             session_path=session_path,
             workspace=workspace,
         )
+        if self.model_session_path is None:
+            plane.state.request_settings_revision = self._request_settings_revision
+            for model_id, override in self._request_overrides.items():
+                from agent_runtime.core.generation_settings import ModelRequestPreferences
+
+                plane.state.request_preferences[model_id] = ModelRequestPreferences.model_validate({
+                    key: None if value == "default" else value for key, value in override["options"].items()
+                })
+        return plane
 
 
 async def _close_owned_sync_resource(resource: object, *, label: str) -> None:

@@ -57,6 +57,8 @@ models:
     protocol: openai_compatible
     base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 262144
+    reasoning:
+      thinking_toggle: chat_template_kwargs
     # MLX buffers a complete tool call before sending its arguments.
     timeout_seconds: 300
     defaults:
@@ -82,7 +84,14 @@ models:
     provider: deepseek
     tokenizer_model: deepseek-v4-official
     context_window_tokens: 1048576
+    # Official model metadata checked 2026-10-18; hard capacity, not the requested allowance.
+    max_output_tokens: 393216
+    reasoning:
+      supported_efforts: [low, high, max]
+      default_effort: high
+      thinking_toggle: thinking
     defaults:
+      max_output_tokens: 65536
       provider_options:
         thinking:
           type: enabled
@@ -213,10 +222,20 @@ generation:
 # ---------------------------------------------------------------------------
 # LLM stage budgets: input/output budget by internal LLM stage.
 # ---------------------------------------------------------------------------
+# Automatic working-history compaction target, independent of provider capacity.
+# null retains the model-derived threshold; large protected user inputs remain usable.
+auto_compact_token_limit: 65536
+
 llm_budgets:
+  # Agent checkpoints have their own output allowance, independent of RAG summaries.
+  context_compaction:
+    max_input_tokens: null
+    max_output_tokens: 8192
+    safety_margin_tokens: 512
+
   # One Harness sampling round may produce tool calls or a final answer.
-  # The model declaration supplies the requested output limit; this policy is
-  # only the model-independent ceiling for an agent step.
+  # New requests use user/model output settings; this is the conservative fallback.
+  # Legacy frozen requests retain their original stage ceiling.
   # A null input cap uses the model window after output and safety reserves.
   # Set a positive integer only to impose an additional per-request input cap.
   agent_step:

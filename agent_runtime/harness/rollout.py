@@ -44,6 +44,10 @@ from agent_runtime.streaming.events import (
 _REDUCER_VERSION = 1
 
 
+class TurnInputChangedError(RuntimeError):
+    """A response no longer covers the active Turn's received user input."""
+
+
 def _validate_resource_usage_input(resource: str, initial_used: int) -> None:
     if not isinstance(resource, str) or not resource.strip() or len(resource) > 120:
         raise ValueError("resource must be a non-empty name of at most 120 characters")
@@ -558,10 +562,19 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
-    def update_session_settings(self, thread_id: str, settings: Mapping[str, Any]) -> None:
+    def update_session_settings(
+        self, thread_id: str, settings: Mapping[str, Any], *, expected_request_revision: int | None = None,
+    ) -> None:
         frozen = _json_object(settings, field="settings")
         with self._transaction():
-            self.read_thread(thread_id)
+            thread = self.read_thread(thread_id)
+            if (expected_request_revision is not None
+                    and thread.settings.get("request_settings_revision", 0) != expected_request_revision):
+                from agent_runtime.model_config_io import ConfigVersionConflict
+
+                raise ConfigVersionConflict(
+                    "Request settings changed in another Session; reopen before changing settings"
+                )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=None,
@@ -676,17 +689,100 @@ class RolloutStore:
                 )
         return self.read_turn(turn_id)
 
+    def user_input_revision(self, turn_id: str) -> int:
+        """Count canonical user messages, independently of context compaction."""
+        return int(self._connection.execute(
+            "SELECT COUNT(*) FROM items WHERE turn_id = ? AND kind = 'user_message' AND status = 'completed'",
+            (turn_id,),
+        ).fetchone()[0])
+
+    def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int | None:
+        revision = request_ref.get("input_revision")
+        if isinstance(revision, int) and not isinstance(revision, bool):
+            return revision
+        # Pre-steering rollouts have no version field. Their canonical request
+        # Item still establishes which user messages preceded that request.
+        items = self.list_items(turn_id)
+        request = next((item for item in items if item.kind == "model_request"
+                        and item.payload.get("request_ref", {}).get("request_id")
+                        == request_ref.get("request_id")), None)
+        if request is None:
+            return None
+        return sum(item.kind == "user_message" and item.status == "completed"
+                   and item.sequence < request.sequence for item in items)
+
+    def receive_turn_input(
+        self, *, thread_id: str, turn_id: str, text: str,
+        input_files: tuple[Mapping[str, Any], ...] = (),
+    ) -> ItemSnapshot:
+        """Durably accept steering for exactly the expected active Turn."""
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("input must be non-empty")
+        item_id = f"item_{uuid4().hex}"
+        with self._transaction():
+            thread = self.read_thread(thread_id)
+            turn = self.read_turn(turn_id) if thread.active_turn_id == turn_id else None
+            if turn is None or turn.status not in {"running", "paused", "interrupted"}:
+                raise RuntimeError("expected Turn is no longer active; input was not accepted")
+            if self._connection.execute(
+                "SELECT 1 FROM rollout_records WHERE turn_id = ? "
+                "AND record_type = 'turn_cancellation_requested' LIMIT 1",
+                (turn_id,),
+            ).fetchone() is not None:
+                raise RuntimeError("Turn cancellation was requested; input was not accepted")
+            revision = self.user_input_revision(turn_id) + 1
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
+                payload={"item_id": item_id, "kind": "user_message"},
+            )
+            self._append_and_reduce(
+                thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
+                payload={"item_id": item_id, "payload": {"text": text, "input_revision": revision}},
+            )
+            for value in input_files:
+                file_id = f"item_{uuid4().hex}"
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
+                    payload={"item_id": file_id, "kind": "input_file"},
+                )
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
+                    payload={"item_id": file_id, "payload": _json_object(value, field="input file")},
+                )
+        return self.read_item(item_id)
+
+    def turn_input_status(self, item_id: str) -> str:
+        """Derive input consumption from ordinary model dispatches, never preparation."""
+        item = self.read_item(item_id)
+        if item.kind != "user_message" or "input_revision" not in item.payload:
+            raise ValueError("Item is not a steering receipt")
+        dispatched = {json.loads(row["payload_json"]).get("operation_id") for row in self._connection.execute(
+            "SELECT payload_json FROM rollout_records WHERE turn_id = ? AND record_type = 'model_attempt_dispatched'",
+            (item.turn_id,),
+        ).fetchall()}
+        for operation in self.list_model_operations(item.turn_id):
+            if (operation.request_ref.get("purpose") == "agent_step"
+                    and (operation.request_ref.get("input_revision") or 0) >= item.payload["input_revision"]
+                    and operation.operation_id in dispatched):
+                return "applied"
+        status = self.read_turn(item.turn_id).status
+        return "pending" if status in {"running", "paused", "interrupted"} else "unconsumed"
+
     def complete_turn(
         self,
         *,
         turn_id: str,
         answer: str,
         producer: str = "runtime",
+        expected_input_revision: int | None = None,
     ) -> TurnSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
+            if (expected_input_revision is not None
+                    and self.user_input_revision(turn_id) != expected_input_revision):
+                raise TurnInputChangedError("new user input superseded this final answer")
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
             ).fetchone()
@@ -796,15 +892,13 @@ class RolloutStore:
         if not isinstance(raw_plan, Mapping):
             raise RuntimeError("canonical plan_state payload is malformed")
         revision = int(raw_plan["revision"]) + 1
-        step_status = "completed" if status == "complete" else "blocked"
         steps = [
-            {
-                **dict(step),
-                "status": (step_status if step.get("status") in {"pending", "in_progress"} else step.get("status")),
-            }
+            dict(step)
             for step in raw_plan.get("steps", ())
             if isinstance(step, Mapping)
         ]
+        if status == "complete" and any(step.get("status") not in {"completed", "skipped"} for step in steps):
+            status = "needs_replan"
         plan = {
             **dict(raw_plan),
             "revision": revision,
@@ -812,12 +906,15 @@ class RolloutStore:
             "active_step_id": None,
             "steps": steps,
         }
-        event_type = "completed" if status == "complete" else "blocked"
+        event_type = "completed" if status == "complete" else status
         event = {
             "event_type": event_type,
             "message": message
             or (
-                "Plan completed with the accepted Turn." if status == "complete" else "Plan blocked by the failed Turn."
+                "Plan completed as reported; task validation is separate." if status == "complete" else (
+                    "Turn accepted with unfinished plan steps; review remaining work."
+                    if status == "needs_replan" else "Plan blocked by the failed Turn; reported steps retained."
+                )
             ),
             "tool_call_ids": [],
         }
@@ -1545,6 +1642,20 @@ class RolloutStore:
             raise RuntimeError("prepared model operation projection is missing")
         return _model_operation_snapshot(row)
 
+    def supersede_prepared_model(self, operation_id: str) -> None:
+        """Close an undispatched stale request without reserving or spending budget."""
+        with self._transaction():
+            operation = next(op for op in self.list_model_operations() if op.operation_id == operation_id)
+            if operation.status != "prepared":
+                raise RuntimeError("only an undispatched prepared model can be superseded")
+            self._append_and_reduce(
+                thread_id=operation.thread_id, turn_id=operation.turn_id,
+                record_type="model_attempt_rejected", producer="runtime",
+                payload={"operation_id": operation_id, "attempt_id": operation.active_attempt_id,
+                         "generation": operation.generation, "reason": "new user input before dispatch",
+                         "error_type": "input_superseded"},
+            )
+
     def dispatch_model_attempt(
         self,
         operation_id: str,
@@ -1575,6 +1686,10 @@ class RolloutStore:
             if operation["status"] != "prepared":
                 raise RuntimeError(f"model operation is not prepared: {operation_id}")
             request_ref = json.loads(operation["request_ref_json"])
+            revision = self.request_input_revision(str(operation["turn_id"]), request_ref)
+            if (request_ref.get("purpose") == "agent_step" and revision is not None
+                    and revision != self.user_input_revision(str(operation["turn_id"]))):
+                raise TurnInputChangedError("new user input before model dispatch")
             plan = request_ref.get("compaction_plan")
             if request_ref.get("purpose") == "context_summary" and plan is not None:
                 summary_ops = [
@@ -2724,6 +2839,7 @@ class RolloutStore:
         tool_name: str,
         arguments: Mapping[str, Any],
         origin: Mapping[str, Any],
+        argument_error: str | None = None,
     ) -> ItemSnapshot:
         if not tool_call_id or not tool_name:
             raise ValueError("tool call identity must be non-empty")
@@ -2735,6 +2851,10 @@ class RolloutStore:
             "arguments": frozen_arguments,
             "origin": frozen_origin,
         }
+        if argument_error is not None:
+            if not isinstance(argument_error, str):
+                raise TypeError("argument_error must be a string or None")
+            expected_payload["argument_error"] = argument_error
         item_id: str | None = None
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
@@ -3764,9 +3884,9 @@ class RolloutStore:
                             if not isinstance(raw_step, Mapping):
                                 continue
                             status = raw_step.get("status")
-                            normalized_status: Literal["pending", "in_progress"]
+                            normalized_status: Literal["pending", "in_progress", "completed"]
                             if status in {"pending", "completed"}:
-                                normalized_status = "pending"
+                                normalized_status = status
                             elif status == "in_progress":
                                 normalized_status = "in_progress"
                             else:
@@ -3906,6 +4026,33 @@ class RolloutStore:
         if row is None:
             raise KeyError(f"unknown tool operation: {operation_id}")
         return _tool_operation_snapshot(row)
+
+    def record_tool_continuation(
+        self, *, operation_id: str, key: str, result: Mapping[str, Any],
+    ) -> ItemSnapshot:
+        """Persist the owner's confirmed terminal result when its live scope closes."""
+        operation = self.read_tool_operation(operation_id)
+        if operation.result_item_id is None:
+            raise RuntimeError("continuation requires a committed launch result")
+        for item in self.list_items(operation.turn_id):
+            if item.kind == "tool_continuation" and item.payload.get("operation_id") == operation_id:
+                return item
+        item_id = f"item_{uuid4().hex}"
+        with self._transaction():
+            self._append_and_reduce(
+                thread_id=operation.thread_id, turn_id=operation.turn_id,
+                record_type="item_started", producer="runtime",
+                payload={"item_id": item_id, "kind": "tool_continuation"},
+            )
+            self._append_and_reduce(
+                thread_id=operation.thread_id, turn_id=operation.turn_id,
+                record_type="item_completed", producer="runtime",
+                payload={"item_id": item_id, "payload": {
+                    **dict(result), "operation_id": operation_id, "key": key,
+                    "source_result_item_id": operation.result_item_id,
+                }},
+            )
+        return self.read_item(item_id)
 
     def record_verification(
         self,

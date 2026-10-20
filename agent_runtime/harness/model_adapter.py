@@ -50,7 +50,7 @@ from agent_runtime.modeling.gateway import (
     model_request_input_text,
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
-from agent_runtime.modeling.openai_wire import serialize_openai_request
+from agent_runtime.modeling.openai_wire import serialize_openai_request, stable_prompt_cache_key
 from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
 from agent_runtime.tools.tool import JsonValue
@@ -87,7 +87,16 @@ class GatewayHarnessModel:
     def prepare(self, request: HarnessModelRequest) -> PreparedModelCall:
         if request.purpose not in {"agent_step", "context_summary", "memory_extract", "memory_consolidate"}:
             raise ValueError("unsupported model request purpose")
-        if request.purpose != "agent_step" and request.tools:
+        summary_fork = (request.purpose == "context_summary"
+                        and request.binding_manifest.get("summary_cache_fork") is True)
+        # Keep the parent's tool choice as well as its schemas: providers can
+        # render a different prefix for "none". Summary responses are data only;
+        # TurnExecutor rejects any returned tool calls before orchestration.
+        append_state = (request.binding_manifest.get("execution_context_policy", {})
+                        .get("cache_continuity") == "append-v1")
+        if summary_fork and not self._resolved.capabilities.supports_native_tools:
+            raise ContextBudgetExceededError("Summary prefix forks require a native tool protocol.")
+        if request.purpose != "agent_step" and request.tools and not summary_fork:
             raise ValueError("internal summary requests must not expose tools")
         for name in ("input_token_limit", "output_token_limit"):
             limit = getattr(request, name)
@@ -111,8 +120,11 @@ class GatewayHarnessModel:
             raise ValueError("Harness model context may only place context fragments before the first user message")
         first = messages[first_user_index]
         clock_blocks: tuple[ContextBlock, ...] = ()
+        dynamic_context = (
+            request.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v1"
+        )
         clock = request.binding_manifest.get("runtime_clock")
-        if request.purpose == "agent_step" and isinstance(clock, Mapping):
+        if request.purpose == "agent_step" and isinstance(clock, Mapping) and not append_state:
             clock_blocks = (ContextBlock(
                 name="runtime_clock",
                 content="Current runtime clock facts:\n" + json.dumps(dict(clock), sort_keys=True) +
@@ -128,7 +140,7 @@ class GatewayHarnessModel:
                     "unresolved questions and next steps. "
                     "Do not perform the task or call tools. Never invent missing facts.",
                 )
-                if request.purpose != "agent_step"
+                if request.purpose != "agent_step" and not summary_fork
                 else self._instructions
             ),
             frozen_run_context=(
@@ -137,15 +149,23 @@ class GatewayHarnessModel:
                     content=f"Current model ID for this turn: {self._model_id}.",
                 ),
             )
-            + clock_blocks
+            + (() if dynamic_context else clock_blocks)
             + tuple(
                 ContextBlock(name=f"harness_prefix_{index}", content=message.content)
                 for index, message in enumerate(leading, start=1)
             ),
             initial_user_task=first.content,
-            transcript=messages[first_user_index + 1 :],
+            transcript=(*messages[first_user_index + 1 :], *(
+                tuple(ModelMessage(role="context", content=cast(str, block.content)) for block in clock_blocks)
+                if dynamic_context else ()
+            )),
         )
         settings = _model_settings(self._resolved)
+        effective_settings = None
+        if (request.purpose == "agent_step" or summary_fork) and (
+            getattr(self._resolved.gateway, "agent_output_policy", None) == "model-aware-v1"
+        ):
+            settings, effective_settings = _request_settings(request, self._resolved, settings)
         policy = request.binding_manifest.get("tool_execution_policy", {})
         if (
             self._resolved.request_defaults.parallel_tool_calls is None
@@ -155,13 +175,20 @@ class GatewayHarnessModel:
             settings = replace(settings, parallel_tool_calls=policy["max_parallel_calls"] > 1)
         stage = (LLMCallStage.LLM_SUMMARIZE if request.purpose.startswith("memory_") else
                  LLMCallStage.CONTEXT_COMPACTION if request.purpose == "context_summary" else LLMCallStage.AGENT_STEP)
-        if request.purpose != "agent_step":
+        if request.purpose != "agent_step" and not summary_fork:
             options = dict(settings.provider_options)
-            if "thinking" in options:
+            reasoning = self._resolved.capabilities.reasoning
+            legacy = getattr(self._resolved.gateway, "agent_output_policy", None) is None
+            if ((reasoning is not None and reasoning.thinking_toggle == "thinking")
+                    or (legacy and reasoning is None and "thinking" in options)):
                 options["thinking"] = {"type": "disabled"}
             template = options.get("chat_template_kwargs")
-            if isinstance(template, Mapping) and "enable_thinking" in template:
-                options["chat_template_kwargs"] = {**template, "enable_thinking": False}
+            if ((reasoning is not None and reasoning.thinking_toggle == "chat_template_kwargs")
+                    or (legacy and reasoning is None and isinstance(template, Mapping)
+                        and "enable_thinking" in template)):
+                options["chat_template_kwargs"] = {
+                    **(dict(template) if isinstance(template, Mapping) else {}), "enable_thinking": False,
+                }
             settings = replace(settings, provider_options=options)
         effective_budget = getattr(self._resolved.gateway, "effective_stage_budget", None)
         if callable(effective_budget):
@@ -183,6 +210,10 @@ class GatewayHarnessModel:
                     request.output_token_limit,
                 ),
             )
+        if effective_settings is not None:
+            if settings.max_output_tokens != effective_settings["max_output_tokens"]:
+                effective_settings["output_constraints"].append("turn_output_token_limit")
+            effective_settings["max_output_tokens"] = settings.max_output_tokens
         context, canonical_request, context_projection = _budgeted_request(
             request_id=request.request_id or f"{request.turn_id}:step:{request.step}",
             context=context,
@@ -193,6 +224,10 @@ class GatewayHarnessModel:
             input_token_limit=request.input_token_limit,
             capacity_policy=context_capacity_policy(request.binding_manifest)
             or getattr(self._resolved.gateway, "context_policy", None),
+            append_state=append_state,
+            include_input_status=(request.binding_manifest.get("execution_context_policy", {})
+                                  .get("revision") != "working-context-v2"),
+            supported_cache_parameters=self._resolved.capabilities.supported_cache_parameters if append_state else (),
         )
         request_hash = hashlib.sha256(canonical_model_request_json(canonical_request).encode()).hexdigest()
         context_hash = hashlib.sha256(context.context_revision.encode()).hexdigest()
@@ -222,7 +257,11 @@ class GatewayHarnessModel:
             wire_hash=wire_hash,
             request_ref={
                 "model_id": self._model_id,
+                **({"effective_settings": effective_settings} if effective_settings is not None else {}),
                 "purpose": request.purpose,
+                **({"runtime_input_update": context.transcript[-1].content}
+                   if append_state and context.transcript
+                   and context.transcript[-1].content.startswith("Runtime input limits:\n") else {}),
                 "request_id": canonical_request.request_id,
                 "prompt_revision": canonical_request.prompt_revision,
                 "toolset_revision": canonical_request.toolset_revision,
@@ -350,6 +389,7 @@ class GatewayHarnessModel:
                     id=call.id,
                     name=call.name,
                     arguments=call.input,
+                    argument_error=call.argument_error,
                 )
                 for call in response.turn.tool_calls
             ),
@@ -525,6 +565,7 @@ def _model_messages(
                         id=call.id,
                         name=call.name,
                         input=dict(call.arguments),
+                        argument_error=call.argument_error,
                     )
                     for call in message.tool_calls
                 ),
@@ -532,6 +573,57 @@ def _model_messages(
             )
         )
     return tuple(converted)
+
+
+def _request_settings(
+    request: HarnessModelRequest, resolved: ResolvedModel, settings: ModelSettings,
+) -> tuple[ModelSettings, dict[str, Any]]:
+    from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
+
+    snapshot = request.binding_manifest.get("request_settings", {})
+    if snapshot.get("model_id", resolved.model_id) != resolved.model_id:
+        # A catalog alias can differ from the wire model ID. The snapshot is
+        # authenticated against the binding alias by the control plane.
+        if snapshot.get("model_id") != request.binding_manifest.get("model_id"):
+            raise ValueError("request settings belong to another model")
+    preferences = ModelRequestPreferences.model_validate(snapshot.get("preferences", {}))
+    defaults = resolved.request_defaults
+    reasoning = resolved.capabilities.reasoning or ReasoningCapabilities()
+    effort = preferences.reasoning_effort or defaults.reasoning_effort or reasoning.default_effort
+    reasoning.validate_effort(effort)
+    options = dict(settings.provider_options)
+    if effort == "off":
+        options.pop(reasoning.effort_parameter, None)
+    elif effort is not None:
+        options[reasoning.effort_parameter] = effort
+    if effort is not None and reasoning.thinking_toggle == "thinking":
+        options["thinking"] = {"type": "disabled" if effort == "off" else "enabled"}
+    elif effort is not None and reasoning.thinking_toggle == "chat_template_kwargs":
+        template = options.get("chat_template_kwargs", {})
+        options["chat_template_kwargs"] = {**(dict(template) if isinstance(template, Mapping) else {}),
+                                           "enable_thinking": effort != "off"}
+    fallback = resolved.gateway.stage_budget(LLMCallStage.AGENT_STEP).max_output_tokens
+    requested = preferences.max_output_tokens or defaults.max_output_tokens or fallback
+    output = requested
+    constraints = []
+    if resolved.capabilities.max_output_tokens is not None and output > resolved.capabilities.max_output_tokens:
+        output = resolved.capabilities.max_output_tokens
+        constraints.append("model_max_output_tokens")
+    window_limit = resolved.capabilities.context_window_tokens - resolved.gateway.stage_budget(
+        LLMCallStage.AGENT_STEP).safety_margin_tokens - 1
+    if output > window_limit:
+        output = window_limit
+        constraints.append("model_context_window")
+    return replace(settings, max_output_tokens=output, provider_options=options), {
+        "revision": snapshot.get("revision", 0),
+        "reasoning_effort": effort,
+        "reasoning_source": "user" if preferences.reasoning_effort else "model_default",
+        "requested_output_tokens": requested,
+        "max_output_tokens": output,
+        "output_source": ("user" if preferences.max_output_tokens else
+                          "model_default" if defaults.max_output_tokens else "conservative_fallback"),
+        "output_constraints": constraints,
+    }
 
 
 def _model_settings(resolved: ResolvedModel) -> ModelSettings:
@@ -611,7 +703,8 @@ def _model_resource_request(
     if max_input_tokens is not None and input_tokens > max_input_tokens:
         raise ContextBudgetExceededError(
             "Committed model context cannot fit inside the effective provider "
-            f"boundary: {input_tokens} > {max_input_tokens} input tokens."
+            f"boundary: {input_tokens} > {max_input_tokens} input tokens.",
+            reason_code="model_context_window_exceeded",
         )
     estimated_cost = estimated_model_cost_micros(
         input_tokens=input_tokens,
@@ -654,14 +747,24 @@ def _budgeted_request(
     stage: LLMCallStage = LLMCallStage.AGENT_STEP,
     input_token_limit: int | None = None,
     capacity_policy: ContextCapacityPolicy | None = None,
+    append_state: bool = False,
+    include_input_status: bool = True,
+    supported_cache_parameters: tuple[str, ...] = (),
 ) -> tuple[StableModelContext, ModelRequest, Mapping[str, Any] | None]:
     def build(candidate: StableModelContext) -> ModelRequest:
-        return build_model_request(
+        canonical = build_model_request(
             request_id=request_id,
             context=candidate,
             selected_tools=selected_tools,  # type: ignore[arg-type]
             settings=settings,
         )
+        if "prompt_cache_key" in supported_cache_parameters:
+            canonical = build_model_request(
+                request_id=request_id, context=candidate,
+                selected_tools=selected_tools,  # type: ignore[arg-type]
+                settings=replace(settings, cache_parameters={"prompt_cache_key": stable_prompt_cache_key(canonical)}),
+            )
+        return canonical
 
     gateway = resolved.gateway
     accounting = resolved.token_accounting
@@ -709,15 +812,21 @@ def _budgeted_request(
         }
         if stage == LLMCallStage.AGENT_STEP and input_token_limit is None:
             max_input_tokens = auto_limit
-        if stage == LLMCallStage.AGENT_STEP:
+        if stage == LLMCallStage.AGENT_STEP and include_input_status:
+            input_status = "Runtime input limits:\n" + json.dumps({key: policy_fields[key] for key in (
+                "model_context_tokens", "explicit_input_cap", "effective_input_limit",
+                "auto_compact_limit", "post_compact_target",
+            )}, sort_keys=True)
+            previous_status = next((m.content for m in reversed(context.transcript)
+                                    if m.content.startswith("Runtime input limits:\n")), None)
+            append_input_status = not append_state or input_status != previous_status
+        else:
+            append_input_status = False
+        if append_input_status:
             context = build_stable_context(
                 instructions=context.instructions, frozen_run_context=context.frozen_run_context,
                 initial_user_task=context.initial_user_task,
-                transcript=(*context.transcript, ModelMessage(role="context", content="Runtime input limits:\n" +
-                    json.dumps({key: policy_fields[key] for key in (
-                        "model_context_tokens", "explicit_input_cap", "effective_input_limit",
-                        "auto_compact_limit", "post_compact_target",
-                    )}, sort_keys=True))),
+                transcript=(*context.transcript, ModelMessage(role="context", content=input_status)),
             )
     if input_token_limit is not None:
         max_input_tokens = min(max_input_tokens, input_token_limit)
@@ -743,5 +852,5 @@ def _budgeted_request(
     raise ContextCompactionRequiredError(
         input_tokens=input_tokens,
         max_input_tokens=max_input_tokens,
-        reason_code="token_threshold" if capacity_policy is not None else "context_budget_exhausted",
+        reason_code="token_threshold" if capacity_policy is not None else "model_context_window_exceeded",
     )

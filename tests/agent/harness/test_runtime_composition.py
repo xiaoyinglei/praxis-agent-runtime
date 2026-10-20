@@ -84,6 +84,7 @@ async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) 
         "allow_web_tools": False,
             "allow_write_tools": False,
             "auto_approve_sandboxed": False,
+            "approval_mode": "ask",
             "denied_tool_names": [],
             "deny_effects": [],
             "max_parallel_calls": 4,

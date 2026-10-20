@@ -31,6 +31,7 @@ from agent_runtime.tools.tool import (
     Tool,
     ToolCall,
     ToolContentBlock,
+    ToolContinuation,
     ToolEffect,
     ToolProgressSink,
     ToolResult,
@@ -52,6 +53,7 @@ _PROTECTED_WORKSPACE_METADATA_KEYS = frozenset(
         "workspace_tree_after_sha256",
         "workspace_tree_before_sha256",
         "workspace_tree_changed",
+        "runtime_workspace_origin_operation_id",
     }
 )
 _MISSING_WORKSPACE_FILE_SHA256 = hashlib.sha256(b"praxis-workspace-file-missing-v1").hexdigest()
@@ -74,9 +76,12 @@ class ExecutionStatus(StrEnum):
 class ExecutionStartRejectedError(RuntimeError):
     """A durable scheduler rejected execution before the tool runner was called."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, metadata: Mapping[str, JsonValue] | None = None,
+                 retryable: bool = False) -> None:
         self.code = code
         self.message = message
+        self.metadata = metadata
+        self.retryable = retryable
         super().__init__(message)
 
 
@@ -197,6 +202,13 @@ class _UnknownCancellationError(Exception):
     pass
 
 
+@dataclass
+class _LiveContinuation:
+    operation_id: str
+    workspace_root: Path | None
+    before_sha256: str | None
+
+
 class ToolExecutor:
     """The sole validation-to-ToolResult execution choke point."""
 
@@ -228,6 +240,36 @@ class ToolExecutor:
         self._externalizer = externalizer or _bound_model_output
         self._trace_sink = trace_sink
         self._traces: list[ToolExecutionTrace] = []
+        self._continuations: dict[tuple[object, str], _LiveContinuation] = {}
+
+    def restore_continuation(self, owner: object, key: str, *, operation_id: str,
+                             workspace_root: Path | None, before_sha256: str | None) -> None:
+        """Harness restores only ledger-validated launch receipts, never model claims."""
+        self._continuations[(owner, key)] = _LiveContinuation(operation_id, workspace_root, before_sha256)
+
+    async def observe_continuation(
+        self, continuation: ToolContinuation,
+    ) -> Mapping[str, JsonValue]:
+        """Observe an issued handle without granting or repeating its effects."""
+        key = (continuation.owner, continuation.key)
+        live = self._continuations.get(key)
+        if live is None:
+            return {}
+        metadata: dict[str, JsonValue] = {"runtime_workspace_origin_operation_id": live.operation_id}
+        if live.workspace_root is not None:
+            after = await asyncio.to_thread(workspace_tree_sha256, live.workspace_root)
+            metadata.update({
+                "runtime_workspace_write": True,
+                "workspace_tree_before_sha256": live.before_sha256,
+                "workspace_tree_after_sha256": after,
+                "workspace_tree_changed": live.before_sha256 is not None and after is not None
+                and live.before_sha256 != after,
+            })
+            if after is not None:
+                live.before_sha256 = after
+        if continuation.terminal:
+            self._continuations.pop(key, None)
+        return metadata
 
     @property
     def traces(self) -> tuple[ToolExecutionTrace, ...]:
@@ -434,6 +476,13 @@ class ToolExecutor:
                 started_at=started_at,
             )
 
+        if call.argument_error is not None:
+            return await self._finish(
+                call=call,
+                result=_error_result(call, code="invalid_arguments", message=call.argument_error, retryable=True),
+                record=None,
+                started_at=started_at,
+            )
         try:
             arguments = tool.validate_input(call.arguments)
         except ToolValidationError as error:
@@ -487,6 +536,24 @@ class ToolExecutor:
         try:
             self._hard_guard(tool, arguments, resolved, context)
         except ToolGuardError as error:
+            constraint: dict[str, JsonValue] = {}
+            if error.code == "filesystem_denied" and context.effective_permissions is not None:
+                permissions = context.effective_permissions
+                write = ToolEffect.WRITE_WORKSPACE in resolved.effects
+                constraint = {
+                    "kind": "filesystem_permission",
+                    "permissions_revision": permissions.revision,
+                    "resources": tuple(
+                        {"path": target.value, "access": "write" if write else "read"}
+                        for target in resolved.targets if target.kind == "workspace_path"
+                        and not permissions.path_access(target.value, write=write)
+                    ),
+                    "recovery": (
+                        "Changing tools does not change this resource permission. "
+                        "Choose an authorized resource or explain the blocker. "
+                        "Retry this resource only after the permission policy changes."
+                    ),
+                }
             return await self._finish(
                 call=call,
                 result=_error_result(
@@ -494,6 +561,8 @@ class ToolExecutor:
                     code=error.code,
                     message=error.reason,
                     retryable=False,
+                    metadata={"permission_constraint": constraint} if constraint else None,
+                    structured_content={"permission_constraint": constraint} if constraint else None,
                 ),
                 record=None,
                 started_at=started_at,
@@ -552,6 +621,12 @@ class ToolExecutor:
                 resolved=resolved,
                 boundary=boundary,
             )
+        call_denied = call.tool_call_id in context.denied_tool_call_ids
+        network_denied = (ToolEffect.NETWORK in resolved.effects
+                          and _network_approval_id(call.tool_call_id) in context.denied_tool_call_ids)
+        if call_denied or network_denied:
+            decision = CanUseToolResult(UseToolDecision.DENY, "tool call was denied by the user",
+                                        "tool" if call_denied else "network")
         if decision.decision is UseToolDecision.DENY:
             return await self._finish(
                 call=call,
@@ -560,6 +635,7 @@ class ToolExecutor:
                     code="tool_denied",
                     message=decision.reason,
                     retryable=False,
+                    metadata=_approval_metadata(call, resolved, decision) if call_denied or network_denied else None,
                 ),
                 record=None,
                 started_at=started_at,
@@ -587,6 +663,7 @@ class ToolExecutor:
             and not (decision.decision is UseToolDecision.ASK and decision.approval_scope == "network")
             and not (context.effective_permissions is not None
                      and context.effective_permissions.command_network_allowed() == "allow")
+            and context.approval_mode != "full"
         ):
             if (context.effective_permissions is not None
                     and context.effective_permissions.effective_approval == "never"):
@@ -754,6 +831,18 @@ class ToolExecutor:
                 prepared=prepared,
             )
         prepared = replace(prepared, record=started_record)
+        if prepared.context.invocation_guard is not None:
+            try:
+                prepared.context.invocation_guard(prepared.call)
+            except ExecutionStartRejectedError as rejected:
+                return await self._finish(
+                    call=prepared.call,
+                    result=_error_result(prepared.call, code=rejected.code, message=rejected.message,
+                                         retryable=rejected.retryable,
+                                         metadata=rejected.metadata),
+                    record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=rejected.code),
+                    prepared=prepared,
+                )
         if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
             try:
                 current = prepared.context.refreshed()
@@ -944,7 +1033,7 @@ class ToolExecutor:
             retryable=output.retryable,
             truncated=truncated,
             metadata={
-                **dict(output.metadata),
+                **{key: value for key, value in output.metadata.items() if key != "runtime_project_instructions"},
                 "operation_id": prepared.record.operation_id,
             },
             attachments=output.attachments,
@@ -1040,6 +1129,16 @@ class ToolExecutor:
                         ),
                     }
                 )
+            if prepared.tool.continuation is not None:
+                continuation = prepared.tool.continuation(prepared.arguments, result.structured_content)
+                if continuation is not None:
+                    key = (continuation.owner, continuation.key)
+                    if continuation.phase == "start":
+                        self._continuations[key] = _LiveContinuation(
+                            prepared.record.operation_id, prepared.workspace_root,
+                            prepared.workspace_tree_before_sha256,
+                        )
+                    metadata.update(await self.observe_continuation(continuation))
             if record is not None:
                 metadata["operation_id"] = record.operation_id
                 diagnostic = metadata.get("diagnostic")
@@ -1476,6 +1575,7 @@ def _error_result(
     message: str,
     retryable: bool,
     metadata: Mapping[str, JsonValue] | None = None,
+    structured_content: Mapping[str, JsonValue] | None = None,
     error: Exception | None = None,
 ) -> ToolResult:
     safe_message = " ".join(redact_sensitive_text(message).split())[:512]
@@ -1493,6 +1593,7 @@ def _error_result(
         error_message=safe_message,
         retryable=retryable,
         metadata=result_metadata,
+        structured_content=structured_content,
     )
 
 

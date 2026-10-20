@@ -49,7 +49,9 @@ class SyntheticProvider:
     def _turn(self, *, messages, **kwargs):
         del kwargs
         text = json.dumps(messages, ensure_ascii=False)
-        if "Summarize the supplied execution history faithfully." in text:
+        if ("Summarize the supplied execution history faithfully." in text
+                or "Create a concise context checkpoint for another LLM that will resume this task." in text
+                or "Return only a checkpoint; do not continue the task or call tools." in text):
             self.summary_sources.append(text)
             facts = [fact for fact in ["GOLD_WEB_FACT=17", "GOLD_CODE_FACT=17", "GOLD_DIALOG_FACT=17"] if fact in text]
             return ToolUseResult(
@@ -192,7 +194,9 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         "--disable-workspace-mcp",
         "--no-require-workspace-change",
         "--max-tokens-total",
-        "200000",
+        # CharacterAccounting counts serialized characters rather than model tokens.
+        # This case tests context retention; cumulative-budget stops have separate cases.
+        "500000",
         "--allow-write-tools",
     ]
     if task == "dialog":

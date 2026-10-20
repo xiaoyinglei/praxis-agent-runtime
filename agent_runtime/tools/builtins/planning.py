@@ -17,6 +17,7 @@ from agent_runtime.tools.tool import (
     ResolvedToolUse,
     Tool,
     ToolDefinition,
+    ToolValidationError,
     json_schema_output,
     pydantic_input,
 )
@@ -80,6 +81,15 @@ _UPDATE_OUTPUT_SCHEMA, _unused_update_output_validator = pydantic_input(
 )
 
 
+def _validate_plan_input(arguments: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
+    validated = _validate_update_input(arguments)
+    steps = validated["plan"]
+    assert isinstance(steps, tuple)
+    if sum(isinstance(step, Mapping) and step.get("status") == "in_progress" for step in steps) > 1:
+        raise ToolValidationError(path="$.plan", message="At most one step can be in_progress at a time")
+    return validated
+
+
 def create_update_plan_tool(plan_updater: PlanUpdater) -> Tool:
     if not callable(plan_updater):
         raise TypeError("plan_updater must be callable")
@@ -87,14 +97,16 @@ def create_update_plan_tool(plan_updater: PlanUpdater) -> Tool:
         definition=ToolDefinition(
             name="update_plan",
             description=(
-                "Replace the visible advisory strategy for the current task. "
+                "Updates the advisory task plan. At most one step can be in_progress at a time. "
+                "Update after completing a phase and when the strategy changes; "
+                "provide an explanation for scope changes. Submit the complete plan. "
                 'Every plan item requires only "step" and "status". The plan '
                 "explains intended work; it never grants or restricts tool "
                 "permission and never proves that the task is complete."
             ),
             input_schema=_UPDATE_INPUT_SCHEMA,
         ),
-        validate_input=_validate_update_input,
+        validate_input=_validate_plan_input,
         run=plan_updater,
         normalize_output=_normalize_update_output,
         output_schema=_UPDATE_OUTPUT_SCHEMA,
@@ -103,7 +115,7 @@ def create_update_plan_tool(plan_updater: PlanUpdater) -> Tool:
             effects=frozenset(),
             targets=(),
         ),
-        execution_revision="builtin-update-plan-v1",
+        execution_revision="builtin-update-plan-v2-single-active",
         idempotent=True,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.COOPERATIVE,

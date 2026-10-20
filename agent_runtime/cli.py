@@ -18,12 +18,15 @@ import typer
 import yaml
 from pydantic import ValidationError
 
+from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODES, ApprovalMode
+from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
+from agent_runtime.local_files import parse_file_input, resolve_local_file
 from agent_runtime.local_runtime import EndpointConflictError, LocalRuntimeError
 from agent_runtime.mcp_cli import mcp_app
 from agent_runtime.model_admin import (
@@ -44,7 +47,12 @@ from agent_runtime.runtime.builder import build_model_admin_service
 from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.setup_cli import setup
 from agent_runtime.terminal_input import CHAT_COMMANDS, TerminalComposer, resolve_pause_choice
-from agent_runtime.terminal_render import TerminalToolEventDisplay, safe_terminal_text, web_error_message
+from agent_runtime.terminal_render import (
+    TerminalToolEventDisplay,
+    format_usage_summary,
+    safe_terminal_text,
+    web_error_message,
+)
 from agent_runtime.tools.web_limits import WebLimits
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
@@ -61,6 +69,7 @@ agent_app.add_typer(model_app, name="model", help="查看和切换当前模型�
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
 agent_app.command("setup")(setup)
 agent_app.command("connections")(connections_command)
+agent_app.command("commands")(commands)
 
 
 @agent_app.command("permissions")
@@ -182,10 +191,14 @@ def agent_history(
 
 class _PermissionOptions(TypedDict, total=False):
     permissions: Path
+    approval_mode: ApprovalMode
 
 
-def _permission_options(path: Path | None) -> _PermissionOptions:
-    return {} if path is None else {"permissions": path}
+def _permission_options(path: Path | None, approval_mode: ApprovalMode | None = None) -> _PermissionOptions:
+    options: _PermissionOptions = {} if path is None else {"permissions": path}
+    if approval_mode is not None:
+        options["approval_mode"] = approval_mode
+    return options
 
 
 class _WebOptions(TypedDict, total=False):
@@ -267,7 +280,22 @@ def _failure_title(stop_reason: str | None) -> str:
     if stop_reason == "model_provider_failed":
         return "模型服务暂时无法完成请求，请检查模型配置或稍后重试。"
     if stop_reason == "model_step_budget_exhausted":
-        return "本次执行已达到尝试次数上限，任务尚未完成。"
+        return "本次执行已达到尝试次数上限，本轮未完成收尾。"
+    capacity_failures = {
+        "model_token_budget_exhausted": "本轮累计 Token 预算不足，无法继续执行或完成收尾。",
+        "model_context_window_exceeded": "模型单次请求超出上下文窗口，压缩恢复后仍无法继续。",
+        "context_summary_incomplete": "上下文摘要输出被截断，原始历史已保留；本轮无法完成必要压缩。",
+        "context_summary_invalid": "上下文摘要内容无效，原始历史已保留；本轮无法完成必要压缩。",
+        "summary_context_overflow": "模型拒绝摘要请求：摘要输入超出可用上下文。",
+        "byte_guard": "上下文达到配置的字节上限，本轮无法完成必要压缩。",
+        "message_guard": "上下文达到配置的消息数上限，本轮无法完成必要压缩。",
+        "context_source_changed": "上下文在压缩期间持续变化，本轮未能完成压缩。",
+        "context_compaction_failed": "上下文压缩失败，原始历史已保留。",
+        "no_compactable_context": "受保护的当前任务无法通过压缩历史缩小，本轮无法继续。",
+        "summary_unit_exceeds_context": "一个完整的历史工作单元超出摘要输入容量，原始历史已保留。",
+    }
+    if stop_reason in capacity_failures:
+        return capacity_failures[stop_reason]
     return "错误: Agent 运行失败"
 
 
@@ -296,6 +324,7 @@ def _display_agent_result(
     verbose: bool,
     answer_streamed: bool = False,
     show_execution: bool = True,
+    show_usage: bool = True,
 ) -> None:
     if result.status == "failed":
         _display_failure(
@@ -314,7 +343,7 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if result.status == "done" and (verbose or result.validation_status != "not_evaluated"):
+    if result.status == "done":
         scope = (
             f"（范围: {safe_terminal_text(result.validation_scope)}）"
             if result.validation_scope is not None else ""
@@ -337,6 +366,9 @@ def _display_agent_result(
         print(plan_summary)
     if result.tool_calls and show_execution:
         print(_format_tool_summary(result))
+
+    if show_usage:
+        print("\n" + format_usage_summary(result.usage))
 
     if verbose:
         usage = result.usage
@@ -407,6 +439,26 @@ async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | No
         print(f"请输入: {', '.join(options)}；q 取消")
 
 
+async def _handle_cli_pause(result: AgentResult) -> str | None:
+    """TTY approval uses a selector; plain input remains available for pipes."""
+    request = result.pause
+    if request is not None and request.kind == "tool_approval" and request.options and _is_interactive_terminal():
+        from prompt_toolkit.shortcuts import radiolist_dialog
+
+        details = [request.question]
+        details.extend(f"{call.tool_name}: {call.args_preview}" for call in request.tool_calls)
+        scope = request.context.get("session_grant_label")
+        if isinstance(scope, str):
+            details.append("本会话授权范围：" + scope)
+        return await radiolist_dialog(
+            title="操作审批", text=safe_terminal_text("\n".join(details)),
+            values=[(choice, APPROVAL_CHOICES.get(choice, choice)) for choice in request.options],
+            default="deny" if "deny" in request.options else request.options[0],
+            ok_text="确认", cancel_text="取消",
+        ).run_async()
+    return _handle_pause(result)
+
+
 def _handle_pause(
     result: AgentResult,
 ) -> str | None:
@@ -423,13 +475,20 @@ def _handle_pause(
             print(f"  {risk_mark} {tc.tool_name}: {tc.args_preview}")
             if tc.reason:
                 print(f"     原因: {tc.reason}")
+    grant_label = req.context.get("session_grant_label")
+    if "allow_session" in req.options and isinstance(grant_label, str):
+        print("  本会话授权范围: " + safe_terminal_text(grant_label))
 
     options = req.options
     text_answer = req.kind in {"clarification", "choice"}
     if not options and not text_answer:
         print("此暂停没有提供可选操作，已取消当前执行。")
         return None
-    print(f"  选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
+    if req.kind == "tool_approval":
+        for number, option in enumerate(options, 1):
+            print(f"  {number}. {APPROVAL_CHOICES.get(option, option)}")
+    else:
+        print(f"  选项: {', '.join(options)}" if options else "输入你的回答；q 取消。")
 
     while True:
         choice = input("> ").strip()
@@ -437,11 +496,13 @@ def _handle_pause(
             return None
         if text_answer:
             resolved = choice if choice and (not options or choice in options) else None
+        elif choice.isdecimal() and 1 <= int(choice) <= len(options):
+            resolved = options[int(choice) - 1]
         else:
             resolved = resolve_pause_choice(choice, options)
         if resolved is not None:
             return resolved
-        print(f"  请输入: {', '.join(options)} (或 Y=允许, N=拒绝, q=退出)")
+        print("  请选择选项编号；q 取消。" if not text_answer else "  请输入你的回答。")
 
 
 def _display_pending_recovery(
@@ -514,6 +575,9 @@ def _create_agent_facade(
     web_proxy_url: str | None = None,
     web_limits_file: Path | None = None,
     permissions: Path | None = None,
+    approval_mode: ApprovalMode | None = None,
+    reasoning_effort: str | None = None,
+    max_output_tokens: int | None = None,
     _selection_requester: ModelSwitchRequester = "system",
 ) -> Agent:
     from agent_runtime.agent import Agent
@@ -521,6 +585,8 @@ def _create_agent_facade(
     try:
         return Agent(
             model=model,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
             checkpoint_db=checkpoint_db,
             workspace_path=workspace_path,
             model_session_path=model_session_path,
@@ -530,7 +596,7 @@ def _create_agent_facade(
             web_search_provider=web_search_provider,
             web_proxy_url=web_proxy_url,
             web_limits=_load_web_limits(web_limits_file),
-            **_permission_options(permissions),
+            **_permission_options(permissions, approval_mode),
             _selection_requester=_selection_requester,
         )
     except ValueError as error:
@@ -538,6 +604,8 @@ def _create_agent_facade(
             raise typer.BadParameter(str(error), param_hint="--web-proxy / proxy environment") from None
         if str(error).startswith("Web search"):
             raise typer.BadParameter(str(error), param_hint="--web-search-provider / --web-search-key-file") from None
+        if reasoning_effort is not None or max_output_tokens is not None:
+            raise typer.BadParameter(str(error), param_hint="--effort / --max-output-tokens") from None
         raise
 
 
@@ -592,18 +660,11 @@ def _run_cli_async[T](awaitable: Coroutine[Any, Any, T]) -> T:
 def _resolve_cli_input_files(values: Sequence[str]) -> list[str]:
     resolved: list[str] = []
     for value in values:
-        path = Path(value).expanduser()
-        if not path.exists():
-            raise typer.BadParameter(
-                f"输入文件不存在: {value}",
-                param_hint="--file",
-            )
-        if not path.is_file():
-            raise typer.BadParameter(
-                f"输入路径不是文件: {value}",
-                param_hint="--file",
-            )
-        resolved.append(str(path.resolve()))
+        try:
+            path = resolve_local_file(value, base=Path.cwd(), resolve_symlinks=False)
+        except (OSError, ValueError) as error:
+            raise typer.BadParameter(str(error), param_hint="--file") from error
+        resolved.append(str(path))
     return resolved
 
 
@@ -642,7 +703,7 @@ async def _run_facade_command(
         )
         while result.status == "paused" and interactive_approval:
             display.finish()
-            action = _handle_pause(result)
+            action = await _handle_cli_pause(result)
             if action is None:
                 break
             display.begin_turn()
@@ -765,9 +826,12 @@ def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | Non
             for call in request.tool_calls:
                 print(safe_terminal_text(f"  {call.tool_name}: {call.args_preview}"))
             if request.options:
-                print("可直接回复: " + ", ".join(request.options))
                 if request.kind == "tool_approval":
-                    print("Y 允许 · N 拒绝；/new 开始新聊天。")
+                    print("可选择: " + " / ".join(APPROVAL_CHOICES.get(choice, choice)
+                                               for choice in request.options))
+                    print("继续后会显示审批选择面板；/new 开始新聊天。")
+                else:
+                    print("可直接回复: " + ", ".join(request.options))
             else:
                 print("直接输入你的回答即可继续；/new 开始新聊天。")
         else:
@@ -806,6 +870,13 @@ async def _chat_facade_loop(
     last_answer = ""
     verbose = False
     default_chat_workspace = facade.workspace_path or Path.cwd()
+    startup_approval_mode = getattr(facade, "approval_mode", None)
+    chat_approval_mode = startup_approval_mode
+    if chat_approval_mode is None and resume_thread_id is None and previous_turn_id is None:
+        chat_approval_mode = "auto"
+    if _ui:
+        _ui.approval_mode = chat_approval_mode or "历史权限待加载"
+    pending_files: list[str] = []
     default_chat_knowledge = getattr(facade, "knowledge", None)
     chat_workspace = default_chat_workspace
     model_id = "历史聊天" if resume_thread_id is not None else facade.current_model().id
@@ -818,8 +889,20 @@ async def _chat_facade_loop(
         session: Session | None = None
         selected_chat: ChatSessionSummary | None = None
 
+        def refresh_request_status(control: Agent | Session) -> None:
+            context = getattr(control, "tool_execution_context", None)
+            if _ui and context is not None:
+                _ui.approval_mode = context.approval_mode
+            reader = getattr(control, "request_settings", None)
+            if callable(reader):
+                event_display.update_request_settings(reader())
+
+        if resume_thread_id is None:
+            refresh_request_status(facade)
+
         async def reopen(selector: str) -> bool:
             nonlocal session, selected_chat, current_turn_id, last_result, last_answer, model_id
+            nonlocal chat_approval_mode
             database = facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH
             selected = await _select_chat_session(
                 database, Path(default_chat_workspace), selector=selector, ui=_ui,
@@ -833,25 +916,30 @@ async def _chat_facade_loop(
             stack.callback(event_display.finish)
             session = None
             selected_chat = selected
+            chat_approval_mode = startup_approval_mode
+            facade.approval_mode = startup_approval_mode
             current_turn_id = selected.head_turn_id
             last_result = None
             last_answer = next((text for kind, text in reversed(messages) if kind == "answer"), "")
             event_display.clear_context_status()
+            pending_files.clear()
             model_id = selected.model_id or "未选择模型"
             facade.model = selected.model_id
             facade._followup_model_id = None
             if _ui:
                 _ui.model = model_id
+                _ui.approval_mode = "历史权限待加载"
                 await _ui.replay_messages(messages)
             else:
                 for kind, text in messages:
-                    print(("❯ " if kind == "user" else "Praxis\n") + safe_terminal_text(text) + "\n")
+                    prefix = "❯ " if kind == "user" else "Praxis\n" if kind == "answer" else ""
+                    print(prefix + safe_terminal_text(text) + "\n")
             pending = (await facade.read_result(selected.active_turn_id)
                        if selected.active_turn_id and selected.status in {"paused", "interrupted"} else None)
             _print_chat_recovery(selected, pending)
             return True
 
-        async def open_session() -> Session:
+        async def open_session(*, frozen_turn_id: str | None = None) -> Session:
             nonlocal session, model_id, previous_turn_id
             changed = getattr(session, "connections_changed", None)
             if session is not None and callable(changed) and changed():
@@ -867,17 +955,65 @@ async def _chat_facade_loop(
                     metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor)
                     facade.knowledge = metadata.runtime.knowledge
             opened = await stack.enter_async_context(facade.session(
-                previous_turn_id=previous_turn_id if selected_chat is None else None,
-                thread_id=selected_chat.thread_id if selected_chat is not None else None,
+                **({"_frozen_turn_id": frozen_turn_id} if frozen_turn_id is not None else {
+                    "previous_turn_id": previous_turn_id if selected_chat is None else None,
+                    "thread_id": selected_chat.thread_id if selected_chat is not None else None,
+                }),
                 max_turns=max_turns, max_tokens_total=max_tokens_total,
                 require_workspace_change=False, allow_write_tools=allow_write_tools,
                 allow_execute_tools=allow_execute_tools, allow_web_tools=allow_web_tools,
+                **({"approval_mode": chat_approval_mode} if chat_approval_mode is not None else {}),
             ))
             session = opened
             model_id = opened.current_model().id
             if _ui:
                 _ui.model = model_id
+            refresh_request_status(opened)
             return opened
+
+        async def change_request_settings(query: str) -> None:
+            query = query.strip()
+            control = session or facade
+            if _ui and query == "/effort":
+                capability = control.current_model().reasoning
+                choices = ["default"]
+                if capability is not None:
+                    choices.extend(capability.supported_efforts or ())
+                    if capability.thinking_toggle is not None:
+                        choices.append("off")
+                if len(choices) == 1:
+                    print("当前模型未声明可选择的思考强度；设置未更改。")
+                    return
+                current = control.request_settings()["preferences"]["reasoning_effort"] or "default"
+                selected = await _ui.choose_menu(choices, title="选择思考强度", current=current)
+                if selected is None:
+                    return
+                query = f"/effort {selected}"
+            _handle_request_settings_command(query, agent=control)
+            refresh_request_status(control)
+
+        if _ui is not None:
+            async def receive_input(text: str) -> str | None:
+                assert _ui is not None
+                if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
+                    await change_request_settings(text)
+                    return None
+                turn_id = _ui.display.turn_id
+                if turn_id is None:
+                    raise RuntimeError("当前 Turn 尚未启动，请保留输入稍后发送")
+                receiver = session if session is not None else facade
+                guidance, files = parse_file_input(text, base=Path(default_chat_workspace))
+                if files:
+                    if session is None:
+                        raise RuntimeError("当前操作尚无可接收附件的会话；输入已保留")
+                    receipt = await session.steer(guidance or "补充输入文件，请结合当前任务读取。",
+                                                  expected_turn_id=turn_id, files=files)
+                else:
+                    receipt = await receiver.steer(text, expected_turn_id=turn_id)
+                return receipt.item_id
+
+            _ui.on_input = receive_input
+            _ui.input_status = lambda identity: facade.input_status(identity)
 
         if resume_thread_id is not None and not await reopen(resume_thread_id):
             return
@@ -898,11 +1034,70 @@ async def _chat_facade_loop(
             if query == "/help":
                 _print_chat_help()
                 continue
+            if query == "/attach" or query.startswith("/attach "):
+                raw = query.removeprefix("/attach").strip()
+                if raw:
+                    remaining, files = parse_file_input(raw, base=Path(default_chat_workspace))
+                    if remaining or not files:
+                        print("附加失败：请输入存在的本地文件路径；含空格的多个路径请分别加引号。")
+                        continue
+                    pending_files[:] = list(dict.fromkeys((*pending_files, *files)))
+                print("待发送附件（原地只读，不复制）：" + ("\n" + "\n".join(pending_files) if pending_files else "无"))
+                continue
+            if query == "/detach":
+                pending_files.clear()
+                print("已清除待发送附件。")
+                continue
             if query == "/permissions" or query.startswith("/permissions "):
                 from agent_runtime.permission_policy import PermissionPolicy
 
                 parts = query.split(maxsplit=2)
                 try:
+                    mode = None
+                    if query == "/permissions":
+                        current_mode = (session.tool_execution_context.approval_mode if session
+                                        else chat_approval_mode or "ask")
+                        choices = list(APPROVAL_MODES.values())
+                        if _ui:
+                            chosen = await _ui.choose_menu(
+                                choices, title="选择审批模式", current=APPROVAL_MODES[current_mode],
+                            )
+                            if chosen is None:
+                                continue
+                            mode = list(APPROVAL_MODES)[choices.index(chosen)]
+                        else:
+                            for key, label in APPROVAL_MODES.items():
+                                print(f"  {key}: {label}")
+                            chosen = (await asyncio.to_thread(input, "审批模式 ask/auto/full（空行取消）: ")).strip()
+                            if not chosen:
+                                continue
+                            mode = chosen
+                    elif len(parts) == 3 and parts[1] == "mode":
+                        mode = parts[2]
+                    if mode is not None:
+                        if mode not in APPROVAL_MODES:
+                            raise ValueError("审批模式必须为 ask、auto 或 full")
+                        if session is not None:
+                            session.update_tool_policy(approval_mode=cast(ApprovalMode, mode),
+                                                       allow_write_tools=False, allow_execute_tools=False,
+                                                       allow_web_tools=False, auto_approve_sandboxed=False)
+                        chat_approval_mode = cast(ApprovalMode, mode)
+                        facade.approval_mode = chat_approval_mode
+                        if _ui:
+                            _ui.approval_mode = chat_approval_mode
+                        allow_write_tools = allow_execute_tools = allow_web_tools = False
+                        print("审批模式: " + APPROVAL_MODES[mode])
+                        continue
+                    if query == "/permissions grants":
+                        grants = session.approval_grants() if session is not None else ()
+                        print("当前会话授权：" + ("\n" + "\n".join(safe_terminal_text(grant.label) for grant in grants)
+                                             if grants else "无"))
+                        continue
+                    if query == "/permissions revoke":
+                        if session is not None:
+                            session.revoke_approval_grants()
+                        print("已撤销当前会话的全部命令授权。")
+                        continue
                     if len(parts) == 3 and parts[1] == "load":
                         policy_path = Path(parts[2]).expanduser()
                         if session is not None:
@@ -924,8 +1119,9 @@ async def _chat_facade_loop(
                     elif len(parts) == 2 and parts[1] == "reload":
                         if session is not None:
                             session.reload_permissions()
-                    elif query != "/permissions":
-                        print("用法: /permissions [load <文件> | profile <workspace|read-only|trusted-local> | reload]")
+                    elif query != "/permissions show":
+                        print("用法: /permissions [mode ask|auto|full | grants | revoke | show | "
+                              "load <文件> | profile <名称> | reload]")
                         continue
                     effective = session.permissions() if session is not None else facade.effective_permissions()
                     print(json.dumps(effective.explain(), ensure_ascii=False, indent=2))
@@ -983,9 +1179,11 @@ async def _chat_facade_loop(
                 last_result = None
                 last_answer = ""
                 event_display.clear_context_status()
+                pending_files.clear()
                 chat_workspace = default_chat_workspace
                 if _ui:
                     _ui.model = model_id
+                refresh_request_status(facade)
                 print("下一条消息将使用空历史。")
                 continue
             if query == "/verbose":
@@ -994,6 +1192,12 @@ async def _chat_facade_loop(
                 print(f"详细输出: {'开' if verbose else '关'}")
                 if verbose:
                     event_display.show_context_status()
+                continue
+            if query.split(maxsplit=1)[0] in {"/effort", "/output"}:
+                try:
+                    await change_request_settings(query)
+                except ValueError as error:
+                    print(f"设置未更改：{error}")
                 continue
             if query == "/model" or query.startswith("/model "):
                 model_control = session or facade
@@ -1011,7 +1215,15 @@ async def _chat_facade_loop(
                 model_id = model_control.current_model().id
                 if _ui:
                     _ui.model = model_id
+                refresh_request_status(model_control)
                 continue
+            query, dropped = parse_file_input(query, base=Path(default_chat_workspace))
+            if dropped:
+                pending_files[:] = list(dict.fromkeys((*pending_files, *dropped)))
+                print(f"已附加 {len(pending_files)} 个本地文件（原地只读，不复制）。")
+                if not query:
+                    print("继续输入任务后发送；/attach 查看，/detach 清除待发送附件。")
+                    continue
             if query.startswith("/"):
                 print(f"未知命令: {query.split()[0]}；输入 /help 查看可用命令。")
                 continue
@@ -1055,17 +1267,31 @@ async def _chat_facade_loop(
                         facade.knowledge = metadata.runtime.knowledge
             if saved_result is None:
                 session = await open_session()
-            resume_driver = session if saved_result is None and session is not None else facade
+            elif saved_action != "abort" and (_ui is not None or pending_files):
+                session = await open_session(frozen_turn_id=saved_result.turn_id)
+            resume_driver = session if session is not None else facade
             event_display.begin_turn()
             try:
                 if saved_result is not None:
                     assert saved_action is not None
-                    submission = facade.resume(saved_result.turn_id, saved_action,
-                                               user_input=saved_input, event_sink=event_display)
+                    if pending_files and saved_action != "abort":
+                        assert session is not None
+                        await session.steer("补充输入文件，请结合当前任务读取。",
+                                            expected_turn_id=saved_result.turn_id, files=list(pending_files))
+                    submission = resume_driver.resume(saved_result.turn_id, saved_action,
+                                                      user_input=saved_input, event_sink=event_display)
                 else:
                     assert session is not None
-                    submission = session.submit(query, event_sink=event_display)
+                    submission = session.submit(query, event_sink=event_display, **(
+                        {"files": list(pending_files)} if pending_files else {}
+                    ))
                 result = await _ui.operation(submission) if _ui else await submission
+                event_display.update_usage(result.usage)
+                if saved_result is None or saved_action != "abort":
+                    pending_files.clear()
+            except (OSError, ValueError) as error:
+                print("发送失败：" + safe_terminal_text(str(error)))
+                continue
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                     raise
@@ -1078,8 +1304,14 @@ async def _chat_facade_loop(
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
+                if not (_ui and _ui.fullscreen):
+                    print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
-                action = await _handle_ui_pause(result, _ui) if _ui else _handle_pause(result)
+                pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
+                                        and any(facade.input_status(identity) == "pending"
+                                                for identity in _ui._input_receipts))
+                action = ("continue" if pending_steering
+                          else await _handle_ui_pause(result, _ui) if _ui else await _handle_cli_pause(result))
                 if action is None:
                     result = await resume_driver.resume(result.turn_id, "abort")
                     print("已取消。")
@@ -1093,6 +1325,7 @@ async def _chat_facade_loop(
                     resumption = resume_driver.resume(result.turn_id, action, event_sink=event_display)
                 try:
                     result = await _ui.operation(resumption) if _ui else await resumption
+                    event_display.update_usage(result.usage)
                 except asyncio.CancelledError:
                     if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                         raise
@@ -1100,6 +1333,7 @@ async def _chat_facade_loop(
                     result = await resume_driver.resume(result.turn_id, "abort", event_sink=event_display)
                     print("已取消当前执行；已发生的文件修改不会回滚。")
             event_display.finish()
+            event_display.update_usage(result.usage)
             last_result = result
             last_answer = result.answer or ""
             _display_agent_result(
@@ -1107,6 +1341,7 @@ async def _chat_facade_loop(
                 verbose=verbose,
                 answer_streamed=event_display.answer_streamed,
                 show_execution=_ui is None,
+                show_usage=not (_ui and _ui.fullscreen),
             )
 
 
@@ -1127,6 +1362,41 @@ def _print_model_menu(agent: Agent | Session) -> None:
     ):
         print(line)
     print("切换: /model <model_id>")
+
+
+class _RequestSettingsOptions(TypedDict, total=False):
+    reasoning_effort: str
+    max_output_tokens: int
+
+
+def _handle_request_settings_command(query: str, *, agent: Any) -> None:
+    parts = query.split()
+    if len(parts) not in (1, 2) or parts[0] not in {"/effort", "/output"}:
+        raise ValueError("用法：/effort <支持的强度|default|off>；/output <正整数|default>")
+    if len(parts) == 2:
+        if parts[0] == "/effort":
+            agent.configure_request(reasoning_effort=parts[1])
+        else:
+            value = parts[1]
+            if value != "default" and (not value.isascii() or not value.isdecimal() or int(value) < 1):
+                raise ValueError("输出额度必须为正整数或 default")
+            agent.configure_request(max_output_tokens=value if value == "default" else int(value))
+    snapshot = agent.request_settings()
+    spec = agent.current_model()
+    preferences = snapshot["preferences"]
+    defaults = snapshot["model_defaults"]
+    effort = preferences["reasoning_effort"] or defaults["reasoning_effort"]
+    requested = preferences["max_output_tokens"] or defaults["max_output_tokens"]
+    output = min(requested, spec.max_output_tokens) if spec.max_output_tokens is not None else requested
+    print(f"模型: {spec.id}；思考强度: {effort or '未声明'}；单次输出额度: {output:,}")
+    if spec.reasoning is not None and spec.reasoning.supported_efforts is not None:
+        print("支持强度: " + (", ".join(spec.reasoning.supported_efforts) or "不支持"))
+    else:
+        print("支持强度: 未知（需在模型声明中配置）")
+    if requested != output:
+        print(f"申请 {requested:,}，受模型上限限制为 {output:,}；请求时还会校验上下文和累计预算。")
+    if len(parts) == 2:
+        print("设置已保存，从下一次模型请求生效；已发出的请求和恢复重试保持原配置。")
 
 
 def _handle_model_slash_command(
@@ -1733,8 +2003,21 @@ def agent_chat(
                                  help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option(
+            "--approval-mode", help="ask 请求批准 | auto 帮我批准（新聊天默认）| full 范围内全自动",
+        ),
+    ] = None,
+    reasoning_effort: Annotated[
+        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+    ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
+    if approval_mode == "ask":
+        allow_write_tools = allow_execute_tools = allow_web_tools = False
     if sum((previous_turn_id is not None, last or continue_chat, resume_thread_id is not None)) > 1:
         raise typer.BadParameter("--previous-turn-id、--continue/--last 和 --resume 只能选择一个")
     effective_previous_turn_id = previous_turn_id
@@ -1773,13 +2056,19 @@ def agent_chat(
         web_options["web_search_provider"] = web_search_provider
     if web_proxy_url is not None:
         web_options["web_proxy_url"] = web_proxy_url
+    request_options: _RequestSettingsOptions = {}
+    if reasoning_effort is not None:
+        request_options["reasoning_effort"] = reasoning_effort
+    if max_output_tokens is not None:
+        request_options["max_output_tokens"] = max_output_tokens
     facade = _create_agent_facade(
+        **request_options,
         model=facade_model,
         checkpoint_db=checkpoint_db,
         workspace_path=facade_workspace,
         model_session_path=DEFAULT_MODEL_SESSION_PATH,
         knowledge=facade_knowledge,
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         _selection_requester="user",
         **web_options,
     )
@@ -1902,8 +2191,19 @@ def agent_run(
         ),
     ] = False,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
+    approval_mode: Annotated[
+        ApprovalMode, typer.Option("--approval-mode", help="ask 请求批准 | auto 帮我批准 | full 权限范围内全自动"),
+    ] = "auto",
+    reasoning_effort: Annotated[
+        str | None, typer.Option("--effort", help="模型声明支持的思考强度；default/off 需匹配模型能力"),
+    ] = None,
+    max_output_tokens: Annotated[
+        int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
+    ] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
+    if approval_mode == "ask":
+        allow_write_tools = allow_execute_tools = allow_web_tools = False
     if previous_turn_id is not None and last:
         raise typer.BadParameter("--previous-turn-id 与 --last 不能同时使用")
     effective_previous_turn_id = previous_turn_id
@@ -1923,12 +2223,14 @@ def agent_run(
             "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
     facade = _create_agent_facade(
+        reasoning_effort=reasoning_effort,
+        max_output_tokens=max_output_tokens,
         model=model,
         checkpoint_db=checkpoint_db,
         workspace_path=Path.cwd(),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         enable_workspace_mcp=not disable_workspace_mcp,
         web_search_key_file=web_search_key_file,
         web_search_provider=web_search_provider,
@@ -2001,12 +2303,15 @@ def agent_resume(
                                  help="bing | brave | tavily"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option("--approval-mode", help="覆盖聊天保存的审批模式：ask | auto | full"),
+    ] = None,
 ) -> None:
     """重新打开旧聊天：只读回放历史，下一条消息创建新 Turn。原任务恢复使用 recover。"""
     agent_chat(resume_thread_id=thread_id or "", checkpoint_db=checkpoint_db,
                web_proxy_url=web_proxy_url, web_limits_file=web_limits_file,
                web_search_key_file=web_search_key_file, web_search_provider=web_search_provider,
-               **_permission_options(permissions))
+               **_permission_options(permissions, approval_mode))
 
 
 @agent_app.command(name="recover")
@@ -2056,6 +2361,9 @@ def agent_recover(
                                  help="bing | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
+    approval_mode: Annotated[
+        ApprovalMode | None, typer.Option("--approval-mode", help="恢复时使用的当前审批模式：ask | auto | full"),
+    ] = None,
 ) -> None:
     """先读取持久化 Turn 元数据，再恢复未完成的 Turn。"""
     if turn_id is not None and last:
@@ -2103,7 +2411,7 @@ def agent_recover(
         checkpoint_db=checkpoint_db,
         workspace_path=turn_metadata.runtime.workspace_path,
         knowledge=turn_metadata.runtime.knowledge,
-        **_permission_options(permissions),
+        **_permission_options(permissions, approval_mode),
         **web_options,
     )
     event_display = _CLIToolEventDisplay()

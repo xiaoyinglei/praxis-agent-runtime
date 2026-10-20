@@ -470,3 +470,53 @@ def test_inline_python_source_alone_does_not_attest_assertion_execution() -> Non
         arguments={"command": "python3 -c \"print('assert add(2, 3) == 5')\""},
         structured_content={"exit_code": 0},
     ) is None
+
+
+def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
+    with RolloutStore(tmp_path / "run.db") as store:
+        turn = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="run command",
+            binding_manifest={"completion_policy": {"revision": "completion-v2", "require_workspace_change": False}},
+        )
+        _commit_tool_result(
+            store, turn_id=turn.turn_id, call_id="launch", tool_name="run_command",
+            arguments={"command": "sleep 1", "yield_time_seconds": 0.01, "timeout_seconds": None},
+            result={"status": "running", "session_id": "cmd_live", "exit_code": None},
+        )
+        gate = DeliveryCompletionGate(store)
+        pending = gate.evaluate(_proposal(store, turn.turn_id))
+        assert pending.action == "continue" and "cmd_live" in pending.reason
+        _commit_tool_result(
+            store, turn_id=turn.turn_id, call_id="poll-wrong", tool_name="manage_command",
+            arguments={"session_id": "cmd_other"},
+            result={"status": "completed", "session_id": "cmd_other", "exit_code": 0},
+        )
+        assert gate.evaluate(_proposal(store, turn.turn_id)).action == "continue"
+        _commit_tool_result(
+            store, turn_id=turn.turn_id, call_id="poll", tool_name="manage_command",
+            arguments={"session_id": "cmd_live"},
+            result={"status": "completed", "session_id": "cmd_live", "exit_code": 0},
+        )
+        assert gate.evaluate(_proposal(store, turn.turn_id)).action == "accept"
+
+
+def test_acceptance_command_uses_linked_terminal_session_result(tmp_path):
+    with RolloutStore(tmp_path / "run.db") as store:
+        turn = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="verify command",
+            binding_manifest={"completion_policy": {
+                "revision": "completion-v2", "require_workspace_change": False, "acceptance_command": "make check",
+            }},
+        )
+        _commit_tool_result(
+            store, turn_id=turn.turn_id, call_id="launch", tool_name="run_command",
+            arguments={"command": "make check", "working_dir": ".", "yield_time_seconds": 0.01},
+            result={"status": "running", "session_id": "cmd_live", "exit_code": None},
+        )
+        _commit_tool_result(
+            store, turn_id=turn.turn_id, call_id="poll", tool_name="manage_command",
+            arguments={"session_id": "cmd_live", "action": "wait"},
+            result={"status": "completed", "session_id": "cmd_live", "exit_code": 0},
+        )
+        decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
+        assert decision.action == "accept" and decision.validation_status == "passed"
