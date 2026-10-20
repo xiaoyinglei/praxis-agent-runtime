@@ -1146,3 +1146,38 @@ def test_failure_streak_respects_real_changes_and_external_effects(changed, exte
     executor = TurnExecutor.__new__(TurnExecutor)
     executor._store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)
     assert executor._repeated_tool_failure("turn") is expected
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_cancelled_local_tool_commits_outcome_before_turn_can_abort(tmp_path, parallel):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+
+    async def run(_arguments):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaned.set()
+
+    tool = replace(_read_tool(workspace=workspace), run=run, concurrency_safe=parallel,
+                   timeout_seconds=30)
+    async with await Session.open(database=tmp_path / "rollout.sqlite3", workspace=workspace,
+                                  model=ToolThenAnswerModel(), tools={"read_file": tool}) as runtime:
+        task = asyncio.create_task(runtime.submit("read README"))
+        await asyncio.wait_for(started.wait(), 3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleaned.is_set()
+        [operation] = runtime.store.list_tool_operations()
+        assert operation.status == "failed" and operation.error_code == "cancelled"
+        assert operation.result_item_id is not None
+        turn = runtime.store.read_turn(operation.turn_id)
+        assert turn.status == "paused"
+        result = await runtime.resume(turn.turn_id, "abort")
+        assert result.stop_reason == "cancelled"
+        assert runtime.store.verify().valid

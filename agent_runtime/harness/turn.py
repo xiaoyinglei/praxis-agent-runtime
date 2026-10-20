@@ -2156,6 +2156,16 @@ class TurnExecutor:
                     turn_id=turn_id,
                     calls=tuple(_aci_tool_call(call, prepared.request_ref) for call in response.tool_calls),
                 )
+            except asyncio.CancelledError:
+                await asyncio.shield(self._commit(partial(
+                    self._store.request_turn_cancellation, turn_id=turn_id,
+                    reason="Turn task cancelled during tool execution",
+                )))
+                if self._store.read_turn(turn_id).status == "running":
+                    await asyncio.shield(self._commit(partial(
+                        self._store.pause_turn, turn_id=turn_id, reason="tool execution was interrupted",
+                    )))
+                raise
             except ToolApprovalRequiredError as pause:
                 return TurnResult(
                     thread_id=thread_id,
