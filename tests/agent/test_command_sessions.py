@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import shlex
-import shutil
 import sys
 from pathlib import Path
 
@@ -59,10 +57,17 @@ def command_backend(request, tmp_path):
     return open_workspace(tmp_path / "workspace", create=True)
 
 
-def python_command(code):
-    # Real sandboxes expose the system interpreter; host virtualenvs may be private.
-    executable = shutil.which("python3", path=os.defpath) or sys.executable
-    return shlex.quote(executable) + " -c " + shlex.quote(code)
+def python_command(workspace, code):
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
+    # Declare the test interpreter's read dependencies instead of relying on an OS shim.
+    roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
+             Path(sys.executable).resolve().parent.parent}
+    policy = PermissionPolicy(filesystem=tuple(
+        PathRule(path=str(root), access="read") for root in sorted(roots)
+    )).resolve(workspace.root)
+    workspace.permission_provider = lambda: policy
+    return shlex.quote(sys.executable) + " -c " + shlex.quote(code)
 
 
 async def start(sessions, command, **options):
@@ -87,7 +92,7 @@ async def test_real_lifecycle_wait_cancel_child_cleanup_and_private_temp(command
     from agent_runtime.tools.builtins.command_sessions import CommandSessions
 
     sessions = CommandSessions(command_backend, termination_grace_seconds=0.2)
-    command = python_command(
+    command = python_command(command_backend,
         'import os, subprocess, signal, time; '
         'child = subprocess.Popen(["/bin/sh", "-c", "trap \'\' TERM; while :; do sleep 1; done"]); '
         'print(str(child.pid) + " " + os.environ["TMPDIR"], flush=True); '
@@ -167,7 +172,7 @@ async def test_session_output_keeps_tail_after_progress_budget(command_backend):
 
     sessions = CommandSessions(command_backend)
     try:
-        result = await start(sessions, python_command(
+        result = await start(sessions, python_command(command_backend,
             'import sys; print("HEAD", flush=True); '
             'sys.stdout.write("x" * 400000); sys.stderr.write("y" * 400000); '
             'print("TAIL", flush=True); print("ERRTAIL", file=sys.stderr, flush=True)'
@@ -213,7 +218,7 @@ async def test_real_macos_large_files_and_external_writes_are_visible(command_ba
 
     sessions = CommandSessions(command_backend)
     try:
-        result = await start(sessions, python_command(
+        result = await start(sessions, python_command(command_backend,
             'from pathlib import Path; import time; '
             'f = Path("large.bin").open("wb"); '
             '[f.write(b"x" * 1024 * 1024) for _ in range(65)]; f.close(); '
@@ -299,7 +304,9 @@ async def test_uncollected_results_are_not_evicted(tmp_path, monkeypatch):
     owner = command_sessions.CommandSessions(open_workspace(tmp_path, create=True))
     try:
         first = await start(owner, "sleep 0.05")
-        await asyncio.sleep(0.1)
+        pending = owner._sessions[first.session_id]
+        await asyncio.wait_for(asyncio.shield(pending.task), 5)
+        assert not pending.observed_terminal
         refused = await start(owner, "true")
         assert refused.sandbox_error == "command_session_capacity"
         assert (await owner.manage(first.session_id, action="status", wait_seconds=0)).exit_code == 0
@@ -335,7 +342,7 @@ async def test_real_session_keeps_network_opt_in(tmp_path):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        command = python_command(
+        command = python_command(sessions.workspace,
             'import socket; s = socket.socket(); s.settimeout(1); '
             f's.connect(("127.0.0.1", {listener.getsockname()[1]})); print("connected", flush=True)'
         )

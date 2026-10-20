@@ -208,6 +208,7 @@ async def test_worker_journal_is_hidden_under_explicit_parent_read_grant(tmp_pat
 
 class CrashResumeModel(PatchThenAnswerModel):
     delay = 1.5
+    wait_for_release = False
 
     def prepare(self, request):
         return replace(super().prepare(request), dispatch_payload=request)
@@ -216,8 +217,10 @@ class CrashResumeModel(PatchThenAnswerModel):
         request = prepared.dispatch_payload
         outputs = [json.loads(m.content)["structured_content"] for m in request.messages if m.role == "tool"]
         if not outputs:
+            wait = ("while [ ! -f command-release ]; do sleep 0.05; done"
+                    if self.wait_for_release else f"sleep {self.delay}")
             call = HarnessToolCall(id="launch", name="run_command", arguments={
-                "command": f"printf ready; sleep {self.delay}; printf done", "timeout_seconds": None,
+                "command": f"printf ready; {wait}; printf done", "timeout_seconds": None,
                 "yield_time_seconds": 0.01,
             })
         elif len(outputs) == 1:
@@ -254,7 +257,9 @@ from agent_runtime import Agent
 from tests.agent.test_command_recovery import CrashResumeModel
 async def main():
     agent = Agent(workspace_path=Path(sys.argv[1]), checkpoint_db=Path(sys.argv[2]), enable_workspace_mcp=False)
-    CrashResumeModel.delay = float(sys.argv[3])
+    CrashResumeModel.wait_for_release = sys.argv[3] == 'abort'
+    if not CrashResumeModel.wait_for_release:
+        CrashResumeModel.delay = float(sys.argv[3])
     agent._model_factory = CrashResumeModel
     async with agent.session(allow_execute_tools=True, max_steps=6) as session:
         result = await session.submit('Run a command then edit source')
@@ -263,8 +268,10 @@ async def main():
         await asyncio.Event().wait()
 asyncio.run(main())
 '''
-    process = subprocess.Popen([sys.executable, "-c", script, str(workspace), str(database), "30" if abort else "1.5"],
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(workspace), str(database), "abort" if abort else "1.5"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
     try:
         line = await asyncio.wait_for(asyncio.to_thread(process.stdout.readline), 15)
         assert line, process.stderr.read() if process.poll() is not None else "parent not ready"
@@ -279,6 +286,8 @@ asyncio.run(main())
         if inspector == "sdk":
             status = await agent.command(turn_id, key)
             assert status.session_id == key
+            if abort:
+                assert status.status == "running"
         else:
             from typer.testing import CliRunner
 
@@ -289,6 +298,8 @@ asyncio.run(main())
             ])
             assert inspected.exit_code == 0, inspected.output
             assert json.loads(inspected.output)["session_id"] == key
+            if abort:
+                assert json.loads(inspected.output)["status"] == "running"
         if abort:
             result = await agent.resume(turn_id, "abort")
             assert result.status == "failed"  # Public AgentResult maps cancelled Turn to failed.
@@ -309,6 +320,7 @@ asyncio.run(main())
             assert store.verify().valid
         assert (workspace / "source").read_text() == "after"
     finally:
+        (workspace / "command-release").touch()
         if process.poll() is None:
             process.kill()
             process.wait()
