@@ -42,7 +42,7 @@ from rich.style import Style as RichStyle
 from rich.text import Text
 from rich.theme import Theme
 
-from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODES
+from agent_runtime.approval import APPROVAL_CHOICES
 from agent_runtime.connection_manager import ConnectionServer
 from agent_runtime.result import AgentPause
 from agent_runtime.terminal_input import _COMPOSER_BINDINGS, CHAT_COMMANDS, BoundedPromptHistory, resolve_pause_choice
@@ -207,6 +207,8 @@ class TerminalChatApp:
         self._row = 0
         self._follow = True
         self._show_history = False
+        self._detail_position: tuple[int, bool, bool] | None = None
+        self._detail_folds: dict[Block, bool] = {}
         self._fold_rows: dict[int, Block] = {}
         self._line_count = 1
         self._layout_key: tuple[int, int, bool] | None = None
@@ -217,8 +219,8 @@ class TerminalChatApp:
         self._selecting = False
         self._highlight_key: object = None
         self._highlighted: StyleAndTextTuples = []
-        # Inline leaves selection to the terminal; fullscreen scrolls its own history.
-        self._mouse_enabled = self.fullscreen
+        # Keep native terminal selection until the user explicitly enables mouse mode.
+        self._mouse_enabled = False
         self._model_choices: list[str] = []
         self._model_index = 0
         self._model_pending: asyncio.Future[str | None] | None = None
@@ -267,7 +269,9 @@ class TerminalChatApp:
 
         @keys.add("escape", filter=approving, eager=True)
         def cancel_approval(event: KeyPressEvent) -> None:
-            if self._approval is not None:
+            if self.view.details:
+                self.toggle_details()
+            elif self._approval is not None:
                 self._resolve_approval(self._approval, None)
 
         @keys.add("left", filter=has_focus(self.approval_buttons))
@@ -324,7 +328,10 @@ class TerminalChatApp:
 
         @keys.add("escape", filter=has_focus(self.model_menu), eager=True)
         def close_model(event: KeyPressEvent) -> None:
-            self._resolve_model(None)
+            if self.view.details:
+                self.toggle_details()
+            else:
+                self._resolve_model(None)
 
         @keys.add("f2")
         def native_mouse(event: KeyPressEvent) -> None:
@@ -394,6 +401,9 @@ class TerminalChatApp:
         @keys.add("escape", filter=has_focus(self.body))
         def focus_input(event: KeyPressEvent) -> None:
             event.app.layout.focus(self.editor)
+            if self.view.details:
+                self.toggle_details()
+                return
             self._show_history = False
             self._follow = True
 
@@ -428,12 +438,17 @@ class TerminalChatApp:
 
         @keys.add("c-o")
         def toggle_latest(event: KeyPressEvent) -> None:
-            block = self._fold_rows.get(self._row) if event.app.layout.has_focus(self.body) else None
-            if block is None:
-                block = next((b for b in reversed(self.view.blocks) if b.kind == "group"), None)
-            if block:
-                self.view.toggle(block)
-                self._show_history = True
+            self.toggle_details()
+
+        @keys.add("escape", filter=has_focus(self.editor) & ~approving & Condition(
+            lambda: self._model_pending is None and self.editor.buffer.complete_state is None
+            and (self.view.details or self._operation is not None),
+        ), eager=Condition(lambda: self.view.details))
+        def dismiss_or_stop(event: KeyPressEvent) -> None:
+            if self.view.details:
+                self.toggle_details()
+            else:
+                cancel(event)
 
         @keys.add("c-c")
         def cancel(event: KeyPressEvent) -> None:
@@ -446,6 +461,7 @@ class TerminalChatApp:
                 self._selection_start = self._selection_end = None
             elif self._operation and not self._operation.done():
                 self.status = "正在取消，等待执行清理"
+                self.display.stopping()
                 if not self._operation.cancelling():
                     self._operation.cancel()
             elif self.editor.text:
@@ -464,7 +480,7 @@ class TerminalChatApp:
             self.body,
             wrap_lines=False,
             height=lambda: (Dimension(min=1, weight=1) if self.fullscreen else
-                            Dimension(min=0, max=max(0, self.app.output.get_size().rows - 10))),
+                            Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8))),
             dont_extend_height=not self.fullscreen,
         )
         approval_panel = HSplit([
@@ -480,12 +496,16 @@ class TerminalChatApp:
             [
                 Window(
                     FormattedTextControl(self._header),
-                    height=lambda: 3 if self.app.output.get_size().rows >= 12 else 0,
+                    height=lambda: (1 if self.fullscreen else 3) if self._header() else 0,
                 ),
                 body_window,
                 ConditionalContainer(
                     DynamicContainer(lambda: framed_menu if get_app().output.get_size().rows >= 18 else menu),
                     filter=Condition(lambda: self._model_pending is not None),
+                ),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self._activity_fragments), height=1, wrap_lines=False),
+                    filter=Condition(lambda: self._operation is not None or self.display._started_at is not None),
                 ),
                 Window(height=1, char="─", style="class:dim"),
                 ConditionalContainer(
@@ -498,7 +518,10 @@ class TerminalChatApp:
                     Window(FormattedTextControl(self._connection_fragments), height=1),
                     filter=Condition(lambda: self.display.connection_required),
                 ),
-                Window(FormattedTextControl(self._status_fragments), height=2, wrap_lines=False),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self._status_fragments), height=2, wrap_lines=False),
+                    filter=Condition(lambda: self.view.details),
+                ),
                 Window(FormattedTextControl(self._footer), height=1),
             ]
         )
@@ -540,6 +563,7 @@ class TerminalChatApp:
                     "tool": "",
                     "dim": "#888888",
                     "error": "ansired",
+                    "warning": "ansiyellow",
                     "added": "ansigreen",
                     "removed": "ansired",
                     "approval-body": "",
@@ -628,7 +652,7 @@ class TerminalChatApp:
         fragments: StyleAndTextTuples = []
         line = 0
         self._fold_rows = {}
-        for text, block, style in self.view.rows(include_scrollback=history):
+        for text, block, style in self.view.rows(include_scrollback=history, width=width):
             if style == "answer" and text.strip():
                 rendered = _answer_fragments(text.removeprefix("● "), width, "NO_COLOR" not in os.environ)
                 handler = self._handler(None, line)
@@ -829,7 +853,7 @@ class TerminalChatApp:
             return
         width = max(4, self.app.output.get_size().columns - 1)
         fragments: StyleAndTextTuples = []
-        for text, _, style in self.view.rows(include_scrollback=False):
+        for text, _, style in self.view.rows(include_scrollback=False, width=width):
             if style == "answer" and text.strip():
                 fragments.extend(_answer_fragments(text.removeprefix("● "), width, "NO_COLOR" not in os.environ))
             else:
@@ -863,9 +887,15 @@ class TerminalChatApp:
             self._model_pending.set_result(choice)
 
     def _header(self) -> StyleAndTextTuples:
+        if not self.fullscreen and self.view.blocks:
+            return []
+        if self.app.output.get_size().rows < 12:
+            return []
         width = max(1, self.app.output.get_size().columns - 2)
         title = display_rows(" ✳ Praxis", width=width)[0]
         workspace = os.path.basename(self.workspace.rstrip("/")) or self.workspace
+        if self.fullscreen:
+            return [("class:header", display_rows(f" ✳ Praxis · {safe_terminal_text(workspace)}", width=width)[0])]
         context = display_rows(f"   {safe_terminal_text(self.model)} · {safe_terminal_text(workspace)}", width=width)[0]
         return [("class:header", title + "\n"), ("class:dim", context + "\n")]
 
@@ -981,9 +1011,36 @@ class TerminalChatApp:
         return await self.choose_menu(choices, title="选择模型", current=current)
 
     def _status_fragments(self) -> StyleAndTextTuples:
+        if not self.view.details:
+            return []
         width = max(1, self.app.output.get_size().columns - 1)
         settings, usage = self.display.status_lines(self.model, width=width)
         return [("class:dim", " " + settings + "\n " + usage)]
+
+    def toggle_details(self) -> None:
+        if not self.view.details:
+            self._detail_position = self._row, self._follow, self._show_history
+            self._detail_folds = {node: node.expanded for block in self.view.blocks
+                                  for node in (block, *block.children)}
+            self.display.set_verbose(True)
+            self._show_history = True
+            self._follow = False
+            self.fragments()
+            self._row = max((row for row, block in self._fold_rows.items() if block.kind == "tool"), default=0)
+        else:
+            self.display.set_verbose(False)
+            for block, expanded in self._detail_folds.items():
+                block.expanded = expanded
+            self._detail_folds.clear()
+            if self._detail_position is not None:
+                self._row, self._follow, self._show_history = self._detail_position
+                self._detail_position = None
+        self.view.invalidate()
+
+    def _activity_fragments(self) -> StyleAndTextTuples:
+        activity = self.status if self._operation and self._operation.cancelling() else self.display.activity_text()
+        width = max(1, self.app.output.get_size().columns - 1)
+        return [("class:assistant", display_rows(" ✳ " + activity, width=width)[0])]
 
     def _footer(self) -> StyleAndTextTuples:
         if self._approval is not None:
@@ -991,14 +1048,12 @@ class TerminalChatApp:
             return [("class:dim", f" ↑↓ 选择 · Enter 确认 · Esc 取消 · {tab_hint}")]
         if self._model_pending is not None:
             return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
-        activity = self.display.activity_text() if self._operation and not self._operation.cancelling() else self.status
-        mouse_hint = "PgUp 历史 · F2 鼠标" if self.fullscreen else ""
-        hint = activity if self._operation else "/help 帮助"
-        hint += " · " + APPROVAL_MODES.get(self.approval_mode, self.approval_mode).split(" · ")[0]
+        hint = "Ctrl+C 停止" if self._operation else "/help 帮助"
+        hint += " · Ctrl+O 返回" if self.view.details else " · Ctrl+O 详情"
         return [
             (
                 "class:dim",
-                f" {hint} · Enter 发送 · Ctrl+J 换行" + (f" · {mouse_hint}" if mouse_hint else ""),
+                f" {hint} · Enter 发送 · Ctrl+J 换行",
             )
         ]
 
@@ -1025,7 +1080,7 @@ class TerminalChatApp:
             while True:
                 self._refresh_inputs()
                 self.invalidate()
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(1)
         refresh_task = asyncio.create_task(refresh())
         try:
             return await self._operation
@@ -1055,7 +1110,7 @@ class TerminalChatApp:
                 return
             self.view.message(text + "\n", "user")
             block = self.view._add(Block("notice"))
-            block.append(f"补充 {identity}：已接收 · 待生效\n")
+            block.append("补充已接收 · 等待应用\n")
             self._input_receipts[identity] = block
             self._refresh_inputs()
             if self._approval is not None:
@@ -1074,8 +1129,8 @@ class TerminalChatApp:
                 continue
             if status == "pending":
                 continue
-            label = "已生效（已进入模型请求）" if status == "applied" else "本次执行已结束，补充尚未生效"
-            text = f"补充 {identity}：{label}\n"
+            label = "已应用（已进入模型请求）" if status == "applied" else "本次执行已结束，补充尚未应用"
+            text = f"补充{label}\n"
             if block.in_scrollback:
                 self.view.message(text, "notice")
             else:

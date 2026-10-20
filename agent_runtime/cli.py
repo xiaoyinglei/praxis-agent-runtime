@@ -325,14 +325,15 @@ def _display_agent_result(
     answer_streamed: bool = False,
     show_execution: bool = True,
     show_usage: bool = True,
+    show_outcome: bool = True,
 ) -> None:
-    if result.status == "failed":
+    if result.status == "failed" and show_outcome:
         _display_failure(
             stop_reason=result.stop_reason,
             diagnostics=result.diagnostics,
             verbose=verbose,
         )
-    elif result.diagnostics:
+    elif result.diagnostics and show_outcome:
         degraded = sum(1 for diagnostic in result.diagnostics if diagnostic.degraded)
         if degraded:
             print(f"\n警告: Agent 以降级模式运行（{degraded} 项诊断）")
@@ -343,7 +344,7 @@ def _display_agent_result(
     if result.answer and not answer_streamed:
         print(f"\n{safe_terminal_text(result.answer)}")
 
-    if result.status == "done":
+    if result.status == "done" and show_outcome:
         scope = (
             f"（范围: {safe_terminal_text(result.validation_scope)}）"
             if result.validation_scope is not None else ""
@@ -407,6 +408,21 @@ def _display_agent_result(
 
     if verbose:
         print(f"状态: {result.status}")
+
+
+async def _cancel_ui_execution(driver: Agent | Session, ui: TerminalChatApp, turn_id: str | None) -> AgentResult | None:
+    ui.display.stopping()
+    if turn_id is None:
+        ui.display.interrupted()
+        return None
+    try:
+        result: AgentResult = await ui.operation(driver.resume(turn_id, "abort", event_sink=ui.display))
+    except BaseException:
+        ui.display.interrupted()
+        raise
+    ui.display.present_result(result)
+    ui.display.finish()
+    return result
 
 
 async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | None:
@@ -1295,16 +1311,14 @@ async def _chat_facade_loop(
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                     raise
-                _ui.display.interrupted()
-                if _ui.display.turn_id:
-                    current_turn_id = _ui.display.turn_id
-                    await resume_driver.resume(current_turn_id, "abort", event_sink=event_display)
-                print("已取消当前执行；已发生的文件修改不会回滚。")
+                await _cancel_ui_execution(resume_driver, _ui, _ui.display.turn_id)
                 continue
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
-                if not (_ui and _ui.fullscreen):
+                if _ui:
+                    _ui.display.present_result(result)
+                else:
                     print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
                 pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
@@ -1313,8 +1327,13 @@ async def _chat_facade_loop(
                 action = ("continue" if pending_steering
                           else await _handle_ui_pause(result, _ui) if _ui else await _handle_cli_pause(result))
                 if action is None:
-                    result = await resume_driver.resume(result.turn_id, "abort")
-                    print("已取消。")
+                    if _ui:
+                        cancelled = await _cancel_ui_execution(resume_driver, _ui, result.turn_id)
+                        assert cancelled is not None
+                        result = cancelled
+                    else:
+                        result = await resume_driver.resume(result.turn_id, "abort", event_sink=event_display)
+                        print("已取消。")
                     break
                 event_display.begin_turn(reset=False)
                 if text_answer:
@@ -1329,11 +1348,13 @@ async def _chat_facade_loop(
                 except asyncio.CancelledError:
                     if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
                         raise
-                    _ui.display.interrupted()
-                    result = await resume_driver.resume(result.turn_id, "abort", event_sink=event_display)
-                    print("已取消当前执行；已发生的文件修改不会回滚。")
+                    cancelled = await _cancel_ui_execution(resume_driver, _ui, result.turn_id)
+                    assert cancelled is not None
+                    result = cancelled
             event_display.finish()
             event_display.update_usage(result.usage)
+            if _ui:
+                _ui.display.present_result(result)
             last_result = result
             last_answer = result.answer or ""
             _display_agent_result(
@@ -1341,7 +1362,8 @@ async def _chat_facade_loop(
                 verbose=verbose,
                 answer_streamed=event_display.answer_streamed,
                 show_execution=_ui is None,
-                show_usage=not (_ui and _ui.fullscreen),
+                show_usage=_ui is None,
+                show_outcome=_ui is None,
             )
 
 

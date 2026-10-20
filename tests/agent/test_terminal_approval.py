@@ -212,9 +212,9 @@ async def test_arrow_selection_and_enter_work_when_mouse_is_disabled(mode):
         task = asyncio.create_task(ui.run(conversation))
         try:
             await wait_for(lambda: ui.status == "等待确认")
-            assert ui.app.mouse_support() == (mode == "fullscreen")
-            # Inline already uses native mouse selection; F2 releases fullscreen reporting.
-            pipe.send_text(("\x1bOQ" if mode == "fullscreen" else "") + "\x1b[A\r")
+            assert ui.app.mouse_support() is False
+            # Keyboard selection works without enabling mouse reporting in either mode.
+            pipe.send_text("\x1b[A\r")
             await asyncio.wait_for(task, 3)
         finally:
             if not task.done():
