@@ -61,12 +61,13 @@ def python_command(workspace, code):
     from agent_runtime.permission_policy import PathRule, PermissionPolicy
 
     # Declare the test interpreter's read dependencies instead of relying on an OS shim.
-    roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
-             Path(sys.executable).resolve().parent.parent}
-    policy = PermissionPolicy(filesystem=tuple(
-        PathRule(path=str(root), access="read") for root in sorted(roots)
-    )).resolve(workspace.root)
-    workspace.permission_provider = lambda: policy
+    if sys.platform == "darwin":
+        roots = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
+                 Path(sys.executable).resolve().parent.parent}
+        policy = PermissionPolicy(filesystem=tuple(
+            PathRule(path=str(root), access="read") for root in sorted(roots)
+        )).resolve(workspace.root)
+        workspace.permission_provider = lambda: policy
     return shlex.quote(sys.executable) + " -c " + shlex.quote(code)
 
 

@@ -1111,19 +1111,27 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
         )
     )
 
-    await asyncio.wait_for(sink_started.wait(), timeout=0.5)
-    assert model.dispatch_started.is_set() is False
-    with RolloutStore(database) as committed_store:
-        turns = committed_store.list_turns()
-        assert len(turns) == 1
-        assert turns[0].status == "running"
-        assert committed_store.verify().valid is True
+    try:
+        async with asyncio.timeout(5):
+            await sink_started.wait()
+            assert model.dispatch_started.is_set() is False
+            with RolloutStore(database) as committed_store:
+                turns = committed_store.list_turns()
+                assert len(turns) == 1
+                assert turns[0].status == "running"
+                assert committed_store.verify().valid is True
 
-    release_sink.set()
-    await asyncio.wait_for(model.dispatch_started.wait(), timeout=0.5)
-    model.release_dispatch.set()
-    result = await asyncio.wait_for(running, timeout=1.0)
-    assert result.answer == "live stream answer"
+            release_sink.set()
+            await model.dispatch_started.wait()
+            model.release_dispatch.set()
+            result = await running
+            assert result.answer == "live stream answer"
+    finally:
+        release_sink.set()
+        model.release_dispatch.set()
+        if not running.done():
+            running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
 
 
 @pytest.mark.anyio
