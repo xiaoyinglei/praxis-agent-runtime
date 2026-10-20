@@ -1302,24 +1302,6 @@ class IngestPipeline:
         )
         return [doc_record, *section_records, *asset_records]
 
-    def _write_summary_records(
-        self,
-        records: Sequence[DocSummaryRecord | SectionSummaryRecord | AssetSummaryRecord],
-    ) -> None:
-        if not records:
-            return
-        vectors = self._embedder.embed([record.summary_text for record in records])
-        if len(vectors) != len(records):
-            raise RuntimeError(
-                f"embedding count mismatch: expected {len(records)}, got {len(vectors)}"
-            )
-        upsert_records = getattr(self._summary_repo, "upsert_records", None)
-        if callable(upsert_records):
-            upsert_records(list(zip(records, vectors, strict=True)), embedding_space=self._embedding_space)
-            return
-        for record, vector in zip(records, vectors, strict=True):
-            self._summary_repo.upsert_record(record, vector, embedding_space=self._embedding_space)
-
     def _write_prepared_summary_records(self, prepared_items: Sequence[_PreparedIngestItem]) -> None:
         records_to_embed: list[DocSummaryRecord | SectionSummaryRecord | AssetSummaryRecord] = []
         vector_indexes: list[tuple[DocSummaryRecord | SectionSummaryRecord | AssetSummaryRecord, int]] = []

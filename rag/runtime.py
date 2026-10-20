@@ -867,17 +867,6 @@ class RAGRuntime:
             )
         )
 
-    def _build_agent_service(self, *, answer_generation_service: AnswerGenerationService) -> object:
-        del answer_generation_service
-        raise NotImplementedError("Legacy agent service wiring was removed")
-
-    def _ensure_agent_service(self) -> object:
-        raise NotImplementedError("Legacy agent service wiring was removed")
-
-    @staticmethod
-    def _agent_task_request_class() -> type[object]:
-        raise NotImplementedError("Legacy agent task request wiring was removed")
-
     def _register_or_validate_runtime_contract(self) -> None:
         payload = dict(self.capability_bundle.runtime_contract_payload)
         existing = self.stores.cache_repo.get_cache_entry(_RUNTIME_CONTRACT_KEY, namespace=_RUNTIME_CONTRACT_NAMESPACE)

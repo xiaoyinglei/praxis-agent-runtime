@@ -68,23 +68,6 @@ class AuthorizationService:
             return True
         return str(doc_id) in set(context.allowed_doc_ids)
 
-    def _resolver_access_policy(self, user_id: str) -> AccessPolicy | None:
-        resolver = self.resolver
-        if resolver is None:
-            return None
-        resolve_user_view = getattr(resolver, "resolve_user_view", None)
-        if callable(resolve_user_view):
-            view = resolve_user_view(user_id)
-            policy = getattr(view, "access_policy", None)
-            if isinstance(policy, AccessPolicy):
-                return policy
-        access_policy_for_user = getattr(resolver, "access_policy_for_user", None)
-        if callable(access_policy_for_user):
-            policy = access_policy_for_user(user_id)
-            if isinstance(policy, AccessPolicy):
-                return policy
-        return None
-
     def _allowed_doc_ids_for_user(self, user_id: str) -> tuple[set[str], bool]:
         resolver = self.resolver
         if resolver is None:

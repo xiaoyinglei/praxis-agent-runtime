@@ -388,12 +388,6 @@ def _contains_demo_absolute_path(value: str) -> bool:
     )
 
 
-def _sanitize_demo_diff(value: str) -> str:
-    return "\n".join(
-        line for line in value.splitlines() if not _contains_demo_absolute_path(line)
-    )
-
-
 def _format_result(result: SmokeResult, *, verbose: bool) -> tuple[str, ...]:
     lines = [
         f"{'PASS' if result.passed else 'FAIL'} {result.name}",

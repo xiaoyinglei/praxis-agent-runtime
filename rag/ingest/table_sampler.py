@@ -204,10 +204,6 @@ def _summary_sample(
     return "\n".join(lines).strip()
 
 
-def _field_types(columns: list[str], rows: list[list[str]]) -> list[str]:
-    return [f"{field['name']}={field['type']}" for field in _schema(columns, rows)]
-
-
 def _columns_text(columns: list[str], column_count: int) -> str:
     if not columns:
         return ""

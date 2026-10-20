@@ -37,8 +37,6 @@ docs/superpowers/
 !/docs/guide.md
 !/docs/development.md
 !/docs/runtime-recovery.md
-!/docs/runtime-design-review.md
-!/docs/runtime-output-and-linux-repair.md
 !/docs/macos-command-sessions.md
 !/docs/interactive-steering.md
 !/docs/model-request-settings.md

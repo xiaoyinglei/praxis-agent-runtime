@@ -75,30 +75,6 @@ class GroundingBudgets:
     rerank_max_total_tokens: int = 2048
 
 
-class _GroundingMetadataRepo(Protocol):
-    def get_section(self, section_id: int) -> SectionRecord | None: ...
-
-    def list_sections(self, *, doc_id: int | None = None, source_id: int | None = None) -> list[SectionRecord]: ...
-
-    def get_asset(self, asset_id: int) -> AssetRecord | None: ...
-
-    def list_assets(
-        self,
-        *,
-        doc_id: int | None = None,
-        source_id: int | None = None,
-        section_id: int | None = None,
-    ) -> list[AssetRecord]: ...
-
-    def get_layout_meta_cache(
-        self,
-        *,
-        source_id: int | None = None,
-        doc_id: int | None = None,
-        content_hash: str | None = None,
-    ) -> LayoutMetaCacheRecord | None: ...
-
-
 class _RangeReadableObjectStore(Protocol):
     def read_byte_range(self, key: str, start: int, end: int) -> bytes: ...
 

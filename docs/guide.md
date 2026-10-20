@@ -289,7 +289,7 @@ macOS 子进程通过 `/usr/bin/sandbox-exec` 和 Seatbelt 隔离。Linux 通过
 Linux 候选视图支持工作区内相对符号链接，保留普通文件 mtime，按块复制与指纹校验，不再有普通文件总量 64 MiB 上限；仍需要候选副本磁盘空间。
 `run_command` / `execute_python` 的 `publish_on_failure=true` 可显式保留通过安全检查的失败或超时产物，
 方便后续命令增量续建；工具仍报告失败，`workspace_published` 说明是否发布。默认关闭，取消及沙箱启动失败不发布。
-它不增加写权限或取消 destructive 审批；不恢复已终止的进程。详见[输出与构建恢复契约](runtime-output-and-linux-repair.md)。
+它不增加写权限或取消 destructive 审批；不恢复已终止的进程。详见[输出与构建恢复](runtime-recovery.md#linux-输出与构建恢复)。
 
 macOS / Linux 活跃 Session 的 `run_command` 可用 `yield_time_seconds` 先返回任务 ID，随后用
 `manage_command` 查询、等待或取消同一个进程。等待期限与执行期限独立；显式
