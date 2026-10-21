@@ -24,6 +24,7 @@ from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
 from agent_runtime.harness import RolloutStore, TurnSnapshot
+from agent_runtime.harness.ownership import ConversationBusyError
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.local_files import parse_file_input, resolve_local_file
@@ -838,6 +839,9 @@ def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | Non
     if session.active_turn_id:
         if pending is not None and pending.pause is not None:
             request = pending.pause
+            if request.kind == "tool_reconciliation":
+                print("上次操作的执行结果尚未确认，任务保持暂停。请先核对执行结果；/new 可开始其他聊天。")
+                return
             print("上一轮等待你的回复: " + safe_terminal_text(request.question))
             for call in request.tool_calls:
                 print(safe_terminal_text(f"  {call.tool_name}: {call.args_preview}"))
@@ -851,7 +855,7 @@ def _print_chat_recovery(session: ChatSessionSummary, pending: AgentResult | Non
             else:
                 print("直接输入你的回答即可继续；/new 开始新聊天。")
         else:
-            print("上一轮尚未结束，历史已打开。完成后可直接发送新消息；/new 开始新聊天。")
+            print("历史已打开。直接发送消息可继续中断的任务；若原进程仍在执行，会提示回到原终端。")
 
 
 async def _chat_facade_loop(
@@ -1258,19 +1262,17 @@ async def _chat_facade_loop(
                     continue
                 selected_chat = latest
                 if selected_chat.active_turn_id:
-                    if selected_chat.status not in {"paused", "interrupted"}:
-                        _print_chat_recovery(selected_chat)
-                        continue
                     saved_result = await facade.read_result(selected_chat.active_turn_id)
                     request = saved_result.pause
                     if request is None:
-                        _print_chat_recovery(selected_chat, saved_result)
-                        continue
-                    if request.kind in {"clarification", "choice"}:
+                        saved_result = None
+                    elif request.kind in {"clarification", "choice"}:
                         if request.options and query not in request.options:
                             _print_chat_recovery(selected_chat, saved_result)
                             continue
                         saved_action, saved_input = "continue", query
+                    elif request.kind == "model_retry" and query not in {"retry", "abort"}:
+                        saved_result = None
                     else:
                         saved_action = resolve_pause_choice(query, request.options)
                         if saved_action is None and _ui:
@@ -1278,7 +1280,7 @@ async def _chat_facade_loop(
                         if saved_action is None:
                             _print_chat_recovery(selected_chat, saved_result)
                             continue
-                    if saved_action != "abort":
+                    if saved_result is not None and saved_action != "abort":
                         metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, saved_result.turn_id)
                         facade.knowledge = metadata.runtime.knowledge
             if saved_result is None:
@@ -1290,12 +1292,9 @@ async def _chat_facade_loop(
             try:
                 if saved_result is not None:
                     assert saved_action is not None
-                    if pending_files and saved_action != "abort":
-                        assert session is not None
-                        await session.steer("补充输入文件，请结合当前任务读取。",
-                                            expected_turn_id=saved_result.turn_id, files=list(pending_files))
                     submission = resume_driver.resume(saved_result.turn_id, saved_action,
-                                                      user_input=saved_input, event_sink=event_display)
+                        user_input=saved_input, event_sink=event_display,
+                        **({"files": list(pending_files)} if pending_files and saved_action != "abort" else {}))
                 else:
                     assert session is not None
                     submission = session.submit(query, event_sink=event_display, **(
@@ -1305,8 +1304,11 @@ async def _chat_facade_loop(
                 event_display.update_usage(result.usage)
                 if saved_result is None or saved_action != "abort":
                     pending_files.clear()
-            except (OSError, ValueError) as error:
+            except (OSError, ValueError, ConversationBusyError) as error:
                 print("发送失败：" + safe_terminal_text(str(error)))
+                if _ui:
+                    _ui.editor.text = query
+                    _ui.invalidate()
                 continue
             except asyncio.CancelledError:
                 if _ui is None or ((task := asyncio.current_task()) is not None and task.cancelling()):
@@ -1316,6 +1318,9 @@ async def _chat_facade_loop(
             current_turn_id = result.turn_id
             while result.status == "paused":
                 event_display.finish()
+                if result.pause is not None and result.pause.kind == "tool_reconciliation":
+                    print("上次操作的执行结果尚未确认，任务保持暂停；核对前不会自动重跑或取消该操作。")
+                    break
                 if _ui:
                     _ui.display.present_result(result)
                 else:

@@ -60,7 +60,8 @@ cd /path/to/project
 uv run --project /path/to/praxis-agent-runtime agent chat
 ```
 
-依赖使用复制模式安装，避免与外部 uv 缓存形成硬链接。已安装的旧环境若触发 `workspace_hardlink_detected`，先核对错误路径，再在安装目录重装依赖：
+项目已在 `pyproject.toml` 中将 uv 的默认 `link-mode` 固定为 `copy`，普通 `uv sync`、`uv run` 和 `uv pip install` 的安装也使用独立文件，避免与外部缓存形成硬链接。
+更改默认值不会改造已安装的旧文件。旧环境若触发 `workspace_hardlink_detected`，先核对错误路径，再在安装目录重装依赖；后续更新沿用项目默认值：
 
 ```bash
 uv sync --locked --reinstall --link-mode copy

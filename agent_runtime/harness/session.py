@@ -16,11 +16,20 @@ from uuid import uuid4
 from agent_runtime.approval import ApprovalMode, CommandGrant
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
+from agent_runtime.harness.context import validate_tool_history
+from agent_runtime.harness.ownership import (
+    OWNERSHIP_REVISION,
+    ConversationBusyError,
+    ConversationRecoveryRequiredError,
+    execution_owner,
+    recover_owner_loss,
+)
 from agent_runtime.harness.protocol import (
     BoundHarnessModel,
     CompletionDecision,
     CompletionGate,
     CompletionProposal,
+    ContextBudgetExceededError,
     ContextManager,
     ToolRouter,
     TurnResult,
@@ -336,23 +345,25 @@ class Session:
             raise RuntimeError("Session already has an active Turn")
         async with self._active_turn_lock:
             self._ensure_open()
-            self._active_task = asyncio.current_task()
-            if event_sink is not None:
-                self.event_dispatcher.subscribe_controlling_sink(event_sink)
-            try:
-                yield
-            finally:
+            with execution_owner(self.database, self.thread_id):
+                self._active_task = asyncio.current_task()
+                if event_sink is not None:
+                    self.event_dispatcher.subscribe_controlling_sink(event_sink)
                 try:
-                    if event_sink is not None:
-                        self.event_dispatcher.unsubscribe_controlling_sink(event_sink)
-                    if self.tool_orchestrator is not None:
-                        self.tool_orchestrator.release_turn_state()
-                    self.head_turn_id = self.store.read_thread(self.thread_id).head_turn_id
-                    if (self._cancel_live_commands is not None and self.head_turn_id is not None
-                            and self.store.read_turn(self.head_turn_id).status in {"completed", "failed", "cancelled"}):
-                        await self._cancel_live_commands()
+                    yield
                 finally:
-                    self._active_task = None
+                    try:
+                        if event_sink is not None:
+                            self.event_dispatcher.unsubscribe_controlling_sink(event_sink)
+                        if self.tool_orchestrator is not None:
+                            self.tool_orchestrator.release_turn_state()
+                        self.head_turn_id = self.store.read_thread(self.thread_id).head_turn_id
+                        if (self._cancel_live_commands is not None and self.head_turn_id is not None
+                                and self.store.read_turn(self.head_turn_id).status
+                                in {"completed", "failed", "cancelled"}):
+                            await self._cancel_live_commands()
+                    finally:
+                        self._active_task = None
 
     def _executor(self) -> TurnExecutor:
         executor = TurnExecutor(
@@ -381,8 +392,29 @@ class Session:
         if not isinstance(task, str) or not task.strip():
             raise ValueError("user_message must be non-empty")
         async with self._active_turn(event_sink):
-            if self.store.read_thread(self.thread_id).active_turn_id is not None:
-                raise RuntimeError("active Turn must be resumed or aborted before submit")
+            active = self.store.read_thread(self.thread_id).active_turn_id
+            if active is not None:
+                pending = [item for item in self.store.list_interactions(active) if item.status == "pending"]
+                if pending and all(item.kind != "tool_reconciliation" for item in pending):
+                    raise RuntimeError("active Turn must be resumed or aborted before submit")
+                executor = self._executor()
+                await executor._commit(lambda: recover_owner_loss(self.store, active, abort=True))
+                pending = [item for item in self.store.list_interactions(active) if item.status == "pending"]
+                unsafe = any(op.status in {"running", "unknown"} for op in self.store.list_tool_operations(active))
+                if pending or unsafe:
+                    raise ConversationRecoveryRequiredError(
+                        "上次操作的结果尚未确认，输入未发送；核对前不会自动重跑。可用 /new 开始其他聊天。")
+                if self.store.read_turn(active).status not in {"paused", "interrupted"}:
+                    raise ConversationBusyError("旧任务尚无可安全结束的中断记录；请先核对原执行状态。")
+                try:
+                    validate_tool_history(self.store, active)
+                except ContextBudgetExceededError as error:
+                    raise ConversationRecoveryRequiredError(
+                        "旧任务的工具调用与结果记录尚未闭合，输入未发送；请先恢复或核对原操作。"
+                    ) from error
+                if self._cancel_live_commands is not None:
+                    await self._cancel_live_commands()
+                await executor._commit(lambda: self.store.cancel_turn(turn_id=active))
             if self.model_control_plane is not None and self.current_model().id != self._ready_model_id:
                 await self._bootstrap_model_provider()
             input_files: tuple[dict[str, object], ...] = ()
@@ -390,6 +422,7 @@ class Session:
                 input_files = self.attach_files(files)
             turn_id = f"turn_{uuid4().hex}"
             binding = dict(self.binding_provider.snapshot(thread_id=self.thread_id, turn_id=turn_id))
+            binding["execution_ownership"] = OWNERSHIP_REVISION
             binding["budget_root_turn_id"] = turn_id
             if self._agent is not None:
                 binding["web_limits"] = self._agent.web_limits.model_dump(mode="json")
@@ -1046,6 +1079,7 @@ class Session:
         action: str,
         *,
         user_input: str | None = None,
+        files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
         async with self._active_turn(event_sink):
@@ -1053,6 +1087,9 @@ class Session:
             if turn.thread_id != self.thread_id:
                 raise RuntimeError("Turn belongs to a different Session")
             executor = self._executor()
+            if turn.status in {"running", "paused", "interrupted"}:
+                await executor._commit(lambda: recover_owner_loss(self.store, turn_id, abort=action == "abort"))
+            turn = self.store.read_turn(turn_id)
             if action == "abort":
                 if self._cancel_live_commands is not None:
                     await self._cancel_live_commands()
@@ -1067,6 +1104,13 @@ class Session:
                     store=self.store,
                 )
             pending = tuple(item for item in self.store.list_interactions(turn_id) if item.status == "pending")
+            if files:
+                if not pending and any(op.status == "unknown" for op in self.store.list_model_operations(turn_id)):
+                    raise ValueError("重试旧请求不能附加新文件；请将附件作为新消息发送。")
+                await self.steer("补充输入文件，请结合当前任务读取。", expected_turn_id=turn_id, files=files)
+            if any(item.kind == "tool_reconciliation" for item in pending) and action in {"continue", "retry"}:
+                return AgentResult._from_harness(TurnResult(thread_id=self.thread_id, turn_id=turn_id,
+                    answer=None, status=turn.status, interaction_id=pending[0].request_id), store=self.store)
             approvals = [item for item in self.store.list_interactions(turn_id) if item.kind == "tool_approval"]
             if turn.status == "completed" and approvals and action in {"allow_once", "approve", "deny"}:
                 internal = await executor.resume(
@@ -1185,6 +1229,11 @@ class Session:
                 internal = await executor.run_turn(
                     executor.restore_turn_context(turn_id), start_step=executor.agent_step_count(turn_id) + 1,
                 )
+            elif (not pending and not model_operations and not self.store.list_tool_operations(turn_id)
+                  and turn.status == "running"
+                  and action in {"continue", "retry"}
+                  and turn.binding_manifest.get("execution_ownership") == OWNERSHIP_REVISION):
+                internal = await executor.run_turn(executor.restore_turn_context(turn_id), start_step=1)
             else:
                 raise RuntimeError("resume action does not match the Turn's durable pending state")
             return AgentResult._from_harness(internal, store=self.store)
