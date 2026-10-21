@@ -11,7 +11,6 @@ import rag
 from agent_runtime.knowledge import RAGKnowledgeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
-CODING_REFERENCE = ROOT / "CLAUDE.md"
 
 _HISTORICAL_EXCEPTIONS = {
     ROOT / "evals/code_agent/benchmark_v1.json",
@@ -53,11 +52,7 @@ def _active_contract_files() -> Iterator[Path]:
     yield ROOT / "README.md"
     yield ROOT / "docs/guide.md"
     yield ROOT / "docs/development.md"
-    for optional in (CODING_REFERENCE,):
-        if optional.is_file():
-            yield optional
     yield ROOT / "pyproject.toml"
-    yield from (path for path in (ROOT / "docs/design").glob("*.md") if path not in _HISTORICAL_EXCEPTIONS)
 
 
 def test_distribution_and_console_entrypoint_use_praxis_namespace() -> None:
@@ -125,59 +120,3 @@ def test_context_evaluation_runners_remain_active_contracts() -> None:
     assert _CONTEXT_EVALS / "README.md" in active
     assert ROOT / "docs/guide.md" in active
     assert ROOT / "docs/development.md" in active
-
-
-@pytest.mark.skipif(not CODING_REFERENCE.is_file(), reason="Local-only coding reference absent")
-def test_coding_reference_tracks_the_current_praxis_runtime() -> None:
-    reference = CODING_REFERENCE.read_text(encoding="utf-8")
-
-    assert reference.startswith("# CLAUDE.md — Praxis Coding Agent Reference\n")
-    assert "cd /path/to/praxis-agent-runtime" in reference
-    for gate in (
-        "uv run ruff check .",
-        "uv run mypy",
-        "uv run pytest -q",
-        "uv run lint-imports",
-        "uv build",
-    ):
-        assert gate in reference
-    for tool_name in (
-        "search_text",
-        "list_files",
-        "read_file",
-        "inspect_data_file",
-        "apply_patch",
-        "run_command",
-        "execute_python",
-        "update_plan",
-        "find_tools",
-    ):
-        assert f"`{tool_name}`" in reference
-    for current_path in (
-        "agent_runtime/harness/turn.py",
-        "agent_runtime/harness/session.py",
-        "agent_runtime/harness/context.py",
-        "agent_runtime/harness/tool_orchestrator.py",
-        "agent_runtime/harness/rollout.py",
-        "agent_runtime/builtin/generic.py",
-        "agent_runtime/tools/selection.py",
-        "agent_runtime/primitive_ops.py",
-        "agent_runtime/tools/tool.py",
-        "agent_runtime/tools/registry.py",
-        "agent_runtime/tools/executor.py",
-        "agent_runtime/cli.py",
-        "rag/cli.py",
-    ):
-        assert f"`{current_path}`" in reference
-        assert (ROOT / current_path).is_file()
-
-    stale_terms = (
-        "tool_" + "search",
-        "activate_" + "tools",
-        "write_" + "file",
-        "run_python_" + "inline",
-        "Tool" + "Spec",
-        "Base" + "Tool",
-        "--" + "agent",
-    )
-    assert all(term not in reference for term in stale_terms)

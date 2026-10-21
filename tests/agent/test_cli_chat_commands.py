@@ -607,8 +607,10 @@ async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
             return _result(answer="second answer")
 
         async def resume(self, turn_id, action, **kwargs):
+            from dataclasses import replace
             calls.append((turn_id, action))
-            return _result(turn_id=turn_id)
+            assert kwargs["event_sink"].activity_text().startswith("正在停止")
+            return replace(_result(turn_id=turn_id), status="failed", stop_reason="cancelled")
 
     async def wait_for(predicate):
         async with asyncio.timeout(3):
@@ -638,7 +640,7 @@ async def test_live_ui_cancel_cleans_turn_and_can_submit_again(tmp_path):
                     await task
         assert calls == ["slow", ("slow-turn", "abort"), "next"]
         assert facade.opened == facade.closed == 1
-        assert "已取消当前执行" in ui.view.plain_text()
+        assert "已停止" in ui.view.plain_text()
 
 
 @pytest.mark.anyio

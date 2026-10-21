@@ -445,6 +445,9 @@ class ToolOrchestrator:
                 resolved.targets,
             )
 
+        async def accept_cancelled(execution: ToolExecution) -> None:
+            await self._accept_execution(turn_id, call, _associate_execution(execution, turn_id), execution_context)
+
         execution = await self._execute_in_turn(
             turn_id,
             call,
@@ -453,6 +456,7 @@ class ToolOrchestrator:
             record_sink=persist,
             preflight_sink=capture_preflight,
             progress_sink=publish_progress,
+            cancellation_sink=accept_cancelled,
         )
         await self._accept_execution(turn_id, call, execution, execution_context)
         return execution.result

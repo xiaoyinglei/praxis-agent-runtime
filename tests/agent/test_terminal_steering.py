@@ -33,10 +33,12 @@ async def test_busy_enter_submits_ordered_messages_without_finishing_operation()
                 await asyncio.sleep(.01)
             assert received == ["first addition", "second addition"]
             assert not task.done()
-            assert "待生效" in ui.view.plain_text()
+            assert "等待应用" in ui.view.plain_text()
             ui.input_status = lambda identity: "applied"
-            await asyncio.sleep(.25)
-            assert "已生效" in ui.view.plain_text()
+            async with asyncio.timeout(3):
+                while "已应用" not in ui.view.plain_text():
+                    await asyncio.sleep(.01)
+            assert "已应用" in ui.view.plain_text()
         finally:
             release.set()
             await asyncio.wait_for(task, 3)
@@ -161,4 +163,4 @@ async def test_busy_settings_command_is_not_rendered_as_steering_receipt():
         ui.on_input = receive
         await ui._send_input('/effort low')
         assert not ui._input_receipts
-        assert '待生效' not in ui.view.plain_text()
+        assert '等待应用' not in ui.view.plain_text()

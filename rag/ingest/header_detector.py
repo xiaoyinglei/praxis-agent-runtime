@@ -297,18 +297,6 @@ def _detect_header_cluster(
     return cluster_indices, kind, confidence, warnings
 
 
-def _consecutive_groups(indices: list[int]) -> list[list[int]]:
-    if not indices:
-        return []
-    groups: list[list[int]] = [[indices[0]]]
-    for i in indices[1:]:
-        if i == groups[-1][-1] + 1:
-            groups[-1].append(i)
-        else:
-            groups.append([i])
-    return groups
-
-
 def _consecutive_groups_with_gap(indices: list[int], *, max_gap: int = 1) -> list[list[int]]:
     """允许最多 max_gap 行的间隔，跳过中间的空行/说明行。"""
     if not indices:
@@ -456,15 +444,6 @@ def _flatten_multi_level(
         col_name = "_".join(parts) if parts else f"column_{c + 1}"
         columns.append(col_name)
     return deduplicate_table_columns(columns)
-
-
-def _deduplicate_column(name: str, seen: set[str]) -> str:
-    if name not in seen:
-        return name
-    idx = 2
-    while f"{name}_{idx}" in seen:
-        idx += 1
-    return f"{name}_{idx}"
 
 
 __all__ = [

@@ -284,6 +284,7 @@ class ToolExecutor:
         record_sink: RecordSink | None = None,
         preflight_sink: PreflightSink | None = None,
         progress_sink: ToolProgressSink | None = None,
+        cancellation_sink: ExecutionSink | None = None,
     ) -> ToolExecution:
         trace_count = len(self._traces)
         started_at = time.monotonic()
@@ -298,7 +299,7 @@ class ToolExecutor:
             )
             if isinstance(prepared, ToolExecution):
                 return prepared
-            return await self._invoke(prepared, progress_sink=progress_sink)
+            return await self._invoke(prepared, progress_sink=progress_sink, cancellation_sink=cancellation_sink)
         except asyncio.CancelledError:
             if len(self._traces) == trace_count:
                 await self._finish(

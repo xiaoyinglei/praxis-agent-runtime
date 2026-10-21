@@ -8,7 +8,6 @@
 原步数、tokens 和费用预算照常扣除。截断的正文、reasoning 和工具调用不作为后续 assistant 消息重放，
 已完成工具结果保留；content_filter、未知终态和 summary 不走自动重试。重开进程不会重置额度，
 缺少该策略字段的旧 Turn 保持旧契约。缺失 provider 终态仍进入 unknown 的人工恢复路径。
-具体实现、CLI/SDK 和 Linux 构建恢复验证见[修复记录](runtime-output-and-linux-repair.md)。
 
 ## 先恢复能力边界，再打开资源
 
@@ -48,30 +47,15 @@ MCP 发现已开启时，发现阶段使用原 Turn 权限快照与当前有效�
 文件系统限制或硬性检查。对于进程与网络同时存在的操作，网络可能仍需独立审批。
 `deny` 拒绝该操作；`abort` 取消 Turn。
 
-## 成熟实现的源码对照
+## Linux 输出与构建恢复
 
-本次对照使用本机 `reference-src/codex` 与 `reference-src/claude_code-src` 源码快照，
-不将其当作上游当前版本声明，也不假定其他产品的聊天恢复与本项目的同一 Turn 恢复完全相同。
+Linux 的候选工作区支持工作区内相对符号链接，保留普通文件 mtime，按块复制并校验指纹。
+普通文件总量没有 64 MiB 上限，仍需要足够空间存放候选副本。
 
-- Codex `codex-rs/core/src/thread_manager.rs:1099` 的
-  `resume_thread_with_history` 分别接收当前 `Config` 与 `InitialHistory`；
-  `codex-rs/core/src/session/mod.rs:732` 从配置建立审批和权限状态，
-  `session/mod.rs:1415` 单独重建历史与用量。可借鉴的是配置与历史职责分离。
-- Claude Code `src/utils/sessionRestore.ts:95` 的
-  `restoreSessionStateFromLog` 恢复文件历史、归因和任务状态；
-  `src/utils/permissions/permissionSetup.ts:872` 从当前 CLI 设置建立工具权限。
-  `src/cli/print.ts:5345` 明确要求 SDK 动态 MCP 与 CLI 配置入口在连接前使用同一企业策略过滤。
-  可借鉴的是所有资源入口共享权限门，历史恢复不能替代当前权限检查。
+`run_command` 和 `execute_python` 默认不发布失败产物。显式设置
+`publish_on_failure=true` 时，失败或超时产生的文件通过安全检查后可以发布，
+供下一次命令增量续建。工具仍报告失败，`workspace_published` 表示是否实际发布。
+取消及沙箱启动失败不发布；此选项不增加写权限，也不取消破坏性操作审批。
 
-本项目据此将修复放在共享 Session 的恢复准备阶段：先应用已有冻结字段，
-再沿用现有资源打开与审批流程。没有新增另一套恢复执行器或根据任务文字定制的规则。
-
-## 验证
-
-```bash
-.venv/bin/python -m pytest tests/agent/harness/test_frozen_mcp_recovery.py -q
-```
-
-测试覆盖 SDK 与真实 Typer `recover` 入口：原 Turn 关闭 MCP，暂停后出现未经信任的工作区
-配置，新进程使用默认设置仍可批准原操作并完成恢复。发现调用计数还覆盖当前禁用、
-历史禁止、当前禁止与正常启用的对照；另验证当前新增的工具禁止使旧审批失效且不写文件。
+续建是基于已发布的文件重新执行命令，不恢复已终止进程的内存。
+活跃命令的查询、等待和取消见[命令会话](macos-command-sessions.md)。

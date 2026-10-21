@@ -24,7 +24,7 @@ async def test_web_error_details_are_retained_but_collapsed():
 
 
 @pytest.mark.anyio
-async def test_failed_tool_title_identifies_error_and_detail_entry():
+async def test_failed_tool_keeps_code_in_details_and_readable_preview():
     view = Conversation()
     display = ConversationEventDisplay(view)
     display.begin_turn()
@@ -35,8 +35,11 @@ async def test_failed_tool_title_identifies_error_and_detail_entry():
                          "error_message": "tool runner failed", "structured_content": None}},
     ))
     title = display.group.children[0].title
-    assert "runner_failed" in title
-    assert "点击查看" in title
+    assert "runner_failed" not in title
+    assert "网页工具执行异常" in view.plain_text()
+    display.set_verbose(True)
+    assert "runner_failed" in view.plain_text()
+    assert "tool runner failed" in view.plain_text()
 
 
 def test_nested_folds_toggle_in_place_without_duplicating_output():
@@ -802,7 +805,7 @@ def test_long_reference_url_remains_complete_in_native_scrollback():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mode", ["inline", "fullscreen"])
-async def test_request_settings_and_usage_have_a_fixed_status_bar_without_transcript_notices(mode):
+async def test_request_settings_and_usage_are_available_in_details_without_transcript_notices(mode):
     from prompt_toolkit.input import create_pipe_input
     from prompt_toolkit.output import DummyOutput
 
@@ -820,6 +823,8 @@ async def test_request_settings_and_usage_have_a_fixed_status_bar_without_transc
         ui.display.update_usage(AgentUsage(input_tokens=100, output_tokens=20, total_tokens=120,
                                           cache_read_input_tokens=80))
         ui.display.finish()
+        assert ui._status_fragments() == []
+        ui.display.set_verbose(True)
         status = "".join(fragment[1] for fragment in ui._status_fragments())
         assert "demo" in status and "high" in status
         assert "本轮累计" in status and "缓存" in status and "80" in status
@@ -848,6 +853,7 @@ def test_usage_update_invalidates_retained_status_and_compact_status_keeps_cache
         ui.display.update_usage(AgentUsage(input_tokens=4000, output_tokens=500, total_tokens=4500,
                                           cache_read_input_tokens=3000, reasoning_tokens=100))
         assert invalidated
+        ui.display.set_verbose(True)
         lines = "".join(fragment[1] for fragment in ui._status_fragments()).splitlines()
         assert all(wcswidth(line) <= 80 for line in lines)
         assert "缓存" in lines[1] and "推理" in lines[1]
@@ -890,6 +896,8 @@ async def test_effort_menu_reuses_picker_and_preserves_status_on_selection_and_c
             pipe.send_text("\x1b")
             await asyncio.wait_for(task, 3)
             assert selected == ["high", None]
+            assert ui._status_fragments() == []
+            ui.display.set_verbose(True)
             assert "120" in "".join(fragment[1] for fragment in ui._status_fragments())
             assert "选择思考强度" not in ui.view.plain_text()
         finally:
@@ -927,6 +935,7 @@ async def test_large_token_status_keeps_model_effort_context_cache_and_reasoning
         }))
         ui.display.update_usage(AgentUsage(input_tokens=2500000, output_tokens=1000000,
             total_tokens=3500000, cache_read_input_tokens=1800000, reasoning_tokens=500000))
+        ui.display.set_verbose(True)
         lines = "".join(fragment[1] for fragment in ui._status_fragments()).splitlines()
         assert len(lines) == 2 and all(wcswidth(line) <= columns for line in lines)
         assert "深" in lines[0] and "high" in lines[0] and "上下文" in lines[0]
