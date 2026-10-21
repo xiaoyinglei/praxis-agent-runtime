@@ -175,13 +175,17 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
 
 
 @pytest.mark.anyio
-async def test_running_conversation_is_read_only_without_manual_recovery_workflow(tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("tool_unknown", [False, True])
+async def test_running_conversation_attempts_owned_recovery_when_user_sends(
+    tmp_path, monkeypatch, capsys, tool_unknown,
+):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
     thread_id, _ = conversation(database, workspace)
     with RolloutStore(database) as store:
         running = store.start_turn(thread_id=thread_id, user_message="unfinished", binding_manifest={})
     before = records(database)
+    resumed = []
 
     class Facade:
         checkpoint_db = database
@@ -190,14 +194,31 @@ async def test_running_conversation_is_read_only_without_manual_recovery_workflo
         def current_model(self):
             return SimpleNamespace(id="caller-model")
 
-        def session(self, **options):
-            raise AssertionError("Active conversation must stay read-only")
+        @asynccontextmanager
+        async def session(self, **options):
+            assert options["thread_id"] == thread_id
+            yield self
 
-    commands = iter(["new message must be blocked", "/exit"])
+        async def read_result(self, turn_id):
+            assert turn_id == running.turn_id
+            return _result(turn_id=turn_id, status="running")
+
+        async def submit(self, task, **options):
+            resumed.append(task)
+            if tool_unknown:
+                from agent_runtime.result import AgentPause
+                return _result(turn_id=running.turn_id, status="paused", pause=AgentPause(
+                    request_id="unknown", kind="tool_reconciliation", question="结果待核对", options=()))
+            return _result(turn_id="turn_new", answer="continued")
+
+        async def resume(self, *_args, **_options):
+            raise AssertionError("Unknown tool effects must never be automatically aborted")
+
+    commands = iter(["continue with my new requirement", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
     output = capsys.readouterr().out
-    assert "处理中" in output and "完成后可直接发送新消息" in output
+    assert resumed == ["continue with my new requirement"]
     assert "recover " not in output
     assert list_chat_sessions(database, workspace=workspace)[0].active_turn_id == running.turn_id
     assert records(database) == before

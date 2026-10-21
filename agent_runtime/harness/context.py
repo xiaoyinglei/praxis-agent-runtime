@@ -578,6 +578,11 @@ class RolloutContextManager:
         return _project_items(self._store.list_context_items(turn_id))
 
 
+def validate_tool_history(store: RolloutStore, turn_id: str) -> None:
+    """Check provider message structure without applying an old Turn's capacity limits."""
+    _validate_tool_groups(tuple(message for _, message in _project_items(store.list_context_items(turn_id))))
+
+
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 

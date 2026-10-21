@@ -343,39 +343,45 @@ class Agent:
         action: str,
         *,
         user_input: str | None = None,
+        files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
     ) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
         if action == "abort":
             from agent_runtime.harness import RolloutEventReader
+            from agent_runtime.harness.ownership import execution_owner, recover_owner_loss
 
             with RolloutStore(self._harness_database()) as store:
                 turn = store.read_turn(turn_id)
                 thread = store.read_thread(turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
-                from agent_runtime.harness.command_recovery import cancel_commands
-                await cancel_commands(self, turn_id)
-                mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
-                cancelled = mutation.value
-                result = AgentResult._from_harness(
-                    TurnResult(
-                        thread_id=cancelled.thread_id,
-                        turn_id=cancelled.turn_id,
-                        answer=None,
-                        status="cancelled",
-                    ),
-                    store=store,
-                )
-                if event_sink is not None:
-                    dispatcher = TurnEventDispatcher()
-                    dispatcher.subscribe_controlling_sink(event_sink)
-                    for replayed in RolloutEventReader(store).project_committed_batch(mutation.records):
-                        await dispatcher.emit(replayed.event, cursor=replayed.cursor)
+                with execution_owner(self._harness_database(), thread.thread_id):
+                    from agent_runtime.harness.command_recovery import cancel_commands
+                    recovered = store.capture_mutation(lambda: recover_owner_loss(store, turn_id, abort=True))
+                    await cancel_commands(self, turn_id)
+                    mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
+                    cancelled = mutation.value
+                    result = AgentResult._from_harness(
+                        TurnResult(
+                            thread_id=cancelled.thread_id,
+                            turn_id=cancelled.turn_id,
+                            answer=None,
+                            status="cancelled",
+                        ),
+                        store=store,
+                    )
+                    if event_sink is not None:
+                        dispatcher = TurnEventDispatcher()
+                        dispatcher.subscribe_controlling_sink(event_sink)
+                        for replayed in RolloutEventReader(store).project_committed_batch(
+                            (*recovered.records, *mutation.records)
+                        ):
+                            await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
         async with self.session(_frozen_turn_id=turn_id, event_sink=event_sink) as session:
-            return await session.resume(turn_id, action, user_input=user_input)
+            return await session.resume(turn_id, action, user_input=user_input, files=files)
 
     async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult

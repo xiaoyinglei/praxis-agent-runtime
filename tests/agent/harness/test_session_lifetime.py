@@ -296,7 +296,7 @@ async def test_agent_factory_sessions_have_independent_model_state_and_resources
 
 
 @pytest.mark.anyio
-async def test_cancelled_turn_keeps_session_open_and_can_be_aborted(tmp_path, monkeypatch):
+async def test_cancelled_model_turn_keeps_session_open_for_natural_followup(tmp_path, monkeypatch):
     from tests.agent.harness.test_public_agent_cutover import BlockingPublicModel
 
     model = BlockingPublicModel()
@@ -309,12 +309,11 @@ async def test_cancelled_turn_keeps_session_open_and_can_be_aborted(tmp_path, mo
         await asyncio.gather(running, return_exceptions=True)
         assert not session._closed
         [turn] = session.store.list_turns()
-        with pytest.raises(RuntimeError, match="active Turn"):
-            await session.submit("cannot bypass pending outcome")
-        await session.resume(turn.turn_id, "abort")
         model.release_dispatch.set()
         result = await session.submit("next turn")
         assert result.turn_id != turn.turn_id
+        assert session.store.read_turn(turn.turn_id).status == "cancelled"
+        assert session.store.list_model_operations(turn.turn_id)[0].status == "unknown"
         assert session.store.verify().valid
 
 

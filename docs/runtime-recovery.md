@@ -4,6 +4,33 @@
 恢复同一个持久化 Turn。`previous_turn_id` 则为新 Turn 提供历史上下文；
 `agent resume THREAD_ID` 重新打开聊天，下一条消息也会创建新 Turn。
 
+## 关闭终端后继续聊天
+
+`agent resume THREAD_ID`、`agent chat --continue` 和聊天内 `/resume` 都先只读展示历史，
+不会因为选择了会话就调用模型。直接发送新消息时，运行时先取得该 Thread 的独占执行锁：
+
+- 原进程仍在执行：拒绝另一执行循环，提示回到原终端，交互终端保留草稿。
+- 原进程已退出：将未提交结果的模型请求记为 unknown，保留其未知费用与历史记录；
+  安全结束旧 Turn，在同一 Thread 创建新 Turn，带上原历史和这次新消息。
+- 尚未启动的工具调用：记录“未执行”的规范工具结果，闭合消息组，不执行旧调用。
+- 工具已开始但结果未知：逐项进入结果核对，保留暂停，不自动重跑、取消或假报完成。
+  已提交执行结果但缺少规范 ToolResult 的情况也需要核对。
+- 待审批、待澄清的会话仍走原交互流程；打开历史不会产生授权。
+
+执行锁由操作系统管理，进程退出即释放；新 Turn 记录该所有权协议版本。
+旧版本运行中的记录没有这一承诺，只能在已有模型或工具租约过期后接管，
+不能仅凭取得新锁就推断旧进程退出。锁文件不能删除，否则会破坏跨进程互斥。
+
+普通新消息不会重试旧的压缩请求，也不会增加旧 Turn 的冻结摘要调用额度。
+显式 `agent recover TURN_ID --action continue` / `retry` 仍恢复同一 Turn，受原预算、
+模型、权限与未知结果限制。一次取消请求只在最近的 `turn_resumed` 之后有效；
+明确恢复后仍可继续接收中途输入，并可再次取消。
+
+这套聊天边界对照了 [Codex thread/resume 与 turn/start 的公开契约](https://developers.openai.com/codex/app-server)、
+[Codex 历史重建源码](https://github.com/openai/codex/blob/8c076942cb70fba8e5c4732c23f1faabc4aed484/codex-rs/core/src/session/mod.rs#L1676)
+以及 [Claude Code 的已保存会话与活跃后台会话区分](https://code.claude.com/docs/en/sessions)。
+Claude Code 的公开 GitHub 仓库未提供这里所需的完整运行时源码，因此没有将其内部实现作为已核实证据。
+
 新 Turn 对已知 `incomplete/max_output_tokens` 允许一次完整步骤重试，额度按整个 Turn 冻结，
 原步数、tokens 和费用预算照常扣除。截断的正文、reasoning 和工具调用不作为后续 assistant 消息重放，
 已完成工具结果保留；content_filter、未知终态和 summary 不走自动重试。重开进程不会重置额度，

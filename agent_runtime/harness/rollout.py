@@ -724,11 +724,7 @@ class RolloutStore:
             turn = self.read_turn(turn_id) if thread.active_turn_id == turn_id else None
             if turn is None or turn.status not in {"running", "paused", "interrupted"}:
                 raise RuntimeError("expected Turn is no longer active; input was not accepted")
-            if self._connection.execute(
-                "SELECT 1 FROM rollout_records WHERE turn_id = ? "
-                "AND record_type = 'turn_cancellation_requested' LIMIT 1",
-                (turn_id,),
-            ).fetchone() is not None:
+            if self.turn_cancellation_pending(turn_id):
                 raise RuntimeError("Turn cancellation was requested; input was not accepted")
             revision = self.user_input_revision(turn_id) + 1
             self._append_and_reduce(
@@ -1325,15 +1321,7 @@ class RolloutStore:
             ).fetchone()
             if active is None or active["active_turn_id"] != turn_id:
                 raise RuntimeError("cancellation request cannot target a foreign active slot")
-            existing = self._connection.execute(
-                """
-                SELECT 1 FROM rollout_records
-                WHERE turn_id = ? AND record_type = 'turn_cancellation_requested'
-                LIMIT 1
-                """,
-                (turn_id,),
-            ).fetchone()
-            if existing is None:
+            if not self.turn_cancellation_pending(turn_id):
                 self._append_and_reduce(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -1345,6 +1333,14 @@ class RolloutStore:
                     },
                 )
         return self.read_turn(turn_id)
+
+    def turn_cancellation_pending(self, turn_id: str) -> bool:
+        """A durable stop applies only until the next explicit execution resume."""
+        return self._connection.execute(
+            "SELECT 1 FROM rollout_records WHERE turn_id = ? AND record_type = 'turn_cancellation_requested' "
+            "AND record_id > COALESCE((SELECT MAX(record_id) FROM rollout_records "
+            "WHERE turn_id = ? AND record_type = 'turn_resumed'), 0) LIMIT 1", (turn_id, turn_id),
+        ).fetchone() is not None
 
     def request_clarification(
         self,
