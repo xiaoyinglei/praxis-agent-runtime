@@ -44,7 +44,10 @@ def _probe_key(name: str | None, key: str | None) -> Iterator[None]:
 def _configure_model(service: ModelAdminService, model_id: str | None) -> str:
     typer.echo("1/3 选择模型")
     entries = service.list_models()
-    if model_id is None:
+    if model_id is None and len(entries) == 1:
+        model_id = entries[0].model_id
+        typer.echo("默认模型：" + safe_terminal_text(model_id))
+    elif model_id is None:
         for entry in entries:
             typer.echo("  " + safe_terminal_text(entry.model_id))
         model_id = typer.prompt("模型 ID（输入 new 添加模型）", default=service.current().id)

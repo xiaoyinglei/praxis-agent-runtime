@@ -101,7 +101,7 @@ class ModelRegistry:
     加载顺序：AGENT_MODELS_PATH(YAML) > AGENT_MODELS(JSON) > models.yaml 内置默认
     """
 
-    _BUNDLED_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "models.yaml"
+    _BUNDLED_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "agent-models.yaml"
     _BUNDLED_CONFIG_PACKAGE = "agent_runtime"
     _BUNDLED_CONFIG_RESOURCE = ("_data", "models.yaml")
 

@@ -1,0 +1,84 @@
+# Public Agent default. Add other cloud/local models with agent model add.
+# Research and developer models remain in configs/models.yaml.
+providers:
+  deepseek:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+models:
+  deepseek-flash:
+    capability: chat
+    continuation_summary_role: assistant
+    provider: deepseek
+    tokenizer_model: deepseek-v4-official
+    context_window_tokens: 1048576
+    max_output_tokens: 393216
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+      thinking_toggle: thinking
+    defaults:
+      max_output_tokens: 65536
+      provider_options:
+        thinking:
+          type: enabled
+defaults:
+  primary_model: deepseek-flash
+generation:
+  summary:
+    max_tokens: 1024
+    temperature: 0.3
+  answer:
+    max_tokens: 4096
+    temperature: 0.7
+  planner:
+    max_tokens: 2048
+    temperature: 0.3
+  synthesize:
+    max_tokens: 4096
+    temperature: 0.5
+  factcheck:
+    max_tokens: 2048
+    temperature: 0.1
+  tool_decision:
+    max_tokens: 4096
+    temperature: 0.2
+  final_answer:
+    max_tokens: 4096
+    temperature: 0.5
+auto_compact_token_limit: 65536
+llm_budgets:
+  context_compaction:
+    max_input_tokens: null
+    max_output_tokens: 8192
+    safety_margin_tokens: 512
+  agent_step:
+    max_input_tokens: null
+    max_output_tokens: 32768
+    safety_margin_tokens: 512
+  retrieval_summary:
+    max_input_tokens: 6000
+    max_output_tokens: 1024
+    safety_margin_tokens: 512
+  llm_summarize:
+    max_input_tokens: 16000
+    max_output_tokens: 2048
+    safety_margin_tokens: 512
+  llm_generate:
+    max_input_tokens: 16000
+    max_output_tokens: 3072
+    safety_margin_tokens: 512
+  rag_answer:
+    max_input_tokens: 16000
+    max_output_tokens: 4096
+    safety_margin_tokens: 512
+tokenizer:
+  tokenizer_backend: auto
+  chunk_token_size: 480
+  chunk_overlap_tokens: 64
+  prompt_reserved_tokens: 256
+  local_files_only: true

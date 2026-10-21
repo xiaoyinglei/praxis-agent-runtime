@@ -48,7 +48,7 @@ uv run agent setup
 uv run agent chat
 ```
 
-`setup` 会引导你选择或接入模型，验证连接，并保存当前项目的选择。你可以使用云端 API，也可以连接自己启动的兼容模型服务。验证会产生少量真实模型用量。
+首次 `setup` 默认连接 DeepSeek，只需隐藏输入自己的 API Key，验证后保存当前项目的选择。其他云端模型和自己启动的本地模型通过 `agent model add` 接入，再用 `agent model switch MODEL_ID` 切换，见[接入模型](docs/guide.md#接入模型)。验证会产生少量真实模型用量。
 
 API Key 在终端中隐藏输入。macOS 使用系统 Keychain，Linux 使用个人配置目录中的私有凭据文件；配置文件保存模型定义与凭据变量名。其他用户下载项目后，配置自己的模型和账号即可使用。
 
