@@ -1,0 +1,82 @@
+name: native-release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: darwin-arm64
+          - runner: macos-15-intel
+            platform: darwin-x86_64
+          - runner: ubuntu-24.04
+            platform: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Build standalone distribution
+        run: python scripts/build_native_bundle.py --out-dir native-dist --expected-platform '${{ matrix.platform }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: native-dist/praxis-*
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native-dist
+          merge-multiple: true
+      - name: Publish complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          tag="v$version"
+          for target in darwin-arm64 darwin-x86_64 linux-arm64 linux-x86_64; do
+            test -f "native-dist/praxis-$target.tar.gz"
+            test -f "native-dist/praxis-$target.tar.gz.sha256"
+          done
+          (cd native-dist && cat ./*.sha256 | sha256sum --check)
+          cat > /tmp/praxis-release-notes.md <<'NOTES'
+          Install without Python, uv or virtual-environment setup:
+
+          ```sh
+          curl -fsSL https://raw.githubusercontent.com/xiaoyinglei/praxis-agent-runtime/main/install.sh | sh
+          ```
+
+          Run `agent setup` to enter your own DeepSeek API key, then `agent chat`.
+          Archives include standalone CPython and locked base dependencies; they do not include MLX or model weights.
+          Linux command execution requires the documented Bubblewrap/libseccomp system backend.
+          These are native builds; no test suite was executed for this release.
+          NOTES
+          if gh release view "$tag" >/dev/null 2>&1; then
+            test "$(gh release view "$tag" --json isDraft --jq .isDraft)" = true
+            test "$(gh release view "$tag" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_COMMIT"
+          else
+            gh release create "$tag" --target "$RELEASE_COMMIT" --draft --title "Praxis $version" --notes-file /tmp/praxis-release-notes.md
+          fi
+          gh release upload "$tag" native-dist/* --clobber
+          gh release edit "$tag" --draft=false --latest

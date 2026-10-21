@@ -4,7 +4,21 @@
 
 ## 安装与首次配置
 
-需要 Git、uv、Python 3.12 或 3.13，以及 macOS 或 Linux。PyPI 安装包名为 [`praxis-agent`](https://pypi.org/project/praxis-agent/)，可以安装到独立工具环境：
+普通用户在 macOS 或 glibc Linux（arm64/x86_64）执行：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/xiaoyinglei/praxis-agent-runtime/main/install.sh | sh
+```
+
+安装器下载与本机匹配的独立发行包，核对 SHA-256，再安装自带 Python 和依赖的 Agent。用户不需要安装 uv、pip、Python，也不需要创建或激活虚拟环境。程序与版本位于 `~/.local/share/praxis/versions`，命令位于 `~/.local/bin/agent`；已有其他方式安装的同名命令不会被覆盖。
+
+需要时安装器会向 zsh/bash 的启动配置追加命令路径。子进程无法修改当前终端的 PATH，因此安装结束会显示立即可用的完整命令；重新打开终端后可以直接运行 `agent`。相同安装命令也用于更新：下载或解包失败不会替换旧启动入口，之前的版本保留在 `versions` 中。
+
+安装后进入自己的项目，执行 `agent setup`、`agent chat`。安装器不会读取 Key 或调用模型。Linux 的命令执行另需系统沙箱后端，见 [Ubuntu 部署](../DEPLOY_UBUNTU.md)。
+
+可通过 `PRAXIS_INSTALL_DIR`、`PRAXIS_BIN_DIR` 指定绝对安装路径，通过 `PRAXIS_VERSION=v0.1.1` 安装指定 GitHub 发行版。这些变量需传给管道右侧的 `sh` 进程，例如 `curl ... | PRAXIS_VERSION=v0.1.1 sh`。
+
+已有 Python 环境的用户可以继续使用 PyPI 安装包 [`praxis-agent`](https://pypi.org/project/praxis-agent/)。下面只是 uv 安装示例；uv 不是普通用户的前置要求：
 
 ```bash
 uv tool install --python 3.12 --link-mode copy praxis-agent
