@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "praxis-agent"
-version = "0.1.0"
+version = "0.1.1"
 description = "Praxis — a trusted-local workspace agent runtime for files, code, data, and private knowledge."
 readme = "README.md"
 license = "MIT"
@@ -88,7 +88,7 @@ exclude = ["/.agents", "/.claude", "/.vscode", "/.import_linter_cache"]
 packages = ["agent_runtime", "rag"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"configs/models.yaml" = "agent_runtime/_data/models.yaml"
+"configs/agent-models.yaml" = "agent_runtime/_data/models.yaml"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

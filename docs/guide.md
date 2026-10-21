@@ -27,7 +27,9 @@ uv run agent chat
 
 使用复制方式安装依赖，避免工作区中的依赖文件与外部 uv 缓存形成硬链接，触发沙箱包含性检查。Linux 还需要 Bubblewrap 和 libseccomp，见 [Ubuntu 部署](../DEPLOY_UBUNTU.md)。
 
-向导可以选择已登记的模型，也可以输入 `new` 接入新服务。需要准备服务商实际的模型 ID、API 地址、上下文容量和 API Key；模型服务必须已经启动。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
+公开版只内置一个 DeepSeek 默认模型（`deepseek-flash`），首次向导直接进入 API Key 输入，不要求选择开发者的模型列表。需要有自己的 DeepSeek API 账号和 Key；安装包不包含开发者的凭据、个人模型注册表或 MLX 模型权重。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
+
+使用其他服务商时，先按下文的 `agent model add` 命令接入，再运行 `agent setup --model MODEL_ID` 隐藏输入对应 Key。需要准备服务商实际的模型 ID、API 地址和上下文容量；本地模型服务必须已经启动。
 
 ```bash
 uv run agent setup --model MODEL_ID --no-mcp
@@ -55,7 +57,7 @@ uv run --project /path/to/praxis-agent-runtime agent chat
 
 模型服务需要提供 OpenAI-compatible 接口，并满足配置中声明的能力：真实流式文本增量与权威完成状态、合法工具调用，以及启用时的结构化输出。模型 ID 必须与服务实际提供的 ID 一致。
 
-内置模型定义只读。用户模型通过 CLI 登记到个人注册表，不需要修改 `configs/models.yaml`：
+公开版默认定义位于 `configs/agent-models.yaml`，只包含 DeepSeek。`configs/models.yaml` 保留研究与开发使用的多模型配置，不作为 Agent 的默认模型目录。内置模型定义只读；用户模型通过 CLI 登记到个人注册表，不需要修改源码配置：
 
 ```bash
 uv run agent model list --source
@@ -96,7 +98,13 @@ uv run --extra local-mlx python -m mlx_lm.server \
   --model mlx-community/Qwen3.5-9B-4bit \
   --host 127.0.0.1 --port 8080
 
-# 终端 2
+# 终端 2：主动接入本地服务，再选择它
+uv run agent model add mlx-community/Qwen3.5-9B-4bit \
+  --provider mlx \
+  --base-url http://127.0.0.1:8080/v1 \
+  --context-window-tokens 262144 \
+  --timeout-seconds 300
+uv run agent model switch mlx-community/Qwen3.5-9B-4bit
 uv run agent chat --model mlx-community/Qwen3.5-9B-4bit
 ```
 
