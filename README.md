@@ -26,15 +26,21 @@ Praxis 把这些事情放进执行流程。模型根据观察规划下一步；�
 
 ## 快速开始
 
-普通用户不需要预先安装 Python、uv，也不需要管理虚拟环境。macOS 或 glibc Linux（arm64/x86_64）可安装自带运行环境的独立发行包：
+### 一条命令安装
+
+不需要预先安装 Python、uv 或 pip，也不需要创建、激活虚拟环境。支持 macOS 和 glibc Linux，自动选择 arm64 或 x86_64 发行包：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/xiaoyinglei/praxis-agent-runtime/main/install.sh | sh
 ```
 
-安装器校验 SHA-256 后，将程序放在 `~/.local/share/praxis`、启动命令放在 `~/.local/bin/agent`。需要时会配置当前 shell 的命令路径；重新打开终端即可生效，安装结束也会显示可立即使用的完整路径。重新运行同一条命令即可更新，原有项目与模型配置保留。Linux 命令执行仍需要对应的系统沙箱后端，见 [Ubuntu 部署](DEPLOY_UBUNTU.md)。
+安装器下载自带 Python 和依赖的[独立发行包](https://github.com/xiaoyinglei/praxis-agent-runtime/releases/latest)，校验 SHA-256 后完成安装。程序位于 `~/.local/share/praxis`，启动命令位于 `~/.local/bin/agent`。需要时会配置 shell 的命令路径；重新打开终端后可直接使用 `agent`，安装结束也会显示当前终端可立即使用的完整命令。
 
-然后进入你要处理的项目：
+Linux 命令执行需要 Bubblewrap 和 libseccomp 系统后端，见 [Ubuntu 部署](DEPLOY_UBUNTU.md)。
+
+### 首次配置与聊天
+
+进入你要处理的项目，接入模型并开始聊天：
 
 ```sh
 cd /path/to/my-project
@@ -42,16 +48,33 @@ agent setup
 agent chat
 ```
 
-已有 Python 包管理习惯的用户也可以从 PyPI 安装。以下 uv 示例需要 Python **3.12 或 3.13**（uv 可自动准备）：
+首次 `setup` 默认接入 **DeepSeek**，按提示隐藏输入你自己的 API Key。连接检查会产生少量真实模型用量，可跳过 GitHub 等可选服务。其他云端模型和本地模型通过 `agent model add` 接入，再用 `agent model switch MODEL_ID` 切换，见[接入模型](docs/guide.md#接入模型)。MLX 和本地模型权重不会随普通安装下载。
 
-```bash
-uv tool install --python 3.12 --link-mode copy praxis-agent
-cd /path/to/my-project
-agent setup
-agent chat
+macOS 将 Key 保存到系统 Keychain，Linux 使用个人配置目录中的私有凭据文件。个人模型配置默认位于 `~/.config/praxis`，聊天记录保存在各项目的 `.praxis/` 中。
+
+### 更新与卸载
+
+更新时重新执行上面的安装命令即可。安装器保留旧版本，下载或解包失败时不会替换现有启动入口；通过其他方式安装的同名 `agent` 命令也不会被覆盖。
+
+使用默认路径独立安装后，可以这样卸载程序：
+
+```sh
+rm -f "$HOME/.local/bin/agent"
+rm -rf "$HOME/.local/share/praxis"
 ```
 
-参与开发时，需要 Git 和 uv，也可以通过源码安装：
+个人配置、已保存凭据和项目聊天记录保留。如使用了自定义安装路径，请删除对应的程序目录和启动入口。完整安装说明见[使用指南](docs/guide.md#安装与首次配置)。
+
+<details>
+<summary>已有 Python 环境或参与源码开发</summary>
+
+[`praxis-agent`](https://pypi.org/project/praxis-agent/) 同时提供 CLI 和 Python SDK。已有 Python **3.12 或 3.13** 环境时，可使用自己的环境管理方式安装，例如：
+
+```bash
+python -m pip install praxis-agent
+```
+
+参与本仓库开发时，使用 Git 和 uv：
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
@@ -62,11 +85,7 @@ uv run agent setup
 uv run agent chat
 ```
 
-首次 `setup` 默认连接 DeepSeek，只需隐藏输入自己的 API Key，验证后保存当前项目的选择。其他云端模型和自己启动的本地模型通过 `agent model add` 接入，再用 `agent model switch MODEL_ID` 切换，见[接入模型](docs/guide.md#接入模型)。验证会产生少量真实模型用量。
-
-API Key 在终端中隐藏输入。macOS 使用系统 Keychain，Linux 使用个人配置目录中的私有凭据文件；配置文件保存模型定义与凭据变量名。其他用户下载项目后，配置自己的模型和账号即可使用。
-
-PyPI 安装包名为 [`praxis-agent`](https://pypi.org/project/praxis-agent/)。安装过程、模型要求和本地 MLX 的启动方式见[使用指南](docs/guide.md#安装与首次配置)。
+</details>
 
 ## 用它完成什么
 
@@ -78,27 +97,28 @@ PyPI 安装包名为 [`praxis-agent`](https://pypi.org/project/praxis-agent/)。
 | 外部服务 | “查看这个仓库的 Issue，或查找 Notion 中的文档。” | GitHub、Notion、Linear 与自定义远程 MCP |
 | 长期项目 | “继续上次的工作，沿用我确认过的项目约定。” | 聊天恢复、可选工作区记忆、可选私有知识库 RAG |
 
-工作区以启动命令时所在的目录为准。处理其他项目时，先进入项目目录，再指定 Praxis 的源码位置：
+工作区以启动命令时所在的目录为准。处理其他项目时，进入对应目录后直接启动：
 
 ```bash
 cd /path/to/my-project
-uv run --project /path/to/praxis-agent-runtime agent setup
-uv run --project /path/to/praxis-agent-runtime agent chat
+agent chat
 ```
 
-在聊天中直接描述目标即可。工具记录可以展开查看，写入和执行授权会单独呈现。需要一次性执行任务时：
+在聊天中直接描述目标即可。工具记录可以展开查看，写入和执行授权会单独呈现。
 
 本地附件默认读取原文件，不复制到工作区。把文件拖入终端并按 Enter，输入区中的独立路径行会被识别为待发送附件；再输入分析任务即可。支持带空格的引号/转义路径、多个文件和本机 `file://` 地址；混合说明文字时把路径放在单独一行，或先使用 `/attach "/绝对路径/客户 资料.xlsx"`。`/attach` 查看待发送附件，`/detach` 清除待发送附件。不要把文件复制到项目里才能使用；SDK 的 `files=[...]` 和一次性命令 `--file` 也使用原地引用。
 
 所选外部文件只授予读取权限，父目录和其他文件不会被开放；显式拒绝与管理员权限上限仍然生效。附件引用会随聊天保存，原文件之后修改、移动或删除会影响后续读取；旧版本已经保存的附件副本保持兼容，不会自动删除历史数据。
 
+也可以通过 `agent run` 执行一次性任务。下面的验收命令以本仓库为例，可替换为目标项目自己的检查命令：
+
 ```bash
 # 只做分析，不要求修改工作区
-uv run agent run "阅读 pyproject.toml，解释项目入口和模块职责。" \
+agent run "阅读 pyproject.toml，解释项目入口和模块职责。" \
   --no-require-workspace-change
 
 # 修改类任务：要求实际变更，并运行用户指定的验收
-uv run agent run "修复配置加载中的异常处理，更新相关测试并验证。" \
+agent run "修复配置加载中的异常处理，更新相关测试并验证。" \
   --require-workspace-change --acceptance-command "uv run pytest -q"
 ```
 
@@ -130,7 +150,7 @@ Praxis 以 Thread 保存聊天，以 Turn 表示一次请求，以 Step 推进�
 新聊天默认“帮我批准”，自动处理普通工作区编辑、只读沙箱命令和公开网页读取。输入 `/permissions` 可在面板里选择审批模式；需要确认时直接选择“允许一次 / 本会话允许同类命令 / 拒绝”，支持方向键和鼠标。临时授权可以查看、撤销，重新打开聊天后失效。详见[审批方式](docs/guide.md#审批方式)。
 
 - **命令与 Python：**macOS 使用 Seatbelt，Linux 使用 Bubblewrap。默认只读、禁网络；额外的联网或工作区写入需要授权。Linux 写入先进入私有候选工作区，成功并通过检查后才发布变更。
-- **外部服务：**通过 `uv run agent connections` 管理账号。个人远程 MCP 在需要调用时连接；缺少认证或工具目录时才显示连接提示，点击后由你选择登录，不会在普通聊天中自动弹授权页。
+- **外部服务：**通过 `agent connections` 管理账号。个人远程 MCP 在需要调用时连接；缺少认证或工具目录时才显示连接提示，点击后由你选择登录，不会在普通聊天中自动弹授权页。
 - **聊天与记忆：**`agent resume` 打开历史聊天；可选记忆按工作区隔离、默认关闭，来源与修改可检查。记忆生成与 RAG 是独立能力。
 - **结果与验证：**运行结束不等于答案已经证实。`AgentResult.validation_status` 区分未评估、通过和失败，`validation_scope` 说明实际检查范围；只读分析可以直接回答，不制造修改证据。
 
