@@ -343,6 +343,30 @@ def test_core_reinstall_repairs_cached_wheel_hardlinks(tmp_path, monkeypatch):
     assert all("--link-mode" in args and args[args.index("--link-mode") + 1] == "copy" for args in installation_calls)
     assert all("--reinstall" in args for args in installation_calls)
 
+    # Ordinary installs must retain independent files without a CLI override,
+    # even when the user's uv configuration requests hardlinks.
+    import json
+    import tomllib
+
+    settings = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["uv"]
+    project_config = "[tool.uv]\n"
+    if "link-mode" in settings:
+        project_config += "link-mode = " + json.dumps(settings["link-mode"]) + "\n"
+    (repo / "pyproject.toml").write_text(project_config)
+    user_config = tmp_path / "user-config" / "uv"
+    user_config.mkdir(parents=True)
+    (user_config / "uv.toml").write_text('link-mode = "hardlink"\n')
+    real_run(
+        ["uv", "--cache-dir", str(cache / "uv"), "pip", "install", "--python", str(python),
+         "--reinstall", str(wheel)],
+        cwd=repo,
+        env={**os.environ, "XDG_CONFIG_HOME": str(user_config.parent)},
+        check=True,
+    )
+    assert installed.stat().st_nlink == 1
+    assert header.stat().st_nlink == 1
+    assert _workspace_sandbox_preflight_issue(repo, allow_workspace_write=False) is None
+
 
 def test_dependency_file_check_includes_headers_outside_site_packages(tmp_path):
     installer = load_script("install-agent-deps.py")

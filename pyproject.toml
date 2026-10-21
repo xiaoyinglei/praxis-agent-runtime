@@ -130,3 +130,4 @@ ignore_missing_imports = true
 
 [tool.uv]
 default-groups = ["dev"]
+link-mode = "copy"
