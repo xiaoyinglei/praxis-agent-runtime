@@ -26,9 +26,23 @@ Praxis 把这些事情放进执行流程。模型根据观察规划下一步；�
 
 ## 快速开始
 
-需要 Python **3.12 或 3.13**、Git 和 [uv](https://docs.astral.sh/uv/)。当前支持 macOS 和 Linux；命令执行还需要对应平台的沙箱后端。
+普通用户不需要预先安装 Python、uv，也不需要管理虚拟环境。macOS 或 glibc Linux（arm64/x86_64）可安装自带运行环境的独立发行包：
 
-从 PyPI 安装后，在你要处理的项目目录启动：
+```sh
+curl -fsSL https://raw.githubusercontent.com/xiaoyinglei/praxis-agent-runtime/main/install.sh | sh
+```
+
+安装器校验 SHA-256 后，将程序放在 `~/.local/share/praxis`、启动命令放在 `~/.local/bin/agent`。需要时会配置当前 shell 的命令路径；重新打开终端即可生效，安装结束也会显示可立即使用的完整路径。重新运行同一条命令即可更新，原有项目与模型配置保留。Linux 命令执行仍需要对应的系统沙箱后端，见 [Ubuntu 部署](DEPLOY_UBUNTU.md)。
+
+然后进入你要处理的项目：
+
+```sh
+cd /path/to/my-project
+agent setup
+agent chat
+```
+
+已有 Python 包管理习惯的用户也可以从 PyPI 安装。以下 uv 示例需要 Python **3.12 或 3.13**（uv 可自动准备）：
 
 ```bash
 uv tool install --python 3.12 --link-mode copy praxis-agent
@@ -37,7 +51,7 @@ agent setup
 agent chat
 ```
 
-参与开发时也可以通过源码安装：
+参与开发时，需要 Git 和 uv，也可以通过源码安装：
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git
