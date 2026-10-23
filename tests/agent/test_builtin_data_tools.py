@@ -119,11 +119,9 @@ async def test_inspect_data_file_reads_spreadsheet_pdf_csv_and_json(
     assert isinstance(spreadsheet_output, Mapping)
     assert spreadsheet_output["valid"] is True
     assert spreadsheet_output["sheet_names"] == ("Sales",)
-    assert spreadsheet_output["tables"][0]["headers"] == (
-        "region",
-        "revenue",
-    )
+    assert "headers" not in spreadsheet_output["tables"][0]
     assert spreadsheet_output["tables"][0]["rows"] == (
+        ("region", "revenue"),
         ("East", "120"),
         ("West", "180"),
     )
@@ -136,11 +134,9 @@ async def test_inspect_data_file_reads_spreadsheet_pdf_csv_and_json(
 
     csv_output = csv_result.result.structured_content
     assert isinstance(csv_output, Mapping)
-    assert csv_output["tables"][0]["row_count"] == 3
-    assert csv_output["tables"][0]["headers"] == (
-        "variant",
-        "converted",
-    )
+    assert csv_output["tables"][0]["row_count"] == 4
+    assert csv_output["tables"][0]["rows"][0] == ("variant", "converted")
+    assert "headers" not in csv_output["tables"][0]
 
     json_output = json_result.result.structured_content
     assert isinstance(json_output, Mapping)
@@ -263,7 +259,7 @@ async def test_execute_python_uses_managed_runtime_and_attests_new_output(
     assert isinstance(inspected_output, Mapping)
     assert inspected_output["valid"] is True
     assert inspected_output["sha256"] == after_sha256
-    assert inspected_output["tables"][0]["rows"] == (("mean", "42.5"),)
+    assert inspected_output["tables"][0]["rows"] == (("metric", "value"), ("mean", "42.5"))
 
 
 @pytest.mark.anyio
