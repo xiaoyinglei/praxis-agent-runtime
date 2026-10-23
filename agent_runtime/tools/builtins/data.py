@@ -5,7 +5,8 @@ import csv
 import hashlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, time
 from pathlib import Path
 from typing import Literal
@@ -29,6 +30,24 @@ from agent_runtime.workspace import WorkspaceRuntime
 
 _MAX_INSPECTABLE_BYTES = 200 * 1024 * 1024
 _MAX_CELL_CHARACTERS = 2_000
+_MAX_GRID_CELLS = 2_000
+_MAX_GRID_CHARACTERS = 32_000
+
+
+@dataclass
+class _GridBudget:
+    cells: int = _MAX_GRID_CELLS
+    characters: int = _MAX_GRID_CHARACTERS
+
+    def text(self, value: object) -> tuple[str, bool]:
+        rendered = _cell_text(value)
+        limit = min(_MAX_CELL_CHARACTERS, self.characters)
+        if limit == 0:
+            return "", bool(rendered)
+        shortened = len(rendered) > limit
+        result = rendered[: max(0, limit - 1)] + "…" if shortened else rendered
+        self.characters = max(0, self.characters - len(result))
+        return result, shortened
 
 
 class InspectDataFileInput(BaseModel):
@@ -46,8 +65,14 @@ class InspectDataFileInput(BaseModel):
         default=10,
         ge=1,
         le=100,
-        description="Maximum data rows returned for each table or worksheet.",
+        description="Maximum raw rows per grid, including titles, headers and blank rows.",
     )
+    start_row: int = Field(default=1, ge=1, description="One-based worksheet row or logical CSV/TSV record.")
+    start_column: int = Field(default=1, ge=1, le=16_384, description="One-based source column.")
+    max_columns: int = Field(default=20, ge=1, le=100, description="Maximum source columns per grid.")
+    sheet_name: str | None = Field(default=None, min_length=1, max_length=31,
+                                  description="Read only this Excel worksheet; otherwise page through worksheets.")
+    sheet_offset: int = Field(default=0, ge=0, description="Zero-based worksheet offset when sheet_name is omitted.")
     max_sheets: int = Field(
         default=20,
         ge=1,
@@ -65,7 +90,7 @@ class InspectDataFileInput(BaseModel):
         ge=100,
         le=100_000,
         description=(
-            "Maximum characters returned per PDF page or JSON preview."
+            "Maximum characters per PDF page/JSON preview, or combined grid text (hard cap 32000)."
         ),
     )
 
@@ -74,10 +99,16 @@ class TablePreview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    headers: list[str]
     rows: list[list[str]]
-    row_count: int = Field(ge=0)
-    column_count: int = Field(ge=0)
+    row_numbers: list[int]
+    column_numbers: list[int]
+    cell_types: list[list[str]]
+    number_formats: list[list[str]]
+    row_count: int | None = Field(ge=0, description="Total source rows, or null when the scan has not reached EOF.")
+    column_count: int | None = Field(ge=0, description="Total source columns, or null before EOF.")
+    next_row: int | None
+    next_column: int | None
+    truncated_cells: list[tuple[int, int]]
     truncated: bool
 
 
@@ -100,6 +131,7 @@ class InspectDataFileOutput(BaseModel):
     summary: str
     tables: list[TablePreview]
     sheet_names: list[str]
+    next_sheet_offset: int | None = None
     page_count: int | None
     pages: list[PagePreview]
     json_type: str | None
@@ -130,13 +162,21 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
             description=(
                 "Inspect a workspace spreadsheet, PDF, CSV, TSV, or JSON file "
                 "without returning raw binary bytes. The result includes a "
-                "runtime-computed SHA-256 plus bounded worksheet rows, extracted "
-                "PDF text, delimited-table rows, or a JSON preview. Use this before "
-                "analysis and once after execute_python creates a data artifact. A "
-                "successful inspection of the exact generated path verifies that "
-                "artifact's file structure and content; then return a non-empty "
-                "final answer with zero tool calls instead of reading the original "
-                "binary again or repeating the inspection."
+                "runtime-computed SHA-256 plus raw worksheet/CSV/TSV grids, extracted PDF text, or a JSON preview. "
+                "Grid rows preserve titles, units, repeated/multiple header rows and blanks; no row is assumed "
+                "to be a header and merged-cell blanks are not filled. row_numbers and column_numbers give "
+                "one-based source coordinates (CSV rows are logical records, including quoted newlines). "
+                "Use start_row/start_column with max_rows/max_columns to page, sheet_name to select a sheet, "
+                "or sheet_offset with max_sheets for sheet pages. next_row/next_column refer to additional "
+                "rows/columns in this grid page; next_sheet_offset continues sheet pages. null counts mean "
+                "the scan has not reached EOF. Counts include every raw row, including any headers. "
+                "Cell text is stored content, not Excel display formatting. Excel cell_types retain formula/error "
+                "types; number_formats preserves Excel format codes (empty means General/not applicable). Formula "
+                "expressions are never evaluated or replaced by cached blanks. One call returns at most 2000 grid "
+                "cells; max_characters bounds combined cell text and formats, with a hard cap of 32000 characters. "
+                "truncated_cells lists source row/column pairs with shortened text/format; retrieve full values "
+                "with execute_python and openpyxl if needed. Empty/out-of-range grids provide no content evidence. "
+                "A successful inspection establishes parseability and the displayed content, not analysis correctness."
             ),
             input_schema=_INSPECT_INPUT_SCHEMA,
         ),
@@ -146,7 +186,7 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
         output_schema=_INSPECT_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda arguments: _resolve_inspect_use(workspace, arguments),
-        execution_revision="builtin-inspect-data-file-v1",
+        execution_revision="builtin-inspect-data-file-v2-raw-grids",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -242,6 +282,67 @@ def _inspect_data_file(
         )
 
 
+def _preview_grid(
+    name: str,
+    records: Iterable[Sequence[object]],
+    request: InspectDataFileInput,
+    *,
+    excel: bool,
+    budget: _GridBudget,
+) -> TablePreview:
+    """Bound a source grid without interpreting its rows or trusting XLSX dimensions."""
+    rows: list[list[str]] = []
+    types: list[list[str]] = []
+    formats: list[list[str]] = []
+    numbers: list[int] = []
+    shortened: list[tuple[int, int]] = []
+    total_rows = total_columns = page_columns = 0
+    more_rows = False
+    max_columns = min(request.max_columns, budget.cells)
+    max_rows = min(request.max_rows, budget.cells // max_columns)
+    for row_number, record in enumerate(records, start=1):
+        if row_number >= request.start_row and len(rows) == max_rows:
+            more_rows = True
+            break
+        total_rows = row_number
+        total_columns = max(total_columns, len(record))
+        if row_number < request.start_row:
+            continue
+        page_columns = max(page_columns, len(record))
+        values, cell_types, number_formats = [], [], []
+        begin = request.start_column - 1
+        for column, cell in enumerate(record[begin : begin + max_columns], request.start_column):
+            value = getattr(cell, "value", None) if excel else cell
+            rendered, text_shortened = budget.text(value)
+            number_format = str(getattr(cell, "number_format", "General"))
+            rendered_format, format_shortened = budget.text("" if number_format == "General" else number_format)
+            if text_shortened or format_shortened:
+                shortened.append((row_number, column))
+            values.append(rendered)
+            cell_types.append("empty" if value is None else str(getattr(cell, "data_type", "s")))
+            number_formats.append(rendered_format)
+        rows.append(values)
+        types.append(cell_types)
+        formats.append(number_formats)
+        numbers.append(row_number)
+    width = min(max_columns, max(0, page_columns - request.start_column + 1))
+    budget.cells -= len(rows) * width
+    for values, cell_types, number_formats in zip(rows, types, formats, strict=True):
+        values.extend([""] * (width - len(values)))
+        cell_types.extend(["empty"] * (width - len(cell_types)))
+        number_formats.extend([""] * (width - len(number_formats)))
+    next_column = request.start_column + width if page_columns >= request.start_column + width else None
+    return TablePreview(
+        name=name, rows=rows, row_numbers=numbers,
+        column_numbers=list(range(request.start_column, request.start_column + width)),
+        cell_types=types, number_formats=formats, row_count=None if more_rows else total_rows,
+        column_count=None if more_rows else total_columns,
+        next_row=request.start_row + len(rows) if more_rows else None,
+        next_column=next_column, truncated_cells=shortened,
+        truncated=more_rows or next_column is not None or bool(shortened),
+    )
+
+
 def _inspect_workbook(
     target: Path,
     *,
@@ -251,69 +352,38 @@ def _inspect_workbook(
 ) -> InspectDataFileOutput:
     from openpyxl import load_workbook
 
-    workbook = load_workbook(
-        target,
-        read_only=True,
-        data_only=True,
-        keep_links=False,
-    )
+    # Public openpyxl streaming API: retain formulas and ignore potentially wrong
+    # producer-supplied dimensions, as recommended by its optimised-mode docs.
+    workbook = load_workbook(target, read_only=True, data_only=False, keep_links=False)
     try:
         sheet_names = list(workbook.sheetnames)
-        previews: list[TablePreview] = []
-        for worksheet in workbook.worksheets[: request.max_sheets]:
-            row_iterator = worksheet.iter_rows(values_only=True)
-            first_row = next(row_iterator, ())
-            column_count = max(worksheet.max_column or 0, len(first_row))
-            headers = [
-                _cell_text(value) or f"column_{index}"
-                for index, value in enumerate(first_row, start=1)
-            ]
-            if len(headers) < column_count:
-                headers.extend(
-                    f"column_{index}"
-                    for index in range(len(headers) + 1, column_count + 1)
-                )
-            rows: list[list[str]] = []
-            for values in row_iterator:
-                if len(rows) >= request.max_rows:
-                    break
-                normalized = [_cell_text(value) for value in values]
-                if len(normalized) < column_count:
-                    normalized.extend("" for _ in range(column_count - len(normalized)))
-                rows.append(normalized[:column_count])
-            row_count = max((worksheet.max_row or 0) - (1 if first_row else 0), 0)
-            previews.append(
-                TablePreview(
-                    name=worksheet.title,
-                    headers=headers[:column_count],
-                    rows=rows,
-                    row_count=row_count,
-                    column_count=column_count,
-                    truncated=row_count > len(rows),
-                )
-            )
-        truncated = len(sheet_names) > len(previews) or any(
-            preview.truncated for preview in previews
-        )
+        if request.sheet_name is not None:
+            if request.sheet_offset:
+                raise ValueError("sheet_name and sheet_offset cannot be combined")
+            selected = [workbook[request.sheet_name]]
+            next_sheet = None
+        else:
+            end = request.sheet_offset + request.max_sheets
+            selected = workbook.worksheets[request.sheet_offset:end]
+            next_sheet = end if end < len(sheet_names) else None
+        previews = []
+        budget = _GridBudget(characters=min(request.max_characters, _MAX_GRID_CHARACTERS))
+        for index, worksheet in enumerate(selected):
+            if budget.cells == 0:
+                next_sheet = request.sheet_offset + index
+                break
+            worksheet.reset_dimensions()
+            records = worksheet.iter_rows()
+            try:
+                previews.append(_preview_grid(worksheet.title, records, request, excel=True, budget=budget))
+            finally:
+                records.close()
         return InspectDataFileOutput(
-            path=request.path,
-            format=file_format,
-            size_bytes=size_bytes,
-            sha256=_file_sha256(target),
-            valid=True,
-            summary=(
-                f"Valid {file_format.upper()} workbook with "
-                f"{len(sheet_names)} worksheet(s)."
-            ),
-            tables=previews,
-            sheet_names=sheet_names,
-            page_count=None,
-            pages=[],
-            json_type=None,
-            json_keys=[],
-            json_preview=None,
-            truncated=truncated,
-            error=None,
+            path=request.path, format=file_format, size_bytes=size_bytes, sha256=_file_sha256(target),
+            valid=True, summary="Raw worksheet cells; header roles are not inferred; formulas are not evaluated.",
+            tables=previews, sheet_names=sheet_names, next_sheet_offset=next_sheet,
+            page_count=None, pages=[], json_type=None, json_keys=[], json_preview=None,
+            truncated=next_sheet is not None or any(p.truncated for p in previews), error=None,
         )
     finally:
         workbook.close()
@@ -327,7 +397,7 @@ def _inspect_delimited(
     size_bytes: int,
 ) -> InspectDataFileOutput:
     delimiter = "\t" if file_format == "tsv" else ","
-    with target.open("r", encoding="utf-8-sig", errors="replace", newline="") as stream:
+    with target.open("r", encoding="utf-8-sig", newline="") as stream:
         sample = stream.read(16_384)
         stream.seek(0)
         if file_format == "csv" and sample:
@@ -335,55 +405,15 @@ def _inspect_delimited(
                 delimiter = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
             except csv.Error:
                 pass
-        reader = csv.reader(stream, delimiter=delimiter)
-        header_row = next(reader, [])
-        headers = [
-            _cell_text(value) or f"column_{index}"
-            for index, value in enumerate(header_row, start=1)
-        ]
-        rows: list[list[str]] = []
-        row_count = 0
-        column_count = len(headers)
-        for values in reader:
-            row_count += 1
-            column_count = max(column_count, len(values))
-            if len(rows) < request.max_rows:
-                rows.append([_cell_text(value) for value in values])
-
-    if len(headers) < column_count:
-        headers.extend(
-            f"column_{index}"
-            for index in range(len(headers) + 1, column_count + 1)
+        table = _preview_grid(
+            target.name, csv.reader(stream, delimiter=delimiter, strict=True), request, excel=False,
+            budget=_GridBudget(characters=min(request.max_characters, _MAX_GRID_CHARACTERS)),
         )
-    for row in rows:
-        row.extend("" for _ in range(column_count - len(row)))
-    table = TablePreview(
-        name=target.name,
-        headers=headers,
-        rows=rows,
-        row_count=row_count,
-        column_count=column_count,
-        truncated=row_count > len(rows),
-    )
     return InspectDataFileOutput(
-        path=request.path,
-        format=file_format,
-        size_bytes=size_bytes,
-        sha256=_file_sha256(target),
-        valid=True,
-        summary=(
-            f"Valid {file_format.upper()} table with {row_count} data row(s) "
-            f"and {column_count} column(s)."
-        ),
-        tables=[table],
-        sheet_names=[],
-        page_count=None,
-        pages=[],
-        json_type=None,
-        json_keys=[],
-        json_preview=None,
-        truncated=table.truncated,
-        error=None,
+        path=request.path, format=file_format, size_bytes=size_bytes, sha256=_file_sha256(target),
+        valid=True, summary="Raw delimited records; header roles are not inferred; row numbers count logical records.",
+        tables=[table], sheet_names=[], page_count=None, pages=[], json_type=None, json_keys=[], json_preview=None,
+        truncated=table.truncated, error=None,
     )
 
 
@@ -550,9 +580,15 @@ def _format_from_path(
 
 
 def _cell_text(value: object) -> str:
+    from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+
     if value is None:
         return ""
-    if isinstance(value, (datetime, date, time)):
+    if isinstance(value, ArrayFormula):
+        rendered = value.text or json.dumps({"formula_type": "array", **dict(value)}, sort_keys=True)
+    elif isinstance(value, DataTableFormula):
+        rendered = json.dumps({"formula_type": "data_table", **dict(value)}, sort_keys=True)
+    elif isinstance(value, (datetime, date, time)):
         rendered = value.isoformat()
     elif isinstance(value, float) and not math.isfinite(value):
         rendered = str(value)
@@ -560,9 +596,7 @@ def _cell_text(value: object) -> str:
         rendered = f"<binary value: {len(value)} bytes>"
     else:
         rendered = str(value)
-    if len(rendered) <= _MAX_CELL_CHARACTERS:
-        return rendered
-    return rendered[: _MAX_CELL_CHARACTERS - 1] + "…"
+    return rendered
 
 
 def _file_sha256(path: Path) -> str:

@@ -313,6 +313,28 @@ Linux 候选视图支持工作区内相对符号链接，保留普通文件 mtim
 方便后续命令增量续建；工具仍报告失败，`workspace_published` 说明是否发布。默认关闭，取消及沙箱启动失败不发布。
 它不增加写权限或取消 destructive 审批；不恢复已终止的进程。详见[输出与构建恢复](runtime-recovery.md#linux-输出与构建恢复)。
 
+`inspect_data_file` 用 `openpyxl` 的只读流式接口读取 XLSX/XLSM，用标准库 `csv` 读取 CSV/TSV。
+表格预览是原始网格，不推测表头；标题、单位、多层字段行和空行都留在 `tables[].rows` 中。
+`row_numbers`、`column_numbers` 给出每个返回值的一起始源坐标；CSV 行号指逻辑记录，带引号字段里的换行不另计一行。
+先查看原始网格，再显式选择用于分析的字段行和数据区域；转成 pandas DataFrame 时可先用 `header=None`，
+确认结构后再指定 `header`，不要把位置假设当成源文件事实。
+
+通过 `sheet_name` 选择工作表，或用 `sheet_offset`、`max_sheets` 分页；
+通过 `start_row`、`start_column`、`max_rows`、`max_columns` 读取源区域，起始行列默认均为 1。
+默认每张表预览 10 行、20 列，包含标题或字段行；`next_row`、`next_column` 继续当前网格，
+`next_sheet_offset` 继续工作表列表。尚未扫描到文件末尾时，`row_count`、`column_count` 为 `null`，
+不会把工作簿声明的尺寸当成核实过的总量。空预览或越界读取不能证明内容已检查。
+
+单次调用最多返回 2000 个网格单元格，`max_characters` 限制合计值与格式文本（默认 8000，硬上限 32000 字符），
+每个文本另限 2000 字符；`truncated_cells` 指明文本或格式被缩短的源坐标。
+`cell_types` 保留文本、数字、日期、公式和错误的类型，`number_formats` 保留 Excel 格式码（空字符串表示 General 或不适用）。
+数值是存储内容，不模拟 Excel 格式化显示；公式保留表达式或数据表公式属性，不执行计算，也不把缺失缓存当空白值。
+需要完整长文本、合并区域等更多工作簿元数据，或需要按已确认表头转换数据时，使用 `execute_python` 中的 `openpyxl` / `pandas`。
+解析成功和文件有效不等于业务分析正确。
+
+这次原始网格契约升级为 `builtin-inspect-data-file-v2-raw-grids`，移除了推测性的 `headers` 字段，
+`row_count` 现在包含全部原始行。旧工具版本的待恢复调用会按执行版本检查拒绝，需重新提交检查；已保存的历史结果不重写。
+
 macOS / Linux 活跃 Session 的 `run_command` 可用 `yield_time_seconds` 先返回任务 ID，随后用
 `manage_command` 查询、等待或取消同一个进程。等待期限与执行期限独立；显式
 `timeout_seconds=null` 才取消执行期限，省略时仍为 120 秒。取消、abort、Turn 失败或
