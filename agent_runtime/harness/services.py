@@ -149,10 +149,13 @@ class SessionBindingProvider:
         }
         binding["model_response_recovery"] = {"revision": "restart-step-v1", "max_retries": 1}
         binding["tool_failure_recovery"] = {"revision": "one-replan-v1"}
+        binding["completion_continuation_policy"] = {"revision": "bounded-v1", "max_continuations": 8}
         binding["step_budget_policy"] = {"revision": "pressure-v1"}
         binding["execution_context_policy"] = {
             "revision": "working-context-v2",
             "cache_continuity": "append-v1",
+            "context_updates": "append-v1",
+            "tool_result_order": "call-v1",
         }
         binding["model_step_budget"] = self._model_step_budget
         binding["model_token_budget_total"] = self._model_token_budget_total
@@ -398,7 +401,20 @@ def configure_services(
         try:
             return store.read_turn(turn_id).binding_manifest.get("project_instructions")
         except KeyError:
-            return instruction_snapshot(session.tool_execution_context)
+            from agent_runtime.project_instructions import extend_instructions, restored_instructions
+
+            snapshot = instruction_snapshot(session.tool_execution_context)
+            thread = store.read_thread(session.thread_id)
+            previous = thread.head_turn_id or thread.fork_turn_id
+            if previous is not None:
+                prior = restored_instructions(store.read_turn(previous).binding_manifest, store.list_items(previous))
+                if prior is not None and prior["root"] == snapshot["root"]:
+                    # Refresh known scopes once for a new Turn. Do not silently
+                    # drop nested guidance when only the root was bootstrapped.
+                    snapshot = extend_instructions(snapshot, session.tool_execution_context,
+                                                   (Path(snapshot["root"]) / scope / "AGENTS.md"
+                                                    for scope in prior["directories"]))
+            return snapshot
 
     session.binding_provider = SessionBindingProvider(
         model=model,

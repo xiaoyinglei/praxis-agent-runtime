@@ -92,8 +92,11 @@ async def test_public_agent_freezes_rules_each_turn_and_reinjects_context(tmp_pa
         assert "RULE_V1" in step.messages[0].content
         assert "RULE_V2" not in step.messages[0].content
         assert (await session.submit("next task")).status == "done"
-    assert "RULE_V1" in model.requests[0].messages[0].content
-    assert "RULE_V2" in model.requests[-1].messages[0].content
+    initial = next(m.content for m in model.requests[0].messages if m.content.startswith("Project instructions ("))
+    latest = next(m.content for m in reversed(model.requests[-1].messages)
+                  if m.content.startswith("Project instructions ("))
+    assert "RULE_V1" in initial and "RULE_V2" not in initial
+    assert "RULE_V2" in latest and "RULE_V1" not in latest
 
 
 @pytest.mark.anyio
@@ -132,7 +135,8 @@ async def test_scoped_rules_are_seen_before_action_and_survive_reopen(tmp_path):
         assert len(result.tool_calls) == 2
         assert result.tool_calls[0].error_code == "project_instructions_required"
         assert result.tool_calls[1].is_error is False
-        assert "NESTED_RULE" in model.requests[1].messages[0].content
+        assert any("NESTED_RULE" in m.content and m.content.startswith("Project instructions (")
+                   for m in model.requests[1].messages)
         assert session.store.verify().valid
     (nested / "AGENTS.md").write_text("CHANGED_RULE")
     async with agent.session(_frozen_turn_id=result.turn_id) as session:

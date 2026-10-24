@@ -1273,6 +1273,13 @@ async def _chat_facade_loop(
                         saved_action, saved_input = "continue", query
                     elif request.kind == "model_retry" and query not in {"retry", "abort"}:
                         saved_result = None
+                    elif request.kind == "tool_reconciliation":
+                        if query in {"continue", "retry", "abort"}:
+                            saved_action = query
+                        else:
+                            # Session.submit reconciles under execution ownership
+                            # before accepting this text as a follow-up Turn.
+                            saved_result = None
                     else:
                         saved_action = resolve_pause_choice(query, request.options)
                         if saved_action is None and _ui:
@@ -2027,7 +2034,7 @@ def agent_chat(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
+                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
     approval_mode: Annotated[
@@ -2204,7 +2211,7 @@ def agent_run(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；默认无密钥用 Bing，有密钥用 Brave"),
+                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     web_limits_file: Annotated[
         Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
@@ -2327,7 +2334,7 @@ def agent_resume(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily"),
+                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
     approval_mode: Annotated[

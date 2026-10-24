@@ -326,6 +326,8 @@ class ToolExecutor:
         progress_sinks: Mapping[str, ToolProgressSink] | None = None,
         execution_sink: ExecutionSink | None = None,
     ) -> tuple[ToolExecution, ...]:
+        task = asyncio.current_task()
+        cancellations = 0 if task is None else task.cancelling()
         prior_records = records or {}
         completed: dict[int, ToolExecution] = {}
         prepared: list[tuple[int, _PreparedExecution]] = []
@@ -343,8 +345,12 @@ class ToolExecutor:
                 await _emit_execution(execution_sink, item)
             else:
                 prepared.append((index, item))
+            if task is not None and task.cancelling() > cancellations:
+                raise asyncio.CancelledError
 
         async def invoke(item: _PreparedExecution) -> ToolExecution:
+            task = asyncio.current_task()
+            cancellations = 0 if task is None else task.cancelling()
             execution = await self._invoke(
                 item,
                 progress_sink=(progress_sinks or {}).get(
@@ -353,6 +359,10 @@ class ToolExecutor:
                 cancellation_sink=execution_sink,
             )
             await _emit_execution(execution_sink, execution)
+            # FINISH_CURRENT may absorb cancellation to preserve an atomic
+            # result. Commit that result, then stop admitting queued calls.
+            if task is not None and task.cancelling() > cancellations:
+                raise asyncio.CancelledError
             return execution
 
         batches: list[list[tuple[int, _PreparedExecution]]] = []
@@ -705,18 +715,6 @@ class ToolExecutor:
             if (context.workspace_root is not None and ToolEffect.WRITE_WORKSPACE in resolved.effects)
             else None
         )
-        workspace_tree_before_sha256 = (
-            await asyncio.to_thread(workspace_tree_sha256, workspace_root) if workspace_root is not None else None
-        )
-        workspace_file_before_sha256 = (
-            await asyncio.to_thread(
-                _workspace_file_target_snapshots,
-                workspace_root,
-                resolved,
-            )
-            if workspace_root is not None
-            else ()
-        )
         await _emit_record(record_sink, execution_record)
         return _PreparedExecution(
             call=call,
@@ -729,8 +727,8 @@ class ToolExecutor:
             record_sink=record_sink,
             started_at=started_at,
             workspace_root=workspace_root,
-            workspace_tree_before_sha256=workspace_tree_before_sha256,
-            workspace_file_before_sha256=workspace_file_before_sha256,
+            workspace_tree_before_sha256=None,
+            workspace_file_before_sha256=(),
             permissions_revision=(
                 None if context.effective_permissions is None else context.effective_permissions.revision
             ),
@@ -814,6 +812,9 @@ class ToolExecutor:
         )
         try:
             await _emit_record(prepared.record_sink, started_record)
+        except asyncio.CancelledError:
+            await self._finish_cancelled(replace(prepared, record=started_record), cancellation_sink)
+            raise
         except ExecutionStartRejectedError as rejected:
             record = replace(
                 prepared.record,
@@ -873,6 +874,16 @@ class ToolExecutor:
                     prepared=prepared,
                 )
         try:
+            # Preparation may be far ahead of invocation. Observe changes only
+            # after admission, so earlier conflicting calls are not attributed
+            # to this runner. Workspace observers are exclusive in a batch.
+            if prepared.workspace_root is not None:
+                before = await asyncio.to_thread(workspace_tree_sha256, prepared.workspace_root)
+                files = await asyncio.to_thread(
+                    _workspace_file_target_snapshots, prepared.workspace_root, prepared.resolved,
+                )
+                prepared = replace(prepared, workspace_tree_before_sha256=before,
+                                   workspace_file_before_sha256=files)
             raw = await _run_with_timeout(
                 prepared.tool,
                 prepared.arguments,
@@ -934,23 +945,7 @@ class ToolExecutor:
                 prepared=prepared,
             )
         except asyncio.CancelledError:
-            record = replace(
-                prepared.record,
-                status=ExecutionStatus.FAILED,
-                error_code="cancelled",
-            )
-            execution = await self._finish(
-                call=prepared.call,
-                result=_error_result(
-                    prepared.call,
-                    code="cancelled",
-                    message="tool execution was cancelled",
-                    retryable=True,
-                ),
-                record=record,
-                prepared=prepared,
-            )
-            await _emit_execution(cancellation_sink, execution)
+            await self._finish_cancelled(prepared, cancellation_sink)
             raise
         except FileNotFoundError as error:
             record = replace(
@@ -1051,6 +1046,18 @@ class ToolExecutor:
             prepared=prepared,
         )
 
+    async def _finish_cancelled(
+        self, prepared: _PreparedExecution, cancellation_sink: ExecutionSink | None,
+    ) -> None:
+        execution = await self._finish(
+            call=prepared.call,
+            result=_error_result(prepared.call, code="cancelled", message="tool execution was cancelled",
+                                 retryable=True),
+            record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code="cancelled"),
+            prepared=prepared,
+        )
+        await _emit_execution(cancellation_sink, execution)
+
     async def _failed_after_runner(
         self,
         prepared: _PreparedExecution,
@@ -1082,6 +1089,39 @@ class ToolExecutor:
         )
 
     async def _finish(
+        self,
+        *,
+        call: ToolCall,
+        result: ToolResult,
+        record: ToolExecutionRecord | None,
+        record_sink: RecordSink | None = None,
+        started_at: float | None = None,
+        resolved: ResolvedToolUse | None = None,
+        boundary: ExecutionBoundary | None = None,
+        decision: UseToolDecision | None = None,
+        prepared: _PreparedExecution | None = None,
+    ) -> ToolExecution:
+        # Terminal observation/recording must drain before admission is
+        # released. Preserve cancellation on the caller; the batch/orchestrator
+        # propagates it after accepting this known result durably.
+        finishing = asyncio.create_task(self._finish_execution(
+            call=call, result=result, record=record, record_sink=record_sink, started_at=started_at,
+            resolved=resolved, boundary=boundary, decision=decision, prepared=prepared,
+        ))
+        execution = await _drain_task(finishing)
+        # Optional telemetry must remain cancellable; a slow sink cannot hold
+        # known tool results hostage during shutdown.
+        caller = asyncio.current_task()
+        if self._trace_sink is not None and (caller is None or not caller.cancelling()):
+            try:
+                emitted = self._trace_sink(execution.trace)
+                if inspect.isawaitable(emitted):
+                    await emitted
+            except (asyncio.CancelledError, Exception):
+                pass
+        return execution
+
+    async def _finish_execution(
         self,
         *,
         call: ToolCall,
@@ -1160,13 +1200,6 @@ class ToolExecutor:
             duration_ms=max(0.0, (time.monotonic() - (started_at or time.monotonic())) * 1000),
         )
         self._traces.append(trace)
-        if self._trace_sink is not None:
-            try:
-                emitted = self._trace_sink(trace)
-                if inspect.isawaitable(emitted):
-                    await emitted
-            except Exception:
-                pass
         return ToolExecution(result=result, record=record, trace=trace)
 
 
@@ -1360,6 +1393,16 @@ def _bound_model_output(
     return bounded_output, True
 
 
+async def _drain_task[T](task: asyncio.Task[T]) -> T:
+    """Keep terminal work owned until it stops, including repeated cancellation."""
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+
+
 async def _run_with_timeout(
     tool: Tool,
     arguments: Mapping[str, JsonValue],
@@ -1391,7 +1434,7 @@ async def _run_with_timeout(
             return task.result()
         task.cancel()
         try:
-            await task
+            await _drain_task(task)
         except asyncio.CancelledError:
             pass
         except Exception:
@@ -1399,34 +1442,36 @@ async def _run_with_timeout(
         raise _CancelledTimeoutError
     except asyncio.CancelledError:
         if tool.interrupt_behavior is InterruptBehavior.FINISH_CURRENT:
-            remaining = max(0.0, tool.timeout_seconds - (loop.time() - started_at))
-            if remote:
+            async def finish_current() -> object:
+                remaining = max(0.0, tool.timeout_seconds - (loop.time() - started_at))
+                if remote:
+                    try:
+                        return await asyncio.wait_for(
+                            asyncio.shield(task),
+                            timeout=remaining,
+                        )
+                    except TimeoutError:
+                        task.add_done_callback(_consume_background_task)
+                        raise _UnknownTimeoutError from None
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+                if task in done:
+                    return task.result()
+                task.cancel()
                 try:
-                    return await asyncio.wait_for(
-                        asyncio.shield(task),
-                        timeout=remaining,
-                    )
-                except TimeoutError:
-                    task.add_done_callback(_consume_background_task)
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
                     raise _UnknownTimeoutError from None
-            done, _ = await asyncio.wait({task}, timeout=remaining)
-            if task in done:
-                return task.result()
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                raise _UnknownTimeoutError from None
-            raise _CancelledTimeoutError from None
+                raise _CancelledTimeoutError from None
+            return await _drain_task(asyncio.create_task(finish_current()))
         if remote:
             task.add_done_callback(_consume_background_task)
             raise _UnknownCancellationError from None
         else:
             task.cancel()
             try:
-                await task
+                await _drain_task(task)
             except (asyncio.CancelledError, Exception):
                 pass
         raise
@@ -1662,7 +1707,9 @@ def _truncate_json_string(value: str, max_bytes: int) -> str:
 def _can_run_in_parallel(prepared: tuple[_PreparedExecution, ...]) -> bool:
     if len(prepared) < 2:
         return False
-    if any(not item.tool.concurrency_safe for item in prepared):
+    if any(not item.tool.concurrency_safe or item.workspace_root is not None for item in prepared):
+        # Full-workspace before/after observation is itself a shared resource,
+        # even when declared write targets are disjoint.
         return False
     return not any(
         _resolved_uses_conflict(left.resolved, right.resolved)

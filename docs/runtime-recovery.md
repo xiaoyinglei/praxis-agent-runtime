@@ -86,3 +86,41 @@ Linux 的候选工作区支持工作区内相对符号链接，保留普通文�
 
 续建是基于已发布的文件重新执行命令，不恢复已终止进程的内存。
 活跃命令的查询、等待和取消见[命令会话](macos-command-sessions.md)。
+
+## 工具批次、取消与结果恢复
+
+同一模型响应的原生 `tool_calls` 经 `TurnExecutor` 进入
+`ToolOrchestrator.execute_batch`：先记录全部调用，再按能力及状态边界分段。
+`ToolExecutor` 预检当前段，按 `max_parallel_calls` 和已解析资源冲突分批执行。
+独占工具、远程未知结果和改变运行时状态的操作保持执行屏障；运行时不根据工具名、
+任务文字或错误内容猜测调用依赖。后续调用依赖前项结果时，应由模型下一步提出。
+
+独立调用的参数错误、权限拒绝、runner 异常和已确认取消的本地超时各自形成结果，
+不取消健康的兄弟调用。存储提交失败属于批次故障：停止接纳并排空已启动调用，
+保留原操作供恢复核对；不能用一条临时错误消息冒充已持久化的执行结果。
+非幂等远程超时、进程死亡或未知副作用继续进入逐项对账，不能自动重跑。
+
+取消后，`FINISH_CURRENT` 完成当前调用并提交结果，再传播取消，
+不启动排队工具或下一模型请求。重复取消仍排空同一完成或清理任务，
+不会仅因再次收到取消就把活跃 runner 记为已停止。普通执行和审批恢复共享这套接纳语义。
+claim 事件投递期间、runner 尚未进入时的取消会提交确定的取消结果；runner 已完成后的
+输出快照与终态记录会排空，保留已知结果，可选遥测不会阻止取消。
+`agent recover TURN_ID --action continue` / `retry` 仅在明确取消后的暂停、无待处理交互和
+无运行中或未知操作时继续；恢复跳过已有结果，只执行原来未开始的调用。
+`abort` 会为未执行调用闭合工具消息组。审批、澄清和对账仍走各自原有流程。
+
+工作区写的前快照在真正获准调用 runner 后拍摄。由于当前证据同时观察整个工作区树，
+这些写操作互斥，避免将兄弟调用的修改归给 no-op 写；独立读保持有界并发。
+该互斥限于当前批次，不提供对其他 Thread、宿主进程写入或活跃后台命令的全局事务隔离。
+
+新 Turn 冻结 `execution_context_policy.tool_result_order=call-v1`，响应记录保存该标记。
+审计账本保留实际完成顺序，provider 上下文的完整工具组按原调用顺序排列，
+结果通过 `tool_call_id` 关联。旧响应缺少标记时保持原完成顺序；重开不会补默认值或
+改变旧请求布局。工具组未闭合时不能发送下一模型请求。
+
+该机制参考了 Apache-2.0 的 Codex commit `ddf04ad26789d040f9ef6a96736f76602e35a6cc`：
+[能力驱动的并行接纳及调用错误边界](https://github.com/openai/codex/blob/ddf04ad26789d040f9ef6a96736f76602e35a6cc/codex-rs/core/src/tools/parallel.rs#L88)、
+[顺序排空并发结果](https://github.com/openai/codex/blob/ddf04ad26789d040f9ef6a96736f76602e35a6cc/codex-rs/core/src/session/turn.rs#L2213)，
+以及 [Claude 的完整并行工具结果协议](https://platform.claude.com/docs/en/agents-and-tools/tool-use/parallel-tool-use)。
+Python 实现复用本项目执行和持久化组件，没有复制外部源码；Claude 本地参考副本仅用于比较，
+不作为已核实私有核心或可复制授权的依据。

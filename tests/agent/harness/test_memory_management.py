@@ -173,22 +173,51 @@ async def test_readonly_tool_policy_cannot_mutate_memory(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_empty_memory_still_exposes_version_for_first_explicit_write(tmp_path):
-    from agent_runtime.harness import Session
+async def test_empty_memory_exposes_version_through_read_for_first_explicit_write(tmp_path):
+    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, Session
     from agent_runtime.harness.memory import MemoryConfig
-    from tests.agent.harness.test_cross_session_memory import MemoryModel
+    from agent_runtime.tools.permissions import ToolExecutionContext
+    from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
-    model = MemoryModel()
+    class Model(_UpdatePlanThenAnswerModel):
+        def __init__(self):
+            self.requests = []
+
+        def prepare(self, request):
+            self.requests.append(request)
+            return super().prepare(request)
+
+        async def dispatch(self, prepared, *, delta_sink=None):
+            step = prepared.request_ref["step"]
+            if step == 1:
+                call = HarnessToolCall(id="read", name="read_memory", arguments={})
+            elif step == 2:
+                detail = next(m.content for m in reversed(self.requests[-1].messages) if m.role == "tool")
+                # Tool results use the normal ACI envelope; the version is not
+                # a volatile navigation field in every model request.
+                version = json.loads(json.loads(detail)["content"][0]["data"]["text"])["version"]
+                call = HarnessToolCall(id="write", name="manage_memory", arguments={
+                    "action": "remember", "key": "runner", "text": "Use uv.", "expected_version": version})
+            else:
+                return HarnessModelResponse(text="remembered", provider_response_id=None, usage={})
+            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(call,))
+
+    model = Model()
     async with await Session.open(
         database=tmp_path / "r.db", workspace=tmp_path, model=model,
         memory=MemoryConfig(generate_memories=False), require_workspace_change=False,
+        tool_execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, allow_write_tools=True),
     ) as session:
-        await session.submit("Remember a new preference.")
+        result = await session.submit("Remember a new preference: use uv.")
+        assert result.status == "done", result.diagnostics
+        assert all(not call.is_error for call in result.tool_calls)
+        assert session.store.read_memory_state(tmp_path)["entries"][0]["text"] == "Use uv."
     navigation = [
         message.content for message in model.requests[0].messages
         if message.content.startswith("Cross-chat memory")
     ]
     assert len(navigation) == 1
     snapshot = json.loads(navigation[0].split("\n", 1)[1])
-    assert snapshot["version"] == 0
+    assert "version" not in snapshot
+    assert "read_memory" in snapshot["recall"]
     assert snapshot["entries"] == []

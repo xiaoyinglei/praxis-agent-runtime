@@ -312,7 +312,7 @@ async def test_pre_dispatch_orphan_abort_and_invalid_action(tmp_path, action):
 @pytest.mark.parametrize("legacy", [False, True])
 async def test_interrupted_tool_requires_reconciliation_and_cannot_be_aborted(tmp_path, legacy):
     from agent_runtime import Agent
-    from agent_runtime.harness.ownership import OWNERSHIP_REVISION
+    from agent_runtime.harness.ownership import OWNERSHIP_REVISION, ConversationRecoveryRequiredError
     from tests.agent.harness.test_tool_claim_fencing import _ready_operation
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -330,7 +330,7 @@ async def test_interrupted_tool_requires_reconciliation_and_cannot_be_aborted(tm
         operation = session.store.read_tool_operation(operation_id)
         assert operation.status == "unknown" and operation.requires_reconciliation
         facade = Agent(checkpoint_db=database, workspace_path=workspace)
-        with pytest.raises(RuntimeError, match="cannot discard a running or unknown tool"):
+        with pytest.raises(ConversationRecoveryRequiredError, match="取消未完成"):
             await facade.resume(turn.turn_id, "abort")
         assert session.store.read_thread(session.thread_id).active_turn_id == turn.turn_id
         assert session.store.verify().valid

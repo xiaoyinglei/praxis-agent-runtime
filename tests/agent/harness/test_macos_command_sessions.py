@@ -119,6 +119,57 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
     assert not list((workspace / ".praxis/runtime/scratch").glob("run-command-*"))
 
 
+@pytest.mark.parametrize("entrypoint", ["sdk", "cli"])
+def test_public_managed_python_script_entry(tmp_path, monkeypatch, entrypoint):
+    workspace = tmp_path / "workspace"
+    scripts = workspace / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "helper.py").write_text("VALUE = 42\n")
+    (scripts / "check.py").write_text("import helper\nassert helper.VALUE == 42\nprint('script-checked')\n")
+    database = tmp_path / "script.db"
+
+    class ScriptModel(SessionCommandModel):
+        async def dispatch(self, prepared, **_kwargs):
+            request = prepared.dispatch_payload
+            results = [json.loads(m.content) for m in request.messages if m.role == "tool"]
+            if results:
+                assert not results[-1]["is_error"], results[-1]
+                output = results[-1]["structured_content"]
+                assert output["stdout"] == "script-checked\n"
+                assert output["verification"] is None
+                return HarnessModelResponse(text="observed script result", provider_response_id=None,
+                                            usage={"input_tokens": 3, "output_tokens": 3})
+            return HarnessModelResponse(text="", provider_response_id=None,
+                tool_calls=(HarnessToolCall("script", "execute_python", {"script_path": "scripts/check.py"}),),
+                usage={"input_tokens": 3, "output_tokens": 3})
+
+    def configure(agent):
+        monkeypatch.setattr(agent, "_model_factory", lambda: ScriptModel("unused"))
+        return agent
+
+    if entrypoint == "sdk":
+        agent = configure(Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False))
+        result = asyncio.run(agent.run("Run the check script", allow_execute_tools=True))
+        assert result.status == "done", result
+        assert result.answer == "observed script result"
+    else:
+        original = cli._create_agent_facade
+        monkeypatch.setattr(cli, "_create_agent_facade", lambda **kwargs: configure(original(**kwargs)))
+        monkeypatch.chdir(workspace)
+        result = CliRunner().invoke(cli.agent_app, [
+            "run", "Run the check script", "--allow-execute-tools", "--disable-workspace-mcp",
+            "--non-interactive", "--rollout-db", str(database),
+        ])
+        assert result.exit_code == 0, result.output
+        assert "observed script result" in result.output
+    with RolloutStore(database) as store:
+        turn = store.list_turns()[-1]
+        assert turn.status == "completed"
+        [operation] = store.list_tool_operations(turn.turn_id)
+        assert operation.status == "succeeded"
+        assert store.verify().valid
+
+
 def test_public_pause_closes_job_and_resume_reads_durable_terminal(tmp_path, monkeypatch):
     class PauseAfterLaunch(SessionCommandModel):
         async def dispatch(self, prepared, **kwargs):

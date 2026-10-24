@@ -72,7 +72,8 @@ async def test_memory_update_is_durable_and_an_independent_chat_uses_a_frozen_sn
         assert snapshot["entries"][0] == {"key": "environment", "title": "Python environment"}
         detail = session.store.read_memory_state(tmp_path, version=snapshot["version"])["entries"][0]
         assert detail["text"] == "Use uv for this workspace."
-        assert "Python environment" in model.requests[-1].messages[0].content
+        assert any("Python environment" in m.content and m.content.startswith("Cross-chat memory (")
+                   for m in model.requests[-1].messages)
         frozen = json.dumps(snapshot)
         session.delete_memory("environment")
         assert json.dumps(session.store.read_turn(reply.turn_id).binding_manifest["memory_snapshot"]) == frozen

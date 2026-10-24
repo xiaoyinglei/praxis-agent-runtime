@@ -5,7 +5,6 @@ import codecs
 import ctypes
 import errno
 import hashlib
-import json
 import math
 import os
 import platform
@@ -169,13 +168,18 @@ class RunCommandOutput(BaseModel):
 class ManagedPythonInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    code: str = Field(
+    code: str | None = Field(
+        default=None,
         min_length=1,
         max_length=100_000,
         description=(
             "Python source code executed directly by the managed Praxis "
             "interpreter. Pass plain code, not a shell command or heredoc."
         ),
+    )
+    script_path: str | None = Field(
+        default=None, min_length=1, max_length=4096,
+        description="Workspace-relative Python entry script. Supply exactly one of code or script_path.",
     )
     working_dir: str = Field(
         default=".",
@@ -213,6 +217,12 @@ class ManagedPythonInput(BaseModel):
     )
 
     publish_on_failure: bool = Field(default=False, description=_FAILURE_PUBLICATION_DESCRIPTION)
+
+    @model_validator(mode="after")
+    def require_one_source(self) -> ManagedPythonInput:
+        if (self.code is None) == (self.script_path is None):
+            raise ValueError("supply exactly one of code or script_path")
+        return self
 
 
 class ManagedPythonOutput(BaseModel):
@@ -265,6 +275,17 @@ def _validate_python_input(
             path="$.output_paths",
             message="output paths must be unique",
         )
+    if validated.get("code") is not None:
+        try:
+            compile(str(validated["code"]), "<managed-python>", "exec", dont_inherit=True)
+        except SyntaxError as error:
+            raise ToolValidationError(
+                path="$.code",
+                message=(
+                    f"Invalid Python source: {error.msg} (line {error.lineno}, column {error.offset}). "
+                    "No code was executed."
+                ),
+            ) from None
     return validated
 
 
@@ -406,6 +427,16 @@ def create_execute_python_tool(
         definition=ToolDefinition(
             name="execute_python",
             description=(
+                "Run plain Python source in a fresh managed interpreter process. "
+                "Each call must include its own imports and definitions; variables do not persist. "
+                "Supply exactly one of code or script_path. For reusable code, save and edit a workspace "
+                "script, then pass script_path. It runs as __main__, with its directory on the import path. "
+                "Inline code can import from working_dir. The interpreter uses Praxis packages, not a project's venv. "
+                "Use tempfile for temporary files: its per-call directory is writable and is removed "
+                "after execution; it is not storage for the next call. Do not assume /tmp is writable. "
+                "The workspace is read-only by default. For generated files, set workspace_write=true "
+                "and list every intended output in output_paths; existing permissions still apply. "
+                "Invalid inline Python syntax is rejected before execution or approval. "
                 "On Linux, writes use a private candidate workspace with streaming copies and fingerprints. "
                 "Only exit 0 with all path, permission and host-change checks passing publishes changes by default; "
                 "publish_on_failure=true also publishes validated partial build files on failure or timeout. "
@@ -421,21 +452,13 @@ def create_execute_python_tool(
                 "task workspace has no .venv and does not use shell heredocs. Use "
                 "it for spreadsheet transforms, PDF analysis, CSV/JSON processing, "
                 "statistics, and charts with the runtime's installed libraries "
-                "such as pandas, openpyxl, PyMuPDF, SciPy, and matplotlib. The "
-                "code runs in a fresh process on every call: variables and imports "
-                "do not persist between calls. Save reusable results in workspace "
-                "files. To run an existing Python script with this same interpreter, "
-                "use import runpy; runpy.run_path('script.py', run_name='__main__'). The "
-                "workspace is read-only by default. For generated files, set "
-                "workspace_write=true and list every intended output in "
-                "output_paths. Use inspect_data_file to inspect generated artifacts "
+                "such as pandas, openpyxl, PyMuPDF, SciPy, and matplotlib. "
+                "Use inspect_data_file to inspect generated artifacts "
                 "and check the requested results. A valid file structure does not "
-                "verify calculation or transformation correctness. Do not invoke a shell or create a heredoc "
-                "from the Python code merely to repeat inspection. For behavioral verification, execute real "
-                "assertions that check the requested result. Output records only assertions actually reached; "
-                "uncalled functions and skipped branches are not checks. Assertion counts do not establish "
-                "which files or requirements were verified. For delivery, inspect changed artifacts or run "
-                "the project's relevant checks after the write."
+                "verify calculation or transformation correctness. Python source executes without assertion "
+                "instrumentation. Use checks appropriate to the requested result; stdout/stderr and exit status "
+                "report execution facts, not correctness or test coverage. For delivery, inspect changed artifacts "
+                "or run the project's relevant checks after the write."
             ),
             input_schema=_PYTHON_INPUT_SCHEMA,
         ),
@@ -445,7 +468,7 @@ def create_execute_python_tool(
         output_schema=_PYTHON_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE, ToolEffect.EXECUTE_PROCESS}),
         resolve_use=lambda arguments: _resolve_managed_python_use(workspace, arguments),
-        execution_revision="builtin-execute-python-v8-declared-targets",
+        execution_revision="builtin-execute-python-v11-plain-execution",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.MANAGED_PROCESS,
@@ -548,64 +571,11 @@ async def _run_command(
             start_new_session=True,
             pass_fds=() if network_filter is None else (network_filter.fileno(),),
         )
-        if process.stdout is None or process.stderr is None:
-            raise RuntimeError("command process pipes were not created")
-        progress_budget = _CommandProgressBudget()
-        stdout_task = asyncio.create_task(
-            _read_command_stream(
-                process.stdout,
-                kind=ToolProgressKind.STDOUT,
-                progress_sink=progress_sink,
-                progress_budget=progress_budget,
-                capture_output=capture_output,
-            )
+        stdout_bytes, stderr_bytes, timed_out = await _collect_process_output(
+            process, timeout_seconds=request.timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+            progress_sink=progress_sink, capture_output=capture_output,
         )
-        stderr_task = asyncio.create_task(
-            _read_command_stream(
-                process.stderr,
-                kind=ToolProgressKind.STDERR,
-                progress_sink=progress_sink,
-                progress_budget=progress_budget,
-                capture_output=capture_output,
-            )
-        )
-        wait_task = asyncio.create_task(process.wait())
-        communication = asyncio.gather(stdout_task, stderr_task, wait_task)
-        timed_out = False
-        try:
-            done, _pending = await asyncio.wait(
-                {communication},
-                timeout=request.timeout_seconds,
-            )
-            if communication not in done:
-                timed_out = True
-                await _terminate_process_group(
-                    process,
-                    grace_seconds=termination_grace_seconds,
-                )
-            stdout_bytes, stderr_bytes, _returncode = await communication
-            # A shell can exit while a background child has closed its pipes.
-            # Finishing the command also ends the rest of its process group.
-            if _SANDBOX_PLATFORM == "darwin" and not timed_out:
-                await _terminate_process_group(process, grace_seconds=termination_grace_seconds)
-        except asyncio.CancelledError:
-            await _terminate_process_group(
-                process,
-                grace_seconds=termination_grace_seconds,
-            )
-            try:
-                await communication
-            except (asyncio.CancelledError, Exception):
-                pass
-            raise
-        except BaseException:
-            await _terminate_process_group(
-                process,
-                grace_seconds=termination_grace_seconds,
-            )
-            communication.cancel()
-            await asyncio.gather(communication, return_exceptions=True)
-            raise
 
         publish_error = None
         workspace_published = False if view is not None else None
@@ -643,6 +613,77 @@ async def _run_command(
     return output
 
 
+async def _collect_process_output(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout_seconds: float | None,
+    termination_grace_seconds: float,
+    progress_sink: ToolProgressSink | None = None,
+    capture_output: Callable[[ToolProgressKind, bytes], None] | None = None,
+) -> tuple[bytes, bytes, bool]:
+    """Drain bounded streams and reap the same process group for both execution tools."""
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("command process pipes were not created")
+    progress_budget = _CommandProgressBudget()
+    stdout_task = asyncio.create_task(
+        _read_command_stream(
+            process.stdout,
+            kind=ToolProgressKind.STDOUT,
+            progress_sink=progress_sink,
+            progress_budget=progress_budget,
+            capture_output=capture_output,
+        )
+    )
+    stderr_task = asyncio.create_task(
+        _read_command_stream(
+            process.stderr,
+            kind=ToolProgressKind.STDERR,
+            progress_sink=progress_sink,
+            progress_budget=progress_budget,
+            capture_output=capture_output,
+        )
+    )
+    wait_task = asyncio.create_task(process.wait())
+    communication = asyncio.gather(stdout_task, stderr_task, wait_task)
+    timed_out = False
+    try:
+        done, _pending = await asyncio.wait(
+            {communication},
+            timeout=timeout_seconds,
+        )
+        if communication not in done:
+            timed_out = True
+            await _terminate_process_group(
+                process,
+                grace_seconds=termination_grace_seconds,
+            )
+        stdout_bytes, stderr_bytes, _returncode = await communication
+        # A shell can exit while a background child has closed its pipes.
+        # Finishing the command also ends the rest of its process group.
+        if _SANDBOX_PLATFORM == "darwin" and not timed_out:
+            await _terminate_process_group(process, grace_seconds=termination_grace_seconds)
+    except asyncio.CancelledError:
+        await _terminate_process_group(
+            process,
+            grace_seconds=termination_grace_seconds,
+        )
+        try:
+            await communication
+        except (asyncio.CancelledError, Exception):
+            pass
+        raise
+    except BaseException:
+        await _terminate_process_group(
+            process,
+            grace_seconds=termination_grace_seconds,
+        )
+        communication.cancel()
+        await asyncio.gather(communication, return_exceptions=True)
+        raise
+
+    return stdout_bytes, stderr_bytes, timed_out
+
+
 async def _execute_managed_python(
     workspace: WorkspaceRuntime,
     request: ManagedPythonInput,
@@ -665,6 +706,15 @@ async def _execute_managed_python(
             code=sandbox_issue[0],
         )
 
+    entry_path = None
+    if request.script_path is not None:
+        entry_path = workspace.resolve_path(request.script_path)
+        workspace.ensure_within_workspace(entry_path)
+        if permissions is not None and (reason := permissions.path_reason(entry_path)):
+            return _python_sandbox_error(
+                started_at=started_at, message=reason, code="sandbox_filesystem_denied",
+            )
+
     preflight_issue = _workspace_sandbox_preflight_issue(
         workspace.root,
         allow_workspace_write=request.workspace_write,
@@ -681,8 +731,14 @@ async def _execute_managed_python(
         prefix="run-python-",
         dir=workspace.scratch,
     ) as temporary_root, ExitStack() as resources:
-        script_path = Path(temporary_root) / "praxis_task.py"
-        script_path.write_text(request.code, encoding="utf-8")
+        if entry_path is not None:
+            script_path = entry_path
+            import_directory = script_path.parent
+        else:
+            script_path = Path(temporary_root) / "praxis_task.py"
+            assert request.code is not None
+            script_path.write_text(request.code, encoding="utf-8")
+            import_directory = cwd
         runner_path = Path(temporary_root) / "praxis_python_runner.py"
         report_path = Path(temporary_root) / "verification.json"
         shutil.copyfile(Path(__file__).parents[1] / "python_verification.py", runner_path)
@@ -723,6 +779,7 @@ async def _execute_managed_python(
             str(runner_path),
             str(script_path),
             str(report_path),
+            str(import_directory),
             cwd=str(cwd),
             env=environment,
             stdout=asyncio.subprocess.PIPE,
@@ -730,30 +787,10 @@ async def _execute_managed_python(
             start_new_session=True,
             pass_fds=() if network_filter is None else (network_filter.fileno(),),
         )
-        communication = asyncio.create_task(process.communicate())
-        timed_out = False
-        try:
-            done, _pending = await asyncio.wait(
-                {communication},
-                timeout=request.timeout_seconds,
-            )
-            if communication not in done:
-                timed_out = True
-                await _terminate_process_group(
-                    process,
-                    grace_seconds=termination_grace_seconds,
-                )
-            stdout_bytes, stderr_bytes = await communication
-        except asyncio.CancelledError:
-            await _terminate_process_group(
-                process,
-                grace_seconds=termination_grace_seconds,
-            )
-            try:
-                await communication
-            except Exception:
-                pass
-            raise
+        stdout_bytes, stderr_bytes, timed_out = await _collect_process_output(
+            process, timeout_seconds=request.timeout_seconds,
+            termination_grace_seconds=termination_grace_seconds,
+        )
 
         publish_error = None
         workspace_published = False if view is not None else None
@@ -771,13 +808,6 @@ async def _execute_managed_python(
             stderr += ("\n" if stderr else "") + publish_error
         if timed_out and not stderr:
             stderr = "Python code timed out and its process group was terminated"
-        verification = None
-        if process.returncode == 0 and not timed_out and report_path.is_file():
-            try:
-                if report_path.stat().st_size <= 1_000_000:
-                    verification = json.loads(report_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                pass
         return ManagedPythonOutput(
             stdout=stdout,
             stderr=stderr,
@@ -788,7 +818,6 @@ async def _execute_managed_python(
             python_version=platform.python_version(),
             network_enabled=request.network,
             workspace_published=workspace_published,
-            verification=verification,
             sandbox_error=(
                 "sandbox_publish_denied" if publish_error is not None else "sandbox_start_failed"
                 if _SANDBOX_PLATFORM == "linux" and process.returncode != 0 and stderr.startswith("bwrap:")

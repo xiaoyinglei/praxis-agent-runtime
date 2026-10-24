@@ -44,7 +44,7 @@ class RAGKnowledgeConfig(BaseModel):
 @dataclass(frozen=True, slots=True)
 class AgentEvidence:
     evidence_id: str
-    doc_id: int
+    doc_id: str | int | None
     citation_anchor: str
     text: str
     score: float
@@ -76,7 +76,7 @@ class AgentCitation:
     page_start: int | None = None
     page_end: int | None = None
     citation_anchor: str | None = None
-    doc_id: int | None = None
+    doc_id: str | int | None = None
     benchmark_doc_id: str | None = None
     source_id: int | None = None
     source_type: str | None = None
@@ -87,7 +87,7 @@ def agent_evidence_from_value(value: object) -> AgentEvidence:
         return value
     return AgentEvidence(
         evidence_id=str(_value(value, "evidence_id")),
-        doc_id=int(_value(value, "doc_id")),
+        doc_id=_optional_document_id(_value(value, "doc_id")),
         citation_anchor=str(_value(value, "citation_anchor")),
         text=str(_value(value, "text")),
         score=float(_value(value, "score")),
@@ -118,7 +118,7 @@ def agent_citation_from_value(value: object) -> AgentCitation:
         page_start=_optional_int(_value(value, "page_start")),
         page_end=_optional_int(_value(value, "page_end")),
         citation_anchor=_optional_str(_value(value, "citation_anchor")),
-        doc_id=_optional_int(_value(value, "doc_id")),
+        doc_id=_optional_document_id(_value(value, "doc_id")),
         benchmark_doc_id=_optional_str(_value(value, "benchmark_doc_id")),
         source_id=_optional_int(_value(value, "source_id")),
         source_type=_optional_str(_value(value, "source_type")),
@@ -135,6 +135,10 @@ def _optional_str(value: object) -> str | None:
 
 def _optional_int(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _optional_document_id(value: object) -> str | int | None:
+    return value if isinstance(value, str) else _optional_int(value)
 
 
 def _grounding_mapping(value: object) -> Mapping[str, JsonValue] | None:

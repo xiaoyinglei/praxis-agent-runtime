@@ -95,7 +95,7 @@ def test_cli_defaults_leave_legacy_rag_agent_state_untouched(
 
 def test_agent_constructor_and_switch_paths_keep_requester_domains() -> None:
     agent = Agent(
-        model="mlx-community/Qwen3.5-9B-4bit",
+        model="deepseek-flash",
         model_session_path=None,
     )
 
@@ -320,7 +320,7 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
         [
             "model",
             "show",
-            "mlx-community/Qwen3.5-9B-4bit",
+            "deepseek-flash",
             "--session-path",
             session,
         ],
@@ -333,7 +333,7 @@ def test_model_list_and_show_are_read_only_and_do_not_construct_provider(
     assert "model=" not in listed.output
     assert "provider=" in listed.output
     assert shown.exit_code == 0, shown.output
-    assert "model_id: mlx-community/Qwen3.5-9B-4bit" in shown.output
+    assert "model_id: deepseek-flash" in shown.output
     assert "alias:" not in shown.output
     assert "\nmodel:" not in shown.output
     assert "source: builtin" in shown.output
@@ -736,7 +736,7 @@ def test_model_remove_rejects_builtin_and_current_user_alias(tmp_path: Path) -> 
     session_options = ["--session-path", str(tmp_path / "session.json")]
     builtin = runner.invoke(
         agent_app,
-        ["model", "remove", "mlx-community/Qwen3.5-9B-4bit", *session_options],
+        ["model", "remove", "deepseek-flash", *session_options],
     )
     added = runner.invoke(
         agent_app,

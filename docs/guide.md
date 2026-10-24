@@ -41,9 +41,9 @@ uv run agent chat
 
 使用复制方式安装依赖，避免工作区中的依赖文件与外部 uv 缓存形成硬链接，触发沙箱包含性检查。Linux 还需要 Bubblewrap 和 libseccomp，见 [Ubuntu 部署](../DEPLOY_UBUNTU.md)。
 
-公开版只内置一个 DeepSeek 默认模型（`deepseek-flash`），首次向导直接进入 API Key 输入，不要求选择开发者的模型列表。需要有自己的 DeepSeek API 账号和 Key；安装包不包含开发者的凭据、个人模型注册表或 MLX 模型权重。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
+公开版默认使用 DeepSeek（`deepseek-flash`），首次向导直接进入默认模型的 API Key 输入。内置目录也提供已核验声明的其他服务商型号；安装包不包含开发者的凭据、个人模型注册表或 MLX 模型权重。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
 
-使用其他服务商时，先按下文的 `agent model add` 命令接入，再运行 `agent setup --model MODEL_ID` 隐藏输入对应 Key。需要准备服务商实际的模型 ID、API 地址和上下文容量；本地模型服务必须已经启动。
+使用目录已有型号时，运行 `agent setup --model MODEL_ID` 隐藏输入对应 Key，不需要手填上下文容量。目录外的服务商或本地模型按下文的 `agent model add` 接入；本地模型服务必须已经启动。
 
 ```bash
 uv run agent setup --model MODEL_ID --no-mcp
@@ -67,11 +67,24 @@ uv run --project /path/to/praxis-agent-runtime agent chat
 
 上面的 `--project` 选择 uv 使用的安装项目，当前目录仍然是 Agent 的工作区。后续示例省略这部分前缀，默认在 Praxis 源码目录执行。
 
+## 内置模型目录
+
+主流云模型的维护源是 [`configs/model-catalog.yaml`](../configs/model-catalog.yaml)，本版核对截止日期为 **2026-10-22**。公开运行配置 `configs/agent-models.yaml` 及研究配置中的对应条目由它同步生成，安装包沿用公开配置；CLI 与 Python SDK 使用同一注册流程。维护方式与协议限制见 [`configs/model-catalog.md`](../configs/model-catalog.md)。
+
+快照覆盖 OpenAI、Anthropic、Google、DeepSeek、Kimi、Qwen、智谱、MiniMax，并核对项目已有 Groq 型号。`chat_completions` 表示声明与当前接口匹配，不等于账号已授权或真实任务通过；`catalog_only` 保留官方容量与协议限制，不进入可运行列表。尚无明确整数的容量保留原始单位，不从 `1M` 猜数值。当前多模态消息协议未接通，目录中的厂商视觉能力不等于 Agent 已能读取图片。
+
+例如使用已内置的 Kimi：
+
+```bash
+uv run agent setup --model kimi-k3 --no-mcp
+uv run agent chat --model kimi-k3
+```
+
 ## 接入模型
 
 模型服务需要提供 OpenAI-compatible 接口，并满足配置中声明的能力：真实流式文本增量与权威完成状态、合法工具调用，以及启用时的结构化输出。模型 ID 必须与服务实际提供的 ID 一致。
 
-公开版默认定义位于 `configs/agent-models.yaml`，只包含 DeepSeek。`configs/models.yaml` 保留研究与开发使用的多模型配置，不作为 Agent 的默认模型目录。内置模型定义只读；用户模型通过 CLI 登记到个人注册表，不需要修改源码配置：
+已有个人注册表若与新版内置型号重名，启动会明确拒绝冲突，不会覆盖用户定义；升级前需保留个人文件并解决同名条目。内置模型定义只读；目录外的用户模型通过 CLI 登记，不需要修改源码配置：
 
 ```bash
 uv run agent model list --source
@@ -313,7 +326,18 @@ Linux 候选视图支持工作区内相对符号链接，保留普通文件 mtim
 方便后续命令增量续建；工具仍报告失败，`workspace_published` 说明是否发布。默认关闭，取消及沙箱启动失败不发布。
 它不增加写权限或取消 destructive 审批；不恢复已终止的进程。详见[输出与构建恢复](runtime-recovery.md#linux-输出与构建恢复)。
 
+`search_text` 使用随安装依赖提供的 ripgrep，不依赖系统 `PATH` 上的 `rg`。运行时负责读取权限、
+路径与 glob 范围、资源限制和结构化输出；匹配交给 ripgrep。结果按路径顺序返回，不推测源码重要性。
+`regex=true` 使用 ripgrep 的 Rust 正则语法，`regex=false` 搜索字面文本；省略时保留自动识别模式。
+搜索在独立进程运行，默认 15 秒超时，取消会终止并回收搜索进程组，不阻塞聊天事件循环。
+单文件最多读取 2 MB，合计 64 MB，最多枚举 20,000 个目录项；后端 JSON 与最终输出分别有
+8 MB、1.5 MB 上限。返回内容或扫描范围不完整时，`truncated=true`；不能据此断言整个目录没有匹配。
+只有精确文件已读取且结果未截断，才能在该次观察范围内确认文本不存在。符号链接不跟随；
+显式授权的外部路径仍受原权限上限约束。缺少后端依赖会明确报告 `search_backend_unavailable`。
+
 `inspect_data_file` 用 `openpyxl` 的只读流式接口读取 XLSX/XLSM，用标准库 `csv` 读取 CSV/TSV。
+解析在独立子进程运行；取消或 60 秒工具超时会终止并回收解析进程，退出聊天不再等待解析线程。
+子进程使用当前读取权限的快照，不继承宿主凭据或工作区的 Python 导入路径。
 表格预览是原始网格，不推测表头；标题、单位、多层字段行和空行都留在 `tables[].rows` 中。
 `row_numbers`、`column_numbers` 给出每个返回值的一起始源坐标；CSV 行号指逻辑记录，带引号字段里的换行不另计一行。
 先查看原始网格，再显式选择用于分析的字段行和数据区域；转成 pandas DataFrame 时可先用 `header=None`，
@@ -334,6 +358,16 @@ Linux 候选视图支持工作区内相对符号链接，保留普通文件 mtim
 
 这次原始网格契约升级为 `builtin-inspect-data-file-v2-raw-grids`，移除了推测性的 `headers` 字段，
 `row_count` 现在包含全部原始行。旧工具版本的待恢复调用会按执行版本检查拒绝，需重新提交检查；已保存的历史结果不重写。
+
+`execute_python` 使用 Praxis 的托管解释器和数据处理依赖，每次启动独立进程。
+传入 `code` 执行内联代码，或传入工作区相对路径 `script_path` 执行已有脚本，两者只能选一个。
+脚本以 `__main__` 执行，并可导入脚本同目录模块；内联代码可导入 `working_dir` 中的模块。
+它使用托管环境，不采用项目 `.venv`；需要项目依赖时用 `run_command` 运行项目解释器。
+两种执行工具共用有界输出读取和进程组超时、取消清理。Python 源码按原有语义执行，
+不改写 AST、不统计断言；兼容输出字段 `verification` 为 `null`。
+stdout、stderr 和退出码记录执行事实。新请求不根据工具名或命令名称自动生成验证结论；
+需要机器验收时，使用明确的 `acceptance_command`，检查范围仅是该命令的真实执行结果。
+旧 Turn 的完成策略仍按原记录解释，历史验证记录不会重写。读取次数不会强制模型开始修改或隐藏工具。
 
 macOS / Linux 活跃 Session 的 `run_command` 可用 `yield_time_seconds` 先返回任务 ID，随后用
 `manage_command` 查询、等待或取消同一个进程。等待期限与执行期限独立；显式
@@ -367,11 +401,17 @@ uv run --extra rag rag --help
 
 `rag` 负责索引与检索服务准备，普通 Agent 启动不会初始化 Embedding、重排或向量数据库。先建立索引和对应存储服务，再显式连接 `RAGKnowledgeConfig`；其提供方边界按需初始化。引用提供可追溯性，不自动证明内容正确。
 
+知识工具的 grounding 与证据不足标记只描述该工具的结果，可从 `tool_calls[].structured_output` 读取。
+`AgentResult.groundedness` 和 `insufficient_evidence` 保留兼容，均为 `false`，表示最终答案未经此类评估，
+不代表最终答案已被证明错误或正确。文档 ID 保留原有字符串、整数或空值，不强制转换为数字。
+
 ## 公网检索
 
-`web_search` 与 `web_fetch` 默认向 CLI 提供公网搜索和阅读。它们只能访问通过检查的公网地址，不向工具开放任意内网。查询会发送给所选搜索服务，读取网页也会对目标站点发请求。
+`web_search` 与 `web_fetch` 默认向 CLI 提供搜索与网页阅读工具。它们只能访问通过检查的公网地址，不向工具开放任意内网。已配置的搜索会把查询发送给所选服务，读取网页会对目标站点发请求。
 
-未提供搜索 Key 时使用 Bing 公开页面，可能遇到限流或验证。可通过 `--web-search-provider brave|tavily` 与 `--web-search-key-file PATH` 选择服务；密钥文件应位于工作区外。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
+默认未配置搜索服务或 Key 时，`web_search` 返回 `web_search_not_configured`，不发请求、不消耗网络请求预算；Agent 仍可启动，`web_fetch` 可直接读取已知公网 URL。使用 `--web-search-provider brave|tavily` 与 `--web-search-key-file PATH` 配置 API 搜索；密钥文件应位于工作区外。仅提供 Key 时沿用 Brave。需要公开 HTML 搜索时可显式选择 `--web-search-provider bing`（不提供 Key），但它依赖页面结构，可能遇到限流或验证，不保证可用性。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
+
+恢复未完成 Turn 时，搜索服务须与原工具执行版本一致。升级前默认使用 Bing 的待恢复调用，需要显式指定 `--web-search-provider bing`；新版未配置状态使用独立执行版本，不会把旧调用静默切换到其他服务。Brave/Tavily 恢复仍须提供原服务与受保护密钥文件，密钥不会写入 Turn 记录。Python SDK 对应参数为 `web_search_provider` 与 `web_search_key_file`。
 
 网页读取保存来源、内容哈希及快照，长内容可以继续读取。成功取得文字不代表已经找到足够证据，HTTP 403、登录墙、内容截断和资源阻断应单独解释。
 
@@ -443,6 +483,10 @@ asyncio.run(main())
 子目录规则按文件工具的结构化目标、命令工作目录和声明的文件目标逐级发现。首次遇到尚未展示的规则，原动作会以 `project_instructions_required` 暂缓，下一次请求先展示规则，再由模型调整或重试动作。这也适用于直接写文件。运行在根目录的脚本如果间接访问其他子目录，Runtime 无法静态知道脚本的全部文件访问；需要显式指定相关工作目录或先读取对应目录的文件。项目规则是模型指导，不是文件系统权限的替代品。
 
 默认每轮最多 128 步，CLI 的 `--max-steps`（旧名 `--max-turns`）或 SDK 的 `max_steps` 可显式覆盖。每步展示剩余预算，最后两步提醒收尾。达到上限仍未结束时，状态保持失败，提供持久化的工具结果统计和修改保留说明；不会追加未授权的模型请求或把部分工作标成完成。历史任务继续使用原来冻结的预算与恢复策略。
+
+新任务还限制完成检查自身的连续续跑：完成建议被驳回后，最多允许 8 次没有工具调用或新用户输入的续跑；再次被驳回时，以 `completion_continuation_limit` 失败结束，保留最后一次检查的验证状态、范围和原因。期间实际验收通过即可正常完成，不会因为达到次数而拒绝成功，也不会绕过失败验收宣布完成。工具调用或新输入重置这一计数；它不判断任务进度，不限制合理的重复读取。所有续跑仍消耗同一份步数、token 和费用预算；旧 Turn 不会在恢复时被追加这一策略。
+
+工具结果落盘后的终止检查在正常执行和恢复时走同一路径。恢复不会重跑已提交的工具结果，也不会把同一个完成建议、裁决或恢复反馈重复计算。[终止机制与成熟实现依据](runtime-termination.md)记录了设计边界。
 
 `update_plan` 保存模型报告的步骤状态。模型标记完成不代表任务通过独立验收，运行结束也不会自动勾完剩余步骤：仍有未完成步骤时计划标记为 `needs_replan`，失败时标记为 `blocked` 并保留原步骤状态。普通 CLI 答复始终显示验证状态及范围；`not_evaluated` 表示本轮自然结束，但没有独立任务验收。
 

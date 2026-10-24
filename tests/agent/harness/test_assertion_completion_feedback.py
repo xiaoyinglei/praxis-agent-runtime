@@ -21,7 +21,9 @@ from tests.agent.harness.test_verification_feedback import _start_changed_turn
         "assert open('unrelated.txt').read() == 'other'",
     ],
 )
-def test_assertion_feedback_explains_missing_targets_and_supported_recovery(tmp_path: Path, code: str) -> None:
+def test_historical_assertion_feedback_explains_missing_targets_and_supported_recovery(
+    tmp_path: Path, code: str,
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "module.py").write_text("updated")
@@ -37,8 +39,9 @@ def test_assertion_feedback_explains_missing_targets_and_supported_recovery(tmp_
         text=True,
     )
     assert execution.returncode == 0, execution.stderr
-    observation = json.loads(report.read_text())
-    assert observation == {"assertions_passed": 1, "assertions_failed": 0}
+    assert not report.exists()
+    # Immutable pre-v11 results remain readable by the compatibility gate.
+    observation = {"assertions_passed": 1, "assertions_failed": 0, "scope": "entry_script"}
 
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)

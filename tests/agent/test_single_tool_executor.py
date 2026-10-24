@@ -1609,6 +1609,7 @@ def _concurrency_tools(
     events: list[str],
     active: list[int],
     maximum: list[int],
+    observe_workspace: bool = False,
 ) -> tuple[Tool, Tool]:
     def build(name: str, target: str, safe: bool) -> Tool:
         async def runner(_arguments: Mapping[str, Any]) -> object:
@@ -1624,10 +1625,10 @@ def _concurrency_tools(
             name,
             run=runner,
             resolve_use=lambda _arguments: ResolvedToolUse(
-                effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
-                targets=(ToolTarget(kind="workspace_path", value=target),),
+                effects=frozenset({ToolEffect.WRITE_WORKSPACE if observe_workspace else ToolEffect.NETWORK}),
+                targets=(ToolTarget(kind="workspace_path" if observe_workspace else "resource", value=target),),
             ),
-            static_effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
+            static_effects=frozenset({ToolEffect.WRITE_WORKSPACE if observe_workspace else ToolEffect.NETWORK}),
             concurrency_safe=safe,
         )
 
@@ -1643,16 +1644,18 @@ def _concurrency_tools(
 
 @pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("same_target", "second_safe", "expected_parallelism"),
+    ("same_target", "second_safe", "observe_workspace", "expected_parallelism"),
     [
-        pytest.param(False, True, 2, id="safe-distinct-targets"),
-        pytest.param(True, True, 1, id="conflicting-targets"),
-        pytest.param(False, False, 1, id="unsafe-tool"),
+        pytest.param(False, True, False, 2, id="safe-distinct-targets"),
+        pytest.param(True, True, False, 1, id="conflicting-targets"),
+        pytest.param(False, False, False, 1, id="unsafe-tool"),
+        pytest.param(False, True, True, 1, id="shared-workspace-observation"),
     ],
 )
 async def test_batch_parallelism_requires_safe_non_conflicting_tools(
     same_target: bool,
     second_safe: bool,
+    observe_workspace: bool,
     expected_parallelism: int,
 ) -> None:
     events: list[str] = []
@@ -1664,6 +1667,7 @@ async def test_batch_parallelism_requires_safe_non_conflicting_tools(
         events=events,
         active=active,
         maximum=maximum,
+        observe_workspace=observe_workspace,
     )
     executor = ToolExecutor({"one": one, "two": two})
     calls = (
@@ -1673,10 +1677,10 @@ async def test_batch_parallelism_requires_safe_non_conflicting_tools(
 
     executions = await executor.execute_batch(
         calls,
-        context=_context(
-            workspace_root=Path("/workspace"),
+        context=replace(_context(
+            workspace_root=Path("/workspace") if observe_workspace else None,
             allow_write=True,
-        ),
+        ), allow_web_tools=True, approval_mode="full"),
     )
 
     assert maximum[0] == expected_parallelism

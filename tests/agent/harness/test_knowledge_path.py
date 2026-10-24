@@ -189,11 +189,92 @@ async def test_configured_knowledge_uses_the_durable_harness_tool_path(
         }
         assert public_call.structured_output["citations"] == ("doc-1#fact",)
         assert public.usage.tool_calls == 1
-        assert public.groundedness is True
+        assert public.groundedness is False
         assert public.insufficient_evidence is False
         assert public.evidence[0].evidence_id == "evidence-1"
         assert public.citations[0].citation_anchor == "doc-1#fact"
         assert runtime.store.verify().valid is True
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("groundedness,insufficient", [(True, False), (False, True)])
+async def test_tool_grounding_flags_do_not_judge_the_final_answer(
+    tmp_path: Path, groundedness: bool, insufficient: bool,
+) -> None:
+    class ContradictingModel(KnowledgeModel):
+        async def dispatch(self, prepared, *, delta_sink: object = None):
+            response = await super().dispatch(prepared, delta_sink=delta_sink)
+            if response.tool_calls:
+                return response
+            return HarnessModelResponse(
+                text="The retained fact is false.", provider_response_id="contradiction",
+                usage={"input_tokens": 8, "output_tokens": 4},
+            )
+
+    async def search(_payload, execution_context):
+        return KnowledgeSearchOutput(
+            answer_text="The retained fact is true.",
+            groundedness_flag=groundedness,
+            insufficient_evidence=insufficient,
+        )
+
+    async with await Session.open(
+        database=tmp_path / "rollout.sqlite3", workspace=tmp_path,
+        model=ContradictingModel(), completion_gate=AcceptGroundedAnswer(),
+        knowledge_runner=search, knowledge_revision="fixture-v1",
+        knowledge_config={"corpus": "fixture"},
+    ) as runtime:
+        result = await runtime.submit("answer from knowledge")
+
+        assert result.answer == "The retained fact is false."
+        assert result.status == "done"
+        assert result.groundedness is False
+        assert result.insufficient_evidence is False
+        assert result.validation_status == "not_evaluated"
+        assert result.tool_calls[0].structured_output["groundedness_flag"] is groundedness
+        assert result.tool_calls[0].structured_output["insufficient_evidence"] is insufficient
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("doc_id", [None, "policy-v3", "001", 7])
+async def test_public_knowledge_evidence_preserves_document_identifiers(
+    tmp_path: Path, doc_id: str | int | None,
+) -> None:
+    from agent_runtime import Agent
+    from agent_runtime.knowledge import agent_citation_from_value
+
+    async def search(_payload, execution_context):
+        evidence = {
+            "evidence_id": "evidence-1", "citation_anchor": "fact#1",
+            "text": "The retained fact", "score": 0.9,
+        }
+        if doc_id is not None:
+            evidence["doc_id"] = doc_id
+        return KnowledgeSearchOutput.model_validate({
+            "results": [evidence],
+            "citations": ["fact#1"],
+        })
+
+    database = tmp_path / "rollout.sqlite3"
+    async with await Session.open(
+        database=database, workspace=tmp_path, model=KnowledgeModel(),
+        completion_gate=AcceptGroundedAnswer(), knowledge_runner=search,
+        knowledge_revision="fixture-v1", knowledge_config={"corpus": "fixture"},
+    ) as runtime:
+        result = await runtime.submit("answer from knowledge")
+        assert result.status == "done"
+        assert runtime.store.verify().valid is True
+
+    reader = Agent(checkpoint_db=database, workspace_path=tmp_path)
+    replayed = await reader.read_result(result.turn_id)
+    for projected in (result, replayed):
+        assert projected.evidence[0].doc_id == doc_id
+        assert type(projected.evidence[0].doc_id) is type(doc_id)
+        assert projected.citations[0].doc_id == doc_id
+        assert type(projected.citations[0].doc_id) is type(doc_id)
+    citation = agent_citation_from_value({"doc_id": doc_id})
+    assert citation.doc_id == doc_id
+    assert type(citation.doc_id) is type(doc_id)
 
 
 @pytest.mark.anyio

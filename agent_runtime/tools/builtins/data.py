@@ -5,6 +5,9 @@ import csv
 import hashlib
 import json
 import math
+import os
+import signal
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time
@@ -26,12 +29,19 @@ from agent_runtime.tools.tool import (
     json_schema_output,
     pydantic_input,
 )
-from agent_runtime.workspace import WorkspaceRuntime
+from agent_runtime.workspace import WorkspacePathError, WorkspaceRuntime
 
 _MAX_INSPECTABLE_BYTES = 200 * 1024 * 1024
 _MAX_CELL_CHARACTERS = 2_000
 _MAX_GRID_CELLS = 2_000
 _MAX_GRID_CHARACTERS = 32_000
+_MAX_WORKER_ERROR_CHARACTERS = 1_024
+_WORKER_FAILURE_MESSAGE = "Data inspection worker failed; no preview was produced."
+_WORKER_ERRORS: dict[str, type[Exception]] = {
+    "FileNotFoundError": FileNotFoundError,
+    "PermissionError": PermissionError,
+    "WorkspacePathError": WorkspacePathError,
+}
 
 
 @dataclass
@@ -154,7 +164,7 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
         arguments: Mapping[str, JsonValue],
     ) -> InspectDataFileOutput:
         request = InspectDataFileInput.model_validate(arguments)
-        return await asyncio.to_thread(_inspect_data_file, workspace, request)
+        return await _inspect_in_worker(workspace, request)
 
     return Tool(
         definition=ToolDefinition(
@@ -176,6 +186,7 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
                 "cells; max_characters bounds combined cell text and formats, with a hard cap of 32000 characters. "
                 "truncated_cells lists source row/column pairs with shortened text/format; retrieve full values "
                 "with execute_python and openpyxl if needed. Empty/out-of-range grids provide no content evidence. "
+                "Parsing runs in an isolated worker that is terminated on cancellation or timeout. "
                 "A successful inspection establishes parseability and the displayed content, not analysis correctness."
             ),
             input_schema=_INSPECT_INPUT_SCHEMA,
@@ -186,7 +197,7 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
         output_schema=_INSPECT_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
         resolve_use=lambda arguments: _resolve_inspect_use(workspace, arguments),
-        execution_revision="builtin-inspect-data-file-v2-raw-grids",
+        execution_revision="builtin-inspect-data-file-v4-worker-errors",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -194,6 +205,90 @@ def create_inspect_data_file_tool(workspace: WorkspaceRuntime) -> Tool:
         timeout_seconds=60.0,
         max_model_output_bytes=500_000,
     )
+
+
+async def _inspect_in_worker(
+    workspace: WorkspaceRuntime, request: InspectDataFileInput,
+) -> InspectDataFileOutput:
+    workspace.ensure_readable(workspace.resolve_path(request.path))
+    package_root = Path(__file__).resolve().parents[3]
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {str(package_root)!r}); "
+        "from agent_runtime.tools.builtins.data import _inspection_worker; _inspection_worker()"
+    )
+    permissions = workspace.permissions
+    payload = json.dumps({
+        "root": str(workspace.root.resolve()),
+        "permissions": permissions.model_dump(mode="json") if permissions is not None else None,
+        "request": request.model_dump(mode="json"),
+    }).encode()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-I", "-B", "-c", bootstrap,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
+        env={"PATH": os.defpath, "LANG": "C.UTF-8"}, cwd="/",
+    )
+    try:
+        output, _ = await process.communicate(payload)
+        if process.returncode:
+            raise RuntimeError(_WORKER_FAILURE_MESSAGE)
+        try:
+            response = json.loads(output)
+        except (ValueError, UnicodeError):
+            raise RuntimeError(_WORKER_FAILURE_MESSAGE) from None
+        if isinstance(response, dict) and "worker_error" in response:
+            error = response["worker_error"]
+            if isinstance(error, dict):
+                kind, message = error.get("type"), error.get("message")
+                if isinstance(kind, str) and kind in _WORKER_ERRORS and isinstance(message, str):
+                    raise _WORKER_ERRORS[kind](message[:_MAX_WORKER_ERROR_CHARACTERS])
+            raise RuntimeError(_WORKER_FAILURE_MESSAGE)
+        try:
+            return InspectDataFileOutput.model_validate(response)
+        except ValueError:
+            raise RuntimeError(_WORKER_FAILURE_MESSAGE) from None
+    finally:
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        cleanup = asyncio.create_task(process.wait())
+        interrupted = False
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                # Repeated interrupts must not abandon a still-unreaped parser.
+                interrupted = True
+                continue
+        cleanup.result()
+        if interrupted:
+            raise asyncio.CancelledError
+
+
+def _inspection_worker() -> None:
+    from agent_runtime.permission_policy import ResolvedPermissions
+
+    payload = json.load(sys.stdin)
+    raw_permissions = payload["permissions"]
+    permissions = None if raw_permissions is None else ResolvedPermissions.model_validate(raw_permissions)
+    workspace = WorkspaceRuntime(
+        root=Path(payload["root"]), is_temporary=False,
+        permission_provider=(lambda: permissions) if permissions else None,
+    )
+    try:
+        result = _inspect_data_file(workspace, InspectDataFileInput.model_validate(payload["request"]))
+    except (FileNotFoundError, PermissionError, WorkspacePathError) as error:
+        sys.stdout.write(json.dumps({"worker_error": {
+            "type": type(error).__name__, "message": str(error)[:_MAX_WORKER_ERROR_CHARACTERS],
+        }}))
+    except Exception:
+        # Only known resource errors cross the boundary. Parser/runtime failures
+        # must not leak arbitrary exception details, stderr or worker tracebacks.
+        sys.stdout.write(json.dumps({"worker_error": {"type": "worker_failed"}}))
+    else:
+        sys.stdout.write(result.model_dump_json())
 
 
 def _inspect_data_file(

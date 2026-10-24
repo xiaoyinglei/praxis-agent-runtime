@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -50,9 +51,6 @@ from agent_runtime.tools.tool import (
 )
 
 _TOOL_LEASE_GRACE_SECONDS = 30.0
-_INSPECTION_TOOL_NAMES = frozenset({"find_tools", "inspect_data_file", "list_files", "read_file", "search_text"})
-_INITIAL_INSPECTION_BUDGET = 12
-_PLANNED_INSPECTION_BUDGET = 20
 
 _ACTIVE_TOOL_BINDING: ContextVar[Mapping[str, Any] | None] = ContextVar("praxis_tool_binding", default=None)
 
@@ -74,66 +72,6 @@ def current_tool_turn_id() -> str:
     if turn_id is None:
         raise RuntimeError("tool runner is not executing inside a Harness Turn")
     return turn_id
-
-
-def tool_consumes_inspection_budget(tool: Tool) -> bool:
-    """Return whether a model-visible tool is inspection-first before an edit."""
-
-    return tool.definition.name in _INSPECTION_TOOL_NAMES or (
-        ToolEffect.READ_WORKSPACE in tool.static_effects and ToolEffect.WRITE_WORKSPACE not in tool.static_effects
-    )
-
-
-def _operation_consumes_inspection_budget(operation: object) -> bool:
-    tool_name = getattr(operation, "tool_name", None)
-    effects = getattr(operation, "effects", ())
-    return tool_name in _INSPECTION_TOOL_NAMES or (
-        ToolEffect.READ_WORKSPACE.value in effects and ToolEffect.WRITE_WORKSPACE.value not in effects
-    )
-
-
-def _uses_legacy_inspection_budget(store: RolloutStore, turn_id: str) -> bool:
-    policy = store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
-    return (
-        isinstance(policy, Mapping)
-        and policy.get("revision") != "completion-v2"
-        and policy.get("require_workspace_change") is True
-    )
-
-
-def _has_committed_workspace_change(store: RolloutStore, turn_id: str) -> bool:
-    result_items = {
-        item.item_id: item
-        for item in store.list_items(turn_id)
-        if item.kind == "tool_result" and item.status == "completed" and item.producer == "tool"
-    }
-    for operation in store.list_tool_operations(turn_id):
-        if operation.status != "succeeded" or operation.result_item_id is None:
-            continue
-        result = result_items.get(operation.result_item_id)
-        if result is None:
-            continue
-        metadata = result.payload.get("metadata")
-        if (
-            isinstance(metadata, Mapping)
-            and metadata.get("runtime_workspace_write") is True
-            and metadata.get("workspace_tree_changed") is True
-        ):
-            return True
-    return False
-
-
-def inspection_tools_available(store: RolloutStore, turn_id: str) -> bool:
-    if not _uses_legacy_inspection_budget(store, turn_id):
-        return True
-    operations = tuple(
-        operation for operation in store.list_tool_operations(turn_id) if operation.status == "succeeded"
-    )
-    if _has_committed_workspace_change(store, turn_id):
-        return True
-    planned = any(operation.tool_name == "update_plan" for operation in operations)
-    budget = _PLANNED_INSPECTION_BUDGET if planned else _INITIAL_INSPECTION_BUDGET
-    return sum(_operation_consumes_inspection_budget(operation) for operation in operations) < budget
 
 
 class ToolApprovalRequiredError(RuntimeError):
@@ -272,6 +210,64 @@ class ToolOrchestrator:
                 result={**dict(result), "metadata": dict(metadata)},
             ))
 
+    async def reconcile_command_observation(self, sessions: Any, turn_id: str) -> bool:
+        """Observe an authorized original job after its wait/status client died.
+
+        Called only while the Session holds execution ownership. This never
+        repeats a launch or cancellation, and a lost worker stays uncertain.
+        """
+        from agent_runtime.tools.builtins.command_sessions import ManageCommandInput
+        from agent_runtime.tools.builtins.shell import _normalize_command_output
+
+        pending = [item for item in self._store.list_interactions(turn_id)
+                   if item.kind == "tool_reconciliation" and item.status == "pending"]
+        if len(pending) != 1 or pending[0].operation_id is None:
+            return False
+        operation = self._store.read_tool_operation(pending[0].operation_id)
+        tool = self._tools.get("manage_command")
+        if (operation.tool_name != "manage_command" or operation.status != "unknown"
+                or tool is None or operation.execution_revision != tool.execution_revision):
+            return False
+        call = self._committed_tool_call(turn_id=turn_id, tool_call_id=operation.tool_call_id)
+        request = ManageCommandInput.model_validate(dict(call.arguments))
+        if request.action not in {"wait", "status"}:
+            return False
+        # Restoring repeats the launch receipt, digest, revision and permission
+        # checks. It attaches the same worker; it does not execute its command.
+        await self.restore_command_sessions(sessions, turn_id, include_terminal=True)
+        output = await sessions.manage(request.session_id, action="status", wait_seconds=0)
+        if (output.session_id != request.session_id
+                or output.sandbox_error not in {None, "command_permissions_changed"}):
+            return False
+        continuation = sessions.continuation(call.arguments, output.model_dump(mode="json"))
+        if continuation is None:
+            return False
+        normalized = _normalize_command_output(output)
+        metadata = await self._executor.observe_continuation(continuation)
+        result = ToolResult(
+            tool_call_id=call.tool_call_id, tool_name=call.tool_name,
+            structured_content=normalized.structured_content, is_error=normalized.is_error,
+            error_code=normalized.error_code, error_message=normalized.error_message,
+            truncated=output.truncated,
+            metadata={**dict(metadata), "reconciler_revision": "durable-command-observation-v1"},
+        )
+        status: Literal["succeeded", "failed", "cancelled"] = (
+            "cancelled" if output.status == "cancelled" else "failed" if result.is_error else "succeeded"
+        )
+
+        def commit() -> None:
+            with self._store._transaction():
+                self.reconcile(turn_id=turn_id, outcome=ToolReconciliationOutcome(status=status, result=result))
+                origin = metadata.get("runtime_workspace_origin_operation_id")
+                if continuation.terminal and isinstance(origin, str):
+                    self._store.record_tool_continuation(operation_id=origin, key=continuation.key, result={
+                        "structured_content": output.model_dump(mode="json"), "is_error": normalized.is_error,
+                        "error_code": normalized.error_code, "error_message": normalized.error_message,
+                        "metadata": dict(metadata),
+                    })
+        await self._commit(commit)
+        return True
+
     async def _commit[T](self, operation: Callable[[], T]) -> T:
         mutation = self._store.capture_mutation(operation)
         if self._event_dispatcher is not None:
@@ -393,24 +389,13 @@ class ToolOrchestrator:
         return result
 
     async def execute(self, *, turn_id: str, call: ToolCall) -> ToolResult:
+        task = asyncio.current_task()
+        cancellations = 0 if task is None else task.cancelling()
         await self._record_call(turn_id, call)
         if self.input_superseded(turn_id, call):
             return await self._discard_superseded(turn_id, call)
         execution_context = replace(self._context_for_call(turn_id, call),
                                     invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
-        inspection_block = self._inspection_budget_result(
-            turn_id=turn_id,
-            call=call,
-        )
-        if inspection_block is not None:
-            await self._commit(
-                lambda: self._store.record_tool_result(
-                    turn_id=turn_id,
-                    operation_id=None,
-                    result=_tool_result_payload(inspection_block),
-                )
-            )
-            return inspection_block
         tool = self._tools.get(call.tool_name)
         active_record: ToolExecutionRecord | None = None
 
@@ -459,6 +444,9 @@ class ToolOrchestrator:
             cancellation_sink=accept_cancelled,
         )
         await self._accept_execution(turn_id, call, execution, execution_context)
+        if (task is not None and task.cancelling() > cancellations
+                and self._store.read_turn(turn_id).status == "running"):
+            raise asyncio.CancelledError
         return execution.result
 
     async def _record_call(self, turn_id: str, call: ToolCall) -> None:
@@ -568,6 +556,8 @@ class ToolOrchestrator:
             )
 
         results: list[ToolResult] = []
+        task = asyncio.current_task()
+        cancellations = 0 if task is None else task.cancelling()
         offset = 0
         while offset < len(calls):
             end = offset + 1
@@ -575,10 +565,12 @@ class ToolOrchestrator:
                 while end < len(calls) and parallel_local(calls[end]) and calls[end].origin == calls[offset].origin:
                     end += 1
             # State-changing and remote calls are barriers. Resolve the next
-            # segment's context and inspection budget only after this one drains.
+            # segment's context only after this one drains.
             results.extend(await self._execute_batch_segment(turn_id=turn_id, calls=calls[offset:end]))
             if self._store.read_turn(turn_id).status != "running":
                 break
+            if task is not None and task.cancelling() > cancellations:
+                raise asyncio.CancelledError
             offset = end
         return tuple(results)
 
@@ -587,29 +579,8 @@ class ToolOrchestrator:
             return tuple([await self.execute(turn_id=turn_id, call=call) for call in calls])
         contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
         tools = tuple(self._tools.get(call.tool_name) for call in calls)
-        inspection_fits = True
-        if _uses_legacy_inspection_budget(self._store, turn_id) and not _has_committed_workspace_change(
-            self._store, turn_id
-        ):
-            operations = self._store.list_tool_operations(turn_id)
-            budget = (
-                _PLANNED_INSPECTION_BUDGET
-                if any(op.tool_name == "update_plan" and op.status == "succeeded" for op in operations)
-                else _INITIAL_INSPECTION_BUDGET
-            )
-            call_ids = {call.tool_call_id for call in calls}
-            used_or_pending = sum(
-                _operation_consumes_inspection_budget(op)
-                and (
-                    op.status == "succeeded" or (op.tool_call_id not in call_ids and op.status in {"ready", "running"})
-                )
-                for op in operations
-            )
-            demand = sum(tool is not None and tool_consumes_inspection_budget(tool) for tool in tools)
-            inspection_fits = used_or_pending + demand <= budget
         serial = (
-            not inspection_fits
-            or any(context != contexts[0] for context in contexts[1:])
+            any(context != contexts[0] for context in contexts[1:])
             or any(call.origin != calls[0].origin for call in calls[1:])
             or any(
                 tool is not None
@@ -782,6 +753,11 @@ class ToolOrchestrator:
         if tool is not None and tool.after_commit is not None and not execution.result.is_error:
             await tool.after_commit(call.arguments, execution.result.structured_content, record.operation_id)
         operation = self._store.read_tool_operation(record.operation_id)
+        # Historical gates retain their frozen verifier semantics. New Turns
+        # use explicit acceptance commands and do not mint inferred certificates.
+        policy = self._store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
+        if isinstance(policy, Mapping) and policy.get("revision") == "completion-v2":
+            return
         evidence = classify_tool_verification(
             tool_name=call.tool_name,
             arguments=call.arguments,
@@ -798,37 +774,6 @@ class ToolOrchestrator:
                     verified_resources=evidence.verified_resources,
                 )
             )
-
-    def _inspection_budget_result(
-        self,
-        *,
-        turn_id: str,
-        call: ToolCall,
-    ) -> ToolResult | None:
-        tool = self._tools.get(call.tool_name)
-        if tool is None or not tool_consumes_inspection_budget(tool):
-            return None
-        if inspection_tools_available(self._store, turn_id):
-            return None
-        operations = self._store.list_tool_operations(turn_id)
-        inspection_count = sum(
-            operation.status == "succeeded" and _operation_consumes_inspection_budget(operation)
-            for operation in operations
-        )
-        return ToolResult(
-            tool_call_id=call.tool_call_id,
-            tool_name=call.tool_name,
-            is_error=True,
-            error_code="inspection_budget_exhausted",
-            error_message=(
-                f"The Turn already completed {inspection_count} read-only "
-                "inspection calls without a workspace edit. Stop mapping the "
-                "repository: synthesize the evidence and call apply_patch, or "
-                "call update_plan once with a focused hypothesis to unlock the "
-                "final eight inspections. Do not retry this read unchanged."
-            ),
-            retryable=False,
-        )
 
     async def resume_approval(
         self, *, turn_id: str, decision: str,
@@ -1011,6 +956,8 @@ class ToolOrchestrator:
         record: ToolExecutionRecord,
     ) -> ToolResult:
         """Execute and publish after the caller has validated its approval scope."""
+        task = asyncio.current_task()
+        cancellations = 0 if task is None else task.cancelling()
         active_record: ToolExecutionRecord | None = None
         context = replace(context, invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
 
@@ -1037,6 +984,9 @@ class ToolOrchestrator:
                 progress=progress,
             )
 
+        async def accept(execution: ToolExecution) -> None:
+            await self._accept_execution(turn_id, call, _associate_execution(execution, turn_id), context)
+
         execution = await self._execute_in_turn(
             turn_id,
             call,
@@ -1045,12 +995,12 @@ class ToolOrchestrator:
             record_sink=persist,
             preflight_sink=capture_preflight,
             progress_sink=publish_progress,
+            cancellation_sink=accept,
         )
-        await self._commit_execution_result(
-            turn_id=turn_id,
-            call=call,
-            execution=execution,
-        )
+        await accept(execution)
+        if (task is not None and task.cancelling() > cancellations
+                and self._store.read_turn(turn_id).status == "running"):
+            raise asyncio.CancelledError
         return execution.result
 
     def reconcile(
@@ -1150,14 +1100,22 @@ class ToolOrchestrator:
                 self._lease_seconds,
                 tool.timeout_seconds + _TOOL_LEASE_GRACE_SECONDS,
             )
-            try:
-                claim = await self._commit(
-                    lambda: self._store.claim_tool_operation(
-                        operation_id=record.operation_id,
-                        worker_id=self._worker_id,
-                        lease_seconds=lease_seconds,
-                    )
+            def claim_operation() -> Any:
+                claim = self._store.claim_tool_operation(
+                    operation_id=record.operation_id, worker_id=self._worker_id,
+                    lease_seconds=lease_seconds,
                 )
+                if claim.fencing_token is None:
+                    raise RuntimeError("claimed tool operation has no fencing token")
+                if claim.attempt_count != record.attempt_count:
+                    raise RuntimeError("tool runner attempt count differs from durable claim")
+                # The claim is durable before event delivery can suspend. Keep
+                # its fence available even if that delivery is cancelled.
+                self._claims[record.operation_id] = (claim.claim_generation, claim.fencing_token)
+                return claim
+
+            try:
+                await self._commit(claim_operation)
             except ResourceClaimConflictError as conflict:
                 await self._commit(
                     lambda: self._store.reject_ready_tool_operation(
@@ -1169,14 +1127,6 @@ class ToolOrchestrator:
                     "resource_busy",
                     str(conflict),
                 ) from None
-            if claim.fencing_token is None:
-                raise RuntimeError("claimed tool operation has no fencing token")
-            if claim.attempt_count != record.attempt_count:
-                raise RuntimeError("tool runner attempt count differs from durable claim")
-            self._claims[record.operation_id] = (
-                claim.claim_generation,
-                claim.fencing_token,
-            )
             return
         if record.status in {
             ExecutionStatus.COMPLETED,

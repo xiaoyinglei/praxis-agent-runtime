@@ -31,6 +31,57 @@ class FetchThenAnswer(PatchThenAnswerModel):
 
 
 @pytest.mark.anyio
+async def test_product_unconfigured_search_reports_error_without_network_or_startup_failure(tmp_path, monkeypatch):
+    import agent_runtime.tools.web_http as http_module
+    from agent_runtime.tools.web_http import PublicWebClient
+
+    real_client = PublicWebClient
+    monkeypatch.setattr(http_module, "PublicWebClient", lambda **options: real_client(
+        **options, transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected network request"))))
+    database = tmp_path / "state.sqlite"
+    agent = Agent(workspace_path=tmp_path / "workspace", checkpoint_db=database, enable_workspace_mcp=False)
+    model = FetchThenAnswer({"query": "public docs"}, "web_search")
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    result = await agent.run("Search public docs", require_workspace_change=False)
+    assert result.status == "done"
+    with RolloutStore(database) as store:
+        outputs = [item.payload for item in store.list_items(result.turn_id) if item.kind == "tool_result"]
+        assert len(outputs) == 1
+        assert outputs[0]["error_code"] == "web_search_not_configured"
+        assert outputs[0]["structured_content"]["request_attempted"] is False
+        assert outputs[0]["structured_content"]["request_budget"]["used"] == 0
+        assert store.list_tool_operations(result.turn_id)[0].effects == ()
+
+
+@pytest.mark.anyio
+async def test_explicit_bing_resume_preserves_original_search_binding(tmp_path, monkeypatch):
+    import agent_runtime.tools.web_http as http_module
+    from agent_runtime.tools.web_http import PublicWebClient
+
+    hits = []
+    real_client = PublicWebClient
+    monkeypatch.setattr(http_module, "PublicWebClient", lambda **options: real_client(
+        **options, transport=httpx.MockTransport(lambda request: hits.append(request) or httpx.Response(
+            200, text='<ol id="b_results"><li class="b_no">No results</li></ol>',
+            headers={"content-type": "text/html"}))))
+    options = dict(workspace_path=tmp_path / "workspace", checkpoint_db=tmp_path / "state.sqlite",
+                   enable_workspace_mcp=False, web_search_provider="bing")
+    first = Agent(**options)
+    monkeypatch.setattr(first, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
+    paused = await first.run("Search public docs", require_workspace_change=False)
+    assert paused.status == "paused"
+    assert hits == []
+    second = Agent(**options)
+    monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
+    resumed = await second.resume(paused.turn_id, "allow_once")
+    assert resumed.status == "done"
+    assert len(hits) == 1 and hits[0].url.host == "www.bing.com"
+    with RolloutStore(options["checkpoint_db"]) as store:
+        operation = store.list_tool_operations(resumed.turn_id)[0]
+        assert operation.execution_revision == "builtin-public-web-search-bing-v5"
+
+
+@pytest.mark.anyio
 async def test_product_fetch_persists_source_and_reopens_without_network(tmp_path, monkeypatch):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime.tools.web_http import PublicWebClient

@@ -1,16 +1,37 @@
-# Public Agent default. Add other cloud/local models with agent model add.
-# Research and developer models remain in configs/models.yaml.
+# Cloud snapshot: 2026-10-22; maintained in configs/model-catalog.yaml.
+# Regenerate with: uv run python scripts/sync_model_catalog.py
+# Generated public/wheel catalog. Do not edit cloud definitions here.
 providers:
   deepseek:
     protocol: openai_compatible
     location: cloud
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
+  groq:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+  kimi:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+  minimax:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.minimax.cn/v1
+    api_key_env: MINIMAX_API_KEY
+  qwen:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
 models:
   deepseek-flash:
     capability: chat
-    continuation_summary_role: assistant
     provider: deepseek
+    continuation_summary_role: assistant
     tokenizer_model: deepseek-v4-official
     context_window_tokens: 1048576
     max_output_tokens: 393216
@@ -22,10 +43,124 @@ models:
       default_effort: high
       thinking_toggle: thinking
     defaults:
+      temperature: 1.0
+      top_p: 0.95
       max_output_tokens: 65536
       provider_options:
         thinking:
           type: enabled
+  deepseek-v4-pro:
+    capability: chat
+    provider: deepseek
+    context_window_tokens: 1048576
+    max_output_tokens: 393216
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+      thinking_toggle: thinking
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+      provider_options:
+        thinking:
+          type: enabled
+  kimi-k3:
+    capability: chat
+    provider: kimi
+    context_window_tokens: 1048576
+    max_output_tokens: 1048576
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  qwen3.8-max:
+    capability: chat
+    provider: qwen
+    context_window_tokens: 983616
+    max_output_tokens: 131072
+    supports_structured_output: true
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - xhigh
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  qwen3.8-flash:
+    capability: chat
+    provider: qwen
+    context_window_tokens: 983616
+    max_output_tokens: 131072
+    supports_structured_output: true
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - xhigh
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  MiniMax-M3.1-Flash:
+    capability: chat
+    provider: minimax
+    context_window_tokens: 1000000
+    max_output_tokens: 524288
+    supports_structured_output: false
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - high
+      - xhigh
+      - max
+      default_effort: high
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  openai/gpt-oss-120b:
+    capability: chat
+    provider: groq
+    tokenizer_model: gpt-oss-120b
+    context_window_tokens: 131072
+    max_output_tokens: 65536
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - high
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 8192
+  llama-3.3-70b-versatile:
+    capability: chat
+    provider: groq
+    context_window_tokens: 131072
+    max_output_tokens: 32768
+    supports_structured_output: false
+    reasoning:
+      supported_efforts: []
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 8192
 defaults:
   primary_model: deepseek-flash
 generation:

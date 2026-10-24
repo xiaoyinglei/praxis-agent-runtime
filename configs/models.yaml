@@ -1,56 +1,43 @@
-# Model catalog: single source of truth for model configuration.
-#
-# Design rules:
-#   1. Business code MUST NOT reference provider names, base_url, api_key, or raw model names directly.
-#   2. Resolve models only through rag.models.runtime.resolve_runtime_config().
-#   3. Provider = how to connect.
-#   4. Model = what model to use.
-#   5. Generation = how to use the selected model for a task.
-#   6. Budgets/tokenizer = runtime limits, not model identity.
-
-# ---------------------------------------------------------------------------
-# Providers: connection-level configuration.
-# ---------------------------------------------------------------------------
+# Cloud snapshot: 2026-10-22; maintained in configs/model-catalog.yaml.
+# Regenerate with: uv run python scripts/sync_model_catalog.py
+# Local and older research entries are preserved; they are outside this snapshot.
 providers:
   mlx:
     location: local
-
   deepseek:
     protocol: openai_compatible
     location: cloud
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
-
   groq:
     protocol: openai_compatible
     location: cloud
     base_url: https://api.groq.com/openai/v1
     api_key_env: GROQ_API_KEY
-
   kimi:
     protocol: openai_compatible
     location: cloud
     base_url: https://api.moonshot.cn/v1
     api_key_env: MOONSHOT_API_KEY
-
   mimo:
     protocol: openai_compatible
     location: cloud
     base_url: https://token-plan-cn.xiaomimimo.com/v1
     api_key_env: MIMO_API_KEY
-
   sentence_transformers:
     protocol: sentence_transformers
     location: local
-
-
-# ---------------------------------------------------------------------------
-# Models: model identity only.
-# ---------------------------------------------------------------------------
+  minimax:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.minimax.cn/v1
+    api_key_env: MINIMAX_API_KEY
+  qwen:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
 models:
-  # -------------------------------------------------------------------------
-  # Chat models: local MLX.
-  # -------------------------------------------------------------------------
   mlx-community/Qwen3.5-9B-4bit:
     capability: chat
     provider: mlx
@@ -59,82 +46,34 @@ models:
     context_window_tokens: 262144
     reasoning:
       thinking_toggle: chat_template_kwargs
-    # MLX buffers a complete tool call before sending its arguments.
     timeout_seconds: 300
     defaults:
       provider_options:
         chat_template_kwargs:
           enable_thinking: true
-
   mlx-community/gemma-4-26b-a4b-it-4bit:
     capability: chat
     provider: mlx
     protocol: openai_compatible
     base_url: http://127.0.0.1:8080/v1
     context_window_tokens: 262144
-
-  # -------------------------------------------------------------------------
-  # Chat models: DeepSeek.
-  # -------------------------------------------------------------------------
-  # DeepSeek V4.1 Flash, official API identifier as of 2026-09-21.
-  deepseek-flash:
-    capability: chat
-    # Continuation memory uses this explicit wire role, frozen per Turn.
-    continuation_summary_role: assistant
-    provider: deepseek
-    tokenizer_model: deepseek-v4-official
-    context_window_tokens: 1048576
-    # Official model metadata checked 2026-10-18; hard capacity, not the requested allowance.
-    max_output_tokens: 393216
-    reasoning:
-      supported_efforts: [low, high, max]
-      default_effort: high
-      thinking_toggle: thinking
-    defaults:
-      max_output_tokens: 65536
-      provider_options:
-        thinking:
-          type: enabled
-
   deepseek-chat:
     capability: chat
     provider: deepseek
     context_window_tokens: 128000
-
   deepseek-reasoner:
     capability: chat
     provider: deepseek
     context_window_tokens: 128000
-
-  # Keep only if your DeepSeek account actually supports this model.
   deepseek-v4-flash:
     capability: chat
     provider: deepseek
     context_window_tokens: 128000
     experimental: true
-
-  # -------------------------------------------------------------------------
-  # Chat models: Groq.
-  # -------------------------------------------------------------------------
-  openai/gpt-oss-120b:
-    capability: chat
-    provider: groq
-    tokenizer_model: gpt-oss-120b
-    context_window_tokens: 131072
-
-  llama-3.3-70b-versatile:
-    capability: chat
-    provider: groq
-    context_window_tokens: 32768
-
-  # -------------------------------------------------------------------------
-  # Chat models: MiMo.
-  # -------------------------------------------------------------------------
   mimo-v2.5-pro:
     capability: chat
     provider: mimo
     context_window_tokens: 256000
-
   kimi-k2.6:
     capability: chat
     provider: kimi
@@ -145,129 +84,207 @@ models:
       provider_options:
         thinking:
           type: enabled
-
-  # -------------------------------------------------------------------------
-  # Embedding models.
-  # -------------------------------------------------------------------------
   mlx-community/Qwen3-Embedding-8B-4bit-DWQ:
     capability: embedding
     provider: mlx
     protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-8B-4bit-DWQ
-
   mlx-community/Qwen3-Embedding-4B-4bit-DWQ:
     capability: embedding
     provider: mlx
     protocol: mlx_embedding
     embedding_space: mlx/Qwen3-Embedding-4B-4bit-DWQ
-
-  # -------------------------------------------------------------------------
-  # Reranker models.
-  # -------------------------------------------------------------------------
   BAAI/bge-reranker-v2-m3:
     capability: reranker
     provider: sentence_transformers
-
   Qwen/Qwen3-Reranker-4B:
     capability: reranker
     provider: sentence_transformers
-
-
-# ---------------------------------------------------------------------------
-# Defaults: what to use when no explicit model is requested.
-# ---------------------------------------------------------------------------
+  deepseek-flash:
+    capability: chat
+    provider: deepseek
+    continuation_summary_role: assistant
+    tokenizer_model: deepseek-v4-official
+    context_window_tokens: 1048576
+    max_output_tokens: 393216
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+      thinking_toggle: thinking
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+      provider_options:
+        thinking:
+          type: enabled
+  deepseek-v4-pro:
+    capability: chat
+    provider: deepseek
+    context_window_tokens: 1048576
+    max_output_tokens: 393216
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+      thinking_toggle: thinking
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+      provider_options:
+        thinking:
+          type: enabled
+  kimi-k3:
+    capability: chat
+    provider: kimi
+    context_window_tokens: 1048576
+    max_output_tokens: 1048576
+    reasoning:
+      supported_efforts:
+      - low
+      - high
+      - max
+      default_effort: high
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  qwen3.8-max:
+    capability: chat
+    provider: qwen
+    context_window_tokens: 983616
+    max_output_tokens: 131072
+    supports_structured_output: true
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - xhigh
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  qwen3.8-flash:
+    capability: chat
+    provider: qwen
+    context_window_tokens: 983616
+    max_output_tokens: 131072
+    supports_structured_output: true
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - xhigh
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  MiniMax-M3.1-Flash:
+    capability: chat
+    provider: minimax
+    context_window_tokens: 1000000
+    max_output_tokens: 524288
+    supports_structured_output: false
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - high
+      - xhigh
+      - max
+      default_effort: high
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 65536
+  openai/gpt-oss-120b:
+    capability: chat
+    provider: groq
+    tokenizer_model: gpt-oss-120b
+    context_window_tokens: 131072
+    max_output_tokens: 65536
+    reasoning:
+      supported_efforts:
+      - low
+      - medium
+      - high
+      default_effort: medium
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 8192
+  llama-3.3-70b-versatile:
+    capability: chat
+    provider: groq
+    context_window_tokens: 131072
+    max_output_tokens: 32768
+    supports_structured_output: false
+    reasoning:
+      supported_efforts: []
+    defaults:
+      temperature: 1.0
+      top_p: 0.95
+      max_output_tokens: 8192
 defaults:
-  # Product runs use the selected cloud model when --model is omitted.
-  # Benchmark release lanes remain explicit in their manifest.
   primary_model: deepseek-flash
-
   embedding_model: mlx-community/Qwen3-Embedding-8B-4bit-DWQ
   reranker_model: Qwen/Qwen3-Reranker-4B
-
-
-# ---------------------------------------------------------------------------
-# Generation profiles: parameters for the one selected chat model.
-# Model selection happens only through the top-level model ID.
-# ---------------------------------------------------------------------------
 generation:
   summary:
     max_tokens: 1024
     temperature: 0.3
-
   answer:
     max_tokens: 4096
     temperature: 0.7
-
   planner:
     max_tokens: 2048
     temperature: 0.3
-
   synthesize:
     max_tokens: 4096
     temperature: 0.5
-
   factcheck:
     max_tokens: 2048
     temperature: 0.1
-
   tool_decision:
     max_tokens: 4096
     temperature: 0.2
-
   final_answer:
     max_tokens: 4096
     temperature: 0.5
-
-
-# ---------------------------------------------------------------------------
-# LLM stage budgets: input/output budget by internal LLM stage.
-# ---------------------------------------------------------------------------
-# Automatic working-history compaction target, independent of provider capacity.
-# null retains the model-derived threshold; large protected user inputs remain usable.
 auto_compact_token_limit: 65536
-
 llm_budgets:
-  # Agent checkpoints have their own output allowance, independent of RAG summaries.
   context_compaction:
     max_input_tokens: null
     max_output_tokens: 8192
     safety_margin_tokens: 512
-
-  # One Harness sampling round may produce tool calls or a final answer.
-  # New requests use user/model output settings; this is the conservative fallback.
-  # Legacy frozen requests retain their original stage ceiling.
-  # A null input cap uses the model window after output and safety reserves.
-  # Set a positive integer only to impose an additional per-request input cap.
   agent_step:
     max_input_tokens: null
     max_output_tokens: 32768
     safety_margin_tokens: 512
-
   retrieval_summary:
     max_input_tokens: 6000
     max_output_tokens: 1024
     safety_margin_tokens: 512
-
   llm_summarize:
     max_input_tokens: 16000
     max_output_tokens: 2048
     safety_margin_tokens: 512
-
   llm_generate:
     max_input_tokens: 16000
     max_output_tokens: 3072
     safety_margin_tokens: 512
-
   rag_answer:
     max_input_tokens: 16000
     max_output_tokens: 4096
     safety_margin_tokens: 512
-
-
-# ---------------------------------------------------------------------------
-# Tokenizer/chunking defaults.
-# Model context window should come from models.<model_id>.context_window_tokens.
-# ---------------------------------------------------------------------------
 tokenizer:
   tokenizer_backend: auto
   chunk_token_size: 480

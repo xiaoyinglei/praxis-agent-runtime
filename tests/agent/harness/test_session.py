@@ -1289,7 +1289,12 @@ def test_completion_gate_continue_feeds_the_gap_back_into_the_same_turn(
             item.payload["action"] for item in store.list_items(result.turn_id) if item.kind == "completion_decision"
         ] == ["continue", "accept"]
         [feedback] = [item for item in store.list_items(result.turn_id) if item.kind == "completion_feedback"]
-        assert feedback.payload == {"text": "verification evidence is missing"}
+        first_decision = next(item for item in store.list_items(result.turn_id) if item.kind == "completion_decision")
+        assert feedback.payload == {
+            "text": "verification evidence is missing", "source_item_id": first_decision.item_id,
+        }
+        proposal = store.read_item(first_decision.payload["proposal_item_id"])
+        assert proposal.payload["source_item_id"] == store.list_model_operations(result.turn_id)[0].response_item_id
         assert store.verify().valid is True
 
 

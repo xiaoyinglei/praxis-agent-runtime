@@ -27,6 +27,7 @@ from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.protocol import (
     DEFAULT_MAX_STEPS,
     BindingProvider,
+    CompletionDecision,
     CompletionGate,
     CompletionProposal,
     ContextBudgetExceededError,
@@ -244,14 +245,18 @@ class TurnExecutor:
         project_instructions = restored_instructions(
             turn_context.binding_manifest, self._store.list_items(turn_context.turn_id),
         )
-        if project_instructions is not None and project_instructions["entries"]:
+        execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
+        append_context = execution_policy.get("context_updates") == "append-v1"
+        if not append_context and project_instructions is not None and project_instructions["entries"]:
             messages = (HarnessMessage(role="context", content=instruction_context(project_instructions)), *messages)
         snapshot = turn_context.binding_manifest.get("memory_snapshot")
-        if snapshot is not None:
+        if not append_context and snapshot is not None:
             from agent_runtime.harness.memory import memory_navigation
 
             messages = (HarnessMessage(role="context", content=memory_navigation(snapshot)), *messages)
-        execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
+        context_updates: tuple[str, ...] = ()
+        if append_context:
+            messages, context_updates = self._append_context_updates(messages, project_instructions, snapshot)
         append_state = execution_policy.get("cache_continuity") == "append-v1"
         runtime_capacity = execution_policy.get("revision") == "working-context-v2"
         clock = capture_runtime_clock()
@@ -350,6 +355,9 @@ class TurnExecutor:
         # Freeze clock facts in the saved step, just like its messages and tools.
         # Repreparing/recovering this request must not read a different clock.
         binding["runtime_clock"] = clock
+        binding.pop("context_updates", None)
+        if context_updates:
+            binding["context_updates"] = context_updates
         binding.pop("runtime_context_update", None)
         if update is not None:
             binding["runtime_context_update"] = update
@@ -366,6 +374,35 @@ class TurnExecutor:
             output_token_limit=turn_context.binding_manifest.get("memory_output_tokens"),
             input_revision=input_revision,
         )
+
+    @staticmethod
+    def _append_context_updates(
+        messages: tuple[HarnessMessage, ...],
+        instructions: Mapping[str, Any] | None,
+        memory: Mapping[str, Any] | None,
+    ) -> tuple[tuple[HarnessMessage, ...], tuple[str, ...]]:
+        """Diff the visible baseline, including after compaction, without writing it.
+
+        Updates become history only when the model request is committed. They
+        replace earlier snapshots of the same kind, rather than modifying an
+        already dispatched prefix. Frozen legacy Turns retain their old layout.
+        """
+        from agent_runtime.harness.memory import memory_navigation
+        from agent_runtime.project_instructions import instruction_context
+
+        updates = []
+        for marker, content, meaningful in (
+            ("Project instructions (", None if instructions is None else
+             instruction_context(instructions, replaces_previous=True),
+             bool(instructions and instructions["entries"])),
+            ("Cross-chat memory (", None if memory is None else memory_navigation(memory, include_version=False),
+             memory is not None),
+        ):
+            previous = next((message.content for message in reversed(messages)
+                             if message.role == "context" and message.content.startswith(marker)), None)
+            if content is not None and content != previous and (meaningful or previous is not None):
+                updates.append(content)
+        return (*messages, *(HarnessMessage(role="context", content=update) for update in updates)), tuple(updates)
 
     def _append_runtime_state(
         self, turn: TurnContext, messages: tuple[HarnessMessage, ...], *,
@@ -552,6 +589,8 @@ class TurnExecutor:
             prepared,
             request_ref={
                 **prepared.request_ref,
+                **({"context_updates": list(step.binding_manifest["context_updates"])}
+                   if step.purpose == "agent_step" and step.binding_manifest.get("context_updates") else {}),
                 **({"runtime_context_update": step.binding_manifest["runtime_context_update"]}
                    if step.purpose == "agent_step" and step.binding_manifest.get("runtime_context_update") else {}),
                 "purpose": step.purpose,
@@ -825,10 +864,14 @@ class TurnExecutor:
                     )
                 raise RuntimeError("committed tool call has an uncertain operation; use tool reconciliation")
             result_item = self._store.read_item(tool_operation.result_item_id)
+            result_payload = result_item.payload
+            if result_item.kind == "tool_reconciliation" and result_item.producer == "reconciler":
+                result_payload = result_item.payload.get("result", {})
             if (
-                result_item.kind != "tool_result"
+                result_item.kind not in {"tool_result", "tool_reconciliation"}
                 or result_item.status != "completed"
-                or result_item.payload.get("tool_call_id") != call.id
+                or not isinstance(result_payload, Mapping)
+                or result_payload.get("tool_call_id") != call.id
             ):
                 raise RuntimeError("committed tool result linkage is malformed")
         token_budget = turn.binding_manifest.get("model_token_budget_total")
@@ -860,6 +903,11 @@ class TurnExecutor:
             )
             if handled is not None:
                 return handled
+        handled = await self._after_tool_batch(
+            thread_id=turn.thread_id, turn_id=turn_id, source_item_id=operation.response_item_id,
+        )
+        if handled is not None:
+            return handled
         return await self.run_turn(
             turn_context,
             start_step=self.agent_step_count(turn_id) + 1,
@@ -2152,7 +2200,7 @@ class TurnExecutor:
             if self._tool_orchestrator is None:
                 raise RuntimeError("model requested tools but no ToolOrchestrator exists")
             try:
-                results = await self._tool_orchestrator.execute_batch(
+                await self._tool_orchestrator.execute_batch(
                     turn_id=turn_id,
                     calls=tuple(_aci_tool_call(call, prepared.request_ref) for call in response.tool_calls),
                 )
@@ -2174,59 +2222,97 @@ class TurnExecutor:
                     status="paused",
                     interaction_id=pause.interaction_id,
                 )
-            for call, result in zip(response.tool_calls, results, strict=False):
-                turn = self._store.read_turn(turn_id)
-                if turn.status == "paused":
-                    pending = [
-                        interaction
-                        for interaction in self._store.list_interactions(turn_id)
-                        if interaction.status == "pending"
-                    ]
-                    if len(pending) != 1:
-                        raise RuntimeError("paused tool execution has no unique interaction")
-                    return TurnResult(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        answer=None,
-                        status="paused",
-                        interaction_id=pending[0].request_id,
-                    )
-                if (result.is_error and result.error_code != "input_superseded"
-                        and self._repeated_tool_failure(turn_id)):
-                    feedback = json.dumps({
-                        "reason_code": "repeated_tool_failure_recovery",
-                        "message": "The same deterministic tool failure has repeated without progress. "
-                        "Inspect its resource or correct the request before retrying. Changing only paging or "
-                        "output limits cannot repair a missing resource. You have one recovery opportunity; "
-                        "use a different justified action or explain the blocker honestly.",
-                    }, sort_keys=True)
-                    recovery_used = any(
-                        item.kind == "completion_feedback" and item.payload.get("text") == feedback
-                        for item in self._store.list_items(turn_id)
-                    )
-                    if (turn.binding_manifest.get("tool_failure_recovery") == {"revision": "one-replan-v1"}
-                            and not recovery_used):
-                        def record_recovery_feedback(reason: str = feedback) -> ItemSnapshot:
-                            return self._store.record_completion_feedback(turn_id=turn_id, reason=reason)
-
-                        await self._commit(record_recovery_feedback)
-                        return None
-                    return await self._fail_turn(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        reason_code="repeated_tool_failure",
-                        message=(
-                            f"未观察到有效进展，工具 {call.name} 重复发生同一确定性故障（{result.error_code}）："
-                            f"{result.error_message}。本轮恢复机会已用尽，已停止重复调用。"
-                        ),
-                    )
-            return None
+            return await self._after_tool_batch(
+                thread_id=thread_id, turn_id=turn_id,
+                source_item_id=self._store.list_model_operations(turn_id)[-1].response_item_id,
+            )
         return await self._finish_answer(
             thread_id=thread_id,
             turn_id=turn_id,
             answer=response.text,
             input_revision=revision,
+            source_item_id=self._store.list_model_operations(turn_id)[-1].response_item_id,
         )
+
+    async def _after_tool_batch(
+        self, *, thread_id: str, turn_id: str, source_item_id: str | None,
+    ) -> TurnResult | None:
+        """Apply the same durable post-tool transition during execution and recovery."""
+        turn = self._store.read_turn(turn_id)
+        if turn.status == "paused":
+            pending = [i for i in self._store.list_interactions(turn_id) if i.status == "pending"]
+            if len(pending) != 1:
+                raise RuntimeError("paused tool execution has no unique interaction")
+            return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None,
+                              status="paused", interaction_id=pending[0].request_id)
+        if source_item_id is None:
+            raise RuntimeError("tool batch has no committed model response")
+        operation = self._store.list_model_operations(turn_id)[-1]
+        revision = self._store.request_input_revision(turn_id, operation.request_ref)
+        if revision is not None and revision != self._store.user_input_revision(turn_id):
+            return None
+        items = self._store.list_items(turn_id)
+        if any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == source_item_id
+               for i in items):
+            return None  # A committed recovery grant belongs to this batch, not a new attempt.
+        call_ids = {call["id"] for call in self._store.read_item(source_item_id).payload.get("tool_calls", ())}
+        failure = next((result for _, result in reversed(self._canonical_tool_results(turn_id))
+                        if result.get("tool_call_id") in call_ids and result.get("is_error") is True
+                        and result.get("error_code") != "input_superseded"), None)
+        if failure is None or not self._repeated_tool_failure(turn_id):
+            return None
+        feedback = json.dumps({
+            "reason_code": "repeated_tool_failure_recovery",
+            "message": "The same deterministic tool failure has repeated without progress. "
+            "Inspect its resource or correct the request before retrying. Changing only paging or "
+            "output limits cannot repair a missing resource. You have one recovery opportunity; "
+            "use a different justified action or explain the blocker honestly.",
+        }, sort_keys=True)
+        recovery_used = any(i.kind == "completion_feedback" and i.payload.get("text") == feedback for i in items)
+        if (turn.binding_manifest.get("tool_failure_recovery") == {"revision": "one-replan-v1"}
+                and not recovery_used):
+            await self._commit(lambda: self._store.record_completion_feedback(
+                turn_id=turn_id, reason=feedback, source_item_id=source_item_id,
+            ))
+            return None
+        return await self._fail_turn(
+            thread_id=thread_id, turn_id=turn_id, reason_code="repeated_tool_failure",
+            message=(f"未观察到有效进展，工具 {failure.get('tool_name')} 重复发生同一确定性故障"
+                     f"（{failure.get('error_code')}）：{failure.get('error_message')}。"
+                     "本轮恢复机会已用尽，已停止重复调用。"),
+        )
+
+    def _canonical_tool_results(self, turn_id: str) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """Read the accepted outcome; keep superseded unknowns only in the audit ledger."""
+        operations = {op.tool_call_id: op for op in self._store.list_tool_operations(turn_id)}
+        results: list[tuple[str, Mapping[str, Any]]] = []
+        for item in self._store.list_items(turn_id):
+            if item.status != "completed":
+                continue
+            payload = item.payload
+            if item.kind == "tool_reconciliation" and item.producer == "reconciler":
+                reconciled = item.payload.get("result")
+                if not isinstance(reconciled, Mapping):
+                    continue
+                payload = reconciled
+                call_id = payload.get("tool_call_id")
+                if not isinstance(call_id, str):
+                    continue
+                operation = operations.get(call_id)
+                if operation is None or operation.result_item_id != item.item_id:
+                    continue
+            elif item.kind == "tool_result":
+                call_id = payload.get("tool_call_id")
+                if not isinstance(call_id, str):
+                    continue
+                operation = operations.get(call_id)
+                if (operation is not None and operation.result_item_id is not None
+                        and operation.result_item_id != item.item_id):
+                    continue
+            else:
+                continue
+            results.append((item.item_id, payload))
+        return tuple(results)
 
     def _repeated_tool_failure(self, turn_id: str) -> bool:
         """Use committed results so a process restart cannot reset the failure streak."""
@@ -2236,15 +2322,12 @@ class TurnExecutor:
             for item in items
             if item.kind == "tool_call" and item.status == "completed"
         }
-        results = [item.payload for item in items if item.kind == "tool_result" and item.status == "completed"]
+        canonical = self._canonical_tool_results(turn_id)
+        results = [result for _, result in canonical]
         if len(results) < 3:
             return False
         operations = {op.result_item_id: op for op in self._store.list_tool_operations(turn_id)}
-        result_items = {
-            item.payload.get("tool_call_id"): item.item_id
-            for item in items
-            if item.kind == "tool_result" and item.status == "completed"
-        }
+        result_items = {result.get("tool_call_id"): item_id for item_id, result in canonical}
         target = None
         repeats = 0
         for result in reversed(results):
@@ -2329,41 +2412,59 @@ class TurnExecutor:
         turn_id: str,
         answer: str,
         input_revision: int | None = None,
+        source_item_id: str | None = None,
     ) -> TurnResult | None:
         if input_revision is not None and self._store.user_input_revision(turn_id) != input_revision:
             return None
-        proposal_item = await self._commit(
-            lambda: self._store.record_final_proposal(
-                turn_id=turn_id,
-                answer=answer,
+        items = self._store.list_items(turn_id)
+        proposal_item = next((i for i in items if i.kind == "final_proposal" and source_item_id is not None
+                              and i.payload.get("source_item_id") == source_item_id), None)
+        if proposal_item is None:
+            proposal_item = await self._commit(
+                lambda: self._store.record_final_proposal(
+                    turn_id=turn_id, answer=answer, source_item_id=source_item_id,
+                )
             )
-        )
         proposal = CompletionProposal(
             thread_id=thread_id,
             turn_id=turn_id,
             item_id=proposal_item.item_id,
             answer=answer,
         )
-        decision = self._completion_gate.evaluate(proposal)
-        await self._commit(
-            lambda: self._store.record_completion_decision(
-                turn_id=turn_id,
-                proposal_item_id=proposal.item_id,
-                action=decision.action,
-                reason=decision.reason,
-                validation_status=decision.validation_status,
-                validation_scope=decision.validation_scope,
+        decision_item = next((i for i in items if i.kind == "completion_decision"
+                              and i.payload.get("proposal_item_id") == proposal.item_id), None)
+        if decision_item is None:
+            decision = self._completion_gate.evaluate(proposal)
+            if decision.action == "continue" and self._completion_continuation_limit_reached(turn_id):
+                decision = replace(
+                    decision, action="fail", reason_code="completion_continuation_limit",
+                    reason=("Completion checks exhausted their consecutive continuation allowance without a tool "
+                            "exchange or new user input. The last check did not accept the result: " + decision.reason),
+                )
+            decision_item = await self._commit(
+                lambda: self._store.record_completion_decision(
+                    turn_id=turn_id,
+                    proposal_item_id=proposal.item_id,
+                    action=decision.action,
+                    reason=decision.reason,
+                    validation_status=decision.validation_status,
+                    validation_scope=decision.validation_scope,
+                    reason_code=decision.reason_code,
+                )
             )
-        )
+        else:
+            decision = CompletionDecision(**{key: value for key, value in decision_item.payload.items()
+                                             if key != "proposal_item_id"})
         if input_revision is not None and self._store.user_input_revision(turn_id) != input_revision:
             return None
         if decision.action == "continue":
-            await self._commit(
-                lambda: self._store.record_completion_feedback(
-                    turn_id=turn_id,
-                    reason=decision.reason,
+            if not any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == decision_item.item_id
+                       for i in items):
+                await self._commit(
+                    lambda: self._store.record_completion_feedback(
+                        turn_id=turn_id, reason=decision.reason, source_item_id=decision_item.item_id,
+                    )
                 )
-            )
             return None
         if decision.action == "pause":
             interaction = await self._commit(
@@ -2383,7 +2484,7 @@ class TurnExecutor:
             await self._commit(
                 lambda: self._store.fail_turn(
                     turn_id=turn_id,
-                    reason_code="completion_rejected",
+                    reason_code=decision.reason_code or "completion_rejected",
                     message=decision.reason,
                 )
             )
@@ -2408,6 +2509,27 @@ class TurnExecutor:
             turn_id=completed.turn_id,
             answer=answer,
         )
+
+    def _completion_continuation_limit_reached(self, turn_id: str) -> bool:
+        """Bound Stop feedback itself; tool exchanges are not proof of task progress."""
+        policy = self._store.read_turn(turn_id).binding_manifest.get("completion_continuation_policy", {})
+        if not isinstance(policy, Mapping) or policy.get("revision") != "bounded-v1":
+            return False  # Old Turns keep their frozen behavior.
+        limit = policy.get("max_continuations")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise RuntimeError("frozen completion continuation limit is invalid")
+        continuations = 0
+        for item in reversed(self._store.list_items(turn_id)):
+            if item.status != "completed":
+                continue
+            if item.kind == "user_message" or (
+                item.kind == "model_response" and item.payload.get("response_status", "completed") == "completed"
+                and item.payload.get("tool_calls")
+            ):
+                break
+            if item.kind == "completion_decision" and item.payload.get("action") == "continue":
+                continuations += 1
+        return continuations >= limit
 
 
 def _aci_tool_call(

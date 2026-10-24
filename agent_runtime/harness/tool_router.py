@@ -6,10 +6,6 @@ from collections.abc import Mapping
 
 from agent_runtime.harness.protocol import HarnessMessage
 from agent_runtime.harness.rollout import RolloutStore
-from agent_runtime.harness.tool_orchestrator import (
-    inspection_tools_available,
-    tool_consumes_inspection_budget,
-)
 from agent_runtime.tools.tool import Tool
 
 
@@ -31,7 +27,11 @@ class StaticToolRouter:
 
 
 class DurableToolRouter:
-    """Derive deferred activation only from committed find_tools results."""
+    """Inherit committed discovery through the visible conversation's fork boundary.
+
+    Discovery exposes installed declarations; the orchestrator still checks the
+    executing Turn's permissions and the model call's frozen tool origin.
+    """
 
     def __init__(
         self,
@@ -60,14 +60,16 @@ class DurableToolRouter:
         messages: tuple[HarnessMessage, ...],
     ) -> tuple[Tool, ...]:
         del messages
+        items = self._store.list_context_items(turn_id)
         operations = {
             operation.result_item_id: operation
-            for operation in self._store.list_tool_operations(turn_id)
+            for source_turn_id in dict.fromkeys(item.turn_id for item in items)
+            for operation in self._store.list_tool_operations(source_turn_id)
             if operation.result_item_id is not None
         }
         active: list[str] = []
         discoverable = set(self._discoverable_names)
-        for item in self._store.list_context_items(turn_id):
+        for item in items:
             operation = operations.get(item.item_id)
             if (
                 item.kind != "tool_result"
@@ -91,10 +93,4 @@ class DurableToolRouter:
                 ):
                     active.append(name)
         selected_names = (*self._resident_names, *active)
-        if not inspection_tools_available(self._store, turn_id):
-            selected_names = tuple(
-                name
-                for name in selected_names
-                if not tool_consumes_inspection_budget(self._tools[name])
-            )
         return tuple(self._tools[name] for name in selected_names)

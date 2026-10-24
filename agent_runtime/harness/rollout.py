@@ -1342,6 +1342,24 @@ class RolloutStore:
             "WHERE turn_id = ? AND record_type = 'turn_resumed'), 0) LIMIT 1", (turn_id, turn_id),
         ).fetchone() is not None
 
+    def resume_cancelled_turn(self, *, turn_id: str) -> TurnSnapshot:
+        """Explicitly continue a quiescent cancellation without replaying results."""
+        with self._transaction():
+            turn = self.read_turn(turn_id)
+            if turn.status != "paused" or not self.turn_cancellation_pending(turn_id):
+                raise RuntimeError("Turn has no paused cancellation to resume")
+            if self.read_thread(turn.thread_id).active_turn_id != turn_id:
+                raise RuntimeError("cancelled Turn does not own the active slot")
+            if (any(item.status == "pending" for item in self.list_interactions(turn_id))
+                    or any(op.status in {"running", "unknown"} for op in self.list_tool_operations(turn_id))
+                    or any(op.status in {"dispatched", "unknown"} for op in self.list_model_operations(turn_id))):
+                raise RuntimeError("pending or uncertain execution must be resolved before resume")
+            self._append_and_reduce(
+                thread_id=turn.thread_id, turn_id=turn_id, record_type="turn_resumed",
+                producer="user", payload={"turn_id": turn_id, "reason": "explicit cancellation resume"},
+            )
+        return self.read_turn(turn_id)
+
     def request_clarification(
         self,
         *,
@@ -2382,6 +2400,9 @@ class RolloutStore:
                         **public_metadata,
                     },
                 )
+            result_order = self.read_turn(str(operation["turn_id"])).binding_manifest.get(
+                "execution_context_policy", {},
+            ).get("tool_result_order")
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -2394,6 +2415,7 @@ class RolloutStore:
                     "payload": {
                         "text": text,
                         "tool_calls": frozen_tool_calls,
+                        **({"tool_result_order": "call-v1"} if result_order == "call-v1" else {}),
                         "provider_response_id": provider_response_id,
                         "usage": frozen_usage,
                         "response_status": response_status,
@@ -4197,12 +4219,20 @@ class RolloutStore:
             )
         return {"resource": resource, "limit": limit, "used": used, "remaining": limit - used, "item_id": item_id}
 
-    def record_final_proposal(self, *, turn_id: str, answer: str) -> ItemSnapshot:
+    def record_final_proposal(
+        self, *, turn_id: str, answer: str, source_item_id: str | None = None,
+    ) -> ItemSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
+            payload = {"text": answer}
+            if source_item_id is not None:
+                source = self.read_item(source_item_id)
+                if source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed":
+                    raise RuntimeError("final proposal requires a completed model response from this Turn")
+                payload["source_item_id"] = source_item_id
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -4215,7 +4245,7 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="model",
-                payload={"item_id": item_id, "payload": {"text": answer}},
+                payload={"item_id": item_id, "payload": payload},
             )
         return self._latest_item(turn_id)
 
@@ -4228,6 +4258,7 @@ class RolloutStore:
         reason: str,
         validation_status: str = "not_evaluated",
         validation_scope: str | None = None,
+        reason_code: str | None = None,
     ) -> ItemSnapshot:
         if action not in {"accept", "continue", "pause", "fail"}:
             raise ValueError(f"unsupported completion action: {action}")
@@ -4239,6 +4270,8 @@ class RolloutStore:
             not isinstance(validation_scope, str) or not validation_scope.strip()
         ):
             raise ValueError("completion validation scope must be non-empty or None")
+        if reason_code is not None and (not isinstance(reason_code, str) or not reason_code.strip()):
+            raise ValueError("completion reason code must be non-empty or None")
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
@@ -4268,6 +4301,7 @@ class RolloutStore:
                         "reason": reason,
                         "validation_status": validation_status,
                         "validation_scope": validation_scope,
+                        **({"reason_code": reason_code} if reason_code is not None else {}),
                     },
                 },
             )
@@ -4278,12 +4312,20 @@ class RolloutStore:
         *,
         turn_id: str,
         reason: str,
+        source_item_id: str | None = None,
     ) -> ItemSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("completion feedback reason must be non-empty")
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
+            payload = {"text": reason}
+            if source_item_id is not None:
+                source = self.read_item(source_item_id)
+                if (source.turn_id != turn_id or source.status != "completed"
+                        or source.kind not in {"model_response", "completion_decision"}):
+                    raise RuntimeError("feedback requires a completed source from this Turn")
+                payload["source_item_id"] = source_item_id
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -4296,7 +4338,7 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="verifier",
-                payload={"item_id": item_id, "payload": {"text": reason}},
+                payload={"item_id": item_id, "payload": payload},
             )
         return self._latest_item(turn_id)
 
@@ -4354,8 +4396,18 @@ class RolloutStore:
         return _item_snapshot(row)
 
     def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
+        """Visible model/recall window; the complete ledger remains separately readable."""
         self._assert_artifact_integrity()
-        return self.list_conversation_items(turn_id)
+        items = self.list_conversation_items(turn_id)
+        start = 0
+        seen = set()
+        for index, item in enumerate(items):
+            if item.turn_id not in seen:
+                seen.add(item.turn_id)
+                reset = self.read_turn(item.turn_id).binding_manifest.get("context_reset")
+                if reset == {"revision": "v1", "reason": "memory_revoked"}:
+                    start = index
+        return items[start:]
 
     def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Read original Items through the fork point; do not load or execute artifacts."""

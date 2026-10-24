@@ -350,7 +350,11 @@ class Agent:
 
         if action == "abort":
             from agent_runtime.harness import RolloutEventReader
-            from agent_runtime.harness.ownership import execution_owner, recover_owner_loss
+            from agent_runtime.harness.ownership import (
+                ConversationRecoveryRequiredError,
+                execution_owner,
+                recover_owner_loss,
+            )
 
             with RolloutStore(self._harness_database()) as store:
                 turn = store.read_turn(turn_id)
@@ -361,6 +365,9 @@ class Agent:
                     from agent_runtime.harness.command_recovery import cancel_commands
                     recovered = store.capture_mutation(lambda: recover_owner_loss(store, turn_id, abort=True))
                     await cancel_commands(self, turn_id)
+                    if any(operation.status in {"running", "unknown"}
+                           for operation in store.list_tool_operations(turn_id)):
+                        raise ConversationRecoveryRequiredError("取消未完成：执行结果仍未核对，任务保持暂停。")
                     mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
                     cancelled = mutation.value
                     result = AgentResult._from_harness(

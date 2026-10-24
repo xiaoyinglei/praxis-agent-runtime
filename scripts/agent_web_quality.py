@@ -168,7 +168,8 @@ async def measure_evidence_cases() -> dict[str, Any]:
         client = PublicWebClient(transport=httpx.MockTransport(lambda _, data=body: httpx.Response(
             200, content=data, headers={'content-type': 'text/html'})))
         try:
-            tools = web.create_web_tools(client, save_source=save, load_source=blobs.__getitem__)
+            tools = web.create_web_tools(
+                client, save_source=save, load_source=blobs.__getitem__, search_provider='bing')
             executor = ToolExecutor({tool.definition.name: tool for tool in tools})
             name = case['tool']
             origin = ToolCallOrigin('quality', 'quality', (name,))

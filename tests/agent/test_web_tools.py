@@ -11,7 +11,7 @@ from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecisio
 from agent_runtime.tools.tool import ToolCall, ToolCallOrigin, ToolEffect
 
 
-def web_tools(tmp_path, handler, *, key=None, before_request=None):
+def web_tools(tmp_path, handler, *, key=None, provider=None, before_request=None):
     from agent_runtime.tools.builtins.web import create_web_tools
     from agent_runtime.tools.web_http import PublicWebClient
 
@@ -26,7 +26,7 @@ def web_tools(tmp_path, handler, *, key=None, before_request=None):
         return sources[source_id]
 
     client = PublicWebClient(transport=httpx.MockTransport(handler))
-    tools = create_web_tools(client, save_source=save, load_source=load, search_key=key,
+    tools = create_web_tools(client, save_source=save, load_source=load, search_key=key, search_provider=provider,
                              before_request=before_request)
     return {tool.definition.name: tool for tool in tools}, client, sources
 
@@ -124,13 +124,48 @@ async def test_brave_search_maps_sources_and_keeps_credential_private(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_missing_search_key_uses_public_search_without_credentials(tmp_path):
+async def test_unconfigured_search_returns_typed_error_without_network_or_budget_reservation(tmp_path):
+    budget_calls = []
+    tools, client, _ = web_tools(
+        tmp_path, lambda _: pytest.fail("Unconfigured search must not make a network request"),
+        before_request=lambda: budget_calls.append(True),
+    )
+    try:
+        tool = tools["web_search"]
+        execution = await ToolExecutor(tools).execute(
+            call("web_search", {"query": "latest news", "freshness": "pw"}),
+            context=ToolExecutionContext(),
+        )
+        assert execution.result.is_error
+        assert execution.result.error_code == "web_search_not_configured"
+        output = execution.result.structured_content
+        assert not output["results"]
+        assert output["result_status"] == "error"
+        assert output["request_attempted"] is False
+        assert output["network_bytes"] == 0
+        assert output["freshness_requested"] == "pw"
+        assert "brave" in output["error_message"] and "tavily" in output["error_message"]
+        assert budget_calls == []
+        assert tool.resolve_use({"query": "latest news"}).effects == frozenset()
+        assert tool.execution_revision != "builtin-public-web-search-bing-v5"
+        from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
+
+        orchestrator = object.__new__(ToolOrchestrator)
+        orchestrator._tools = tools
+        with pytest.raises(RuntimeError, match="original operation tool is unavailable: web_search"):
+            orchestrator.restore_tools({"web_search": "builtin-public-web-search-bing-v5"})
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_explicit_bing_uses_public_search_without_credentials(tmp_path):
     requests = []
     tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
         200, text='<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/news">News</a>'
         '</h2><div class="b_caption"><p>Latest report</p></div></li></ol>',
         headers={"content-type": "text/html"}, request=requests.append(req) or req,
-    ))
+    ), provider="bing")
     try:
         result = await tools["web_search"].run({"query": "latest news", "freshness": "pw"})
         assert result["error_code"] is None
@@ -141,6 +176,7 @@ async def test_missing_search_key_uses_public_search_without_credentials(tmp_pat
         assert requests[0].url.params["filters"] == 'ex1:"ez2"'
         assert "X-Subscription-Token" not in requests[0].headers
         assert tools["web_search"].resolve_use({"query": "latest news"}).targets[0].value == "https://www.bing.com/search"
+        assert tools["web_search"].execution_revision == "builtin-public-web-search-bing-v5"
     finally:
         await client.aclose()
 
@@ -151,10 +187,10 @@ async def test_missing_search_key_uses_public_search_without_credentials(tmp_pat
     ('<html>Login or unexpected markup</html>', "web_search_invalid_response"),
     ('<ol id="b_results"><li class="b_no">No results</li></ol>', None),
 ])
-async def test_keyless_search_distinguishes_blocked_invalid_and_empty(tmp_path, body, code):
+async def test_explicit_bing_distinguishes_blocked_invalid_and_empty(tmp_path, body, code):
     tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
         200, text=body, headers={"content-type": "text/html"},
-    ))
+    ), provider="bing")
     try:
         result = await tools["web_search"].run({"query": "public query"})
         assert result["error_code"] == code

@@ -1,3 +1,9 @@
+"""Compatibility verifier classification for pre-completion-v2 Turn records.
+
+New public Turns use explicit acceptance commands, without inferred certificates.
+This module preserves the interpretation of historical completion policies.
+"""
+
 from __future__ import annotations
 
 import shlex
@@ -102,7 +108,9 @@ def assess_tool_verification(
             )
         return VerificationAssessment(
             "assertion_not_executed",
-            "No successful assertion execution was observed. Define and run the check with execute_python; "
+            "No successful assertion was observed in the entry script or submitted code. "
+            "Imported modules, runpy targets and dynamically compiled code are outside this observation scope. "
+            "Pass the check file as script_path or run its test runner directly; "
             "unreached assertions, optimized-out assertions and process exit status alone are not evidence.",
         )
     if tool_name != "run_command":

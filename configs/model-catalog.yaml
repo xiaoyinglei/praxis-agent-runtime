@@ -1,0 +1,318 @@
+# Maintained cloud-model metadata. Generate runtime views with scripts/sync_model_catalog.py.
+# This freezes metadata, not the weights behind a provider's moving model alias.
+version: 1
+as_of: '2026-10-22'
+scope: official APIs; representative text/tool models; no subscriptions or third-party resellers
+verification: official documentation; Kimi context lengths additionally read from its Models API
+policy:
+  default_model: deepseek-flash
+  notes: Product output/effort defaults are allowances, not manufacturer hard limits. Prices are intentionally omitted.
+providers:
+  deepseek:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+  kimi:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+  qwen:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+  minimax:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.minimax.cn/v1
+    api_key_env: MINIMAX_API_KEY
+  groq:
+    protocol: openai_compatible
+    location: cloud
+    base_url: https://api.groq.com/openai/v1
+    api_key_env: GROQ_API_KEY
+models:
+  deepseek-flash:
+    provider: deepseek
+    integration: chat_completions
+    sources:
+      - https://api-docs.deepseek.com/api/list-models/
+      - https://api-docs.deepseek.com/quick_start/pricing/
+      - https://api-docs.deepseek.com/guides/thinking_mode/
+    notes: Alias currently serves DeepSeek-V4.1-Flash-1017. Thinking and answer count toward output; temperature is ignored in thinking mode.
+    config:
+      capability: chat
+      provider: deepseek
+      continuation_summary_role: assistant
+      tokenizer_model: deepseek-v4-official
+      context_window_tokens: 1048576
+      max_output_tokens: 393216
+      reasoning:
+        supported_efforts: [low, high, max]
+        default_effort: high
+        thinking_toggle: thinking
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+        provider_options:
+          thinking: {type: enabled}
+  deepseek-v4-pro:
+    provider: deepseek
+    integration: chat_completions
+    sources:
+      - https://api-docs.deepseek.com/api/list-models/
+      - https://api-docs.deepseek.com/quick_start/pricing/
+      - https://api-docs.deepseek.com/guides/thinking_mode/
+    notes: Alias currently serves DeepSeek-V4-Pro-0813. Text input only at the provider; multimodal transport is outside this snapshot.
+    config:
+      capability: chat
+      provider: deepseek
+      context_window_tokens: 1048576
+      max_output_tokens: 393216
+      reasoning:
+        supported_efforts: [low, high, max]
+        default_effort: high
+        thinking_toggle: thinking
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+        provider_options:
+          thinking: {type: enabled}
+  kimi-k3:
+    provider: kimi
+    integration: chat_completions
+    sources:
+      - https://platform.kimi.com/docs/guide/kimi-k3-quickstart
+      - https://platform.kimi.com/docs/api/models-overview
+      - https://platform.kimi.com/docs/api/list-models
+    notes: Models API confirmed context_length=1048576 on snapshot date. Always thinking; native default effort=max, product default=high. No K2 thinking toggle. Fixed temperature/top_p must be preserved.
+    config:
+      capability: chat
+      provider: kimi
+      context_window_tokens: 1048576
+      max_output_tokens: 1048576
+      reasoning:
+        supported_efforts: [low, high, max]
+        default_effort: high
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+  qwen3.8-max:
+    provider: qwen
+    integration: chat_completions
+    sources:
+      - https://help.aliyun.com/zh/model-studio/qwen3-8-max
+      - https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions
+      - https://help.aliyun.com/zh/model-studio/deep-thinking
+      - https://help.aliyun.com/zh/model-studio/qwen-structured-output
+    notes: Beijing API; old DashScope domain remains supported. max_completion_tokens includes thinking+answer; native effort=xhigh, product=medium. Preserve reasoning_content in tool loops.
+    limits:
+      context_window_tokens: 1000000
+      max_input_non_thinking_tokens: 991808
+      max_input_thinking_tokens: 983616
+      max_answer_tokens: 131072
+      max_thinking_tokens: 262144
+      semantics: Separate documented limits; runtime window is conservatively capped at 983616 until independent input limits are represented. Combined max_completion_tokens cap is 131072.
+    config:
+      capability: chat
+      provider: qwen
+      context_window_tokens: 983616
+      max_output_tokens: 131072
+      supports_structured_output: true
+      reasoning:
+        supported_efforts: [low, medium, xhigh]
+        default_effort: medium
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+  qwen3.8-flash:
+    provider: qwen
+    integration: chat_completions
+    sources:
+      - https://help.aliyun.com/zh/model-studio/qwen3-8-flash
+      - https://help.aliyun.com/zh/model-studio/qwen-api-via-openai-chat-completions
+      - https://help.aliyun.com/zh/model-studio/qwen-structured-output
+    notes: Same documented input/answer/thinking limits as Max; runtime window and combined output cap are conservative. Provider also maps high/max to xhigh; canonical effort names are listed here.
+    limits:
+      context_window_tokens: 1000000
+      max_input_non_thinking_tokens: 991808
+      max_input_thinking_tokens: 983616
+      max_answer_tokens: 131072
+      max_thinking_tokens: 262144
+      semantics: Runtime window is conservatively capped at 983616 until independent input limits are represented. Combined max_completion_tokens cap is 131072.
+    config:
+      capability: chat
+      provider: qwen
+      context_window_tokens: 983616
+      max_output_tokens: 131072
+      supports_structured_output: true
+      reasoning:
+        supported_efforts: [low, medium, xhigh]
+        default_effort: medium
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+  MiniMax-M3.1-Flash:
+    provider: minimax
+    integration: chat_completions
+    sources:
+      - https://platform.minimax.cn/docs/guides/text-generation
+      - https://platform.minimax.cn/docs/api-reference/text-chat-openai
+      - https://platform.minimax.cn/docs/api-reference/text-openai-api
+    notes: Always adaptive thinking; reasoning_content is separate by default. Output cap includes thinking; provider default/recommendation=131072, product allowance=65536. No disable-thinking control declared.
+    config:
+      capability: chat
+      provider: minimax
+      context_window_tokens: 1000000
+      max_output_tokens: 524288
+      supports_structured_output: false
+      reasoning:
+        supported_efforts: [low, medium, high, xhigh, max]
+        default_effort: high
+      defaults:
+        temperature: 1.0
+        top_p: 0.95
+        max_output_tokens: 65536
+  MiniMax-M3:
+    provider: minimax
+    integration: catalog_only
+    blocker: The documented reasoning_split option is not supported by the current typed provider options. Do not silently drop or mix reasoning state.
+    sources:
+      - https://platform.minimax.cn/docs/api-reference/text-openai-api
+      - https://platform.minimax.cn/docs/api-reference/text-chat-openai
+    limits: {context_window_tokens: 1000000, max_output_tokens: 524288}
+    notes: Adaptive thinking can be disabled; effort is ignored. M2.x retirement notices are not a reason to alias them to M3.
+  openai/gpt-oss-120b:
+    provider: groq
+    integration: chat_completions
+    sources:
+      - https://console.groq.com/docs/model/openai/gpt-oss-120b
+      - https://console.groq.com/docs/openai
+    config:
+      capability: chat
+      provider: groq
+      tokenizer_model: gpt-oss-120b
+      context_window_tokens: 131072
+      max_output_tokens: 65536
+      reasoning:
+        supported_efforts: [low, medium, high]
+        default_effort: medium
+      defaults: {temperature: 1.0, top_p: 0.95, max_output_tokens: 8192}
+  llama-3.3-70b-versatile:
+    provider: groq
+    integration: chat_completions
+    sources:
+      - https://console.groq.com/docs/model/llama-3.3-70b-versatile
+    notes: Corrects the old 32768 context entry; that number is the output cap. JSON Object Mode is not strict JSON Schema support.
+    config:
+      capability: chat
+      provider: groq
+      context_window_tokens: 131072
+      max_output_tokens: 32768
+      supports_structured_output: false
+      reasoning: {supported_efforts: []}
+      defaults: {temperature: 1.0, top_p: 0.95, max_output_tokens: 8192}
+  gpt-6.1-sol:
+    provider: openai
+    integration: catalog_only
+    blocker: Official tool calling requires Responses API. Current runtime serializes Chat Completions; do not advertise it as agent-ready.
+    sources:
+      - https://developers.openai.com/api/docs/models/gpt-6.1-sol
+    limits: {context_window_tokens: 1050000, max_output_tokens: 128000}
+    reasoning: {supported_efforts: [low, medium, high, xhigh, max], default_effort: medium}
+    endpoint: https://api.openai.com/v1/responses
+  gpt-6-astra:
+    provider: openai
+    integration: catalog_only
+    blocker: Needs a verified Responses adapter and sampling-parameter support; this task does not add a new transport.
+    sources:
+      - https://developers.openai.com/api/docs/models/gpt-6-astra
+    limits: {context_window_tokens: 1050000, max_output_tokens: 128000}
+    reasoning: {supported_efforts: [low, medium, high, xhigh, max]}
+    endpoint: https://api.openai.com/v1/responses
+  gpt-6-luna:
+    provider: openai
+    integration: catalog_only
+    blocker: Chat function calling requires effort=none; reasoning tool use needs Responses. No silent reasoning downgrade to fit the current adapter.
+    sources:
+      - https://developers.openai.com/api/docs/models/gpt-6-luna
+    limits: {context_window_tokens: 1050000, max_output_tokens: 128000}
+    reasoning: {supported_efforts: [none, low, medium, high, xhigh, max], default_effort: medium}
+    endpoint: https://api.openai.com/v1/responses
+  claude-opus-5-5:
+    provider: anthropic
+    integration: catalog_only
+    blocker: OpenAI compatibility rejects the current simultaneous temperature/top_p parameters and ignores reasoning_effort. Native thinking state needs an adapter.
+    sources:
+      - https://platform.claude.com/docs/en/models/opus-5-5/overview
+      - https://platform.claude.com/docs/en/build-with-claude/effort
+      - https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk
+    limits: {context_window_reported: 1M, context_window_tokens: null, max_output_tokens: 128000}
+    notes: Context integer not independently resolved; do not guess decimal vs binary. 300K Batch beta is not the ordinary output cap.
+    reasoning: {supported_efforts: [low, medium, high, xhigh, max], default_effort: medium}
+    endpoint: https://api.anthropic.com/v1/messages
+  claude-sonnet-5-5:
+    provider: anthropic
+    integration: catalog_only
+    blocker: Same sampling/effort compatibility gap as Opus. Forced tool choice is also unsupported in the compatibility layer.
+    sources:
+      - https://platform.claude.com/docs/en/models/sonnet-5-5/overview
+      - https://platform.claude.com/docs/en/cli-sdks-libraries/libraries/openai-sdk
+    limits: {context_window_reported: 1M, context_window_tokens: null, max_output_tokens: 128000}
+    reasoning: {supported_efforts: [low, medium, high, xhigh, max], default_effort: high}
+    endpoint: https://api.anthropic.com/v1/messages
+  gemini-4-argon:
+    provider: google
+    integration: catalog_only
+    blocker: Tool loops require opaque Google thought_signature replay, which current tool-call normalization does not preserve. Long background output needs a separate protocol.
+    sources:
+      - https://ai.google.dev/gemini-api/docs/models/gemini-4-argon
+      - https://ai.google.dev/gemini-api/docs/tokens
+      - https://ai.google.dev/gemini-api/docs/generate-content/tokens
+      - https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
+    limits:
+      context_window_tokens: 1048576
+      semantics: Input, thinking and output share one window.
+      interactions_sync_max_output_tokens: 65536
+      generate_content_nonstream_max_output_tokens: 32768
+      generate_content_stream_max_output_tokens: 65536
+    reasoning: {supported_efforts: [low, medium, high], default_effort: medium}
+    endpoint: https://generativelanguage.googleapis.com/v1beta/openai/
+  gemini-3.8-flash:
+    provider: google
+    integration: catalog_only
+    blocker: Tool-call thought signatures must survive round trips; current adapter is not verified to preserve them.
+    sources:
+      - https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash
+      - https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures
+    limits: {max_input_tokens: 1048576, max_output_tokens: 65536, semantics: 'Separate input and output budgets, not a combined window.'}
+    reasoning: {supported_efforts: [low, medium, high]}
+    endpoint: https://generativelanguage.googleapis.com/v1beta/openai/
+  glm-5.3:
+    provider: zhipu
+    integration: catalog_only
+    blocker: Official docs specify max_tokens, while the current serializer sends max_completion_tokens. Exact context integer and output-accounting compatibility remain unverified.
+    sources:
+      - https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3
+      - https://docs.bigmodel.cn/cn/guide/start/concept-param
+      - https://docs.bigmodel.cn/cn/guide/develop/openai/introduction
+    limits: {context_window_reported: 1M, context_window_tokens: null, max_output_tokens: 131072}
+    reasoning: {supported_efforts: [low, high, max], default_effort: max}
+    endpoint: https://open.bigmodel.cn/api/paas/v4/
+  glm-5.3-flash:
+    provider: zhipu
+    integration: catalog_only
+    blocker: Same output-parameter and unresolved context-unit gap as GLM-5.3. Streaming tool/thinking options need verification.
+    sources:
+      - https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash
+      - https://docs.bigmodel.cn/cn/guide/start/concept-param
+    limits: {context_window_reported: 1M, context_window_tokens: null, max_output_tokens: 131072}
+    reasoning: {supported_efforts: [low, high, max], default_effort: max}
+    endpoint: https://open.bigmodel.cn/api/paas/v4/

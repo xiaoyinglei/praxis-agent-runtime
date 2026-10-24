@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -77,8 +78,8 @@ def fake_sandbox_exec(
         return await create_subprocess_exec(*argv[3:], **kwargs)
 
     monkeypatch.setattr(
-        shell_module.asyncio,
-        "create_subprocess_exec",
-        execute_without_seatbelt,
+        shell_module,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": execute_without_seatbelt}),
     )
     return executable

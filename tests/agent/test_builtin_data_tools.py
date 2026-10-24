@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -194,6 +195,9 @@ async def test_managed_python_fresh_process_and_saved_script_share_interpreter(t
         "import os, sys, json, openpyxl\nnonce = 42\n"
         "print(json.dumps({'pid': os.getpid(), 'executable': sys.executable, 'package': openpyxl.__file__}))"
     )}, workspace=workspace, approve=True)
+    missing = await _execute(tool, {"code": "print(nonce)"}, workspace=workspace, approve=True)
+    assert missing.result.error_code == "python_failed"
+    assert "NameError" in missing.result.structured_content["stderr"]
     second = await _execute(tool, {"code": (
         "assert 'nonce' not in globals()\n"
         "import runpy\nrunpy.run_path('probe.py', run_name='__main__')"
@@ -205,6 +209,112 @@ async def test_managed_python_fresh_process_and_saved_script_share_interpreter(t
     assert before["pid"] != after["pid"]
     assert before["executable"] == after["executable"]
     assert before["package"] == after["package"]
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_script_imports_siblings_without_instrumentation(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / "helper.py").write_text("VALUE = 42\n")
+    (scripts / "check.py").write_text(
+        "import helper, sys\nassert helper.VALUE == 42\n"
+        "assert __name__ == '__main__'\n"
+        "assert sys.argv == [__file__]\nprint('script-ok')\n"
+    )
+    execution = await _execute(_tools(workspace)["execute_python"],
+                               {"script_path": "scripts/check.py"}, workspace=workspace)
+    assert not execution.result.is_error, execution.result.error_message
+    output = execution.result.structured_content
+    assert output["stdout"] == "script-ok\n"
+    assert output["verification"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+@pytest.mark.parametrize("encoding,declaration", [("utf-8-sig", "utf-8"), ("latin-1", "latin-1")])
+async def test_managed_python_script_respects_source_encoding(tmp_path: Path, encoding, declaration) -> None:
+    workspace = open_workspace(tmp_path)
+    (tmp_path / "encoded.py").write_bytes((f"# coding: {declaration}\nprint('café')\n").encode(encoding))
+    execution = await _execute(_tools(workspace)["execute_python"],
+                               {"script_path": "encoded.py"}, workspace=workspace)
+    assert not execution.result.is_error, execution.result.error_message
+    assert execution.result.structured_content["stdout"] == "café\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_legacy_runpy_can_import_workspace_modules(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path)
+    (tmp_path / "helper.py").write_text("VALUE = 42\n")
+    (tmp_path / "check.py").write_text("import helper\nprint(helper.VALUE)\n")
+    execution = await _execute(_tools(workspace)["execute_python"],
+        {"code": "import runpy; runpy.run_path('check.py', run_name='__main__')"}, workspace=workspace)
+    assert not execution.result.is_error, execution.result.error_message
+    assert execution.result.structured_content["stdout"] == "42\n"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_bounds_output_while_reading_both_streams(tmp_path: Path, monkeypatch) -> None:
+    from agent_runtime.tools.builtins import shell
+
+    workspace = open_workspace(tmp_path)
+    retained_sizes = []
+    original = shell._bounded_stream
+
+    def observe(value):
+        retained_sizes.append(len(value))
+        return original(value)
+
+    monkeypatch.setattr(shell, "_bounded_stream", observe)
+    execution = await _execute(_tools(workspace)["execute_python"], {"code": (
+        "import sys\nprint('HEAD' + 'x' * 262144 + 'TAIL')\n"
+        "print('ERR_HEAD' + 'y' * 262144 + 'ERR_TAIL', file=sys.stderr)\n"
+    )}, workspace=workspace)
+    assert not execution.result.is_error
+    output = execution.result.structured_content
+    assert output["truncated"]
+    assert output["stdout"].startswith("HEAD") and output["stdout"].endswith("TAIL\n")
+    assert output["stderr"].startswith("ERR_HEAD") and output["stderr"].endswith("ERR_TAIL\n")
+    assert retained_sizes and max(retained_sizes) <= shell._MAX_STREAM_BYTES + 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("arguments", [{}, {"code": "pass", "script_path": "check.py"}])
+async def test_managed_python_requires_exactly_one_source(tmp_path: Path, arguments) -> None:
+    workspace = open_workspace(tmp_path)
+    execution = await _execute(_tools(workspace)["execute_python"], arguments, workspace=workspace)
+    assert execution.result.error_code == "invalid_arguments"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_script_respects_denied_alias(tmp_path: Path) -> None:
+    from agent_runtime.permission_policy import PathRule, PermissionPolicy
+
+    workspace = open_workspace(tmp_path)
+    (tmp_path / "entry.py").write_text("print('must-not-run')\n")
+    (tmp_path / "denied.py").symlink_to("entry.py")
+    policy = PermissionPolicy(filesystem=(PathRule(path="denied.py", access="deny"),)).resolve(tmp_path)
+    workspace.permission_provider = lambda: policy
+    execution = await _execute(_tools(workspace)["execute_python"],
+                               {"script_path": "denied.py"}, workspace=workspace)
+    assert execution.result.is_error
+    assert execution.result.structured_content["sandbox_error"] == "sandbox_filesystem_denied"
+    assert execution.result.structured_content["stdout"] == ""
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_managed_python_script_cannot_escape_workspace(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+    (tmp_path / "outside.py").write_text("print('must-not-run')\n")
+    execution = await _execute(_tools(workspace)["execute_python"],
+                               {"script_path": "../outside.py"}, workspace=workspace)
+    assert execution.result.is_error
+    assert "must-not-run" not in str(execution.result.structured_content)
 
 
 @pytest.mark.anyio
@@ -281,6 +391,69 @@ async def test_execute_python_requires_declared_outputs_for_workspace_write(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("code", [
+    "print(f'{(1 + 2)*100:+.0f}%')\nreturn 1",
+    "from pathlib import Path\nPath('unexpected.txt').touch()\nprint(f'{1)')",
+    "if True:\nprint('missing indentation')",
+])
+async def test_execute_python_rejects_invalid_source_before_write_approval(
+    tmp_path: Path, code: str,
+) -> None:
+    workspace = open_workspace(tmp_path)
+    boundary_calls = []
+
+    def unexpected(*_args: object, **_kwargs: object) -> Any:
+        boundary_calls.append("permission_or_execution")
+        raise AssertionError("Invalid source must not reach permission or execution")
+
+    tool = replace(_tools(workspace)["execute_python"], run=unexpected)
+    execution = await ToolExecutor({"execute_python": tool}, permission_decider=unexpected).execute(
+        ToolCall(
+            tool_call_id="invalid-source", tool_name="execute_python",
+            arguments={"code": code, "workspace_write": True, "output_paths": ["unexpected.txt"]},
+            origin=ToolCallOrigin(request_id="syntax", toolset_revision="syntax-v1",
+                                  exposed_tool_names=("execute_python",)),
+        ),
+        context=ToolExecutionContext(workspace_root=workspace.root, cwd=workspace.root),
+    )
+
+    assert execution.result.error_code == "invalid_arguments"
+    message = execution.result.error_message or ""
+    assert "$.code" in message
+    assert "line" in message and "column" in message
+    assert not boundary_calls
+    assert execution.record is None
+    assert not (workspace.root / "unexpected.txt").exists()
+
+
+@pytest.mark.anyio
+async def test_execute_python_valid_dynamic_source_still_requires_write_approval(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path)
+    execution = await _execute(
+        _tools(workspace)["execute_python"],
+        {"code": "globals()['value'] = 7\nprint(value)",
+         "workspace_write": True, "output_paths": ["output.txt"]},
+        workspace=workspace,
+    )
+
+    assert execution.result.error_code == "approval_required"
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_sandbox_exec")
+async def test_execute_python_runs_valid_dynamic_definitions_after_approval(tmp_path: Path) -> None:
+    workspace = open_workspace(tmp_path)
+    execution = await _execute(
+        _tools(workspace)["execute_python"],
+        {"code": "globals()['value'] = 7\nassert value == 7\nprint(value)"},
+        workspace=workspace, approve=True,
+    )
+
+    assert not execution.result.is_error
+    assert execution.result.structured_content["stdout"] == "7\n"
+
+
+@pytest.mark.anyio
 @pytest.mark.skipif(
     sys.platform != "darwin" or not os.path.isfile("/usr/bin/sandbox-exec"),
     reason="real managed Python sandbox requires macOS Seatbelt",
@@ -294,6 +467,10 @@ async def test_execute_python_real_sandbox_imports_runtime_data_stack(
         {
             "code": (
                 "import fitz, openpyxl, pandas, scipy; "
+                "import tempfile; from pathlib import Path; "
+                "temp = tempfile.TemporaryDirectory(); "
+                "probe = Path(temp.name) / 'probe.txt'; probe.write_text('scratch-ok'); "
+                "assert probe.read_text() == 'scratch-ok'; temp.cleanup(); "
                 "print('seatbelt-data-stack-ok')"
             )
         },

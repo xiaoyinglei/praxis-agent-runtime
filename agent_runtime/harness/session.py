@@ -351,6 +351,17 @@ class Session:
                     self.event_dispatcher.subscribe_controlling_sink(event_sink)
                 try:
                     yield
+                except asyncio.CancelledError:
+                    active = self.store.read_thread(self.thread_id).active_turn_id
+                    if active is not None:
+                        def pause_cancelled() -> None:
+                            with self.store._transaction():
+                                self.store.request_turn_cancellation(turn_id=active,
+                                    reason="Session execution task was cancelled")
+                                if self.store.read_turn(active).status == "running":
+                                    self.store.pause_turn(turn_id=active, reason="Execution task was cancelled")
+                        await asyncio.shield(self._executor()._commit(pause_cancelled))
+                    raise
                 finally:
                     try:
                         if event_sink is not None:
@@ -399,6 +410,9 @@ class Session:
                     raise RuntimeError("active Turn must be resumed or aborted before submit")
                 executor = self._executor()
                 await executor._commit(lambda: recover_owner_loss(self.store, active, abort=True))
+                if self._command_sessions is not None and self.tool_orchestrator is not None:
+                    while await self.tool_orchestrator.reconcile_command_observation(self._command_sessions, active):
+                        await executor._commit(lambda: recover_owner_loss(self.store, active, abort=True))
                 pending = [item for item in self.store.list_interactions(active) if item.status == "pending"]
                 unsafe = any(op.status in {"running", "unknown"} for op in self.store.list_tool_operations(active))
                 if pending or unsafe:
@@ -427,10 +441,32 @@ class Session:
             if self._agent is not None:
                 binding["web_limits"] = self._agent.web_limits.model_dump(mode="json")
             binding["memory_generation_allowed"] = self.memory_config.generate_memories
+            current_memory: Mapping[str, Any] | None = None
             if self.memory_config.use_memories:
                 from agent_runtime.harness.memory import memory_snapshot
 
-                binding["memory_snapshot"] = memory_snapshot(self.store, self.workspace_path, navigation_only=True)
+                current_memory = memory_snapshot(self.store, self.workspace_path, navigation_only=True)
+                binding["memory_snapshot"] = current_memory
+            thread = self.store.read_thread(self.thread_id)
+            previous = thread.head_turn_id or thread.fork_turn_id
+            if previous is not None:
+                from agent_runtime.harness.memory import memory_context_revoked
+
+                # Any earlier snapshot in the visible window may have supplied
+                # recalled data. An intermediate updated/disabled snapshot does
+                # not remove it, especially in pre-boundary databases.
+                visible = self.store.list_context_items(previous)
+                versions = set()
+                for source_turn_id in dict.fromkeys(item.turn_id for item in reversed(visible)):
+                    old = self.store.read_turn(source_turn_id).binding_manifest.get("memory_snapshot")
+                    if old is None or old["version"] in versions:
+                        continue
+                    versions.add(old["version"])
+                    if memory_context_revoked(self.store, self.workspace_path, old, current_memory):
+                        # Mixed summaries and assistant replies can contain
+                        # recalled data. Keep the audit ledger, not its prefix.
+                        binding["context_reset"] = {"revision": "v1", "reason": "memory_revoked"}
+                        break
             result = await self._executor().run(
                 turn_id=turn_id,
                 user_message=task,
@@ -1089,10 +1125,22 @@ class Session:
             executor = self._executor()
             if turn.status in {"running", "paused", "interrupted"}:
                 await executor._commit(lambda: recover_owner_loss(self.store, turn_id, abort=action == "abort"))
+                if action in {"continue", "retry"} and self._command_sessions is not None:
+                    assert self.tool_orchestrator is not None
+                    while await self.tool_orchestrator.reconcile_command_observation(self._command_sessions, turn_id):
+                        await executor._commit(lambda: recover_owner_loss(self.store, turn_id))
             turn = self.store.read_turn(turn_id)
+            if (action in {"continue", "retry"} and turn.status == "paused"
+                    and self.store.turn_cancellation_pending(turn_id)
+                    and not any(item.status == "pending" for item in self.store.list_interactions(turn_id))):
+                await executor._commit(lambda: self.store.resume_cancelled_turn(turn_id=turn_id))
+                turn = self.store.read_turn(turn_id)
             if action == "abort":
                 if self._cancel_live_commands is not None:
                     await self._cancel_live_commands()
+                if any(operation.status in {"running", "unknown"}
+                       for operation in self.store.list_tool_operations(turn_id)):
+                    raise ConversationRecoveryRequiredError("取消未完成：执行结果仍未核对，任务保持暂停。")
                 cancelled = await executor._commit(lambda: self.store.cancel_turn(turn_id=turn_id))
                 return AgentResult._from_harness(
                     TurnResult(

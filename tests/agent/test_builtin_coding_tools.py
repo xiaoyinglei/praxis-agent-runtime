@@ -718,7 +718,7 @@ async def test_search_text_reports_only_exact_text_file_provenance(
 
 
 @pytest.mark.anyio
-async def test_search_text_prioritizes_source_and_returns_local_context(
+async def test_search_text_targeted_source_returns_local_context(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -737,7 +737,7 @@ async def test_search_text_prioritizes_source_and_returns_local_context(
 
     execution = await _execute(
         _tools_by_name(workspace)["search_text"],
-        {"pattern": "PlanState", "path": ".", "max_results": 1},
+        {"pattern": "PlanState", "path": "src/state.py", "max_results": 1},
         workspace=workspace,
     )
 
@@ -750,11 +750,11 @@ async def test_search_text_prioritizes_source_and_returns_local_context(
         "",
     )
     assert match["context_after"] == ("    revision: int = 0",)
-    assert execution.result.structured_content["truncated"] is True
+    assert execution.result.structured_content["truncated"] is False
 
 
 @pytest.mark.anyio
-async def test_search_text_deprioritizes_agent_support_sources_at_workspace_root(
+async def test_search_text_uses_deterministic_paths_without_domain_priority(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -779,11 +779,12 @@ async def test_search_text_deprioritizes_agent_support_sources_at_workspace_root
 
     assert execution.result.structured_content is not None
     [match] = execution.result.structured_content["matches"]
-    assert match["file_path"] == "src/runtime.py"
+    assert match["file_path"] == ".agents/skills/helper/scripts.py"
+    assert execution.result.structured_content["truncated"] is True
 
 
 @pytest.mark.anyio
-async def test_search_text_directory_results_are_diverse_across_matching_files(
+async def test_search_text_result_limit_preserves_file_and_line_order(
     tmp_path: Path,
 ) -> None:
     workspace = open_workspace(tmp_path, create=True)
@@ -811,10 +812,16 @@ async def test_search_text_directory_results_are_diverse_across_matching_files(
     assert execution.result.structured_content is not None
     matches = execution.result.structured_content["matches"]
     assert len(matches) == 5
-    assert {match["file_path"] for match in matches} == {
-        "src/noisy.py",
-        "src/relevant.py",
-    }
+    assert [match["file_path"] for match in matches] == ["src/noisy.py"] * 5
+    assert [match["line_number"] for match in matches] == [1, 2, 3, 4, 5]
+    targeted = await _execute(
+        _tools_by_name(workspace)["search_text"],
+        {"pattern": "OpenAI", "path": "src/relevant.py", "max_results": 5},
+        workspace=workspace,
+    )
+    assert targeted.result.structured_content is not None
+    assert targeted.result.structured_content["matches"][0]["file_path"] == "src/relevant.py"
+    assert targeted.result.structured_content["truncated"] is False
     assert execution.result.structured_content["truncated"] is True
 
 

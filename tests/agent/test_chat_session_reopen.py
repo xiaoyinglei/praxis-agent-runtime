@@ -296,3 +296,161 @@ def test_continue_selects_recent_thread_in_current_workspace(tmp_path, monkeypat
     monkeypatch.setattr(cli, "_chat_facade_loop", loop)
     cli.agent_chat(checkpoint_db=database, continue_chat=True)
     assert calls[0]["resume_thread_id"] == thread_id and calls[0]["previous_turn_id"] is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("action", ["continue", "retry", "abort"])
+async def test_reopened_reconciliation_reaches_owned_recovery(tmp_path, monkeypatch, action):
+    from agent_runtime.result import AgentPause
+    database = tmp_path / "state.sqlite"
+    workspace = tmp_path / "workspace"
+    thread_id, _ = conversation(database, workspace)
+    with RolloutStore(database) as store:
+        turn = store.start_turn(thread_id=thread_id, user_message="interrupted command", binding_manifest={})
+        store.pause_turn(turn_id=turn.turn_id, reason="command observation needs recovery")
+    calls = []
+
+    class Facade:
+        checkpoint_db = database
+        workspace_path = workspace
+
+        def session(self, **options):
+            raise AssertionError("A saved pending Turn must use the owned resume path")
+
+        async def read_result(self, turn_id):
+            return _result(turn_id=turn_id, status="paused", pause=AgentPause(
+                request_id="pending-wait", kind="tool_reconciliation", question="needs recovery", options=()))
+
+        async def resume(self, turn_id, action, **options):
+            calls.append((turn_id, action, options.get("user_input")))
+            return _result(turn_id=turn_id, answer="recovered original observation")
+
+    commands = iter([action, "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
+    assert calls == [(turn.turn_id, action, None)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(("query", "reconciled", "driver"), [
+    ("Stop the old work and explain the existing files", False, "agent"),
+    ("Stop the old work and explain the existing files", True, "agent"),
+    ("abort", False, "agent"),
+    ("abort", True, "agent"),
+    ("abort", False, "session"),
+    ("abort", True, "session"),
+])
+async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
+    tmp_path, monkeypatch, capsys, query, reconciled, driver,
+):
+    from agent_runtime import Agent
+    from agent_runtime.harness import Session, ToolOrchestrator
+    from agent_runtime.harness.ownership import OWNERSHIP_REVISION
+    from tests.agent.harness.test_process_reopen import ReopenModel
+
+    database = tmp_path / "state.sqlite"
+    workspace = tmp_path / "workspace"
+    thread_id, _ = conversation(database, workspace)
+    with RolloutStore(database) as store:
+        old = store.start_turn(thread_id=thread_id, user_message="interrupted operation",
+                               binding_manifest={"execution_ownership": OWNERSHIP_REVISION})
+        operation = store.prepare_model_operation(
+            turn_id=old.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
+            request_ref={"request_id": "old-request", "purpose": "agent_step"},
+        )
+        attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
+        assert store.complete_model_attempt(
+            operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
+            text="", provider_response_id=None, usage={},
+            tool_calls=({"id": "write-call", "name": "write_file", "arguments": {"path": "artifact"}},),
+        )
+        values = dict(turn_id=old.turn_id, operation_id="uncertain-write", tool_call_id="write-call",
+                      tool_name="write_file", arguments_digest="args", execution_revision="write-v1",
+                      idempotent=False, attempt_count=0, error_code=None, requires_reconciliation=False)
+        store.record_tool_execution_state(status="prepared", **values)
+        store.record_tool_execution_state(status="ready", **values)
+        claim = store.claim_tool_operation(operation_id="uncertain-write", worker_id="dead", lease_seconds=30)
+        assert store.commit_tool_operation_result(
+            turn_id=old.turn_id, operation_id=claim.operation_id, claim_generation=claim.claim_generation,
+            fencing_token=claim.fencing_token, status="unknown", attempt_count=1,
+            error_code="execution_owner_lost", requires_reconciliation=True,
+            result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": True,
+                    "content": [], "attachments": []},
+        )
+
+    model = ReopenModel()
+    observed = []
+
+    async def observe(orchestrator, _commands, turn_id):
+        # An independent receipt is available only in the recoverable case.
+        pending = [item for item in orchestrator._store.list_interactions(turn_id)
+                   if item.kind == "tool_reconciliation" and item.status == "pending"]
+        observed.append(turn_id)
+        if not reconciled or not pending:
+            return False
+        orchestrator._store.resolve_tool_reconciliation(
+            turn_id=turn_id, status="succeeded", reconciler_revision="independent-receipt-v1",
+            result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": False,
+                    "content": [], "attachments": []},
+        )
+        return True
+
+    monkeypatch.setattr(ToolOrchestrator, "reconcile_command_observation", observe)
+
+    class Facade:
+        checkpoint_db = database
+        workspace_path = workspace
+
+        async def read_result(self, turn_id):
+            return await Agent(checkpoint_db=database, workspace_path=workspace).read_result(turn_id)
+
+        async def resume(self, turn_id, action, **options):
+            assert query == "abort" and action == "abort", "New requests must reach Session.submit"
+            if reconciled:
+                # A receipt can close the effect between the read and owned abort.
+                with RolloutStore(database) as store:
+                    store.resolve_tool_reconciliation(
+                        turn_id=turn_id, status="succeeded", reconciler_revision="independent-receipt-v1",
+                        result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": False,
+                                "content": [], "attachments": []},
+                    )
+            if driver == "session":
+                async with await Session.open(database=database, workspace=workspace, thread_id=thread_id,
+                                              model=model, _background_memory=False) as session:
+                    return await session.resume(turn_id, action, **options)
+            return await Agent(checkpoint_db=database, workspace_path=workspace).resume(turn_id, action, **options)
+
+        @asynccontextmanager
+        async def session(self, **options):
+            assert query != "abort", "Cancellation must not open a model Session"
+            assert options["thread_id"] == thread_id
+            async with await Session.open(database=database, workspace=workspace, thread_id=thread_id,
+                                          model=model, _background_memory=False) as session:
+                session._command_sessions = object()
+                yield SimpleNamespace(current_model=lambda: SimpleNamespace(id="offline-model"),
+                                      submit=session.submit)
+
+    commands = iter([query, "/exit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
+    await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
+    output = capsys.readouterr().out
+    assert bool(observed) is (query != "abort")
+    with RolloutStore(database, read_only=True) as store:
+        assert store.verify().valid
+        assert store.read_tool_operation("uncertain-write").attempt_count == 1
+        turns = store.list_turns(thread_id)
+        if reconciled:
+            assert store.read_turn(old.turn_id).status == "cancelled"
+            if query == "abort":
+                assert len(turns) == 2 and not model.requests
+            else:
+                assert len(turns) == 3 and turns[-1].status == "completed"
+                assert any(message.role == "user" and message.content == query
+                           for message in model.requests[-1].messages)
+        else:
+            assert ("取消未完成" if query == "abort" else "输入未发送") in output
+            assert store.read_turn(old.turn_id).status == "paused"
+            assert store.read_tool_operation("uncertain-write").status == "unknown"
+            assert any(item.kind == "tool_reconciliation" and item.status == "pending"
+                       for item in store.list_interactions(old.turn_id))
+            assert len(turns) == 2 and not model.requests

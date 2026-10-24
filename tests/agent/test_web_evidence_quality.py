@@ -66,7 +66,7 @@ def search_page(rows):
 async def test_search_preserves_backend_leads_without_query_interpretation(tmp_path, query, rows):
     hits = []
     tools, client, _ = web_tools(tmp_path, lambda req: hits.append(req) or httpx.Response(
-        200, text=search_page(rows), headers={'content-type': 'text/html'}))
+        200, text=search_page(rows), headers={'content-type': 'text/html'}), provider='bing')
     try:
         execution = await ToolExecutor(tools).execute(call('web_search', {'query': query}),
                                                     context=ToolExecutionContext(allow_web_tools=True))

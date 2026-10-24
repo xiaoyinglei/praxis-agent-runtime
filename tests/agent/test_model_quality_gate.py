@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 import importlib.util
 import json
@@ -1419,14 +1420,34 @@ async def test_run_model_trials_returns_inconclusive_partial_evidence(
     assert raw_case["score"]["passed"] is None
 
 
-@pytest.mark.anyio
-async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
+@pytest.mark.parametrize("catalog_source", ["historical_fixture", "public_builtin"])
+def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    catalog_source: str,
 ) -> None:
     module = _load_gate_module()
     suite = module.load_suite(FIXTURE_PATH)
-    model_id = str(suite["models"][0])
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
+    if catalog_source == "historical_fixture":
+        model_id = str(suite["models"][0])
+        # The measured fixture and baseline retain their original model ID.
+        # Supply that historical declaration explicitly instead of pretending
+        # that it remains a built-in public model.
+        monkeypatch.setenv("RAG_AGENT_MODELS", json.dumps({
+            "models": {model_id: {
+                "provider": "openai_compatible",
+                "provider_name": "deepseek",
+                "protocol": "openai_compatible",
+                "base_url": "https://provider.invalid/v1",
+                "context_window_tokens": 131072,
+                "max_output_tokens": 8192,
+            }},
+            "default_model": model_id,
+        }))
+    else:
+        model_id = "deepseek-flash"
     first_case = suite["cases"][0]
     inconclusive = _inconclusive_model_report(
         module,
@@ -1439,6 +1460,13 @@ async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
     received_model_ids: list[str] = []
 
     async def run_case(**kwargs: object) -> object:
+        from agent_runtime.models import ModelControlPlane
+
+        control_plane = kwargs["control_plane"]
+        assert isinstance(control_plane, ModelControlPlane)
+        assert control_plane.current_model().id == model_id
+        assert control_plane.current_model().provider == "deepseek"
+        assert kwargs["case"] == first_case
         received_model_ids.append(str(kwargs["model_id"]))
         return observation
 
@@ -1448,17 +1476,58 @@ async def test_fixture_model_id_initializes_real_control_plane_and_reaches_case(
     )
     monkeypatch.setattr(module, "run_live_case", run_case)
 
+    if catalog_source == "historical_fixture":
+        monkeypatch.setattr(module, "source_repository_fingerprint", lambda _repository: SimpleNamespace(
+            source_commit="a" * 40, source_tree="b" * 40, dirty=False,
+        ))
+        report_path = tmp_path / "gate-report.json"
+        monkeypatch.setattr(sys, "argv", [
+            str(SCRIPT_PATH), "gate", "--fixture", str(FIXTURE_PATH),
+            "--baseline", str(BASELINE_PATH), "--env-file", str(tmp_path / "missing.env"),
+            "--report", str(report_path),
+        ])
+        assert module.main() == 2
+        gate_report = json.loads(report_path.read_text(encoding="utf-8"))
+        assert gate_report["passed"] is None
+        report = gate_report["runs"][0]
+    else:
+        report = asyncio.run(module.run_model_trials(
+            model_id=model_id,
+            cases=suite["cases"],
+            trials=1,
+            env_file=tmp_path / "missing.env",
+        ))
+
+    assert received_model_ids == [model_id]
+    assert report["model_id"] == model_id
+    assert report["provider"] == "deepseek"
+    assert report["infrastructure_failure"]["case_id"] == str(first_case["id"])
+
+
+@pytest.mark.anyio
+async def test_unregistered_historical_fixture_model_is_inconclusive_before_cases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_gate_module()
+    suite = module.load_suite(FIXTURE_PATH)
+    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
+
+    async def should_not_run_case(**_kwargs: object) -> object:
+        raise AssertionError("An unregistered fixture model must not reach a live case")
+
+    monkeypatch.setattr(module, "run_live_case", should_not_run_case)
     report = await module.run_model_trials(
-        model_id=model_id,
-        cases=suite["cases"],
-        trials=1,
+        model_id=str(suite["models"][0]), cases=suite["cases"], trials=1,
         env_file=tmp_path / "missing.env",
     )
 
-    assert received_model_ids == ["deepseek-v4-flash"]
-    assert report["model_id"] == "deepseek-v4-flash"
-    assert report["provider"] == "deepseek"
-    assert report["infrastructure_failure"]["case_id"] == str(first_case["id"])
+    assert report["status"] == "inconclusive"
+    assert report["trials"] == []
+    assert report["trial_metrics"] == []
+    assert report["infrastructure_failure"]["stage"] == "model_control_plane_initialization"
+    assert report["infrastructure_failure"]["diagnostic_error_types"] == ["UnknownModelIdError"]
 
 
 @pytest.mark.parametrize("failure_stage", ["from_env", "current_model"])

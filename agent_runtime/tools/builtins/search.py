@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import fnmatch
+import asyncio
+import importlib.metadata
+import json
 import os
-import re
+import signal
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -18,34 +21,12 @@ from agent_runtime.tools.tool import (
     ToolDefinition,
     ToolEffect,
     ToolTarget,
-    ToolValidationError,
     json_schema_output,
     pydantic_input,
 )
 from agent_runtime.workspace import WorkspaceRuntime
 
-_INTERNAL_DIRECTORY = ".agent_memory"
-_DEFAULT_IGNORED_DIRECTORIES = frozenset(
-    {
-        _INTERNAL_DIRECTORY,
-        ".git",
-        ".mypy_cache",
-        ".nox",
-        ".pytest_cache",
-        ".rag",
-        ".ruff_cache",
-        ".tox",
-        ".venv",
-        "__pycache__",
-        "node_modules",
-    }
-)
-_AUXILIARY_SOURCE_DIRECTORIES = frozenset({".agents", ".codex"})
 _MAX_SEARCH_FILE_BYTES = 2_000_000
-_MAX_RETURNED_LINE_CHARS = 500
-_SOURCE_FILE_SUFFIXES = frozenset(
-    {".c", ".cc", ".cpp", ".go", ".java", ".js", ".jsx", ".py", ".rs", ".ts", ".tsx"}
-)
 
 
 class SearchTextInput(BaseModel):
@@ -69,7 +50,7 @@ class SearchTextInput(BaseModel):
     regex: bool | None = Field(
         default=None,
         description=(
-            "Matching mode. Use true for a Python regular expression and false "
+            "Matching mode. Use true for a ripgrep (Rust) regular expression and false "
             "for exact literal text. Omit it to auto-detect common regex syntax "
             "such as '.*', '|', '^', '$', character classes, or escaped classes."
         ),
@@ -113,12 +94,13 @@ class SearchTextOutput(BaseModel):
 
 
 _SEARCH_INPUT_SCHEMA, _validate_search_model = pydantic_input(SearchTextInput)
-_SEARCH_OUTPUT_SCHEMA, _unused_search_output_validator = pydantic_input(
-    SearchTextOutput
-)
+_SEARCH_OUTPUT_SCHEMA, _unused_search_output_validator = pydantic_input(SearchTextOutput)
 
 
 def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
+    async def run(arguments: Mapping[str, JsonValue]) -> object:
+        return await _search_text(workspace, SearchTextInput.model_validate(arguments))
+
     return Tool(
         definition=ToolDefinition(
             name="search_text",
@@ -126,10 +108,10 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Search current workspace files without an index. Use it to locate "
                 "relevant symbols, text, or files. Supports literal or regex matching, one file or directory "
                 "path, an optional glob, bounded context lines, and a result limit. "
-                "Directory searches first diversify results across matching files and "
-                "prioritize product source over agent-support directories before filling "
-                "remaining slots. Symlinks are not followed, so every call observes only "
-                "current in-workspace file contents. A targeted post-write search can "
+                "Files are searched in deterministic path order using the bundled ripgrep engine. "
+                "Traversal, file bytes, context and output are bounded; truncated means "
+                "the search or displayed text is incomplete. Symlinks are not followed; "
+                "each call observes current authorized file contents. A targeted post-write search can "
                 "confirm literal presence, or absence only when its exact-file scope is "
                 "reported and non-truncated. Reuse that result while the workspace is "
                 "unchanged. Search verifies matching text within the reported scope, "
@@ -138,10 +120,7 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
             input_schema=_SEARCH_INPUT_SCHEMA,
         ),
         validate_input=_validate_search_input,
-        run=lambda arguments: _search_text(
-            workspace,
-            SearchTextInput.model_validate(arguments),
-        ),
+        run=run,
         normalize_output=_normalize_search_output,
         output_schema=_SEARCH_OUTPUT_SCHEMA,
         static_effects=frozenset({ToolEffect.READ_WORKSPACE}),
@@ -150,13 +129,11 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
             targets=(
                 ToolTarget(
                     kind="workspace_path",
-                    value=str(
-                        workspace.resolve_path(str(arguments["path"]) or ".")
-                    ),
+                    value=str(workspace.resolve_path(str(arguments["path"]) or ".")),
                 ),
             ),
         ),
-        execution_revision="builtin-search-text-v5-exact-file-provenance",
+        execution_revision="builtin-search-text-v6-ripgrep-worker",
         idempotent=True,
         concurrency_safe=True,
         cancellation_mode=CancellationMode.COOPERATIVE,
@@ -169,203 +146,89 @@ def create_search_text_tool(workspace: WorkspaceRuntime) -> Tool:
 def _validate_search_input(
     arguments: Mapping[str, JsonValue],
 ) -> Mapping[str, JsonValue]:
-    canonical = _validate_search_model(arguments)
-    if _uses_regular_expression(
-        str(canonical["pattern"]),
-        canonical["regex"] if isinstance(canonical["regex"], bool) else None,
-    ):
-        try:
-            re.compile(str(canonical["pattern"]))
-        except re.error:
-            raise ToolValidationError(
-                path="$.pattern",
-                message="invalid regular expression",
-            ) from None
-    return canonical
+    return _validate_search_model(arguments)
 
 
-def _search_text(
-    workspace: WorkspaceRuntime,
-    request: SearchTextInput,
-) -> SearchTextOutput:
-    files = _searchable_files(workspace, request.path, request.glob)
-    exact_file_target = _exact_file_search_target(
-        workspace,
-        request.path,
-        files=files,
-    )
-    expression = (
-        re.compile(request.pattern)
-        if _uses_regular_expression(request.pattern, request.regex)
-        else None
-    )
-    matches: list[SearchTextMatch] = []
-    overflow: list[SearchTextMatch] = []
-    truncated = False
-    searched_file_path: str | None = None
-    per_file_limit = max(1, (request.max_results + 4) // 5)
-
-    for path in files:
-        raw = path.read_bytes()[: _MAX_SEARCH_FILE_BYTES + 1]
-        if b"\x00" in raw:
-            continue
-        if len(raw) > _MAX_SEARCH_FILE_BYTES:
-            raw = raw[:_MAX_SEARCH_FILE_BYTES]
-            truncated = True
-        lines = raw.decode("utf-8", errors="replace").splitlines()
-        workspace.ensure_readable(path)
-        relative = workspace.path_label(path)
-        if exact_file_target is not None and path == exact_file_target:
-            searched_file_path = relative
-        file_match_count = 0
-        for index, line in enumerate(lines):
-            found = expression.search(line) if expression is not None else None
-            if expression is None:
-                start = line.find(request.pattern)
-                if start < 0:
-                    continue
-                end = start + len(request.pattern)
-            else:
-                if found is None:
-                    continue
-                start, end = found.span()
-            before_start = max(0, index - request.context_lines)
-            after_end = min(len(lines), index + request.context_lines + 1)
-            match = SearchTextMatch(
-                file_path=relative,
-                line_number=index + 1,
-                line_content=_bounded_line(line),
-                match_start=start,
-                match_end=end,
-                context_before=[
-                    _bounded_line(value) for value in lines[before_start:index]
-                ],
-                context_after=[
-                    _bounded_line(value) for value in lines[index + 1 : after_end]
-                ],
-            )
-            if (
-                len(matches) < request.max_results
-                and file_match_count < per_file_limit
-            ):
-                matches.append(match)
-                file_match_count += 1
-                continue
-            if len(overflow) < request.max_results:
-                overflow.append(match)
-                if len(matches) >= request.max_results:
-                    return SearchTextOutput(
-                        matches=matches,
-                        total_matches=len(matches),
-                        truncated=True,
-                        searched_file_path=searched_file_path,
-                    )
-                continue
-            truncated = True
-            break
-    remaining = request.max_results - len(matches)
-    returned = [*matches, *overflow[:remaining]]
-    truncated = truncated or len(overflow) > remaining
-    return SearchTextOutput(
-        matches=returned,
-        total_matches=len(returned),
-        truncated=truncated,
-        searched_file_path=searched_file_path,
-    )
+def _ripgrep_binary() -> Path:
+    """Locate our locked dependency, never an unrelated executable on PATH."""
+    distribution = importlib.metadata.distribution("ripgrep-bin")
+    for entry in distribution.files or ():
+        if entry.name in {"rg", "rg.exe"}:
+            binary = Path(str(distribution.locate_file(entry))).resolve()
+            if binary.is_file() and os.access(binary, os.X_OK):
+                return binary
+    raise FileNotFoundError("Installed ripgrep-bin has no executable rg")
 
 
-def _exact_file_search_target(
-    workspace: WorkspaceRuntime,
-    value: str,
-    *,
-    files: tuple[Path, ...],
-) -> Path | None:
-    lexical = workspace.resolve_path(value or ".")
+async def _stop_worker(process: asyncio.subprocess.Process) -> None:
     try:
-        target = workspace.ensure_readable(lexical)
-    except (OSError, ValueError):
-        return None
-    if lexical.is_symlink() or not target.is_file():
-        return None
-    if len(files) != 1 or files[0] != target:
-        return None
-    return target
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=0.5)
+    except TimeoutError:
+        pass
+    finally:
+        # The worker may exit before a stubborn descendant. Always finish the
+        # whole process group, even when waiting for its leader already returned.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await process.wait()
 
 
-def _searchable_files(
-    workspace: WorkspaceRuntime,
-    value: str,
-    glob: str | None,
-) -> tuple[Path, ...]:
-    lexical = workspace.resolve_path(value or ".")
-    target = workspace.ensure_readable(lexical)
-    relative_target = Path(workspace.path_label(target))
-    if relative_target.parts and relative_target.parts[0] == _INTERNAL_DIRECTORY:
-        raise PermissionError("agent memory is not searchable")
-    if lexical.is_symlink():
-        return ()
-    if target.is_file():
-        return (target,) if _matches_glob(workspace, target, glob) else ()
-    if not target.is_dir():
-        return ()
-
-    files: list[Path] = []
-    for directory, directory_names, file_names in os.walk(
-        target,
-        followlinks=False,
-    ):
-        current = Path(directory)
-        directory_names[:] = sorted(
-            name
-            for name in directory_names
-            if name not in _DEFAULT_IGNORED_DIRECTORIES
-            and not (current / name).is_symlink()
-            and workspace.is_readable(current / name)
-        )
-        for name in sorted(file_names):
-            path = current / name
-            if path.is_symlink() or not path.is_file() or not workspace.is_readable(path):
-                continue
-            if _matches_glob(workspace, path, glob):
-                files.append(path)
-    return tuple(
-        sorted(
-            files,
-            key=lambda path: _search_file_priority(workspace, path),
-        )
+async def _search_text(workspace: WorkspaceRuntime, request: SearchTextInput) -> object:
+    # Keep authorization at the public boundary; traversal repeats it in the worker.
+    workspace.ensure_readable(workspace.resolve_path(request.path or "."))
+    try:
+        binary = _ripgrep_binary()
+    except (importlib.metadata.PackageNotFoundError, FileNotFoundError):
+        return {
+            "error_code": "search_backend_unavailable",
+            "error_message": "Search requires the packaged ripgrep-bin dependency; reinstall Praxis.",
+        }
+    package_root = Path(__file__).resolve().parents[3]
+    bootstrap = (
+        f"import sys; sys.path.insert(0, {str(package_root)!r}); "
+        "from agent_runtime.tools.builtins.search_worker import main; main()"
     )
-
-
-def _matches_glob(
-    workspace: WorkspaceRuntime,
-    path: Path,
-    glob: str | None,
-) -> bool:
-    if glob is None:
-        return True
-    relative = workspace.path_label(path)
-    return fnmatch.fnmatch(path.name, glob) or fnmatch.fnmatch(relative, glob)
-
-
-def _bounded_line(value: str) -> str:
-    return value[:_MAX_RETURNED_LINE_CHARS]
-
-
-def _search_file_priority(
-    workspace: WorkspaceRuntime,
-    path: Path,
-) -> tuple[int, str]:
-    relative = workspace.path_label(path)
-    parts = set(Path(relative).parts[:-1])
-    if "docs" in parts:
-        group = 3
-    elif parts & _AUXILIARY_SOURCE_DIRECTORIES:
-        group = 2
-    elif path.suffix.lower() in _SOURCE_FILE_SUFFIXES:
-        group = 1 if "tests" in parts else 0
-    else:
-        group = 2
-    return group, relative
+    permissions = workspace.permissions
+    payload = json.dumps(
+        {
+            "root": str(workspace.root.resolve()),
+            "permissions": permissions.model_dump(mode="json") if permissions is not None else None,
+            "request": request.model_dump(mode="json"),
+            "regex": _uses_regular_expression(request.pattern, request.regex),
+            "binary": str(binary),
+        }
+    ).encode()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-I",
+        "-c",
+        bootstrap,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = await process.communicate(payload)
+        if process.returncode != 0:
+            return {"error_code": "search_worker_failed", "error_message": "Search worker failed; retry the search."}
+        result = json.loads(stdout)
+        return result if "error_code" in result else SearchTextOutput.model_validate(result)
+    finally:
+        # A cancelled caller must not leave a worker or backend touching the tree.
+        cleanup = asyncio.create_task(_stop_worker(process))
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
 
 
 def _uses_regular_expression(pattern: str, requested: bool | None) -> bool:
@@ -391,6 +254,14 @@ def _uses_regular_expression(pattern: str, requested: bool | None) -> bool:
 
 
 def _normalize_search_output(raw: object) -> NormalizedToolOutput:
+    if isinstance(raw, dict) and "error_code" in raw:
+        return NormalizedToolOutput(
+            structured_content={"matches": (), "total_matches": 0, "truncated": True, "searched_file_path": None},
+            is_error=True,
+            error_code=str(raw["error_code"]),
+            error_message=str(raw["error_message"]),
+            retryable=False,
+        )
     validated = SearchTextOutput.model_validate(raw)
     structured = json_schema_output(
         _SEARCH_OUTPUT_SCHEMA,

@@ -347,6 +347,7 @@ async def test_completed_output_is_withheld_after_policy_change(tmp_path):
 
 
 def test_worker_code_snapshot_is_outside_editable_install_and_immutable(tmp_path, monkeypatch):
+    monkeypatch.setattr(journal, "command_state_directory", lambda: tmp_path / "private-state")
     source = tmp_path / "editable" / "agent_runtime" / "tools" / "builtins" / "command_worker.py"
     source.parent.mkdir(parents=True)
     source.write_text("original trusted executor")

@@ -161,6 +161,7 @@ class CompletionDecision:
     reason: str
     validation_status: Literal["not_evaluated", "passed", "failed"] = "not_evaluated"
     validation_scope: str | None = None
+    reason_code: str | None = None
 
 
 class CompletionGate(Protocol):

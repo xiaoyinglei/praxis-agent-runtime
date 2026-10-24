@@ -417,8 +417,9 @@ class RolloutContextManager:
                         or item.kind == "context_compaction"):
                     continue
                 message = _item_message(item)
-                if message is not None and (item.item_id not in protected or message.role != "user"):
-                    sources.append({"history_index": history_positions[item.item_id], **asdict(message)})
+                for entry in (*_request_context_messages(item), *((message,) if message is not None else ())):
+                    if item.item_id not in protected or entry.role != "user":
+                        sources.append({"history_index": history_positions[item.item_id], **asdict(entry)})
         sources.extend(
             {
                 "history_index": history_positions[item.item_id],
@@ -593,13 +594,24 @@ def _unique_json(values: list[Any]) -> list[Any]:
 
 def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessMessage], ...]:
     replacements, suppressed = _compaction_projection(items)
+    reconciled = {
+        (item.turn_id, result.get("tool_call_id"))
+        for item in items
+        if item.kind == "tool_reconciliation" and item.producer == "reconciler" and item.status == "completed"
+        and isinstance((result := item.payload.get("result")), Mapping)
+    }
+    stable_groups = {item.item_id for item in items
+                     if item.kind == "model_response" and item.payload.get("tool_result_order") == "call-v1"}
     projected = []
     for item in items:
         if item.status != "completed":
             continue
         if (replacement := replacements.get(item.item_id)) is not None:
             projected.append((item.item_id, replacement))
-        if item.item_id not in suppressed and (message := _item_message(item)) is not None:
+        if item.item_id not in suppressed:
+            projected.extend((item.item_id, message) for message in _request_context_messages(item))
+        superseded = item.kind == "tool_result" and (item.turn_id, item.payload.get("tool_call_id")) in reconciled
+        if item.item_id not in suppressed and not superseded and (message := _item_message(item)) is not None:
             projected.append((item.item_id, message))
         if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
             input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
@@ -609,18 +621,28 @@ def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessM
     ordered = []
     deferred = []
     pending: set[str] = set()
+    call_order: dict[str, int] = {}
+    tool_results = []
     for entry in projected:
         message = entry[1]
-        if pending and message.role == "user":
+        if pending and message.role in {"user", "context"}:
             deferred.append(entry)
             continue
-        ordered.append(entry)
-        pending.update(call.id for call in message.tool_calls)
-        if message.role == "tool":
+        if message.tool_calls:
+            call_order = ({call.id: index for index, call in enumerate(message.tool_calls)}
+                          if entry[0] in stable_groups else {})
+        if message.role == "tool" and pending:
+            tool_results.append(entry)
             pending.discard(message.tool_call_id or "")
+        else:
+            ordered.append(entry)
+        pending.update(call.id for call in message.tool_calls)
         if not pending:
+            ordered.extend(sorted(tool_results, key=lambda item: call_order.get(item[1].tool_call_id or "", -1)))
+            tool_results.clear()
             ordered.extend(deferred)
             deferred.clear()
+    ordered.extend(tool_results)  # Retain incomplete/invalid groups for validation.
     ordered.extend(deferred)
     return tuple(ordered)
 
@@ -654,6 +676,14 @@ def _validate_tool_groups(messages: tuple[HarnessMessage, ...]) -> None:
             pending.update(ids)
     if pending:
         raise ContextBudgetExceededError("Context contains an unfinished tool group.")
+
+
+def _request_context_messages(item: ItemSnapshot) -> tuple[HarnessMessage, ...]:
+    if item.kind != "model_request" or item.producer != "runtime":
+        return ()
+    return tuple(HarnessMessage(role="context", content=update)
+                 for update in item.payload.get("request_ref", {}).get("context_updates", ())
+                 if isinstance(update, str))
 
 
 def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
@@ -693,6 +723,12 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
                 content=model_content,
                 tool_call_id=tool_call_id,
             )
+    if item.kind == "tool_reconciliation" and item.producer == "reconciler":
+        result = item.payload.get("result")
+        if isinstance(result, Mapping) and isinstance(result.get("tool_call_id"), str):
+            content = result.get("model_content")
+            return HarnessMessage(role="tool", tool_call_id=result["tool_call_id"],
+                                  content=content if isinstance(content, str) else _json(dict(result)))
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
         return HarnessMessage(role="context", content=text)
     if item.kind == "tool_continuation" and item.producer == "runtime":

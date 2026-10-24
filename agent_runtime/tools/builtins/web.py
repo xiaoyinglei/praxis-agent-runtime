@@ -276,10 +276,10 @@ def create_web_tools(
     budget_status: Callable[[], dict[str, Any]] | None = None,
     failure_lookup: Callable[[str, str], dict[str, Any] | None] | None = None,
 ) -> tuple[Tool, ...]:
-    provider = search_provider if search_provider is not None else ("brave" if search_key is not None else "bing")
-    if provider not in {"bing", "brave", "tavily"}:
+    provider = search_provider if search_provider is not None else ("brave" if search_key is not None else None)
+    if provider not in {None, "bing", "brave", "tavily"}:
         raise ValueError("Web search provider must be bing, brave or tavily.")
-    if (provider == "bing") != (search_key is None):
+    if provider is not None and (provider == "bing") != (search_key is None):
         raise ValueError("Web search requires a credential for brave/tavily and no credential for bing.")
     accounting = TokenAccountingService(TokenizerContract("", "deepseek-v4-official", "deepseek-v4-official"))
     search_schema, validate_search = pydantic_input(WebSearchInput)
@@ -287,10 +287,17 @@ def create_web_tools(
     search_output_schema, _ = pydantic_input(WebSearchOutput)
     fetch_output_schema, _ = pydantic_input(WebFetchOutput)
     search_endpoint = {"bing": "https://www.bing.com/search", "brave": _SEARCH_ENDPOINT,
-                       "tavily": _TAVILY_ENDPOINT}[provider]
+                       "tavily": _TAVILY_ENDPOINT}.get(provider, "") if provider is not None else ""
 
     async def search_uncached(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
         request = WebSearchInput.model_validate(arguments)
+        if provider is None:
+            return WebSearchOutput(
+                query=request.query, error_code="web_search_not_configured",
+                error_message=("Web search is not configured. Configure brave or tavily with a protected "
+                               "search credential, or explicitly select bing for public HTML search. "
+                               "web_fetch remains available for known public URLs."),
+            ).model_dump(mode="json")
         if provider == "bing":
             params = {"q": request.query, "count": str(request.max_results)}
             if request.freshness:
@@ -573,7 +580,7 @@ def create_web_tools(
                 return {**search_cache[key], "network_bytes": 0, "cache_hit": True, "request_attempted": False,
                         "request_budget": budget_status() if budget_status is not None else None}
             output = await search_uncached(arguments)
-            output["request_attempted"] = output["error_code"] != "web_request_budget_exceeded"
+            output["request_attempted"] = provider is not None and output["error_code"] != "web_request_budget_exceeded"
             output["request_budget"] = budget_status() if budget_status is not None else None
             original_results = output["results"]
             bounded_results = []
@@ -638,7 +645,11 @@ def create_web_tools(
                 "use web_fetch to read supporting content. "
                 + ("Uses configured Tavily basic search (one API credit per uncached request); "
                    "no generated answer is requested or returned. " if provider == "tavily" else
-                   "Uses public Bing search without credentials, or Brave when a search credential is configured. ")
+                   "Uses configured Brave search. " if provider == "brave" else
+                   "Uses explicitly selected public Bing HTML search; availability and markup may change. "
+                   if provider == "bing" else
+                   "Search is not configured: returns web_search_not_configured without network access. "
+                   "Configure brave/tavily with credentials, or explicitly select bing for HTML search. ")
                 +
                 "Queries leave this machine: never include credentials or private workspace content. "
                 "The backend interprets the query as supplied. repeated_results means the title/URL/snippet list "
@@ -650,10 +661,13 @@ def create_web_tools(
             ), search_schema),
             validate_input=validate_search, run=search,
             normalize_output=lambda raw: normalized(raw, WebSearchOutput, search_output_schema),
-            output_schema=search_output_schema, static_effects=frozenset({ToolEffect.NETWORK}),
+            output_schema=search_output_schema,
+            static_effects=frozenset({ToolEffect.NETWORK}) if provider is not None else frozenset(),
             resolve_use=lambda _args: ResolvedToolUse(
-                effects=frozenset({ToolEffect.NETWORK}), targets=(ToolTarget("public_web", search_endpoint),),
+                effects=frozenset({ToolEffect.NETWORK}) if provider is not None else frozenset(),
+                targets=(ToolTarget("public_web", search_endpoint),) if provider is not None else (),
             ), execution_revision=(
+                "builtin-public-web-search-unconfigured-v1" if provider is None else
                 "builtin-public-web-search-tavily-v1" if provider == "tavily" else
                 "builtin-public-web-v5" if search_key is not None else "builtin-public-web-search-bing-v5"
             ),

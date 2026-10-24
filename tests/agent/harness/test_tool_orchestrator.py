@@ -433,7 +433,7 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
 
 
 @pytest.mark.anyio
-async def test_inspection_budget_forces_a_concrete_action_after_twelve_reads(
+async def test_legacy_turn_remains_readable_after_twelve_inspections(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -488,23 +488,20 @@ async def test_inspection_budget_forces_a_concrete_action_after_twelve_reads(
             ),
         )
 
-        assert blocked.is_error is True
-        assert blocked.error_code == "inspection_budget_exhausted"
-        assert blocked.retryable is False
-        assert "apply_patch" in (blocked.error_message or "")
-        assert len(store.list_tool_operations(turn.turn_id)) == 12
+        assert blocked.is_error is False
+        assert len(store.list_tool_operations(turn.turn_id)) == 13
         router = DurableToolRouter(
             store=store,
             tools={"read_file": tool},
             resident_names=("read_file",),
             discoverable_names=(),
         )
-        assert router.select(turn_id=turn.turn_id, messages=()) == ()
+        assert router.select(turn_id=turn.turn_id, messages=()) == (tool,)
         assert store.verify().valid is True
 
 
 @pytest.mark.anyio
-async def test_inspection_budget_counts_read_only_process_tools_by_effect(
+async def test_read_only_processes_are_not_blocked_by_inspection_counts(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -586,15 +583,15 @@ async def test_inspection_budget_counts_read_only_process_tools_by_effect(
             ),
         )
 
-        assert blocked.error_code == "inspection_budget_exhausted"
-        assert len(store.list_tool_operations(turn.turn_id)) == 12
+        assert blocked.is_error is False
+        assert len(store.list_tool_operations(turn.turn_id)) == 13
         router = DurableToolRouter(
             store=store,
             tools=tools,
             resident_names=tuple(tools),
             discoverable_names=(),
         )
-        assert router.select(turn_id=turn.turn_id, messages=()) == ()
+        assert router.select(turn_id=turn.turn_id, messages=()) == tuple(tools.values())
 
 
 @pytest.mark.anyio
@@ -1141,7 +1138,7 @@ def test_failure_streak_respects_real_changes_and_external_effects(changed, exte
             "error_code": "command_failed" if failed else None, "error_message": "TypeError" if failed else None,
             "metadata": {"workspace_tree_changed": changed if not failed else False},
         }))
-        operations.append(SimpleNamespace(result_item_id=result_id,
+        operations.append(SimpleNamespace(tool_call_id=call_id, result_item_id=result_id,
                                           effects=["network"] if external else ["write_workspace", "execute_process"]))
     executor = TurnExecutor.__new__(TurnExecutor)
     executor._store = SimpleNamespace(list_items=lambda _: items, list_tool_operations=lambda _: operations)

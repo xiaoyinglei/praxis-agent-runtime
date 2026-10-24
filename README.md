@@ -74,7 +74,13 @@ rm -rf "$HOME/.local/share/praxis"
 python -m pip install praxis-agent
 ```
 
-参与本仓库开发时，使用 Git 和 uv：
+已有 uv 时，也可以使用独立工具环境安装：
+
+```bash
+uv tool install --python 3.12 --link-mode copy praxis-agent
+```
+
+源码安装和参与本仓库开发时，使用 Git 和 uv：
 
 ```bash
 git clone https://github.com/xiaoyinglei/praxis-agent-runtime.git

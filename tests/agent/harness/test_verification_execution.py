@@ -53,25 +53,23 @@ def test_uv_wrapper_flags_are_not_the_verifier(command):
 
 
 @pytest.mark.parametrize(
-    "code, optimized, passed, failed",
+    "code, optimized",
     [
-        ("def never_called():\n    assert False", False, 0, 0),
-        ("if False:\n    assert False", False, 0, 0),
-        ("assert True", True, 0, 0),
-        ("assert True", False, 1, 0),
-        ("try:\n    assert False\nexcept AssertionError:\n    pass", False, 0, 1),
+        ("def never_called():\n    assert False", False),
+        ("if False:\n    assert False", False),
+        ("assert True", True),
+        ("assert True", False),
+        ("try:\n    assert False\nexcept AssertionError:\n    pass", False),
         (
             "assert True\nAssertionError = ValueError\ntry:\n    assert False\nexcept BaseException:\n    pass",
             False,
-            1,
-            1,
         ),
-        ("def check():\n    assert True\ncheck()", False, 1, 0),
-        ("import sys\nassert sys.modules['__main__'].__file__ == __file__", False, 1, 0),
-        ("assert __cached__ is None\nassert __loader__.get_filename() == __file__", False, 2, 0),
+        ("def check():\n    assert True\ncheck()", False),
+        ("import sys\nassert sys.modules['__main__'].__file__ == __file__", False),
+        ("assert __cached__ is None\nassert __loader__.get_filename() == __file__", False),
     ],
 )
-def test_managed_runner_observes_checks_that_really_execute(tmp_path, code, optimized, passed, failed):
+def test_managed_runner_preserves_plain_python_semantics_without_certificates(tmp_path, code, optimized):
     runner = Path(__file__).resolve().parents[3] / "agent_runtime/tools/python_verification.py"
     script = tmp_path / "task.py"
     script.write_text(code)
@@ -82,9 +80,30 @@ def test_managed_runner_observes_checks_that_really_execute(tmp_path, code, opti
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    evidence = json.loads(report.read_text())
-    assert evidence["assertions_passed"] == passed
-    assert evidence["assertions_failed"] == failed
+    normal = subprocess.run([sys.executable, *(["-O"] if optimized else []), str(script)],
+                            capture_output=True, text=True)
+    assert result.returncode == normal.returncode
+    assert result.stdout == normal.stdout
+    assert not report.exists()
+
+
+@pytest.mark.parametrize("future", [False, True])
+def test_managed_runner_preserves_the_source_annotation_semantics(tmp_path, future):
+    runner = Path(__file__).resolve().parents[3] / "agent_runtime/tools/python_verification.py"
+    script = tmp_path / "annotations.py"
+    script.write_text(
+        ("from __future__ import annotations\n" if future else "")
+        + "def f(value: MissingType):\n    return value\nprint(f.__annotations__)\n"
+    )
+    normal = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+    managed = subprocess.run(
+        [sys.executable, "-I", str(runner), str(script), str(tmp_path / "report.json")],
+        capture_output=True, text=True,
+    )
+    assert managed.returncode == normal.returncode
+    assert managed.stdout == normal.stdout
+    if not future:
+        assert "NameError" in normal.stderr and "NameError" in managed.stderr
 
 
 def test_executed_assertion_does_not_invent_file_coverage(tmp_path):
@@ -101,14 +120,13 @@ def test_executed_assertion_does_not_invent_file_coverage(tmp_path):
         text=True,
     )
     assert result.returncode == 0, result.stderr
-    observed = json.loads(report.read_text())
+    assert not report.exists()
     assessment = assess_tool_verification(
         tool_name="execute_python",
         arguments={"code": script.read_text()},
-        structured_content={"exit_code": 0, "verification": observed},
+        structured_content={"exit_code": 0},
     )
-    assert assessment.evidence is not None
-    assert assessment.evidence.verified_resources == ()
+    assert assessment.evidence is None
 
 
 def test_unrelated_assertions_do_not_verify_the_changed_file(tmp_path):
@@ -163,7 +181,7 @@ def test_collection_and_build_only_modes_do_not_execute_checks(command):
     assert result.reason_code == "no_tests_executed"
 
 
-def test_exit_callback_cannot_replace_final_observation_report(tmp_path):
+def test_managed_runner_does_not_overwrite_task_files(tmp_path):
     runner = Path(__file__).resolve().parents[3] / "agent_runtime/tools/python_verification.py"
     script = tmp_path / "task.py"
     report = tmp_path / "report.json"
@@ -175,7 +193,7 @@ def test_exit_callback_cannot_replace_final_observation_report(tmp_path):
     )
     result = subprocess.run([sys.executable, str(runner), str(script), str(report)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert json.loads(report.read_text()) == {"assertions_passed": 0, "assertions_failed": 0}
+    assert json.loads(report.read_text()) == {"assertions_passed": 1, "assertions_failed": 0}
 
 
 def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):

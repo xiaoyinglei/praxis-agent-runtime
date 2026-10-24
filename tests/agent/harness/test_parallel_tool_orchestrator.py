@@ -246,7 +246,7 @@ async def test_batch_remote_unknown_pauses_before_starting_later_calls(tmp_path:
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("revision", [None, "completion-v2"])
-async def test_batch_inspection_limit_is_only_part_of_the_legacy_contract(tmp_path: Path, revision):
+async def test_batch_reads_remain_available_for_all_completion_policies(tmp_path: Path, revision):
     count = 0
 
     async def run(args):
@@ -268,10 +268,8 @@ async def test_batch_inspection_limit_is_only_part_of_the_legacy_contract(tmp_pa
         )
         calls = tuple(replace(calls[0], tool_call_id=f"read-{i}") for i in range(15))
         results = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
-        expected_count = 12 if revision is None else 15
-        assert count == expected_count
-        assert sum(not result.is_error for result in results) == expected_count
-        assert all(result.is_error for result in results[expected_count:])
+        assert count == 15
+        assert all(not result.is_error for result in results)
         assert store.verify().valid
 
 

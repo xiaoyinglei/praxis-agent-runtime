@@ -407,6 +407,8 @@ def test_bundled_catalog_has_no_process_launcher_configuration() -> None:
         "deepseek",
         "groq",
         "kimi",
+        "qwen",
+        "minimax",
         "mimo",
         "mlx",
         "sentence_transformers",

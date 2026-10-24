@@ -34,6 +34,7 @@ dependencies = [
   "jsonschema>=4.26.0",
   "prompt-toolkit>=3.0.52",
   "regex>=2025.7.34",
+  "ripgrep-bin>=15.2,<16",
   "wcwidth>=0.2.13",
   "markdown-it-py>=3,<5",
   "markdownify>=1.2.3,<2",
@@ -89,6 +90,7 @@ packages = ["agent_runtime", "rag"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "configs/agent-models.yaml" = "agent_runtime/_data/models.yaml"
+"configs/model-catalog.yaml" = "agent_runtime/_data/model-catalog.yaml"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

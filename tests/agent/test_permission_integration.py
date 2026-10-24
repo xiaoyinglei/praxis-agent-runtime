@@ -23,12 +23,13 @@ def scoped_workspace(tmp_path):
     return workspace, source
 
 
-def test_read_list_and_search_share_external_read_permission(tmp_path):
+@pytest.mark.anyio
+async def test_read_list_and_search_share_external_read_permission(tmp_path):
     workspace, source = scoped_workspace(tmp_path)
     assert "reference fact" in _read_file(workspace, ReadFileInput(path=str(source / "notes.txt"))).content
     entries = _list_files(workspace, ListFilesInput(path=str(source))).entries
     assert entries[0].path == str(source / "notes.txt")
-    matches = _search_text(workspace, SearchTextInput(pattern="reference fact", path=str(source))).matches
+    matches = (await _search_text(workspace, SearchTextInput(pattern="reference fact", path=str(source)))).matches
     assert matches[0].file_path == str(source / "notes.txt")
     with pytest.raises((WorkspacePathError, PermissionError)):
         _apply_patch(
@@ -38,7 +39,8 @@ def test_read_list_and_search_share_external_read_permission(tmp_path):
     assert (source / "notes.txt").read_text() == "reference fact\n"
 
 
-def test_recursive_tools_do_not_expose_denied_descendants(tmp_path):
+@pytest.mark.anyio
+async def test_recursive_tools_do_not_expose_denied_descendants(tmp_path):
     workspace, source = scoped_workspace(tmp_path)
     secret = source / "secret.txt"
     secret.write_text("reference secret")
@@ -47,7 +49,7 @@ def test_recursive_tools_do_not_expose_denied_descendants(tmp_path):
     ).resolve(workspace.root)
     workspace.permission_provider = lambda: policy
     assert all(entry.name != "secret.txt" for entry in _list_files(workspace, ListFilesInput(path=str(source))).entries)
-    matches = _search_text(workspace, SearchTextInput(pattern="reference", path=str(source))).matches
+    matches = (await _search_text(workspace, SearchTextInput(pattern="reference", path=str(source)))).matches
     assert [match.file_path for match in matches] == [str(source / "notes.txt")]
     with pytest.raises((WorkspacePathError, PermissionError)):
         _read_file(workspace, ReadFileInput(path=str(secret)))

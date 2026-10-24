@@ -126,6 +126,14 @@ class AgentUsage:
 
 @dataclass(frozen=True, slots=True)
 class AgentResult:
+    """Public Turn result, without an automatic final-answer grounding assessment.
+
+    ``groundedness`` and ``insufficient_evidence`` are compatibility fields and
+    remain false when projecting a Turn. Knowledge-provider assessments apply
+    only to that tool's answer and remain in ``tool_calls[].structured_output``.
+    False here means unassessed, not a negative final-answer verdict.
+    """
+
     answer: str | None
     status: AgentResultStatus
     files: tuple[str, ...]
@@ -217,12 +225,21 @@ class AgentResult:
         projected_calls: list[AgentToolCall] = []
         evidence: list[AgentEvidence] = []
         citations: list[AgentCitation] = []
-        groundedness = False
-        insufficient_evidence = False
+        reconciled_ids = {
+            reconciled_result.get("tool_call_id")
+            for item in items
+            if item.kind == "tool_reconciliation" and item.producer == "reconciler"
+            and isinstance((reconciled_result := item.payload.get("result")), Mapping)
+            and isinstance(reconciled_result.get("tool_call_id"), str)
+        }
         for item in items:
-            if item.kind != "tool_result":
-                continue
             payload = item.payload
+            if item.kind == "tool_reconciliation" and item.producer == "reconciler":
+                payload = item.payload.get("result", {})
+                if not isinstance(payload, Mapping):
+                    continue
+            elif item.kind != "tool_result" or payload.get("tool_call_id") in reconciled_ids:
+                continue
             tool_call_id = payload.get("tool_call_id")
             tool_name = payload.get("tool_name")
             if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
@@ -262,10 +279,6 @@ class AgentResult:
                 raw_structured, Mapping
             ):
                 continue
-            groundedness = raw_structured.get("groundedness_flag") is True
-            insufficient_evidence = (
-                raw_structured.get("insufficient_evidence") is True
-            )
             raw_evidence = raw_structured.get("results")
             if isinstance(raw_evidence, Sequence) and not isinstance(
                 raw_evidence, (str, bytes)
@@ -492,8 +505,8 @@ class AgentResult:
             stop_reason=turn.terminal_reason_code or turn.status,
             pause=pause,
             workspace_path=thread.workspace,
-            groundedness=groundedness,
-            insufficient_evidence=insufficient_evidence,
+            groundedness=False,
+            insufficient_evidence=False,
             plan=plan,
             plan_events=plan_events,
             needs_user_input=None if pause is None else pause.question,

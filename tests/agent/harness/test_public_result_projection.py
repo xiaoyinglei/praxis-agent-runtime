@@ -135,6 +135,8 @@ async def test_harness_turn_projects_to_the_stable_public_agent_result(tmp_path:
         assert result.status == "done"
         assert result.validation_status == "not_evaluated"
         assert result.validation_scope is None
+        assert result.groundedness is False
+        assert result.insufficient_evidence is False
         assert result.thread_id == internal.thread_id
         assert result.turn_id == internal.turn_id
         assert result.workspace_path == str(workspace.resolve())

@@ -38,6 +38,8 @@ jobs:
         run: uv run --all-extras ruff check .
       - name: Mypy
         run: uv run --all-extras mypy
+      - name: Model catalog synchronization
+        run: uv run --all-extras python scripts/sync_model_catalog.py --check
       - name: Pytest
         run: uv run --all-extras pytest -q
       - name: Web evidence quality acceptance

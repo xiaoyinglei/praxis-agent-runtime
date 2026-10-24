@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import yaml
 
@@ -8,7 +10,9 @@ from agent_runtime.modeling.contracts import LLMCallStage
 
 @pytest.fixture
 def project_registry(tmp_path, monkeypatch):
-    monkeypatch.delenv("RAG_AGENT_MODELS_PATH", raising=False)
+    # This test covers both local research and cloud definitions. The public
+    # catalog deliberately excludes local models and unverified transports.
+    monkeypatch.setenv("RAG_AGENT_MODELS_PATH", str(Path(__file__).resolve().parents[2] / "configs/models.yaml"))
     monkeypatch.delenv("RAG_AGENT_MODELS", raising=False)
     monkeypatch.setenv("PRAXIS_DISABLE_DOTENV", "1")
     monkeypatch.setenv("PRAXIS_MODEL_REGISTRY_PATH", str(tmp_path / "model-registry.yaml"))
