@@ -337,6 +337,178 @@ class Agent:
         return await manage_command(self, turn_id, session_id, action=action, wait_seconds=wait_seconds,
                                     stream=stream, offset=offset, max_bytes=max_bytes)
 
+    async def list_checkpoints(self, *, thread_id: str | None = None) -> list[dict[str, object]]:
+        """List workspace checkpoints recorded for this workspace's Threads."""
+        from agent_runtime.checkpoints import _numeric, thread_checkpoint_rows
+        from agent_runtime.harness import RolloutStore
+
+        database = self._harness_database()
+        rows: list[dict[str, object]] = []
+        if database.exists():
+            with RolloutStore(database, read_only=True) as store:
+                threads = (thread_id,) if thread_id is not None else tuple(
+                    dict.fromkeys(turn.thread_id for turn in store.list_turns())
+                )
+                rows = [row for current in threads for row in thread_checkpoint_rows(store, current)]
+        # Restore anchors live only in the shadow repository (restores happen
+        # outside Turns), so merge them in or a rewind could not be undone.
+        from agent_runtime.checkpoints import CheckpointService
+
+        recorded = {str(row.get("checkpoint_id")) for row in rows}
+        service_rows: list[dict[str, object]] = []
+        for entry in await CheckpointService(self._workspace_path()).list_checkpoints():
+            if entry.checkpoint_id in recorded or " restore " not in f" {entry.subject} ":
+                continue
+            service_rows.append({
+                "checkpoint_id": entry.checkpoint_id,
+                "turn_id": "",
+                "trigger": "restore",
+                "tree_sha256": None,
+                "changed_file_count": 0,
+                "wall_time": entry.timestamp,
+                "sequence": entry.sequence,
+                "turn_input": "回滚前状态（撤销回滚用）",
+            })
+        rows.extend(service_rows)
+
+        def row_order(row: dict[str, object]) -> tuple[float, int]:
+            return _numeric(row.get("wall_time")), int(_numeric(row.get("sequence")))
+
+        rows.sort(key=row_order, reverse=True)
+        return rows
+
+    async def rewind(self, checkpoint_id: str) -> dict[str, object]:
+        """Restore workspace files to a shadow checkpoint; the current state is anchored first.
+
+        Refuses while any Turn in this workspace is still running or paused:
+        restoring underneath live execution would corrupt its workspace views.
+        """
+        from agent_runtime.checkpoints import CheckpointService
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database(), read_only=True) as store:
+            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+        if active:
+            raise RuntimeError(
+                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再回滚。"
+            )
+        result = await CheckpointService(self._workspace_path()).restore(checkpoint_id)
+        return {
+            "target_checkpoint_id": result.target_checkpoint_id,
+            "restored": list(result.restored),
+            "deleted": list(result.deleted),
+            "restore_anchor_id": result.anchor_checkpoint_id,
+        }
+
+    async def commit_status(self) -> dict[str, object]:
+        """Read the workspace repository's branch and pending change set."""
+        from agent_runtime.git_delivery import GitDelivery
+
+        status = await GitDelivery(self._workspace_path()).status()
+        return {
+            "branch": status.branch,
+            "changed": [f"{code} {path}" for code, path in status.changed],
+            "changed_file_count": len(status.changed),
+        }
+
+    async def commit(
+        self, message: str, *, branch_name: str | None = None,
+    ) -> dict[str, object]:
+        """Commit workspace changes on a ``praxis/*`` branch of the real repository.
+
+        A user-authorized delivery operation: the sandbox and the model never
+        gain Git write access; this host-side call stages exactly what
+        ``commit_status`` showed and refuses while Turns are still active.
+        """
+        from agent_runtime.git_delivery import GitDelivery
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database(), read_only=True) as store:
+            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+        if active:
+            raise RuntimeError(
+                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再提交。"
+            )
+        result = await GitDelivery(self._workspace_path()).commit(message, branch_name=branch_name)
+        return {
+            "commit_id": result.commit_id,
+            "branch": result.branch,
+            "changed_file_count": result.changed_file_count,
+            "created_branch": result.created_branch,
+        }
+
+    async def pull_request_status(self) -> dict[str, object]:
+        """Read what a pull request from the current praxis branch would contain."""
+        from agent_runtime.git_delivery import GitDelivery
+
+        status = await GitDelivery(self._workspace_path()).pull_request_status()
+        return {
+            "branch": status.branch,
+            "remote_url": status.remote_url,
+            "base_branch": status.base_branch,
+            "commit_subjects": list(status.commit_subjects),
+            "changed_paths": list(status.changed_paths),
+            "uncommitted_count": status.uncommitted_count,
+            "open_pull_request_url": status.open_pull_request_url,
+        }
+
+    async def open_pull_request(
+        self, *, title: str | None = None, body: str | None = None,
+        base_branch: str | None = None,
+    ) -> dict[str, object]:
+        """Push the current praxis branch and open (or return) its pull request.
+
+        Publishing is outward-facing: it runs host-side only after the caller
+        confirmed the previewed change set, and refuses while Turns are active.
+        """
+        from agent_runtime.git_delivery import GitDelivery
+        from agent_runtime.harness import RolloutStore
+
+        with RolloutStore(self._harness_database(), read_only=True) as store:
+            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+        if active:
+            raise RuntimeError(
+                "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再发布。"
+            )
+        result = await GitDelivery(self._workspace_path()).open_pull_request(
+            title=title, body=body, base_branch=base_branch,
+        )
+        return {
+            "url": result.url,
+            "branch": result.branch,
+            "created": result.created,
+        }
+
+    async def pull_request_checks(
+        self, branch: str | None = None, *,
+        include_failure_logs: bool = False,
+        wait_seconds: float = 0.0,
+        poll_interval_seconds: float = 20.0,
+    ) -> dict[str, object]:
+        """Read a branch's PR checks; optionally wait until they settle."""
+        from agent_runtime.git_delivery import GitDelivery
+
+        report = await GitDelivery(self._workspace_path()).pull_request_checks(
+            branch,
+            include_failure_logs=include_failure_logs,
+            wait_seconds=wait_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        return {
+            "branch": report.branch,
+            "overall": report.overall,
+            "pull_request_url": report.pull_request_url,
+            "checks": [
+                {"name": check.name, "state": check.state,
+                 "workflow": check.workflow, "link": check.link}
+                for check in report.checks
+            ],
+            "failure_logs": [
+                {"workflow": name, "logs": logs}
+                for name, logs in report.failure_logs
+            ],
+        }
+
     async def resume(
         self,
         turn_id: str,

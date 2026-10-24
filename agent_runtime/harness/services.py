@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
+from agent_runtime.checkpoints import CheckpointService
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.context import RolloutContextManager
@@ -387,6 +388,7 @@ def configure_services(
         tools=tool_snapshot,
         execution_context=execution_context,
         worker_id=worker_id,
+        checkpoints=CheckpointService(workspace),
     )
     session.tool_execution_context = execution_context
     session.model = model

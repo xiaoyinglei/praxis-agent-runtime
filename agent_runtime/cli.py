@@ -7,6 +7,7 @@ import os
 import shlex
 import sqlite3
 import sys
+import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -18,7 +19,7 @@ import typer
 import yaml
 from pydantic import ValidationError
 
-from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODES, ApprovalMode
+from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODES, ApprovalMode, approval_mode_hint
 from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
@@ -456,23 +457,41 @@ async def _handle_ui_pause(result: AgentResult, ui: TerminalChatApp) -> str | No
         print(f"请输入: {', '.join(options)}；q 取消")
 
 
-async def _handle_cli_pause(result: AgentResult) -> str | None:
+async def _handle_cli_pause(
+    result: AgentResult, *, approval_mode: ApprovalMode | None = None,
+    set_approval_mode: Callable[[ApprovalMode], None] | None = None,
+) -> str | None:
     """TTY approval uses a selector; plain input remains available for pipes."""
     request = result.pause
     if request is not None and request.kind == "tool_approval" and request.options and _is_interactive_terminal():
         from prompt_toolkit.shortcuts import radiolist_dialog
 
         details = [request.question]
+        if approval_mode is not None:
+            details.insert(0, approval_mode_hint(approval_mode))
         details.extend(f"{call.tool_name}: {call.args_preview}" for call in request.tool_calls)
         scope = request.context.get("session_grant_label")
         if isinstance(scope, str):
             details.append("本会话授权范围：" + scope)
-        return await radiolist_dialog(
-            title="操作审批", text=safe_terminal_text("\n".join(details)),
-            values=[(choice, APPROVAL_CHOICES.get(choice, choice)) for choice in request.options],
-            default="deny" if "deny" in request.options else request.options[0],
-            ok_text="确认", cancel_text="取消",
-        ).run_async()
+        values = [(choice, APPROVAL_CHOICES.get(choice, choice)) for choice in request.options]
+        if set_approval_mode is not None:
+            values.append(("permissions", APPROVAL_CHOICES["permissions"]))
+        while True:
+            action = await radiolist_dialog(
+                title="操作审批", text=safe_terminal_text("\n".join(details)), values=values,
+                default="deny" if "deny" in request.options else request.options[0],
+                ok_text="确认", cancel_text="取消",
+            ).run_async()
+            if action != "permissions":
+                return action
+            selected = await radiolist_dialog(
+                title="选择审批模式", text="应用到当前任务并按新策略重新检查；明确禁令和沙箱仍有效。",
+                values=list(APPROVAL_MODES.items()), default=approval_mode,
+                ok_text="应用", cancel_text="返回审批",
+            ).run_async()
+            if selected is not None and selected != approval_mode and set_approval_mode is not None:
+                set_approval_mode(cast(ApprovalMode, selected))
+                return "recheck"
     return _handle_pause(result)
 
 
@@ -720,7 +739,10 @@ async def _run_facade_command(
         )
         while result.status == "paused" and interactive_approval:
             display.finish()
-            action = await _handle_cli_pause(result)
+            action = await _handle_cli_pause(
+                result, approval_mode=getattr(facade, "approval_mode", None) or "auto",
+                set_approval_mode=lambda mode: setattr(facade, "approval_mode", mode),
+            )
             if action is None:
                 break
             display.begin_turn()
@@ -1012,7 +1034,38 @@ async def _chat_facade_loop(
             _handle_request_settings_command(query, agent=control)
             refresh_request_status(control)
 
+        def set_approval_mode(mode: str) -> bool:
+            nonlocal chat_approval_mode, allow_write_tools, allow_execute_tools, allow_web_tools
+            if mode not in APPROVAL_MODES:
+                raise ValueError("审批模式必须为 ask、auto 或 full")
+            previous = session.tool_execution_context.approval_mode if session else chat_approval_mode
+            if session is not None:
+                session.update_tool_policy(approval_mode=cast(ApprovalMode, mode),
+                                           allow_write_tools=False, allow_execute_tools=False,
+                                           allow_web_tools=False, auto_approve_sandboxed=False)
+            chat_approval_mode = cast(ApprovalMode, mode)
+            facade.approval_mode = chat_approval_mode
+            if _ui:
+                _ui.approval_mode = chat_approval_mode
+            allow_write_tools = allow_execute_tools = allow_web_tools = False
+            print("审批模式: " + APPROVAL_MODES[mode])
+            return mode != previous
+
+        async def choose_approval_mode() -> bool:
+            current = session.tool_execution_context.approval_mode if session else chat_approval_mode or "ask"
+            if _ui:
+                choices = list(APPROVAL_MODES.values())
+                chosen = await _ui.choose_menu(choices, title="选择审批模式", current=APPROVAL_MODES[current])
+                if chosen is None:
+                    return False
+                return set_approval_mode(list(APPROVAL_MODES)[choices.index(chosen)])
+            for key, label in APPROVAL_MODES.items():
+                print(f"  {key}: {label}")
+            chosen = (await asyncio.to_thread(input, "审批模式 ask/auto/full（空行取消）: ")).strip()
+            return set_approval_mode(chosen) if chosen else False
+
         if _ui is not None:
+            _ui.on_permissions = choose_approval_mode
             async def receive_input(text: str) -> str | None:
                 assert _ui is not None
                 if text.split(maxsplit=1)[0] in {"/effort", "/output"}:
@@ -1075,38 +1128,12 @@ async def _chat_facade_loop(
                 try:
                     mode = None
                     if query == "/permissions":
-                        current_mode = (session.tool_execution_context.approval_mode if session
-                                        else chat_approval_mode or "ask")
-                        choices = list(APPROVAL_MODES.values())
-                        if _ui:
-                            chosen = await _ui.choose_menu(
-                                choices, title="选择审批模式", current=APPROVAL_MODES[current_mode],
-                            )
-                            if chosen is None:
-                                continue
-                            mode = list(APPROVAL_MODES)[choices.index(chosen)]
-                        else:
-                            for key, label in APPROVAL_MODES.items():
-                                print(f"  {key}: {label}")
-                            chosen = (await asyncio.to_thread(input, "审批模式 ask/auto/full（空行取消）: ")).strip()
-                            if not chosen:
-                                continue
-                            mode = chosen
+                        await choose_approval_mode()
+                        continue
                     elif len(parts) == 3 and parts[1] == "mode":
                         mode = parts[2]
                     if mode is not None:
-                        if mode not in APPROVAL_MODES:
-                            raise ValueError("审批模式必须为 ask、auto 或 full")
-                        if session is not None:
-                            session.update_tool_policy(approval_mode=cast(ApprovalMode, mode),
-                                                       allow_write_tools=False, allow_execute_tools=False,
-                                                       allow_web_tools=False, auto_approve_sandboxed=False)
-                        chat_approval_mode = cast(ApprovalMode, mode)
-                        facade.approval_mode = chat_approval_mode
-                        if _ui:
-                            _ui.approval_mode = chat_approval_mode
-                        allow_write_tools = allow_execute_tools = allow_web_tools = False
-                        print("审批模式: " + APPROVAL_MODES[mode])
+                        set_approval_mode(mode)
                         continue
                     if query == "/permissions grants":
                         grants = session.approval_grants() if session is not None else ()
@@ -1148,6 +1175,259 @@ async def _chat_facade_loop(
                 except (OSError, ValueError) as error:
                     print("权限配置失败: " + safe_terminal_text(str(error)))
                 continue
+            if query == "/rewind" or query.startswith("/rewind "):
+                argument = query.removeprefix("/rewind").strip()
+                current_thread = (selected_chat.thread_id if selected_chat
+                                  else getattr(session, "thread_id", None))
+                try:
+                    from agent_runtime.checkpoints import CheckpointError, _numeric
+
+                    rows = await facade.list_checkpoints(thread_id=current_thread)
+                    if not rows:
+                        print("当前会话还没有检查点。首次修改工作区文件时会自动建立。")
+                        continue
+                    trigger_labels = {"pre_write": "写前", "restore": "回滚前"}
+                    labels = [
+                        "{time}  {trigger}  变更 {count} 个文件  {note}".format(
+                            time=time.strftime("%m-%d %H:%M:%S", time.localtime(_numeric(row.get("wall_time")))),
+                            trigger=trigger_labels.get(str(row["trigger"]), str(row["trigger"])),
+                            count=row.get("changed_file_count"),
+                            note=safe_terminal_text(str(row["turn_input"] or row["turn_id"])),
+                        )
+                        for row in rows
+                    ]
+                    selected_row: dict[str, object] | None = None
+                    if argument:
+                        if argument.isdigit():
+                            index = int(argument)
+                            selected_row = rows[index - 1] if 1 <= index <= len(rows) else None
+                        else:
+                            matches = [row for row in rows
+                                       if str(row["checkpoint_id"]).startswith(argument)]
+                            if len(matches) > 1:
+                                print(f"检查点前缀匹配多个结果（{len(matches)} 个），请输入更长的前缀。")
+                                continue
+                            selected_row = matches[0] if len(matches) == 1 else None
+                        if selected_row is None:
+                            print("没有对应的检查点；/rewind 查看列表。")
+                            continue
+                    elif _ui:
+                        chosen = await _ui.choose_menu(labels, title="选择要回滚的检查点（最新在前）")
+                        if chosen is None:
+                            continue
+                        selected_row = rows[labels.index(chosen)]
+                    else:
+                        print("检查点（最新在前）：")
+                        for index, label in enumerate(labels, start=1):
+                            print(f"  {index:>3}. {label}")
+                        answer = (await asyncio.to_thread(input, "输入序号回滚（空行取消）: ")).strip()
+                        if not answer or not answer.isdigit() or not 1 <= int(answer) <= len(rows):
+                            continue
+                        selected_row = rows[int(answer) - 1]
+                    if _ui:
+                        confirmed = await _ui.choose_menu(
+                            ["确认回滚", "取消"], title="回滚前会先把当前状态保存为检查点",
+                        )
+                        if confirmed != "确认回滚":
+                            continue
+                    else:
+                        confirm = (await asyncio.to_thread(
+                            input,
+                            "回滚会把工作区文件恢复到该检查点（之后新增的文件会被删除；"
+                            "当前状态会先保存为检查点）。确认回滚？[y/N] ",
+                        )).strip()
+                        if confirm.casefold() not in {"y", "yes"}:
+                            continue
+                    rewind_result = await facade.rewind(str(selected_row["checkpoint_id"]))
+                    restored = [str(path) for path in cast("list[object]", rewind_result.get("restored", ()))]
+                    deleted = [str(path) for path in cast("list[object]", rewind_result.get("deleted", ()))]
+                    print(f"已回滚到 {str(rewind_result.get('target_checkpoint_id', ''))[:12]}："
+                          f"还原 {len(restored)} 个文件，删除 {len(deleted)} 个文件。")
+                    anchor = str(rewind_result.get("restore_anchor_id") or "")
+                    if anchor:
+                        print(f"回滚前状态已保存为检查点 {anchor[:12]}；再次 /rewind 可撤销本次回滚。")
+                    for path in restored[:30]:
+                        print(f"  还原 {safe_terminal_text(path)}")
+                    for path in deleted[:30]:
+                        print(f"  删除 {safe_terminal_text(path)}")
+                except (CheckpointError, OSError, RuntimeError) as error:
+                    print("回滚失败: " + safe_terminal_text(str(error)))
+                continue
+            if query == "/commit" or query.startswith("/commit "):
+                message = query.removeprefix("/commit").strip()
+                try:
+                    from agent_runtime.git_delivery import DeliveryError
+
+                    status = await facade.commit_status()
+                    changed = cast("list[object]", status.get("changed", ()))
+                    if not changed:
+                        print("没有可提交的变更。")
+                        continue
+                    print(f"当前分支 {status.get('branch')}，待提交 {len(changed)} 项：")
+                    for entry in changed[:20]:
+                        print(f"  {safe_terminal_text(str(entry))}")
+                    if len(changed) > 20:
+                        print(f"  …另有 {len(changed) - 20} 项")
+                    if not message:
+                        if _ui:
+                            print("请输入 /commit <提交说明> 后重试。")
+                            continue
+                        message = (await asyncio.to_thread(input, "提交说明: ")).strip()
+                        if not message:
+                            continue
+                    if _ui:
+                        confirmed = await _ui.choose_menu(
+                            ["确认提交", "取消"],
+                            title="提交会包含上面列出的全部变更",
+                        )
+                        if confirmed != "确认提交":
+                            continue
+                    else:
+                        confirm = (await asyncio.to_thread(
+                            input, "确认提交以上变更到 praxis/* 分支？[y/N] ",
+                        )).strip()
+                        if confirm.casefold() not in {"y", "yes"}:
+                            continue
+                    delivery = await facade.commit(message)
+                    print(f"已提交 {str(delivery.get('commit_id'))[:12]} 到分支 "
+                          f"{delivery.get('branch')}（{delivery.get('changed_file_count')} 个文件）。")
+                except (DeliveryError, OSError, RuntimeError) as error:
+                    print("提交失败: " + safe_terminal_text(str(error)))
+                continue
+            if query == "/pull" or query.startswith("/pull "):
+                title = query.removeprefix("/pull").strip()
+                try:
+                    from agent_runtime.checkpoints import _numeric
+                    from agent_runtime.git_delivery import DeliveryError
+
+                    pr_status = await facade.pull_request_status()
+                    subjects = cast("list[object]", pr_status.get("commit_subjects", ()))
+                    paths = cast("list[object]", pr_status.get("changed_paths", ()))
+                    existing = pr_status.get("open_pull_request_url")
+                    print(f"分支 {pr_status.get('branch')} → origin，基准 "
+                          f"{pr_status.get('base_branch')}：")
+                    for subject in subjects[:15]:
+                        print(f"  提交 {safe_terminal_text(str(subject))}")
+                    for changed_path in paths[:20]:
+                        print(f"  文件 {safe_terminal_text(str(changed_path))}")
+                    if len(paths) > 20:
+                        print(f"  …另有 {len(paths) - 20} 个文件")
+                    uncommitted = int(_numeric(pr_status.get("uncommitted_count")))
+                    if uncommitted:
+                        print(f"提示：工作区还有 {uncommitted} 项未提交变更，不会包含在本 PR 中"
+                              "（可先 /commit）。")
+                    if isinstance(existing, str) and existing:
+                        print(f"该分支已有 Pull Request：{existing}")
+                    if not title and _ui:
+                        print("请输入 /pull <标题> 后重试（默认标题取最新提交说明）。")
+                        continue
+                    if _ui:
+                        confirmed = await _ui.choose_menu(
+                            ["确认推送并创建", "取消"],
+                            title="推送分支并创建 Pull Request",
+                        )
+                        if confirmed != "确认推送并创建":
+                            continue
+                    else:
+                        confirm = (await asyncio.to_thread(
+                            input, "确认推送并创建 Pull Request？[y/N] ",
+                        )).strip()
+                        if confirm.casefold() not in {"y", "yes"}:
+                            continue
+                    pull_request = await facade.open_pull_request(title=title or None)
+                    verb = "已创建" if pull_request.get("created") else "已更新"
+                    print(f"{verb} Pull Request：{pull_request.get('url')}")
+                except (DeliveryError, OSError, RuntimeError) as error:
+                    print("创建 Pull Request 失败: " + safe_terminal_text(str(error)))
+                continue
+            if query == "/checks" or query.startswith("/checks "):
+                ci_message: str | None = None
+                try:
+                    from agent_runtime.git_delivery import DeliveryError, compose_ci_failure_message
+
+                    tokens = query.split()[1:]
+                    branch: str | None = None
+                    wait_seconds = 0.0
+                    index = 0
+                    while index < len(tokens):
+                        token = tokens[index]
+                        if token == "--wait":
+                            wait_seconds = 600.0
+                            if index + 1 < len(tokens) and tokens[index + 1].isdigit():
+                                wait_seconds = float(tokens[index + 1])
+                                index += 1
+                        elif token.startswith("--wait=") and token[7:].isdigit():
+                            wait_seconds = float(token[7:])
+                        elif branch is None:
+                            branch = token
+                        index += 1
+                    if wait_seconds > 0:
+                        print(f"等待 CI 完成（最长 {int(wait_seconds)} 秒，Ctrl+C 取消）…")
+                    try:
+                        report = await facade.pull_request_checks(
+                            branch, include_failure_logs=True,
+                            wait_seconds=wait_seconds,
+                        )
+                    except KeyboardInterrupt:
+                        print("已取消等待；可再次运行 /checks 查看当前状态。")
+                        continue
+                    state_icons = {"pass": "✅", "fail": "❌", "pending": "⏳",
+                                   "skipping": "⏸", "cancel": "⛔"}
+                    checks = cast("list[dict[str, object]]", report.get("checks", ()))
+                    print(f"分支 {report.get('branch')} 的 PR 检查"
+                          f"（{report.get('pull_request_url') or 'PR'}）：")
+                    for check in checks:
+                        icon = state_icons.get(str(check.get("state")), "·")
+                        print(f"  {icon} {safe_terminal_text(str(check.get('name', '')))}"
+                              f"（{safe_terminal_text(str(check.get('workflow', '')))}）")
+                    overall = str(report.get("overall"))
+                    if overall == "pass":
+                        print(f"CI 全部通过 ✅（{len(checks)} 项）。")
+                        continue
+                    if overall == "none":
+                        print("该 Pull Request 没有配置检查。")
+                        continue
+                    if overall == "pending":
+                        print("仍在进行中；可用 /checks --wait 继续等待。")
+                        continue
+                    failed = [check for check in checks
+                              if str(check.get("state")) in {"fail", "cancel"}]
+                    failure_logs = cast("list[dict[str, object]]", report.get("failure_logs", ()))
+                    for entry in failure_logs:
+                        logs = str(entry.get("logs", ""))
+                        print(f"—— {entry.get('workflow')} 失败日志（截断）：")
+                        for line in logs[-1200:].splitlines()[-25:]:
+                            print("  " + safe_terminal_text(line))
+                    if _ui:
+                        confirmed = await _ui.choose_menu(
+                            ["交给 agent 分析修复", "取消"],
+                            title=f"CI 失败（{len(failed)} 项）",
+                        )
+                        if confirmed != "交给 agent 分析修复":
+                            continue
+                    else:
+                        confirm = (await asyncio.to_thread(
+                            input, "把失败详情交给 agent 分析修复？[y/N] ",
+                        )).strip()
+                        if confirm.casefold() not in {"y", "yes"}:
+                            continue
+                    ci_message = compose_ci_failure_message(
+                        branch=str(report.get("branch")),
+                        pull_request_url=(
+                            str(report["pull_request_url"])
+                            if isinstance(report.get("pull_request_url"), str) else None
+                        ),
+                        failed=[(str(check.get("name", "")), str(check.get("workflow", "")))
+                                for check in failed],
+                        failure_logs=[(str(entry.get("workflow", "")), str(entry.get("logs", "")))
+                                      for entry in failure_logs],
+                    )
+                except (DeliveryError, OSError, RuntimeError) as error:
+                    print("读取 CI 状态失败: " + safe_terminal_text(str(error)))
+                    continue
+                if ci_message is None:
+                    continue
+                query = ci_message
             if query == "/connections":
                 if _ui:
                     await _ui.open_connections()
@@ -2481,3 +2761,143 @@ def agent_recover(
         raise typer.Exit(code=2)
     if result.status == "failed":
         raise typer.Exit(code=1)
+
+
+async def _watch_command(
+    *,
+    workspace: Path,
+    checkpoint_db: Path,
+    permissions: Path | None,
+    approval_mode: ApprovalMode,
+    branch: str | None,
+    thread_id: str | None,
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    fix: bool,
+) -> int:
+    """Wait for CI on a delivery branch; on failure hand the report to the agent."""
+    from agent_runtime.git_delivery import (
+        BRANCH_PREFIX,
+        DeliveryError,
+        GitDelivery,
+        compose_ci_failure_message,
+    )
+
+    delivery = GitDelivery(workspace)
+    try:
+        resolved_branch = branch
+        if resolved_branch is None:
+            resolved_branch = delivery.current_branch()
+            if not resolved_branch.startswith(BRANCH_PREFIX):
+                resolved_branch = delivery.latest_delivery_branch() or ""
+        if not resolved_branch.startswith(BRANCH_PREFIX):
+            print("没有可观察的 praxis/* 分支；请先 /commit，或用 --branch 指定。")
+            return 2
+        print(f"观察分支 {resolved_branch} 的 CI（最长 {int(timeout_seconds)} 秒，"
+              f"每 {int(poll_interval_seconds)} 秒轮询；Ctrl+C 取消）…")
+        report = await delivery.pull_request_checks(
+            resolved_branch,
+            include_failure_logs=True,
+            wait_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        failed = [check for check in report.checks if check.state in {"fail", "cancel"}]
+        if report.overall == "pass":
+            print(f"CI 全部通过 ✅（{len(report.checks)} 项）。")
+            return 0
+        if report.overall == "none":
+            print("该 Pull Request 没有配置检查。")
+            return 2
+        if report.overall == "pending":
+            print("等待超时，CI 仍在进行中；可再次运行 agent watch 继续。")
+            return 2
+        for check in failed:
+            print(f"  ❌ {check.name}（{check.workflow}）")
+        if not fix:
+            print("已按 --no-fix 停止；去掉该参数可把失败交给 agent 分析修复。")
+            return 1
+        resolved_thread = thread_id
+        if resolved_thread is None:
+            if not checkpoint_db.exists():
+                print("当前工作区没有历史会话可续写；用 --thread 指定，或使用 --no-fix。")
+                return 2
+            sessions = list_chat_sessions(checkpoint_db, workspace=workspace)
+            if not sessions:
+                print("当前工作区没有历史会话可续写；用 --thread 指定，或使用 --no-fix。")
+                return 2
+            resolved_thread = sessions[0].thread_id
+        message = compose_ci_failure_message(
+            branch=report.branch,
+            pull_request_url=report.pull_request_url,
+            failed=[(check.name, check.workflow) for check in failed],
+            failure_logs=report.failure_logs,
+        )
+        facade = _create_agent_facade(
+            checkpoint_db=checkpoint_db,
+            workspace_path=workspace,
+            permissions=permissions,
+            approval_mode=approval_mode,
+            enable_workspace_mcp=False,
+        )
+        print(f"把失败详情交给会话 {resolved_thread} 的 agent 分析…")
+        try:
+            async with facade.session(
+                thread_id=resolved_thread, approval_mode=approval_mode,
+            ) as session:
+                result = await session.submit(message)
+        except ConversationBusyError as error:
+            print(f"会话正由其他进程使用，未能续写：{error}")
+            print("失败详情已打印在上方，可稍后在聊天中手动交给 agent。")
+            return 2
+        if result.status == "paused":
+            print("agent 等待审批或补充输入；用 agent resume 选择会话继续。")
+            return 1
+        print(result.answer or "（agent 未返回文字结论）")
+        print(f"验证状态: {result.validation_status}")
+        print("修复完成后请检查工作区，再运行聊天内 /commit 提交、/pull 推送。")
+        return 1
+    except DeliveryError as error:
+        print("观察失败: " + safe_terminal_text(str(error)))
+        return 2
+
+
+@agent_app.command(name="watch")
+def agent_watch(
+    branch: Annotated[
+        str | None, typer.Option("--branch", help="要观察的分支；默认当前分支或最新的 praxis/* 分支")
+    ] = None,
+    thread_id: Annotated[
+        str | None, typer.Option("--thread", help="CI 失败时要续写的会话 ID；默认当前工作区最近会话")
+    ] = None,
+    timeout_seconds: Annotated[
+        float, typer.Option("--timeout", min=10, max=7200, help="最长等待秒数")
+    ] = 1800.0,
+    poll_interval_seconds: Annotated[
+        float, typer.Option("--interval", min=5, max=600, help="轮询间隔秒数")
+    ] = 30.0,
+    fix: Annotated[
+        bool, typer.Option("--fix/--no-fix", help="CI 失败时是否把失败详情交给 agent 分析修复")
+    ] = True,
+    checkpoint_db: Annotated[
+        Path, typer.Option("--rollout-db", "--checkpoint-db", help="完整 SQLite Rollout／事件数据库")
+    ] = DEFAULT_CHECKPOINT_PATH,
+    permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限")] = None,
+    approval_mode: Annotated[
+        ApprovalMode, typer.Option("--approval-mode", help="续写使用的审批模式：ask | auto | full")
+    ] = "auto",
+) -> None:
+    """等待交付分支的 CI；失败时自动把详情交给该工作区会话的 agent 修复。
+
+    交付动作保持用户确认：watch 只完成观察与分析，/commit 与 /pull 仍由你在聊天中执行。
+    """
+    raise typer.Exit(_run_cli_async(_watch_command(
+        workspace=Path.cwd(),
+        checkpoint_db=checkpoint_db,
+        permissions=permissions,
+        approval_mode=approval_mode,
+        branch=branch,
+        thread_id=thread_id,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        fix=fix,
+    )))

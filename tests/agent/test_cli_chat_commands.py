@@ -780,3 +780,311 @@ async def test_interactive_run_preserves_pause_action_and_text(
     )
     assert result.status == "done"
     assert calls == [("run-turn", action, user_input)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_rewind_command_selects_and_restores_checkpoint(tmp_path, confirmed):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    rewound = []
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        async def list_checkpoints(self, *, thread_id=None):
+            return [{
+                "checkpoint_id": "a" * 40,
+                "turn_id": "turn_1",
+                "trigger": "pre_write",
+                "tree_sha256": None,
+                "changed_file_count": 2,
+                "wall_time": 1760000000.0,
+                "sequence": 3,
+                "turn_input": "修复超时处理",
+            }]
+
+        async def rewind(self, checkpoint_id):
+            rewound.append(checkpoint_id)
+            return {"target_checkpoint_id": checkpoint_id, "restored": ["a.py"], "deleted": []}
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("/rewind must not call the model")
+
+    class UI(TerminalChatApp):
+        commands = iter(["/rewind", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_menu(self, choices, *, title, current=""):
+            if "确认回滚" in choices:
+                return "确认回滚" if confirmed else "取消"
+            assert len(choices) == 1
+            assert "修复超时处理" in choices[0]
+            return choices[0]
+
+    await cli._chat_facade_loop(
+        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+    )
+    assert rewound == (["a" * 40] if confirmed else [])
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_commit_command_previews_and_delivers(tmp_path, confirmed):
+    import subprocess
+
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    repo = tmp_path / "project"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.com"], check=True)
+    (repo / "a.txt").write_text("change\n")
+
+    committed = []
+
+    class Facade(_SessionFactory):
+        workspace_path = repo
+
+        def current_model(self):
+            return _model_spec("test")
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("/commit must not call the model")
+
+        async def commit_status(self):
+            return {"branch": "master", "changed": ["?? a.txt"], "changed_file_count": 1}
+
+        async def commit(self, message, *, branch_name=None):
+            committed.append(message)
+            return {"commit_id": "b" * 40, "branch": "praxis/x",
+                    "changed_file_count": 1, "created_branch": True}
+
+    class UI(TerminalChatApp):
+        commands = iter(["/commit 修复超时处理", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_menu(self, choices, *, title, current=""):
+            assert "确认提交" in choices
+            return "确认提交" if confirmed else "取消"
+
+    await cli._chat_facade_loop(
+        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(repo)),
+    )
+    assert committed == (["修复超时处理"] if confirmed else [])
+
+
+@pytest.mark.anyio
+async def test_commit_command_reports_clean_workspace(tmp_path):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("/commit must not call the model")
+
+        async def commit_status(self):
+            return {"branch": "master", "changed": [], "changed_file_count": 0}
+
+        async def commit(self, message, *, branch_name=None):
+            pytest.fail("nothing to commit must not deliver")
+
+    class UI(TerminalChatApp):
+        commands = iter(["/commit anything", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+    await cli._chat_facade_loop(
+        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_pull_command_previews_and_publishes(tmp_path, confirmed):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    published = []
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("/pull must not call the model")
+
+        async def pull_request_status(self):
+            return {
+                "branch": "praxis/x", "remote_url": "git@github.com:o/r.git",
+                "base_branch": "main", "commit_subjects": ["fix: timeout"],
+                "changed_paths": ["a.py", "b.py"], "uncommitted_count": 2,
+                "open_pull_request_url": None,
+            }
+
+        async def open_pull_request(self, *, title=None, body=None, base_branch=None):
+            published.append(title)
+            return {"url": "https://github.com/o/r/pull/7", "branch": "praxis/x",
+                    "created": True}
+
+    class UI(TerminalChatApp):
+        commands = iter(["/pull 修复超时", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_menu(self, choices, *, title, current=""):
+            assert "确认推送并创建" in choices
+            return "确认推送并创建" if confirmed else "取消"
+
+    await cli._chat_facade_loop(
+        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+    )
+    assert published == (["修复超时"] if confirmed else [])
+
+
+@pytest.mark.anyio
+async def test_pull_command_with_title_skips_hint(tmp_path):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    published = []
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        async def submit(self, *args, **kwargs):
+            pytest.fail("/pull must not call the model")
+
+        async def pull_request_status(self):
+            return {
+                "branch": "praxis/x", "remote_url": "git@github.com:o/r.git",
+                "base_branch": "main", "commit_subjects": ["fix: timeout"],
+                "changed_paths": ["a.py"], "uncommitted_count": 0,
+                "open_pull_request_url": "https://github.com/o/r/pull/3",
+            }
+
+        async def open_pull_request(self, *, title=None, body=None, base_branch=None):
+            published.append(title)
+            return {"url": "https://github.com/o/r/pull/3", "branch": "praxis/x",
+                    "created": False}
+
+    class UI(TerminalChatApp):
+        commands = iter(["/pull 修复超时", "/exit"])
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_menu(self, choices, *, title, current=""):
+            return "确认推送并创建"
+
+    await cli._chat_facade_loop(
+        Facade(), max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)),
+    )
+    assert published == ["修复超时"]
+
+
+def _ci_checks_facade(tmp_path, submitted, overall, checks=None, failure_logs=None):
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    class Facade(_SessionFactory):
+        workspace_path = tmp_path
+
+        def current_model(self):
+            return _model_spec("test")
+
+        def request_settings(self):
+            return {"preferences": {"reasoning_effort": None, "max_output_tokens": None},
+                    "model_defaults": {}}
+
+        async def submit(self, *args, **kwargs):
+            submitted.append(args[0] if args else kwargs.get("task"))
+            return _result(turn_id="ci-turn")
+
+        async def pull_request_checks(self, branch=None, *,
+                                      include_failure_logs=False, wait_seconds=0.0,
+                                      poll_interval_seconds=20.0):
+            return {
+                "branch": branch or "praxis/x",
+                "overall": overall,
+                "pull_request_url": "https://github.com/o/r/pull/5",
+                "checks": checks if checks is not None else [],
+                "failure_logs": failure_logs or [],
+            }
+
+    class UI(TerminalChatApp):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.commands = iter(getattr(self, "_script", ("/checks", "/exit")))
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def operation(self, awaitable):
+            return await awaitable
+
+    return Facade, UI
+
+
+@pytest.mark.anyio
+async def test_checks_command_reports_success_without_submitting(tmp_path):
+    submitted = []
+    facade_class, ui_class = _ci_checks_facade(
+        tmp_path, submitted, "pass",
+        checks=[{"name": "build", "state": "pass", "workflow": "CI", "link": "u"}],
+    )
+    await cli._chat_facade_loop(
+        facade_class(), max_tokens_total=None,
+        _ui=ui_class(model="test", workspace=str(tmp_path)),
+    )
+    assert submitted == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("confirmed", [True, False])
+async def test_checks_failure_can_be_handed_to_agent(tmp_path, confirmed):
+    submitted = []
+    facade_class, ui_class = _ci_checks_facade(
+        tmp_path, submitted, "fail",
+        checks=[
+            {"name": "build", "state": "pass", "workflow": "CI", "link": "u"},
+            {"name": "test", "state": "fail", "workflow": "CI", "link": "u"},
+        ],
+        failure_logs=[{"workflow": "CI", "logs": "AssertionError: boom\n  file.py:12"}],
+    )
+    ui = ui_class(model="test", workspace=str(tmp_path))
+    ui.commands = iter(["/checks", "/exit"])
+    original_choose = ui.choose_menu
+
+    async def choose_menu(choices, *, title, current=""):
+        if "交给 agent 分析修复" in choices:
+            return "交给 agent 分析修复" if confirmed else "取消"
+        return await original_choose(choices, title=title, current=current)
+
+    ui.choose_menu = choose_menu
+    await cli._chat_facade_loop(
+        facade_class(), max_tokens_total=None, _ui=ui,
+    )
+    if confirmed:
+        assert len(submitted) == 1
+        assert submitted[0].startswith("CI 失败")
+        assert "AssertionError: boom" in submitted[0]
+        assert "提醒我运行 /commit" in submitted[0]
+    else:
+        assert submitted == []

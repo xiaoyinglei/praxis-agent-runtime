@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -14,6 +16,12 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from agent_runtime.approval import CommandGrant, command_grant
+from agent_runtime.checkpoints import (
+    CheckpointError,
+    CheckpointService,
+    CheckpointSnapshot,
+    CheckpointUnavailableError,
+)
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness.events import RolloutEventReader
@@ -32,8 +40,9 @@ from agent_runtime.tools.executor import (
     ToolExecution,
     ToolExecutionRecord,
     ToolExecutor,
+    _network_approval_id,
 )
-from agent_runtime.tools.permissions import ToolExecutionContext
+from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool
 from agent_runtime.tools.tool import (
     CancellationMode,
     JsonValue,
@@ -51,6 +60,8 @@ from agent_runtime.tools.tool import (
 )
 
 _TOOL_LEASE_GRACE_SECONDS = 30.0
+
+logger = logging.getLogger(__name__)
 
 _ACTIVE_TOOL_BINDING: ContextVar[Mapping[str, Any] | None] = ContextVar("praxis_tool_binding", default=None)
 
@@ -170,6 +181,7 @@ class ToolOrchestrator:
         worker_id: str | None = None,
         lease_seconds: float = 300.0,
         event_dispatcher: TurnEventDispatcher | None = None,
+        checkpoints: CheckpointService | None = None,
     ) -> None:
         self._store = store
         self._tools = tools
@@ -178,6 +190,7 @@ class ToolOrchestrator:
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._lease_seconds = lease_seconds
         self._event_dispatcher = event_dispatcher
+        self._checkpoints = checkpoints
         self._claims: dict[str, tuple[int, str]] = {}
         self._resolved_scopes: dict[
             str,
@@ -575,6 +588,8 @@ class ToolOrchestrator:
         return tuple(results)
 
     async def _execute_batch_segment(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
+        if self._checkpoints is not None:
+            await self._ensure_turn_checkpoint(turn_id, calls)
         if any(self.input_superseded(turn_id, call) for call in calls):
             return tuple([await self.execute(turn_id=turn_id, call=call) for call in calls])
         contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
@@ -642,6 +657,65 @@ class ToolOrchestrator:
         finally:
             _ACTIVE_TOOL_BINDING.reset(binding_token)
             _ACTIVE_TOOL_TURN_ID.reset(token)
+
+    async def _ensure_turn_checkpoint(self, turn_id: str, calls: Sequence[ToolCall]) -> None:
+        """Snapshot the workspace once per Turn before its first mutation attempt.
+
+        The single rule covers every write path: any tool call resolving to
+        WRITE_WORKSPACE (apply_patch, workspace-write commands, Python outputs)
+        triggers the checkpoint. Checkpoints are a safety net, never a gate:
+        failures disable or skip the snapshot and the tool call proceeds.
+        """
+        checkpoints = self._checkpoints
+        if checkpoints is None:
+            return
+        if any(
+            item.kind == "workspace_checkpoint" and item.status == "completed"
+            and item.payload.get("trigger") == "pre_write"
+            for item in self._store.list_items(turn_id)
+        ):
+            return
+        for call in calls:
+            if call.argument_error is not None or not self._call_writes_workspace(call):
+                continue
+            try:
+                snapshot = await checkpoints.snapshot(trigger="pre_write", turn_id=turn_id)
+            except CheckpointUnavailableError as error:
+                logger.warning("workspace checkpoints disabled: %s", error)
+                self._checkpoints = None
+                return
+            except (CheckpointError, OSError) as error:
+                logger.warning("workspace checkpoint skipped: %s", error)
+                return
+            await self._record_turn_checkpoint(turn_id, snapshot)
+            return
+
+    async def _record_turn_checkpoint(
+        self, turn_id: str, snapshot: CheckpointSnapshot,
+    ) -> None:
+        def persist() -> None:
+            self._store.record_workspace_checkpoint(
+                turn_id=turn_id,
+                checkpoint_id=snapshot.checkpoint_id,
+                trigger=snapshot.trigger,
+                tree_sha256=snapshot.tree_sha256,
+                changed_file_count=snapshot.changed_file_count,
+                wall_time=time.time(),
+            )
+
+        await self._commit(persist)
+
+    def _call_writes_workspace(self, call: ToolCall) -> bool:
+        """Mirror the executor's effect resolution: static ∪ dynamic effects."""
+        tool = self._tools.get(call.tool_name)
+        if tool is None:
+            return False
+        try:
+            arguments = tool.validate_input(call.arguments)
+            resolved = tool.resolve_use(arguments)
+        except Exception:
+            return False
+        return ToolEffect.WRITE_WORKSPACE in tool.static_effects | resolved.effects
 
     async def _execute_in_turn(
         self,
@@ -801,6 +875,32 @@ class ToolOrchestrator:
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
         execution_context = self._context_for_turn(turn_id)
+        recheck = decision == "recheck"
+        approval_ids = {call.tool_call_id}
+        if interaction.request.get("approval_scope") == "network":
+            approval_ids.add(_network_approval_id(call.tool_call_id))
+        if recheck:
+            # A mode change is not a one-time grant. Re-evaluate the committed
+            # call, then let the normal executor enforce the current policy.
+            execution_context = execution_context.refreshed()
+            arguments = tool.validate_input(call.arguments)
+            outcome = can_use_tool(tool, arguments, tool.resolve_use(arguments), execution_context)
+            if outcome.decision is UseToolDecision.ASK:
+                preflight = await self._execute_in_turn(turn_id, call, context=replace(
+                    execution_context,
+                    approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
+                    require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
+                ))
+                current_request = _approval_request(
+                    preflight, record=ToolExecutionRecord.prepare(call, tool), tool=tool,
+                    context=execution_context, arguments=call.arguments,
+                )
+                if _approval_scope(current_request) != _approval_scope(interaction.request):
+                    interaction = await self._commit(lambda: self._store.refresh_tool_approval(
+                        turn_id=turn_id, request=current_request,
+                    ))
+                raise ToolApprovalInvalidatedError(interaction.request_id)
+            decision = "approve" if outcome.decision is UseToolDecision.ALLOW else "deny"
         grant = None
         if on_session_grant is not None:
             arguments = tool.validate_input(call.arguments)
@@ -809,7 +909,7 @@ class ToolOrchestrator:
                     or interaction.request.get("approval_scope", "tool") != "tool"
                     or interaction.request.get("session_grant") != grant.to_json()):
                 raise ValueError("this approval does not offer a current Session command grant")
-        if decision == "approve":
+        if decision == "approve" and not recheck:
             preflight_context = replace(
                 execution_context,
                 approved_tool_call_ids=(execution_context.approved_tool_call_ids - {call.tool_call_id}),
@@ -829,6 +929,9 @@ class ToolOrchestrator:
                 context=execution_context,
                 arguments=call.arguments,
             )
+            # The forced dry run checks targets and policy under the tool gate;
+            # preserve which scope this pending user decision actually covers.
+            current_request["approval_scope"] = interaction.request.get("approval_scope", "tool")
             if preflight.result.error_code != "approval_required" or _approval_scope(
                 interaction.request
             ) != _approval_scope(current_request):
@@ -843,6 +946,7 @@ class ToolOrchestrator:
             lambda: self._store.resolve_tool_approval(
                 turn_id=turn_id,
                 decision=decision,
+                policy_recheck=recheck,
             )
         )
         record = ToolExecutionRecord(
@@ -854,14 +958,14 @@ class ToolOrchestrator:
             status=ExecutionStatus.PREPARED,
             attempt_count=operation.attempt_count,
         )
-        approved = decision == "approve"
+        approved = decision == "approve" and not recheck
         context = replace(
             execution_context,
             approved_tool_call_ids=(
-                execution_context.approved_tool_call_ids | ({call.tool_call_id} if approved else set())
+                execution_context.approved_tool_call_ids | (approval_ids if approved else set())
             ),
             denied_tool_call_ids=(
-                execution_context.denied_tool_call_ids | (set() if approved else {call.tool_call_id})
+                execution_context.denied_tool_call_ids | (approval_ids if decision == "deny" else set())
             ),
         )
         result = await self._execute_approved_record(
@@ -882,6 +986,7 @@ class ToolOrchestrator:
             and interaction.response.get("decision") == "approve"
             and interaction.operation_id is not None
             and self._store.read_tool_operation(interaction.operation_id).status == "ready"
+            and self._store.read_tool_operation(interaction.operation_id).approval_request_id == interaction.request_id
         ]
         if len(resolved) != 1 or resolved[0].operation_id is None:
             raise RuntimeError("recovery requires one resolved approved operation")
@@ -902,6 +1007,34 @@ class ToolOrchestrator:
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
         execution_context = self._context_for_turn(turn_id)
+        if interaction.response.get("policy_recheck") is True:
+            # A crashed automatic policy decision is never restored as a user grant.
+            arguments = tool.validate_input(call.arguments)
+            execution_context = execution_context.refreshed()
+            outcome = can_use_tool(tool, arguments, tool.resolve_use(arguments), execution_context)
+            if outcome.decision is UseToolDecision.ASK:
+                preflight = await self._execute_in_turn(turn_id, call, context=replace(
+                    execution_context,
+                    approved_tool_call_ids=execution_context.approved_tool_call_ids - {call.tool_call_id},
+                    require_confirmation_for=execution_context.require_confirmation_for | {call.tool_name},
+                ))
+                current_request = _approval_request(
+                    preflight, record=ToolExecutionRecord.prepare(call, tool), tool=tool,
+                    context=execution_context, arguments=call.arguments,
+                )
+                refreshed = await self._commit(lambda: self._store.refresh_tool_approval(
+                    turn_id=turn_id, request=current_request,
+                ))
+                raise ToolApprovalInvalidatedError(refreshed.request_id)
+            return await self._execute_approved_record(
+                turn_id=turn_id, call=call, tool=tool, context=execution_context,
+                record=ToolExecutionRecord(
+                    tool_call_id=operation.tool_call_id, tool_name=operation.tool_name,
+                    operation_id=operation.operation_id, arguments_digest=operation.arguments_digest,
+                    idempotent=operation.idempotent, status=ExecutionStatus.PREPARED,
+                    attempt_count=operation.attempt_count,
+                ),
+            )
         preflight_context = replace(
             execution_context,
             approved_tool_call_ids=(execution_context.approved_tool_call_ids - {call.tool_call_id}),
@@ -917,6 +1050,7 @@ class ToolOrchestrator:
             context=execution_context,
             arguments=call.arguments,
         )
+        current_request["approval_scope"] = interaction.request.get("approval_scope", "tool")
         if preflight.result.error_code != "approval_required" or _approval_scope(
             interaction.request
         ) != _approval_scope(current_request):
@@ -939,7 +1073,9 @@ class ToolOrchestrator:
         )
         context = replace(
             execution_context,
-            approved_tool_call_ids=(execution_context.approved_tool_call_ids | {call.tool_call_id}),
+            approved_tool_call_ids=(execution_context.approved_tool_call_ids | {call.tool_call_id}
+                                    | ({_network_approval_id(call.tool_call_id)}
+                                       if interaction.request.get("approval_scope") == "network" else set())),
             denied_tool_call_ids=(execution_context.denied_tool_call_ids - {call.tool_call_id}),
         )
         return await self._execute_approved_record(
