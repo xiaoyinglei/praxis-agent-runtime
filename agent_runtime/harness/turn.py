@@ -668,7 +668,7 @@ class TurnExecutor:
             if turn.status == "running" and decision == "approve":
                 try:
                     await self._tool_orchestrator.recover_resolved_approval(turn_id=turn_id)
-                except ToolApprovalInvalidatedError as invalidated:
+                except (ToolApprovalInvalidatedError, ToolApprovalRequiredError) as invalidated:
                     return TurnResult(
                         thread_id=turn.thread_id,
                         turn_id=turn_id,
@@ -685,7 +685,7 @@ class TurnExecutor:
                 decision=decision,
                 on_session_grant=on_session_grant,
             )
-        except ToolApprovalInvalidatedError as invalidated:
+        except (ToolApprovalInvalidatedError, ToolApprovalRequiredError) as invalidated:
             return TurnResult(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,

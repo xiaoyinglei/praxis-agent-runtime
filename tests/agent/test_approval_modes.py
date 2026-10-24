@@ -101,7 +101,7 @@ def test_complex_or_elevated_commands_do_not_offer_reusable_grant(tmp_path, args
 class CommandModel:
     """Use the existing deterministic model contract, executing real tool IO."""
 
-    def __new__(cls, arguments):
+    def __new__(cls, arguments, tool_name="run_command"):
         from agent_runtime.harness import HarnessToolCall
         from tests.agent.harness.test_approval_resume import WriteThenAnswerModel
 
@@ -110,7 +110,7 @@ class CommandModel:
                 response = await super().dispatch(prepared, delta_sink=delta_sink)
                 if response.tool_calls:
                     return replace(response, tool_calls=(HarnessToolCall(
-                        id="command-call", name="run_command", arguments=arguments,
+                        id="command-call", name=tool_name, arguments=arguments,
                     ),))
                 return response
 
@@ -248,6 +248,235 @@ async def test_deny_pending_call_still_denies_after_mode_changes(tmp_path, mode)
         assert operation.status == "denied"
 
 
+@pytest.mark.anyio
+async def test_recheck_after_mode_selection_executes_current_call_once(tmp_path):
+    async with await command_session(tmp_path, mode="auto", workspace_write=True) as session:
+        result = await session.submit("run")
+        assert result.status == "paused"
+        session.update_tool_policy(approval_mode="full")
+        result = await session.resume(result.turn_id, "recheck")
+        assert result.status == "done"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "succeeded"
+        assert operation.attempt_count == 1
+        assert not any(i.status == "pending" for i in session.store.list_interactions(result.turn_id))
+
+
+@pytest.mark.anyio
+async def test_recheck_is_not_a_one_time_approval_and_preserves_forced_ask(tmp_path):
+    async with await command_session(tmp_path, mode="ask") as session:
+        result = await session.submit("run")
+        unchanged = await session.resume(result.turn_id, "recheck")
+        assert unchanged.status == "paused"
+        assert unchanged.pause.request_id == result.pause.request_id
+        session.update_tool_policy(approval_mode="full", require_confirmation_for=frozenset({"run_command"}))
+        unchanged = await session.resume(result.turn_id, "recheck")
+        assert unchanged.status == "paused"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.attempt_count == 0
+        # The refreshed request can now be explicitly approved exactly once.
+        result = await session.resume(result.turn_id, "approve")
+        assert result.status == "done"
+
+
+@pytest.mark.anyio
+async def test_recheck_honors_current_explicit_denial(tmp_path):
+    async with await command_session(tmp_path, mode="ask") as session:
+        result = await session.submit("run")
+        session.update_tool_policy(approval_mode="full", denied_tool_names=frozenset({"run_command"}))
+        result = await session.resume(result.turn_id, "recheck")
+        assert result.status == "done"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "denied"
+        assert operation.attempt_count == 0
+
+
+@pytest.mark.anyio
+async def test_recheck_crash_recovery_does_not_become_a_one_time_approval(tmp_path, monkeypatch):
+    async with await command_session(tmp_path, mode="ask") as session:
+        result = await session.submit("run")
+        thread_id = session.thread_id
+        session.update_tool_policy(approval_mode="full")
+
+        async def crash(**kwargs):
+            raise RuntimeError("crash before execution")
+
+        monkeypatch.setattr(session.tool_orchestrator, "_execute_approved_record", crash)
+        with pytest.raises(RuntimeError, match="crash before execution"):
+            await session.resume(result.turn_id, "recheck")
+
+    async with await command_session(tmp_path, mode="ask", thread_id=thread_id) as session:
+        recovered = await session.resume(result.turn_id, "continue")
+        assert recovered.status == "paused"
+        assert recovered.pause is not None
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.attempt_count == 0
+        # Rechecking under ask still cannot grant the operation.
+        assert (await session.resume(result.turn_id, "recheck")).status == "paused"
+        assert (await session.resume(result.turn_id, "approve")).status == "done"
+
+
+@pytest.mark.anyio
+async def test_report_python_write_continues_after_selecting_full_and_persists_mode(tmp_path):
+    from agent_runtime.harness import Session
+    from agent_runtime.tools.builtins.shell import create_execute_python_tool
+    from agent_runtime.tools.registry import ToolRegistry
+    from tests.agent.harness.test_approval_resume import AcceptAnswer
+
+    workspace = open_workspace(tmp_path, create=True)
+    registry = ToolRegistry()
+    registry.register(create_execute_python_tool(workspace))
+    arguments = {"code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
+                 "workspace_write": True, "output_paths": ["report.md"]}
+    async with await Session.open(
+        database=tmp_path / "report.sqlite3", workspace=tmp_path,
+        model=CommandModel(arguments, tool_name="execute_python"), tools=registry.freeze(),
+        completion_gate=AcceptAnswer(), approval_mode="auto",
+    ) as session:
+        result = await session.submit("generate report")
+        assert result.status == "paused" and not (tmp_path / "report.md").exists()
+        session.update_tool_policy(approval_mode="full")
+        result = await session.resume(result.turn_id, "recheck")
+        assert result.status == "done"
+        assert (tmp_path / "report.md").read_text() == "sales report"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "succeeded" and operation.attempt_count == 1
+        settings = session.store.read_thread(session.thread_id).settings
+        assert settings["tool_execution_policy"]["approval_mode"] == "full"
+
+
+@pytest.mark.anyio
+async def test_repeated_crashes_recover_only_the_current_approval(tmp_path, monkeypatch):
+    async def crash(**kwargs):
+        raise RuntimeError("crash before execution")
+
+    async with await command_session(tmp_path, mode="ask") as session:
+        result = await session.submit("run")
+        thread_id = session.thread_id
+        session.update_tool_policy(approval_mode="full")
+        monkeypatch.setattr(session.tool_orchestrator, "_execute_approved_record", crash)
+        with pytest.raises(RuntimeError, match="crash before execution"):
+            await session.resume(result.turn_id, "recheck")
+
+    async with await command_session(tmp_path, mode="ask", thread_id=thread_id) as session:
+        result = await session.resume(result.turn_id, "continue")
+        assert result.status == "paused"
+        monkeypatch.setattr(session.tool_orchestrator, "_execute_approved_record", crash)
+        with pytest.raises(RuntimeError, match="crash before execution"):
+            await session.resume(result.turn_id, "approve")
+
+    async with await command_session(tmp_path, mode="ask", thread_id=thread_id) as session:
+        result = await session.resume(result.turn_id, "continue")
+        assert result.status == "done"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "succeeded" and operation.attempt_count == 1
+
+
+@pytest.mark.anyio
+async def test_repeated_mode_changes_keep_network_approval_pending(tmp_path):
+    async with await command_session(tmp_path, mode="ask", network=True) as session:
+        result = await session.submit("run")
+        for mode in ("auto", "ask", "auto"):
+            session.update_tool_policy(approval_mode=mode)
+            result = await session.resume(result.turn_id, "recheck")
+            assert result.status == "paused" and result.pause is not None
+            [operation] = session.store.list_tool_operations(result.turn_id)
+            assert operation.attempt_count == 0
+        session.update_tool_policy(approval_mode="full")
+        result = await session.resume(result.turn_id, "recheck")
+        assert result.status == "done"
+        before = session.store.projection_hashes()
+        session.store.rebuild_projections()
+        assert session.store.projection_hashes() == before
+
+
+@pytest.mark.anyio
+async def test_single_run_mode_picker_reaches_public_agent_resume(tmp_path, monkeypatch):
+    from agent_runtime import Agent, cli
+
+    choices = iter(["permissions", "full"])
+
+    class Dialog:
+        async def run_async(self):
+            return next(choices)
+
+    monkeypatch.setattr(cli, "_is_interactive_terminal", lambda: True)
+    monkeypatch.setattr("prompt_toolkit.shortcuts.radiolist_dialog", lambda **kwargs: Dialog())
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "run.sqlite3",
+                  model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
+    agent._model_factory = lambda: CommandModel({
+        "code": "from pathlib import Path\nPath('report.md').write_text('sales report')",
+        "workspace_write": True, "output_paths": ["report.md"],
+    }, tool_name="execute_python")
+    result = await cli._run_facade_command(agent, task="generate report", files=(),
+                                         max_tokens_total=None, interactive_approval=True)
+    assert result.status == "done"
+    assert (tmp_path / "report.md").read_text() == "sales report"
+    assert agent.approval_mode == "full"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("no_permissions", [False, True])
+async def test_recheck_then_network_approval_reuses_operation_without_early_execution(tmp_path, no_permissions):
+    async with await command_session(tmp_path, mode="ask", network=True) as session:
+        if no_permissions:
+            session.tool_execution_context = replace(session.tool_execution_context,
+                                                     permissions=None, permission_provider=None)
+            session._apply_tool_context()
+        result = await session.submit("run")
+        [original] = session.store.list_tool_operations(result.turn_id)
+        session.update_tool_policy(approval_mode="auto")
+        result = await session.resume(result.turn_id, "recheck")
+        if result.pause.context["approval_scope"] == "tool":
+            result = await session.resume(result.turn_id, "approve")
+        assert result.status == "paused" and result.pause.context["approval_scope"] == "network"
+        [waiting] = session.store.list_tool_operations(result.turn_id)
+        assert waiting.operation_id == original.operation_id and waiting.attempt_count == 0
+        result = await session.resume(result.turn_id, "approve")
+        assert result.status == "done"
+        [completed] = session.store.list_tool_operations(result.turn_id)
+        assert completed.status == "succeeded" and completed.attempt_count == 1
+
+
+@pytest.mark.anyio
+async def test_network_scope_can_be_denied_without_execution(tmp_path):
+    async with await command_session(tmp_path, mode="ask", network=True) as session:
+        result = await session.submit("run")
+        result = await session.resume(result.turn_id, "approve")
+        assert result.pause.context["approval_scope"] == "network"
+        result = await session.resume(result.turn_id, "deny")
+        assert result.status == "done"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "denied" and operation.attempt_count == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("crash_scope", ["tool", "network"])
+async def test_network_scope_approval_survives_crash_without_duplicate_execution(tmp_path, monkeypatch, crash_scope):
+    async with await command_session(tmp_path, mode="ask", network=True) as session:
+        result = await session.submit("run")
+        thread_id = session.thread_id
+        if crash_scope == "network":
+            result = await session.resume(result.turn_id, "approve")
+            assert result.pause.context["approval_scope"] == "network"
+
+        async def crash(**kwargs):
+            raise RuntimeError("crash before execution")
+
+        monkeypatch.setattr(session.tool_orchestrator, "_execute_approved_record", crash)
+        with pytest.raises(RuntimeError, match="crash before execution"):
+            await session.resume(result.turn_id, "approve")
+
+    async with await command_session(tmp_path, mode="ask", thread_id=thread_id, network=True) as session:
+        result = await session.resume(result.turn_id, "continue")
+        if crash_scope == "tool":
+            assert result.status == "paused" and result.pause.context["approval_scope"] == "network"
+            result = await session.resume(result.turn_id, "approve")
+        assert result.status == "done"
+        [operation] = session.store.list_tool_operations(result.turn_id)
+        assert operation.status == "succeeded" and operation.attempt_count == 1
+
+
 def test_sdk_accepts_mode_and_cli_exposes_modes_for_all_entrypoints(tmp_path):
     from typer.main import get_command
 
@@ -291,6 +520,44 @@ async def test_permissions_picker_changes_mode_without_loading_model(tmp_path):
     await cli._chat_facade_loop(facade, max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
     assert facade.approval_mode == "ask"
     assert facade.opened == 0
+
+
+@pytest.mark.anyio
+async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_approval(tmp_path):
+    from agent_runtime import Agent, cli
+    from agent_runtime.terminal_app import TerminalChatApp
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "chat.sqlite3",
+                  model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
+    agent._model_factory = lambda: CommandModel({"command": "printf hello", "workspace_write": True})
+
+    class UI(TerminalChatApp):
+        commands = iter(["run", "/exit"])
+        approvals = 0
+
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+
+        async def choose_menu(self, choices, *, title, current=""):
+            assert current == cli.APPROVAL_MODES["auto"]
+            return cli.APPROVAL_MODES["full"]
+
+        async def choose_approval(self, request):
+            self.approvals += 1
+            assert self.approvals == 1
+            assert await self.on_permissions()
+            return "recheck"
+
+    ui = UI(model="test", workspace=str(tmp_path))
+    await cli._chat_facade_loop(agent, max_tokens_total=None, _ui=ui)
+    assert ui.approvals == 1
+    assert ui.approval_mode == agent.approval_mode == "full"
+    from agent_runtime.harness import RolloutStore
+
+    with RolloutStore(agent.checkpoint_db, read_only=True) as store:
+        turns = store.list_turns()
+        [operation] = store.list_tool_operations(turns[0].turn_id)
+        assert operation.status == "succeeded" and operation.attempt_count == 1
 
 
 @pytest.mark.anyio

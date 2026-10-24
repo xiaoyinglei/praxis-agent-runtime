@@ -42,7 +42,7 @@ from rich.style import Style as RichStyle
 from rich.text import Text
 from rich.theme import Theme
 
-from agent_runtime.approval import APPROVAL_CHOICES
+from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODE_NAMES, approval_mode_hint
 from agent_runtime.connection_manager import ConnectionServer
 from agent_runtime.result import AgentPause
 from agent_runtime.terminal_input import _COMPOSER_BINDINGS, CHAT_COMMANDS, BoundedPromptHistory, resolve_pause_choice
@@ -197,6 +197,8 @@ class TerminalChatApp:
         self._input_sequence = 0
         self._operation: asyncio.Task[Any] | None = None
         self.on_input: Callable[[str], Awaitable[str | None]] | None = None
+        self.on_permissions: Callable[[], Awaitable[bool]] | None = None
+        self._opening_permissions = False
         self.input_status: Callable[[str], str] | None = None
         self._input_tasks: set[asyncio.Task[None]] = set()
         self._input_receipts: dict[str, Block] = {}
@@ -247,8 +249,12 @@ class TerminalChatApp:
             style="class:approval-body",
         )
         self.approval_buttons = FormattedTextControl(self._approval_fragments, focusable=True)
-        approving = Condition(lambda: self._approval is not None)
+        approving = Condition(lambda: self._approval is not None and self._model_pending is None)
         keys = KeyBindings()
+
+        @keys.add("f4")
+        def permissions(event: KeyPressEvent) -> None:
+            self.app.create_background_task(self.open_permissions())
 
         @keys.add("f3", filter=Condition(lambda: self.display.connection_required))
         def open_connections(event: KeyPressEvent) -> None:
@@ -274,28 +280,28 @@ class TerminalChatApp:
             elif self._approval is not None:
                 self._resolve_approval(self._approval, None)
 
-        @keys.add("left", filter=has_focus(self.approval_buttons))
-        @keys.add("up", filter=has_focus(self.approval_buttons))
-        @keys.add("right", filter=has_focus(self.approval_buttons))
-        @keys.add("down", filter=has_focus(self.approval_buttons))
+        @keys.add("left", filter=approving & has_focus(self.approval_buttons))
+        @keys.add("up", filter=approving & has_focus(self.approval_buttons))
+        @keys.add("right", filter=approving & has_focus(self.approval_buttons))
+        @keys.add("down", filter=approving & has_focus(self.approval_buttons))
         def select_approval(event: KeyPressEvent) -> None:
             state = self._approval
             if state is not None:
                 direction = -1 if event.key_sequence[0].key in {"left", "up"} else 1
-                state.selected = ((state.selected + direction) % (len(state.options) + 1)
+                state.selected = ((state.selected + direction) % len(self._approval_options(state))
                                   if state.selected is not None else 0)
                 state.pressed = None
 
-        @keys.add("enter", filter=has_focus(self.approval_buttons))
+        @keys.add("enter", filter=approving & has_focus(self.approval_buttons))
         def confirm_approval(event: KeyPressEvent) -> None:
             state = self._approval
             if state is not None and state.selected is not None:
-                self._resolve_approval(state, (*state.options, None)[state.selected])
+                self._resolve_approval(state, self._approval_options(state)[state.selected])
 
         @keys.add("tab", filter=approving)
         @keys.add("s-tab", filter=approving)
         def approval_focus(event: KeyPressEvent) -> None:
-            if self.on_input is not None:
+            if self.on_input is not None and self.app.output.get_size().rows >= 12:
                 if event.app.layout.has_focus(self.approval_buttons):
                     event.app.layout.focus(self.editor)
                 elif event.app.layout.has_focus(self.editor):
@@ -452,10 +458,10 @@ class TerminalChatApp:
 
         @keys.add("c-c")
         def cancel(event: KeyPressEvent) -> None:
-            if self._approval is not None:
-                self._resolve_approval(self._approval, None)
-            elif self._model_pending is not None:
+            if self._model_pending is not None:
                 self._resolve_model(None)
+            elif self._approval is not None:
+                self._resolve_approval(self._approval, None)
             elif self._selected_text():
                 self._copy_text(self._selected_text())
                 self._selection_start = self._selection_end = None
@@ -485,12 +491,13 @@ class TerminalChatApp:
         )
         approval_panel = HSplit([
             self.approval_body,
-            Window(self.approval_buttons, height=lambda: len(self._approval.options) + 1
+            Window(self.approval_buttons, height=lambda: len(self._approval_options(self._approval))
                    if self._approval is not None else 1),
         ])
         framed_approval = Frame(approval_panel, title="操作审批")
         menu = Window(self.model_menu,
-                      height=lambda: Dimension(min=1, preferred=min(8, len(self._model_choices)), max=8))
+                      height=lambda: Dimension(min=min(3, len(self._model_choices)),
+                                               preferred=min(8, len(self._model_choices)), max=8))
         framed_menu = Frame(menu, title=lambda: self._menu_title)
         layout = HSplit(
             [
@@ -512,7 +519,9 @@ class TerminalChatApp:
                     DynamicContainer(lambda: framed_approval if get_app().output.get_size().rows >= 18
                                      else approval_panel), filter=approving,
                 ),
-                ConditionalContainer(self.editor, filter=~approving | Condition(lambda: self.on_input is not None)),
+                ConditionalContainer(self.editor, filter=Condition(lambda: self._model_pending is None) & (
+                    ~approving | Condition(lambda: self.on_input is not None
+                                          and self.app.output.get_size().rows >= 12))),
                 ConditionalContainer(Window(height=1, char="─", style="class:dim"), filter=~approving),
                 ConditionalContainer(
                     Window(FormattedTextControl(self._connection_fragments), height=1),
@@ -900,16 +909,38 @@ class TerminalChatApp:
         return [("class:header", title + "\n"), ("class:dim", context + "\n")]
 
     def _resolve_approval(self, state: _ApprovalState, choice: str | None) -> None:
+        if self._approval is state and choice == "permissions" and self.on_permissions is not None:
+            self.app.create_background_task(self.open_permissions())
+            return
         if self._approval is state and not state.future.done() and (choice is None or choice in state.options):
             state.pressed = None
             state.future.set_result(choice)
+
+    def _approval_options(self, state: _ApprovalState) -> tuple[str | None, ...]:
+        return (*state.options, *(("permissions",) if self.on_permissions is not None else ()), None)
+
+    async def open_permissions(self) -> None:
+        if self.on_permissions is None or self._opening_permissions or self._model_pending is not None:
+            return
+        self._opening_permissions = True
+        try:
+            changed = await self.on_permissions()
+            state = self._approval
+            if changed and state is not None and not state.future.done():
+                state.pressed = None
+                state.future.set_result("recheck")
+        except (OSError, ValueError) as error:
+            self.view.message("审批模式未更改：" + safe_terminal_text(str(error)) + "\n", "error")
+        finally:
+            self._opening_permissions = False
+            self.invalidate()
 
     def _approval_fragments(self) -> StyleAndTextTuples:
         state = self._approval
         if state is None:
             return []
         fragments: StyleAndTextTuples = []
-        for index, choice in enumerate((*state.options, None)):
+        for index, choice in enumerate(self._approval_options(state)):
             def click(event: MouseEvent, selected: str | None = choice, button: int = index) -> None:
                 if self._approval is not state or state.future.done():
                     return
@@ -944,7 +975,7 @@ class TerminalChatApp:
         state = _ApprovalState(
             request.request_id, request.options, asyncio.get_running_loop().create_future(), selected,
         )
-        details = ["需要你确认", "", request.question]
+        details = ["需要你确认", approval_mode_hint(self.approval_mode), "", request.question]
         grant_label = request.context.get("session_grant_label")
         if "allow_session" in request.options and isinstance(grant_label, str):
             details.extend(["", "本会话授权范围：" + grant_label,
@@ -961,12 +992,14 @@ class TerminalChatApp:
         self.approval_body.text = detail
         self._approval = state
         self.status = "等待确认"
-        self.app.layout.focus(self.approval_buttons)
+        if self._model_pending is None:
+            self.app.layout.focus(self.approval_buttons)
         self.invalidate()
         try:
             choice = await state.future
             history.title = "人工审批 · " + (
                 "任务已更新，原动作不再执行" if choice == "continue"
+                else "审批模式已更改，按新策略检查" if choice == "recheck"
                 else "已取消" if choice is None else _approval_label(choice).split(" · ")[0]
             )
             return choice
@@ -976,7 +1009,7 @@ class TerminalChatApp:
                 self._approval = None
                 self.approval_body.text = ""
                 self.status = "就绪"
-                self.app.layout.focus(self.editor)
+                self.app.layout.focus(self.model_menu if self._model_pending is not None else self.editor)
                 self.invalidate()
 
     def _model_fragments(self) -> StyleAndTextTuples:
@@ -1004,7 +1037,7 @@ class TerminalChatApp:
             return await self._model_pending
         finally:
             self._model_pending = None
-            self.app.layout.focus(self.editor)
+            self.app.layout.focus(self.approval_buttons if self._approval is not None else self.editor)
             self.invalidate()
 
     async def choose_model(self, choices: list[str], current: str) -> str | None:
@@ -1043,14 +1076,26 @@ class TerminalChatApp:
         return [("class:assistant", display_rows(" ✳ " + activity, width=width)[0])]
 
     def _footer(self) -> StyleAndTextTuples:
-        if self._approval is not None:
-            tab_hint = "Tab切换到补充输入/详情" if self.on_input is not None else "Tab详情"
-            return [("class:dim", f" ↑↓ 选择 · Enter 确认 · Esc 取消 · {tab_hint}")]
         if self._model_pending is not None:
+            if self.app.output.get_size().columns < 70:
+                return [("class:dim", " ↑↓ 选择 · Enter 确认 · Esc 返回")]
             return [("class:dim", f" {self._menu_title} · ↑↓ 移动 · Enter 确认 · Esc 取消")]
+        mode = APPROVAL_MODE_NAMES.get(self.approval_mode, self.approval_mode)
+
+        def permissions(event: MouseEvent) -> None:
+            if event.event_type == MouseEventType.MOUSE_UP and event.button == MouseButton.LEFT:
+                self.app.create_background_task(self.open_permissions())
+
+        entry: StyleAndTextTuples = [("class:dim", f" {mode} · F4 权限", permissions)]
+        if self._approval is not None:
+            if self.app.output.get_size().columns < 70:
+                return entry + [("class:dim", " · ↑↓ Enter Esc")]
+            tab_hint = ("Tab切换到补充输入/详情" if self.on_input is not None
+                        and self.app.output.get_size().rows >= 12 else "Tab详情")
+            return entry + [("class:dim", f" · ↑↓ 选择 · Enter 确认 · Esc 取消 · {tab_hint}")]
         hint = "Ctrl+C 停止" if self._operation else "/help 帮助"
         hint += " · Ctrl+O 返回" if self.view.details else " · Ctrl+O 详情"
-        return [
+        return entry + [
             (
                 "class:dim",
                 f" {hint} · Enter 发送 · Ctrl+J 换行",
@@ -1063,7 +1108,7 @@ class TerminalChatApp:
             await self.flush_scrollback()
         self.status = "等待确认" if approval else "就绪"
         self._pending = asyncio.get_running_loop().create_future()
-        self.app.layout.focus(self.editor)
+        self.app.layout.focus(self.model_menu if self._model_pending is not None else self.editor)
         self.invalidate()
         try:
             value = await self._pending

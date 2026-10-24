@@ -21,8 +21,18 @@ APPROVAL_MODES: dict[str, str] = {
     "full": "完全访问 · 权限范围内自动批准；仍受沙箱和明确禁令约束",
 }
 MODE_ORDER = {"ask": 0, "auto": 1, "full": 2}
+APPROVAL_MODE_NAMES = {mode: label.split(" · ")[0] for mode, label in APPROVAL_MODES.items()}
 APPROVAL_CHOICES = {"approve": "允许一次", "allow_once": "允许一次",
-                    "allow_session": "本会话允许同类命令", "deny": "拒绝"}
+                    "allow_session": "本会话允许同类命令", "deny": "拒绝",
+                    "permissions": "更改审批模式…"}
+
+
+def approval_mode_hint(mode: str) -> str:
+    """Explain the selected policy without inferring safety from command text."""
+    label = APPROVAL_MODES.get(mode, mode)
+    return ("当前模式：" + label + "\n"
+            "命令或 Python 的工作区写入不属于只读执行；帮我批准仍会询问。\n"
+            "完全访问可自动执行权限范围内的写入和联网；明确禁令、强制确认和沙箱仍有效。")
 _SHELL_SYNTAX = re.compile(r"[;&|<>$`\n\r(){}*?\[\]\\\x00]")
 _INTERPRETER = re.compile(r"(?:.*sh|fish|python[\d.]*|node|ruby|perl|php|lua|eval|exec|env|xargs)")
 
