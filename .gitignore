@@ -43,6 +43,7 @@ docs/superpowers/
 !/docs/interactive-steering.md
 !/docs/model-request-settings.md
 !/docs/worktrees.md
+!/docs/audit-fragility-2026-10-25.md
 !/docs/assets/
 /docs/assets/*
 !/docs/assets/praxis-demo.gif
