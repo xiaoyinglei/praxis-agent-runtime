@@ -52,6 +52,3 @@ docs/superpowers/
 
 # Local proprietary third-party skill; not part of the distributed product.
 /.agents/skills/docx/
-
-# Local agent-session state.
-.zcode/

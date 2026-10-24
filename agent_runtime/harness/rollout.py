@@ -3504,7 +3504,6 @@ class RolloutStore:
         *,
         turn_id: str,
         decision: str,
-        policy_recheck: bool = False,
     ) -> InteractionSnapshot:
         if decision not in {"approve", "deny"}:
             raise ValueError("approval decision must be approve or deny")
@@ -3545,7 +3544,7 @@ class RolloutStore:
                 payload={
                     "request_id": interaction["request_id"],
                     "version": int(interaction["version"]) + 1,
-                    "response": {"decision": decision, **({"policy_recheck": True} if policy_recheck else {})},
+                    "response": {"decision": decision},
                     "approval_status": approval_status,
                 },
             )
@@ -3568,47 +3567,6 @@ class RolloutStore:
                 payload={"turn_id": turn_id, "request_id": interaction["request_id"]},
             )
         return self.read_interaction(str(interaction["request_id"]))
-
-    def refresh_tool_approval(self, *, turn_id: str, request: Mapping[str, Any]) -> InteractionSnapshot:
-        """Replace an unexecuted approval after a policy recheck, atomically."""
-        frozen_request = _json_object(request, field="approval request")
-        request_id = f"interaction_{uuid4().hex}"
-        with self._transaction():
-            turn = self.read_turn(turn_id)
-            candidates = [self.read_interaction(op.approval_request_id) for op in self.list_tool_operations(turn_id)
-                          if op.status in {"awaiting_approval", "ready"} and op.approval_request_id is not None]
-            if turn.status not in {"paused", "running"} or len(candidates) != 1:
-                raise RuntimeError("approval refresh requires one unexecuted operation")
-            previous = candidates[0]
-            if previous.status == "resolved" and previous.response.get("policy_recheck") is not True:
-                raise RuntimeError("only a policy recheck can reopen a resolved approval")
-            if previous.status == "pending":
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="interaction_resolved", producer="runtime",
-                    payload={"request_id": previous.request_id, "version": previous.version + 1,
-                             "response": {"action": "recheck"}, "approval_status": "invalidated"},
-                )
-            else:
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="approval_invalidated", producer="runtime",
-                    payload={"request_id": previous.request_id, "reason": "policy recheck requires confirmation"},
-                )
-            self._append_and_reduce(
-                thread_id=turn.thread_id, turn_id=turn_id, record_type="interaction_requested", producer="runtime",
-                payload={"request_id": request_id, "kind": "tool_approval",
-                         "operation_id": previous.operation_id, "request": frozen_request},
-            )
-            self._append_and_reduce(
-                thread_id=turn.thread_id, turn_id=turn_id,
-                record_type="tool_operation_approval_requested", producer="runtime",
-                payload={"operation_id": previous.operation_id, "request_id": request_id},
-            )
-            if turn.status == "running":
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="turn_paused", producer="runtime",
-                    payload={"turn_id": turn_id, "request_id": request_id},
-                )
-        return self.read_interaction(request_id)
 
     def invalidate_tool_approval(
         self,
@@ -3782,40 +3740,31 @@ class RolloutStore:
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
             prior_call = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE turn_id = ? AND tool_call_id = ?",
+                "SELECT operation_id FROM tool_operations WHERE turn_id = ? AND tool_call_id = ?",
                 (turn_id, tool_call_id),
             ).fetchone()
             if prior_call is not None:
-                if (prior_call["status"] != "ready" or prior_call["approval_request_id"] is None
-                        or prior_call["arguments_digest"] != arguments_digest
-                        or prior_call["execution_revision"] != execution_revision
-                        or prior_call["tool_name"] != tool_name
-                        or tuple(json.loads(prior_call["effects_json"])) != frozen_effects
-                        or tuple(json.loads(prior_call["resources_json"])) != frozen_resources):
-                    raise RuntimeError(f"tool call already has an operation: {prior_call['operation_id']}")
-                # A second scope (e.g. network) must reuse the unstarted operation.
-                operation_id = str(prior_call["operation_id"])
-            else:
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="tool_operation_prepared",
-                    producer="runtime",
-                    payload={
-                        "operation_id": operation_id,
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                        "arguments_digest": arguments_digest,
-                        "execution_revision": execution_revision,
-                        "effects": frozen_effects,
-                        "resources": frozen_resources,
-                        "idempotent": idempotent,
-                        "status": "prepared",
-                        "attempt_count": 0,
-                        "error_code": None,
-                        "requires_reconciliation": False,
-                    },
-                )
+                raise RuntimeError(f"tool call already has an operation: {prior_call['operation_id']}")
+            self._append_and_reduce(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                record_type="tool_operation_prepared",
+                producer="runtime",
+                payload={
+                    "operation_id": operation_id,
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "arguments_digest": arguments_digest,
+                    "execution_revision": execution_revision,
+                    "effects": frozen_effects,
+                    "resources": frozen_resources,
+                    "idempotent": idempotent,
+                    "status": "prepared",
+                    "attempt_count": 0,
+                    "error_code": None,
+                    "requires_reconciliation": False,
+                },
+            )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -4177,65 +4126,6 @@ class RolloutStore:
             )
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="runtime",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self.read_item(item_id)
-
-    def record_workspace_checkpoint(
-        self,
-        *,
-        turn_id: str,
-        checkpoint_id: str,
-        trigger: str,
-        tree_sha256: str | None = None,
-        changed_file_count: int = 0,
-        wall_time: float = 0.0,
-    ) -> ItemSnapshot:
-        """Persist the Turn's workspace checkpoint; one pre_write item per Turn."""
-        if trigger not in {"pre_write", "restore"}:
-            raise ValueError(f"unsupported checkpoint trigger: {trigger}")
-        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
-            raise ValueError("checkpoint_id must be a non-empty string")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            existing_rows = self._connection.execute(
-                """
-                SELECT * FROM items
-                WHERE turn_id = ? AND kind = 'workspace_checkpoint' AND status = 'completed'
-                ORDER BY sequence
-                """,
-                (turn_id,),
-            ).fetchall()
-            for row in existing_rows:
-                payload = json.loads(row["payload_json"])
-                if payload.get("checkpoint_id") == checkpoint_id or (
-                    trigger == "pre_write" and payload.get("trigger") == "pre_write"
-                ):
-                    return _item_snapshot(row)
-            item_id = f"item_{uuid4().hex}"
-            payload = {
-                "checkpoint_id": checkpoint_id,
-                "trigger": trigger,
-                "tree_sha256": tree_sha256,
-                "changed_file_count": changed_file_count,
-                "wall_time": wall_time,
-            }
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="runtime",
-                payload={"item_id": item_id, "kind": "workspace_checkpoint"},
-            )
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
                 turn_id=turn_id,
                 record_type="item_completed",
                 producer="runtime",

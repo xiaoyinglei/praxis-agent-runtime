@@ -55,7 +55,6 @@ _SUPPRESSED_ITEM_KINDS = frozenset(
         "context_message",
         "verification",
         "tool_continuation",
-        "workspace_checkpoint",
         "resource_usage",
     }
 )

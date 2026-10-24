@@ -122,8 +122,6 @@ def test_resident_coding_tool_baseline_is_exact_and_ordered(tmp_path: Path) -> N
         "manage_command",
         "execute_python",
         "update_plan",
-        "commit_changes",
-        "open_pull_request",
     )
     assert tuple(tool.definition.name for tool in tools) == RESIDENT_CODING_TOOL_NAMES
     assert all(isinstance(tool, Tool) for tool in tools)

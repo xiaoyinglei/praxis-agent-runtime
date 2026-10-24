@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import logging
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -49,8 +48,6 @@ from agent_runtime.result import AgentResult
 from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import ToolEffect
-
-logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from agent_runtime.agent import Agent, AgentEventSink
@@ -245,7 +242,6 @@ class Session:
                 raise ValueError("Session requires a bound model")
             self._service_options = dict(service_options)
             configure_services(self, workspace=self.workspace_path, model=model, **service_options)
-            await self._prune_workspace_checkpoints()
             self.thread_id = (
                 thread_id
                 if thread_id is not None
@@ -775,15 +771,6 @@ class Session:
             self.tool_execution_context = replace(self.tool_execution_context, command_grants=(*grants, grant))
             self._apply_tool_context()
 
-    async def _prune_workspace_checkpoints(self) -> None:
-        """Drop expired shadow-repository checkpoints; never block Session open."""
-        from agent_runtime.checkpoints import CheckpointError, CheckpointService
-
-        try:
-            await CheckpointService(self.workspace_path).prune()
-        except CheckpointError as error:
-            logger.warning("checkpoint pruning skipped: %s", error)
-
     async def _open_agent_resources(
         self,
         agent: Agent,
@@ -1187,8 +1174,6 @@ class Session:
                 and interaction.response.get("decision") == "approve"
                 and interaction.operation_id is not None
                 and self.store.read_tool_operation(interaction.operation_id).status == "ready"
-                and (self.store.read_tool_operation(interaction.operation_id).approval_request_id
-                     == interaction.request_id)
                 for interaction in self.store.list_interactions(turn_id)
             )
             recoverable_summary = (
@@ -1213,7 +1198,6 @@ class Session:
                     "approve": "approve",
                     "allow_session": "approve",
                     "deny": "deny",
-                    "recheck": "recheck",
                 }.get(action)
                 if (decision is None and action == "continue" and model_operations
                         and self.store.request_input_revision(turn_id, model_operations[-1].request_ref) is not None
@@ -1221,9 +1205,7 @@ class Session:
                         != self.store.request_input_revision(turn_id, model_operations[-1].request_ref)):
                     decision = "deny"
                 if decision is None:
-                    raise ValueError(
-                        "tool approval action must be allow_once, approve, allow_session, deny, or recheck"
-                    )
+                    raise ValueError("tool approval action must be allow_once, approve, allow_session, or deny")
                 internal = await executor.resume(
                     turn_id=turn_id,
                     decision=decision,
