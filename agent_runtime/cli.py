@@ -63,15 +63,121 @@ if TYPE_CHECKING:
     from agent_runtime.harness.session import Session
     from agent_runtime.result import AgentPause
     from agent_runtime.terminal_app import TerminalChatApp
+    from agent_runtime.worktrees import CreateReport
 
 agent_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_app = typer.Typer(add_completion=False, no_args_is_help=True)
 model_trust_app = typer.Typer(add_completion=False, no_args_is_help=True)
+worktree_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
+agent_app.add_typer(worktree_app, name="worktree", help="管理并行会话的 Git worktree。")
 agent_app.command("setup")(setup)
 agent_app.command("connections")(connections_command)
 agent_app.command("commands")(commands)
+
+
+def _open_cli_worktree(name: str | None) -> CreateReport:
+    """Create the managed worktree that a new ``--worktree`` session runs in."""
+    from agent_runtime.worktrees import WorktreeError, WorktreeManager
+
+    try:
+        report = WorktreeManager(Path.cwd()).create(name)
+    except WorktreeError as error:
+        raise typer.BadParameter(str(error)) from None
+    worktree = report.worktree
+    typer.echo(
+        f"已在独立 worktree 中开始：分支 {worktree.branch}（基准 {worktree.base_commit[:12]}）\n"
+        f"目录：{worktree.root}\n"
+        f"之后继续该会话：cd {worktree.root} && agent chat --continue"
+    )
+    if report.uncommitted_in_source:
+        typer.echo(
+            f"注意：源工作区有 {report.uncommitted_in_source} 个未提交变更，它们不在 worktree 中；"
+            "需要 .env 等被忽略文件时，在仓库根添加 .worktreeinclude。"
+        )
+    return report
+
+
+@worktree_app.command("list")
+def worktree_list(
+    root: Annotated[
+        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+    ] = None,
+) -> None:
+    """列出托管 worktree 与状态；不调用模型或执行工具。"""
+    from agent_runtime.worktrees import WorktreeError, WorktreeManager
+
+    try:
+        manager = WorktreeManager(Path.cwd(), root=root)
+        rows = []
+        for entry in manager.list():
+            inspection = manager.inspect(entry)
+            rows.append({
+                "name": entry.name,
+                "root": str(entry.root),
+                "branch": entry.branch,
+                "base_commit": entry.base_commit,
+                "source_root": str(entry.source_root),
+                "created_at": entry.created_at,
+                "exists": inspection.exists,
+                "dirty_count": inspection.dirty_count,
+                "ahead_count": inspection.ahead_count,
+            })
+    except WorktreeError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+
+
+@worktree_app.command("remove")
+def worktree_remove(
+    name: Annotated[str, typer.Argument(help="worktree 名称或检出路径")],
+    force: Annotated[
+        bool, typer.Option("--force", help="放弃未提交变更与未合并提交后删除"),
+    ] = False,
+    root: Annotated[
+        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+    ] = None,
+) -> None:
+    """删除托管 worktree；有未提交变更或未合并提交时需要 --force。"""
+    from agent_runtime.worktrees import WorktreeError, WorktreeManager
+
+    try:
+        report = WorktreeManager(Path.cwd(), root=root).remove(name, force=force)
+    except WorktreeError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps({
+        "name": report.name,
+        "root": str(report.root),
+        "branch": report.branch,
+        "branch_deleted": report.branch_deleted,
+    }, ensure_ascii=False, indent=2))
+
+
+@worktree_app.command("prune")
+def worktree_prune(
+    keep: Annotated[
+        int, typer.Option("--keep", min=1, help="保留最近多少个托管 worktree"),
+    ] = 15,
+    root: Annotated[
+        Path | None, typer.Option("--root", envvar="PRAXIS_WORKTREE_ROOT", help="worktree 根目录"),
+    ] = None,
+) -> None:
+    """清理最旧的干净 worktree；脏的或有未合并提交的不会被删除。"""
+    from agent_runtime.worktrees import WorktreeError, WorktreeManager
+
+    try:
+        reports = WorktreeManager(Path.cwd(), root=root).prune(keep=keep)
+    except WorktreeError as error:
+        typer.echo(str(error), err=True)
+        raise typer.Exit(1) from None
+    typer.echo(json.dumps([
+        {"name": report.name, "root": str(report.root), "branch": report.branch,
+         "branch_deleted": report.branch_deleted}
+        for report in reports
+    ], ensure_ascii=False, indent=2))
 
 
 @agent_app.command("permissions")
@@ -2328,6 +2434,12 @@ def agent_chat(
     max_output_tokens: Annotated[
         int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
     ] = None,
+    worktree: Annotated[
+        bool, typer.Option("--worktree", help="在独立 Git worktree 中开始新会话，自动生成 worktree/ 分支"),
+    ] = False,
+    worktree_name: Annotated[
+        str | None, typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
+    ] = None,
 ) -> None:
     """交互式 Agent 对话。暂停时支持工具审批。"""
     if approval_mode == "ask":
@@ -2352,15 +2464,28 @@ def agent_chat(
         )
     if effective_previous_turn_id is not None and continued_turn is None:
         continued_turn = _cli_turn(checkpoint_db, effective_previous_turn_id)
+    created_worktree: CreateReport | None = None
+    if worktree or worktree_name is not None:
+        if effective_previous_turn_id is not None or resume_thread_id is not None:
+            raise typer.BadParameter(
+                "--worktree 只用于新会话；恢复旧会话会自动回到其记录的工作区。"
+            )
+        created_worktree = _open_cli_worktree(worktree_name)
     if continued_turn is None:
         facade_model = model
-        facade_workspace: Path | str = Path.cwd()
+        facade_workspace: Path | str = (
+            created_worktree.worktree.root if created_worktree is not None else Path.cwd()
+        )
         facade_knowledge = _load_knowledge_config(knowledge_config)
     else:
         binding = continued_turn.runtime
         facade_model = None
         facade_workspace = binding.workspace_path or Path.cwd()
         facade_knowledge = binding.knowledge
+    if created_worktree is not None:
+        # The worktree carries its own rollout database so its sessions are as
+        # self-contained as its checkout: cd into it and --continue works.
+        checkpoint_db = created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
     web_options: _WebOptions = {}
     if web_limits_file is not None:
         web_options["web_limits_file"] = web_limits_file
@@ -2514,6 +2639,12 @@ def agent_run(
     max_output_tokens: Annotated[
         int | None, typer.Option("--max-output-tokens", min=1, help="单次输出额度（包含思考 token），与累计预算分开"),
     ] = None,
+    worktree: Annotated[
+        bool, typer.Option("--worktree", help="在独立 Git worktree 中执行本任务，自动生成 worktree/ 分支"),
+    ] = False,
+    worktree_name: Annotated[
+        str | None, typer.Option("--worktree-name", help="命名 worktree 分支（worktree/<name>）；隐含 --worktree"),
+    ] = None,
 ) -> None:
     """执行一个新 Turn；可从已完成 Turn 继续上下文。"""
     if approval_mode == "ask":
@@ -2536,12 +2667,24 @@ def agent_run(
             "--previous-turn-id 仅继承上下文；新 Turn 使用当前 session 模型。"
             "不能同时传 --model，请先运行 agent model switch <model-id>。"
         )
+    created_worktree: CreateReport | None = None
+    if worktree or worktree_name is not None:
+        if effective_previous_turn_id is not None:
+            raise typer.BadParameter(
+                "--worktree 只用于新任务；继续旧 Turn 请使用其原工作区。"
+            )
+        created_worktree = _open_cli_worktree(worktree_name)
     facade = _create_agent_facade(
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         model=model,
-        checkpoint_db=checkpoint_db,
-        workspace_path=Path.cwd(),
+        checkpoint_db=(
+            created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
+            if created_worktree is not None else checkpoint_db
+        ),
+        workspace_path=(
+            created_worktree.worktree.root if created_worktree is not None else Path.cwd()
+        ),
         model_session_path=model_session_path,
         knowledge=_load_knowledge_config(knowledge_config),
         **_permission_options(permissions, approval_mode),

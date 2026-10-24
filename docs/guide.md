@@ -183,6 +183,10 @@ uv run agent recover turn_ID --action continue
 
 每轮结束、失败或暂停等待审批时，默认显示本轮累计输入、输出和总 Token，以及提供方已报告的缓存命中和推理用量。缓存命中已包含在输入中，推理已包含在输出中，不会重复相加。用量包含该 Turn 的摘要和重试请求；恢复后继续累计。连接结果不确定时，已记录的 Token 会标注“用量不完整”。这些字段也可从 SDK 的 `result.usage` 读取。
 
+## 并行会话：Worktree 隔离
+
+多个窗口在同一个项目目录同时开会话会互相覆盖文件。`agent chat --worktree`（或 `agent run … --worktree`）在新窗口里为会话创建独立 Git worktree 检出和 `worktree/<名字>` 分支，会话只在自己的检出里读写；主窗口不受影响。`agent worktree list | remove | prune` 管理这些检出，交付照常走 `/commit` 和 `/pull`。设计细节与限制见 [Worktree 隔离](worktrees.md)。
+
 ## 检查点与回滚
 
 一轮对话即将首次修改工作区文件时，Runtime 会先把整个工作区快照为一个**检查点**。检查点存放在用户配置目录（`~/.config/praxis/checkpoints/`，按工作区路径区分）的**影子 git 仓库**里：它只被 Praxis 读写，使用独立的 git 元数据，项目自身的 `.git` 目录始终保持只读，两者互不影响。快照范围与 Runtime 判定“工作区已修改”的范围一致：`.git`、`.praxis`、`.venv`、`node_modules` 和各类缓存目录不进入检查点。

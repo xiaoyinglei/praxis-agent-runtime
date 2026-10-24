@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 BRANCH_PREFIX = "praxis/"
-_BASE_CONFIG_SUFFIX = ".praxis-base"
+BASE_CONFIG_SUFFIX = ".praxis-base"
 _PULL_REQUEST_URL = re.compile(r"https://\S+/pull/\d+")
 _IN_PROGRESS_MARKERS = (
     "MERGE_HEAD",
@@ -238,7 +238,16 @@ class GitDelivery:
         if status.branch != branch:
             self._run_git("switch", "-c", branch)
             # Remember where the delivery branch forked from; /pull targets it.
-            self._run_git("config", f"branch.{branch}{_BASE_CONFIG_SUFFIX}", status.branch)
+            # A branch stacked on another recorded branch (a managed worktree
+            # branch, or an earlier delivery) inherits its base so /pull keeps
+            # targeting the real upstream branch.
+            inherited = self._run_git(
+                "config", "--get", f"branch.{status.branch}{BASE_CONFIG_SUFFIX}", check=False,
+            )
+            fork_base = (inherited.stdout.strip()
+                         if inherited.returncode == 0 and inherited.stdout.strip()
+                         else status.branch)
+            self._run_git("config", f"branch.{branch}{BASE_CONFIG_SUFFIX}", fork_base)
             created_branch = True
         # ``git add -A`` stages exactly what the confirmed preview showed:
         # the repository's own ignore rules decide what counts as a change.
@@ -324,7 +333,7 @@ class GitDelivery:
             raise DeliveryError(f"origin 不是 GitHub 仓库：{remote_url}")
         self._require_gh()
         recorded = self._run_git(
-            "config", "--get", f"branch.{branch}{_BASE_CONFIG_SUFFIX}", check=False,
+            "config", "--get", f"branch.{branch}{BASE_CONFIG_SUFFIX}", check=False,
         )
         base = recorded.stdout.strip() if recorded.returncode == 0 else ""
         if not base:
@@ -556,6 +565,7 @@ def compose_ci_failure_message(
 
 
 __all__ = [
+    "BASE_CONFIG_SUFFIX",
     "BRANCH_PREFIX",
     "CheckRun",
     "DeliveryError",
