@@ -151,15 +151,26 @@ class GitDelivery:
 
     # --- Synchronous implementation --------------------------------------------------
 
-    def _run_git(self, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
-            (self._git or "git", *arguments),
-            cwd=self._workspace,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    def _run_git(
+        self, *arguments: str, check: bool = True,
+        timeout_seconds: float = 120.0,
+    ) -> subprocess.CompletedProcess[str]:
+        # Every git/gh child process needs an upper bound: a hung fetch or
+        # push would otherwise hang the whole delivery session.
+        try:
+            completed = subprocess.run(
+                (self._git or "git", *arguments),
+                cwd=self._workspace,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DeliveryError(
+                f"git {arguments[0]} 超过 {timeout_seconds:g} 秒未响应，已中止。"
+            ) from error
         if check and completed.returncode != 0:
             raise DeliveryError(
                 f"git {arguments[0]} failed ({completed.returncode}): "
@@ -278,15 +289,25 @@ class GitDelivery:
         if shutil.which("gh") is None:
             raise DeliveryError("未找到 gh 命令；请安装 GitHub CLI 并运行 gh auth login。")
 
-    def _gh_output(self, *arguments: str) -> subprocess.CompletedProcess[str]:
-        completed = subprocess.run(
-            ("gh", *arguments),
-            cwd=self._workspace,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_NO_UPDATE_NOTIFIER": "1"},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    def _gh_output(
+        self, *arguments: str, timeout_seconds: float = 300.0,
+    ) -> subprocess.CompletedProcess[str]:
+        # gh talks to the GitHub API, so it is network-bound by nature and
+        # gets a longer default budget than local git operations.
+        try:
+            completed = subprocess.run(
+                ("gh", *arguments),
+                cwd=self._workspace,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GH_NO_UPDATE_NOTIFIER": "1"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise DeliveryError(
+                f"gh {arguments[0]} 超过 {timeout_seconds:g} 秒未响应，已中止。"
+            ) from error
         return completed
 
     def _gh_default_branch(self) -> str:
@@ -341,7 +362,7 @@ class GitDelivery:
         if self._run_git(
             "rev-parse", "--verify", "--quiet", f"origin/{base}", check=False,
         ).returncode != 0:
-            self._run_git("fetch", "origin")
+            self._run_git("fetch", "origin", timeout_seconds=300.0)
         if self._run_git(
             "rev-parse", "--verify", "--quiet", f"origin/{base}", check=False,
         ).returncode != 0:
@@ -392,7 +413,9 @@ class GitDelivery:
         if body is None:
             lines = [f"- {subject}" for subject in status.commit_subjects]
             body = "\n".join(lines) + "\n\n—\n由 Praxis 交付"
-        push = self._run_git("push", "-u", "origin", status.branch, check=False)
+        push = self._run_git(
+            "push", "-u", "origin", status.branch, check=False, timeout_seconds=300.0,
+        )
         if push.returncode != 0:
             raise DeliveryError(
                 "推送失败："

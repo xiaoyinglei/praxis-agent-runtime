@@ -442,3 +442,29 @@ async def test_unknown_raw_check_state_is_never_reported_as_pass(repo: Path) -> 
     from agent_runtime.git_delivery import PullRequestChecks
     report = PullRequestChecks(branch="praxis/x", pull_request_url=None, checks=checks)
     assert report.overall == "pending"
+
+
+async def test_hung_git_subprocess_is_bounded_by_timeout(repo: Path) -> None:
+    fake_git = repo.parent / "git-hang"
+    fake_git.write_text("#!/bin/sh\nsleep 30\n")
+    fake_git.chmod(0o755)
+    delivery = GitDelivery(repo)
+    delivery._git = str(fake_git)
+
+    with pytest.raises(DeliveryError, match="git status 超过 0.2 秒未响应"):
+        delivery._run_git("status", timeout_seconds=0.2)
+
+
+async def test_hung_gh_subprocess_raises_delivery_error(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def hanging_run(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(
+            cmd="gh pr view", timeout=float(kwargs.get("timeout") or 0),
+        )
+
+    monkeypatch.setattr("agent_runtime.git_delivery.subprocess.run", hanging_run)
+    delivery = GitDelivery(repo)
+
+    with pytest.raises(DeliveryError, match="gh pr 超过 300 秒未响应"):
+        delivery._gh_output("pr", "view")
