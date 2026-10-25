@@ -76,16 +76,13 @@ class SkillRuntime:
                 code="skill_not_found",
                 message="skill could not be loaded from the active catalog",
             )
-        instructions = loaded.content.replace(
-            "${SKILL_DIR}",
-            str(loaded.referenced_base_dir),
-        )
-        instructions = _SKILL_DIR_RE.sub(
-            str(loaded.referenced_base_dir),
-            instructions,
-        )
+        # Replacement text is literal data (paths, user arguments): it must
+        # never be interpreted as a regex replacement template.
+        base_dir = str(loaded.referenced_base_dir)
+        instructions = loaded.content.replace("${SKILL_DIR}", base_dir)
+        instructions = _SKILL_DIR_RE.sub(lambda _match: base_dir, instructions)
         if args is not None:
-            instructions = _ARGUMENTS_RE.sub(args, instructions)
+            instructions = _ARGUMENTS_RE.sub(lambda _match: args, instructions)
         return {
             "success": True,
             "name": manifest.name,

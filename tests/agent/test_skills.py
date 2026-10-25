@@ -543,6 +543,26 @@ class TestSkillRuntime:
         assert "$SKILL_DIRECTORY" in instructions
         assert "$ARGUMENTS_SUFFIX" in instructions
 
+    def test_invoke_expands_arguments_as_literal_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_dir = tmp_path / ".agents" / "skills" / "literal-args"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: literal-args\ndescription: Literal expansion test\n---\n"
+            "Target: $ARGUMENTS",
+            encoding="utf-8",
+        )
+        runtime = SkillRuntime(
+            SkillCatalog(scan_and_load_skills(tmp_path, repo_root=tmp_path))
+        )
+
+        literal = r"C:\new\folder\g<name>\1.txt"
+        event = runtime.invoke_skill({"name": "project:literal-args", "args": literal})
+
+        assert f"Target: {literal}" in str(event["instructions"])
+
 class TestFinalSkillToolFactories:
     @pytest.mark.anyio
     async def test_invoke_skill_returns_a_bounded_activation_event(self) -> None:
