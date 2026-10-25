@@ -199,6 +199,23 @@ async def test_explicit_bing_distinguishes_blocked_invalid_and_empty(tmp_path, b
         await client.aclose()
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("status,code", [
+    (403, "web_search_blocked"),
+    (429, "web_search_blocked"),
+    (500, "http_error"),
+])
+async def test_bing_http_status_classification_uses_status_code(tmp_path, status, code):
+    tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
+        status, text="denied", headers={"content-type": "text/html"},
+    ), provider="bing")
+    try:
+        result = await tools["web_search"].run({"query": "public query"})
+        assert result["error_code"] == code
+    finally:
+        await client.aclose()
+
+
 def test_bing_parser_decodes_result_redirect_and_rejects_private_links():
     import base64
 

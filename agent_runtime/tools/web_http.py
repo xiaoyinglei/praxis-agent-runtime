@@ -26,8 +26,11 @@ import httpx
 class PublicWebError(Exception):
     """A stable error code and safe message, without remote data or URL secrets."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, status_code: int | None = None) -> None:
         self.code = code
+        # Machine-readable HTTP status for http_error codes; consumers must
+        # branch on this field, never on the human-readable message.
+        self.status_code = status_code
         self.failure_stage = {
             "nonpublic_address": "dns_validation", "http_error": "http_response",
             "invalid_url": "url_validation", "network_error": "connect", "timeout": "request",
@@ -541,7 +544,11 @@ class PublicWebClient:
                     )
                     continue
                 if not 200 <= response.status_code < 300:
-                    raise PublicWebError("http_error", f"The remote server returned HTTP {response.status_code}.")
+                    raise PublicWebError(
+                        "http_error",
+                        f"The remote server returned HTTP {response.status_code}.",
+                        status_code=int(response.status_code),
+                    )
                 _stage("http_response")
                 body, wire_bytes = await self._read_body(response, wire_bytes, byte_budget, response_limit)
                 # Preserve actual bounded browser policies, never cookies or Content-Encoding.

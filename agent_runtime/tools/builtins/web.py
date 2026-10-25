@@ -319,9 +319,7 @@ def create_web_tools(
                     results=[SearchResult.model_validate(item) for item in items[:request.max_results]],
                 ).model_dump(mode="json")
             except PublicWebError as error:
-                blocked = error.code == "http_error" and str(error) in {
-                    "The remote server returned HTTP 403.", "The remote server returned HTTP 429.",
-                }
+                blocked = error.code == "http_error" and error.status_code in {403, 429}
                 code = "web_search_blocked" if blocked else error.code
                 return WebSearchOutput(query=request.query, provider="bing", error_code=code,
                                        error_message=str(error), connection_mode=error.connection_mode,
