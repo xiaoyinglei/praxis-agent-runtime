@@ -272,6 +272,9 @@ class RolloutStore:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = sqlite3.connect(self._path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
+        # Multiple processes share this WAL database; BEGIN IMMEDIATE must
+        # wait out another process's write lock instead of failing fast.
+        self._connection.execute("PRAGMA busy_timeout = 30000")
         if not read_only:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
@@ -724,8 +727,7 @@ class RolloutStore:
             turn = self.read_turn(turn_id) if thread.active_turn_id == turn_id else None
             if turn is None or turn.status not in {"running", "paused", "interrupted"}:
                 raise RuntimeError("expected Turn is no longer active; input was not accepted")
-            if self.turn_cancellation_pending(turn_id):
-                raise RuntimeError("Turn cancellation was requested; input was not accepted")
+            self._assert_no_pending_cancellation(turn_id)
             revision = self.user_input_revision(turn_id) + 1
             self._append_and_reduce(
                 thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
@@ -1342,6 +1344,13 @@ class RolloutStore:
             "WHERE turn_id = ? AND record_type = 'turn_resumed'), 0) LIMIT 1", (turn_id, turn_id),
         ).fetchone() is not None
 
+    def _assert_no_pending_cancellation(self, turn_id: str) -> None:
+        # Every path that resumes a paused Turn on behalf of user input must
+        # respect a durable cancellation request; an explicit
+        # resume_cancelled_turn is the only way past it.
+        if self.turn_cancellation_pending(turn_id):
+            raise RuntimeError("Turn cancellation was requested; input was not accepted")
+
     def resume_cancelled_turn(self, *, turn_id: str) -> TurnSnapshot:
         """Explicitly continue a quiescent cancellation without replaying results."""
         with self._transaction():
@@ -1412,6 +1421,7 @@ class RolloutStore:
                 raise KeyError(f"unknown turn: {turn_id}")
             if turn["status"] != "paused":
                 raise RuntimeError("clarification response requires a paused Turn")
+            self._assert_no_pending_cancellation(turn_id)
             interaction = self._connection.execute(
                 "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
                 (request_id, turn_id),
@@ -1514,6 +1524,7 @@ class RolloutStore:
                 raise KeyError(f"unknown turn: {turn_id}")
             if turn["status"] != "paused":
                 raise RuntimeError("choice response requires a paused Turn")
+            self._assert_no_pending_cancellation(turn_id)
             interaction = self._connection.execute(
                 "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
                 (request_id, turn_id),
@@ -2306,21 +2317,18 @@ class RolloutStore:
             ).fetchone()
             if operation is None:
                 raise KeyError(f"unknown model operation: {operation_id}")
-            attempt = self._connection.execute(
-                "SELECT * FROM model_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            lease_current = (
-                attempt is not None
-                and attempt["lease_expires_at"] is not None
-                and observed_at <= float(attempt["lease_expires_at"])
-            )
+            # Durable state is the fencing authority. Lease expiry only opens
+            # the recovery takeover (expire_model_attempt_dispatch), which
+            # flips the status to unknown inside the same serialized
+            # transaction. While the operation still points at this attempt
+            # and generation with no committed response, this completion is
+            # authoritative even past the lease clock: a billed response must
+            # not be dropped on a timing boundary.
             is_current = (
                 operation["status"] == "dispatched"
                 and operation["active_attempt_id"] == attempt_id
                 and operation["generation"] == generation
                 and operation["response_item_id"] is None
-                and lease_current
             )
             if not is_current:
                 return False
@@ -2375,6 +2383,7 @@ class RolloutStore:
                     "operation_id": operation_id,
                     "attempt_id": attempt_id,
                     "generation": generation,
+                    "observed_at": observed_at,
                     "provider_response_id": provider_response_id,
                     "usage": frozen_usage,
                     "response_item_id": response_item_id,
@@ -3265,12 +3274,15 @@ class RolloutStore:
             ).fetchone()
             if operation is None:
                 raise KeyError(f"unknown tool operation: {operation_id}")
+            # Same fencing rule as model attempts: expiry only authorizes the
+            # recovery takeover, which rewrites the status to unknown under
+            # the same serialized transaction. A matching claim generation and
+            # fencing token on a still-running operation stay authoritative
+            # past the lease clock.
             is_current = (
                 operation["status"] == "running"
                 and int(operation["claim_generation"]) == claim_generation
                 and operation["fencing_token"] == fencing_token
-                and operation["lease_expires_at"] is not None
-                and observed_at <= float(operation["lease_expires_at"])
             )
             if not is_current:
                 return False
@@ -4832,15 +4844,31 @@ class RolloutStore:
             yield
         except BaseException:
             if began:
-                self._connection.execute("ROLLBACK")
+                self._rollback_quietly()
             raise
         else:
-            self._connection.execute("COMMIT")
+            try:
+                self._connection.execute("COMMIT")
+            except BaseException:
+                # A failed COMMIT (disk full, I/O error) may leave the
+                # transaction open; roll back so the reused connection does
+                # not fail the next BEGIN IMMEDIATE with "cannot start a
+                # transaction within a transaction".
+                self._rollback_quietly()
+                raise
         finally:
             self._pending_transaction_records = None
         captured = self._captured_commits
         if captured is not None:
             captured.append(tuple(pending))
+
+    def _rollback_quietly(self) -> None:
+        # Best-effort cleanup: the caller's original exception must survive
+        # even when the connection is too broken to accept ROLLBACK.
+        try:
+            self._connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def _append_and_reduce(
         self,

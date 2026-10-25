@@ -331,3 +331,90 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
         active_turn_id = store.read_thread(thread_id).active_turn_id
         assert active_turn_id in results
         assert store.verify().valid is True
+
+
+def test_connection_sets_explicit_busy_timeout(tmp_path: Path) -> None:
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        timeout = store._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        assert timeout == 30000
+
+
+def test_failed_commit_does_not_leave_connection_inside_transaction(tmp_path: Path) -> None:
+    class _CommitFailingConnection:
+        """One-shot proxy simulating a disk error on the first COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+            self._failed = False
+
+        def execute(self, script: str, *parameters: object) -> object:
+            if script == "COMMIT" and not self._failed:
+                self._failed = True
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._connection.execute(script, *parameters)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        store._connection = _CommitFailingConnection(store._connection)  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            with store._transaction():
+                store._connection.execute(
+                    "INSERT INTO store_metadata(key, value) VALUES ('probe', '1')",
+                )
+
+        assert store._connection.in_transaction is False
+        probe = store._connection.execute(
+            "SELECT value FROM store_metadata WHERE key = 'probe'",
+        ).fetchone()
+        assert probe is None
+        with store._transaction():
+            pass
+
+
+def test_pending_cancellation_blocks_clarification_and_choice_resolution(tmp_path: Path) -> None:
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        # One active turn per thread: keep each scenario on its own thread.
+        first = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path / "one").thread_id,
+            user_message="pause and cancel for clarification",
+            binding_manifest={"model_id": "test-model"},
+        )
+        second = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path / "two").thread_id,
+            user_message="pause and cancel for choice",
+            binding_manifest={"model_id": "test-model"},
+        )
+        clarification = store.request_clarification(
+            turn_id=first.turn_id, question="which file?",
+        )
+        store.request_turn_cancellation(turn_id=first.turn_id)
+
+        with pytest.raises(RuntimeError, match="cancellation was requested"):
+            store.resolve_clarification(
+                turn_id=first.turn_id,
+                request_id=clarification.request_id,
+                response="that one",
+            )
+
+        assert store.read_turn(first.turn_id).status == "paused"
+        assert store.read_interaction(clarification.request_id).status == "pending"
+
+        choice = store.request_choice(
+            turn_id=second.turn_id, question="which?", options=("a", "b"),
+        )
+        store.request_turn_cancellation(turn_id=second.turn_id)
+
+        with pytest.raises(RuntimeError, match="cancellation was requested"):
+            store.resolve_choice(
+                turn_id=second.turn_id,
+                request_id=choice.request_id,
+                selection="a",
+            )
+
+        assert store.read_interaction(choice.request_id).status == "pending"
+        assert store.verify().valid is True

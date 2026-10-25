@@ -633,3 +633,39 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
             for record in verifier.list_records(thread.thread_id)
         )
         assert verifier.verify().valid is True
+
+
+def test_commit_past_lease_boundary_settles_undisplaced_claim(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="settle past the lease boundary",
+            binding_manifest={"model_id": "test-model"},
+        )
+        operation_id = _ready_operation(store, turn.turn_id)
+        claim = store.claim_tool_operation(
+            operation_id=operation_id,
+            worker_id="worker-a",
+            lease_seconds=5.0,
+            now=100.0,
+        )
+
+        committed = store.commit_tool_operation_outcome(
+            operation_id=operation_id,
+            claim_generation=claim.claim_generation,
+            fencing_token=str(claim.fencing_token),
+            status="succeeded",
+            attempt_count=1,
+            error_code=None,
+            requires_reconciliation=False,
+            now=106.0,
+        )
+
+        assert committed is True
+        assert store.read_tool_operation(operation_id).status == "succeeded"
+        assert store.verify().valid is True
