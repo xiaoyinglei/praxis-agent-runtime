@@ -798,7 +798,7 @@ async def _execute_managed_python(
         if (view is not None and not startup_failed
                 and (request.publish_on_failure or process.returncode == 0 and not timed_out)):
             try:
-                _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+                await _blocking_phase(_commit_linux_workspace_view, workspace, view, initial, protected, permissions)
                 workspace_published = True
             except (OSError, ValueError) as error:
                 publish_error = str(error)
