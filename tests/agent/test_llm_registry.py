@@ -1221,3 +1221,25 @@ class TestModelRegistryResolveForNode:
         reg = ModelRegistry(_make_config())
         resolved = reg.resolve_for_node(node_model=None, node_name="retrieval_hint")
         assert resolved.generator is not None
+
+
+def test_provider_build_failure_names_type_and_keeps_chain_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = ModelRegistry(_make_config())
+
+    def broken_builder(**_kwargs: object) -> object:
+        raise ImportError("openai package is required for this provider")
+
+    monkeypatch.setattr(
+        "agent_runtime.core.llm_registry._build_chat_generator", broken_builder,
+    )
+
+    with pytest.raises(ModelNotAvailableError) as excinfo:
+        registry.resolve("main")
+
+    # The failure type must be diagnosable from the message alone, while the
+    # raw provider exception (untrusted text) never enters the chain.
+    assert "ImportError" in str(excinfo.value)
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__context__ is None
