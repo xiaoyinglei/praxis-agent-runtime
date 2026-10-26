@@ -43,6 +43,16 @@ from agent_runtime.streaming.events import (
 )
 
 _REDUCER_VERSION = 1
+_EVENT_REFERENCE_KEYS = {
+    "item_started": "item_id",
+    "item_completed": "item_id",
+    "model_attempt_completed": "response_item_id",
+    "tool_operation_result_linked": "result_item_id",
+    "tool_operation_claimed": "operation_id",
+    "tool_operation_prepared": "operation_id",
+    "tool_operation_outcome_committed": "operation_id",
+    "tool_operation_migrated": "operation_id",
+}
 
 
 class _WriterBusyError(sqlite3.OperationalError):
@@ -804,6 +814,7 @@ class RolloutStore:
         answer: str,
         producer: str = "runtime",
         expected_input_revision: int | None = None,
+        source_item_id: str | None = None,
     ) -> TurnSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
@@ -825,20 +836,22 @@ class RolloutStore:
             ).fetchone()
             if active["active_turn_id"] != turn_id:
                 raise RuntimeError(f"turn does not own the thread active slot: {turn_id}")
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer=producer,
-                payload={"item_id": item_id, "kind": "agent_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer=producer,
-                payload={"item_id": item_id, "payload": {"text": answer}},
-            )
+            if source_item_id is not None:
+                source = self.read_item(source_item_id)
+                if (source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed"
+                        or source.payload.get("text") != answer
+                        or source.payload.get("response_status", "completed") != "completed"):
+                    raise ValueError("accepted answer requires the matching completed response from this Turn")
+                item_id = source_item_id
+            else:
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer=producer,
+                    payload={"item_id": item_id, "kind": "agent_message"},
+                )
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer=producer,
+                    payload={"item_id": item_id, "payload": {"text": answer}},
+                )
             self._append_terminal_plan_state(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -849,7 +862,7 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="turn_completed",
                 producer=producer,
-                payload={"turn_id": turn_id},
+                payload={"turn_id": turn_id, "answer_item_id": item_id},
             )
         return self.read_turn(turn_id)
 
@@ -3104,6 +3117,8 @@ class RolloutStore:
                     "lease_expires_at": claimed_at + lease_seconds,
                     "attempt_count": int(operation["attempt_count"]) + 1,
                     "public_item_id": public_item_id,
+                    "tool_name": str(operation["tool_name"]),
+                    "tool_call_id": str(operation["tool_call_id"]),
                 },
             )
         return self.read_tool_operation(operation_id)
@@ -4050,7 +4065,13 @@ class RolloutStore:
                         "related_step_id": plan_snapshot["active_step_id"],
                         "tool_call_ids": [operation["tool_call_id"]],
                     }
-            started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
+            started_payload: dict[str, Any] = {
+                "item_id": item_id, "kind": "tool_result",
+                "tool_name": (str(operation["tool_name"])
+                              if operation_id is not None else frozen_result.get("tool_name")),
+                "tool_call_id": (str(operation["tool_call_id"])
+                                 if operation_id is not None else frozen_result.get("tool_call_id")),
+            }
             if public_item_id is not None:
                 started_payload.update(
                     {
@@ -4642,20 +4663,99 @@ class RolloutStore:
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    def read_turn_completion(self, turn_id: str) -> RolloutRecord | None:
+        """Read the terminal acceptance fact, independently of result formatting."""
+        row = self._connection.execute(
+            """SELECT * FROM rollout_records
+               WHERE turn_id = ? AND record_type = 'turn_completed' ORDER BY record_id DESC LIMIT 1""",
+            (turn_id,),
+        ).fetchone()
+        return None if row is None else _record_snapshot(row)
+
+    def read_turn_answer(self, turn_id: str) -> ItemSnapshot:
+        """Resolve the accepted output identity; old Turns retain their original answer Item."""
+        completion = self.read_turn_completion(turn_id)
+        if completion is None:
+            raise RuntimeError("Turn has no committed answer")
+        item_id = completion.payload.get("answer_item_id")
+        if item_id is None:
+            if completion.payload_schema_version >= 3:
+                raise RuntimeError("completed Turn is missing its canonical answer reference")
+            answers = [item for item in self.list_items(turn_id) if item.kind == "agent_message"]
+            if len(answers) != 1:
+                raise RuntimeError("completed Turn has no unique canonical answer")
+            return answers[0]
+        answer = self.read_item(item_id)
+        if (answer.turn_id != turn_id or answer.status != "completed"
+                or answer.kind not in {"agent_message", "model_response"}
+                or answer.payload.get("response_status", "completed") != "completed"):
+            raise RuntimeError("completed Turn has an invalid answer reference")
+        return answer
+
+    def list_record_tail(
+        self, thread_id: str, *, after_thread_sequence: int = 0, limit: int | None = None,
+        through_thread_sequence: int = 9223372036854775807,
+    ) -> tuple[RolloutRecord, ...]:
+        """Read a canonical suffix by its indexed sequence, with an optional record page."""
+        rows = self._connection.execute(
+            """SELECT * FROM rollout_records WHERE thread_id = ? AND thread_sequence > ? AND thread_sequence <= ?
+               ORDER BY thread_sequence LIMIT ?""",
+            (thread_id, after_thread_sequence, through_thread_sequence, -1 if limit is None else limit),
+        ).fetchall()
+        return tuple(_record_snapshot(row) for row in rows)
+
+    def read_event_reference(
+        self,
+        record_type: Literal[
+            "item_started", "item_completed", "model_attempt_completed",
+            "tool_operation_result_linked", "tool_operation_claimed",
+            "tool_operation_prepared", "tool_operation_outcome_committed",
+            "tool_operation_migrated",
+        ],
+        identity: str,
+        *,
+        at_record_id: int | None = None,
+    ) -> RolloutRecord | None:
+        """Read one indexed canonical dependency, including legacy event identities."""
+        key = _EVENT_REFERENCE_KEYS[record_type]
+        row = self._connection.execute(
+            f"""SELECT * FROM rollout_records
+                WHERE record_type = '{record_type}' AND json_extract(payload_json, '$.{key}') = ?
+                {'' if at_record_id is None else 'AND record_id <= ?'}
+                ORDER BY record_id DESC LIMIT 1""",
+            (identity,) if at_record_id is None else (identity, at_record_id),
+        ).fetchone()
+        return None if row is None else _record_snapshot(row)
+
+    def find_model_response_item(self, turn_id: str, text: str | None) -> str | None:
+        """Find one completed response for accepted-answer deduplication, without scanning Items."""
+        row = self._connection.execute(
+            """SELECT item_id FROM items
+               WHERE turn_id = ? AND kind = 'model_response' AND status = 'completed'
+                 AND json_extract(payload_json, '$.text') IS ? LIMIT 1""",
+            (turn_id, text),
+        ).fetchone()
+        return None if row is None else str(row["item_id"])
+
     def list_global_records(
         self,
         *,
         after_record_id: int = 0,
+        limit: int | None = None,
+        through_record_id: int = 9223372036854775807,
     ) -> tuple[RolloutRecord, ...]:
         if isinstance(after_record_id, bool) or not isinstance(after_record_id, int):
             raise TypeError("after_record_id must be an integer")
         if after_record_id < 0:
             raise ValueError("after_record_id must be non-negative")
         rows = self._connection.execute(
-            "SELECT * FROM rollout_records WHERE record_id > ? ORDER BY record_id",
-            (after_record_id,),
+            "SELECT * FROM rollout_records WHERE record_id > ? AND record_id <= ? ORDER BY record_id LIMIT ?",
+            (after_record_id, through_record_id, -1 if limit is None else limit),
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
+
+    def last_global_record_id(self) -> int:
+        return int(self._connection.execute("SELECT COALESCE(MAX(record_id), 0) FROM rollout_records").fetchone()[0])
 
     def projection_hashes(self) -> dict[str, str]:
         """Return versioned metadata digests, not proof of projection integrity.
@@ -4952,6 +5052,13 @@ class RolloutStore:
         producer: str,
         payload: Mapping[str, Any],
     ) -> None:
+        # The canonical completion owns its immutable event metadata. Readers
+        # never need the current Item/operation projection to explain a v3 event.
+        if record_type == "item_completed":
+            start = self.read_event_reference("item_started", str(payload["item_id"]))
+            if start is None:
+                raise RuntimeError("completed internal Item has no durable start")
+            payload = {**start.payload, **payload}
         payload_json = _canonical_json(payload)
         payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
         sequence = self._connection.execute(
@@ -4967,7 +5074,7 @@ class RolloutStore:
                 record_uuid, thread_id, turn_id, thread_sequence, record_type,
                 payload_schema_version, producer, payload_json, payload_hash,
                 created_at, committed_at_ms
-            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, ?, ?)
             """,
             (
                 f"record_{uuid4().hex}",
@@ -5011,7 +5118,8 @@ class RolloutStore:
             # needs this Turn's existing Items to derive its next sequence.
             for table, key, identities, row_payload in (
                 ("turns", "turn_id", (record.turn_id,), _turn_row_payload),
-                ("items", "item_id", (record.payload.get("item_id"),), _item_row_payload),
+                ("items", "item_id", (record.payload.get("item_id"), record.payload.get("answer_item_id")),
+                 _item_row_payload),
                 (
                     "model_operations", "operation_id", (record.payload.get("operation_id"),),
                     _model_operation_row_payload,
@@ -5515,6 +5623,23 @@ class RolloutStore:
             );
             CREATE INDEX IF NOT EXISTS rollout_records_turn_record
                 ON rollout_records(turn_id, record_id);
+            CREATE INDEX IF NOT EXISTS rollout_records_turn_completion
+                ON rollout_records(turn_id, record_id) WHERE record_type = 'turn_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_item
+                ON rollout_records(record_type, json_extract(payload_json, '$.item_id'), record_id)
+                WHERE record_type = 'item_started' OR record_type = 'item_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_model_response
+                ON rollout_records(json_extract(payload_json, '$.response_item_id'), record_id)
+                WHERE record_type = 'model_attempt_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_tool_result
+                ON rollout_records(json_extract(payload_json, '$.result_item_id'), record_id)
+                WHERE record_type = 'tool_operation_result_linked';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_tool_operation
+                ON rollout_records(record_type, json_extract(payload_json, '$.operation_id'), record_id)
+                WHERE record_type = 'tool_operation_claimed'
+                   OR record_type = 'tool_operation_prepared'
+                   OR record_type = 'tool_operation_outcome_committed'
+                   OR record_type = 'tool_operation_migrated';
             CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -5557,6 +5682,9 @@ class RolloutStore:
                 reducer_version INTEGER NOT NULL,
                 UNIQUE(turn_id, sequence)
             );
+            CREATE INDEX IF NOT EXISTS items_model_response_text
+                ON items(turn_id, json_extract(payload_json, '$.text'))
+                WHERE kind = 'model_response' AND status = 'completed';
             CREATE TABLE IF NOT EXISTS model_operations (
                 operation_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),

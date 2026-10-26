@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -99,7 +99,7 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
     }
 )
 _CURSOR_VERSION = 1
-_SCHEMA_EPOCH = "harness-canonical-stream-v2"
+_SCHEMA_EPOCH = "harness-canonical-stream-v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,66 +138,60 @@ class RolloutEventReader:
         self._store = store
 
     def read(
-        self,
-        thread_id: str,
-        *,
-        after: str | None = None,
+        self, thread_id: str, *, after: str | None = None, limit: int | None = None,
     ) -> tuple[ReplayEvent, ...]:
         if not isinstance(thread_id, str) or not thread_id:
             raise ValueError("thread_id must be non-empty")
+        self._validate_limit(limit)
         self._store.read_thread(thread_id)
         sequence = 0 if after is None else self._decode(after, thread_id=thread_id)
-        all_records = self._store.list_records(thread_id)
-        projected = self._project_records(all_records, after_thread_sequence=sequence)
-        return tuple(
-            ReplayEvent(
-                event=replace(
-                    event,
-                    sequence=index,
-                    timestamp_ms=record.committed_at_ms,
-                ),
-                cursor=self._encode(
-                    thread_id=record.thread_id,
-                    sequence=record.thread_sequence,
-                ),
-                record_id=record.record_id,
-                thread_sequence=record.thread_sequence,
+        last = self._store.last_record(thread_id)
+        if last is None:
+            return ()
+        projected: list[tuple[RolloutRecord, StreamEvent]] = []
+        while sequence < last.thread_sequence and (limit is None or len(projected) < limit):
+            records = self._store.list_record_tail(
+                thread_id, after_thread_sequence=sequence, through_thread_sequence=last.thread_sequence,
+                limit=256 if limit is None else min(256, limit - len(projected)),
             )
-            for index, (record, event) in enumerate(projected, start=1)
-        )
+            if not records:
+                break
+            projected.extend(self._project_records(records))
+            sequence = records[-1].thread_sequence
+        return self._wrap_events(projected)
 
     def read_global(
-        self,
-        *,
-        after_record_id: int = 0,
+        self, *, after_record_id: int = 0, limit: int | None = None,
     ) -> tuple[ReplayEvent, ...]:
-        tail_records = self._store.list_global_records(after_record_id=after_record_id)
-        thread_ids = tuple(dict.fromkeys(record.thread_id for record in tail_records))
-        projected = sorted(
-            (
-                pair
-                for thread_id in thread_ids
-                for pair in self._project_records(
-                    self._store.list_records(thread_id),
-                    after_thread_sequence=0,
-                )
-                if pair[0].record_id > after_record_id
-            ),
-            key=lambda pair: pair[0].record_id,
-        )
+        self._validate_limit(limit)
+        if isinstance(after_record_id, bool) or not isinstance(after_record_id, int):
+            raise TypeError("after_record_id must be an integer")
+        if after_record_id < 0:
+            raise ValueError("after_record_id must be non-negative")
+        last = self._store.last_global_record_id()
+        projected: list[tuple[RolloutRecord, StreamEvent]] = []
+        while after_record_id < last and (limit is None or len(projected) < limit):
+            records = self._store.list_global_records(
+                after_record_id=after_record_id, through_record_id=last,
+                limit=256 if limit is None else min(256, limit - len(projected)),
+            )
+            if not records:
+                break
+            projected.extend(self._project_records(records))
+            after_record_id = records[-1].record_id
+        return self._wrap_events(projected)
+
+    @staticmethod
+    def _validate_limit(limit: int | None) -> None:
+        if limit is not None and (type(limit) is not int or limit < 1):
+            raise ValueError("event limit must be a positive integer")
+
+    def _wrap_events(self, projected: Iterable[tuple[RolloutRecord, StreamEvent]]) -> tuple[ReplayEvent, ...]:
         return tuple(
             ReplayEvent(
-                event=replace(
-                    event,
-                    sequence=index,
-                    timestamp_ms=record.committed_at_ms,
-                ),
-                cursor=self._encode(
-                    thread_id=record.thread_id,
-                    sequence=record.thread_sequence,
-                ),
-                record_id=record.record_id,
-                thread_sequence=record.thread_sequence,
+                event=replace(event, sequence=index, timestamp_ms=record.committed_at_ms),
+                cursor=self._encode(thread_id=record.thread_id, sequence=record.thread_sequence),
+                record_id=record.record_id, thread_sequence=record.thread_sequence,
             )
             for index, (record, event) in enumerate(projected, start=1)
         )
@@ -213,247 +207,127 @@ class RolloutEventReader:
         thread_ids = {record.thread_id for record in records}
         if len(thread_ids) != 1:
             raise RuntimeError("committed mutation batch must belong to one Thread")
-        batch_record_ids = {record.record_id for record in records}
-        related = {record.record_id: record for record in records}
-        for turn_id in {record.turn_id for record in records if record.turn_id is not None}:
-            related.update((record.record_id, record) for record in self._store.list_turn_records(turn_id))
-        projected = tuple(
-            (record, event)
-            for record, event in self._project_records(
-                tuple(sorted(related.values(), key=lambda record: record.record_id)),
-                after_thread_sequence=0,
-                include_open_starts=True,
-            )
-            if record.record_id in batch_record_ids
-        )
-        return tuple(
-            ReplayEvent(
-                event=replace(
-                    event,
-                    sequence=index,
-                    timestamp_ms=record.committed_at_ms,
-                ),
-                cursor=self._encode(
-                    thread_id=record.thread_id,
-                    sequence=record.thread_sequence,
-                ),
-                record_id=record.record_id,
-                thread_sequence=record.thread_sequence,
-            )
-            for index, (record, event) in enumerate(projected, start=1)
-        )
+        return self._wrap_events(self._project_records(records))
 
-    def _project_records(
-        self,
-        records: tuple[RolloutRecord, ...],
-        *,
-        after_thread_sequence: int,
-        include_open_starts: bool = False,
-    ) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
-        for record in records:
-            if record.record_type == "item_started":
-                self._validate_internal_item_kind(record)
-            self._validate_public_item_ids(record)
-        starts = {
-            str(record.payload["item_id"]): record
-            for record in records
-            if record.record_type == "item_started" and isinstance(record.payload.get("item_id"), str)
-        }
-        completed_item_ids = {
-            str(record.payload["item_id"])
-            for record in records
-            if record.record_type == "item_completed" and isinstance(record.payload.get("item_id"), str)
-        }
-        duplicate_answer_ids = _accepted_answer_item_ids(records)
-        model_attempts_by_item = {
-            str(record.payload["response_item_id"]): str(record.payload["attempt_id"])
-            for record in records
-            if record.record_type == "model_attempt_completed"
-            and isinstance(record.payload.get("response_item_id"), str)
-            and isinstance(record.payload.get("attempt_id"), str)
-        }
-        tool_operations_by_item = {
-            str(record.payload["result_item_id"]): str(record.payload["operation_id"])
-            for record in records
-            if record.record_type == "tool_operation_result_linked"
-            and isinstance(record.payload.get("result_item_id"), str)
-            and isinstance(record.payload.get("operation_id"), str)
-        }
-        tool_generations_by_operation = {
-            str(record.payload["operation_id"]): int(record.payload["claim_generation"])
-            for record in records
-            if record.record_type == "tool_operation_claimed"
-            and isinstance(record.payload.get("operation_id"), str)
-            and isinstance(record.payload.get("claim_generation"), int)
-        }
-        completed_operations = {
-            (
-                operation_id,
-                tool_generations_by_operation[operation_id],
-            )
-            for record in records
-            if record.record_type == "item_completed"
-            and isinstance(record.payload.get("item_id"), str)
-            and (
-                operation_id := (
-                    str(record.payload["operation_id"])
-                    if isinstance(record.payload.get("operation_id"), str)
-                    else tool_operations_by_item.get(str(record.payload["item_id"]))
-                )
-            )
-            is not None
-            and operation_id in tool_generations_by_operation
-        }
+    def _project_records(self, records: tuple[RolloutRecord, ...]) -> tuple[tuple[RolloutRecord, StreamEvent], ...]:
         projected: list[tuple[RolloutRecord, StreamEvent]] = []
         for record in records:
-            events = self._project_record(
-                record,
-                starts=starts,
-                completed_item_ids=completed_item_ids,
-                duplicate_answer_ids=duplicate_answer_ids,
-                completed_operations=completed_operations,
-                model_attempts_by_item=model_attempts_by_item,
-                tool_operations_by_item=tool_operations_by_item,
-                tool_generations_by_operation=tool_generations_by_operation,
-                include_open_starts=include_open_starts,
-            )
-            if record.thread_sequence > after_thread_sequence:
-                projected.extend((record, event) for event in events)
+            if record.payload_schema_version not in {1, 2, 3}:
+                raise RuntimeError(f"unsupported event record schema: {record.payload_schema_version}")
+            self._validate_public_item_ids(record)
+            current = self._legacy_event_record(record) if record.payload_schema_version < 3 else record
+            if current is None:
+                continue
+            if current.record_type in {"item_started", "item_completed"}:
+                self._validate_internal_item_kind(current)
+            for event in self._project_record(current):
+                projected.append((record, event))
         return tuple(projected)
 
-    def _project_record(
-        self,
-        record: RolloutRecord,
-        *,
-        starts: Mapping[str, RolloutRecord],
-        completed_item_ids: set[str],
-        duplicate_answer_ids: frozenset[str],
-        completed_operations: set[tuple[str, int]],
-        model_attempts_by_item: Mapping[str, str],
-        tool_operations_by_item: Mapping[str, str],
-        tool_generations_by_operation: Mapping[str, int],
-        include_open_starts: bool,
-    ) -> tuple[StreamEvent, ...]:
+    def _legacy_event_record(self, record: RolloutRecord) -> RolloutRecord | None:
+        """Upcast pre-v3 references at the read boundary. New records never enter here."""
+        payload = dict(record.payload)
+        item_id = payload.get("item_id")
+        if record.record_type == "item_completed" and isinstance(item_id, str):
+            start = self._store.read_event_reference("item_started", item_id)
+            if start is None:
+                raise RuntimeError("completed internal Item has no durable start")
+            self._validate_internal_item_kind(start)
+            self._validate_public_item_ids(start)
+            payload = {**start.payload, **payload}
+        kind = payload.get("kind")
+        if kind == "agent_message" and record.producer == "runtime" and record.turn_id is not None:
+            completion = (record if record.record_type == "item_completed"
+                          else self._store.read_event_reference("item_completed", str(item_id)))
+            if completion is not None and self._store.find_model_response_item(
+                record.turn_id, completion.payload.get("payload", {}).get("text"),
+            ) is not None:
+                return None
+        if (kind in {"model_response", "model_reasoning", "model_plan"}
+                and payload.get("public_item_id") is None and record.producer != "migration"):
+            attempt = self._store.read_event_reference("model_attempt_completed", str(item_id))
+            if attempt is not None:
+                channel = {"model_response": "agent_message", "model_reasoning": "reasoning", "model_plan": "plan"}
+                payload["public_item_id"] = derive_model_public_item_id(
+                    turn_id=record.turn_id or "", model_attempt_id=str(attempt.payload["attempt_id"]),
+                    channel=channel[str(kind)],
+                )
+        if record.record_type == "tool_operation_claimed" or kind == "tool_result":
+            operation_id = payload.get("operation_id")
+            if operation_id is None and kind == "tool_result":
+                link = self._store.read_event_reference("tool_operation_result_linked", str(item_id))
+                if link is not None:
+                    operation_id = link.payload["operation_id"]
+                    payload["operation_id"] = operation_id
+            if isinstance(operation_id, str):
+                prepared = self._store.read_event_reference("tool_operation_prepared", operation_id)
+                if prepared is None:
+                    prepared = self._store.read_event_reference("tool_operation_migrated", operation_id)
+                if prepared is None:
+                    raise RuntimeError("legacy tool event has no canonical operation definition")
+                payload.setdefault("tool_name", prepared.payload["tool_name"])
+                payload.setdefault("tool_call_id", prepared.payload["tool_call_id"])
+                if payload.get("public_item_id") is None:
+                    claim = self._store.read_event_reference(
+                        "tool_operation_claimed", operation_id, at_record_id=record.record_id,
+                    )
+                    if claim is not None:
+                        payload["public_item_id"] = derive_operation_public_item_id(
+                            turn_id=record.turn_id or "", operation_id=operation_id,
+                            attempt_generation=int(claim.payload["claim_generation"]),
+                        )
+                if record.record_type == "item_completed" and payload.get("status") is None:
+                    outcome = self._store.read_event_reference(
+                        "tool_operation_outcome_committed", operation_id, at_record_id=record.record_id,
+                    )
+                    outcome_payload = outcome.payload if outcome is not None else prepared.payload
+                    if "status" not in outcome_payload:
+                        raise RuntimeError("legacy tool result has no canonical execution outcome")
+                    status, error = _tool_completion_status(
+                        str(outcome_payload["status"]), outcome_payload.get("error_code"),
+                    )
+                    payload.update(status=status.value, error=error)
+        return replace(record, payload=payload)
+
+    def _project_record(self, record: RolloutRecord) -> tuple[StreamEvent, ...]:
         lifecycle = self._project_lifecycle(record)
         if lifecycle is not None:
             return (lifecycle,)
         item_id = record.payload.get("item_id")
-        start = starts.get(str(item_id))
-        kind = None if start is None else start.payload.get("kind")
+        kind = record.payload.get("kind")
         if record.record_type == "tool_operation_claimed":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
-            generation = record.payload.get("claim_generation")
-            if (
-                not isinstance(public_item_id, str)
-                and record.payload_schema_version == 1
-                and record.turn_id is not None
-                and isinstance(operation_id, str)
-                and isinstance(generation, int)
-            ):
-                public_item_id = derive_operation_public_item_id(
-                    turn_id=record.turn_id,
-                    operation_id=operation_id,
-                    attempt_generation=generation,
-                )
-            if record.turn_id is None or not isinstance(operation_id, str) or not isinstance(public_item_id, str):
+            if not isinstance(public_item_id, str) or record.turn_id is None or not isinstance(operation_id, str):
                 raise RuntimeError("claimed tool operation is missing public identity")
-            if not isinstance(generation, int) or (
-                not include_open_starts
-                and (
-                    operation_id,
-                    generation,
-                )
-                not in completed_operations
-            ):
-                return ()
-            operation = self._store.read_tool_operation(operation_id)
-            return (
-                item_started(
-                    turn_id=record.turn_id,
-                    item_id=public_item_id,
-                    item_kind=(TurnItemKind.COMMAND if operation.tool_name == "run_command" else TurnItemKind.TOOL),
-                    data={
-                        "operation_id": operation_id,
-                        "tool_call_id": operation.tool_call_id,
-                        "tool_name": operation.tool_name,
-                    },
-                ),
-            )
+            return (item_started(
+                turn_id=record.turn_id, item_id=public_item_id,
+                item_kind=TurnItemKind.COMMAND if record.payload["tool_name"] == "run_command" else TurnItemKind.TOOL,
+                data={key: record.payload[key] for key in ("operation_id", "tool_call_id", "tool_name")},
+            ),)
         if record.record_type == "item_started":
-            if not isinstance(item_id, str) or (not include_open_starts and item_id not in completed_item_ids):
+            if kind in _SUPPRESSED_ITEM_KINDS or kind in {"tool_result", "command_execution"}:
                 return ()
-            if item_id in duplicate_answer_ids or kind in _SUPPRESSED_ITEM_KINDS:
-                return ()
-            if kind in {"tool_result", "command_execution"}:
-                return ()
-            legacy_public_item_id = _legacy_model_public_item_id(
-                record,
-                kind=str(kind),
-                model_attempts_by_item=model_attempts_by_item,
-            )
-            return (
-                self._project_item_started(
-                    record,
-                    kind=str(kind),
-                    derived_public_item_id=legacy_public_item_id,
-                ),
-            )
-        elif kind == "tool_result" and record.record_type == "item_completed":
+            return (self._project_item_started(record, kind=str(kind)),)
+        if record.record_type == "item_completed" and kind == "tool_result":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
-            if record.payload_schema_version == 1 and isinstance(item_id, str) and not isinstance(operation_id, str):
-                operation_id = tool_operations_by_item.get(item_id)
-            if (
-                record.payload_schema_version == 1
-                and record.turn_id is not None
-                and isinstance(operation_id, str)
-                and not isinstance(public_item_id, str)
-            ):
-                generation = tool_generations_by_operation.get(operation_id)
-                if generation is not None:
-                    public_item_id = derive_operation_public_item_id(
-                        turn_id=record.turn_id,
-                        operation_id=operation_id,
-                        attempt_generation=generation,
-                    )
             if isinstance(operation_id, str) and isinstance(public_item_id, str):
                 if record.turn_id is None:
                     raise RuntimeError("tool result is missing turn identity")
-                operation = self._store.read_tool_operation(operation_id)
-                status, error = (
-                    _record_item_status(record.payload)
-                    if record.payload_schema_version >= 2
-                    and record.payload.get("status") is not None
-                    else _tool_completion_status(
-                        operation.status,
-                        operation.error_code,
-                    )
-                )
-                completed = item_completed(
-                    turn_id=record.turn_id,
-                    item_id=public_item_id,
-                    item_kind=(TurnItemKind.COMMAND if operation.tool_name == "run_command" else TurnItemKind.TOOL),
-                    status=status,
-                    data={"result": record.payload.get("payload", {})},
-                    error=error,
-                )
-                return (completed,)
-            # Validation and hard-guard rejections have a durable result but no
-            # executable operation. Project that result without inventing one.
-            result = record.payload.get("payload")
-            if (
-                operation_id is None
-                and record.turn_id is not None
-                and isinstance(item_id, str)
-                and isinstance(result, Mapping)
-                and result.get("is_error") is True
-                and isinstance(result.get("tool_name"), str)
-                and isinstance(result.get("tool_call_id"), str)
-            ):
+                status, error = _record_item_status(record.payload)
                 return (item_completed(
-                    turn_id=record.turn_id,
-                    item_id=item_id,
+                    turn_id=record.turn_id, item_id=public_item_id,
+                    item_kind=(TurnItemKind.COMMAND
+                               if record.payload["tool_name"] == "run_command" else TurnItemKind.TOOL),
+                    status=status, data={"result": record.payload.get("payload", {})}, error=error,
+                ),)
+            result = record.payload.get("payload")
+            if (operation_id is None and record.turn_id is not None and isinstance(item_id, str)
+                    and isinstance(result, Mapping) and result.get("is_error") is True
+                    and isinstance(result.get("tool_name"), str) and isinstance(result.get("tool_call_id"), str)):
+                return (item_completed(
+                    turn_id=record.turn_id, item_id=item_id,
                     item_kind=TurnItemKind.COMMAND if result["tool_name"] == "run_command" else TurnItemKind.TOOL,
                     status=ItemStatus.FAILED,
                     error=str(result.get("error_message") or result.get("error_code") or "tool rejected"),
@@ -461,7 +335,7 @@ class RolloutEventReader:
                 ),)
             return ()
         if record.record_type == "item_completed":
-            if not isinstance(item_id, str) or start is None:
+            if not isinstance(item_id, str) or not isinstance(kind, str):
                 raise RuntimeError("completed internal Item has no durable start")
             payload = record.payload.get("payload", {})
             if kind == "context_compaction" and isinstance(payload.get("capacity_diagnostics"), Mapping):
@@ -481,22 +355,9 @@ class RolloutEventReader:
                         **({"effective_settings": dict(request_ref["effective_settings"])}
                            if isinstance(request_ref.get("effective_settings"), Mapping) else {}),
                     }),)
-            if item_id in duplicate_answer_ids or kind in _SUPPRESSED_ITEM_KINDS:
+            if kind in _SUPPRESSED_ITEM_KINDS or kind == "command_execution":
                 return ()
-            if kind == "command_execution":
-                return ()
-            legacy_public_item_id = _legacy_model_public_item_id(
-                record,
-                kind=str(kind),
-                model_attempts_by_item=model_attempts_by_item,
-            )
-            return (
-                self._project_item_completed(
-                    record,
-                    kind=str(kind),
-                    derived_public_item_id=legacy_public_item_id,
-                ),
-            )
+            return (self._project_item_completed(record, kind=kind),)
         if record.record_type in _SUPPRESSED_RECORD_TYPES:
             return ()
         raise RuntimeError(f"unknown durable Rollout record type: {record.record_type!r}")
@@ -817,32 +678,10 @@ class RolloutEventReader:
         sequence = payload.get("thread_sequence")
         if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
             raise _full_resync_error("event cursor sequence is invalid")
-        latest = self._store.list_records(thread_id)
-        if latest and sequence > latest[-1].thread_sequence:
+        latest = self._store.last_record(thread_id)
+        if latest and sequence > latest.thread_sequence:
             raise _full_resync_error("event cursor is ahead of the Thread tail")
         return sequence
-
-
-def _accepted_answer_item_ids(records: tuple[RolloutRecord, ...]) -> frozenset[str]:
-    starts = {
-        str(record.payload["item_id"]): (record.payload.get("kind"), record.producer)
-        for record in records
-        if record.record_type == "item_started" and isinstance(record.payload.get("item_id"), str)
-    }
-    model_texts = {
-        record.payload.get("payload", {}).get("text")
-        for record in records
-        if record.record_type == "item_completed"
-        and starts.get(str(record.payload.get("item_id")), (None, None))[0] == "model_response"
-    }
-    return frozenset(
-        item_id
-        for record in records
-        if record.record_type == "item_completed"
-        and (item_id := str(record.payload.get("item_id"))) in starts
-        and starts[item_id] == ("agent_message", "runtime")
-        and record.payload.get("payload", {}).get("text") in model_texts
-    )
 
 
 def _full_resync_error(reason: str) -> ValueError:
@@ -860,33 +699,6 @@ def _tool_completion_status(
     if status == "unknown":
         return ItemStatus.OUTCOME_UNKNOWN, error_code or "tool outcome is unknown"
     return ItemStatus.FAILED, error_code or "tool execution failed"
-
-
-def _legacy_model_public_item_id(
-    record: RolloutRecord,
-    *,
-    kind: str,
-    model_attempts_by_item: Mapping[str, str],
-) -> str | None:
-    if record.payload_schema_version != 1:
-        return None
-    channel_by_kind = {
-        "model_response": "agent_message",
-        "model_reasoning": "reasoning",
-        "model_plan": "plan",
-    }
-    channel = channel_by_kind.get(kind)
-    item_id = record.payload.get("item_id")
-    if channel is None or not isinstance(item_id, str) or record.turn_id is None:
-        return None
-    attempt_id = model_attempts_by_item.get(item_id)
-    if attempt_id is None:
-        return None
-    return derive_model_public_item_id(
-        turn_id=record.turn_id,
-        model_attempt_id=attempt_id,
-        channel=channel,
-    )
 
 
 def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:

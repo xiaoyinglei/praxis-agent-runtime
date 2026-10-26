@@ -651,17 +651,11 @@ class TurnExecutor:
             if prior_decision != decision:
                 raise RuntimeError(f"decision conflicts with resolved approval: {prior_decision} != {decision}")
             if turn.status == "completed":
-                answers = [
-                    item.payload.get("text")
-                    for item in self._store.list_items(turn_id)
-                    if item.kind == "agent_message" and isinstance(item.payload.get("text"), str)
-                ]
-                if len(answers) != 1:
-                    raise RuntimeError("completed Turn has no unique canonical answer")
+                answer = self._store.read_turn_answer(turn_id)
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
-                    answer=answers[0],
+                    answer=str(answer.payload["text"]),
                     status="completed",
                 )
             if turn.status == "running" and decision == "approve":
@@ -935,17 +929,11 @@ class TurnExecutor:
                     f"response conflicts with resolved {interaction.kind}: {prior_response!r} != {response!r}"
                 )
             if turn.status == "completed":
-                answers = [
-                    item.payload.get("text")
-                    for item in self._store.list_items(turn_id)
-                    if item.kind == "agent_message" and isinstance(item.payload.get("text"), str)
-                ]
-                if len(answers) != 1:
-                    raise RuntimeError("completed Turn has no unique canonical answer")
+                answer = self._store.read_turn_answer(turn_id)
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
-                    answer=answers[0],
+                    answer=str(answer.payload["text"]),
                     status="completed",
                 )
             raise RuntimeError(f"resolved {interaction.kind} is already being processed")
@@ -2473,6 +2461,7 @@ class TurnExecutor:
                     turn_id=turn_id,
                     answer=answer,
                     expected_input_revision=input_revision,
+                    source_item_id=source_item_id,
                 )
             )
         except TurnInputChangedError:

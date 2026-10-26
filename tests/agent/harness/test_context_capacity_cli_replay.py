@@ -229,7 +229,10 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         assert compactions
         if mode == "capacity":
             assert all(item.payload["algorithm_revision"] == "semantic-compaction-v6" for item in compactions)
-        answer = next(item.payload["text"] for item in reversed(items) if item.kind == "agent_message")
+        accepted = store.read_turn_answer(turn.turn_id)
+        answer = accepted.payload["text"]
+        assert accepted.kind == "model_response"
+        assert not any(item.kind == "agent_message" for item in items)
         assert (answer == expected) == preserves_fact
         assert store.verify().valid
         tool_results = [item for item in items if item.kind == "tool_result"]

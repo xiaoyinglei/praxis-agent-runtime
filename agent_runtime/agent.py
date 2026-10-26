@@ -611,16 +611,7 @@ class Agent:
                 raise RuntimeError("turn belongs to a different workspace security domain")
             answer: str | None = None
             if turn.status == "completed":
-                answers = [
-                    item.payload.get("text")
-                    for item in store.list_items(turn_id)
-                    if item.kind == "agent_message"
-                    and item.status == "completed"
-                    and isinstance(item.payload.get("text"), str)
-                ]
-                if len(answers) != 1:
-                    raise RuntimeError("completed Turn has no unique canonical answer")
-                answer = answers[0]
+                answer = str(store.read_turn_answer(turn_id).payload["text"])
             pending = next(
                 (
                     interaction.request_id

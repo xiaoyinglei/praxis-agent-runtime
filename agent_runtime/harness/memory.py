@@ -195,9 +195,12 @@ def _source(
                           for e in state.get("skipped_sources", []))
         if state["processed"].get(thread.thread_id) == revision and not legacy_skip:
             continue
+        answer_ids = {store.read_turn_answer(t.turn_id).item_id
+                      for t in turns if t.turn_id in permitted_turns and t.status == "completed"}
         items = [i for i in store.list_conversation_items(thread.head_turn_id)
-                 if i.turn_id in permitted_turns and i.status == "completed" and i.kind in {
-                     "user_message", "agent_message", "tool_result", "verification", "completion_feedback"}]
+                 if i.turn_id in permitted_turns and i.status == "completed" and (i.kind in {
+                     "user_message", "agent_message", "tool_result", "verification", "completion_feedback"}
+                     or i.item_id in answer_ids)]
         cursor = state.get("source_cursors", {}).get(thread.thread_id, {})
         if exhausted:
             # New history may contribute, but never rebuy the exhausted batch.
@@ -297,8 +300,7 @@ async def update_memory(
                 previous_turn = store.read_turn(previous_id)
                 if (previous_turn.status == "completed"
                         and previous_turn.binding_manifest.get("maintenance_purpose") == "memory_extract"):
-                    answers = [i.payload["text"] for i in store.list_items(previous_id)
-                               if i.kind == "agent_message" and i.status == "completed" and i.payload.get("text")]
+                    answers = [store.read_turn_answer(previous_id).payload["text"]]
                     if answers:
                         try:
                             cached = validate(answers[-1], "memory_extract")

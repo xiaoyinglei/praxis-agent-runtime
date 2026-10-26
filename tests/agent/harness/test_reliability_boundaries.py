@@ -9,8 +9,10 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore, TurnExecutor
+from agent_runtime.harness import rollout as rollout_module
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
+from agent_runtime.streaming.sink import TurnEventDispatcher
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import NormalizedToolOutput, ToolCall, ToolCallOrigin, ToolContentBlock
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
@@ -82,6 +84,139 @@ def test_live_projection_does_not_reload_completed_turns(tmp_path, monkeypatch):
         events = reader.project_committed_batch(mutation.records)
         assert events
         assert not any(record.turn_id != mutation.value.turn_id for record in loaded)
+
+
+@pytest.mark.parametrize("batches", [24, 48])
+@pytest.mark.parametrize("split_items", [False, True])
+def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch, batches, split_items):
+    with RolloutStore(tmp_path / "run.db") as store:
+        turn = _turn(store, tmp_path)
+        early_completion = next(record for record in store.list_turn_records(turn.turn_id)
+                                if record.record_type == "item_completed")
+        loaded = []
+        projected = []
+        original_snapshot = rollout_module._record_snapshot
+        original_project = RolloutEventReader._project_record
+
+        def snapshot(row):
+            record = original_snapshot(row)
+            loaded.append(record.record_id)
+            return record
+
+        def project(reader, record, **kwargs):
+            projected.append(record.record_id)
+            return original_project(reader, record, **kwargs)
+
+        monkeypatch.setattr(rollout_module, "_record_snapshot", snapshot)
+        monkeypatch.setattr(RolloutEventReader, "_project_record", project)
+        total_records = 0
+        total_loaded = 0
+        total_projected = 0
+        sql_steps = 0
+
+        def sql_step():
+            nonlocal sql_steps
+            sql_steps += 1
+            return 0
+
+        for _ in range(batches):
+            mutation = store.capture_mutation(lambda: store.reserve_resource_unit(turn.turn_id, "reads", 256))
+            # Count only live projection, independently of the write/reducer.
+            loaded.clear()
+            projected.clear()
+            store._connection.set_progress_handler(sql_step, 1)
+            try:
+                parts = tuple((record,) for record in mutation.records) if split_items else (mutation.records,)
+                for part in parts:
+                    assert RolloutEventReader(store).project_committed_batch(part) == ()
+            finally:
+                store._connection.set_progress_handler(None, 0)
+            total_records += len(mutation.records)
+            total_loaded += len(loaded)
+            total_projected += len(projected)
+
+        assert total_loaded <= total_records, (batches, total_records, total_loaded)
+        assert total_projected == total_records, (batches, total_records, total_projected)
+        assert sql_steps <= batches * 100, (batches, sql_steps)
+        # A delayed completion must find its old start by identity even after
+        # many unrelated Items. Counting VM work catches hidden SQL full scans.
+        sql_steps = 0
+        store._connection.set_progress_handler(sql_step, 1)
+        try:
+            assert RolloutEventReader(store).project_committed_batch((early_completion,)) == ()
+        finally:
+            store._connection.set_progress_handler(None, 0)
+        assert sql_steps <= 100, sql_steps
+
+
+@pytest.mark.anyio
+async def test_live_projection_matches_replay_across_tool_commits_and_reopened_turn(tmp_path, monkeypatch):
+    database = tmp_path / "run.db"
+    dispatcher = TurnEventDispatcher(capacity=128)
+    stream = dispatcher.subscribe_controlling()
+
+    def no_history(*args, **kwargs):
+        pytest.fail("live delivery must not load Turn or Thread history")
+
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=tmp_path)
+        executor = object.__new__(TurnExecutor)
+        executor._store, executor._event_dispatcher = store, dispatcher
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "list_records", no_history)
+            patch.setattr(store, "list_turn_records", no_history)
+            turn = await executor._commit(lambda: store.start_turn(
+                thread_id=thread.thread_id, user_message="inspect", binding_manifest={}))
+            operation = await executor._commit(lambda: store.prepare_model_operation(
+                turn_id=turn.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
+                request_ref={"request_id": "model-request"},
+            ))
+            attempt = await executor._commit(lambda: store.dispatch_model_attempt(operation.operation_id))
+            await executor._commit(lambda: store.complete_model_attempt(
+                operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
+                text="answer", provider_response_id="response", usage={"input_tokens": 1, "output_tokens": 1},
+                reasoning_content="inspect the file", plan_content="read then answer",
+            ))
+            orchestrator = ToolOrchestrator(
+                store=store, tools={"read_file": _read_tool(workspace=tmp_path)},
+                execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path),
+                event_dispatcher=dispatcher,
+            )
+            for index in range(4):
+                result = await orchestrator.execute(turn_id=turn.turn_id, call=ToolCall(
+                    tool_call_id=f"read-{index}", tool_name="read_file", arguments={"path": "present.txt"},
+                    origin=ToolCallOrigin(request_id="tool-request", toolset_revision="tools",
+                                          exposed_tool_names=("read_file",)),
+                ))
+                assert not result.is_error
+            interaction = await executor._commit(lambda: store.request_clarification(
+                turn_id=turn.turn_id, question="continue?"))
+
+    with RolloutStore(database) as reopened:
+        executor = object.__new__(TurnExecutor)
+        executor._store, executor._event_dispatcher = reopened, dispatcher
+        with monkeypatch.context() as patch:
+            patch.setattr(reopened, "list_records", no_history)
+            patch.setattr(reopened, "list_turn_records", no_history)
+            await executor._commit(lambda: reopened.resolve_clarification(
+                turn_id=turn.turn_id, request_id=interaction.request_id, response="continue"))
+            source = reopened.list_model_operations(turn.turn_id)[0].response_item_id
+            await executor._commit(lambda: reopened.complete_turn(
+                turn_id=turn.turn_id, answer="answer", source_item_id=source,
+            ))
+        live = []
+        while not stream.empty:
+            live.append(stream.receive_nowait())
+        replay = RolloutEventReader(reopened).read(thread.thread_id)
+        assert [replace(event, sequence=0) for event in live] == [
+            replace(event.event, sequence=0) for event in replay
+        ]
+        assert {event.type.value for event in live} >= {"turn_paused", "turn_resumed", "turn_completed"}
+        assert sum(event.type.value == "item_completed" and event.item_kind.value == "tool" for event in live) == 4
+        reopened.rebuild_projections()
+        assert RolloutEventReader(reopened).read(thread.thread_id) == replay
+        assert reopened.verify().valid
+    dispatcher.close()
 
 
 @pytest.mark.anyio

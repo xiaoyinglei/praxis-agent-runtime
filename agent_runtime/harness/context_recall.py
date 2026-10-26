@@ -107,6 +107,7 @@ def create_context_recall_tool(store: RolloutStore) -> Tool:
                     in {
                         "user_message",
                         "agent_message",
+                        "model_response",
                         "context_message",
                         "completion_feedback",
                         "tool_result",
