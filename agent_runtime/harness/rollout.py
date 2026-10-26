@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -42,6 +43,10 @@ from agent_runtime.streaming.events import (
 )
 
 _REDUCER_VERSION = 1
+
+
+class _WriterBusyError(sqlite3.OperationalError):
+    """BEGIN failed before the mutation acquired a writer or ran its body."""
 
 
 class TurnInputChangedError(RuntimeError):
@@ -264,6 +269,7 @@ class RolloutStore:
         self._artifact_root = self._path.with_name(f"{self._path.name}.artifacts")
         self._pending_transaction_records: list[RolloutRecord] | None = None
         self._captured_commits: list[tuple[RolloutRecord, ...]] | None = None
+        self._nonblocking_writer = False
         if read_only:
             self._connection = sqlite3.connect(
                 f"{self._path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None,
@@ -418,6 +424,27 @@ class RolloutStore:
             raise RuntimeError("committed mutation must contain exactly one outer transaction")
         return CommittedMutation(value=value, records=captured[0])
 
+    async def capture_mutation_async[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
+        """Yield while waiting for the writer, retaining this connection's owner.
+
+        Only failed BEGIN admission is retried. Errors after mutation entry,
+        including COMMIT failures, are never replayed here.
+        """
+        timeout = int(self._connection.execute("PRAGMA busy_timeout").fetchone()[0])
+        deadline = time.monotonic() + timeout / 1000
+        while True:
+            self._connection.execute("PRAGMA busy_timeout = 0")
+            self._nonblocking_writer = True
+            try:
+                return self.capture_mutation(operation)
+            except _WriterBusyError:
+                if time.monotonic() >= deadline:
+                    raise
+            finally:
+                self._nonblocking_writer = False
+                self._connection.execute(f"PRAGMA busy_timeout = {timeout}")
+            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
+
     def commit_artifact(
         self,
         *,
@@ -549,12 +576,16 @@ class RolloutStore:
         workspace: Path,
         thread_id: str | None = None,
     ) -> ThreadSnapshot:
+        self._assert_writable()
         resolved_workspace = Path(workspace).resolve()
         if not resolved_workspace.is_dir():
             raise ValueError("workspace must be an existing directory")
         if thread_id is not None and (not isinstance(thread_id, str) or not thread_id.strip()):
             raise ValueError("thread_id must be non-empty when provided")
         thread_id = thread_id or f"thread_{uuid4().hex}"
+        from agent_runtime.harness.workspace_stores import register_workspace_store
+
+        register_workspace_store(resolved_workspace, self._path)
         with self._transaction():
             self._append_and_reduce(
                 thread_id=thread_id,
@@ -1410,7 +1441,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if not isinstance(response, str) or not response.strip():
             raise ValueError("clarification response must be non-empty")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             turn = self._connection.execute(
@@ -1513,7 +1544,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if not isinstance(selection, str) or not selection.strip():
             raise ValueError("choice selection must be non-empty")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             turn = self._connection.execute(
@@ -1699,7 +1730,11 @@ class RolloutStore:
             raise TypeError("resource_request must be ResourceUsage or None")
         if type(allow_protected_budget) is not bool:
             raise TypeError("allow_protected_budget must be a bool")
-        self._assert_artifact_integrity()
+        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
+                                       (operation_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown model operation: {operation_id}")
+        self._assert_artifact_integrity(str(row["turn_id"]))
         dispatched_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -2226,7 +2261,11 @@ class RolloutStore:
         return self.list_model_attempts(operation_id)[-1]
 
     def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
-        self._assert_artifact_integrity()
+        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
+                                       (operation_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown model operation: {operation_id}")
+        self._assert_artifact_integrity(str(row["turn_id"]))
         with self._transaction():
             operation = self._connection.execute(
                 "SELECT * FROM model_operations WHERE operation_id = ?",
@@ -3019,7 +3058,7 @@ class RolloutStore:
             raise ValueError("worker_id must be non-empty")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(self.read_tool_operation(operation_id).turn_id)
         claimed_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -3279,7 +3318,7 @@ class RolloutStore:
             # the same serialized transaction. A matching claim generation and
             # fencing token on a still-running operation stay authoritative
             # past the lease clock.
-            is_current = (
+            is_current = bool(
                 operation["status"] == "running"
                 and int(operation["claim_generation"]) == claim_generation
                 and operation["fencing_token"] == fencing_token
@@ -3389,7 +3428,7 @@ class RolloutStore:
     ) -> ItemSnapshot:
         if status not in {"succeeded", "failed", "cancelled"}:
             raise ValueError("reconciled tool status is unsupported")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         if not isinstance(reconciler_revision, str) or not reconciler_revision.strip():
             raise ValueError("reconciler_revision must be non-empty")
         frozen_result = _json_object(result, field="reconciled tool result")
@@ -3520,7 +3559,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if decision not in {"approve", "deny"}:
             raise ValueError("approval decision must be approve or deny")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         with self._transaction():
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
@@ -4435,6 +4474,7 @@ class RolloutStore:
         turn_id: str,
         reason: str,
         source_item_id: str | None = None,
+        reason_code: str | None = None,
     ) -> ItemSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("completion feedback reason must be non-empty")
@@ -4442,6 +4482,8 @@ class RolloutStore:
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
             payload = {"text": reason}
+            if reason_code is not None:
+                payload["reason_code"] = reason_code
             if source_item_id is not None:
                 source = self.read_item(source_item_id)
                 if (source.turn_id != turn_id or source.status != "completed"
@@ -4519,7 +4561,7 @@ class RolloutStore:
 
     def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Visible model/recall window; the complete ledger remains separately readable."""
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         items = self.list_conversation_items(turn_id)
         start = 0
         seen = set()
@@ -4527,7 +4569,8 @@ class RolloutStore:
             if item.turn_id not in seen:
                 seen.add(item.turn_id)
                 reset = self.read_turn(item.turn_id).binding_manifest.get("context_reset")
-                if reset == {"revision": "v1", "reason": "memory_revoked"}:
+                if (isinstance(reset, Mapping) and reset.get("revision") == "v1"
+                        and reset.get("reason") == "memory_revoked"):
                     start = index
         return items[start:]
 
@@ -4590,6 +4633,12 @@ class RolloutStore:
         rows = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence",
             (thread_id,),
+        ).fetchall()
+        return tuple(_record_snapshot(row) for row in rows)
+
+    def list_turn_records(self, turn_id: str) -> tuple[RolloutRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM rollout_records WHERE turn_id = ? ORDER BY record_id", (turn_id,),
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
@@ -4695,25 +4744,44 @@ class RolloutStore:
             errors.append("projection metadata mismatch")
         return VerificationReport(valid=not errors, errors=tuple(errors))
 
-    def _assert_artifact_integrity(self) -> None:
-        errors = self._artifact_integrity_errors()
+    def _assert_artifact_integrity(self, turn_id: str) -> None:
+        # Dispatch validates its actual conversation references. A damaged blob
+        # in another Thread is still diagnosed by verify(), without disabling
+        # unrelated work throughout the whole store.
+        artifact_ids = {
+            str(attachment["artifact_id"])
+            for item in self.list_conversation_items(turn_id)
+            for attachment in item.payload.get("attachments", ())
+            if isinstance(attachment, Mapping) and isinstance(attachment.get("artifact_id"), str)
+        }
+        errors = self._artifact_integrity_errors(artifact_ids=artifact_ids)
         if errors:
             raise RuntimeError(f"artifact integrity check failed: {errors[0]}")
 
     def _artifact_integrity_errors(
         self,
         state: ProjectionState | None = None,
+        *, artifact_ids: set[str] | None = None,
     ) -> list[str]:
-        artifacts = (
-            state.artifacts
-            if state is not None
-            else {
+        if state is not None:
+            artifacts = state.artifacts
+        elif artifact_ids is None:
+            artifacts = {
                 row["artifact_id"]: _artifact_row_payload(row)
                 for row in self._connection.execute("SELECT * FROM artifacts")
             }
-        )
+        else:
+            artifacts = {}
+            for artifact_id in sorted(artifact_ids):
+                row = self._connection.execute("SELECT * FROM artifacts WHERE artifact_id = ?",
+                                               (artifact_id,)).fetchone()
+                if row is None:
+                    return [f"unknown artifact reference: {artifact_id}"]
+                artifacts[artifact_id] = _artifact_row_payload(row)
         errors: list[str] = []
         for artifact_id, payload in artifacts.items():
+            if artifact_ids is not None and artifact_id not in artifact_ids:
+                continue
             snapshot = ArtifactSnapshot(
                 artifact_id=str(payload["artifact_id"]),
                 thread_id=str(payload["thread_id"]),
@@ -4742,11 +4810,11 @@ class RolloutStore:
                     if not isinstance(attachment, Mapping):
                         errors.append(f"artifact attachment malformed in Item {item['item_id']}")
                         continue
-                    artifact_id = attachment.get("artifact_id")
-                    if not isinstance(artifact_id, str) or artifact_id not in artifacts:
+                    attachment_artifact_id = attachment.get("artifact_id")
+                    if not isinstance(attachment_artifact_id, str) or attachment_artifact_id not in artifacts:
                         errors.append(f"artifact attachment in Item {item['item_id']} references unknown artifact")
                         continue
-                    durable = artifacts[artifact_id]
+                    durable = artifacts[attachment_artifact_id]
                     if (
                         attachment.get("media_type") != durable["media_type"]
                         or attachment.get("name") != durable["name"]
@@ -4839,7 +4907,12 @@ class RolloutStore:
         self._pending_transaction_records = pending
         began = False
         try:
-            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as error:
+                if self._nonblocking_writer and getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY:
+                    raise _WriterBusyError(str(error)) from error
+                raise
             began = True
             yield
         except BaseException:
@@ -5440,6 +5513,8 @@ class RolloutStore:
                 committed_at_ms INTEGER NOT NULL,
                 UNIQUE(thread_id, thread_sequence)
             );
+            CREATE INDEX IF NOT EXISTS rollout_records_turn_record
+                ON rollout_records(turn_id, record_id);
             CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL

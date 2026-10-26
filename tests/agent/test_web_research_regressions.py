@@ -183,10 +183,10 @@ async def test_find_in_snapshot_locates_evidence_without_refetching(tmp_path):
 @pytest.mark.anyio
 async def test_search_retains_backend_results_and_unverified_freshness(tmp_path):
     hits = []
-    body = '<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/mineral">水晶矿物</a>' \
-           '</h2><div class="b_caption"><p>石英百科介绍</p></div></li></ol>'
+    body = {'web': {'results': [{'url': 'https://example.com/mineral', 'title': '水晶矿物',
+                                 'description': '石英百科介绍'}]}}
     tools, client, _ = web_tools(tmp_path, lambda req: hits.append(req) or httpx.Response(
-        200, text=body, headers={'content-type': 'text/html'}), provider='bing')
+        200, json=body), provider='brave', key='fake-search-secret')
     try:
         first = await tools['web_search'].run({'query': '水晶光电 最新消息', 'freshness': 'pw'})
         assert first['result_status'] == 'results'
@@ -241,10 +241,10 @@ def test_unmarked_link_paragraph_is_preserved_without_inferring_promotion_from_t
 
 @pytest.mark.anyio
 async def test_query_variants_report_identical_results_as_execution_fact(tmp_path):
-    body = '<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/page">Unrelated</a>' \
-           '</h2><div class="b_caption"><p>Same snippet</p></div></li></ol>'
+    body = {'web': {'results': [{'url': 'https://example.com/page', 'title': 'Unrelated',
+                                 'description': 'Same snippet'}]}}
     tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
-        200, text=body, headers={'content-type': 'text/html'}), provider='bing')
+        200, json=body), provider='brave', key='fake-search-secret')
     try:
         await tools['web_search'].run({'query': 'different first query'})
         second = await tools['web_search'].run({'query': 'another query'})

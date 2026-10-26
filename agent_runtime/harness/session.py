@@ -24,6 +24,7 @@ from agent_runtime.harness.ownership import (
     ConversationRecoveryRequiredError,
     execution_owner,
     recover_owner_loss,
+    workspace_owner,
 )
 from agent_runtime.harness.protocol import (
     BoundHarnessModel,
@@ -35,6 +36,7 @@ from agent_runtime.harness.protocol import (
     ToolRouter,
     TurnResult,
 )
+from agent_runtime.harness.recovery import recovery_plan
 from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
 from agent_runtime.harness.services import (
     SessionBindingProvider,
@@ -161,7 +163,11 @@ class Session:
                 raise ValueError("Session requires an Agent or database and workspace")
             self.database = Path(database)
             self.workspace_path = Path(workspace).resolve()
+            self._stack.enter_context(workspace_owner(self.workspace_path))
             self.store = self._stack.enter_context(RolloutStore(self.database))
+            from agent_runtime.harness.workspace_stores import register_workspace_store
+
+            register_workspace_store(self.workspace_path, self.database)
             from agent_runtime.harness.memory import MemoryConfig
 
             configured_memory = agent.memory if agent is not None and agent.memory is not None else memory
@@ -973,7 +979,7 @@ class Session:
                 ) from None
 
         def saved_fetch_failure(url: str, mode: str) -> dict[str, Any] | None:
-            from agent_runtime.tools.builtins.web import WebFetchInput
+            from agent_runtime.tools.builtins.web import WebFetchInput, fetch_acquisition_mode
 
             items = self.store.list_items(current_tool_turn_id())
             arguments = {
@@ -992,8 +998,7 @@ class Session:
                     # Rejected input is not acquisition evidence and must not
                     # prevent unrelated valid requests after continuation.
                     continue
-                prior_mode = ("auto" if request.render == "auto" and request.view != "raw" else
-                              "browser" if request.render is True else "http")
+                prior_mode = fetch_acquisition_mode(request, agent.web_search_provider)
                 if request.url != url or prior_mode != mode:
                     continue
                 output = item.payload.get("structured_content")
@@ -1130,11 +1135,14 @@ class Session:
         user_input: str | None = None,
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
+        expected_request_id: str | None = None,
     ) -> AgentResult:
         async with self._active_turn(event_sink):
             turn = self.store.read_turn(turn_id)
             if turn.thread_id != self.thread_id:
                 raise RuntimeError("Turn belongs to a different Session")
+            if expected_request_id is not None and recovery_plan(self.store, turn_id).request_id != expected_request_id:
+                raise ValueError("recovery request changed; inspect current state before responding")
             executor = self._executor()
             if turn.status in {"running", "paused", "interrupted"}:
                 await executor._commit(lambda: recover_owner_loss(self.store, turn_id, abort=action == "abort"))
@@ -1143,17 +1151,12 @@ class Session:
                     while await self.tool_orchestrator.reconcile_command_observation(self._command_sessions, turn_id):
                         await executor._commit(lambda: recover_owner_loss(self.store, turn_id))
             turn = self.store.read_turn(turn_id)
-            if (action in {"continue", "retry"} and turn.status == "paused"
-                    and self.store.turn_cancellation_pending(turn_id)
-                    and not any(item.status == "pending" for item in self.store.list_interactions(turn_id))):
-                await executor._commit(lambda: self.store.resume_cancelled_turn(turn_id=turn_id))
-                turn = self.store.read_turn(turn_id)
             if action == "abort":
                 if self._cancel_live_commands is not None:
                     await self._cancel_live_commands()
-                if any(operation.status in {"running", "unknown"}
-                       for operation in self.store.list_tool_operations(turn_id)):
-                    raise ConversationRecoveryRequiredError("取消未完成：执行结果仍未核对，任务保持暂停。")
+                plan = recovery_plan(self.store, turn_id)
+                if not plan.accepts("abort"):
+                    raise ConversationRecoveryRequiredError(f"取消未完成：{plan.reason_code}；请先核对执行状态。")
                 cancelled = await executor._commit(lambda: self.store.cancel_turn(turn_id=turn_id))
                 return AgentResult._from_harness(
                     TurnResult(
@@ -1169,136 +1172,51 @@ class Session:
                 if not pending and any(op.status == "unknown" for op in self.store.list_model_operations(turn_id)):
                     raise ValueError("重试旧请求不能附加新文件；请将附件作为新消息发送。")
                 await self.steer("补充输入文件，请结合当前任务读取。", expected_turn_id=turn_id, files=files)
-            if any(item.kind == "tool_reconciliation" for item in pending) and action in {"continue", "retry"}:
+            plan = recovery_plan(self.store, turn_id)
+            if plan.route == "reconcile" and action in {"continue", "retry"}:
                 return AgentResult._from_harness(TurnResult(thread_id=self.thread_id, turn_id=turn_id,
-                    answer=None, status=turn.status, interaction_id=pending[0].request_id), store=self.store)
-            approvals = [item for item in self.store.list_interactions(turn_id) if item.kind == "tool_approval"]
-            if turn.status == "completed" and approvals and action in {"allow_once", "approve", "deny"}:
+                    answer=None, status=turn.status, interaction_id=plan.request_id), store=self.store)
+            if plan.route == "resume_cancelled" and plan.accepts(action):
+                await executor._commit(lambda: self.store.resume_cancelled_turn(turn_id=turn_id))
+                plan = recovery_plan(self.store, turn_id)
+            if not plan.accepts(action):
+                raise RuntimeError(f"resume action {action!r} is unavailable: {plan.reason_code}; "
+                                 f"available actions: {', '.join(plan.actions) or 'none'}")
+            if plan.route == "approval_resolved":
                 internal = await executor.resume(
-                    turn_id=turn_id,
-                    decision="approve" if action == "allow_once" else action,
+                    turn_id=turn_id, decision="approve" if action == "allow_once" else action,
                 )
-                return AgentResult._from_harness(internal, store=self.store)
-            model_operations = self.store.list_model_operations(turn_id)
-            unknown_model = tuple(operation for operation in model_operations if operation.status == "unknown")
-            resolved_approved_ready = any(
-                interaction.kind == "tool_approval"
-                and interaction.status == "resolved"
-                and interaction.response.get("decision") == "approve"
-                and interaction.operation_id is not None
-                and self.store.read_tool_operation(interaction.operation_id).status == "ready"
-                and (self.store.read_tool_operation(interaction.operation_id).approval_request_id
-                     == interaction.request_id)
-                for interaction in self.store.list_interactions(turn_id)
-            )
-            recoverable_summary = (
-                turn.status == "running"
-                and bool(model_operations)
-                and model_operations[-1].status == "completed"
-                and model_operations[-1].request_ref.get("purpose") == "context_summary"
-                and model_operations[-1].response_item_id is not None
-            )
-            recoverable_committed_response = False
-            if (
-                turn.status == "running"
-                and model_operations
-                and model_operations[-1].status == "completed"
-                and model_operations[-1].response_item_id is not None
-            ):
-                response = self.store.read_item(model_operations[-1].response_item_id)
-                recoverable_committed_response = response.kind == "model_response"
-            if len(pending) == 1 and pending[0].kind == "tool_approval":
-                decision = {
-                    "allow_once": "approve",
-                    "approve": "approve",
-                    "allow_session": "approve",
-                    "deny": "deny",
-                    "recheck": "recheck",
-                }.get(action)
-                if (decision is None and action == "continue" and model_operations
-                        and self.store.request_input_revision(turn_id, model_operations[-1].request_ref) is not None
-                        and self.store.user_input_revision(turn_id)
-                        != self.store.request_input_revision(turn_id, model_operations[-1].request_ref)):
-                    decision = "deny"
-                if decision is None:
-                    raise ValueError(
-                        "tool approval action must be allow_once, approve, allow_session, deny, or recheck"
-                    )
+            elif plan.route == "approval":
+                decision = {"allow_once": "approve", "approve": "approve", "allow_session": "approve",
+                            "deny": "deny", "recheck": "recheck"}.get(action, "deny")
                 internal = await executor.resume(
-                    turn_id=turn_id,
-                    decision=decision,
+                    turn_id=turn_id, decision=decision,
                     on_session_grant=self._add_approval_grant if action == "allow_session" else None,
                 )
-            elif len(pending) == 1 and pending[0].kind in {
-                "clarification",
-                "choice",
-            }:
-                if action != "continue" or user_input is None:
+            elif plan.route == "input":
+                if user_input is None:
                     raise ValueError(f"{pending[0].kind} resume requires action=continue and user_input")
+                assert plan.request_id is not None
                 internal = await executor.respond_interaction(
-                    turn_id=turn_id,
-                    request_id=pending[0].request_id,
-                    response=user_input,
+                    turn_id=turn_id, request_id=plan.request_id, response=user_input,
                 )
-            elif (
-                not pending
-                and len(unknown_model) == 1
-                and action
-                in {
-                    "continue",
-                    "retry",
-                }
-            ):
+            elif plan.route == "retry_model":
                 internal = await executor.retry_unknown_model(turn_id=turn_id)
-            elif (
-                not pending
-                and resolved_approved_ready
-                and action
-                in {
-                    "allow_once",
-                    "approve",
-                    "continue",
-                    "retry",
-                }
-            ):
-                internal = await executor.resume(
-                    turn_id=turn_id,
-                    decision="approve",
-                )
-            elif (
-                not pending
-                and recoverable_committed_response
-                and action
-                in {
-                    "continue",
-                    "retry",
-                }
-            ):
+            elif plan.route == "approved_ready":
+                internal = await executor.resume(turn_id=turn_id, decision="approve")
+            elif plan.route == "committed_response":
                 internal = await executor.recover_committed_model_response(turn_id=turn_id)
-            elif (
-                not pending
-                and turn.status == "running"
-                and model_operations
-                and model_operations[-1].status == "prepared"
-                and action in {"continue", "retry"}
-            ):
+            elif plan.route == "prepared_model":
                 internal = await executor.recover_prepared_model(turn_id=turn_id)
-            elif not pending and executor.pending_context_overflow(turn_id) and action in {"continue", "retry"}:
+            elif plan.route == "context_overflow":
                 internal = await executor.run_turn(
-                    executor.restore_turn_context(turn_id),
-                    start_step=executor.agent_step_count(turn_id),
+                    executor.restore_turn_context(turn_id), start_step=executor.agent_step_count(turn_id),
                 )
-            elif not pending and recoverable_summary and action in {"continue", "retry"}:
-                internal = await executor.recover_committed_model_response(turn_id=turn_id)
-            elif (not pending and turn.status == "running" and action in {"continue", "retry"}
-                  and executor.pending_input_supersession(turn_id)):
+            elif plan.route == "input_superseded":
                 internal = await executor.run_turn(
                     executor.restore_turn_context(turn_id), start_step=executor.agent_step_count(turn_id) + 1,
                 )
-            elif (not pending and not model_operations and not self.store.list_tool_operations(turn_id)
-                  and turn.status == "running"
-                  and action in {"continue", "retry"}
-                  and turn.binding_manifest.get("execution_ownership") == OWNERSHIP_REVISION):
+            elif plan.route == "first_dispatch":
                 internal = await executor.run_turn(executor.restore_turn_context(turn_id), start_step=1)
             else:
                 raise RuntimeError("resume action does not match the Turn's durable pending state")

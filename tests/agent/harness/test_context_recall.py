@@ -101,7 +101,7 @@ def test_recall_requires_runtime_turn_identity(tmp_path: Path):
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
         tool = create_context_recall_tool(store)
         with pytest.raises(RuntimeError, match="Harness Turn"):
-            tool.run(tool.validate_input({"item_id": "anything"}))
+            asyncio.run(tool.run(tool.validate_input({"item_id": "anything"})))
 
 
 def test_recall_exposes_chronology_across_turns(tmp_path: Path):

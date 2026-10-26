@@ -1833,3 +1833,77 @@ async def test_continuation_observes_between_calls_without_new_write_grant(tmp_p
     (tmp_path / "later").write_text("unrelated change after job ended")
     ended = await executor.execute(_call("observe_work", call_id="poll-4"), context=_context(workspace_root=tmp_path))
     assert "runtime_workspace_origin_operation_id" not in ended.result.metadata
+
+@pytest.mark.anyio
+async def test_blocking_runner_keeps_loop_responsive_and_reports_completed_deadline():
+    import threading
+    started, finished = threading.Event(), threading.Event()
+    def runner(_arguments):
+        started.set()
+        time.sleep(0.08)
+        finished.set()
+        return {'value': 'actual result'}
+    tool = _tool(run=runner, timeout_seconds=0.01)
+    execution_task = asyncio.create_task(ToolExecutor({'demo': tool}).execute(_call(), context=_context()))
+    await asyncio.sleep(0.02)
+    assert started.is_set() and not finished.is_set(), 'synchronous runner blocked the event loop'
+    execution = await execution_task
+    assert finished.is_set() and not execution.result.is_error
+    assert execution.result.metadata['execution_deadline_exceeded'] is True
+    assert execution.result.structured_content == {'value': 'actual result'}
+
+
+@pytest.mark.anyio
+async def test_cancelled_sync_mutation_is_owned_until_its_real_completion():
+    import threading
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+    def runner(_arguments):
+        started.set()
+        release.wait(timeout=1)
+        finished.set()
+        return {'value': 'written'}
+    tool = _tool(run=runner)
+    execution_task = asyncio.create_task(ToolExecutor({'demo': tool}).execute(_call(), context=_context()))
+    await asyncio.to_thread(started.wait, 1)
+    execution_task.cancel()
+    await asyncio.sleep(0.01)
+    assert not execution_task.done()
+    release.set()
+    execution = await execution_task
+    assert finished.is_set()
+    assert execution.result.metadata['execution_cancellation_requested'] is True
+    assert not execution.result.is_error
+
+@pytest.mark.anyio
+async def test_finish_current_async_runner_retains_real_result_after_deadline():
+    finished = asyncio.Event()
+    async def runner(_arguments):
+        try:
+            await asyncio.sleep(0.04)
+        except asyncio.CancelledError:
+            # A mutation that already started still owns its final receipt.
+            await asyncio.sleep(0.01)
+        finished.set()
+        return {'value': 'committed'}
+    tool = _tool(run=runner, timeout_seconds=0.01, interrupt_behavior=InterruptBehavior.FINISH_CURRENT)
+    execution = await ToolExecutor({'demo': tool}).execute(_call(), context=_context())
+    assert finished.is_set()
+    assert not execution.result.is_error
+    assert execution.result.structured_content == {'value': 'committed'}
+    assert execution.result.metadata['execution_deadline_exceeded'] is True
+
+
+@pytest.mark.anyio
+async def test_finish_current_async_cancellation_is_reported_with_completed_result():
+    started = asyncio.Event()
+    async def runner(_arguments):
+        started.set()
+        await asyncio.sleep(0.02)
+        return {'value': 'committed'}
+    tool = _tool(run=runner, interrupt_behavior=InterruptBehavior.FINISH_CURRENT)
+    task = asyncio.create_task(ToolExecutor({'demo': tool}).execute(_call(), context=_context()))
+    await started.wait()
+    task.cancel()
+    execution = await task
+    assert not execution.result.is_error
+    assert execution.result.metadata['execution_cancellation_requested'] is True

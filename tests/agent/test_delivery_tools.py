@@ -194,3 +194,117 @@ def test_effects_declare_host_execution_and_network(workspace) -> None:
     pull = create_open_pull_request_tool(workspace)
     assert commit.static_effects == frozenset({ToolEffect.EXECUTE_PROCESS})
     assert pull.static_effects == frozenset({ToolEffect.EXECUTE_PROCESS, ToolEffect.NETWORK})
+
+
+async def test_delivery_remains_usable_inside_an_open_session(workspace, tmp_path) -> None:
+    import subprocess
+
+    from agent_runtime.harness import Session
+
+    root = workspace.root
+    for args in (("init", "-b", "main"), ("config", "user.name", "Test"),
+                 ("config", "user.email", "test@example.com")):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    (root / "base").write_text("base")
+    subprocess.run(["git", "-C", str(root), "add", "base"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "base"], check=True)
+    tool = create_commit_changes_tool(workspace)
+    async with await Session.open(database=tmp_path / "rollout.db", workspace=root,
+                                  model=object(), tools={tool.definition.name: tool}):
+        (root / "change").write_text("allowed")
+        execution = await ToolExecutor({tool.definition.name: tool}).execute(
+            _call(tool, {"message": "from session"}),
+            context=_context(workspace_root=root, cwd=root, approval_mode="full"),
+        )
+        assert not execution.result.is_error
+        assert execution.result.structured_content["commit_id"]
+
+
+async def test_cancelled_delivery_tool_exposes_its_completed_result(workspace, monkeypatch) -> None:
+    import asyncio
+
+    from agent_runtime.git_delivery import DeliveryInterruptedError
+
+    started, release = asyncio.Event(), asyncio.Event()
+    class Delivery:
+        def __init__(self, _root):
+            pass
+        async def commit(self, *_args, **_kwargs):
+            started.set()
+            await release.wait()
+            raise DeliveryInterruptedError(DeliveryResult("a" * 40, "praxis/task", 1, True))
+    monkeypatch.setattr("agent_runtime.tools.builtins.delivery.GitDelivery", Delivery)
+    tool = create_commit_changes_tool(workspace)
+    execution = asyncio.create_task(ToolExecutor({tool.definition.name: tool}).execute(
+        _call(tool, {"message": "settled"}),
+        context=_context(workspace_root=workspace.root, cwd=workspace.root, approval_mode="full"),
+    ))
+    await started.wait()
+    execution.cancel()
+    release.set()
+    result = await execution
+    assert not result.result.is_error
+    assert result.result.structured_content["commit_id"] == "a" * 40
+    assert result.result.structured_content["interruption_requested"] is True
+
+
+async def test_session_cancellation_records_the_real_git_commit(workspace, tmp_path) -> None:
+    import asyncio
+    import subprocess
+
+    from agent_runtime.core.model_request import toolset_revision_for_tools
+    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, PreparedModelCall, Session
+
+    root = workspace.root
+    for args in (("init", "-b", "main"), ("config", "user.name", "Test"),
+                 ("config", "user.email", "test@example.com")):
+        subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+    (root / "base").write_text("base")
+    subprocess.run(["git", "-C", str(root), "add", "base"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "-qm", "base"], check=True)
+    (root / "change").write_text("approved")
+    entered, release = tmp_path / "hook-entered", tmp_path / "hook-release"
+    hook = root / ".git/hooks/pre-commit"
+    hook.write_text(f'#!/bin/sh\ntouch "{entered}"\nwhile [ ! -e "{release}" ]; do sleep 0.02; done\n')
+    hook.chmod(0o755)
+    class Model:
+        def snapshot(self, **_kwargs):
+            return {"model_id": "delivery-test"}
+        def prepare(self, request):
+            return PreparedModelCall(request_hash="r", context_hash="c", wire_hash="w",
+                tool_hash=toolset_revision_for_tools(request.tools), request_ref={
+                    "request_id": "delivery-test", "toolset_revision": toolset_revision_for_tools(request.tools),
+                    "exposed_tool_names": [tool.definition.name for tool in request.tools]})
+        async def dispatch(self, prepared, *, delta_sink=None):
+            return HarnessModelResponse(
+                text="", provider_response_id="delivery-response", usage={"input_tokens": 1, "output_tokens": 1},
+                tool_calls=(HarnessToolCall(id="commit-call", name="commit_changes",
+                                           arguments={"message": "settled in session"}),),
+            )
+        def ensure_available(self, binding, **kwargs):
+            pass
+    tool = create_commit_changes_tool(workspace)
+    async with await Session.open(database=tmp_path / "session.db", workspace=root,
+            model=Model(), tools={tool.definition.name: tool},
+            tool_execution_context=_context(workspace_root=root, cwd=root, approval_mode="full")) as session:
+        submission = asyncio.create_task(session.submit("commit this change"))
+        try:
+            async with asyncio.timeout(5):
+                while not entered.exists():
+                    if submission.done():
+                        pytest.fail(f"submission ended before tool ran: {submission.result()}")
+                    await asyncio.sleep(0.01)
+            submission.cancel()
+        finally:
+            release.touch()
+        with pytest.raises(asyncio.CancelledError):
+            await submission
+        operations = session.store.list_tool_operations()
+        assert len(operations) == 1
+        assert operations[0].status == "succeeded"
+        result = session.store.read_item(operations[0].result_item_id).payload["structured_content"]
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        assert result["commit_id"] == head
+        assert result["error"] is None

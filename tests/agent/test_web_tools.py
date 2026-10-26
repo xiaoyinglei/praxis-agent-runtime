@@ -114,7 +114,8 @@ async def test_brave_search_maps_sources_and_keeps_credential_private(tmp_path):
     tools, client, _ = web_tools(tmp_path, handler, key="fake-search-secret")
     try:
         result = await tools["web_search"].run({"query": "python agents", "max_results": 5, "freshness": None})
-        assert result["results"] == [{"title": "A", "url": "https://example.com/a", "snippet": "Snippet"}]
+        assert result["results"] == [{"title": "A", "url": "https://example.com/a", "snippet": "Snippet",
+                                      "summary": None, "published_at": None}]
         assert requests[0].url.host == "api.search.brave.com"
         assert requests[0].headers["X-Subscription-Token"] == "fake-search-secret"
         assert "fake-search-secret" not in json.dumps(result)
@@ -147,86 +148,14 @@ async def test_unconfigured_search_returns_typed_error_without_network_or_budget
         assert "brave" in output["error_message"] and "tavily" in output["error_message"]
         assert budget_calls == []
         assert tool.resolve_use({"query": "latest news"}).effects == frozenset()
-        assert tool.execution_revision != "builtin-public-web-search-bing-v5"
         from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 
         orchestrator = object.__new__(ToolOrchestrator)
         orchestrator._tools = tools
         with pytest.raises(RuntimeError, match="original operation tool is unavailable: web_search"):
-            orchestrator.restore_tools({"web_search": "builtin-public-web-search-bing-v5"})
+            orchestrator.restore_tools({"web_search": "unavailable-search-version"})
     finally:
         await client.aclose()
-
-
-@pytest.mark.anyio
-async def test_explicit_bing_uses_public_search_without_credentials(tmp_path):
-    requests = []
-    tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
-        200, text='<ol id="b_results"><li class="b_algo"><h2><a href="https://example.com/news">News</a>'
-        '</h2><div class="b_caption"><p>Latest report</p></div></li></ol>',
-        headers={"content-type": "text/html"}, request=requests.append(req) or req,
-    ), provider="bing")
-    try:
-        result = await tools["web_search"].run({"query": "latest news", "freshness": "pw"})
-        assert result["error_code"] is None
-        assert result["provider"] == "bing"
-        assert result["results"] == [{"title": "News", "url": "https://example.com/news", "snippet": "Latest report"}]
-        assert requests[0].url.host == "www.bing.com"
-        assert requests[0].url.params["q"] == "latest news"
-        assert requests[0].url.params["filters"] == 'ex1:"ez2"'
-        assert "X-Subscription-Token" not in requests[0].headers
-        assert tools["web_search"].resolve_use({"query": "latest news"}).targets[0].value == "https://www.bing.com/search"
-        assert tools["web_search"].execution_revision == "builtin-public-web-search-bing-v5"
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("body,code", [
-    ('<form id="b_captcha">verify</form>', "web_search_blocked"),
-    ('<html>Login or unexpected markup</html>', "web_search_invalid_response"),
-    ('<ol id="b_results"><li class="b_no">No results</li></ol>', None),
-])
-async def test_explicit_bing_distinguishes_blocked_invalid_and_empty(tmp_path, body, code):
-    tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
-        200, text=body, headers={"content-type": "text/html"},
-    ), provider="bing")
-    try:
-        result = await tools["web_search"].run({"query": "public query"})
-        assert result["error_code"] == code
-        assert result["results"] == []
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("status,code", [
-    (403, "web_search_blocked"),
-    (429, "web_search_blocked"),
-    (500, "http_error"),
-])
-async def test_bing_http_status_classification_uses_status_code(tmp_path, status, code):
-    tools, client, _ = web_tools(tmp_path, lambda req: httpx.Response(
-        status, text="denied", headers={"content-type": "text/html"},
-    ), provider="bing")
-    try:
-        result = await tools["web_search"].run({"query": "public query"})
-        assert result["error_code"] == code
-    finally:
-        await client.aclose()
-
-
-def test_bing_parser_decodes_result_redirect_and_rejects_private_links():
-    import base64
-
-    from agent_runtime.tools.web_content import extract_search_results
-
-    encoded = base64.urlsafe_b64encode(b"https://example.com/news").decode().rstrip("=")
-    body = ('<ol id="b_results">'
-            f'<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?u=a1{encoded}">News</a></h2>'
-            '<div class="b_caption"><p>Evidence</p></div></li>'
-            '<li class="b_algo"><h2><a href="http://127.0.0.1/secret">Bad</a></h2></li></ol>').encode()
-    assert extract_search_results(body) == [{"title": "News", "url": "https://example.com/news", "snippet": "Evidence"}]
 
 
 @pytest.mark.anyio

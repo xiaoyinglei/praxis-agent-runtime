@@ -44,6 +44,7 @@ from agent_runtime.tools.executor import (
 )
 from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool
 from agent_runtime.tools.tool import (
+    ArtifactReference,
     CancellationMode,
     JsonValue,
     ResolvedToolUse,
@@ -186,7 +187,7 @@ class ToolOrchestrator:
         self._store = store
         self._tools = tools
         self._execution_context = execution_context
-        self._executor = ToolExecutor(tools)
+        self._executor = ToolExecutor(tools, artifact_sink=self._save_output_artifact)
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._lease_seconds = lease_seconds
         self._event_dispatcher = event_dispatcher
@@ -198,6 +199,15 @@ class ToolOrchestrator:
         ] = {}
         self._instruction_targets: dict[tuple[str, str], tuple[ToolTarget, ...]] = {}
         self._instruction_snapshots: dict[str, Mapping[str, Any]] = {}
+
+    async def _save_output_artifact(self, content: bytes, media_type: str, name: str) -> ArtifactReference:
+        # The Store remains the sole owner of durable artifact identities.
+        # Executor workers hand back bytes, never a file URI masquerading as one.
+        turn_id = current_tool_turn_id()
+        artifact = await self._commit(lambda: self._store.commit_artifact(
+            turn_id=turn_id, content=content, media_type=media_type, name=name,
+        ))
+        return ArtifactReference(artifact.artifact_id, artifact.media_type, artifact.name)
 
     def attach_event_dispatcher(
         self,
@@ -282,7 +292,7 @@ class ToolOrchestrator:
         return True
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = self._store.capture_mutation(operation)
+        mutation = await self._store.capture_mutation_async(operation)
         if self._event_dispatcher is not None:
             for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
                 await self._event_dispatcher.emit(

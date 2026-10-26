@@ -10,7 +10,6 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import asdict, dataclass, replace
 from functools import partial
-from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from uuid import uuid4
@@ -201,7 +200,7 @@ class TurnExecutor:
         )
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = self._store.capture_mutation(operation)
+        mutation = await self._store.capture_mutation_async(operation)
         if self._event_dispatcher is not None:
             for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
                 await self._event_dispatcher.emit(
@@ -1644,38 +1643,12 @@ class TurnExecutor:
         )
 
     def pending_context_overflow(self, turn_id: str) -> bool:
-        operations = [
-            op
-            for op in self._store.list_model_operations(turn_id)
-            if op.request_ref.get("purpose") != "context_summary"
-        ]
-        return bool(
-            operations
-            and any(
-                record.turn_id == turn_id
-                and record.record_type == "model_attempt_rejected"
-                and record.payload.get("operation_id") == operations[-1].operation_id
-                and record.payload.get("error_type") == "context_overflow"
-                for record in self._store.list_records(self.thread_id)
-            )
-        )
+        from agent_runtime.harness.recovery import pending_context_overflow
+        return pending_context_overflow(self._store, turn_id)
 
     def pending_input_supersession(self, turn_id: str) -> bool:
-        operations = self._store.list_model_operations(turn_id)
-        if not operations or operations[-1].status != "failed":
-            return False
-        operation = operations[-1]
-        records = self._store.list_records(self.thread_id)
-        return any(
-            record.record_type == "model_attempt_rejected"
-            and record.payload.get("attempt_id") == operation.active_attempt_id
-            and record.payload.get("error_type") == "input_superseded"
-            for record in records
-        ) and not any(
-            record.record_type == "model_attempt_dispatched"
-            and record.payload.get("attempt_id") == operation.active_attempt_id
-            for record in records
-        )
+        from agent_runtime.harness.recovery import pending_input_supersession
+        return pending_input_supersession(self._store, turn_id)
 
     async def run_turn(
         self,
@@ -2188,7 +2161,8 @@ class TurnExecutor:
                 item.kind == "model_response" and item.payload.get("response_status") == "incomplete"
                 for item in self._store.list_items(turn_id)
             )
-            if (policy == {"revision": "restart-step-v1", "max_retries": 1}
+            if (isinstance(policy, Mapping) and policy.get("revision") == "restart-step-v1"
+                    and type(policy.get("max_retries")) is int and policy["max_retries"] == 1
                     and response.incomplete_reason == "max_output_tokens" and incomplete <= 1):
                 return None
             return await self._fail_turn(
@@ -2268,11 +2242,14 @@ class TurnExecutor:
             "output limits cannot repair a missing resource. You have one recovery opportunity; "
             "use a different justified action or explain the blocker honestly.",
         }, sort_keys=True)
-        recovery_used = any(i.kind == "completion_feedback" and i.payload.get("text") == feedback for i in items)
-        if (turn.binding_manifest.get("tool_failure_recovery") == {"revision": "one-replan-v1"}
+        recovery_used = any(i.kind == "completion_feedback"
+                            and _feedback_reason_code(i.payload) == "repeated_tool_failure_recovery" for i in items)
+        recovery_policy = turn.binding_manifest.get("tool_failure_recovery")
+        if (isinstance(recovery_policy, Mapping) and recovery_policy.get("revision") == "one-replan-v1"
                 and not recovery_used):
             await self._commit(lambda: self._store.record_completion_feedback(
                 turn_id=turn_id, reason=feedback, source_item_id=source_item_id,
+                reason_code="repeated_tool_failure_recovery",
             ))
             return None
         return await self._fail_turn(
@@ -2371,7 +2348,7 @@ class TurnExecutor:
             signature = (
                 result.get("tool_name"),
                 result.get("error_code"),
-                result.get("error_message"),
+                None,
                 call.get("arguments"),
             )
             operation = operations.get(result_items.get(result.get("tool_call_id")))
@@ -2389,14 +2366,10 @@ class TurnExecutor:
                     resource["identity"] for resource in operation.resources
                     if resource.get("kind") == "filesystem" and resource.get("access") == "read"
                 ))
-                try:
-                    missing = tuple(identity for identity in resources if not Path(identity).exists())
-                except OSError:
-                    missing = ()
-                if missing:
-                    # Paging and lexical path spelling cannot repair an absent resource.
-                    # Commands and validation errors still require exact argument identity.
-                    signature = (result.get("tool_name"), "file_not_found", None, missing)
+                if resources:
+                    # The committed outcome already attests a missing resource.
+                    # Replaying it must not perform unrecorded filesystem probes.
+                    signature = (result.get("tool_name"), "file_not_found", None, resources)
             if target is None:
                 target = signature
             if signature == target:
@@ -2530,6 +2503,18 @@ class TurnExecutor:
             if item.kind == "completion_decision" and item.payload.get("action") == "continue":
                 continuations += 1
         return continuations >= limit
+
+
+def _feedback_reason_code(payload: Mapping[str, Any]) -> str | None:
+    code = payload.get("reason_code")
+    if isinstance(code, str):
+        return code
+    # Read the structured field from old records; rendered text is not identity.
+    try:
+        legacy = json.loads(payload.get("text", ""))
+    except (ValueError, TypeError):
+        return None
+    return legacy.get("reason_code") if isinstance(legacy, dict) else None
 
 
 def _aci_tool_call(

@@ -29,7 +29,7 @@ class ObserverLagged(RuntimeError):  # noqa: N818 - protocol name
 
 class _EventChannel:
     def __init__(self, *, capacity: int, last_cursor: str | None = None) -> None:
-        self.queue: asyncio.Queue[StreamEvent] = asyncio.Queue(maxsize=capacity)
+        self.queue: asyncio.Queue[tuple[StreamEvent, str | None]] = asyncio.Queue(maxsize=capacity)
         self.available = asyncio.Event()
         self.closed = asyncio.Event()
         self.error: Exception = EventChannelClosed("event channel is closed")
@@ -38,41 +38,38 @@ class _EventChannel:
     async def put(self, event: StreamEvent) -> None:
         if self.closed.is_set():
             raise self.error
-        put = asyncio.create_task(self.queue.put(event))
+        put = asyncio.create_task(self.queue.put((event, None)))
         closing = asyncio.create_task(self.closed.wait())
-        await asyncio.wait((put, closing), return_when=asyncio.FIRST_COMPLETED)
-        if self.closed.is_set():
-            put.cancel()
-            await asyncio.gather(put, return_exceptions=True)
-            self._discard_queued()
-            raise self.error
-        closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
-        await put
-        self.available.set()
+        try:
+            await asyncio.wait((put, closing), return_when=asyncio.FIRST_COMPLETED)
+            if self.closed.is_set():
+                self._discard_queued()
+                raise self.error
+            await put
+            self.available.set()
+        finally:
+            for task in (put, closing):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(put, closing, return_exceptions=True)
 
     async def receive(self) -> StreamEvent:
-        if self.closed.is_set():
-            raise self.error
-        receive = asyncio.create_task(self.queue.get())
-        closing = asyncio.create_task(self.closed.wait())
-        await asyncio.wait((receive, closing), return_when=asyncio.FIRST_COMPLETED)
-        if self.closed.is_set():
-            receive.cancel()
-            await asyncio.gather(receive, return_exceptions=True)
-            self._discard_queued()
-            raise self.error
-        closing.cancel()
-        await asyncio.gather(closing, return_exceptions=True)
-        event = await receive
-        if self.queue.empty():
-            self.available.clear()
-        return event
+        # No detached Queue.get: cancellation of a wait must never leave a
+        # consumer that can steal a later event. Pop and cursor advance have no
+        # suspension point, so the cursor describes delivered events only.
+        while True:
+            await self.available.wait()
+            if self.closed.is_set():
+                raise self.error
+            if not self.queue.empty():
+                return self.receive_nowait()
 
     def receive_nowait(self) -> StreamEvent:
         if self.closed.is_set():
             raise self.error
-        event = self.queue.get_nowait()
+        event, cursor = self.queue.get_nowait()
+        if cursor is not None:
+            self.last_cursor = cursor
         if self.queue.empty():
             self.available.clear()
         return event
@@ -81,13 +78,11 @@ class _EventChannel:
         if self.closed.is_set():
             return
         try:
-            self.queue.put_nowait(event)
+            self.queue.put_nowait((event, cursor))
         except asyncio.QueueFull:
             self.close(error=ObserverLagged(last_cursor=self.last_cursor))
             return
         self.available.set()
-        if cursor is not None:
-            self.last_cursor = cursor
 
     def close(self, *, error: Exception | None = None) -> None:
         if self.closed.is_set():
@@ -96,6 +91,7 @@ class _EventChannel:
             self.error = error
         self.closed.set()
         self._discard_queued()
+        self.available.set()  # Wake receive/wait_available so they observe closure.
 
     def _discard_queued(self) -> None:
         while not self.queue.empty():
@@ -182,23 +178,23 @@ class TurnEventDispatcher:
             channel.put_passive(event, cursor=cursor)
         for sink in tuple(self._controlling_sinks):
             delivery = asyncio.create_task(sink.emit(event))
-            done, _pending = await asyncio.wait(
-                {delivery},
-                timeout=self._sink_cancel_grace_seconds,
-            )
-            if not done:
-                delivery.cancel()
-                await asyncio.sleep(0)
-                delivery.add_done_callback(_consume_task_result)
-                raise EventChannelClosed(
-                    "controlling event sink exceeded cancellation grace"
-                )
             try:
-                delivery.result()
-            except Exception as exc:
-                raise EventChannelClosed(
-                    f"controlling event sink failed: {exc}"
-                ) from exc
+                done, _pending = await asyncio.wait(
+                    {delivery}, timeout=self._sink_cancel_grace_seconds,
+                )
+                if not done:
+                    raise EventChannelClosed("controlling event sink exceeded cancellation grace")
+                try:
+                    delivery.result()
+                except Exception as exc:
+                    raise EventChannelClosed(f"controlling event sink failed: {exc}") from exc
+            finally:
+                if not delivery.done():
+                    delivery.cancel()
+                    await asyncio.wait({delivery}, timeout=self._sink_cancel_grace_seconds)
+                # A hostile sink may ignore cancellation; never lose its future
+                # exception, while keeping display shutdown bounded.
+                delivery.add_done_callback(_consume_task_result)
 
 
 def _consume_task_result(task: asyncio.Task[None]) -> None:

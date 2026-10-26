@@ -114,30 +114,30 @@ class TestLoader:
                 manifest = load_skill_from_file(sf, SkillSource.PROJECT)
                 assert manifest.extra.get(field) == "some-value", f"Field '{field}' should be in extra"
 
-    def test_allowed_tools_parses(self):
-        """allowed_tools should be parsed as a tuple."""
+    def test_empty_allowed_tools_keeps_skill_unrestricted(self):
+        """Nonempty tool restrictions are unsupported; an empty list is unrestricted."""
         with tempfile.TemporaryDirectory() as d:
             skill_md = _write_skill(
                 Path(d),
                 "t1",
                 "desc",
-                allowed_tools=["read_file", "search_knowledge"],
+                allowed_tools=[],
             )
             manifest = load_skill_from_file(skill_md, SkillSource.PROJECT)
-            assert manifest.allowed_tools == ("read_file", "search_knowledge")
+            assert manifest.allowed_tools == ()
 
-    def test_paths_parses(self):
-        """paths should be parsed as a tuple."""
+    def test_empty_paths_keeps_skill_unrestricted(self):
+        """Nonempty path restrictions are unsupported; an empty list is unrestricted."""
         with tempfile.TemporaryDirectory() as d:
             skill_md = _write_skill(
                 Path(d),
                 "t2",
                 "desc",
-                paths=["**/*.xlsx", "docs/**"],
+                paths=[],
             )
             manifest = load_skill_from_file(skill_md, SkillSource.PROJECT)
-            assert manifest.path_patterns == ("**/*.xlsx", "docs/**")
-            assert manifest.has_path_filter is True
+            assert manifest.path_patterns == ()
+            assert manifest.has_path_filter is False
 
     def test_disable_model_invocation(self):
         """disable_model_invocation should be parsed as bool."""

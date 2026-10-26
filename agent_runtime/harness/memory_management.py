@@ -218,7 +218,7 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         "additionalProperties": False,
     }
 
-    def run(arguments: Mapping[str, Any]) -> NormalizedToolOutput:
+    async def run(arguments: Mapping[str, Any]) -> NormalizedToolOutput:
         from agent_runtime.harness.memory import delete_memory
 
         turn = store.read_turn(current_tool_turn_id())

@@ -200,6 +200,10 @@ async def test_memory_revocation_starts_a_new_context_window_and_survives_reopen
 async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_path, monkeypatch):
     from agent_runtime.harness import RolloutContextManager
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
+    from agent_runtime.runtime_clock import capture_runtime_clock
+
+    clock = capture_runtime_clock()
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: dict(clock))
 
     (tmp_path / "AGENTS.md").write_text("ROOT_BASELINE")
     model = Probe("answer")

@@ -475,7 +475,6 @@ class ModelRegistry:
                 subject,
                 type(build_error).__name__,
                 redact_sensitive_text(build_error),
-                exc_info=build_error,
             )
             raise ModelNotAvailableError(
                 f"Failed to build provider for {subject}: {type(build_error).__name__} "

@@ -159,17 +159,22 @@ async def measure_evidence_cases() -> dict[str, Any]:
     cases = json.loads((FIXTURES / 'evidence_cases.json').read_text())
     records = {}
     for case in cases:
-        body = case['html'].encode()
+        is_search = case['tool'] == 'web_search'
+        body = (json.dumps(case['search_response'], ensure_ascii=False).encode() if is_search
+                else case['html'].encode())
         blobs: dict[str, bytes] = {}
         def save(content: bytes, target: dict[str, bytes] = blobs) -> str:
             identity = f'artifact_{len(target):032x}'
             target[identity] = content
             return identity
-        client = PublicWebClient(transport=httpx.MockTransport(lambda _, data=body: httpx.Response(
-            200, content=data, headers={'content-type': 'text/html'})))
+        media_type = 'application/json' if is_search else 'text/html'
+        client = PublicWebClient(transport=httpx.MockTransport(lambda _, data=body, media=media_type: httpx.Response(
+            200, content=data, headers={'content-type': media})))
         try:
             tools = web.create_web_tools(
-                client, save_source=save, load_source=blobs.__getitem__, search_provider='bing')
+                client, save_source=save, load_source=blobs.__getitem__,
+                search_provider='deepseek' if is_search else None,
+                search_key='fixture-only-search-secret' if is_search else None)
             executor = ToolExecutor({tool.definition.name: tool for tool in tools})
             name = case['tool']
             origin = ToolCallOrigin('quality', 'quality', (name,))

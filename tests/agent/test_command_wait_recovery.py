@@ -15,7 +15,12 @@ from agent_runtime import Agent
 from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
-pytestmark = pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="requires actual OS sandbox")
+pytestmark = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason=("the live command writes into the real workspace on macOS Seatbelt; "
+            "the Linux candidate view publishes only after completion, so "
+            "counter/release visibility while running cannot be observed"),
+)
 
 
 class WaitRecoveryModel(PatchThenAnswerModel):

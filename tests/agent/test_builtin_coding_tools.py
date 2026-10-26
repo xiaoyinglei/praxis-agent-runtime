@@ -1442,3 +1442,115 @@ async def test_read_file_byte_cursor_roundtrip_with_line_limit(tmp_path):
         offset = output["next_offset"]
     assert offset is None
     assert "".join(chunks) == content
+
+@pytest.mark.anyio
+async def test_read_file_utf8_pages_preserve_complete_characters(tmp_path):
+    workspace = open_workspace(tmp_path, create=True)
+    (tmp_path / 'unicode.txt').write_text('甲乙\nΩ')
+    tool = _tools_by_name(workspace)['read_file']
+    offset, chunks = 0, []
+    for _ in range(20):
+        execution = await _execute(tool, {'path': 'unicode.txt', 'offset': offset, 'max_bytes': 1}, workspace=workspace)
+        output = execution.result.structured_content
+        chunks.append(output['content'])
+        following = output['next_offset']
+        if following is None:
+            break
+        assert following > offset
+        offset = following
+    assert ''.join(chunks) == '甲乙\nΩ'
+
+
+def test_line_read_applies_byte_budget_before_allocating_full_line(tmp_path):
+    import tracemalloc
+
+    from agent_runtime.tools.builtins.filesystem import ReadFileInput, _read_file
+    workspace = open_workspace(tmp_path, create=True)
+    (tmp_path / 'long.txt').write_bytes(b'A' * 4_000_000)
+    tracemalloc.start()
+    try:
+        result = _read_file(workspace, ReadFileInput(path='long.txt', max_lines=1, max_bytes=1))
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result.content == 'A'
+    assert peak < 1_000_000, 'line processing allocated the whole source line'
+
+
+@pytest.mark.anyio
+async def test_file_read_rejects_parent_symlink_swapped_after_authorization(tmp_path, monkeypatch):
+    from agent_runtime.tools.builtins import filesystem as fs
+    workspace = open_workspace(tmp_path / 'workspace', create=True)
+    directory = workspace.root / 'directory'
+    directory.mkdir()
+    (directory / 'data').write_text('inside')
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'data').write_text('outside secret')
+    checked = fs._checked_path
+    def swap(*args, **kwargs):
+        result = checked(*args, **kwargs)
+        directory.rename(workspace.root / 'saved')
+        directory.symlink_to(outside, target_is_directory=True)
+        return result
+    monkeypatch.setattr(fs, '_checked_path', swap)
+    result = await _execute(_tools_by_name(workspace)['read_file'], {'path': 'directory/data'}, workspace=workspace)
+    assert result.result.is_error
+    assert 'outside secret' not in str(result.result)
+
+
+@pytest.mark.anyio
+async def test_independent_patch_executors_preserve_both_changes(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+
+    from agent_runtime.tools.builtins import filesystem as fs
+    workspace = open_workspace(tmp_path, create=True)
+    (tmp_path / 'edit').write_text('A B')
+    installing, release = threading.Event(), threading.Event()
+    original = fs._atomic_write_text
+    def paused(path, text, *args, **kwargs):
+        if text == 'a B':
+            installing.set()
+            assert release.wait(timeout=2)
+        return original(path, text, *args, **kwargs)
+    monkeypatch.setattr(fs, '_atomic_write_text', paused)
+    tool = _tools_by_name(workspace)['apply_patch']
+    first = asyncio.create_task(_execute(
+        tool, {'file_path': 'edit', 'old_string': 'A', 'new_string': 'a'}, workspace=workspace))
+    try:
+        assert await asyncio.to_thread(installing.wait, 1)
+        second = asyncio.create_task(_execute(
+            tool, {'file_path': 'edit', 'old_string': 'B', 'new_string': 'b'}, workspace=workspace))
+        await asyncio.sleep(0.03)
+    finally:
+        release.set()
+    results = await asyncio.gather(first, second)
+    assert all(not result.result.is_error for result in results)
+    assert (tmp_path / 'edit').read_text() == 'a b'
+
+
+@pytest.mark.anyio
+async def test_patch_rejects_external_version_change_before_install(tmp_path, monkeypatch):
+    from agent_runtime.tools.builtins import filesystem as fs
+    workspace = open_workspace(tmp_path, create=True)
+    source = tmp_path / 'edit'
+    source.write_text('old')
+    original = fs._atomic_write_text
+    def external_edit(path, text, *args, **kwargs):
+        source.write_text('editor changed this')
+        return original(path, text, *args, **kwargs)
+    monkeypatch.setattr(fs, '_atomic_write_text', external_edit)
+    result = await _execute(_tools_by_name(workspace)['apply_patch'],
+                            {'file_path': 'edit', 'old_string': 'old', 'new_string': 'new'}, workspace=workspace)
+    assert result.result.is_error
+    assert source.read_text() == 'editor changed this'
+
+
+def test_utf8_line_page_at_eof_does_not_offer_an_empty_continuation(tmp_path):
+    from agent_runtime.tools.builtins.filesystem import ReadFileInput, _read_file
+    workspace = open_workspace(tmp_path, create=True)
+    (tmp_path / 'unicode').write_text('甲')
+    result = _read_file(workspace, ReadFileInput(path='unicode', max_lines=1, max_bytes=1))
+    assert result.content == '甲'
+    assert result.truncated is False and result.next_offset is None

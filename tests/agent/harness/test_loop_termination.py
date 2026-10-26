@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import sys
 
@@ -47,6 +48,22 @@ def agent_for(tmp_path, model):
 
 class Crash(BaseException):
     pass
+
+
+@pytest.mark.anyio
+async def test_recovery_allowance_is_independent_of_feedback_wording(tmp_path, monkeypatch):
+    original = RolloutStore.record_completion_feedback
+
+    def reword(store, **kwargs):
+        payload = json.loads(kwargs["reason"])
+        payload["message"] = "A revised explanation of the same recovery decision."
+        kwargs["reason"] = json.dumps(payload)
+        return original(store, **kwargs)
+
+    monkeypatch.setattr(RolloutStore, "record_completion_feedback", reword)
+    result = await agent_for(tmp_path, LoopModel(invalid_until=4)).run("Inspect", max_steps=10)
+    assert result.stop_reason == "repeated_tool_failure"
+    assert result.usage.model_calls == 4
 
 
 @pytest.mark.anyio

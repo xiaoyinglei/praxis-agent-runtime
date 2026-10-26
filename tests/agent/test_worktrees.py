@@ -252,3 +252,253 @@ def test_cli_worktree_list_and_remove(repo: Path, worktrees_root: Path, monkeypa
     assert removed.exit_code == 0, removed.output
     assert json.loads(removed.output)["branch_deleted"] is True
     assert not worktree.root.exists()
+
+
+def test_remove_preserves_owned_turn_even_when_forced(repo: Path, worktrees_root: Path) -> None:
+    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness.ownership import execution_owner
+
+    manager = _manager(repo, worktrees_root)
+    worktree = manager.create("running").worktree
+    database = worktree.root / ".praxis" / "checkpoints.sqlite"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=worktree.root)
+        store.start_turn(thread_id=thread.thread_id, user_message="running", binding_manifest={"model_id": "test"})
+        with execution_owner(database, thread.thread_id):
+            for force in (False, True):
+                with pytest.raises(WorktreeError):
+                    manager.remove(worktree.name, force=force)
+            assert database.is_file()
+
+
+def test_workspace_lock_creates_private_configuration_parents(tmp_path: Path, monkeypatch) -> None:
+    import stat
+
+    from agent_runtime.harness.ownership import workspace_owner
+
+    config = tmp_path / "new-parent" / "config"
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(config))
+    with workspace_owner(tmp_path):
+        assert stat.S_IMODE(config.stat().st_mode) == 0o700
+        assert stat.S_IMODE((config / "workspace-locks").stat().st_mode) == 0o700
+
+
+@pytest.mark.anyio
+async def test_open_session_protects_clean_checkout_until_close(repo: Path, worktrees_root: Path) -> None:
+    from agent_runtime.harness import Session
+    from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel
+
+    manager = _manager(repo, worktrees_root)
+    worktree = manager.create("open-session").worktree
+    async with await Session.open(
+        database=worktree.root / ".praxis" / "checkpoints.sqlite", workspace=worktree.root,
+        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+    ):
+        with pytest.raises(WorktreeError):
+            manager.remove(worktree.name)
+        assert worktree.root.is_dir()
+    assert manager.remove(worktree.name).branch_deleted
+
+
+@pytest.mark.anyio
+async def test_subdirectory_session_with_external_database_protects_checkout(
+    repo: Path, worktrees_root: Path, tmp_path: Path,
+) -> None:
+    from agent_runtime.harness import Session
+    from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel
+
+    manager = _manager(repo, worktrees_root)
+    worktree = manager.create("subdirectory").worktree
+    subdirectory = worktree.root / "nested"
+    subdirectory.mkdir()
+    async with await Session.open(
+        database=tmp_path / "external.sqlite", workspace=subdirectory,
+        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+    ):
+        with pytest.raises(WorktreeError):
+            manager.remove(worktree.name, force=True)
+        assert subdirectory.is_dir()
+
+
+@pytest.mark.anyio
+async def test_session_does_not_block_removing_an_idle_sibling_inside_repository(repo: Path) -> None:
+    from agent_runtime.harness import Session
+    from tests.agent.harness.test_approval_resume import AcceptAnswer, WriteThenAnswerModel
+
+    manager = _manager(repo, repo / ".managed")
+    busy = manager.create("busy").worktree
+    idle = manager.create("idle").worktree
+    async with await Session.open(
+        database=busy.root / ".praxis/checkpoints.sqlite", workspace=busy.root,
+        model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
+    ):
+        assert manager.remove(idle.name).branch_deleted
+        assert busy.root.is_dir()
+
+
+def test_remove_requires_force_for_ignored_user_files(repo: Path, worktrees_root: Path) -> None:
+    manager = _manager(repo, worktrees_root)
+    worktree = manager.create("local-data").worktree
+    local = worktree.root / ".env"
+    local.write_text("UNIQUE_LOCAL_VALUE=review\n")
+    with pytest.raises(WorktreeError, match="--force"):
+        manager.remove(worktree.name)
+    assert local.read_text() == "UNIQUE_LOCAL_VALUE=review\n"
+    assert manager.remove(worktree.name, force=True).branch_deleted
+
+
+def test_prune_and_explicit_paths_stay_within_repository(repo: Path, worktrees_root: Path, tmp_path: Path) -> None:
+    other = tmp_path / "other-project"
+    other.mkdir()
+    _git(other, "init", "--quiet")
+    _git(other, "config", "user.name", "Test")
+    _git(other, "config", "user.email", "test@example.com")
+    (other / ".gitignore").write_text(".praxis/\n")
+    _git(other, "add", ".gitignore")
+    _git(other, "commit", "-q", "-m", "base")
+    foreign = _manager(other, worktrees_root).create("foreign").worktree
+    manager = _manager(repo, worktrees_root)
+    manager.create("one")
+    manager.create("two")
+    assert {entry.name for entry in manager.list()} == {"one", "two"}
+    with pytest.raises(WorktreeError):
+        manager.remove(str(foreign.root), force=True)
+    manager.prune(keep=1)
+    assert foreign.root.is_dir()
+    # Looking up from a linked checkout still resolves the same repository.
+    remaining = manager.list()[0]
+    assert _manager(remaining.root, worktrees_root).list() == manager.list()
+
+
+def test_broken_foreign_repository_does_not_block_current_repository(
+    repo: Path, worktrees_root: Path, tmp_path: Path,
+) -> None:
+    import shutil
+
+    manager = _manager(repo, worktrees_root)
+    current = manager.create("current").worktree
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    _git(foreign, "init", "--quiet")
+    _git(foreign, "config", "user.name", "Test")
+    _git(foreign, "config", "user.email", "test@example.com")
+    _git(foreign, "commit", "--allow-empty", "-q", "-m", "base")
+    _manager(foreign, worktrees_root).create("broken")
+    shutil.rmtree(foreign)
+    assert [entry.name for entry in manager.list()] == ["current"]
+    assert manager.remove(current.name).branch_deleted
+
+
+@pytest.mark.anyio
+@pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="requires native OS sandbox")
+async def test_worktree_git_reads_work_in_sandbox_without_source_or_metadata_writes(
+    repo: Path, worktrees_root: Path,
+) -> None:
+    from agent_runtime.tools.builtins.shell import create_run_command_tool
+    from agent_runtime.workspace import open_workspace
+
+    worktree = _manager(repo, worktrees_root).create("native-git").worktree
+    tool = create_run_command_tool(open_workspace(worktree.root))
+    for command in ("git status --porcelain", "git diff", "git log -1 --format=%s"):
+        output = await tool.run(tool.validate_input({"command": command}))
+        assert output.exit_code == 0, output.stderr
+    # Grant only Git metadata, never the source checkout or metadata mutation.
+    output = await tool.run(tool.validate_input({"command": f"cat '{repo / 'base.txt'}'"}))
+    assert output.exit_code != 0
+    metadata = repo / ".git" / "config"
+    before = metadata.read_bytes()
+    output = await tool.run(tool.validate_input({
+        "command": f"printf corrupted >> '{metadata}'", "workspace_write": True,
+    }))
+    assert output.exit_code != 0
+    assert metadata.read_bytes() == before
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("entrypoint", ["sdk", "cli"])
+@pytest.mark.skipif(sys.platform not in {"darwin", "linux"}, reason="requires native OS sandbox")
+async def test_public_worktree_run_verifies_real_git_status(
+    repo: Path, worktrees_root: Path, monkeypatch, entrypoint: str,
+) -> None:
+    from agent_runtime import Agent, cli
+    from tests.agent.harness.test_macos_command_sessions import SessionCommandModel
+
+    command = "git status --porcelain"
+    if entrypoint == "sdk":
+        worktree = _manager(repo, worktrees_root).create("public-sdk").worktree
+        agent = Agent(workspace_path=worktree.root, checkpoint_db=worktree.root / ".praxis/checkpoints.sqlite",
+                      enable_workspace_mcp=False)
+        monkeypatch.setattr(agent, "_model_factory", lambda: SessionCommandModel(command))
+        result = await agent.run("Inspect Git", allow_execute_tools=True, acceptance_command=command, max_steps=4)
+        assert result.status == "done", result
+        assert result.validation_status == "passed"
+    else:
+        monkeypatch.chdir(repo)
+        monkeypatch.setenv("PRAXIS_WORKTREE_ROOT", str(worktrees_root))
+        original = cli._create_agent_facade
+
+        def create(**kwargs):
+            agent = original(**kwargs)
+            monkeypatch.setattr(agent, "_model_factory", lambda: SessionCommandModel(command))
+            return agent
+
+        monkeypatch.setattr(cli, "_create_agent_facade", create)
+        # CliRunner owns its own event loop, as it does in a normal CLI process.
+        import asyncio
+
+        result = await asyncio.to_thread(runner.invoke, cli.agent_app, [
+            "run", "Inspect Git", "--worktree-name", "public-cli", "--allow-execute-tools",
+            "--acceptance-command", command, "--max-steps", "4", "--non-interactive", "--disable-workspace-mcp",
+        ])
+        assert result.exit_code == 0, result.output
+
+
+def test_linked_git_metadata_is_only_mounted_read_only_on_linux(repo: Path, worktrees_root: Path, tmp_path) -> None:
+    from agent_runtime.tools.builtins import shell
+
+    worktree = _manager(repo, worktrees_root).create("linux-metadata").worktree
+    arguments = shell._linux_sandbox_argv(
+        workspace_root=worktree.root, temporary_root=tmp_path / "scratch", additional_read_roots=(),
+    )
+    common = str(repo / ".git")
+    offset = arguments.index(common)
+    assert arguments[offset - 1:offset + 2] == ["--ro-bind", common, common]
+    assert str(repo) not in arguments
+    # A broken or forged backlink must never turn a .git pointer into a read grant.
+    administrative = Path(_git(worktree.root, "rev-parse", "--absolute-git-dir").strip())
+    (administrative / "gitdir").write_text(str(tmp_path / "unrelated"))
+    assert shell._linked_git_metadata_roots(worktree.root) == ()
+
+
+def test_remove_protects_sdk_store_at_arbitrary_location(repo, tmp_path, monkeypatch):
+    from agent_runtime.harness import RolloutStore
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "host-config"))
+    manager = WorktreeManager(repo, root=tmp_path / "trees")
+    entry = manager.create("registered-store").worktree
+    database = entry.root / ".praxis" / "custom-state" / "conversation.db"
+    with RolloutStore(database) as store:
+        thread = store.create_thread(workspace=entry.root)
+        turn = store.start_turn(thread_id=thread.thread_id, user_message="unfinished", binding_manifest={})
+        store.pause_turn(turn_id=turn.turn_id, reason="waiting for user")
+    with pytest.raises(WorktreeError, match="未结束"):
+        manager.remove(entry.name)
+    assert database.is_file()
+
+
+def test_prune_retains_unregistered_runtime_state(repo, tmp_path, monkeypatch):
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "host-config"))
+    manager = WorktreeManager(repo, root=tmp_path / "trees")
+    entry = manager.create("unregistered-state").worktree
+    state = entry.root / ".praxis" / "unknown-format.bin"
+    state.write_bytes(b"user session state from an older runtime")
+    with pytest.raises(WorktreeError, match="状态"):
+        manager.remove(entry.name)
+    assert state.is_file()
+
+
+def test_explicit_worktree_base_is_delivery_target(repo, tmp_path):
+    _git(repo, "branch", "release")
+    manager = WorktreeManager(repo, root=tmp_path / "trees")
+    entry = manager.create("release-fix", base="release").worktree
+    assert _git(repo, "config", "--get", f"branch.{entry.branch}.praxis-base").strip() == "release"

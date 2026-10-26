@@ -1243,3 +1243,20 @@ def test_provider_build_failure_names_type_and_keeps_chain_clean(
     assert "ImportError" in str(excinfo.value)
     assert excinfo.value.__cause__ is None
     assert excinfo.value.__context__ is None
+
+
+def test_provider_build_debug_log_never_formats_raw_exception(monkeypatch, caplog) -> None:
+    import logging
+
+    secret = "sk-review-dummy-12345678901234567890"
+
+    def broken_builder(**_kwargs: object) -> object:
+        raise RuntimeError(f"provider init failed api_key={secret}")
+
+    monkeypatch.setattr("agent_runtime.core.llm_registry._build_chat_generator", broken_builder)
+    with caplog.at_level(logging.DEBUG, logger="agent_runtime.core.llm_registry"):
+        with pytest.raises(ModelNotAvailableError):
+            ModelRegistry(_make_config()).resolve("main")
+    assert "RuntimeError" in caplog.text
+    assert "[REDACTED]" in caplog.text
+    assert secret not in caplog.text

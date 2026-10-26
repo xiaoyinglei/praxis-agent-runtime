@@ -6,11 +6,13 @@ import hashlib
 import os
 import stat
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable, Iterator
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.model_config_io import ensure_durable_directory
+from agent_runtime.user_config import user_config_directory
 
 OWNERSHIP_REVISION = "thread-flock-v1"
 
@@ -32,18 +34,44 @@ def execution_owner(database: Path, thread_id: str) -> Iterator[None]:
     """
     database = database.resolve()
     directory = database.with_name(database.name + ".locks")
-    directory.mkdir(mode=0o700, exist_ok=True)
+    with _file_owner(directory, hashlib.sha256(thread_id.encode()).hexdigest(), exclusive=True):
+        yield
+
+
+@contextmanager
+def workspace_owner(workspace: Path, *, exclusive: bool = False) -> Iterator[None]:
+    """Share an external workspace lock while Sessions are open; deletion excludes them."""
+    config = user_config_directory()
+    ensure_durable_directory(config)
+    directory = config / "workspace-locks"
+    workspace = workspace.resolve()
+    # A Session can use a subdirectory (or nested repository) of a managed
+    # checkout and keep its DB elsewhere. Every containing checkout must
+    # therefore remain alive, not just the exact workspace path.
+    roots = {workspace}
+    if not exclusive:
+        roots.update(parent for parent in workspace.parents if (parent / ".git").exists())
+    with ExitStack() as locks:
+        for root in sorted(roots):
+            key = hashlib.sha256(os.fsencode(root)).hexdigest()
+            locks.enter_context(_file_owner(directory, key, exclusive=exclusive))
+        yield
+
+
+@contextmanager
+def _file_owner(directory: Path, key: str, *, exclusive: bool) -> Iterator[None]:
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
         raise ValueError("unsafe conversation lock directory")
-    path = directory / (hashlib.sha256(thread_id.encode()).hexdigest() + ".lock")
+    path = directory / (key + ".lock")
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
             raise ValueError("unsafe conversation lock file")
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ConversationBusyError("这个会话仍由另一进程执行；请回到原终端，或等待它停止后再继续。") from None
         try:
@@ -52,6 +80,11 @@ def execution_owner(database: Path, thread_id: str) -> Iterator[None]:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
+
+
+def assert_recovery_leases(*, owned: bool, leases: Iterable[float | None]) -> None:
+    if not owned and any(lease is None or lease >= time.time() for lease in leases):
+        raise ConversationBusyError("旧会话的执行租约尚未过期，暂不能接管；请确认原进程状态后再试。")
 
 
 def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False) -> None:
@@ -68,11 +101,10 @@ def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False
     models = [op for op in store.list_model_operations(turn_id) if op.status == "dispatched"]
     tools = [op for op in store.list_tool_operations(turn_id) if op.status == "running"]
     attempts = {op.operation_id: store.list_model_attempts(op.operation_id)[-1] for op in models}
-    if not owned and any(lease is None or lease >= now for lease in (
+    assert_recovery_leases(owned=owned, leases=(
         *(attempt.lease_expires_at for attempt in attempts.values()),
         *(op.lease_expires_at for op in tools),
-    )):
-        raise ConversationBusyError("旧会话的执行租约尚未过期，暂不能接管；请确认原进程状态后再试。")
+    ))
     with store._transaction():
         for operation in models:
             attempt = attempts[operation.operation_id]

@@ -358,3 +358,63 @@ async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> 
         events.EventType.ITEM_COMPLETED,
         events.EventType.TURN_COMPLETED,
     ]
+
+
+@pytest.mark.anyio
+async def test_cancelled_receive_does_not_steal_the_next_event() -> None:
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_controlling()
+    receiver = asyncio.create_task(stream.receive())
+    await asyncio.sleep(0.01)
+    receiver.cancel()
+    await asyncio.gather(receiver, return_exceptions=True)
+    event = events.turn_started("after-cancel")
+    await dispatcher.emit(event)
+    assert await asyncio.wait_for(stream.receive(), timeout=0.1) == event
+    dispatcher.close()
+
+
+@pytest.mark.anyio
+async def test_passive_overflow_replays_from_last_delivered_cursor() -> None:
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=2)
+    stream = dispatcher.subscribe_passive(last_cursor="before")
+    for number in range(3):
+        await dispatcher.emit(events.turn_started(str(number)), cursor=f"cursor-{number}")
+    with pytest.raises(stream_sinks.ObserverLagged) as lagged:
+        await stream.receive()
+    assert lagged.value.last_cursor == "before"
+    dispatcher.close()
+
+
+@pytest.mark.anyio
+async def test_passive_cursor_advances_only_after_reading() -> None:
+    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+    stream = dispatcher.subscribe_passive(last_cursor="before")
+    await dispatcher.emit(events.turn_started("first"), cursor="cursor-first")
+    await stream.receive()
+    await dispatcher.emit(events.turn_started("unread"), cursor="cursor-unread")
+    await dispatcher.emit(events.turn_started("overflow"), cursor="cursor-overflow")
+    with pytest.raises(stream_sinks.ObserverLagged) as lagged:
+        stream.receive_nowait()
+    assert lagged.value.last_cursor == "cursor-first"
+    dispatcher.close()
+
+
+@pytest.mark.anyio
+async def test_cancelling_emit_closes_its_controlling_sink_task() -> None:
+    entered, stopped = asyncio.Event(), asyncio.Event()
+    class Sink:
+        async def emit(self, event):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+    dispatcher = stream_sinks.TurnEventDispatcher()
+    dispatcher.subscribe_controlling_sink(Sink())
+    emission = asyncio.create_task(dispatcher.emit(events.turn_started("cancel-sink")))
+    await entered.wait()
+    emission.cancel()
+    await asyncio.gather(emission, return_exceptions=True)
+    assert stopped.is_set()
+    dispatcher.close()

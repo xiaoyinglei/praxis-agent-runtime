@@ -18,7 +18,7 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     run = subprocess.run
-    run(["git", "init", "--quiet", str(root)], check=True)
+    run(["git", "init", "--quiet", "-b", "main", str(root)], check=True)
     run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
     run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
     (root / "base.txt").write_text("base\n")
@@ -32,6 +32,77 @@ def _git(repo: Path, *arguments: str, check: bool = True) -> str:
         ["git", "-C", str(repo), *arguments], capture_output=True, text=True, check=check,
     )
     return completed.stdout
+
+
+@pytest.mark.parametrize("operation", ["pull-request", "failed-runs", "failed-log"])
+async def test_github_query_failure_is_not_an_empty_result(repo: Path, operation: str) -> None:
+    delivery = GitDelivery(repo)
+    delivery._gh_output = lambda *args: subprocess.CompletedProcess(args, 4, "", "authentication required")
+    with pytest.raises(DeliveryError, match="authentication required"):
+        if operation == "pull-request":
+            delivery._gh_view_pull_request("praxis/task")
+        elif operation == "failed-runs":
+            delivery._gh_failed_run_ids("praxis/task", "a" * 40)
+        else:
+            delivery._gh_failed_run_logs("123")
+
+
+@pytest.mark.parametrize("operation", ["pull-request", "failed-runs"])
+@pytest.mark.parametrize("payload", ["", "not-json", "{}", "[{}]"])
+async def test_github_query_rejects_malformed_success(repo: Path, operation: str, payload: str) -> None:
+    delivery = GitDelivery(repo)
+    delivery._gh_output = lambda *args: subprocess.CompletedProcess(args, 0, payload, "")
+    with pytest.raises(DeliveryError):
+        if operation == "pull-request":
+            delivery._gh_view_pull_request("praxis/task")
+        else:
+            delivery._gh_failed_run_ids("praxis/task", "a" * 40)
+
+
+async def test_pull_request_absence_uses_successful_structured_query(repo: Path) -> None:
+    delivery = GitDelivery(repo)
+    calls = []
+
+    def output(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "[]", "")
+
+    delivery._gh_output = output
+    assert delivery._gh_view_pull_request("praxis/task") is None
+    assert calls == [("pr", "list", "--head", "praxis/task", "--state", "open", "--limit", "1", "--json", "url")]
+    delivery._gh_output = lambda *args: subprocess.CompletedProcess(
+        args, 0, '[{"url":"https://github.com/o/r/pull/7"}]', "",
+    )
+    assert delivery._gh_view_pull_request("praxis/task") == "https://github.com/o/r/pull/7"
+
+
+@pytest.mark.parametrize("existing_delivery_branch", [False, True])
+async def test_post_commit_timeout_reports_the_actual_advanced_ref(repo: Path, existing_delivery_branch: bool) -> None:
+    if existing_delivery_branch:
+        _git(repo, "checkout", "-q", "-b", "praxis/existing")
+    before = _git(repo, "rev-parse", "HEAD").strip()
+    original_index = (repo / ".git/index").read_bytes()
+    (repo / "base.txt").write_text("approved change\n")
+    hook = repo / ".git/hooks/post-commit"
+    hook.write_text("#!/bin/sh\nsleep 0.5\n")
+    hook.chmod(0o755)
+    delivery = GitDelivery(repo)
+    run_git = delivery._run_git
+
+    def bounded_commit(*args, **kwargs):
+        if args[0] == "commit":
+            kwargs["timeout_seconds"] = 0.2
+        return run_git(*args, **kwargs)
+
+    delivery._run_git = bounded_commit
+    with pytest.raises(DeliveryError) as failure:
+        await delivery.commit("new change")
+    assert failure.value.outcome == "partial"
+    observed = _git(repo, "rev-parse", "HEAD").strip()
+    assert observed != before
+    assert failure.value.details["commit_id"] == observed
+    assert _git(repo, "log", "-1", "--format=%s").strip() == "new change"
+    assert (repo / ".git/index").read_bytes() == original_index
 
 
 async def test_commit_captures_added_modified_and_deleted(repo: Path) -> None:
@@ -320,12 +391,13 @@ def _fake_checks(delivery: GitDelivery, states: list[tuple[str, str]]) -> None:
     """Patch gh wrappers; states mutates when the fake advances per poll."""
     delivery._require_gh = lambda: None  # type: ignore[method-assign]
     delivery._gh_view_pull_request = lambda branch: "https://github.com/o/r/pull/5"  # type: ignore[method-assign]
+    delivery._gh_pull_request_head = lambda branch: "a" * 40  # type: ignore[method-assign]
 
     def pr_checks(branch: str):
         if not states:
             raise DeliveryError(f"分支 {branch} 还没有 Pull Request；请先用 /pull 创建。")
         return tuple(
-            CheckRun(name=name, state=state, workflow="CI", link="https://github.com/o/r/actions")
+            CheckRun(name=name, state=state, workflow="CI", link="https://github.com/o/r/actions/runs/1234/job/1")
             for name, state in states
         )
 
@@ -375,11 +447,11 @@ async def test_checks_without_pull_request_is_refused(repo: Path) -> None:
 async def test_checks_collect_failure_log_excerpts(repo: Path) -> None:
     delivery = GitDelivery(repo)
     _fake_checks(delivery, [("build", "fail")])
-    delivery._gh_failed_run_ids = lambda branch: (("1234", "CI"), ("5678", "lint"))  # type: ignore[method-assign]
+    delivery._gh_failed_run_ids = lambda branch, head: (("1234", "CI"), ("5678", "old"))  # type: ignore[method-assign]
     delivery._gh_failed_run_logs = lambda run_id: f"{run_id}-log\n" * 5000  # type: ignore[method-assign]
     report = await delivery.pull_request_checks(include_failure_logs=True, max_log_bytes=4000)
     assert report.overall == "fail"
-    assert [name for name, _logs in report.failure_logs] == ["CI", "lint"]
+    assert [name for name, _logs in report.failure_logs] == ["CI"]
     total = sum(len(logs) for _name, logs in report.failure_logs)
     assert total <= 4000
     # Excerpts keep the tail of the log, where failures surface.
@@ -390,6 +462,7 @@ async def test_checks_no_checks_configured_reports_none(repo: Path) -> None:
     delivery = GitDelivery(repo)
     delivery._require_gh = lambda: None  # type: ignore[method-assign]
     delivery._gh_view_pull_request = lambda branch: "https://github.com/o/r/pull/5"  # type: ignore[method-assign]
+    delivery._gh_pull_request_head = lambda branch: "a" * 40  # type: ignore[method-assign]
     delivery._gh_pr_checks = lambda branch: ()  # type: ignore[method-assign]
     report = await delivery.pull_request_checks()
     assert report.overall == "none"
@@ -468,3 +541,201 @@ async def test_hung_gh_subprocess_raises_delivery_error(
 
     with pytest.raises(DeliveryError, match="gh pr 超过 300 秒未响应"):
         delivery._gh_output("pr", "view")
+
+
+async def test_delivery_scrubs_repository_environment(repo: Path, tmp_path: Path, monkeypatch) -> None:
+    victim = tmp_path / "victim"
+    subprocess.run(["git", "clone", "-q", str(repo), str(victim)], check=True)
+    _git(victim, "config", "user.name", "Test")
+    _git(victim, "config", "user.email", "test@example.com")
+    before = _git(victim, "rev-parse", "HEAD")
+    (repo / "new.txt").write_text("source change")
+    monkeypatch.setenv("GIT_DIR", str(victim / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repo))
+    result = await GitDelivery(repo).commit("source only")
+    monkeypatch.delenv("GIT_DIR")
+    monkeypatch.delenv("GIT_WORK_TREE")
+    assert _git(victim, "rev-parse", "HEAD") == before
+    assert _git(repo, "rev-parse", "HEAD").strip() == result.commit_id
+
+
+@pytest.mark.parametrize("change", ["new", "content", "index", "branch"])
+async def test_commit_refuses_a_changed_preview(repo: Path, change: str) -> None:
+    (repo / "base.txt").write_text("preview")
+    delivery = GitDelivery(repo)
+    preview = await delivery.status()
+    if change == "new":
+        (repo / "later.txt").write_text("not approved")
+    elif change == "content":
+        (repo / "base.txt").write_text("not approved")
+    elif change == "index":
+        _git(repo, "add", "base.txt")
+    else:
+        _git(repo, "switch", "-c", "other")
+    with pytest.raises(DeliveryError, match="预览"):
+        await delivery.commit("stale", expected_preview_id=preview.preview_id)
+    assert _git(repo, "log", "-1", "--format=%s").strip() == "base"
+
+
+async def test_failed_hook_preserves_original_branch_and_index(repo: Path) -> None:
+    (repo / "base.txt").write_text("part staged")
+    _git(repo, "add", "base.txt")
+    (repo / "base.txt").write_text("unstaged later")
+    (repo / "new.txt").write_text("unstaged new")
+    index = (repo / ".git/index").read_bytes()
+    original_branch = _git(repo, "branch", "--show-current")
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    with pytest.raises(DeliveryError):
+        await GitDelivery(repo).commit("refused")
+    assert _git(repo, "branch", "--show-current") == original_branch
+    assert (repo / ".git/index").read_bytes() == index
+    assert not _git(repo, "branch", "--list", "praxis/*").strip()
+    assert (repo / "base.txt").read_text() == "unstaged later"
+
+
+async def test_commit_cancellation_waits_for_actual_outcome(repo: Path) -> None:
+    from agent_runtime.git_delivery import DeliveryInterruptedError
+
+    (repo / "new.txt").write_text("commit")
+    started, release = repo.parent / "started", repo.parent / "release"
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text(f'#!/bin/sh\ntouch "{started}"\nwhile [ ! -e "{release}" ]; do sleep 0.02; done\n')
+    hook.chmod(0o755)
+    task = asyncio.create_task(GitDelivery(repo).commit("settled"))
+    try:
+        async with asyncio.timeout(5):
+            while not started.exists():
+                await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.03)
+        assert not task.done(), "cancellation must wait until the owned Git operation settles"
+    finally:
+        release.touch()
+    with pytest.raises(DeliveryInterruptedError) as interrupted:
+        await task
+    assert interrupted.value.result.commit_id == _git(repo, "rev-parse", "HEAD").strip()
+    assert not (repo / ".git/index.lock").exists()
+
+
+async def test_gh_query_failure_is_not_an_empty_success(repo: Path) -> None:
+    delivery = GitDelivery(repo)
+    delivery._gh_output = lambda *args: subprocess.CompletedProcess(args, 4, "", "HTTP 401")
+    with pytest.raises(DeliveryError, match="401"):
+        delivery._gh_pr_checks("praxis/task")
+
+
+async def test_unchanged_preview_can_be_committed(repo: Path) -> None:
+    (repo / "base.txt").write_text("approved")
+    delivery = GitDelivery(repo)
+    status = await delivery.status()
+    result = await delivery.commit("approved", expected_preview_id=status.preview_id)
+    assert _git(repo, "show", f"{result.commit_id}:base.txt") == "approved"
+
+
+async def test_failure_logs_use_failed_checks_and_matching_head(repo: Path) -> None:
+    import json
+
+    from agent_runtime.git_delivery import CheckRun
+
+    delivery = GitDelivery(repo)
+    calls = []
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    failed = (
+        CheckRun("current", "fail", "CI", "https://github.com/o/r/actions/runs/123/job/1"),
+        CheckRun("external", "fail", "external", "https://ci.example/run/999"),
+    )
+    def output(*args):
+        calls.append(args)
+        if args[:2] == ("run", "list"):
+            return subprocess.CompletedProcess(args, 0, json.dumps([
+                {"databaseId": 123, "name": "CI", "conclusion": "failure", "headSha": head},
+                {"databaseId": 999, "name": "OLD", "conclusion": "failure", "headSha": "b" * 40},
+            ]), "")
+        return subprocess.CompletedProcess(args, 0, "current failure log", "")
+    delivery._gh_output = output
+    logs = delivery._failure_log_excerpts("praxis/task", 4000, head_commit=head, checks=failed)
+    assert logs == (("CI", "current failure log"),)
+    listing = next(args for args in calls if args[:2] == ("run", "list"))
+    assert listing[listing.index("--commit") + 1] == head
+    assert not any("999" in args for args in calls)
+
+
+async def test_hook_cannot_substitute_an_unapproved_tree(repo: Path) -> None:
+    original = _git(repo, "rev-parse", "HEAD")
+    (repo / "base.txt").write_text("approved")
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nprintf unapproved > injected.txt\ngit add injected.txt\n")
+    hook.chmod(0o755)
+    index = (repo / ".git/index").read_bytes()
+    delivery = GitDelivery(repo)
+    preview = await delivery.status()
+    with pytest.raises(DeliveryError, match="批准"):
+        await delivery.commit("approved only", expected_preview_id=preview.preview_id)
+    assert _git(repo, "rev-parse", "HEAD") == original
+    assert _git(repo, "branch", "--show-current").strip() == "main"
+    assert (repo / ".git/index").read_bytes() == index
+    assert (repo / "injected.txt").read_text() == "unapproved"
+
+
+async def test_publishing_refuses_a_changed_approved_commit(repo: Path, tmp_path: Path) -> None:
+    remote = _bare_remote(tmp_path, "github.com.git")
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-q", "origin", "main")
+    delivery = GitDelivery(repo)
+    (repo / "base.txt").write_text("approved")
+    await delivery.commit("first")
+    _fake_gh(delivery)
+    preview = await delivery.pull_request_status()
+    (repo / "base.txt").write_text("later")
+    await delivery.commit("later")
+    with pytest.raises(DeliveryError, match="预览"):
+        await delivery.open_pull_request(expected_preview_id=preview.preview_id)
+    assert not _git(remote, "branch", "--list", "praxis/*").strip()
+
+
+async def test_install_does_not_unlink_another_gits_new_index_lock(repo: Path, monkeypatch) -> None:
+    import os
+
+    (repo / "base.txt").write_text("approved")
+    replace = os.replace
+    lock = repo / ".git/index.lock"
+    def install(source, destination):
+        replace(source, destination)
+        if Path(destination) == repo / ".git/index":
+            lock.write_bytes(b"another operation")
+    monkeypatch.setattr("agent_runtime.git_delivery.os.replace", install)
+    await GitDelivery(repo).commit("install")
+    assert lock.read_bytes() == b"another operation"
+    lock.unlink()
+
+
+async def test_failed_commit_preserves_preexisting_branch_configuration(repo: Path) -> None:
+    _git(repo, "config", "branch.praxis/feature.description", "user metadata")
+    (repo / "base.txt").write_text("pending")
+    hook = repo / ".git/hooks/pre-commit"
+    hook.write_text("#!/bin/sh\nexit 1\n")
+    hook.chmod(0o755)
+    with pytest.raises(DeliveryError):
+        await GitDelivery(repo).commit("failed", branch_name="praxis/feature")
+    assert _git(repo, "config", "--get", "branch.praxis/feature.description").strip() == "user metadata"
+
+
+async def test_pull_preview_content_and_identity_use_one_frozen_commit(repo: Path, tmp_path: Path) -> None:
+    remote = _bare_remote(tmp_path, "github.com-preview.git")
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-q", "origin", "main")
+    delivery = GitDelivery(repo)
+    (repo / "base.txt").write_text("first")
+    initial = await delivery.commit("first")
+    _fake_gh(delivery)
+    def change_head_while_reading_pr(branch):
+        (repo / "base.txt").write_text("later")
+        _git(repo, "add", "base.txt")
+        _git(repo, "commit", "-qm", "later")
+        return None
+    delivery._gh_view_pull_request = change_head_while_reading_pr
+    preview = await delivery.pull_request_status()
+    assert preview.commit_subjects == ("first",)
+    assert preview.head_commit == initial.commit_id

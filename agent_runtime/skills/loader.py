@@ -82,8 +82,8 @@ def _build_manifest(
     """Build a SkillManifest from parsed frontmatter.
 
     Only raises SkillLoadError for structural problems (missing required
-    fields, wrong types for understood fields).  Unknown fields are
-    silently stored in ``extra``.
+    fields, wrong types for understood fields, unsupported constraints).
+    Unknown fields are silently stored in ``extra``.
     """
     # Required fields
     for field in _REQUIRED_FIELDS:
@@ -164,7 +164,7 @@ def _build_manifest(
     fingerprint = _compute_fingerprint(frontmatter, body)
 
     skill_id = f"{source.value}:{name}"
-    return SkillManifest(
+    manifest = SkillManifest(
         skill_id=skill_id,
         name=name,
         description=description,
@@ -177,8 +177,14 @@ def _build_manifest(
         path_patterns=path_patterns,
         disable_model_invocation=disable_model_invocation,
         content_fingerprint=fingerprint,
+        body=body,
         extra=extra,
     )
+    if manifest.unsupported_constraints:
+        raise SkillLoadError(
+            f"{skill_file}: unsupported skill constraints: " + ", ".join(manifest.unsupported_constraints)
+        )
+    return manifest
 
 
 def _compute_fingerprint(frontmatter: dict[str, Any], body: str) -> str:
@@ -297,8 +303,8 @@ def load_skill_from_file(
     """Parse a single SKILL.md file and return its SkillManifest.
 
     Only raises SkillLoadError for structural problems (missing required
-    fields, wrong types on understood fields).  Unknown fields are stored
-    in ``extra``.
+    fields, wrong types on understood fields, unsupported constraints).
+    Unknown fields are stored in ``extra``.
 
     If ``skill_root`` is provided, the relative path from root to the
     skill directory is used to derive the namespace.  For example::
@@ -334,10 +340,8 @@ def load_skill_from_file(
 
 
 def load_skill_body(manifest: SkillManifest) -> str:
-    """Read the body (after frontmatter) of a skill from disk."""
-    content = manifest.skill_file.read_text(encoding="utf-8")
-    _, body = _parse_frontmatter(content, manifest.skill_file)
-    return body
+    """Return the body frozen with the parsed metadata and content fingerprint."""
+    return manifest.body
 
 
 def scan_and_load_skills(

@@ -213,12 +213,14 @@ class RolloutEventReader:
         thread_ids = {record.thread_id for record in records}
         if len(thread_ids) != 1:
             raise RuntimeError("committed mutation batch must belong to one Thread")
-        thread_id = next(iter(thread_ids))
         batch_record_ids = {record.record_id for record in records}
+        related = {record.record_id: record for record in records}
+        for turn_id in {record.turn_id for record in records if record.turn_id is not None}:
+            related.update((record.record_id, record) for record in self._store.list_turn_records(turn_id))
         projected = tuple(
             (record, event)
             for record, event in self._project_records(
-                self._store.list_records(thread_id),
+                tuple(sorted(related.values(), key=lambda record: record.record_id)),
                 after_thread_sequence=0,
                 include_open_starts=True,
             )

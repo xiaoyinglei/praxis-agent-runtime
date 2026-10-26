@@ -1,31 +1,47 @@
 [
   {
     "id": "city_only_search",
-    "provenance": "Minimal reproduction of server Bing result observed 2026-10-08; synthetic HTML, not an original response capture.",
+    "provenance": "Minimal reproduction of server Bing result observed 2026-10-08; synthetic HTML, not an original response capture. Converted on 2026-10-26 to a synthetic structured Search API response; not a DeepSeek capture.",
     "tool": "web_search",
     "arguments": {
       "query": "北京 Agent 开发工程师 招聘 大模型"
     },
-    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://www.beijing.gov.cn/'>北京市人民政府</a></h2><div class='b_caption'><p>北京城市概况</p></div></li></ol>",
     "expected": {
       "error_code": null,
       "result_status": "results"
     },
-    "is_error": false
+    "is_error": false,
+    "search_response": {
+      "results": [
+        {
+          "title": "北京市人民政府",
+          "url": "https://www.beijing.gov.cn/",
+          "snippet": "北京城市概况"
+        }
+      ]
+    }
   },
   {
     "id": "ignored_site_restriction",
-    "provenance": "Synthetic counterexample: a hostname mentioned in a URL query does not satisfy site:.",
+    "provenance": "Synthetic counterexample: a hostname mentioned in a URL query does not satisfy site:. Converted on 2026-10-26 to a synthetic structured Search API response; not a DeepSeek capture.",
     "tool": "web_search",
     "arguments": {
       "query": "site:zhipin.com 北京 Agent 招聘"
     },
-    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://example.com/?next=zhipin.com'>北京 Agent 招聘</a></h2><div class='b_caption'><p>岗位</p></div></li></ol>",
     "expected": {
       "error_code": null,
       "result_status": "results"
     },
-    "is_error": false
+    "is_error": false,
+    "search_response": {
+      "results": [
+        {
+          "title": "北京 Agent 招聘",
+          "url": "https://example.com/?next=zhipin.com",
+          "snippet": "岗位"
+        }
+      ]
+    }
   },
   {
     "id": "loading_shell",
@@ -104,17 +120,25 @@
   },
   {
     "id": "boolean_query",
-    "provenance": "Synthetic query-language counterexample; backend interprets OR.",
+    "provenance": "Synthetic query-language counterexample; backend interprets OR. Converted on 2026-10-26 to a synthetic structured Search API response; not a DeepSeek capture.",
     "tool": "web_search",
     "arguments": {
       "query": "Python OR Rust"
     },
-    "html": "<ol id='b_results'><li class='b_algo'><h2><a href='https://docs.python.org/'>Python documentation</a></h2><div class='b_caption'><p>Python language</p></div></li></ol>",
     "expected": {
       "error_code": null,
       "result_status": "results"
     },
-    "is_error": false
+    "is_error": false,
+    "search_response": {
+      "results": [
+        {
+          "title": "Python documentation",
+          "url": "https://docs.python.org/",
+          "snippet": "Python language"
+        }
+      ]
+    }
   },
   {
     "id": "empty_extraction",

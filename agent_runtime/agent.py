@@ -80,10 +80,10 @@ class Agent:
             raise TypeError("web_limits must be WebLimits or None")
         self.web_limits = web_limits or WebLimits()
         if web_search_provider is not None:
-            if web_search_provider not in {"bing", "brave", "tavily"}:
-                raise ValueError("Web search provider must be bing, brave or tavily.")
-            if (web_search_provider == "bing") != (web_search_key_file is None):
-                raise ValueError("Web search requires a key file for brave/tavily and no key file for bing.")
+            if web_search_provider not in {"deepseek", "brave", "tavily"}:
+                raise ValueError("Web search provider must be deepseek, brave or tavily.")
+            if web_search_key_file is None:
+                raise ValueError("Web search requires a key file for deepseek/brave/tavily.")
         if mcp_config_trust is not None:
             from agent_runtime.runtime.mcp import MCPConfigTrustDecision
 
@@ -357,7 +357,7 @@ class Agent:
         recorded = {str(row.get("checkpoint_id")) for row in rows}
         service_rows: list[dict[str, object]] = []
         for entry in await CheckpointService(self._workspace_path()).list_checkpoints():
-            if entry.checkpoint_id in recorded or " restore " not in f" {entry.subject} ":
+            if entry.checkpoint_id in recorded or entry.trigger != "restore":
                 continue
             service_rows.append({
                 "checkpoint_id": entry.checkpoint_id,
@@ -409,27 +409,33 @@ class Agent:
             "branch": status.branch,
             "changed": [f"{code} {path}" for code, path in status.changed],
             "changed_file_count": len(status.changed),
+            "preview_id": status.preview_id,
         }
 
     async def commit(
-        self, message: str, *, branch_name: str | None = None,
+        self, message: str, *, branch_name: str | None = None, expected_preview_id: str | None = None,
     ) -> dict[str, object]:
         """Commit workspace changes on a ``praxis/*`` branch of the real repository.
 
         A user-authorized delivery operation: the sandbox and the model never
-        gain Git write access; this host-side call stages exactly what
-        ``commit_status`` showed and refuses while Turns are still active.
+        gain Git write access. Pass ``commit_status()["preview_id"]`` to bind
+        execution to that approved candidate. Without a preview ID this call
+        directly authorizes the current candidate. Cancellation waits for the
+        actual terminal outcome and raises DeliveryInterruptedError with its result.
         """
         from agent_runtime.git_delivery import GitDelivery
         from agent_runtime.harness import RolloutStore
 
         with RolloutStore(self._harness_database(), read_only=True) as store:
-            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}
+                      and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()]
         if active:
             raise RuntimeError(
                 "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再提交。"
             )
-        result = await GitDelivery(self._workspace_path()).commit(message, branch_name=branch_name)
+        result = await GitDelivery(self._workspace_path()).commit(
+            message, branch_name=branch_name, expected_preview_id=expected_preview_id,
+        )
         return {
             "commit_id": result.commit_id,
             "branch": result.branch,
@@ -450,11 +456,13 @@ class Agent:
             "changed_paths": list(status.changed_paths),
             "uncommitted_count": status.uncommitted_count,
             "open_pull_request_url": status.open_pull_request_url,
+            "head_commit": status.head_commit,
+            "preview_id": status.preview_id,
         }
 
     async def open_pull_request(
         self, *, title: str | None = None, body: str | None = None,
-        base_branch: str | None = None,
+        base_branch: str | None = None, expected_preview_id: str | None = None,
     ) -> dict[str, object]:
         """Push the current praxis branch and open (or return) its pull request.
 
@@ -465,13 +473,14 @@ class Agent:
         from agent_runtime.harness import RolloutStore
 
         with RolloutStore(self._harness_database(), read_only=True) as store:
-            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}
+                      and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()]
         if active:
             raise RuntimeError(
                 "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再发布。"
             )
         result = await GitDelivery(self._workspace_path()).open_pull_request(
-            title=title, body=body, base_branch=base_branch,
+            title=title, body=body, base_branch=base_branch, expected_preview_id=expected_preview_id,
         )
         return {
             "url": result.url,
@@ -496,6 +505,7 @@ class Agent:
         )
         return {
             "branch": report.branch,
+            "head_commit": report.head_commit,
             "overall": report.overall,
             "pull_request_url": report.pull_request_url,
             "checks": [
@@ -517,6 +527,7 @@ class Agent:
         user_input: str | None = None,
         files: Sequence[str] | None = None,
         event_sink: AgentEventSink | None = None,
+        expected_request_id: str | None = None,
     ) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
@@ -534,12 +545,17 @@ class Agent:
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
                 with execution_owner(self._harness_database(), thread.thread_id):
+                    if expected_request_id is not None:
+                        from agent_runtime.harness.recovery import recovery_plan
+                        if recovery_plan(store, turn_id).request_id != expected_request_id:
+                            raise ValueError("recovery request changed; inspect current state before responding")
                     from agent_runtime.harness.command_recovery import cancel_commands
                     recovered = store.capture_mutation(lambda: recover_owner_loss(store, turn_id, abort=True))
                     await cancel_commands(self, turn_id)
-                    if any(operation.status in {"running", "unknown"}
-                           for operation in store.list_tool_operations(turn_id)):
-                        raise ConversationRecoveryRequiredError("取消未完成：执行结果仍未核对，任务保持暂停。")
+                    from agent_runtime.harness.recovery import recovery_plan
+                    plan = recovery_plan(store, turn_id)
+                    if not plan.accepts("abort"):
+                        raise ConversationRecoveryRequiredError(f"取消未完成：{plan.reason_code}；请先核对执行状态。")
                     mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
                     cancelled = mutation.value
                     result = AgentResult._from_harness(
@@ -560,7 +576,30 @@ class Agent:
                             await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
         async with self.session(_frozen_turn_id=turn_id, event_sink=event_sink) as session:
-            return await session.resume(turn_id, action, user_input=user_input, files=files)
+            return await session.resume(turn_id, action, user_input=user_input, files=files,
+                                        expected_request_id=expected_request_id)
+
+    async def recovery_state(self, turn_id: str) -> dict[str, Any]:
+        """Inspect available actions without loading a model or recovering execution.
+
+        Availability is an observation. resume rechecks it under execution ownership;
+        pass request_id as expected_request_id to answer that specific request.
+        """
+        from agent_runtime.harness.ownership import ConversationBusyError, execution_owner
+        from agent_runtime.harness.recovery import recovery_plan
+        from agent_runtime.harness.rollout import RolloutStore
+
+        with RolloutStore(self._harness_database(), read_only=True) as store:
+            turn = store.read_turn(turn_id)
+            if Path(store.read_thread(turn.thread_id).workspace).resolve() != self._workspace_path():
+                raise RuntimeError("turn belongs to a different workspace security domain")
+            try:
+                with execution_owner(self._harness_database(), turn.thread_id):
+                    return recovery_plan(store, turn_id).as_dict()
+            except ConversationBusyError:
+                return {"turn_id": turn_id, "status": turn.status, "actions": [],
+                        "reason_code": "execution_active", "evidence_ids": [turn_id], "request_id": None,
+                        "requires_input": False, "question": None, "choices": []}
 
     async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult

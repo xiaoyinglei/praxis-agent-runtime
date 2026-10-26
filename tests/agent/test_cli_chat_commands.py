@@ -859,9 +859,11 @@ async def test_commit_command_previews_and_delivers(tmp_path, confirmed):
             pytest.fail("/commit must not call the model")
 
         async def commit_status(self):
-            return {"branch": "master", "changed": ["?? a.txt"], "changed_file_count": 1}
+            return {"branch": "master", "changed": ["?? a.txt"], "changed_file_count": 1,
+                    "preview_id": "approved-commit"}
 
-        async def commit(self, message, *, branch_name=None):
+        async def commit(self, message, *, branch_name=None, expected_preview_id=None):
+            assert expected_preview_id == "approved-commit"
             committed.append(message)
             return {"commit_id": "b" * 40, "branch": "praxis/x",
                     "changed_file_count": 1, "created_branch": True}
@@ -934,9 +936,10 @@ async def test_pull_command_previews_and_publishes(tmp_path, confirmed):
                 "base_branch": "main", "commit_subjects": ["fix: timeout"],
                 "changed_paths": ["a.py", "b.py"], "uncommitted_count": 2,
                 "open_pull_request_url": None,
+                "preview_id": "approved-pr",
             }
 
-        async def open_pull_request(self, *, title=None, body=None, base_branch=None):
+        async def open_pull_request(self, *, title=None, body=None, base_branch=None, expected_preview_id=None):
             published.append(title)
             return {"url": "https://github.com/o/r/pull/7", "branch": "praxis/x",
                     "created": True}
@@ -978,9 +981,10 @@ async def test_pull_command_with_title_skips_hint(tmp_path):
                 "base_branch": "main", "commit_subjects": ["fix: timeout"],
                 "changed_paths": ["a.py"], "uncommitted_count": 0,
                 "open_pull_request_url": "https://github.com/o/r/pull/3",
+                "preview_id": "approved-pr",
             }
 
-        async def open_pull_request(self, *, title=None, body=None, base_branch=None):
+        async def open_pull_request(self, *, title=None, body=None, base_branch=None, expected_preview_id=None):
             published.append(title)
             return {"url": "https://github.com/o/r/pull/3", "branch": "praxis/x",
                     "created": False}

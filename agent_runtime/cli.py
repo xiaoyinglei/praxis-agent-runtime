@@ -297,6 +297,11 @@ def agent_history(
     typer.echo(json.dumps(rows, ensure_ascii=False, indent=2))
 
 
+class _ResumeOptions(TypedDict, total=False):
+    files: Sequence[str]
+    expected_request_id: str
+
+
 class _PermissionOptions(TypedDict, total=False):
     permissions: Path
     approval_mode: ApprovalMode
@@ -652,11 +657,11 @@ def _display_pending_recovery(
     *,
     turn_id: str,
     checkpoint_db: Path,
+    recovery: Mapping[str, Any],
 ) -> None:
     print(f"\n⏸  待恢复 Turn: {turn_id}")
     if request is None:
-        print("   未检测到待处理的人机请求；可继续中断执行。")
-        options = ["continue", "abort"]
+        print("   未检测到待处理的人机请求。")
     else:
         print(f"   请求: {request.question}")
         for tool_call in request.tool_calls:
@@ -668,13 +673,13 @@ def _display_pending_recovery(
             print(f"   {risk_mark} {tool_call.tool_name}: {tool_call.args_preview}")
             if tool_call.reason:
                 print(f"      原因: {tool_call.reason}")
-        options = list(request.options)
-        if not options:
-            options = (
-                ["allow_once", "deny", "abort"]
-                if request.kind in {"tool_approval", "tool_reconciliation"}
-                else ["continue", "abort"]
-            )
+    options = recovery["actions"]
+    print(f"   恢复依据: {recovery['reason_code']}")
+    if recovery["evidence_ids"]:
+        print("   记录: " + ", ".join(recovery["evidence_ids"]))
+    if not options:
+        print("   当前没有可直接执行的恢复动作；请先核对上述记录。")
+        return
     print("   可用恢复命令:")
     for option in options:
         command = [
@@ -686,8 +691,12 @@ def _display_pending_recovery(
             "--checkpoint-db",
             str(checkpoint_db),
         ]
+        if recovery["request_id"] is not None:
+            command.extend(["--request-id", recovery["request_id"]])
         print(f"     {shlex.join(command)}")
-    if request is not None and request.kind in {"choice", "clarification"}:
+    if recovery["requires_input"]:
+        if request is not None and request.kind == "choice":
+            print("   可选输入: " + ", ".join(recovery["choices"]))
         print("   需要文本时，在 continue 命令后添加 --input '<text>'。")
 
 
@@ -872,15 +881,20 @@ async def _resume_facade_command(
     action: str,
     user_input: str | None = None,
     event_display: _CLIToolEventDisplay | None = None,
+    expected_request_id: str | None = None,
 ) -> AgentResult:
     display = event_display or _CLIToolEventDisplay()
     display.begin_turn()
     try:
+        request_options: _ResumeOptions = (
+            {} if expected_request_id is None else {"expected_request_id": expected_request_id}
+        )
         return await facade.resume(
             turn_id,
             action,
             user_input=user_input,
             event_sink=display,
+            **request_options,
         )
     finally:
         display.finish()
@@ -1362,7 +1376,7 @@ async def _chat_facade_loop(
             if query == "/commit" or query.startswith("/commit "):
                 message = query.removeprefix("/commit").strip()
                 try:
-                    from agent_runtime.git_delivery import DeliveryError
+                    from agent_runtime.git_delivery import DeliveryError, DeliveryInterruptedError
 
                     status = await facade.commit_status()
                     changed = cast("list[object]", status.get("changed", ()))
@@ -1394,9 +1408,11 @@ async def _chat_facade_loop(
                         )).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
-                    delivery = await facade.commit(message)
+                    delivery = await facade.commit(message, expected_preview_id=str(status["preview_id"]))
                     print(f"已提交 {str(delivery.get('commit_id'))[:12]} 到分支 "
                           f"{delivery.get('branch')}（{delivery.get('changed_file_count')} 个文件）。")
+                except DeliveryInterruptedError as error:
+                    print(safe_terminal_text(str(error)))
                 except (DeliveryError, OSError, RuntimeError) as error:
                     print("提交失败: " + safe_terminal_text(str(error)))
                 continue
@@ -1404,7 +1420,7 @@ async def _chat_facade_loop(
                 title = query.removeprefix("/pull").strip()
                 try:
                     from agent_runtime.checkpoints import _numeric
-                    from agent_runtime.git_delivery import DeliveryError
+                    from agent_runtime.git_delivery import DeliveryError, DeliveryInterruptedError
 
                     pr_status = await facade.pull_request_status()
                     subjects = cast("list[object]", pr_status.get("commit_subjects", ()))
@@ -1440,9 +1456,13 @@ async def _chat_facade_loop(
                         )).strip()
                         if confirm.casefold() not in {"y", "yes"}:
                             continue
-                    pull_request = await facade.open_pull_request(title=title or None)
+                    pull_request = await facade.open_pull_request(
+                        title=title or None, expected_preview_id=str(pr_status["preview_id"]),
+                    )
                     verb = "已创建" if pull_request.get("created") else "已更新"
                     print(f"{verb} Pull Request：{pull_request.get('url')}")
+                except DeliveryInterruptedError as error:
+                    print(safe_terminal_text(str(error)))
                 except (DeliveryError, OSError, RuntimeError) as error:
                     print("创建 Pull Request 失败: " + safe_terminal_text(str(error)))
                 continue
@@ -1519,6 +1539,7 @@ async def _chat_facade_loop(
                             continue
                     ci_message = compose_ci_failure_message(
                         branch=str(report.get("branch")),
+                        head_commit=str(report.get("head_commit") or ""),
                         pull_request_url=(
                             str(report["pull_request_url"])
                             if isinstance(report.get("pull_request_url"), str) else None
@@ -1685,9 +1706,12 @@ async def _chat_facade_loop(
             try:
                 if saved_result is not None:
                     assert saved_action is not None
+                    resume_options: _ResumeOptions = (
+                        {"files": list(pending_files)} if pending_files and saved_action != "abort" else {}
+                    )
                     submission = resume_driver.resume(saved_result.turn_id, saved_action,
                         user_input=saved_input, event_sink=event_display,
-                        **({"files": list(pending_files)} if pending_files and saved_action != "abort" else {}))
+                        **resume_options)
                 else:
                     assert session is not None
                     submission = session.submit(query, event_sink=event_display, **(
@@ -2420,7 +2444,7 @@ def agent_chat(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
     approval_mode: Annotated[
@@ -2616,7 +2640,7 @@ def agent_run(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     web_limits_file: Annotated[
         Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS",
@@ -2674,14 +2698,15 @@ def agent_run(
                 "--worktree 只用于新任务；继续旧 Turn 请使用其原工作区。"
             )
         created_worktree = _open_cli_worktree(worktree_name)
+    effective_database = (
+        created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
+        if created_worktree is not None else checkpoint_db
+    ).expanduser().resolve()
     facade = _create_agent_facade(
         reasoning_effort=reasoning_effort,
         max_output_tokens=max_output_tokens,
         model=model,
-        checkpoint_db=(
-            created_worktree.worktree.root / ".praxis" / "checkpoints.sqlite"
-            if created_worktree is not None else checkpoint_db
-        ),
+        checkpoint_db=effective_database,
         workspace_path=(
             created_worktree.worktree.root if created_worktree is not None else Path.cwd()
         ),
@@ -2728,7 +2753,7 @@ def agent_run(
             "recover",
             result.turn_id,
             "--checkpoint-db",
-            str(checkpoint_db),
+            str(effective_database),
         ]
         print(f"   {shlex.join(resume_args)}")
 
@@ -2757,7 +2782,7 @@ def agent_resume(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
+                                 help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
     approval_mode: Annotated[
@@ -2793,12 +2818,15 @@ def agent_recover(
         str | None,
         typer.Option(
             "--action",
-            help=("allow_once | deny | continue | mark_completed | mark_failed | abort"),
+            help=("不带 --action 运行 recover，可查看当前可用动作"),
         ),
     ] = None,
     user_input: Annotated[
         str | None,
         typer.Option("--input", help="clarification/choice 恢复时的用户输入"),
+    ] = None,
+    request_id: Annotated[
+        str | None, typer.Option("--request-id", help="只响应指定的持久请求；请求改变时先重新查看"),
     ] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="详细输出")] = False,
     web_limits_file: Annotated[
@@ -2815,7 +2843,7 @@ def agent_recover(
     ] = None,
     web_search_provider: Annotated[
         str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
-                                 help="bing | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
+                                 help="deepseek | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
     approval_mode: Annotated[
@@ -2873,6 +2901,7 @@ def agent_recover(
     )
     event_display = _CLIToolEventDisplay()
     if action is None:
+        recovery = _run_cli_async(facade.recovery_state(effective_turn_id))
         pending = _run_cli_async(
             _pending_resume_request(
                 facade,
@@ -2884,6 +2913,7 @@ def agent_recover(
             pending,
             turn_id=effective_turn_id,
             checkpoint_db=checkpoint_db,
+            recovery=recovery,
         )
         raise typer.Exit(code=2)
     result = _run_cli_async(
@@ -2893,6 +2923,7 @@ def agent_recover(
             action=action,
             user_input=user_input,
             event_display=event_display,
+            expected_request_id=request_id,
         )
     )
     _display_agent_result(
@@ -2971,6 +3002,7 @@ async def _watch_command(
             resolved_thread = sessions[0].thread_id
         message = compose_ci_failure_message(
             branch=report.branch,
+            head_commit=report.head_commit,
             pull_request_url=report.pull_request_url,
             failed=[(check.name, check.workflow) for check in failed],
             failure_logs=report.failure_logs,

@@ -59,7 +59,9 @@ agent worktree prune                # 清理最旧的干净 worktree（保留最
 - **自包含状态**：worktree 会话的 Rollout 数据库放在 `<worktree>/.praxis/checkpoints.sqlite`，主工作区的会话列表不受影响；在 worktree 目录里 `--continue` 即可恢复。
 - **未提交变更不进入 worktree**：基准是 HEAD 提交。创建输出会提示源工作区未提交文件数量。需要 `.env` 等被忽略的文件时，在仓库根放 `.worktreeinclude`（gitignore 语法，一行一个模式），创建时复制匹配且被忽略的文件（上限 200 个文件 / 64 MiB）。
 - **交付不变**：在 worktree 里 `/commit` 照常创建 `praxis/*` 分支并提交；该分支继承 worktree 分支记录的真实上游，`/pull` 的 base 不变。交付后 worktree 分支仍在基准上，`agent worktree remove` 可以直接清理。
-- **删除保护**：有未提交变更、或有 worktree 分支上未合并的提交时，`remove` 拒绝执行并说明原因，需要显式 `--force`；无法判定状态时同样按受保护处理。`prune` 永不删除受保护项。
+- **删除保护**：打开的会话持有工作区共享锁，删除必须取得排他锁，因此会话空闲等待输入时也受保护；即使 `--force` 也要先关闭会话。未结束的任务、未提交变更（包括被忽略的用户文件）或 worktree 分支上的未合并提交需要显式 `--force` 才能放弃；`.praxis/` 运行时状态不计入脏文件数。无法判定状态时同样按受保护处理，`prune` 不会强制删除。
+- **仓库范围**：`list`、`remove`、`prune` 按 Git common directory 识别当前仓库；共享 worktree 根目录中的其它仓库不受影响。
+- **Git 读取**：沙箱验证 linked worktree 的双向元数据指针后，只读开放对应 Git 元数据，使 `git status`、`git diff`、`git log` 正常工作；源检出的普通文件和 Git 元数据写入仍受原有权限边界限制。
 - **防嵌套**：在 worktree 里再执行 `--worktree` 会拒绝，避免 worktree 套 worktree。
 
 ## 限制

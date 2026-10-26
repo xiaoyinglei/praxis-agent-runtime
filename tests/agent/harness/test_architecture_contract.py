@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 ROOT = Path(__file__).parents[3]
@@ -10,9 +11,20 @@ def _sources_containing(needle: str) -> set[Path]:
     return {path.relative_to(ROOT) for path in RUNTIME.rglob("*.py") if needle in path.read_text(encoding="utf-8")}
 
 
+def _constructor_owners(name: str) -> set[Path]:
+    return {
+        path.relative_to(ROOT)
+        for path in RUNTIME.rglob("*.py")
+        if any(isinstance(node, ast.Call) and (
+            isinstance(node.func, ast.Name) and node.func.id == name
+            or isinstance(node.func, ast.Attribute) and node.func.attr == name
+        ) for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
+    }
+
+
 def test_rollout_reducer_and_tool_runtime_each_have_one_behavior_owner() -> None:
     assert _sources_containing("self._append_and_reduce(") == {Path("agent_runtime/harness/rollout.py")}
-    assert _sources_containing("ToolExecutor(tools)") == {Path("agent_runtime/harness/tool_orchestrator.py")}
+    assert _constructor_owners("ToolExecutor") == {Path("agent_runtime/harness/tool_orchestrator.py")}
     assert _sources_containing("tool.run(arguments)") == {Path("agent_runtime/tools/executor.py")}
     assert _sources_containing("executor = TurnExecutor(") == {Path("agent_runtime/harness/session.py")}
 

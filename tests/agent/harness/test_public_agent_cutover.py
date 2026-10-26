@@ -945,6 +945,7 @@ async def test_public_astream_emits_committed_turn_start_before_model_finishes(
     first = await asyncio.wait_for(anext(stream), timeout=1.0)
 
     assert first.type is EventType.TURN_STARTED
+    await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
     assert model.dispatch_started.is_set()
     assert not model.release_dispatch.is_set()
     model.release_dispatch.set()

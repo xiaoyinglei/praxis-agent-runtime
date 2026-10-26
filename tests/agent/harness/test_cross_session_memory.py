@@ -614,3 +614,71 @@ async def test_new_topic_preserves_a_bank_larger_than_navigation_capacity(tmp_pa
         assert result["status"] == "updated"
         entries = store.read_memory_state(tmp_path)["entries"]
         assert len(entries) == 46 and entries[:45] == originals
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("large_old_source", [False, True])
+async def test_exhausted_memory_batch_stays_blocked_but_new_source_revision_can_learn(tmp_path, large_old_source):
+    from agent_runtime.harness.memory import update_memory
+
+    class InvalidModel(MemoryModel):
+        async def dispatch(self, prepared, *, delta_sink=None):
+            return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
+
+    with RolloutStore(tmp_path / "r.db") as store:
+        source, _ = seed(store, tmp_path, text="old material " * (5000 if large_old_source else 1))
+        for attempt in range(2):
+            result = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
+            assert result["status"] == ("failed" if attempt == 0 else "budget_exhausted")
+            job = store.read_memory_jobs(tmp_path)[source.thread_id]
+            if attempt == 0:
+                store.write_memory_job(tmp_path, source.thread_id, {**job, "retry_after": 0})
+        valid = MemoryModel()
+        assert (await update_memory(store, workspace=tmp_path, model=valid, binding={}))["status"] == "budget_exhausted"
+        assert valid.requests == []
+        new_turn = store.start_turn(thread_id=source.thread_id, user_message="A newly verified reusable convention.",
+                                    binding_manifest={"memory_generation_allowed": True})
+        store.complete_turn(turn_id=new_turn.turn_id, answer="verified")
+        result = await update_memory(store, workspace=tmp_path, model=valid, binding={})
+        assert result["status"] == "updated"
+        assert [request.purpose for request in valid.requests] == ["memory_extract", "memory_consolidate"]
+        assert store.read_memory_state(tmp_path)["entries"]
+        for _ in range(10):
+            if not result.get("has_more"):
+                break
+            result = await update_memory(store, workspace=tmp_path, model=valid, binding={})
+            assert result["status"] == "updated"
+        assert not result.get("has_more")
+        new_user_item = next(item.item_id for item in store.list_items(new_turn.turn_id) if item.kind == "user_message")
+        extracted_sources = [record["item_id"] for request in valid.requests if request.purpose == "memory_extract"
+                             for record in json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])]
+        assert new_user_item in extracted_sources
+        exhausted = store.read_memory_jobs(tmp_path)[source.thread_id]["exhausted_batches"]
+        assert exhausted[0]["turn_ids"] == job["turn_ids"]
+        assert (await update_memory(store, workspace=tmp_path, model=valid, binding={}))["status"] == "unchanged"
+        # A successful newer batch never refunds the exhausted batch's real usage.
+        assert sum(store.read_budget_state(turn_id).used.total_tokens for turn_id in job["turn_ids"]) == 24000
+
+
+@pytest.mark.anyio
+async def test_appending_history_cannot_refund_the_same_failed_memory_batch(tmp_path):
+    from agent_runtime.harness.memory import update_memory
+
+    class InvalidModel(MemoryModel):
+        async def dispatch(self, prepared, *, delta_sink=None):
+            return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
+
+    with RolloutStore(tmp_path / "r.db") as store:
+        source, _ = seed(store, tmp_path, text="unchanged first batch " * 5000)
+        assert (await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={}))["status"] == "failed"
+        previous = store.read_memory_jobs(tmp_path)[source.thread_id]
+        later = store.start_turn(thread_id=source.thread_id, user_message="appended beyond the first batch",
+                                 binding_manifest={"memory_generation_allowed": True})
+        store.complete_turn(turn_id=later.turn_id, answer="done")
+        second = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
+        assert second["status"] == "budget_exhausted"
+        current = store.read_memory_jobs(tmp_path)[source.thread_id]
+        assert current["batch_hash"] == previous["batch_hash"]
+        assert current["source_revision"] != previous["source_revision"]
+        assert len(current["turn_ids"]) == 2
+        assert sum(store.read_budget_state(turn_id).used.total_tokens for turn_id in current["turn_ids"]) == 24000

@@ -169,10 +169,6 @@ def _source(
             continue
         if _unresolved(store, jobs.get(thread.thread_id, {})):
             continue
-        if jobs.get(thread.thread_id, {}).get("status") == "budget_exhausted":
-            continue
-        if jobs.get(thread.thread_id, {}).get("retry_after", 0) > time.time():
-            continue
         turns = store.list_turns(thread.thread_id)
         if not turns or any(t.binding_manifest.get("memory_maintenance")
                             or t.binding_manifest.get("budget_parent_turn_id") for t in turns):
@@ -190,6 +186,11 @@ def _source(
             "turns": [(t.turn_id, t.applied_thread_sequence) for t in turns if t.turn_id in permitted_turns],
             "source_byte_limit": MAX_SOURCE_BYTES,
         }, sort_keys=True).encode()).hexdigest()
+        previous_job = jobs.get(thread.thread_id, {})
+        exhausted = previous_job.get("status") == "budget_exhausted"
+        if previous_job.get("source_revision") == revision and (
+                exhausted or previous_job.get("retry_after", 0) > time.time()):
+            continue
         legacy_skip = any(e["thread_id"] == thread.thread_id and e["reason"] == "source_bytes_exceeded"
                           for e in state.get("skipped_sources", []))
         if state["processed"].get(thread.thread_id) == revision and not legacy_skip:
@@ -198,6 +199,10 @@ def _source(
                  if i.turn_id in permitted_turns and i.status == "completed" and i.kind in {
                      "user_message", "agent_message", "tool_result", "verification", "completion_feedback"}]
         cursor = state.get("source_cursors", {}).get(thread.thread_id, {})
+        if exhausted:
+            # New history may contribute, but never rebuy the exhausted batch.
+            # Original Items and its maintenance Turns remain durable evidence.
+            cursor = previous_job.get("next_cursor", cursor)
         if cursor.get("source_byte_limit", MAX_SOURCE_BYTES) != MAX_SOURCE_BYTES:
             cursor = {}
         start = next((n for n, i in enumerate(items) if i.item_id == cursor.get("item_id")), 0)
@@ -254,9 +259,14 @@ async def update_memory(
         turn_ids = list(previous.get("turn_ids", [])) if same_batch else []
         cached = (previous.get("candidates") if same_batch and previous.get("memory_version") == state["version"]
                   and previous.get("source_revision") == revision else None)
+        exhausted_batches = list(previous.get("exhausted_batches", ()))
+        if previous.get("status") == "budget_exhausted":
+            exhausted_batches.append({key: previous[key] for key in (
+                "source_revision", "batch_hash", "turn_ids", "next_cursor") if key in previous})
         job = store.write_memory_job(workspace, source_thread, {
             "status": "running", "source_revision": revision, "batch_hash": batch_hash,
             "turn_ids": turn_ids, "memory_version": state["version"],
+            "next_cursor": next_cursor, "exhausted_batches": exhausted_batches,
             **({"candidates": cached} if cached is not None else {}),
         }, owner=owner, expected_revision=previous.get("revision", 0))
         refs = {i["item_id"]: i["thread_id"] for i in records}
@@ -465,7 +475,8 @@ def create_memory_tool(store: RolloutStore) -> Tool:
         "limit": {"type": "integer", "minimum": 1, "maximum": 8},
     }, "additionalProperties": False}
 
-    def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:
+    async def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:
+        # This short Store-bound operation must keep the SQLite owner thread.
         turn = store.read_turn(current_tool_turn_id())
         snapshot = turn.binding_manifest.get("memory_snapshot")
         if not snapshot:
