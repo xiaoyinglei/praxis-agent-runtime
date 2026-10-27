@@ -270,6 +270,11 @@ def test_agent_recover_without_action_prints_pending_recovery_info(
     resumed: list[bool] = []
 
     class _Facade:
+        async def recovery_state(self, passed_turn_id: str):
+            assert passed_turn_id == turn_id
+            return {"actions": ["allow_once", "deny", "abort"], "reason_code": "tool_approval_required",
+                    "evidence_ids": [request.request_id], "request_id": request.request_id, "requires_input": False}
+
         async def pending_input(
             self,
             passed_turn_id: str,
@@ -301,7 +306,7 @@ def test_agent_recover_without_action_prints_pending_recovery_info(
     assert resumed == []
 
 
-def test_agent_recover_without_pending_request_offers_continue(
+def test_agent_recover_without_pending_request_uses_the_recovery_plan(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -310,6 +315,11 @@ def test_agent_recover_without_pending_request_offers_continue(
     turn_id = _persist_cli_turn(database, tmp_path / "workspace")
 
     class _Facade:
+        async def recovery_state(self, passed_turn_id: str):
+            assert passed_turn_id == turn_id
+            return {"actions": ["continue", "abort"], "reason_code": "before_first_dispatch",
+                    "evidence_ids": [turn_id], "request_id": None, "requires_input": False}
+
         async def pending_input(
             self,
             passed_turn_id: str,
@@ -328,8 +338,37 @@ def test_agent_recover_without_pending_request_offers_continue(
 
     output = capsys.readouterr().out
     assert exc_info.value.exit_code == 2
-    assert "中断执行" in output
+    assert "before_first_dispatch" in output
     assert "--action continue" in output
+
+
+@pytest.mark.parametrize("kind", ["paused", "choice"])
+def test_recover_inspection_prints_only_real_actions(tmp_path, monkeypatch, capsys, kind):
+    database = tmp_path / "run.sqlite"
+    workspace = tmp_path / "workspace"
+    turn_id = _persist_cli_turn(database, workspace)
+    with RolloutStore(database) as store:
+        if kind == "choice":
+            request = store.request_choice(turn_id=turn_id, question="Which output?", options=("csv", "xlsx"))
+        else:
+            store.pause_turn(turn_id=turn_id, reason="no continuation")
+        before = store.list_records(store.read_turn(turn_id).thread_id)
+    monkeypatch.setattr(Agent, "session", lambda *_args, **_kwargs: pytest.fail("inspection opens live runtime"))
+    with pytest.raises(typer.Exit) as stopped:
+        cli.agent_recover(turn_id=turn_id, checkpoint_db=database, action=None)
+    assert stopped.value.exit_code == 2
+    output = capsys.readouterr().out
+    assert "--action abort" in output
+    if kind == "choice":
+        assert "--action continue" in output and "--input" in output
+        assert f"--request-id {request.request_id}" in output
+        assert "可选输入: csv, xlsx" in output
+        assert "--action csv" not in output and "--action xlsx" not in output
+    else:
+        assert "--action continue" not in output
+        assert "no_resume_point" in output
+    with RolloutStore(database) as store:
+        assert store.list_records(store.read_turn(turn_id).thread_id) == before
 
 
 def test_interactive_terminal_fails_closed_for_ci_or_non_tty(

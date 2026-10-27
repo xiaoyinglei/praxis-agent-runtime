@@ -362,3 +362,126 @@ async def test_mcp_schema_failure_is_normalized_before_transport_call(
     assert execution.result.is_error is True
     assert execution.result.error_code == "invalid_arguments"
     assert calls == 0
+
+
+@pytest.mark.anyio
+async def test_cancelled_stdio_initialization_closes_acquired_resources(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from contextlib import asynccontextmanager
+
+    from agent_runtime.runtime import mcp as runtime
+
+    initializing = asyncio.Event()
+    exited: list[str] = []
+    same_owner: list[bool] = []
+
+    @asynccontextmanager
+    async def transport(_params):
+        owner = asyncio.current_task()
+        try:
+            yield (None, None)
+        finally:
+            exited.append("transport")
+            same_owner.append(asyncio.current_task() is owner)
+
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        async def __aenter__(self):
+            self.owner = asyncio.current_task()
+            return self
+        async def __aexit__(self, *_args):
+            exited.append("session")
+            same_owner.append(asyncio.current_task() is self.owner)
+        async def initialize(self):
+            initializing.set()
+            await asyncio.Event().wait()
+
+    config = tmp_path / "cancel.yaml"
+    config.write_text("servers:\n- name: slow\n  command: ignored\n  enabled: true\n  allow_all_tools: true\n")
+    monkeypatch.setattr(runtime, "stdio_client", transport)
+    monkeypatch.setattr(runtime, "ClientSession", Session)
+    context = runtime.open_product_mcp_tools(config)
+    opening = asyncio.create_task(context.__aenter__())
+    await asyncio.wait_for(initializing.wait(), timeout=1)
+    opening.cancel()
+    await asyncio.gather(opening, return_exceptions=True)
+    assert exited == ["session", "transport"]
+    assert same_owner == [True, True]
+
+
+@pytest.mark.anyio
+async def test_stdio_resource_owner_survives_cross_task_session_close(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    from contextlib import asynccontextmanager
+    from types import SimpleNamespace
+
+    from agent_runtime.runtime import mcp as runtime
+
+    same_owner = []
+
+    @asynccontextmanager
+    async def transport(_params):
+        owner = asyncio.current_task()
+        try:
+            yield (None, None)
+        finally:
+            same_owner.append(asyncio.current_task() is owner)
+
+    class Session:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        async def __aenter__(self):
+            self.owner = asyncio.current_task()
+            return self
+        async def __aexit__(self, *_args):
+            same_owner.append(asyncio.current_task() is self.owner)
+        async def initialize(self):
+            return SimpleNamespace(serverInfo=SimpleNamespace(version="test"))
+        async def list_tools(self):
+            return SimpleNamespace(tools=[])
+
+    config = tmp_path / "owner.yaml"
+    config.write_text("servers:\n- name: owner\n  command: ignored\n  enabled: true\n  allow_all_tools: true\n")
+    monkeypatch.setattr(runtime, "stdio_client", transport)
+    monkeypatch.setattr(runtime, "ClientSession", Session)
+    context = runtime.open_product_mcp_tools(config)
+    await context.__aenter__()
+    await asyncio.create_task(context.__aexit__(None, None, None))
+    assert same_owner == [True, True]
+
+
+@pytest.mark.anyio
+async def test_real_host_stdio_cancel_reaps_the_child(tmp_path: Path) -> None:
+    import asyncio
+    import os
+
+    pid_file = tmp_path / "pid"
+    script = tmp_path / "slow.py"
+    script.write_text("import os, time\nfrom pathlib import Path\n"
+                      f"Path({str(pid_file)!r}).write_text(str(os.getpid()))\ntime.sleep(120)\n")
+    config = tmp_path / "real-cancel.yaml"
+    config.write_text(f"servers:\n- name: slow\n  command: {sys.executable}\n  args: [{str(script)}]\n"
+                      "  enabled: true\n  allow_all_tools: true\n")
+    context = open_product_mcp_tools(config)
+    opening = asyncio.create_task(context.__aenter__())
+    pid = None
+    try:
+        async with asyncio.timeout(5):
+            while not pid_file.exists():
+                await asyncio.sleep(0.01)
+        pid = int(pid_file.read_text())
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(opening, timeout=5)
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        if not opening.done():
+            opening.cancel()
+            await asyncio.gather(opening, return_exceptions=True)
+        if pid is not None:
+            try:
+                os.kill(pid, 15)
+            except ProcessLookupError:
+                pass

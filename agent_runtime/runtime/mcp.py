@@ -224,34 +224,10 @@ async def open_product_mcp_tools(
                 if isinstance(config, _HTTPServerConfig):
                     if effective is not None and effective.network_decision(config.url) != "allow":
                         raise PermissionError("remote MCP discovery requires network allow for its destination")
-                    connection = await server_stack.enter_async_context(_http_mcp_connection(
-                        config, config_path, permissions, permission_provider, close_timeout_seconds,
-                    ))
-                    session, initialized, listed, credential_revision = connection
-                else:
-                    if effective is not None:
-                        params = _sandboxed_mcp_parameters(config, effective, server_stack)
-                    else:
-                        params = StdioServerParameters(
-                            command=config.command, args=list(config.args),
-                            env=dict(config.env) or None, cwd=config.cwd,
-                        )
-                    streams = await asyncio.wait_for(
-                        server_stack.enter_async_context(stdio_client(params)),
-                        timeout=config.startup_timeout_seconds,
-                    )
-                    session = await asyncio.wait_for(
-                        server_stack.enter_async_context(ClientSession(streams[0], streams[1])),
-                        timeout=config.startup_timeout_seconds,
-                    )
-                    initialized = await asyncio.wait_for(
-                        session.initialize(),
-                        timeout=config.startup_timeout_seconds,
-                    )
-                    listed = await asyncio.wait_for(
-                        session.list_tools(),
-                        timeout=config.startup_timeout_seconds,
-                    )
+                connection = await server_stack.enter_async_context(_owned_mcp_connection(
+                    config, config_path, effective, permission_provider, close_timeout_seconds,
+                ))
+                session, initialized, listed, credential_revision = connection
                 listed_names = {item.name for item in listed.tools}
                 missing = config.tools_allowlist - listed_names
                 if missing:
@@ -315,7 +291,14 @@ async def open_product_mcp_tools(
                             }, sort_keys=True).encode()).hexdigest(),
                         )
                     )
-            except Exception as exc:
+            except BaseException as exc:
+                # The local stack owns resources as soon as acquisition succeeds;
+                # cancellation before transfer must close them in this same task.
+                await _close_mcp_stack(
+                    server_stack, timeout_seconds=close_timeout_seconds, label=f"server {config.name}",
+                )
+                if not isinstance(exc, Exception):
+                    raise
                 if diagnostics is not None:
                     diagnostics.append(
                         RuntimeDiagnostic.from_exception(
@@ -328,11 +311,6 @@ async def open_product_mcp_tools(
                     "MCP server %s is unavailable: %s",
                     config.name,
                     exc,
-                )
-                await _close_mcp_stack(
-                    server_stack,
-                    timeout_seconds=close_timeout_seconds,
-                    label=f"server {config.name}",
                 )
                 continue
 
@@ -495,10 +473,10 @@ async def _http_mcp_streams(config: _HTTPServerConfig, config_path: Path,
 
 
 @asynccontextmanager
-async def _http_mcp_connection(config: _HTTPServerConfig, config_path: Path,
-                               permissions: ResolvedPermissions | None,
-                               provider: Callable[[], ResolvedPermissions] | None,
-                               close_timeout: float) -> AsyncIterator[Any]:
+async def _owned_mcp_connection(config: _StdioServerConfig | _HTTPServerConfig, config_path: Path,
+                                permissions: ResolvedPermissions | None,
+                                provider: Callable[[], ResolvedPermissions] | None,
+                                close_timeout: float) -> AsyncIterator[Any]:
     # MCP SDK contexts use task-local AnyIO cancel scopes. The owning task must
     # enter and leave them, including when discovery fails or shutdown is bounded.
     ready: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
@@ -506,29 +484,46 @@ async def _http_mcp_connection(config: _HTTPServerConfig, config_path: Path,
 
     async def serve() -> None:
         try:
-            async with _http_mcp_streams(config, config_path, permissions, provider) as connection:
-                streams, credential_revision = connection
-                async with ClientSession(streams[0], streams[1], read_timeout_seconds=timedelta(
-                    seconds=config.startup_timeout_seconds,
-                )) as session:
-                    async with asyncio.timeout(config.startup_timeout_seconds):
-                        initialized = await session.initialize()
-                        listed = await session.list_tools()
-                    # Initialization may silently refresh OAuth. Bind the actual
-                    # authenticated identity after that refresh has completed.
+            async with AsyncExitStack() as resources:
+                async with asyncio.timeout(config.startup_timeout_seconds):
+                    if isinstance(config, _HTTPServerConfig):
+                        streams, credential_revision = await resources.enter_async_context(
+                            _http_mcp_streams(config, config_path, permissions, provider),
+                        )
+                        client = ClientSession(streams[0], streams[1], read_timeout_seconds=timedelta(
+                            seconds=config.startup_timeout_seconds,
+                        ))
+                    else:
+                        params = (_sandboxed_mcp_parameters(config, permissions, resources)
+                                  if permissions is not None else StdioServerParameters(
+                                      command=config.command, args=list(config.args),
+                                      env=dict(config.env) or None, cwd=config.cwd,
+                                  ))
+                        streams = await resources.enter_async_context(stdio_client(params))
+                        def no_credentials() -> None:
+                            return None
+                        credential_revision = no_credentials
+                        client = ClientSession(streams[0], streams[1])
+                    session = await resources.enter_async_context(client)
+                    initialized = await session.initialize()
+                    listed = await session.list_tools()
+                # Bind any OAuth refresh only after initialization completes.
+                if not ready.done():
                     ready.set_result((session, initialized, listed, credential_revision()))
-                    await stop.wait()
+                await stop.wait()
         except BaseException as error:
             if not ready.done():
                 ready.set_exception(error)
             elif not isinstance(error, asyncio.CancelledError):
-                logger.warning("MCP HTTP connection %s closed: %s", config.name, type(error).__name__)
+                logger.warning("MCP connection %s closed: %s", config.name, type(error).__name__)
 
-    task = asyncio.create_task(serve(), name=f"mcp-http:{config.name}")
+    task = asyncio.create_task(serve(), name=f"mcp-owner:{config.name}")
     try:
         yield await ready
     finally:
         stop.set()
+        if ready.cancelled():
+            task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(task), close_timeout)
         except TimeoutError:

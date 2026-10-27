@@ -12,7 +12,7 @@ from uuid import uuid4
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.memory import MemoryEntry
 from agent_runtime.harness.protocol import ContextSourceChangedError
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.rollout import RolloutStore, _store_operation
 from agent_runtime.tools.tool import JsonValue, NormalizedToolOutput, Tool
 
 MemoryKind = Literal["preference", "fact", "reference"]
@@ -50,6 +50,7 @@ def record_revision(
     return stamped
 
 
+@_store_operation
 def _write(
     store: RolloutStore,
     workspace: Path,
@@ -218,18 +219,19 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         "additionalProperties": False,
     }
 
-    def run(arguments: Mapping[str, Any]) -> NormalizedToolOutput:
+    async def run(arguments: Mapping[str, Any]) -> NormalizedToolOutput:
         from agent_runtime.harness.memory import delete_memory
 
-        turn = store.read_turn(current_tool_turn_id())
-        thread = store.read_thread(turn.thread_id)
+        turn = await store.run_async(store.read_turn, current_tool_turn_id())
+        thread = await store.run_async(store.read_thread, turn.thread_id)
         workspace = Path(thread.workspace).resolve()
         action, key = arguments["action"], arguments["key"]
         if action == "explain":
             snapshot = turn.binding_manifest.get("memory_snapshot")
             if snapshot is None:
                 raise ValueError("no memory snapshot")
-            result = explain_memory(
+            result = await store.run_async(
+                explain_memory,
                 store,
                 workspace,
                 key=key,
@@ -240,17 +242,21 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         else:
             if thread.parent_thread_id is not None or turn.binding_manifest.get("budget_parent_turn_id"):
                 raise ValueError("child agents cannot make explicit user memory edits")
-            sources = [
-                i.item_id
-                for i in store.list_items(turn.turn_id)
-                if i.kind == "user_message" and i.status == "completed" and i.producer == "user"
-            ]
+            sources = await store.run_async(
+                lambda: [
+                    i.item_id
+                    for i in store.list_items(turn.turn_id)
+                    if i.kind == "user_message" and i.status == "completed" and i.producer == "user"
+                ]
+            )
             if not sources:
                 raise ValueError("a current user message is required for explicit memory edits")
             if "expected_version" not in arguments:
                 raise ValueError("writes require expected_version from the memory snapshot or last edit result")
             if action == "forget":
-                result = delete_memory(store, workspace, key, expected_version=arguments["expected_version"])
+                result = await store.run_async(
+                    delete_memory, store, workspace, key, expected_version=arguments["expected_version"]
+                )
                 result = {"version": result["version"], "forgotten_key": key}
             else:
                 if "text" not in arguments:
@@ -262,7 +268,8 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
                     "expected_version": arguments["expected_version"],
                 }
                 if action == "remember":
-                    result = remember_memory(
+                    result = await store.run_async(
+                        remember_memory,
                         store,
                         workspace,
                         title=arguments.get("title", key),
@@ -270,8 +277,13 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
                         **kwargs,
                     )
                 else:
-                    result = edit_memory(
-                        store, workspace, title=arguments.get("title"), kind=arguments.get("kind"), **kwargs
+                    result = await store.run_async(
+                        edit_memory,
+                        store,
+                        workspace,
+                        title=arguments.get("title"),
+                        kind=arguments.get("kind"),
+                        **kwargs,
                     )
                 result = {
                     "version": result["version"],

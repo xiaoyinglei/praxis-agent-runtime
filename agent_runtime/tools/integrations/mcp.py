@@ -25,9 +25,6 @@ from agent_runtime.tools.tool import (
 )
 
 _INVALID_NAME = re.compile(r"[^a-z0-9_]+")
-_MAX_TEXT_CHARS = 100_000
-_MAX_IMAGE_DATA_CHARS = 250_000
-_MAX_CONTENT_BLOCKS = 20
 
 type MCPCaller = Callable[
     [str, str, Mapping[str, JsonValue]],
@@ -179,7 +176,7 @@ def _normalize_mcp_output(
     blocks: list[ToolContentBlock] = []
     content = _field(raw, "content", default=())
     if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
-        for item in content[:_MAX_CONTENT_BLOCKS]:
+        for item in content:
             block = _content_block(item)
             if block is not None:
                 blocks.append(block)
@@ -190,17 +187,17 @@ def _normalize_mcp_output(
             blocks.append(
                 ToolContentBlock(
                     type="text",
-                    data={"text": text[:_MAX_TEXT_CHARS]},
+                    data={"text": text},
                 )
             )
         images = _field(raw, "images", default=())
         if isinstance(images, Sequence) and not isinstance(images, (str, bytes)):
-            for image in images[:_MAX_CONTENT_BLOCKS - len(blocks)]:
+            for image in images:
                 if isinstance(image, str):
                     blocks.append(
                         ToolContentBlock(
                             type="image",
-                            data={"data": image[:_MAX_IMAGE_DATA_CHARS]},
+                            data={"data": image},
                         )
                     )
         resources = _field(raw, "resources", default=())
@@ -208,12 +205,12 @@ def _normalize_mcp_output(
             resources,
             (str, bytes),
         ):
-            for resource in resources[:_MAX_CONTENT_BLOCKS - len(blocks)]:
+            for resource in resources:
                 if isinstance(resource, str):
                     blocks.append(
                         ToolContentBlock(
                             type="resource",
-                            data={"uri": resource[:4096]},
+                            data={"uri": resource},
                         )
                     )
 
@@ -255,17 +252,17 @@ def _content_block(raw: object) -> ToolContentBlock | None:
         if isinstance(text, str):
             return ToolContentBlock(
                 type="text",
-                data={"text": text[:_MAX_TEXT_CHARS]},
+                data={"text": text},
             )
     if block_type == "image":
         data = _field(raw, "data", default="")
         media_type = _field(raw, "mimeType", "mime_type", default="")
         if isinstance(data, str):
             payload: dict[str, JsonValue] = {
-                "data": data[:_MAX_IMAGE_DATA_CHARS]
+                "data": data
             }
             if isinstance(media_type, str) and media_type:
-                payload["mime_type"] = media_type[:200]
+                payload["mime_type"] = media_type
             return ToolContentBlock(type="image", data=payload)
     if block_type == "resource":
         resource = _field(raw, "resource", default={})
@@ -275,13 +272,13 @@ def _content_block(raw: object) -> ToolContentBlock | None:
         text = _field(resource, "text", default=None)
         if isinstance(text, str):
             return ToolContentBlock(type="text", data={
-                "text": text[:_MAX_TEXT_CHARS], "resource_uri": str(uri)[:4096],
-                "truncated": len(text) > _MAX_TEXT_CHARS,
+                "text": text, "resource_uri": str(uri),
+                "truncated": False,
             })
         if isinstance(uri, (str, AnyUrl)):
             return ToolContentBlock(
                 type="resource",
-                data={"uri": str(uri)[:4096]},
+                data={"uri": str(uri)},
             )
     return None
 

@@ -74,7 +74,7 @@ def test_no_saved_chats_does_not_create_database(tmp_path):
     assert not database.parent.exists()
 
 
-def test_replay_keeps_original_messages_after_context_compaction_and_deduplicates_answer(tmp_path):
+def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answer_identity(tmp_path):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -90,7 +90,9 @@ def test_replay_keeps_original_messages_after_context_compaction_and_deduplicate
             operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
             text="final answer", provider_response_id=None, usage={}, now=2,
         )
-        store.complete_turn(turn_id=turn.turn_id, answer="final answer")
+        response_item_id = store.list_model_operations(turn.turn_id)[-1].response_item_id
+        store.complete_turn(turn_id=turn.turn_id, answer="final answer", source_item_id=response_item_id)
+        assert store.read_turn_answer(turn.turn_id).item_id == response_item_id
         following = store.start_turn(thread_id=thread.thread_id, user_message="follow up", binding_manifest={})
         store.record_context_compaction(
             turn_id=following.turn_id, covered_item_ids=tuple(item.item_id for item in store.list_items(turn.turn_id)),

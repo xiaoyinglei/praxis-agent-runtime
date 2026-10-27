@@ -506,6 +506,8 @@ def apply_record(
             _advance(state, thread_id, turn_id, sequence)
         case "item_completed":
             item = state.items[payload["item_id"]]
+            if record.payload_schema_version >= 3 and payload.get("kind") != item["kind"]:
+                raise ValueError("completed Item kind does not match its canonical start")
             item["status"] = "completed"
             item["payload"] = payload["payload"]
             item["applied_thread_sequence"] = sequence
@@ -527,6 +529,14 @@ def apply_record(
             _advance(state, thread_id, turn_id, sequence)
         case "turn_completed":
             turn_id = payload["turn_id"]
+            if record.payload_schema_version >= 3:
+                identity = payload.get("answer_item_id")
+                answer = state.items.get(identity) if isinstance(identity, str) else None
+                if (answer is None or answer["turn_id"] != turn_id or answer["status"] != "completed"
+                        or answer["kind"] not in {"model_response", "agent_message"}
+                        or not isinstance(answer["payload"].get("text"), str)
+                        or answer["payload"].get("response_status", "completed") != "completed"):
+                    raise ValueError("Turn completion requires a committed answer Item from this Turn")
             turn = state.turns[turn_id]
             turn["status"] = "completed"
             turn["terminal_reason_code"] = "completed"
@@ -572,7 +582,7 @@ def _identity_v1(payload: Mapping[str, Any]) -> Mapping[str, Any]:
     return payload
 
 
-_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1}
+_PAYLOAD_UPCASTERS = {1: _identity_v1, 2: _identity_v1, 3: _identity_v1}
 
 
 def _advance(

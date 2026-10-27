@@ -49,7 +49,7 @@ async def test_tavily_preserves_query_and_uses_one_credit_request(freshness, tim
         assert json.loads(request.content) == expected
         assert result["provider"] == "tavily"
         assert result["results"] == [{"title": "Public job", "url": "https://example.com/job",
-                                      "snippet": "Duties and requirements"}]
+                                      "snippet": "Duties and requirements", "summary": None, "published_at": None}]
         assert result["freshness_requested"] == freshness
         assert result["freshness_verified"] is False
         assert result["connection_mode"] == "direct"
@@ -184,8 +184,8 @@ async def test_authenticated_json_post_cancellation_closes_response():
         await client.aclose()
 
 
-@pytest.mark.parametrize("provider,key", [("unknown", "fake-key"), ("tavily", None), ("brave", None),
-                                        ("bing", "fake-key")])
+@pytest.mark.parametrize("provider,key", [("unknown", "fake-key"), ("deepseek", None),
+                                        ("tavily", None), ("brave", None)])
 def test_search_configuration_fails_before_requests(provider, key):
     client = PublicWebClient(transport=httpx.MockTransport(lambda _: pytest.fail("Unexpected network request")))
     with pytest.raises(ValueError, match="[Ss]earch"):
@@ -193,8 +193,8 @@ def test_search_configuration_fails_before_requests(provider, key):
                          search_provider=provider, search_key=key)
 
 
-@pytest.mark.parametrize("provider,key", [("unknown", "search.key"), ("tavily", None),
-                                        ("brave", None), ("bing", "search.key"), ("", None)])
+@pytest.mark.parametrize("provider,key", [("unknown", "search.key"), ("deepseek", None), ("tavily", None),
+                                        ("brave", None), ("", None)])
 def test_sdk_rejects_invalid_search_configuration_before_model_io(provider, key):
     from agent_runtime import Agent
 
@@ -239,7 +239,8 @@ async def test_tavily_sdk_resume_preserves_provider_and_never_persists_key(tmp_p
 
 
 @pytest.mark.parametrize("command", ["run", "chat", "resume", "recover"])
-def test_cli_forwards_search_provider_and_key_from_environment(command, tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider", ["tavily", "deepseek"])
+def test_cli_forwards_search_provider_and_key_from_environment(command, provider, tmp_path, monkeypatch):
     from typer.testing import CliRunner
 
     from agent_runtime import cli
@@ -270,8 +271,8 @@ def test_cli_forwards_search_provider_and_key_from_environment(command, tmp_path
         arguments += [turn_id, "--checkpoint-db", str(database), "--action", "allow_once"]
     key = tmp_path / "search.key"
     result = CliRunner().invoke(cli.agent_app, arguments, env={
-        "PRAXIS_WEB_SEARCH_PROVIDER": "tavily", "PRAXIS_WEB_SEARCH_KEY_FILE": str(key),
+        "PRAXIS_WEB_SEARCH_PROVIDER": provider, "PRAXIS_WEB_SEARCH_KEY_FILE": str(key),
     })
     assert result.exit_code == 0, result.output
-    assert captured[0]["web_search_provider"] == "tavily"
+    assert captured[0]["web_search_provider"] == provider
     assert captured[0]["web_search_key_file"] == key

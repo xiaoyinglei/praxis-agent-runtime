@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -205,31 +206,40 @@ async def test_lagging_passive_observer_detaches_without_blocking_control() -> N
 
 
 @pytest.mark.anyio
-async def test_lagging_observer_does_not_change_another_observers_cursor() -> None:
-    dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
-    first = dispatcher.subscribe_passive(last_cursor="cursor-zero-first")
-    second = dispatcher.subscribe_passive(last_cursor="cursor-zero-second")
-
-    await dispatcher.emit(
-        events.turn_started("turn-cursor-isolation"),
-        cursor="cursor-one",
-    )
-    assert (await first.receive()).type is events.EventType.TURN_STARTED
-    await dispatcher.emit(
-        events.turn_completed("turn-cursor-isolation"),
-        cursor="cursor-two",
-    )
-    await dispatcher.emit(
-        events.turn_aborted("turn-cursor-isolation", reason="late observer"),
-        cursor="cursor-three",
-    )
-
-    with pytest.raises(stream_sinks.ObserverLagged) as first_lag:
-        await first.receive()
-    with pytest.raises(stream_sinks.ObserverLagged) as second_lag:
-        await second.receive()
-    assert first_lag.value.last_cursor == "cursor-two"
-    assert second_lag.value.last_cursor == "cursor-one"
+async def test_lagging_observer_does_not_change_another_observers_cursor(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread_id, turn_id = _start_turn(store, workspace, "observer cursor isolation")
+        store.complete_turn(turn_id=turn_id, answer="durable answer")
+        committed = _reader(store).read(thread_id)
+        assert len(committed) >= 3
+        dispatcher = stream_sinks.TurnEventDispatcher(capacity=1)
+        first = dispatcher.subscribe_passive()
+        second = dispatcher.subscribe_passive()
+        for index, record in enumerate(committed):
+            await dispatcher.emit(record.event, cursor=record.cursor)
+            if index == 0:
+                assert await first.receive() == record.event
+        with pytest.raises(stream_sinks.ObserverLagged) as first_lag:
+            await first.receive()
+        with pytest.raises(stream_sinks.ObserverLagged) as second_lag:
+            await second.receive()
+        assert first_lag.value.last_cursor == committed[0].cursor
+        assert second_lag.value.last_cursor is None
+        # Resume from the error's cursor through the real durable reader: unread
+        # buffered events must remain in the replay, independently per observer.
+        first_tail = _reader(store).read(thread_id, after=first_lag.value.last_cursor)
+        second_tail = _reader(store).read(thread_id, after=second_lag.value.last_cursor)
+        assert [record.cursor for record in first_tail] == [record.cursor for record in committed[1:]]
+        assert [record.cursor for record in second_tail] == [record.cursor for record in committed]
+        # Event.sequence is local to each replay stream; durable cursors and all
+        # other event fields retain exactly the same identities and content.
+        assert [replace(record.event, sequence=0) for record in first_tail] == [
+            replace(record.event, sequence=0) for record in committed[1:]
+        ]
+        assert [record.event for record in second_tail] == [record.event for record in committed]
+        dispatcher.close()
 
 
 def test_thread_cursor_replays_the_same_committed_tail_after_restart(

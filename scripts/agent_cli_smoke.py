@@ -20,6 +20,7 @@ from agent_runtime.cli import (
     agent_app,
 )
 from agent_runtime.harness import RolloutStore
+from agent_runtime.harness.recovery import RecoveryPlan
 from agent_runtime.result import AgentPause, AgentToolSummary
 from agent_runtime.streaming.events import (
     EventType,
@@ -108,6 +109,11 @@ def _render_recovery_commands(turn_id: str, checkpoint_db: Path) -> str:
             request,
             turn_id=turn_id,
             checkpoint_db=checkpoint_db,
+            recovery=RecoveryPlan(
+                turn_id=turn_id, status="paused", route="approval", actions=request.options,
+                reason_code="tool_approval_required", evidence_ids=(turn_id, request.request_id),
+                request_id=request.request_id,
+            ).as_dict(),
         )
     return output.getvalue()
 

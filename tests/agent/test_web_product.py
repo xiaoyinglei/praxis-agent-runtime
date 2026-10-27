@@ -54,7 +54,7 @@ async def test_product_unconfigured_search_reports_error_without_network_or_star
 
 
 @pytest.mark.anyio
-async def test_explicit_bing_resume_preserves_original_search_binding(tmp_path, monkeypatch):
+async def test_deepseek_resume_preserves_original_search_binding(tmp_path, monkeypatch):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime.tools.web_http import PublicWebClient
 
@@ -62,10 +62,12 @@ async def test_explicit_bing_resume_preserves_original_search_binding(tmp_path, 
     real_client = PublicWebClient
     monkeypatch.setattr(http_module, "PublicWebClient", lambda **options: real_client(
         **options, transport=httpx.MockTransport(lambda request: hits.append(request) or httpx.Response(
-            200, text='<ol id="b_results"><li class="b_no">No results</li></ol>',
-            headers={"content-type": "text/html"}))))
+            200, json={"results": []}))))
+    key = tmp_path / "search.key"
+    key.write_text("fake-deepseek-secret")
+    key.chmod(0o400)
     options = dict(workspace_path=tmp_path / "workspace", checkpoint_db=tmp_path / "state.sqlite",
-                   enable_workspace_mcp=False, web_search_provider="bing")
+                   enable_workspace_mcp=False, web_search_provider="deepseek", web_search_key_file=key)
     first = Agent(**options)
     monkeypatch.setattr(first, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
     paused = await first.run("Search public docs", require_workspace_change=False)
@@ -75,10 +77,10 @@ async def test_explicit_bing_resume_preserves_original_search_binding(tmp_path, 
     monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"query": "public docs"}, "web_search"))
     resumed = await second.resume(paused.turn_id, "allow_once")
     assert resumed.status == "done"
-    assert len(hits) == 1 and hits[0].url.host == "www.bing.com"
+    assert len(hits) == 1 and hits[0].url.host == "api.deepseek.com"
     with RolloutStore(options["checkpoint_db"]) as store:
         operation = store.list_tool_operations(resumed.turn_id)[0]
-        assert operation.execution_revision == "builtin-public-web-search-bing-v5"
+        assert operation.execution_revision == "builtin-public-web-search-deepseek-v2"
 
 
 @pytest.mark.anyio

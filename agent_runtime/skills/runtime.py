@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from agent_runtime.skills.catalog import SkillCatalog
+from agent_runtime.skills.models import SkillManifest
 from agent_runtime.skills.policy import SkillPolicy
 
 _SKILL_DIR_RE = re.compile(r"\$SKILL_DIR\b")
@@ -36,17 +37,14 @@ class SkillRuntime:
 
     @property
     def has_model_invocable_skills(self) -> bool:
-        return any(
-            not manifest.disable_model_invocation
-            for manifest in self.catalog.list_all()
-        )
+        return bool(self.model_invocable_skill_ids)
 
     @property
     def catalog_revision(self) -> str:
         payload = "\n".join(
             f"{manifest.skill_id}:{manifest.content_fingerprint}"
             for manifest in self.catalog.list_all()
-            if not manifest.disable_model_invocation
+            if self._invocable(manifest)
         )
         return "skills_" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -69,6 +67,16 @@ class SkillRuntime:
                 code="skill_disabled",
                 message="skill is not available for model invocation",
             )
+        if not self.policy.can_autoload(manifest):
+            return _activation_error(
+                name=name, code="skill_source_untrusted",
+                message="skill source is not trusted for model invocation",
+            )
+        if manifest.unsupported_constraints:
+            return _activation_error(
+                name=name, code="unsupported_skill_constraints",
+                message="unsupported skill constraints: " + ", ".join(manifest.unsupported_constraints),
+            )
         loaded = self.catalog.load(manifest.skill_id)
         if loaded is None:
             return _activation_error(
@@ -76,16 +84,13 @@ class SkillRuntime:
                 code="skill_not_found",
                 message="skill could not be loaded from the active catalog",
             )
-        instructions = loaded.content.replace(
-            "${SKILL_DIR}",
-            str(loaded.referenced_base_dir),
-        )
-        instructions = _SKILL_DIR_RE.sub(
-            str(loaded.referenced_base_dir),
-            instructions,
-        )
+        # Replacement text is literal data (paths, user arguments): it must
+        # never be interpreted as a regex replacement template.
+        base_dir = str(loaded.referenced_base_dir)
+        instructions = loaded.content.replace("${SKILL_DIR}", base_dir)
+        instructions = _SKILL_DIR_RE.sub(lambda _match: base_dir, instructions)
         if args is not None:
-            instructions = _ARGUMENTS_RE.sub(args, instructions)
+            instructions = _ARGUMENTS_RE.sub(lambda _match: args, instructions)
         return {
             "success": True,
             "name": manifest.name,
@@ -101,14 +106,18 @@ class SkillRuntime:
         return tuple(
             manifest.skill_id
             for manifest in self.catalog.list_all()
-            if not manifest.disable_model_invocation
+            if self._invocable(manifest)
         )
 
     def skill_root(self, skill_id: str) -> Path | None:
         manifest = self.catalog.find(skill_id)
-        if manifest is None or manifest.disable_model_invocation:
+        if manifest is None or not self._invocable(manifest):
             return None
         return manifest.root_dir
+
+    def _invocable(self, manifest: SkillManifest) -> bool:
+        return (not manifest.disable_model_invocation and self.policy.can_autoload(manifest)
+                and not manifest.unsupported_constraints)
 
 def _activation_error(*, name: str, code: str, message: str) -> dict[str, object]:
     return {

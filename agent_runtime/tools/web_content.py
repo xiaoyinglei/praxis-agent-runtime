@@ -12,7 +12,7 @@ import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
 
 from bs4 import BeautifulSoup
@@ -32,14 +32,8 @@ async def extract_content_async(body: bytes, content_type: str, url: str) -> Ext
     return ExtractedContent(**{**result, "links": tuple(result["links"])})
 
 
-async def extract_search_results_async(body: bytes) -> list[dict[str, str]]:
-    """Parse the fixed public Bing result page with the same worker limits."""
-    result = await _parse_in_worker(body, "text/html", "https://www.bing.com/search", search=True)
-    return cast(list[dict[str, str]], result["results"])
-
-
 async def _parse_in_worker(
-    body: bytes, content_type: str, url: str, *, search: bool = False,
+    body: bytes, content_type: str, url: str,
 ) -> dict[str, Any]:
     if len(body) > 2_000_000:
         raise PublicWebError("web_response_too_large", "Document exceeds the parsing byte limit.")
@@ -53,7 +47,7 @@ async def _parse_in_worker(
         env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/",
     )
     payload = json.dumps({"body": base64.b64encode(body).decode(), "content_type": content_type,
-                          "url": url, "search": search}).encode()
+                          "url": url}).encode()
     try:
         async with asyncio.timeout(_PARSER_TIMEOUT_SECONDS):
             output, _ = await process.communicate(payload)
@@ -86,58 +80,12 @@ def _worker() -> None:
     try:
         value = json.loads(sys.stdin.buffer.read(3_000_000))
         body = base64.b64decode(value["body"], validate=True)
-        if value.get("search"):
-            output = {"results": extract_search_results(body)}
-        else:
-            output = asdict(extract_content(body, value["content_type"], value["url"]))
+        output = asdict(extract_content(body, value["content_type"], value["url"]))
     except PublicWebError as error:
         output = {"error_code": error.code, "error_message": str(error)}
     except Exception:
         output = {"error_code": "web_content_invalid", "error_message": "Document parsing failed."}
     sys.stdout.write(json.dumps(output, ensure_ascii=False))
-
-
-def extract_search_results(body: bytes) -> list[dict[str, str]]:
-    """Return organic results only; challenge/unknown pages are failures, never empty success."""
-    soup = BeautifulSoup(body, "html.parser")
-    if soup.select_one('#b_captcha, #captcha, iframe[src*="captcha"], form[action*="challenge"]'):
-        raise PublicWebError("web_search_blocked", "Search service requires verification; do not retry this Turn.")
-    entries = soup.select("#b_results li.b_algo")
-    if not entries:
-        if soup.select_one("#b_results .b_no"):
-            return []
-        raise PublicWebError("web_search_invalid_response", "Search service returned an unrecognized page.")
-    results: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for entry in entries[:20]:
-        anchor = entry.select_one("h2 a[href]")
-        if anchor is None:
-            continue
-        href = str(anchor.get("href", ""))
-        if len(href) > 8192:
-            continue
-        try:
-            parsed = urlsplit(urljoin("https://www.bing.com", href))
-            if parsed.hostname in {"bing.com", "www.bing.com", "cn.bing.com"} and parsed.path == "/ck/a":
-                encoded = parse_qs(parsed.query).get("u", [""])[0]
-                if not encoded.startswith("a1"):
-                    continue
-                encoded = encoded[2:]
-                href = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True).decode()
-            url = str(validate_public_url(href))
-            if len(url) > 4096 or urlsplit(url).hostname in {"bing.com", "www.bing.com", "cn.bing.com"}:
-                continue
-        except (PublicWebError, ValueError, UnicodeError):
-            continue
-        if url in seen:
-            continue
-        seen.add(url)
-        caption = entry.select_one(".b_caption p")
-        results.append({"title": anchor.get_text(" ", strip=True)[:500], "url": url,
-                        "snippet": caption.get_text(" ", strip=True)[:2000] if caption else ""})
-    if not results:
-        raise PublicWebError("web_search_invalid_response", "Search page contained no valid public result links.")
-    return results
 
 
 @dataclass(frozen=True, slots=True)

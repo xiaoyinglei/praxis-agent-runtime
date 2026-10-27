@@ -116,3 +116,45 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
             for item in restarted.list_items(turn.turn_id)
         )
         assert restarted.verify().valid is True
+
+
+def test_completion_past_lease_boundary_commits_while_takeover_has_not_run(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        thread = store.create_thread(workspace=workspace)
+        turn = store.start_turn(
+            thread_id=thread.thread_id,
+            user_message="answer past the lease boundary",
+            binding_manifest={"model_id": "test-model"},
+        )
+        operation = store.prepare_model_operation(
+            turn_id=turn.turn_id,
+            request_hash="request-hash",
+            context_hash="context-hash",
+            tool_hash="tool-hash",
+            wire_hash="wire-hash",
+            request_ref={"request_id": "request-1"},
+        )
+        attempt = store.dispatch_model_attempt(
+            operation.operation_id,
+            worker_id="model-worker-a",
+            now=100.0,
+            lease_seconds=5.0,
+        )
+
+        accepted = store.complete_model_attempt(
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            text="billed answer",
+            provider_response_id="response-1",
+            usage={"input_tokens": 3, "output_tokens": 2},
+            now=106.0,
+        )
+
+        assert accepted is True
+        assert any(item.kind == "model_response" for item in store.list_items(turn.turn_id))
+        assert store.verify().valid is True

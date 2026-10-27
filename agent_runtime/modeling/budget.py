@@ -18,6 +18,8 @@ class LLMBudgetLedger:
 
     async def reserve(self, lease_id: str, amount: int) -> bool:
         async with self._lock:
+            if lease_id in self._reserved:
+                raise ValueError("lease is already reserved")
             if amount < 0:
                 raise ValueError("amount must be non-negative")
             if self._committed + sum(self._reserved.values()) + amount > self._total:

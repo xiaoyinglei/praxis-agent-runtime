@@ -4,9 +4,10 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, _json_object
+from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, _json_object, _store_operation
 
 
+@_store_operation
 def record_migrated_context_item(
     store: RolloutStore,
     *,

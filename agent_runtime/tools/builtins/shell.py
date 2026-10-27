@@ -798,7 +798,7 @@ async def _execute_managed_python(
         if (view is not None and not startup_failed
                 and (request.publish_on_failure or process.returncode == 0 and not timed_out)):
             try:
-                _commit_linux_workspace_view(workspace, view, initial, protected, permissions)
+                await _blocking_phase(_commit_linux_workspace_view, workspace, view, initial, protected, permissions)
                 workspace_published = True
             except (OSError, ValueError) as error:
                 publish_error = str(error)
@@ -1152,6 +1152,7 @@ def _linux_sandbox_argv(
                 argv.extend(("--ro-bind", name, name))
     argv.extend(("--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"))
     roots = set(_trusted_toolchain_roots(workspace_root))
+    roots.update(_linked_git_metadata_roots(workspace_root))
     roots.update(Path(root).resolve() for root in additional_read_roots)
     for root in sorted(roots, key=str):
         if root == Path("/"):
@@ -1637,6 +1638,7 @@ def _build_command_sandbox_profile(
     workspace = _escape_seatbelt_string(str(os.path.realpath(workspace_root)))
     temporary = _escape_seatbelt_string(str(os.path.realpath(temporary_root)))
     trusted_roots = {path.resolve() for path in _trusted_toolchain_roots(workspace_root)}
+    trusted_roots.update(_linked_git_metadata_roots(workspace_root))
     trusted_roots.update(
         Path(path).expanduser().resolve() for path in additional_read_roots if Path(path).expanduser().exists()
     )
@@ -1976,6 +1978,34 @@ def _workspace_sandbox_preflight_issue(
                 (f"workspace access refused because {first_relative} has a hardlink outside its protected scope"),
             )
     return None
+
+
+def _linked_git_metadata_roots(workspace_root: os.PathLike[str] | str) -> tuple[Path, ...]:
+    """Read registered worktree metadata without exposing the source checkout.
+
+    Validate Git's bidirectional administrative pointers before admitting the
+    common Git directory. An arbitrary workspace .git pointer is not a grant.
+    These roots enter the same read-only OS boundary as runtime toolchains.
+    """
+    pointer = Path(workspace_root).resolve() / ".git"
+    if not pointer.is_file() or pointer.is_symlink():
+        return ()
+    try:
+        targets = _git_metadata_pointer_targets(pointer, kind="gitdir")
+        if not targets:
+            return ()
+        administrative = targets[-1]
+        common_targets = _git_metadata_pointer_targets(administrative / "commondir", kind="commondir")
+        backlink_targets = _git_metadata_pointer_targets(administrative / "gitdir", kind="commondir")
+        if not common_targets or not backlink_targets:
+            return ()
+        common = common_targets[-1]
+        if (administrative.parent != common / "worktrees" or backlink_targets[-1] != pointer
+                or not (common / "HEAD").is_file() or not (common / "objects").is_dir()):
+            return ()
+        return (common,)
+    except (OSError, UnicodeError, RuntimeError):
+        return ()
 
 
 def _git_metadata_pointer_targets(

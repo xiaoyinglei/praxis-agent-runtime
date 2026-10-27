@@ -23,6 +23,7 @@ from agent_runtime.tools.permissions import (
     enforce_hard_guards,
 )
 from agent_runtime.tools.tool import (
+    ArtifactReference,
     CancellationMode,
     InterruptBehavior,
     JsonValue,
@@ -190,6 +191,13 @@ class _PreparedExecution:
     context: ToolExecutionContext
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletedOutcome:
+    value: object
+    deadline_exceeded: bool = False
+    cancellation_requested: bool = False
+
+
 class _CancelledTimeoutError(Exception):
     pass
 
@@ -222,6 +230,7 @@ class ToolExecutor:
         approval_resolver: ApprovalResolver | None = None,
         output_validator: OutputValidator | None = None,
         externalizer: Externalizer | None = None,
+        artifact_sink: Callable[[bytes, str, str], Awaitable[ArtifactReference]] | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
         copied: dict[str, Tool] = {}
@@ -238,6 +247,7 @@ class ToolExecutor:
         self._approval_resolver = approval_resolver or _resolve_external_approval
         self._output_validator = output_validator or _validate_normalized_output
         self._externalizer = externalizer or _bound_model_output
+        self._artifact_sink = artifact_sink
         self._trace_sink = trace_sink
         self._traces: list[ToolExecutionTrace] = []
         self._continuations: dict[tuple[object, str], _LiveContinuation] = {}
@@ -835,16 +845,25 @@ class ToolExecutor:
         prepared = replace(prepared, record=started_record)
         if prepared.context.invocation_guard is not None:
             try:
-                prepared.context.invocation_guard(prepared.call)
+                guarded = prepared.context.invocation_guard(prepared.call)
+                if inspect.isawaitable(guarded):
+                    await guarded
             except ExecutionStartRejectedError as rejected:
                 return await self._finish(
                     call=prepared.call,
-                    result=_error_result(prepared.call, code=rejected.code, message=rejected.message,
-                                         retryable=rejected.retryable,
-                                         metadata=rejected.metadata),
+                    result=_error_result(
+                        prepared.call,
+                        code=rejected.code,
+                        message=rejected.message,
+                        retryable=rejected.retryable,
+                        metadata=rejected.metadata,
+                    ),
                     record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=rejected.code),
                     prepared=prepared,
                 )
+            except asyncio.CancelledError:
+                await self._finish_cancelled(prepared, cancellation_sink)
+                raise
         if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
             try:
                 current = prepared.context.refreshed()
@@ -984,6 +1003,15 @@ class ToolExecutor:
                 prepared=prepared,
             )
 
+        timing_metadata: dict[str, JsonValue] = {
+            "execution_deadline_exceeded": False, "execution_cancellation_requested": False,
+        }
+        if isinstance(raw, _CompletedOutcome):
+            timing_metadata = {
+                "execution_deadline_exceeded": raw.deadline_exceeded,
+                "execution_cancellation_requested": raw.cancellation_requested,
+            }
+            raw = raw.value
         try:
             output = prepared.tool.normalize_output(raw)
             if not isinstance(output, NormalizedToolOutput):
@@ -1007,7 +1035,18 @@ class ToolExecutor:
                 message="normalized tool output failed validation",
             )
         try:
+            externalized = False
+            if (self._externalizer is _bound_model_output and prepared.context.workspace_root is not None
+                    and _model_visible_size(output) > prepared.tool.max_model_output_bytes):
+                # The runner has completed. Retain both the file worker and
+                # durable artifact admission until this known result can finish.
+                output = await _drain_task(asyncio.create_task(self._save_output(prepared, output)))
+                externalized = True
+            owner = asyncio.current_task()
+            if owner is not None and owner.cancelling():
+                timing_metadata["execution_cancellation_requested"] = True
             output, truncated = self._externalizer(prepared.tool, output)
+            truncated = truncated or externalized
             if not isinstance(output, NormalizedToolOutput) or type(truncated) is not bool:
                 raise TypeError("externalizer must return (NormalizedToolOutput, bool)")
         except Exception as error:
@@ -1030,6 +1069,7 @@ class ToolExecutor:
             truncated=truncated,
             metadata={
                 **{key: value for key, value in output.metadata.items() if key != "runtime_project_instructions"},
+                **timing_metadata,
                 "operation_id": prepared.record.operation_id,
             },
             attachments=output.attachments,
@@ -1046,17 +1086,32 @@ class ToolExecutor:
             prepared=prepared,
         )
 
+    async def _save_output(self, prepared: _PreparedExecution, output: NormalizedToolOutput) -> NormalizedToolOutput:
+        output, preserved = await asyncio.to_thread(_preserve_full_output, prepared.tool, output, prepared.context)
+        if self._artifact_sink is not None:
+            local = output.attachments[-1]
+            assert local.media_type is not None and local.name is not None
+            reference = await self._artifact_sink(preserved, local.media_type, local.name)
+            if not isinstance(reference, ArtifactReference):
+                raise TypeError("artifact_sink must return an ArtifactReference")
+            output = replace(output, attachments=(*output.attachments[:-1], reference))
+        return output
+
     async def _finish_cancelled(
         self, prepared: _PreparedExecution, cancellation_sink: ExecutionSink | None,
     ) -> None:
-        execution = await self._finish(
-            call=prepared.call,
-            result=_error_result(prepared.call, code="cancelled", message="tool execution was cancelled",
-                                 retryable=True),
-            record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code="cancelled"),
-            prepared=prepared,
-        )
-        await _emit_execution(cancellation_sink, execution)
+        async def finish() -> None:
+            execution = await self._finish(
+                call=prepared.call,
+                result=_error_result(
+                    prepared.call, code="cancelled", message="tool execution was cancelled", retryable=True
+                ),
+                record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code="cancelled"),
+                prepared=prepared,
+            )
+            await _emit_execution(cancellation_sink, execution)
+
+        await _drain_task(asyncio.create_task(finish()))
 
     async def _failed_after_runner(
         self,
@@ -1339,6 +1394,37 @@ def _validate_normalized_output(
     return replace(output, structured_content=validated)
 
 
+def _preserve_full_output(
+    tool: Tool, output: NormalizedToolOutput, context: ToolExecutionContext,
+) -> tuple[NormalizedToolOutput, bytes]:
+    from agent_runtime.tools.builtins.file_access import atomic_bytes
+
+    payload = {
+        "content": [{"type": block.type, "data": _jsonable(block.data)} for block in output.content],
+        "structured_content": _jsonable(output.structured_content),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    assert context.workspace_root is not None
+    path = Path(context.workspace_root) / ".praxis" / "runtime" / "artifacts" / "tool-results" / (digest + ".json")
+    permissions = context.effective_permissions
+    if permissions is not None and not permissions.path_access(path):
+        raise ToolValidationError(
+            path="$", message="full output artifact location is not readable under current permissions",
+        )
+    atomic_bytes(path, raw, create_parents=True)
+    reference = ArtifactReference(artifact_id=path.as_uri(), media_type="application/json", name=path.name)
+    # A small explicit pointer works for text, structured values and media alike.
+    # Never cut encoded images or silently discard trailing records in adapters.
+    summary = ToolContentBlock(type="text", data={
+        "text": "Tool output exceeds the model byte limit. Full JSON output is saved at " + str(path),
+    })
+    return (replace(output, content=(summary,), structured_content=None,
+                    attachments=(*output.attachments, reference),
+                    metadata={**dict(output.metadata), "full_output_path": str(path),
+                              "full_output_sha256": digest, "output_truncated": True}), raw)
+
+
 def _bound_model_output(
     tool: Tool,
     output: NormalizedToolOutput,
@@ -1403,77 +1489,62 @@ async def _drain_task[T](task: asyncio.Task[T]) -> T:
                 raise
 
 
+def _completed_outcome(value: object, *, deadline_exceeded: bool = False,
+                       cancellation_requested: bool = False) -> _CompletedOutcome:
+    if isinstance(value, _CompletedOutcome):
+        return replace(value, deadline_exceeded=value.deadline_exceeded or deadline_exceeded,
+                       cancellation_requested=value.cancellation_requested or cancellation_requested)
+    return _CompletedOutcome(value, deadline_exceeded, cancellation_requested)
+
+
 async def _run_with_timeout(
-    tool: Tool,
-    arguments: Mapping[str, JsonValue],
-    *,
-    progress_sink: ToolProgressSink | None = None,
+    tool: Tool, arguments: Mapping[str, JsonValue], *, progress_sink: ToolProgressSink | None = None,
 ) -> object:
     loop = asyncio.get_running_loop()
     started_at = loop.time()
-    task = asyncio.create_task(
-        _call_runner(tool, arguments, progress_sink=progress_sink)
-    )
-    remote = tool.cancellation_mode in {
-        CancellationMode.REMOTE_BEST_EFFORT,
-        CancellationMode.NOT_CANCELLABLE,
-    }
+    owner = asyncio.current_task()
+    cancellations = 0 if owner is None else owner.cancelling()
+    task = asyncio.create_task(_call_runner(tool, arguments, progress_sink=progress_sink))
+    remote = tool.cancellation_mode in {CancellationMode.REMOTE_BEST_EFFORT, CancellationMode.NOT_CANCELLABLE}
     try:
         if remote:
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=tool.timeout_seconds,
-                )
+                return await asyncio.wait_for(asyncio.shield(task), timeout=tool.timeout_seconds)
             except TimeoutError:
                 task.add_done_callback(_consume_background_task)
                 raise _UnknownTimeoutError from None
-
         done, _ = await asyncio.wait({task}, timeout=tool.timeout_seconds)
         if task in done:
             return task.result()
+        if tool.interrupt_behavior is InterruptBehavior.FINISH_CURRENT:
+            completed = await _drain_task(task)
+            return _completed_outcome(completed, deadline_exceeded=True,
+                                      cancellation_requested=owner is not None and owner.cancelling() > cancellations)
         task.cancel()
         try:
-            await _drain_task(task)
+            completed = await _drain_task(task)
+            if isinstance(completed, _CompletedOutcome):
+                return _completed_outcome(completed, deadline_exceeded=True)
         except asyncio.CancelledError:
             pass
         except Exception:
             raise _UnknownTimeoutError from None
         raise _CancelledTimeoutError
     except asyncio.CancelledError:
-        if tool.interrupt_behavior is InterruptBehavior.FINISH_CURRENT:
-            async def finish_current() -> object:
-                remaining = max(0.0, tool.timeout_seconds - (loop.time() - started_at))
-                if remote:
-                    try:
-                        return await asyncio.wait_for(
-                            asyncio.shield(task),
-                            timeout=remaining,
-                        )
-                    except TimeoutError:
-                        task.add_done_callback(_consume_background_task)
-                        raise _UnknownTimeoutError from None
-                done, _ = await asyncio.wait({task}, timeout=remaining)
-                if task in done:
-                    return task.result()
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    raise _UnknownTimeoutError from None
-                raise _CancelledTimeoutError from None
-            return await _drain_task(asyncio.create_task(finish_current()))
+        if tool.interrupt_behavior is InterruptBehavior.FINISH_CURRENT and not remote:
+            completed = await _drain_task(task)
+            return _completed_outcome(completed, deadline_exceeded=loop.time() - started_at > tool.timeout_seconds,
+                                      cancellation_requested=True)
         if remote:
             task.add_done_callback(_consume_background_task)
             raise _UnknownCancellationError from None
-        else:
-            task.cancel()
-            try:
-                await _drain_task(task)
-            except (asyncio.CancelledError, Exception):
-                pass
+        task.cancel()
+        try:
+            completed = await _drain_task(task)
+            if isinstance(completed, _CompletedOutcome):
+                return _completed_outcome(completed, cancellation_requested=True)
+        except (asyncio.CancelledError, Exception):
+            pass
         raise
 
 
@@ -1488,10 +1559,20 @@ async def _call_runner(
             arguments,
             progress_sink or _discard_tool_progress,
         )
-    raw = tool.run(arguments)
+    if inspect.iscoroutinefunction(tool.run):
+        return await tool.run(arguments)
+    # A thread cannot be forcefully stopped. Keep its task owned until it has
+    # actually completed, including after repeated timeout/cancellation requests.
+    worker = asyncio.create_task(asyncio.to_thread(tool.run, arguments))
+    interrupted = False
+    try:
+        raw = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        interrupted = True
+        raw = await _drain_task(worker)
     if inspect.isawaitable(raw):
         return await raw
-    return raw
+    return _CompletedOutcome(raw, cancellation_requested=interrupted)
 
 
 async def _discard_tool_progress(_progress: object) -> None:

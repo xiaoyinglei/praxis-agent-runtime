@@ -119,6 +119,22 @@ def test_retry_spends_an_ordinary_step(tmp_path, monkeypatch):
         assert store.read_turn(result.turn_id).terminal_reason_code == "model_step_budget_exhausted"
 
 
+def test_recovery_policy_metadata_does_not_disable_retry(tmp_path, monkeypatch):
+    start = RolloutStore.start_turn
+
+    def with_metadata(store, **kwargs):
+        kwargs["binding_manifest"]["model_response_recovery"]["note"] = "diagnostic metadata"
+        return start(store, **kwargs)
+
+    monkeypatch.setattr(RolloutStore, "start_turn", with_metadata)
+    model = TruncatedThenAnswer()
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "run.db", enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", lambda: model)
+    result = asyncio.run(agent.run("Explain", max_steps=3))
+    assert result.status == "done"
+    assert result.usage.model_calls == 2
+
+
 def test_legacy_turn_cannot_acquire_retry_policy_on_public_recovery(tmp_path, monkeypatch):
     class Crash(BaseException):
         pass

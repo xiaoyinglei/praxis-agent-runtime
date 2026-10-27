@@ -1305,3 +1305,23 @@ def test_cli_loads_one_explicit_yaml_knowledge_config(tmp_path: Path) -> None:
         storage_root=Path("/tmp/index"),
         vector_backend="sqlite",
     )
+
+
+def test_worktree_pause_recovery_uses_the_effective_database(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    actual = {}
+    workspace = tmp_path / "managed"
+    monkeypatch.setattr(cli_module, "_open_cli_worktree", lambda _name:
+                        SimpleNamespace(worktree=SimpleNamespace(root=workspace)))
+    def create(**kwargs):
+        actual.update(kwargs)
+        return SimpleNamespace()
+    async def run(*_args, **_kwargs):
+        return SimpleNamespace(status="paused", turn_id="worktree-turn", pause=None)
+    monkeypatch.setattr(cli_module, "_create_agent_facade", create)
+    monkeypatch.setattr(cli_module, "_run_facade_command", run)
+    monkeypatch.setattr(cli_module, "_display_agent_result", lambda *_args, **_kwargs: None)
+    result = CliRunner().invoke(agent_app, ["run", "task", "--worktree", "--non-interactive"])
+    assert result.exit_code == 2
+    assert str(actual["checkpoint_db"]) in result.stdout

@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import codecs
 import difflib
 import fnmatch
 import os
 import stat
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent_runtime.tools.builtins.file_access import atomic_bytes, file_version, open_binary, workspace_write_lock
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -46,6 +47,7 @@ _DEFAULT_HIDDEN_DIRECTORIES = frozenset(
     }
 )
 _MAX_PATCH_DIFF_CHARS = 12_000
+_MAX_PATCH_FILE_BYTES = 64 * 1024 * 1024
 
 
 class ListFilesInput(BaseModel):
@@ -132,7 +134,8 @@ class ReadFileInput(BaseModel):
         ge=1,
         le=1_000_000,
         description=(
-            "Optional byte limit from 1 through 1,000,000; omit it to use "
+            "Byte budget from 1 through 1,000,000. UTF-8 pages keep complete characters; "
+            "when the budget is smaller than one character, up to four bytes are returned. Omit it to use "
             "the context-safe 16,000-byte default, then advance offset for "
             "another chunk."
         ),
@@ -331,7 +334,9 @@ def create_apply_patch_tool(workspace: WorkspaceRuntime) -> Tool:
                 "Create a UTF-8 workspace file, or edit an existing file by exact "
                 "text replacement. Omit old_string only when creating a new file. "
                 "Without replace_all, the old text must occur exactly once. The write "
-                "is atomically installed and creation fails if the path exists. Verification "
+                "is atomically installed and creation fails if the path exists. Source and output files are "
+                "limited to 64 MiB. Concurrent Praxis edits serialize; an external source-version change "
+                "before installation is refused. Verification "
                 "toolchains under .venv and node_modules are read-only. A successful "
                 "replacement establishes that the supplied text was written; it does "
                 "not verify execution behavior. Select verification for the requested "
@@ -421,12 +426,12 @@ def _read_file(
         return _read_file_lines(target, request)
 
     size = target.stat().st_size
-    with target.open("rb") as stream:
+    with open_binary(target) as stream:
         prefix = stream.read(8_192)
         stream.seek(request.offset)
-        raw = stream.read(request.max_bytes + 1)
-    truncated = len(raw) > request.max_bytes
-    bounded = raw[: request.max_bytes]
+        raw = stream.read(request.max_bytes + 4)
+    bounded = _complete_text_page(raw, request.max_bytes, request.encoding)
+    truncated = len(raw) > len(bounded)
     binary_format = _binary_format(target, prefix)
     is_binary = binary_format is not None or b"\x00" in bounded
     if is_binary and binary_format is None:
@@ -457,7 +462,7 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
     size = target.stat().st_size
     start_line = None if request.offset else (request.start_line or 1)
     max_lines = request.max_lines or 200
-    with target.open("rb") as stream:
+    with open_binary(target) as stream:
         prefix = stream.read(8_192)
         binary_format = _binary_format(target, prefix)
         if binary_format is not None or b"\x00" in prefix:
@@ -483,7 +488,10 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
             )
         stream.seek(request.offset)
         for _line_number in range(1, start_line or 1):
-            if not stream.readline():
+            skipped = stream.readline(65_536)
+            while skipped and not skipped.endswith(b"\n"):
+                skipped = stream.readline(65_536)
+            if not skipped:
                 return ReadFileOutput(
                     path=request.path,
                     content="",
@@ -505,15 +513,16 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
         byte_limited = False
         while complete_lines < max_lines:
             line_offset = stream.tell()
-            line = stream.readline()
+            remaining = request.max_bytes - bytes_used
+            line = stream.readline(max(1, remaining + 4))
             if not line:
                 break
-            remaining = request.max_bytes - bytes_used
             if len(line) > remaining:
                 if remaining > 0:
-                    chunks.append(line[:remaining])
-                    bytes_used += remaining
-                    stream.seek(line_offset + remaining)
+                    page = _complete_text_page(line, remaining, request.encoding)
+                    chunks.append(page)
+                    bytes_used += len(page)
+                    stream.seek(line_offset + len(page))
                 else:
                     stream.seek(line_offset)
                 byte_limited = True
@@ -525,7 +534,7 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
         continuation_offset = stream.tell()
         has_more = bool(stream.read(1))
         line_limited = complete_lines >= max_lines and has_more
-        truncated = byte_limited or line_limited
+        truncated = (byte_limited and has_more) or line_limited
         bounded = b"".join(chunks)
         is_binary = b"\x00" in bounded
         content = "" if is_binary else bounded.decode(request.encoding, errors="replace")
@@ -549,6 +558,26 @@ def _read_file_lines(target: Path, request: ReadFileInput) -> ReadFileOutput:
             recommended_tool=None,
             encoding=request.encoding,
         )
+
+
+def _complete_text_page(raw: bytes, limit: int, encoding: str) -> bytes:
+    """Keep UTF-8 continuations attached to their code point, with bounded lookahead."""
+    bounded = raw[:limit]
+    if codecs.lookup(encoding).name != "utf-8":
+        return bounded
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    decoder.decode(bounded, final=False)
+    pending = decoder.getstate()[0]
+    if not pending:
+        return bounded
+    complete = len(bounded) - len(pending)
+    if complete:
+        return bounded[:complete]
+    for end in range(len(bounded) + 1, min(len(raw), len(bounded) + 3) + 1):
+        decoder.decode(raw[end - 1:end], final=False)
+        if not decoder.getstate()[0]:
+            return raw[:end]
+    return bounded  # Invalid/incomplete source bytes retain the documented replacement decoding.
 
 
 def _binary_format(path: Path, prefix: bytes) -> str | None:
@@ -603,6 +632,11 @@ def _apply_patch(
     workspace: WorkspaceRuntime,
     request: ApplyPatchInput,
 ) -> _ApplyPatchRunResult:
+    with workspace_write_lock(workspace.root):
+        return _apply_patch_locked(workspace, request)
+
+
+def _apply_patch_locked(workspace: WorkspaceRuntime, request: ApplyPatchInput) -> _ApplyPatchRunResult:
     requested_path = Path(request.file_path)
     if any(
         part.casefold() in _PROTECTED_VERIFICATION_DIRECTORIES
@@ -688,7 +722,14 @@ def _apply_patch(
             )
         )
 
-    current = target.read_text(encoding="utf-8")
+    with open_binary(target) as stream:
+        version = file_version(os.fstat(stream.fileno()))
+        raw = stream.read(_MAX_PATCH_FILE_BYTES + 1)
+        if len(raw) > _MAX_PATCH_FILE_BYTES:
+            raise ValueError("apply_patch source exceeds the 64 MiB file limit")
+        if file_version(os.fstat(stream.fileno())) != version:
+            raise PermissionError("file changed while it was being read")
+    current = raw.decode("utf-8")
     occurrences = current.count(request.old_string)
     if occurrences == 0:
         return _ApplyPatchRunResult(
@@ -709,6 +750,11 @@ def _apply_patch(
             )
         )
 
+    replacements = occurrences if request.replace_all else 1
+    output_bytes = len(raw) + replacements * (len(request.new_string.encode("utf-8"))
+                                              - len(request.old_string.encode("utf-8")))
+    if output_bytes > _MAX_PATCH_FILE_BYTES:
+        raise ValueError("apply_patch output exceeds the 64 MiB file limit")
     updated = (
         current.replace(request.old_string, request.new_string)
         if request.replace_all
@@ -728,7 +774,7 @@ def _apply_patch(
         updated,
         file_path=request.file_path,
     )
-    _atomic_write_text(target, updated)
+    _atomic_write_text(target, updated, expected=version)
     return _ApplyPatchRunResult(
         ApplyPatchOutput(
             file_path=request.file_path,
@@ -763,49 +809,14 @@ def _patch_diff(
     )
 
 
-def _atomic_write_text(path: Path, content: str) -> None:
+def _atomic_write_text(path: Path, content: str, *,
+                       expected: tuple[int, int, int, int, int] | None = None) -> None:
     mode = stat.S_IMODE(path.stat().st_mode)
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary_name = stream.name
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary_name, mode)
-        os.replace(temporary_name, path)
-        temporary_name = None
-    finally:
-        if temporary_name is not None:
-            Path(temporary_name).unlink(missing_ok=True)
+    atomic_bytes(path, content.encode("utf-8"), mode=mode, expected=expected)
 
 
 def _atomic_create_text(path: Path, content: str) -> None:
-    temporary_name: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as stream:
-            temporary_name = stream.name
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary_name, path)
-    finally:
-        if temporary_name is not None:
-            Path(temporary_name).unlink(missing_ok=True)
+    atomic_bytes(path, content.encode("utf-8"), create_only=True)
 
 
 def _workspace_use(

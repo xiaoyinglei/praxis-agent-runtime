@@ -24,7 +24,7 @@ from agent_runtime.checkpoints import (
 )
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
-from agent_runtime.harness.events import RolloutEventReader
+from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
 from agent_runtime.harness.verification import classify_tool_verification
 from agent_runtime.streaming.events import (
@@ -44,6 +44,7 @@ from agent_runtime.tools.executor import (
 )
 from agent_runtime.tools.permissions import ToolExecutionContext, UseToolDecision, can_use_tool
 from agent_runtime.tools.tool import (
+    ArtifactReference,
     CancellationMode,
     JsonValue,
     ResolvedToolUse,
@@ -119,9 +120,10 @@ class ToolOrchestrator:
     async def restore_command_sessions(self, sessions: Any, turn_id: str, *, include_terminal: bool = False) -> None:
         """Claim only jobs whose complete launch is in this Turn's trusted ledger."""
         from agent_runtime.tools.builtins.shell import RunCommandInput
-        items = {item.item_id: item for item in self._store.list_items(turn_id)}
+
+        items = await self._store.run_async(lambda: {item.item_id: item for item in self._store.list_items(turn_id)})
         terminal: set[tuple[str, str]] = set()
-        operations = self._store.list_tool_operations(turn_id)
+        operations = await self._store.run_async(self._store.list_tool_operations, turn_id)
         observed_results = {
             operation.result_item_id for operation in operations
             if operation.tool_name == "manage_command" and operation.status == "succeeded"
@@ -161,7 +163,9 @@ class ToolOrchestrator:
             tool = self._tools.get("run_command")
             if tool is None or operation.execution_revision != tool.execution_revision:
                 raise RuntimeError("command execution revision changed; reconcile the original job explicitly")
-            call = self._committed_tool_call(turn_id=turn_id, tool_call_id=operation.tool_call_id)
+            call = await self._store.run_async(
+                self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
+            )
             await sessions.restore(key, request=RunCommandInput.model_validate(dict(call.arguments)),
                                    digest=digest, operation_id=operation.operation_id)
             if (operation.operation_id, key) in terminal:
@@ -186,7 +190,7 @@ class ToolOrchestrator:
         self._store = store
         self._tools = tools
         self._execution_context = execution_context
-        self._executor = ToolExecutor(tools)
+        self._executor = ToolExecutor(tools, artifact_sink=self._save_output_artifact)
         self._worker_id = worker_id or f"worker_{uuid4().hex}"
         self._lease_seconds = lease_seconds
         self._event_dispatcher = event_dispatcher
@@ -198,6 +202,15 @@ class ToolOrchestrator:
         ] = {}
         self._instruction_targets: dict[tuple[str, str], tuple[ToolTarget, ...]] = {}
         self._instruction_snapshots: dict[str, Mapping[str, Any]] = {}
+
+    async def _save_output_artifact(self, content: bytes, media_type: str, name: str) -> ArtifactReference:
+        # The Store remains the sole owner of durable artifact identities.
+        # Executor workers hand back bytes, never a file URI masquerading as one.
+        turn_id = current_tool_turn_id()
+        artifact = await self._commit(lambda: self._store.commit_artifact(
+            turn_id=turn_id, content=content, media_type=media_type, name=name,
+        ))
+        return ArtifactReference(artifact.artifact_id, artifact.media_type, artifact.name)
 
     def attach_event_dispatcher(
         self,
@@ -232,16 +245,23 @@ class ToolOrchestrator:
         from agent_runtime.tools.builtins.command_sessions import ManageCommandInput
         from agent_runtime.tools.builtins.shell import _normalize_command_output
 
-        pending = [item for item in self._store.list_interactions(turn_id)
-                   if item.kind == "tool_reconciliation" and item.status == "pending"]
+        pending = await self._store.run_async(
+            lambda: [
+                item
+                for item in self._store.list_interactions(turn_id)
+                if item.kind == "tool_reconciliation" and item.status == "pending"
+            ]
+        )
         if len(pending) != 1 or pending[0].operation_id is None:
             return False
-        operation = self._store.read_tool_operation(pending[0].operation_id)
+        operation = await self._store.run_async(self._store.read_tool_operation, pending[0].operation_id)
         tool = self._tools.get("manage_command")
         if (operation.tool_name != "manage_command" or operation.status != "unknown"
                 or tool is None or operation.execution_revision != tool.execution_revision):
             return False
-        call = self._committed_tool_call(turn_id=turn_id, tool_call_id=operation.tool_call_id)
+        call = await self._store.run_async(
+            self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
+        )
         request = ManageCommandInput.model_validate(dict(call.arguments))
         if request.action not in {"wait", "status"}:
             return False
@@ -282,14 +302,7 @@ class ToolOrchestrator:
         return True
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = self._store.capture_mutation(operation)
-        if self._event_dispatcher is not None:
-            for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
-                await self._event_dispatcher.emit(
-                    replayed.event,
-                    cursor=replayed.cursor,
-                )
-        return mutation.value
+        return await commit_and_publish(self._store, operation, self._event_dispatcher)
 
     def update_execution_context(self, context: ToolExecutionContext) -> None:
         self._execution_context = context
@@ -380,11 +393,14 @@ class ToolOrchestrator:
             )
 
     async def _discard_superseded(self, turn_id: str, call: ToolCall) -> ToolResult:
-        operation = next((op for op in self._store.list_tool_operations(turn_id)
-                          if op.tool_call_id == call.tool_call_id), None)
+        operation = await self._store.run_async(
+            lambda: next(
+                (op for op in self._store.list_tool_operations(turn_id) if op.tool_call_id == call.tool_call_id), None
+            )
+        )
         if operation is not None and operation.status in {"prepared", "ready"}:
             if operation.status == "prepared":
-                record = self._pending_record(turn_id, call)
+                record = await self._store.run_async(self._pending_record, turn_id, call)
                 assert record is not None
                 await self._persist_execution_record(turn_id=turn_id, tool=self._tools[call.tool_name], record=record)
             await self._commit(lambda: self._store.reject_ready_tool_operation(
@@ -405,10 +421,12 @@ class ToolOrchestrator:
         task = asyncio.current_task()
         cancellations = 0 if task is None else task.cancelling()
         await self._record_call(turn_id, call)
-        if self.input_superseded(turn_id, call):
+        if await self._store.run_async(self.input_superseded, turn_id, call):
             return await self._discard_superseded(turn_id, call)
-        execution_context = replace(self._context_for_call(turn_id, call),
-                                    invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
+        execution_context = replace(
+            (await self._store.run_async(self._context_for_call, turn_id, call)),
+            invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked),
+        )
         tool = self._tools.get(call.tool_name)
         active_record: ToolExecutionRecord | None = None
 
@@ -450,15 +468,18 @@ class ToolOrchestrator:
             turn_id,
             call,
             context=execution_context,
-            record=self._pending_record(turn_id, call),
+            record=(await self._store.run_async(self._pending_record, turn_id, call)),
             record_sink=persist,
             preflight_sink=capture_preflight,
             progress_sink=publish_progress,
             cancellation_sink=accept_cancelled,
         )
         await self._accept_execution(turn_id, call, execution, execution_context)
-        if (task is not None and task.cancelling() > cancellations
-                and self._store.read_turn(turn_id).status == "running"):
+        if (
+            task is not None
+            and task.cancelling() > cancellations
+            and (await self._store.run_async(self._store.read_turn, turn_id)).status == "running"
+        ):
             raise asyncio.CancelledError
         return execution.result
 
@@ -487,7 +508,7 @@ class ToolOrchestrator:
     ) -> None:
         tool = self._tools.get(call.tool_name)
         if execution.result.error_code == "approval_required":
-            if self.input_superseded(turn_id, call):
+            if await self._store.run_async(self.input_superseded, turn_id, call):
                 await self._discard_superseded(turn_id, call)
                 return
             if tool is None:
@@ -580,7 +601,7 @@ class ToolOrchestrator:
             # State-changing and remote calls are barriers. Resolve the next
             # segment's context only after this one drains.
             results.extend(await self._execute_batch_segment(turn_id=turn_id, calls=calls[offset:end]))
-            if self._store.read_turn(turn_id).status != "running":
+            if (await self._store.run_async(self._store.read_turn, turn_id)).status != "running":
                 break
             if task is not None and task.cancelling() > cancellations:
                 raise asyncio.CancelledError
@@ -590,9 +611,9 @@ class ToolOrchestrator:
     async def _execute_batch_segment(self, *, turn_id: str, calls: Sequence[ToolCall]) -> tuple[ToolResult, ...]:
         if self._checkpoints is not None:
             await self._ensure_turn_checkpoint(turn_id, calls)
-        if any(self.input_superseded(turn_id, call) for call in calls):
+        if await self._store.run_async(lambda: any(self.input_superseded(turn_id, call) for call in calls)):
             return tuple([await self.execute(turn_id=turn_id, call=call) for call in calls])
-        contexts = tuple(self._context_for_call(turn_id, call) for call in calls)
+        contexts = await self._store.run_async(lambda: tuple(self._context_for_call(turn_id, call) for call in calls))
         tools = tuple(self._tools.get(call.tool_name) for call in calls)
         serial = (
             any(context != contexts[0] for context in contexts[1:])
@@ -610,7 +631,7 @@ class ToolOrchestrator:
             results = []
             for call in calls:
                 results.append(await self.execute(turn_id=turn_id, call=call))
-                if self._store.read_turn(turn_id).status != "running":
+                if (await self._store.run_async(self._store.read_turn, turn_id)).status != "running":
                     break
             return tuple(results)
 
@@ -636,18 +657,25 @@ class ToolOrchestrator:
             execution = _associate_execution(execution, turn_id)
             await self._accept_execution(turn_id, by_id[execution.result.tool_call_id], execution, contexts[0])
 
+        snapshot = await self._store.run_async(self._step_snapshot, turn_id, calls[0])
         token = _ACTIVE_TOOL_TURN_ID.set(turn_id)
-        snapshot = self._step_snapshot(turn_id, calls[0])
         binding_token = _ACTIVE_TOOL_BINDING.set(None if snapshot is None else snapshot["binding_manifest"])
         try:
             executions = await self._executor.execute_batch(
                 calls,
-                context=replace(contexts[0], invocation_guard=lambda invoked: self._guard_input(turn_id, invoked)),
-                records={
-                    call.tool_call_id: record
-                    for call in calls
-                    if (record := self._pending_record(turn_id, call)) is not None
-                },
+                context=replace(
+                    contexts[0],
+                    invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked),
+                ),
+                records=(
+                    await self._store.run_async(
+                        lambda: {
+                            call.tool_call_id: record
+                            for call in calls
+                            if (record := self._pending_record(turn_id, call)) is not None
+                        }
+                    )
+                ),
                 record_sink=persist,
                 preflight_sink=preflight,
                 progress_sinks={call.tool_call_id: progress_for(call) for call in calls},
@@ -669,10 +697,13 @@ class ToolOrchestrator:
         checkpoints = self._checkpoints
         if checkpoints is None:
             return
-        if any(
-            item.kind == "workspace_checkpoint" and item.status == "completed"
-            and item.payload.get("trigger") == "pre_write"
-            for item in self._store.list_items(turn_id)
+        if await self._store.run_async(
+            lambda: any(
+                item.kind == "workspace_checkpoint"
+                and item.status == "completed"
+                and (item.payload.get("trigger") == "pre_write")
+                for item in self._store.list_items(turn_id)
+            )
         ):
             return
         for call in calls:
@@ -723,8 +754,8 @@ class ToolOrchestrator:
         call: ToolCall,
         **kwargs: Any,
     ) -> ToolExecution:
+        snapshot = await self._store.run_async(self._step_snapshot, turn_id, call)
         token = _ACTIVE_TOOL_TURN_ID.set(turn_id)
-        snapshot = self._step_snapshot(turn_id, call)
         binding_token = _ACTIVE_TOOL_BINDING.set(None if snapshot is None else snapshot["binding_manifest"])
         try:
             execution = await self._executor.execute(call, **kwargs)
@@ -787,7 +818,7 @@ class ToolOrchestrator:
             return
         claim = self._claims.get(record.operation_id)
         if claim is None:
-            operation = self._store.read_tool_operation(record.operation_id)
+            operation = await self._store.run_async(self._store.read_tool_operation, record.operation_id)
             if (operation.status == "failed" and operation.error_code == record.error_code
                     and record.error_code in {"resource_busy", "input_superseded"}):
                 await self._commit(
@@ -826,10 +857,12 @@ class ToolOrchestrator:
         tool = self._tools.get(call.tool_name)
         if tool is not None and tool.after_commit is not None and not execution.result.is_error:
             await tool.after_commit(call.arguments, execution.result.structured_content, record.operation_id)
-        operation = self._store.read_tool_operation(record.operation_id)
+        operation = await self._store.run_async(self._store.read_tool_operation, record.operation_id)
         # Historical gates retain their frozen verifier semantics. New Turns
         # use explicit acceptance commands and do not mint inferred certificates.
-        policy = self._store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
+        policy = await self._store.run_async(
+            lambda: self._store.read_turn(turn_id).binding_manifest.get("completion_policy", {})
+        )
         if isinstance(policy, Mapping) and policy.get("revision") == "completion-v2":
             return
         evidence = classify_tool_verification(
@@ -853,28 +886,29 @@ class ToolOrchestrator:
         self, *, turn_id: str, decision: str,
         on_session_grant: Callable[[CommandGrant], None] | None = None,
     ) -> ToolResult:
-        pending = [
-            interaction
-            for interaction in self._store.list_interactions(turn_id)
-            if interaction.kind == "tool_approval" and interaction.status == "pending"
-        ]
+        pending = await self._store.run_async(
+            lambda: [
+                interaction
+                for interaction in self._store.list_interactions(turn_id)
+                if interaction.kind == "tool_approval" and interaction.status == "pending"
+            ]
+        )
         if len(pending) != 1:
             raise RuntimeError("resume requires exactly one pending tool approval")
         interaction = pending[0]
         if interaction.operation_id is None:
             raise RuntimeError("tool approval interaction has no operation")
-        operation = self._store.read_tool_operation(interaction.operation_id)
-        call = self._committed_tool_call(
-            turn_id=turn_id,
-            tool_call_id=operation.tool_call_id,
+        operation = await self._store.run_async(self._store.read_tool_operation, interaction.operation_id)
+        call = await self._store.run_async(
+            self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
         )
-        if self.input_superseded(turn_id, call):
+        if await self._store.run_async(self.input_superseded, turn_id, call):
             await self._commit(lambda: self._store.resolve_tool_approval(turn_id=turn_id, decision="deny"))
             return await self._discard_superseded(turn_id, call)
         tool = self._tools.get(call.tool_name)
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
-        execution_context = self._context_for_turn(turn_id)
+        execution_context = await self._store.run_async(self._context_for_turn, turn_id)
         recheck = decision == "recheck"
         approval_ids = {call.tool_call_id}
         if interaction.request.get("approval_scope") == "network":
@@ -972,41 +1006,43 @@ class ToolOrchestrator:
             turn_id=turn_id, call=call, tool=tool, context=context, record=record,
         )
         if on_session_grant is not None and grant is not None and not result.is_error:
-            on_session_grant(grant)
+            await self._store.run_async(on_session_grant, grant)
         return result
 
     async def recover_resolved_approval(self, *, turn_id: str) -> ToolResult:
         """Execute one approved ready operation after a pre-execute crash."""
 
-        resolved = [
-            interaction
-            for interaction in self._store.list_interactions(turn_id)
-            if interaction.kind == "tool_approval"
-            and interaction.status == "resolved"
-            and interaction.response.get("decision") == "approve"
-            and interaction.operation_id is not None
-            and self._store.read_tool_operation(interaction.operation_id).status == "ready"
-            and self._store.read_tool_operation(interaction.operation_id).approval_request_id == interaction.request_id
-        ]
+        resolved = await self._store.run_async(
+            lambda: [
+                interaction
+                for interaction in self._store.list_interactions(turn_id)
+                if interaction.kind == "tool_approval"
+                and interaction.status == "resolved"
+                and interaction.response.get("decision") == "approve"
+                and interaction.operation_id is not None
+                and self._store.read_tool_operation(interaction.operation_id).status == "ready"
+                and self._store.read_tool_operation(interaction.operation_id).approval_request_id
+                == interaction.request_id
+            ]
+        )
         if len(resolved) != 1 or resolved[0].operation_id is None:
             raise RuntimeError("recovery requires one resolved approved operation")
         interaction = resolved[0]
         operation_id = interaction.operation_id
         if operation_id is None:
             raise RuntimeError("resolved approval lost its operation identity")
-        operation = self._store.read_tool_operation(operation_id)
+        operation = await self._store.run_async(self._store.read_tool_operation, operation_id)
         if operation.status != "ready":
             raise RuntimeError("approved operation is not ready for crash recovery")
-        call = self._committed_tool_call(
-            turn_id=turn_id,
-            tool_call_id=operation.tool_call_id,
+        call = await self._store.run_async(
+            self._committed_tool_call, turn_id=turn_id, tool_call_id=operation.tool_call_id
         )
-        if self.input_superseded(turn_id, call):
+        if await self._store.run_async(self.input_superseded, turn_id, call):
             return await self._discard_superseded(turn_id, call)
         tool = self._tools.get(call.tool_name)
         if tool is None:
             raise RuntimeError("approved tool is no longer installed")
-        execution_context = self._context_for_turn(turn_id)
+        execution_context = await self._store.run_async(self._context_for_turn, turn_id)
         if interaction.response.get("policy_recheck") is True:
             # A crashed automatic policy decision is never restored as a user grant.
             arguments = tool.validate_input(call.arguments)
@@ -1095,7 +1131,9 @@ class ToolOrchestrator:
         task = asyncio.current_task()
         cancellations = 0 if task is None else task.cancelling()
         active_record: ToolExecutionRecord | None = None
-        context = replace(context, invocation_guard=lambda invoked: self._guard_input(turn_id, invoked))
+        context = replace(
+            context, invocation_guard=lambda invoked: self._store.run_async(self._guard_input, turn_id, invoked)
+        )
 
         def capture_preflight(updated: ToolExecutionRecord, resolved: ResolvedToolUse) -> None:
             self._instruction_targets[(turn_id, call.tool_call_id)] = resolved.targets
@@ -1134,8 +1172,11 @@ class ToolOrchestrator:
             cancellation_sink=accept,
         )
         await accept(execution)
-        if (task is not None and task.cancelling() > cancellations
-                and self._store.read_turn(turn_id).status == "running"):
+        if (
+            task is not None
+            and task.cancelling() > cancellations
+            and (await self._store.run_async(self._store.read_turn, turn_id)).status == "running"
+        ):
             raise asyncio.CancelledError
         return execution.result
 
@@ -1201,9 +1242,11 @@ class ToolOrchestrator:
         tool: Tool,
         record: ToolExecutionRecord,
     ) -> None:
-        existing = {item.operation_id: item for item in self._store.list_tool_operations(turn_id)}.get(
-            record.operation_id
-        )
+        existing = (
+            await self._store.run_async(
+                lambda: {item.operation_id: item for item in self._store.list_tool_operations(turn_id)}
+            )
+        ).get(record.operation_id)
         if record.status is ExecutionStatus.PREPARED:
             if existing is not None:
                 if existing.status == "prepared":
@@ -1226,8 +1269,10 @@ class ToolOrchestrator:
             )
             return
         if record.status is ExecutionStatus.STARTED:
-            call = self._committed_tool_call(turn_id=turn_id, tool_call_id=record.tool_call_id)
-            if self.input_superseded(turn_id, call):
+            call = await self._store.run_async(
+                self._committed_tool_call, turn_id=turn_id, tool_call_id=record.tool_call_id
+            )
+            if await self._store.run_async(self.input_superseded, turn_id, call):
                 await self._commit(lambda: self._store.reject_ready_tool_operation(
                     operation_id=record.operation_id, error_code="input_superseded",
                 ))

@@ -216,7 +216,8 @@ async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_input_after_durable_tool_start_before_runner_prevents_invocation(tmp_path):
+@pytest.mark.parametrize("delay_executor", [False, True])
+async def test_input_after_durable_tool_start_before_runner_prevents_invocation(tmp_path, monkeypatch, delay_executor):
     from agent_runtime.streaming.events import EventType, TurnItemKind
 
     invoked = []
@@ -234,6 +235,14 @@ async def test_input_after_durable_tool_start_before_runner_prevents_invocation(
                     await session.steer("explain instead", expected_turn_id=event.turn_id)
 
         sink = Sink()
+        original_run = session.store.run_async
+
+        async def delay_constructor(operation, *args, **kwargs):
+            if delay_executor and sink.submitted and operation == session._executor:
+                await asyncio.sleep(0.02)
+            return await original_run(operation, *args, **kwargs)
+
+        monkeypatch.setattr(session.store, "run_async", delay_constructor)
         result = await session.submit("read files", event_sink=sink)
         assert sink.submitted
         assert result.status == "done"

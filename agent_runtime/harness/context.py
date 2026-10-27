@@ -168,7 +168,7 @@ class RolloutContextManager:
             raise ValueError("retained_tail_messages must be a non-negative integer")
         revision = self._store.context_source_revision(turn_id)
         items = tuple(i for i in self._store.list_context_items(turn_id) if i.status == "completed")
-        projected = _project_items(items)
+        projected = self._project_items(items)
         messages = tuple(m for _, m in projected)
         latest_user = next((item_id for item_id, m in reversed(projected) if m.role == "user"), None)
         if latest_user is None:
@@ -322,7 +322,7 @@ class RolloutContextManager:
             ),
         }
         synthetic = replace(items[-1], item_id="candidate", kind="context_compaction", payload=payload)
-        result = tuple(m for _, m in _project_items((*items, synthetic)))
+        result = tuple(m for _, m in self._project_items((*items, synthetic)))
         _validate_tool_groups(result)
         if validate:
             self._validate_budget(result, turn_id=turn_id)
@@ -412,11 +412,12 @@ class RolloutContextManager:
             if semantic is not None:
                 sources.append({"history_index": history_positions[semantic.item_id],
                                 **asdict(_compaction_message(semantic.payload))})
+            answer_item_ids = self._accepted_answer_ids(items)
             for item in items:
                 if (item.item_id not in covered or item.item_id in summarized or item.status != "completed"
                         or item.kind == "context_compaction"):
                     continue
-                message = _item_message(item)
+                message = _item_message(item, answer_item_ids=answer_item_ids)
                 for entry in (*_request_context_messages(item), *((message,) if message is not None else ())):
                     if item.item_id not in protected or entry.role != "user":
                         sources.append({"history_index": history_positions[item.item_id], **asdict(entry)})
@@ -487,7 +488,7 @@ class RolloutContextManager:
             raise ValueError("max_result_bytes must be a non-negative integer")
         revision = self._store.context_source_revision(turn_id)
         items = tuple(i for i in self._store.list_context_items(turn_id) if i.status == "completed")
-        projected = _project_items(items)
+        projected = self._project_items(items)
         if not projected:
             return
         original = tuple(message for _, message in projected)
@@ -576,12 +577,23 @@ class RolloutContextManager:
         )
 
     def _projected_messages(self, turn_id: str) -> tuple[tuple[str, HarnessMessage], ...]:
-        return _project_items(self._store.list_context_items(turn_id))
+        return self._project_items(self._store.list_context_items(turn_id))
+
+    def _accepted_answer_ids(self, items: tuple[ItemSnapshot, ...]) -> frozenset[str]:
+        return frozenset(
+            self._store.read_turn_answer(turn_id).item_id
+            for turn_id in dict.fromkeys(item.turn_id for item in items)
+            if self._store.read_turn(turn_id).status == "completed"
+        )
+
+    def _project_items(self, items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessMessage], ...]:
+        return _project_items(items, answer_item_ids=self._accepted_answer_ids(items))
 
 
 def validate_tool_history(store: RolloutStore, turn_id: str) -> None:
     """Check provider message structure without applying an old Turn's capacity limits."""
-    _validate_tool_groups(tuple(message for _, message in _project_items(store.list_context_items(turn_id))))
+    projected = RolloutContextManager(store)._project_items(store.list_context_items(turn_id))
+    _validate_tool_groups(tuple(message for _, message in projected))
 
 
 def _json(value: Any) -> str:
@@ -592,8 +604,10 @@ def _unique_json(values: list[Any]) -> list[Any]:
     return list({_json(value): value for value in values}.values())
 
 
-def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessMessage], ...]:
-    replacements, suppressed = _compaction_projection(items)
+def _project_items(
+    items: tuple[ItemSnapshot, ...], *, answer_item_ids: frozenset[str] = frozenset(),
+) -> tuple[tuple[str, HarnessMessage], ...]:
+    replacements, suppressed = _compaction_projection(items, answer_item_ids=answer_item_ids)
     reconciled = {
         (item.turn_id, result.get("tool_call_id"))
         for item in items
@@ -611,7 +625,8 @@ def _project_items(items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessM
         if item.item_id not in suppressed:
             projected.extend((item.item_id, message) for message in _request_context_messages(item))
         superseded = item.kind == "tool_result" and (item.turn_id, item.payload.get("tool_call_id")) in reconciled
-        if item.item_id not in suppressed and not superseded and (message := _item_message(item)) is not None:
+        if (item.item_id not in suppressed and not superseded
+                and (message := _item_message(item, answer_item_ids=answer_item_ids)) is not None):
             projected.append((item.item_id, message))
         if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
             input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
@@ -686,7 +701,9 @@ def _request_context_messages(item: ItemSnapshot) -> tuple[HarnessMessage, ...]:
                  if isinstance(update, str))
 
 
-def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
+def _item_message(
+    item: ItemSnapshot, *, answer_item_ids: frozenset[str] = frozenset(),
+) -> HarnessMessage | None:
     if item.kind == "model_request" and item.producer == "runtime":
         update = item.payload.get("request_ref", {}).get("runtime_context_update")
         if isinstance(update, str):
@@ -714,6 +731,8 @@ def _item_message(item: ItemSnapshot) -> HarnessMessage | None:
                 reasoning_content=item.payload.get("reasoning_content"),
                 tool_calls=tuple(_tool_call(call) for call in calls if isinstance(call, Mapping)),
             )
+        if item.item_id in answer_item_ids:
+            return HarnessMessage(role="assistant", content=text)
     if item.kind == "tool_result":
         model_content = item.payload.get("model_content")
         tool_call_id = item.payload.get("tool_call_id")
@@ -845,6 +864,8 @@ def _tool_call(payload: Mapping[str, object]) -> HarnessToolCall:
 
 def _compaction_projection(
     items: tuple[ItemSnapshot, ...],
+    *,
+    answer_item_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, HarnessMessage], set[str]]:
     replacements: dict[str, HarnessMessage] = {}
     suppressed: set[str] = set()
@@ -903,7 +924,8 @@ def _compaction_projection(
                     for original in reversed(items)
                     if original.item_id in covered
                     and original.item_id not in protected
-                    and (_item_message(original) is not None or original.kind == "context_compaction")
+                    and (_item_message(original, answer_item_ids=answer_item_ids) is not None
+                         or original.kind == "context_compaction")
                 ),
                 anchor,
             )

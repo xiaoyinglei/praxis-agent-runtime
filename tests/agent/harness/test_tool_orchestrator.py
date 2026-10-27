@@ -61,7 +61,7 @@ def _read_tool(
         "additionalProperties": False,
     }
 
-    def run(arguments: Mapping[str, JsonValue]) -> dict[str, str]:
+    async def run(arguments: Mapping[str, JsonValue]) -> dict[str, str]:
         if store is not None:
             [operation] = store.list_tool_operations()
             assert operation.status == "running"

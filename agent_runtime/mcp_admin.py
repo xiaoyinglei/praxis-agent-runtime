@@ -158,7 +158,10 @@ def mcp_connections() -> list[dict[str, Any]]:
     config = user_mcp_config()
     if not config.is_file():
         return []
-    raw = yaml.safe_load(config.read_text())
+    try:
+        raw = yaml.safe_load(config.read_text())
+    except yaml.YAMLError as error:
+        raise ValueError("Personal MCP configuration contains invalid YAML") from error
     if not isinstance(raw, dict) or not isinstance(raw.get("servers"), list):
         raise ValueError("Personal MCP configuration must contain a servers list")
     if any(not isinstance(item, dict) or not isinstance(item.get("name"), str) for item in raw["servers"]):

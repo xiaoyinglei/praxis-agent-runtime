@@ -533,6 +533,25 @@ def test_network_errors_and_upstream_errors_are_sanitized() -> None:
     asyncio.run(run())
 
 
+def test_http_error_carries_machine_readable_status_code() -> None:
+    async def run() -> None:
+        client = PublicWebClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(429, content=b"rate limited")),
+        )
+        try:
+            with pytest.raises(PublicWebError) as caught:
+                await client.get("https://example.com")
+            assert caught.value.code == "http_error"
+            assert caught.value.status_code == 429
+        finally:
+            await client.aclose()
+
+        non_http = PublicWebError("network_error", "The public HTTP request failed.")
+        assert non_http.status_code is None
+
+    asyncio.run(run())
+
+
 def test_dns_resolution_is_inside_overall_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         backend = _NumericBackend()

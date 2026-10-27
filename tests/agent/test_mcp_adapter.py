@@ -227,3 +227,72 @@ def test_embedded_text_resource_reaches_agent_as_content():
     assert block.type == "text"
     assert block.data["text"] == "# Actual README\nfile facts"
     assert block.data["resource_uri"] == "repo://owner/project/README.md"
+
+
+def test_mcp_normalization_preserves_all_blocks_and_full_text():
+    [tool] = create_mcp_tools([_descriptor()], lambda *_args: None)
+    blocks = [{'type': 'text', 'text': str(i)} for i in range(20)]
+    blocks.append({'type': 'text', 'text': 'important tail' + 'x' * 100_001})
+    normalized = tool.normalize_output({'content': blocks})
+    assert len(normalized.content) == 21
+    assert normalized.content[-1].data['text'] == blocks[-1]['text']
+
+
+@pytest.mark.anyio
+async def test_oversize_mcp_result_has_complete_workspace_artifact(tmp_path):
+    import json
+    from dataclasses import replace
+    body = 'important beginning\n' + 'x' * 5000 + '\nimportant end'
+    [tool] = create_mcp_tools([_descriptor()], lambda *_args: {'content': [{'type': 'text', 'text': body}]})
+    tool = replace(tool, max_model_output_bytes=700)
+    call = ToolCall(tool_call_id='artifact', tool_name=tool.definition.name, arguments={'query': 'x'},
+                    origin=ToolCallOrigin(request_id='r', toolset_revision='v',
+                                         exposed_tool_names=(tool.definition.name,)))
+    execution = await ToolExecutor({tool.definition.name: tool}).execute(
+        call, context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, approval_mode='full'))
+    assert not execution.result.is_error and execution.result.truncated
+    artifact = Path(execution.result.metadata['full_output_path'])
+    payload = json.loads(artifact.read_text())
+    assert payload['content'][0]['data']['text'] == body
+    assert execution.result.attachments
+
+
+@pytest.mark.anyio
+async def test_saved_mcp_output_is_readable_by_normal_file_tool(tmp_path):
+    from dataclasses import replace
+
+    from agent_runtime.tools.builtins.filesystem import create_read_file_tool
+    from agent_runtime.workspace import open_workspace
+    workspace = open_workspace(tmp_path)
+    [tool] = create_mcp_tools([_descriptor()], lambda *_args: {'content': [{'type': 'text', 'text': 'x' * 5000}]})
+    tool = replace(tool, max_model_output_bytes=700)
+    context = ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, approval_mode='full')
+    origin = ToolCallOrigin(request_id='r', toolset_revision='v', exposed_tool_names=(tool.definition.name,))
+    result = await ToolExecutor({tool.definition.name: tool}).execute(
+        ToolCall(tool_call_id='save', tool_name=tool.definition.name, arguments={'query': 'x'}, origin=origin),
+        context=context)
+    read = create_read_file_tool(workspace)
+    read_origin = ToolCallOrigin(request_id='read', toolset_revision='v', exposed_tool_names=('read_file',))
+    observed = await ToolExecutor({'read_file': read}).execute(ToolCall(
+        tool_call_id='read', tool_name='read_file', arguments={'path': result.result.metadata['full_output_path']},
+        origin=read_origin), context=context)
+    assert not observed.result.is_error
+    assert 'x' * 5000 in observed.result.structured_content['content']
+
+
+@pytest.mark.anyio
+async def test_full_output_is_not_saved_to_a_denied_unreadable_path(tmp_path):
+    from dataclasses import replace
+
+    from agent_runtime.permission_policy import NetworkPolicy, PathRule, PermissionPolicy
+    [tool] = create_mcp_tools([_descriptor()], lambda *_args: {'content': [{'type': 'text', 'text': 'x' * 5000}]})
+    tool = replace(tool, max_model_output_bytes=700)
+    permissions = PermissionPolicy(filesystem=(PathRule(path='.praxis', access='deny'),),
+                                   network=NetworkPolicy(decision='allow')).resolve(tmp_path)
+    context = ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path, approval_mode='full', permissions=permissions)
+    call = ToolCall(tool_call_id='denied', tool_name=tool.definition.name, arguments={'query': 'x'},
+                    origin=ToolCallOrigin(request_id='r', toolset_revision='v',
+                                         exposed_tool_names=(tool.definition.name,)))
+    execution = await ToolExecutor({tool.definition.name: tool}).execute(call, context=context)
+    assert execution.result.error_code == 'externalization_failed'
+    assert not (tmp_path / '.praxis').exists()

@@ -114,30 +114,30 @@ class TestLoader:
                 manifest = load_skill_from_file(sf, SkillSource.PROJECT)
                 assert manifest.extra.get(field) == "some-value", f"Field '{field}' should be in extra"
 
-    def test_allowed_tools_parses(self):
-        """allowed_tools should be parsed as a tuple."""
+    def test_empty_allowed_tools_keeps_skill_unrestricted(self):
+        """Nonempty tool restrictions are unsupported; an empty list is unrestricted."""
         with tempfile.TemporaryDirectory() as d:
             skill_md = _write_skill(
                 Path(d),
                 "t1",
                 "desc",
-                allowed_tools=["read_file", "search_knowledge"],
+                allowed_tools=[],
             )
             manifest = load_skill_from_file(skill_md, SkillSource.PROJECT)
-            assert manifest.allowed_tools == ("read_file", "search_knowledge")
+            assert manifest.allowed_tools == ()
 
-    def test_paths_parses(self):
-        """paths should be parsed as a tuple."""
+    def test_empty_paths_keeps_skill_unrestricted(self):
+        """Nonempty path restrictions are unsupported; an empty list is unrestricted."""
         with tempfile.TemporaryDirectory() as d:
             skill_md = _write_skill(
                 Path(d),
                 "t2",
                 "desc",
-                paths=["**/*.xlsx", "docs/**"],
+                paths=[],
             )
             manifest = load_skill_from_file(skill_md, SkillSource.PROJECT)
-            assert manifest.path_patterns == ("**/*.xlsx", "docs/**")
-            assert manifest.has_path_filter is True
+            assert manifest.path_patterns == ()
+            assert manifest.has_path_filter is False
 
     def test_disable_model_invocation(self):
         """disable_model_invocation should be parsed as bool."""
@@ -542,6 +542,26 @@ class TestSkillRuntime:
         assert f"Use {skill_dir.resolve()}/references with input.csv." in instructions
         assert "$SKILL_DIRECTORY" in instructions
         assert "$ARGUMENTS_SUFFIX" in instructions
+
+    def test_invoke_expands_arguments_as_literal_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        skill_dir = tmp_path / ".agents" / "skills" / "literal-args"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: literal-args\ndescription: Literal expansion test\n---\n"
+            "Target: $ARGUMENTS",
+            encoding="utf-8",
+        )
+        runtime = SkillRuntime(
+            SkillCatalog(scan_and_load_skills(tmp_path, repo_root=tmp_path))
+        )
+
+        literal = r"C:\new\folder\g<name>\1.txt"
+        event = runtime.invoke_skill({"name": "project:literal-args", "args": literal})
+
+        assert f"Target: {literal}" in str(event["instructions"])
 
 class TestFinalSkillToolFactories:
     @pytest.mark.anyio

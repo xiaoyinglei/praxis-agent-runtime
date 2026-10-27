@@ -49,13 +49,6 @@ async def test_http_does_not_invent_or_copy_oversized_cors_headers():
         await client.aclose()
 
 
-def search_page(rows):
-    return '<ol id="b_results">' + ''.join(
-        f'<li class="b_algo"><h2><a href="{url}">{title}</a></h2>'
-        f'<div class="b_caption"><p>{snippet}</p></div></li>' for url, title, snippet in rows
-    ) + '</ol>'
-
-
 @pytest.mark.anyio
 @pytest.mark.parametrize('query,rows', [
     ('Python OR Rust', [('https://docs.python.org/', 'Python documentation', 'Python language')]),
@@ -66,14 +59,16 @@ def search_page(rows):
 async def test_search_preserves_backend_leads_without_query_interpretation(tmp_path, query, rows):
     hits = []
     tools, client, _ = web_tools(tmp_path, lambda req: hits.append(req) or httpx.Response(
-        200, text=search_page(rows), headers={'content-type': 'text/html'}), provider='bing')
+        200, json={'results': [dict(url=url, title=title, snippet=snippet) for url, title, snippet in rows]}),
+        provider='deepseek', key='fake-search-secret')
     try:
         execution = await ToolExecutor(tools).execute(call('web_search', {'query': query}),
                                                     context=ToolExecutionContext(allow_web_tools=True))
         output = execution.result.structured_content
         assert not execution.result.is_error
-        assert hits[0].url.params['q'] == query
-        assert list(output['results']) == [dict(url=url, title=title, snippet=snippet) for url, title, snippet in rows]
+        assert json.loads(hits[0].content)['query'] == query
+        assert list(output['results']) == [dict(url=url, title=title, snippet=snippet,
+                                               summary=None, published_at=None) for url, title, snippet in rows]
         for key in ('matched_query_terms', 'missing_query_terms', 'warning'):
             assert key not in output
         assert output['result_status'] == 'results'
@@ -183,7 +178,7 @@ def test_compaction_model_projection_preserves_execution_facts(tmp_path, error):
                'content': '', 'start_line': 1, 'next_line': None,
                'error_code': 'web_content_empty', 'error_message': 'No extracted text was found.',
                'render_mode': 'http', 'connection_mode': 'direct', 'failure_stage': 'extraction'} if error else
-              {'query': 'Python OR Rust', 'provider': 'bing', 'result_status': 'results',
+              {'query': 'Python OR Rust', 'provider': 'deepseek', 'result_status': 'results',
                'results': [{'url': 'https://docs.python.org', 'title': 'Python', 'snippet': 'Reference'}]})
     with RolloutStore(tmp_path / 'r.db') as store:
         _, turn = start(store, tmp_path)

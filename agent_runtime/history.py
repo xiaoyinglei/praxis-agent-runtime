@@ -59,8 +59,8 @@ def read_chat_messages(
 ) -> tuple[tuple[str, str], ...]:
     """Replay saved human/assistant text, including fork ancestors and no tool results.
 
-    Original Items survive context compaction. Model output and the final
-    agent_message may represent the same answer; publish that answer only once.
+    Original Items survive context compaction. Pre-v3 runtime answers can be
+    aliases of model output; compatibility deduplication is limited to those Turns.
     Incomplete output is not presented as a finished assistant answer.
     """
     with RolloutStore(database, read_only=True) as store:
@@ -73,6 +73,9 @@ def read_chat_messages(
         items = store.list_conversation_items(anchor)
         final_answers = {item.turn_id: item.payload.get("text") for item in items
                          if item.kind == "agent_message" and item.status == "completed"}
+        legacy_turns = {turn_id for turn_id in final_answers
+                        if (completion := store.read_turn_completion(turn_id)) is not None
+                        and completion.payload_schema_version < 3}
         committed_responses = {operation.response_item_id: operation for turn_id in {item.turn_id for item in items}
                                for operation in store.list_model_operations(turn_id)
                                if operation.status == "completed"
@@ -94,7 +97,8 @@ def read_chat_messages(
             elif item.kind == "model_response":
                 if item.item_id not in committed_responses or item.payload.get("response_status") == "incomplete":
                     continue
-                if not item.payload.get("tool_calls") and text == final_answers.get(item.turn_id):
+                if (item.turn_id in legacy_turns and not item.payload.get("tool_calls")
+                        and text == final_answers.get(item.turn_id)):
                     continue
                 operation = committed_responses[item.item_id]
                 revision = store.request_input_revision(item.turn_id, operation.request_ref)

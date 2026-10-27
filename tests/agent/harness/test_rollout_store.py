@@ -34,11 +34,11 @@ def test_settings_update_does_not_rewrite_historical_projections(
         historical_turns = store.list_turns()
         historical_items = tuple(store.list_items(turn.turn_id) for turn in historical_turns)
         statements: list[str] = []
-        store._connection.set_trace_callback(statements.append)
+        store.run_sync(lambda: store._connection.set_trace_callback(statements.append))
 
         store.update_session_settings(thread.thread_id, {"model_alias": "new-model"})
 
-        store._connection.set_trace_callback(None)
+        store.run_sync(lambda: store._connection.set_trace_callback(None))
         inserts = [statement for statement in statements if statement.lstrip().startswith("INSERT INTO")]
         assert len(inserts) == 3, inserts
         assert store.list_turns() == historical_turns
@@ -61,11 +61,13 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         thread_before = store.read_thread(thread.thread_id)
         hashes = store.projection_hashes()
         items = store.list_items(turn.turn_id)
-        store._connection.execute(
-            """
+        store.run_sync(
+            lambda: store._connection.execute(
+                """
             CREATE TRIGGER reject_projection_commit BEFORE UPDATE ON projection_meta
             BEGIN SELECT RAISE(ABORT, 'projection write rejected'); END
             """
+            ).close()
         )
 
         with pytest.raises(sqlite3.IntegrityError, match="projection write rejected"):
@@ -77,7 +79,7 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         assert store.list_items(turn.turn_id) == items
         assert store.projection_hashes() == hashes
         assert store.verify().valid
-        store._connection.execute("DROP TRIGGER reject_projection_commit")
+        store.run_sync(lambda: store._connection.execute("DROP TRIGGER reject_projection_commit").close())
         store.complete_turn(turn_id=turn.turn_id, answer="committed after retry")
         assert store.verify().valid
 
@@ -330,4 +332,103 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
     with RolloutStore(database) as store:
         active_turn_id = store.read_thread(thread_id).active_turn_id
         assert active_turn_id in results
+        assert store.verify().valid is True
+
+
+def test_connection_sets_explicit_busy_timeout(tmp_path: Path) -> None:
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        timeout = store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout").fetchone())[0]
+        assert timeout == 30000
+
+
+def test_failed_commit_does_not_leave_connection_inside_transaction(tmp_path: Path) -> None:
+    class _CommitFailingConnection:
+        """One-shot proxy simulating a disk error on the first COMMIT."""
+
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+            self._failed = False
+
+        def execute(self, script: str, *parameters: object) -> object:
+            if script == "COMMIT" and not self._failed:
+                self._failed = True
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._connection.execute(script, *parameters)
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._connection, name)
+
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        store._connection = _CommitFailingConnection(store._connection)  # type: ignore[assignment]
+
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+
+            def transaction():
+                with store._transaction():
+                    store.run_sync(
+                        lambda: store._connection.execute(
+                            "INSERT INTO store_metadata(key, value) VALUES ('probe', '1')",
+                        ).close()
+                    )
+
+            store.run_sync(transaction)
+
+        assert store._connection.in_transaction is False
+        probe = store.run_sync(
+            lambda: store._connection.execute(
+                "SELECT value FROM store_metadata WHERE key = 'probe'",
+            ).fetchone()
+        )
+        assert probe is None
+
+        def transaction():
+            with store._transaction():
+                pass
+
+        store.run_sync(transaction)
+
+
+def test_pending_cancellation_blocks_clarification_and_choice_resolution(tmp_path: Path) -> None:
+    (tmp_path / "one").mkdir()
+    (tmp_path / "two").mkdir()
+    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        # One active turn per thread: keep each scenario on its own thread.
+        first = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path / "one").thread_id,
+            user_message="pause and cancel for clarification",
+            binding_manifest={"model_id": "test-model"},
+        )
+        second = store.start_turn(
+            thread_id=store.create_thread(workspace=tmp_path / "two").thread_id,
+            user_message="pause and cancel for choice",
+            binding_manifest={"model_id": "test-model"},
+        )
+        clarification = store.request_clarification(
+            turn_id=first.turn_id, question="which file?",
+        )
+        store.request_turn_cancellation(turn_id=first.turn_id)
+
+        with pytest.raises(RuntimeError, match="cancellation was requested"):
+            store.resolve_clarification(
+                turn_id=first.turn_id,
+                request_id=clarification.request_id,
+                response="that one",
+            )
+
+        assert store.read_turn(first.turn_id).status == "paused"
+        assert store.read_interaction(clarification.request_id).status == "pending"
+
+        choice = store.request_choice(
+            turn_id=second.turn_id, question="which?", options=("a", "b"),
+        )
+        store.request_turn_cancellation(turn_id=second.turn_id)
+
+        with pytest.raises(RuntimeError, match="cancellation was requested"):
+            store.resolve_choice(
+                turn_id=second.turn_id,
+                request_id=choice.request_id,
+                selection="a",
+            )
+
+        assert store.read_interaction(choice.request_id).status == "pending"
         assert store.verify().valid is True

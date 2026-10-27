@@ -12,10 +12,17 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_runtime.git_delivery import DeliveryError, GitDelivery
+from agent_runtime.git_delivery import (
+    DeliveryError,
+    DeliveryInterruptedError,
+    DeliveryResult,
+    GitDelivery,
+    PullRequestResult,
+)
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -61,6 +68,8 @@ class CommitChangesOutput(BaseModel):
     branch: str = ""
     changed_file_count: int = 0
     created_branch: bool = False
+    interruption_requested: bool = False
+    outcome: str = "completed"
     error: str | None = None
 
 
@@ -99,6 +108,8 @@ class OpenPullRequestOutput(BaseModel):
     url: str = ""
     branch: str = ""
     created: bool = False
+    interruption_requested: bool = False
+    outcome: str = "completed"
     error: str | None = None
 
 
@@ -110,17 +121,22 @@ def create_commit_changes_tool(workspace: WorkspaceRuntime) -> Tool:
 
     async def run(arguments: Mapping[str, JsonValue]) -> CommitChangesOutput:
         request = CommitChangesInput.model_validate(dict(arguments))
+        interrupted = False
         try:
             result = await GitDelivery(root).commit(
                 request.message, branch_name=request.branch_name,
             )
+        except DeliveryInterruptedError as error:
+            result = cast(DeliveryResult, error.result)
+            interrupted = True
         except DeliveryError as error:
-            return CommitChangesOutput(error=str(error))
+            return CommitChangesOutput(error=str(error), outcome=error.outcome)
         return CommitChangesOutput(
             commit_id=result.commit_id,
             branch=result.branch,
             changed_file_count=result.changed_file_count,
             created_branch=result.created_branch,
+            interruption_requested=interrupted,
         )
 
     def normalize_output(raw: object) -> NormalizedToolOutput:
@@ -162,11 +178,11 @@ def create_commit_changes_tool(workspace: WorkspaceRuntime) -> Tool:
                 ToolTarget(kind="execution_mode", value="host_delivery"),
             ),
         ),
-        execution_revision="delivery-commit-v1",
+        execution_revision="delivery-commit-v2",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.COOPERATIVE,
-        interrupt_behavior=InterruptBehavior.CANCEL,
+        interrupt_behavior=InterruptBehavior.FINISH_CURRENT,
         timeout_seconds=60.0,
         max_model_output_bytes=8_192,
     )
@@ -180,14 +196,19 @@ def create_open_pull_request_tool(workspace: WorkspaceRuntime) -> Tool:
 
     async def run(arguments: Mapping[str, JsonValue]) -> OpenPullRequestOutput:
         request = OpenPullRequestInput.model_validate(dict(arguments))
+        interrupted = False
         try:
             result = await GitDelivery(root).open_pull_request(
                 title=request.title, body=request.body, base_branch=request.base_branch,
             )
+        except DeliveryInterruptedError as error:
+            result = cast(PullRequestResult, error.result)
+            interrupted = True
         except DeliveryError as error:
-            return OpenPullRequestOutput(error=str(error))
+            return OpenPullRequestOutput(error=str(error), outcome=error.outcome)
         return OpenPullRequestOutput(
             url=result.url, branch=result.branch, created=result.created,
+            interruption_requested=interrupted,
         )
 
     def normalize_output(raw: object) -> NormalizedToolOutput:
@@ -229,11 +250,11 @@ def create_open_pull_request_tool(workspace: WorkspaceRuntime) -> Tool:
                 ToolTarget(kind="execution_mode", value="host_delivery"),
             ),
         ),
-        execution_revision="delivery-pull-request-v1",
+        execution_revision="delivery-pull-request-v2",
         idempotent=False,
         concurrency_safe=False,
         cancellation_mode=CancellationMode.COOPERATIVE,
-        interrupt_behavior=InterruptBehavior.CANCEL,
+        interrupt_behavior=InterruptBehavior.FINISH_CURRENT,
         timeout_seconds=180.0,
         max_model_output_bytes=8_192,
     )

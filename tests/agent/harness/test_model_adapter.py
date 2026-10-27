@@ -615,7 +615,9 @@ async def test_harness_backpressure_reaches_sync_provider_bridge(
 
         assert provider.produced < 100
 
-        while not running.done() or not stream.empty:
+        # Delivery of the terminal event can precede the producer task
+        # finishing its cancellation-safe channel cleanup.
+        while events[-1].type is not EventType.TURN_COMPLETED:
             if stream.empty:
                 await asyncio.wait_for(stream.wait_available(), timeout=1.0)
             events.append(stream.receive_nowait())

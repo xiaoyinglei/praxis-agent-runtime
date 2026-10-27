@@ -183,6 +183,10 @@ uv run agent recover turn_ID --action continue
 
 每轮结束、失败或暂停等待审批时，默认显示本轮累计输入、输出和总 Token，以及提供方已报告的缓存命中和推理用量。缓存命中已包含在输入中，推理已包含在输出中，不会重复相加。用量包含该 Turn 的摘要和重试请求；恢复后继续累计。连接结果不确定时，已记录的 Token 会标注“用量不完整”。这些字段也可从 SDK 的 `result.usage` 读取。
 
+## 并行会话：Worktree 隔离
+
+多个窗口在同一个项目目录同时开会话会互相覆盖文件。`agent chat --worktree`（或 `agent run … --worktree`）在新窗口里为会话创建独立 Git worktree 检出和 `worktree/<名字>` 分支，会话只在自己的检出里读写；主窗口不受影响。`agent worktree list | remove | prune` 管理这些检出，交付照常走 `/commit` 和 `/pull`。设计细节与限制见 [Worktree 隔离](worktrees.md)。
+
 ## 检查点与回滚
 
 一轮对话即将首次修改工作区文件时，Runtime 会先把整个工作区快照为一个**检查点**。检查点存放在用户配置目录（`~/.config/praxis/checkpoints/`，按工作区路径区分）的**影子 git 仓库**里：它只被 Praxis 读写，使用独立的 git 元数据，项目自身的 `.git` 目录始终保持只读，两者互不影响。快照范围与 Runtime 判定“工作区已修改”的范围一致：`.git`、`.praxis`、`.venv`、`node_modules` 和各类缓存目录不进入检查点。
@@ -489,9 +493,41 @@ uv run --extra rag rag --help
 
 `web_search` 与 `web_fetch` 默认向 CLI 提供搜索与网页阅读工具。它们只能访问通过检查的公网地址，不向工具开放任意内网。已配置的搜索会把查询发送给所选服务，读取网页会对目标站点发请求。
 
-默认未配置搜索服务或 Key 时，`web_search` 返回 `web_search_not_configured`，不发请求、不消耗网络请求预算；Agent 仍可启动，`web_fetch` 可直接读取已知公网 URL。使用 `--web-search-provider brave|tavily` 与 `--web-search-key-file PATH` 配置 API 搜索；密钥文件应位于工作区外。仅提供 Key 时沿用 Brave。需要公开 HTML 搜索时可显式选择 `--web-search-provider bing`（不提供 Key），但它依赖页面结构，可能遇到限流或验证，不保证可用性。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
+默认未配置搜索服务或 Key 时，`web_search` 返回 `web_search_not_configured`，不发请求、不消耗网络请求预算；Agent 仍可启动，`web_fetch` 可直接读取已知公网 URL。使用 `--web-search-provider deepseek|brave|tavily` 与 `--web-search-key-file PATH` 配置 API 搜索；密钥文件应位于工作区外，内容为 API Key，权限为 `0600` 或 `0400`。仅提供 Key 时沿用 Brave。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
 
-恢复未完成 Turn 时，搜索服务须与原工具执行版本一致。升级前默认使用 Bing 的待恢复调用，需要显式指定 `--web-search-provider bing`；新版未配置状态使用独立执行版本，不会把旧调用静默切换到其他服务。Brave/Tavily 恢复仍须提供原服务与受保护密钥文件，密钥不会写入 Turn 记录。Python SDK 对应参数为 `web_search_provider` 与 `web_search_key_file`。
+DeepSeek 使用官方 [Search API](https://api-docs.deepseek.com/api/search/)：`POST https://api.deepseek.com/v1/tools/search`，使用与模型 API 相同的 DeepSeek Key。查询原样发送，最多 128 个 Unicode 字符；日期筛选直接写 `after:2026-10-01` / `before:2026-10-26`，不传 `freshness`。返回来源 URL、标题、短摘要，以及服务商提供的长摘要 `summary` 和发布日期 `published_at`；日期不是本地核实结果，不请求模型生成答案。长摘要按既有结果字节预算输出，超过预算会明确标记 `results_truncated`，不把摘要的典型长度当成接口长度上限。
+
+配置 `deepseek` 后，`web_fetch` 同时使用官方 [Fetch API](https://api-docs.deepseek.com/api/fetch/)：`POST https://api.deepseek.com/v1/tools/fetch`，复用同一份 Key。抓取和正文提取交给 DeepSeek，本地不访问目标站点、不启动 HTML 解析 worker 或 Chromium，也不在服务失败后切回本地抓取。权限检查同时包含目标 URL 和 API 地址。`render` 仅接受默认值 `auto`，表示由服务商控制获取方式；不代表本地已执行 JavaScript。
+
+客户端采用 [Codex Web 工具](https://github.com/openai/codex/blob/main/codex-rs/ext/web-search/src/tool.rs) 的 search / open / find 动作组织：`web_search(query=...)` 搜索，`web_fetch(url=...)` 打开正文，`web_fetch(source_id=..., find=...)` 在保存的正文里查找。请求通过现有 Tool/Executor 派发，不运行 Rust 客户端或新增服务端。
+
+Fetch 返回的 Markdown 原样保存为有哈希的来源快照；本地复用分页、提纲、链接定位、文字查找和版本比较。`view=raw` 展示实际收到的服务商 JSON，不是目标网页原始 HTML。`network_bytes` 统计本地与 API 间的响应字节，不代表服务商抓取网站的内部流量。Brave、Tavily 与未配置搜索的模式沿用原有直接网页读取方式。
+
+```bash
+agent run "查找 DeepSeek Search API 官方文档" \
+  --web-search-provider deepseek \
+  --web-search-key-file "$HOME/.config/praxis/deepseek.key"
+```
+
+四个入口 `run/chat/resume/recover` 均支持这两个参数，也可通过 `PRAXIS_WEB_SEARCH_PROVIDER` / `PRAXIS_WEB_SEARCH_KEY_FILE` 设置。Python SDK 对应：
+
+```python
+import asyncio
+from pathlib import Path
+from agent_runtime import Agent
+
+async def main():
+    agent = Agent(
+        web_search_provider="deepseek",
+        web_search_key_file=Path.home() / ".config/praxis/deepseek.key",
+    )
+    result = await agent.run("查找 DeepSeek Search API 官方文档", allow_web_tools=True)
+    print(result.answer)
+
+asyncio.run(main())
+```
+
+恢复未完成 Turn 时，搜索和读取工具须与原执行版本一致，并提供原服务的密钥文件；密钥不会写入 Turn 记录。DeepSeek 搜索的新版本为 `builtin-public-web-search-deepseek-v2`，托管读取为 `builtin-public-web-fetch-deepseek-v1`；旧的直接抓取待执行操作不能静默切成托管获取。Bing HTML 搜索已移除。
 
 网页读取保存来源、内容哈希及快照，长内容可以继续读取。成功取得文字不代表已经找到足够证据，HTTP 403、登录墙、内容截断和资源阻断应单独解释。
 

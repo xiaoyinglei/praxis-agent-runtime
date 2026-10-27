@@ -35,7 +35,9 @@ async def test_public_usage_counts_actual_local_tools_and_survives_reopen_and_re
     monkeypatch.setattr(agent, "_model_factory", lambda: ReadTwiceThenAnswer())
     result = await agent.run("Read both files", require_workspace_change=False)
     assert result.status == "done", (result.stop_reason, result.diagnostics)
-    assert [call.is_error for call in result.tool_calls] == [False, True]
+    assert {call.tool_call_id: call.is_error for call in result.tool_calls} == {
+        "read-ok": False, "read-failed": True,
+    }
     assert result.usage.native_calls == result.usage.tool_calls == 2
     assert result.usage.native_errors == 1
     assert result.usage.tool_latency_ms > 0

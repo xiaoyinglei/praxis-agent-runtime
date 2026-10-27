@@ -701,8 +701,8 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
             "model_response",
             "final_proposal",
             "completion_decision",
-            "agent_message",
         ]
+        assert store.read_turn_answer(result.turn_id).item_id == operation.response_item_id
         assert store.verify().valid is True
 
 

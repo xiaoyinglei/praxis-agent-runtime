@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -22,6 +23,7 @@ from agent_runtime.core.llm_config import (
     ModelSpec,
     normalize_model_endpoint,
 )
+from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.model_config_io import (
     UntrustedConfigPathError,
     discover_git_worktree,
@@ -41,6 +43,8 @@ from agent_runtime.modeling.contracts import (
     LLMStageBudget,
     parse_llm_stage_budgets,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class UnknownModelIdError(KeyError):
@@ -452,18 +456,30 @@ class ModelRegistry:
             TokenizerContract,
         )
 
-        generator: object | None = None
-
+        build_error: Exception | None = None
         try:
             generator = _build_chat_generator(
                 model_id=definition.model_id,
                 spec=spec,
             )
-        except Exception:
-            pass
-
-        if generator is None:
-            raise ModelNotAvailableError(f"Failed to build provider for {subject}")
+        except Exception as error:
+            build_error = error
+        if build_error is not None:
+            # Provider construction failures must stay diagnosable without
+            # echoing provider error text, which can embed credentials: name
+            # the exception type on the error, keep the chain clean (the raw
+            # exception is untrusted, so it is never attached), and route the
+            # redacted detail to debug logs.
+            logger.debug(
+                "provider build failed for %s: %s: %s",
+                subject,
+                type(build_error).__name__,
+                redact_sensitive_text(build_error),
+            )
+            raise ModelNotAvailableError(
+                f"Failed to build provider for {subject}: {type(build_error).__name__} "
+                "(enable debug logs for the redacted cause)"
+            )
 
         capabilities = definition.capabilities
 

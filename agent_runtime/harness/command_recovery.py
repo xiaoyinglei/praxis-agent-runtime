@@ -18,12 +18,14 @@ if TYPE_CHECKING:
 
 async def cancel_commands(agent: Agent, turn_id: str) -> None:
     """Abort must reconcile detached processes before declaring the Turn cancelled."""
-    with RolloutStore(agent._harness_database(), read_only=True) as store:
+    async with await RolloutStore.open(agent._harness_database(), read_only=True) as store:
         keys = []
-        for operation in store.list_tool_operations(turn_id):
+        for operation in await store.run_async(store.list_tool_operations, turn_id):
             if operation.tool_name != "run_command" or operation.status != "succeeded" or not operation.result_item_id:
                 continue
-            output = store.read_item(operation.result_item_id).payload.get("structured_content", {})
+            output = (await store.run_async(store.read_item, operation.result_item_id)).payload.get(
+                "structured_content", {}
+            )
             if (isinstance(output.get("session_id"), str) and isinstance(output.get("request_digest"), str)
                     and output.get("status") == "running"):
                 keys.append(output["session_id"])
@@ -37,11 +39,11 @@ async def manage_command(agent: Agent, turn_id: str, session_id: str, *,
                          offset: int = 0, max_bytes: int = 16000) -> RunCommandOutput:
     request = ManageCommandInput(session_id=session_id, action=action, wait_seconds=wait_seconds,
                                  stream=stream, offset=offset, max_bytes=max_bytes)
-    with RolloutStore(agent._harness_database()) as store:
-        if not store.verify().valid:
+    async with await RolloutStore.open(agent._harness_database()) as store:
+        if not (await store.run_async(store.verify)).valid:
             raise RuntimeError("Rollout integrity check failed")
-        turn = store.read_turn(turn_id)
-        if store.read_thread(turn.thread_id).workspace != str(agent.workspace_path.resolve()):
+        turn = await store.run_async(store.read_turn, turn_id)
+        if (await store.run_async(store.read_thread, turn.thread_id)).workspace != str(agent.workspace_path.resolve()):
             raise ValueError("Turn belongs to a different workspace")
         saved = turn.binding_manifest.get("tool_execution_policy", {}).get("permissions")
         ceiling = None if saved is None else ResolvedPermissions.model_validate(saved)

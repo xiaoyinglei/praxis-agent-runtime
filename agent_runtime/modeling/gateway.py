@@ -493,7 +493,9 @@ class LLMGateway:
             or parse_openai_usage(provider_result.value)
             or normalize_llm_usage(
                 input_tokens=input_tokens,
-                output_tokens=self._token_accounting.count(turn.text),
+                output_tokens=sum(
+                    self._token_accounting.count(part) for part in _openai_output_parts(provider_result.value)
+                ),
                 input_tokens_include_cache=True,
                 usage_source="tokenizer_estimate",
             )
@@ -523,7 +525,7 @@ class LLMGateway:
             prompt=prompt,
             kwargs=kwargs,
         )
-        effective_lease_id = lease_id or f"{stage.value}:{id(prompt)}"
+        effective_lease_id = lease_id or f"{stage.value}:{uuid4().hex}"
         if effective_ledger is not None:
             reserved = await effective_ledger.reserve(effective_lease_id, reservation)
             if not reserved:
@@ -577,7 +579,7 @@ class LLMGateway:
             prompt=accounted_prompt,
             kwargs=kwargs,
         )
-        effective_lease_id = lease_id or f"{stage.value}:{id(prompt)}"
+        effective_lease_id = lease_id or f"{stage.value}:{uuid4().hex}"
         if effective_ledger is not None:
             reserved = await effective_ledger.reserve(effective_lease_id, reservation)
             if not reserved:
@@ -655,7 +657,7 @@ class LLMGateway:
             prompt=accounted_prompt,
             kwargs=kwargs,
         )
-        effective_lease_id = lease_id or f"{stage.value}:stream:{id(messages)}"
+        effective_lease_id = lease_id or f"{stage.value}:stream:{uuid4().hex}"
         if quota_provider is not None or quota_model is not None:
             if not quota_provider or not quota_model:
                 raise ValueError("quota_provider and quota_model must be supplied together")
@@ -715,7 +717,9 @@ class LLMGateway:
         producer_thread.start()
 
         # 并发 yield chunks
-        total_output_tokens = 0
+        output_parts: dict[tuple[str, str], list[str]] = {}
+        active_tool = ""
+        anonymous_tools = 0
         final_stop: StreamChunk | None = None
         reported_usage: LLMUsage | None = None
         try:
@@ -727,10 +731,14 @@ class LLMGateway:
                         break
                     await asyncio.sleep(_PROVIDER_BRIDGE_POLL_SECONDS)
                     continue
-                if chunk.type in {"text_delta", "thinking_delta"}:
-                    total_output_tokens += self._token_accounting.count(
-                        chunk.content
-                    )
+                if chunk.type in {"text_delta", "thinking_delta", "plan_delta"}:
+                    output_parts.setdefault((chunk.type, ""), []).append(chunk.content)
+                elif chunk.type == "tool_use_start":
+                    anonymous_tools += 1
+                    active_tool = chunk.tool_id or f"anonymous:{anonymous_tools}"
+                    output_parts.setdefault(("tool_name", active_tool), []).append(chunk.tool_name)
+                elif chunk.type == "tool_input_delta":
+                    output_parts.setdefault(("tool_input", chunk.tool_id or active_tool), []).append(chunk.content)
                 if chunk.type == "message_stop":
                     final_stop = chunk
                     reported_usage = chunk.usage
@@ -763,7 +771,7 @@ class LLMGateway:
         # 提交预算
         usage = reported_usage or normalize_llm_usage(
             input_tokens=input_tokens,
-            output_tokens=total_output_tokens,
+            output_tokens=sum(self._token_accounting.count("".join(parts)) for parts in output_parts.values()),
             input_tokens_include_cache=True,
             usage_source="tokenizer_estimate",
         )
@@ -1063,6 +1071,23 @@ class LLMGateway:
                 stop_reason=stop_reason,
                 usage=result.usage,
             ))
+
+
+def _openai_output_parts(response: object) -> tuple[str, ...]:
+    """Visible generated channels, including tool fragments from incomplete steps."""
+    def field(value: object, name: str, default: object = None) -> Any:
+        return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+    choices = field(response, "choices", ())
+    if not choices:
+        return ()
+    message = field(choices[0], "message")
+    parts = [field(message, "content", ""),
+             field(message, "reasoning_content") or field(message, "reasoning", "")]
+    for call in field(message, "tool_calls", ()) or ():
+        function = field(call, "function")
+        parts.extend((field(function, "name", ""), field(function, "arguments", "")))
+    return tuple(part if isinstance(part, str) else json.dumps(part, ensure_ascii=False) for part in parts if part)
 
 
 def _render_messages_as_prompt(messages: list[dict[str, Any]]) -> str:

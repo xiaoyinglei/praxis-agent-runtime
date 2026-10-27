@@ -10,6 +10,15 @@ from typer.testing import CliRunner
 from agent_runtime.cli import agent_app
 
 
+def test_malformed_personal_config_has_a_catchable_configuration_error(tmp_path, monkeypatch):
+    from agent_runtime import mcp_admin
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path))
+    (tmp_path / "mcp_servers.yaml").write_text("servers: [\n")
+    with pytest.raises(ValueError, match="configuration"):
+        mcp_admin.mcp_connections()
+
+
 def test_github_setup_is_one_command_and_preserves_other_destinations(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / ".config/praxis"))

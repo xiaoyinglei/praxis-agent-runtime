@@ -41,7 +41,8 @@ SOURCE_PRIORITY: dict[SkillSource, int] = {
 
 # ── Fields we actively understand ────────────────────────────────────
 
-# These fields have defined behaviour in the current implementation.
+# These fields are recognized: unsupported nonempty constraints are rejected
+# rather than being passed through as if their restrictions were enforced.
 # Everything else goes into ``extra``.
 _UNDERSTOOD_FIELDS = frozenset({
     "name",
@@ -79,6 +80,13 @@ class SkillManifest:
     disable_model_invocation: bool = False
     content_fingerprint: str = ""  # stable hash of SKILL.md + frontmatter
     extra: dict[str, Any] = field(default_factory=dict)
+    body: str = field(default="", repr=False)  # read together with the fingerprint; never re-read on invocation
+
+    @property
+    def unsupported_constraints(self) -> tuple[str, ...]:
+        """Known restriction syntax for which this runtime has no enforcement."""
+        return tuple(name for name, values in (("allowed_tools", self.allowed_tools), ("paths", self.path_patterns))
+                     if values)
 
     @property
     def has_path_filter(self) -> bool:
@@ -139,6 +147,7 @@ SkillErrorCode = Literal[
     "invalid_skill_manifest",
     "skill_source_untrusted",
     "skill_content_changed_on_resume",
+    "unsupported_skill_constraints",
 ]
 
 

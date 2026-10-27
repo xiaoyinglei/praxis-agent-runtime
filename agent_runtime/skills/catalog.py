@@ -7,7 +7,7 @@ SkillManifest objects and provides:
   - list_visible() — all skills, minus those filtered by state
   - find(name)    — exact lookup
   - listing_for_prompt(max_chars) — budget-aware single-line listing
-  - load(name)    — read full body from disk
+  - load(name)    — return the body frozen with its manifest
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ class SkillCatalog:
         )
 
     def load(self, name: str, iteration: int = 0) -> LoadedSkill | None:
-        """Load a skill body from disk.
+        """Load the body frozen with the skill metadata at discovery.
 
         Returns None if the skill is not in the catalog.  The caller should
         verify the skill exists before calling this.

@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import hashlib
 import json
 import math
 import os
 import sqlite3
+import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from agent_runtime.budget import (
@@ -42,6 +47,16 @@ from agent_runtime.streaming.events import (
 )
 
 _REDUCER_VERSION = 1
+_EVENT_REFERENCE_KEYS = {
+    "item_started": "item_id",
+    "item_completed": "item_id",
+    "model_attempt_completed": "response_item_id",
+    "tool_operation_result_linked": "result_item_id",
+    "tool_operation_claimed": "operation_id",
+    "tool_operation_prepared": "operation_id",
+    "tool_operation_outcome_committed": "operation_id",
+    "tool_operation_migrated": "operation_id",
+}
 
 
 class TurnInputChangedError(RuntimeError):
@@ -246,6 +261,18 @@ class ArtifactSnapshot:
     applied_thread_sequence: int
 
 
+def _store_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
+    """Keep complete synchronous operations on the connection's owning thread."""
+
+    @wraps(method)
+    def owned(*args: P.args, **kwargs: P.kwargs) -> T:
+        store = args[0]
+        assert isinstance(store, RolloutStore)
+        return store.run_sync(lambda: method(*args, **kwargs))
+
+    return owned
+
+
 class RolloutStore:
     """Own canonical records and update projections through one reducer.
 
@@ -259,6 +286,34 @@ class RolloutStore:
         *,
         read_only: bool = False,
     ) -> None:
+        self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
+        self._owner_thread: int | None = None
+        self._admission = threading.Lock()
+        self._closing: Future[None] | None = None
+        try:
+            self.run_sync(lambda: self._initialize(path, read_only=read_only))
+        except BaseException:
+            self.close()
+            raise
+
+    @classmethod
+    async def open(cls, path: Path, *, read_only: bool = False) -> RolloutStore:
+        """Open/migrate on the Store owner without blocking the caller's loop."""
+        self = cls.__new__(cls)
+        self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
+        self._owner_thread = None
+        self._admission = threading.Lock()
+        self._closing = None
+        try:
+            await self.run_async(lambda: self._initialize(path, read_only=read_only))
+        except BaseException:
+            # Cancellation still observes initialization before closing its resource.
+            await self.aclose()
+            raise
+        return self
+
+    def _initialize(self, path: Path, *, read_only: bool) -> None:
+        self._owner_thread = threading.get_ident()
         self._path = Path(path)
         self._read_only = read_only
         self._artifact_root = self._path.with_name(f"{self._path.name}.artifacts")
@@ -272,6 +327,9 @@ class RolloutStore:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._connection = sqlite3.connect(self._path, isolation_level=None)
         self._connection.row_factory = sqlite3.Row
+        # Multiple processes share this WAL database; BEGIN IMMEDIATE must
+        # wait out another process's write lock instead of failing fast.
+        self._connection.execute("PRAGMA busy_timeout = 30000")
         if not read_only:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
@@ -283,9 +341,91 @@ class RolloutStore:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
-    def close(self) -> None:
-        self._connection.close()
+    def _submit[T](self, operation: Callable[[], T]) -> Future[T]:
+        context = contextvars.copy_context()
+        with self._admission:
+            if self._closing is not None:
+                raise sqlite3.ProgrammingError("RolloutStore is closed")
+            return self._owner.submit(context.run, operation)
 
+    def run_sync[T](self, operation: Callable[[], T]) -> T:
+        """Blocking API; compose a complete query/transaction on the same owner.
+
+        Return detached values, never SQLite cursors. Advance read generators with iterate.
+        Async consumers use run_async, including for multi-query read helpers.
+        """
+        if threading.get_ident() == self._owner_thread:
+            return operation()
+        return self._submit(operation).result()
+
+    async def run_async[**P, T](self, operation: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Await one FIFO operation; cancellation waits for its real outcome.
+
+        Accepted work is never cancelled or retried. If cancellation races a
+        failure, the actual Store error wins. Otherwise cancellation propagates
+        after the operation finishes, so callers can reconcile durable state.
+        """
+        return await self._observe(self._submit(lambda: operation(*args, **kwargs)))
+
+    async def iterate[T](self, iterator: Iterator[T]) -> AsyncGenerator[T, None]:
+        """Advance a lazy read helper on the owner; materialize one result at a time."""
+        end = object()
+        try:
+            while True:
+                value = await self.run_async(next, iterator, end)
+                if value is end:
+                    return
+                yield cast(T, value)
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                await self.run_async(close)
+
+    @staticmethod
+    async def _observe[T](future: Future[T]) -> T:
+        waiting = asyncio.wrap_future(future)
+        cancelled = False
+        while not waiting.done():
+            try:
+                await asyncio.shield(waiting)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = waiting.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    def _begin_close(self) -> Future[None]:
+        with self._admission:
+            if self._closing is None:
+
+                def close_connection() -> None:
+                    connection = getattr(self, "_connection", None)
+                    if connection is not None:
+                        connection.close()
+
+                self._closing = self._owner.submit(close_connection)
+                self._owner.shutdown(wait=False)
+            return self._closing
+
+    def close(self) -> None:
+        """Stop admission, drain accepted work and close on the owner (blocking)."""
+        if threading.get_ident() == self._owner_thread:
+            raise RuntimeError("cannot close RolloutStore from its operation")
+        self._begin_close().result()
+        self._owner.shutdown(wait=True)
+
+    async def aclose(self) -> None:
+        """Stop admission and await the same drain/close barrier asynchronously."""
+        await self._observe(self._begin_close())
+
+    async def __aenter__(self) -> RolloutStore:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self.aclose()
+
+    @_store_operation
     def read_memory_state(self, workspace: Path, *, version: int | None = None) -> dict[str, Any]:
         """Read workspace memory; old/read-only databases need no schema migration."""
         key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
@@ -306,10 +446,17 @@ class RolloutStore:
             raise RuntimeError("workspace memory integrity mismatch")
         return dict(state)
 
+    @_store_operation
     def commit_memory_state(
-        self, workspace: Path, *, expected_version: int, state: Mapping[str, Any],
-        claim_owner: str | None = None, job_thread_id: str | None = None,
-        job_state: Mapping[str, Any] | None = None, job_revision: int | None = None,
+        self,
+        workspace: Path,
+        *,
+        expected_version: int,
+        state: Mapping[str, Any],
+        claim_owner: str | None = None,
+        job_thread_id: str | None = None,
+        job_state: Mapping[str, Any] | None = None,
+        job_revision: int | None = None,
     ) -> dict[str, Any]:
         """CAS commit; keep immutable versions for inspection and crash recovery."""
         key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
@@ -329,14 +476,21 @@ class RolloutStore:
             self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)", (key, value))
         return committed
 
+    @_store_operation
     def read_memory_jobs(self, workspace: Path) -> dict[str, Any]:
         key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
         return {} if row is None else dict(json.loads(row["value"]))
 
+    @_store_operation
     def write_memory_job(
-        self, workspace: Path, thread_id: str, state: Mapping[str, Any], *,
-        owner: str | None = None, expected_revision: int | None = None,
+        self,
+        workspace: Path,
+        thread_id: str,
+        state: Mapping[str, Any],
+        *,
+        owner: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -352,6 +506,7 @@ class RolloutStore:
                                      (key, _canonical_json(jobs)))
         return job
 
+    @_store_operation
     def enqueue_memory_job(self, workspace: Path, thread_id: str) -> None:
         with self._transaction():
             if Path(self.read_thread(thread_id).workspace).resolve() != workspace.resolve():
@@ -368,6 +523,7 @@ class RolloutStore:
         if claim.get("owner") != owner or claim.get("expires_at", 0) <= time.time():
             raise ContextSourceChangedError("memory workspace lease is no longer owned")
 
+    @_store_operation
     def claim_memory_job(self, workspace: Path, *, owner: str, now: float, lease_seconds: float) -> bool:
         key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -378,6 +534,7 @@ class RolloutStore:
                                      (key, _canonical_json({"owner": owner, "expires_at": now + lease_seconds})))
         return True
 
+    @_store_operation
     def release_memory_job(self, workspace: Path, *, owner: str) -> None:
         key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -390,6 +547,7 @@ class RolloutStore:
             raise sqlite3.OperationalError("attempt to write a readonly database")
 
     @property
+    @_store_operation
     def epoch(self) -> str:
         row = self._connection.execute("SELECT value FROM store_metadata WHERE key = 'store_epoch'").fetchone()
         if row is None:
@@ -397,9 +555,11 @@ class RolloutStore:
         return str(row["value"])
 
     @property
+    @_store_operation
     def artifact_root(self) -> Path:
         return self._artifact_root
 
+    @_store_operation
     def capture_mutation[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
         """Run one Store mutation and return only that transaction's records."""
 
@@ -415,6 +575,11 @@ class RolloutStore:
             raise RuntimeError("committed mutation must contain exactly one outer transaction")
         return CommittedMutation(value=value, records=captured[0])
 
+    async def capture_mutation_async[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
+        """Run the complete transaction and artifact I/O on the Store owner."""
+        return await self.run_async(lambda: self.capture_mutation(operation))
+
+    @_store_operation
     def commit_artifact(
         self,
         *,
@@ -480,6 +645,7 @@ class RolloutStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @_store_operation
     def read_artifact_metadata(self, artifact_id: str) -> ArtifactSnapshot:
         row = self._connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?",
@@ -489,6 +655,7 @@ class RolloutStore:
             raise KeyError(f"unknown artifact: {artifact_id}")
         return _artifact_snapshot(row)
 
+    @_store_operation
     def list_artifacts(self, turn_id: str | None = None) -> tuple[ArtifactSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM artifacts ORDER BY rowid").fetchall()
@@ -499,10 +666,12 @@ class RolloutStore:
             ).fetchall()
         return tuple(_artifact_snapshot(row) for row in rows)
 
+    @_store_operation
     def artifact_blob_path(self, artifact_id: str) -> Path:
         artifact = self.read_artifact_metadata(artifact_id)
         return self._artifact_root / "blobs" / artifact.blob_sha256
 
+    @_store_operation
     def read_artifact(self, artifact_id: str) -> bytes:
         artifact = self.read_artifact_metadata(artifact_id)
         blob = self.artifact_blob_path(artifact_id)
@@ -516,6 +685,7 @@ class RolloutStore:
             raise RuntimeError("artifact blob hash mismatch")
         return content
 
+    @_store_operation
     def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> tuple[str, ...]:
         if min_age_seconds <= 0:
             raise ValueError("artifact GC min_age_seconds must be positive")
@@ -540,18 +710,23 @@ class RolloutStore:
                     removed.append(str(candidate.relative_to(self._artifact_root)))
         return tuple(sorted(removed))
 
+    @_store_operation
     def create_thread(
         self,
         *,
         workspace: Path,
         thread_id: str | None = None,
     ) -> ThreadSnapshot:
+        self._assert_writable()
         resolved_workspace = Path(workspace).resolve()
         if not resolved_workspace.is_dir():
             raise ValueError("workspace must be an existing directory")
         if thread_id is not None and (not isinstance(thread_id, str) or not thread_id.strip()):
             raise ValueError("thread_id must be non-empty when provided")
         thread_id = thread_id or f"thread_{uuid4().hex}"
+        from agent_runtime.harness.workspace_stores import register_workspace_store
+
+        register_workspace_store(resolved_workspace, self._path)
         with self._transaction():
             self._append_and_reduce(
                 thread_id=thread_id,
@@ -562,8 +737,13 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
+    @_store_operation
     def update_session_settings(
-        self, thread_id: str, settings: Mapping[str, Any], *, expected_request_revision: int | None = None,
+        self,
+        thread_id: str,
+        settings: Mapping[str, Any],
+        *,
+        expected_request_revision: int | None = None,
     ) -> None:
         frozen = _json_object(settings, field="settings")
         with self._transaction():
@@ -583,6 +763,7 @@ class RolloutStore:
                 payload={"settings": frozen},
             )
 
+    @_store_operation
     def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
         thread_id = f"thread_{uuid4().hex}"
         with self._transaction():
@@ -612,6 +793,7 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
+    @_store_operation
     def start_turn(
         self,
         *,
@@ -689,6 +871,7 @@ class RolloutStore:
                 )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def user_input_revision(self, turn_id: str) -> int:
         """Count canonical user messages, independently of context compaction."""
         return int(self._connection.execute(
@@ -696,6 +879,7 @@ class RolloutStore:
             (turn_id,),
         ).fetchone()[0])
 
+    @_store_operation
     def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int | None:
         revision = request_ref.get("input_revision")
         if isinstance(revision, int) and not isinstance(revision, bool):
@@ -711,8 +895,13 @@ class RolloutStore:
         return sum(item.kind == "user_message" and item.status == "completed"
                    and item.sequence < request.sequence for item in items)
 
+    @_store_operation
     def receive_turn_input(
-        self, *, thread_id: str, turn_id: str, text: str,
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        text: str,
         input_files: tuple[Mapping[str, Any], ...] = (),
     ) -> ItemSnapshot:
         """Durably accept steering for exactly the expected active Turn."""
@@ -724,8 +913,7 @@ class RolloutStore:
             turn = self.read_turn(turn_id) if thread.active_turn_id == turn_id else None
             if turn is None or turn.status not in {"running", "paused", "interrupted"}:
                 raise RuntimeError("expected Turn is no longer active; input was not accepted")
-            if self.turn_cancellation_pending(turn_id):
-                raise RuntimeError("Turn cancellation was requested; input was not accepted")
+            self._assert_no_pending_cancellation(turn_id)
             revision = self.user_input_revision(turn_id) + 1
             self._append_and_reduce(
                 thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
@@ -747,6 +935,7 @@ class RolloutStore:
                 )
         return self.read_item(item_id)
 
+    @_store_operation
     def turn_input_status(self, item_id: str) -> str:
         """Derive input consumption from ordinary model dispatches, never preparation."""
         item = self.read_item(item_id)
@@ -764,6 +953,7 @@ class RolloutStore:
         status = self.read_turn(item.turn_id).status
         return "pending" if status in {"running", "paused", "interrupted"} else "unconsumed"
 
+    @_store_operation
     def complete_turn(
         self,
         *,
@@ -771,6 +961,7 @@ class RolloutStore:
         answer: str,
         producer: str = "runtime",
         expected_input_revision: int | None = None,
+        source_item_id: str | None = None,
     ) -> TurnSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
@@ -792,20 +983,22 @@ class RolloutStore:
             ).fetchone()
             if active["active_turn_id"] != turn_id:
                 raise RuntimeError(f"turn does not own the thread active slot: {turn_id}")
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer=producer,
-                payload={"item_id": item_id, "kind": "agent_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer=producer,
-                payload={"item_id": item_id, "payload": {"text": answer}},
-            )
+            if source_item_id is not None:
+                source = self.read_item(source_item_id)
+                if (source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed"
+                        or source.payload.get("text") != answer
+                        or source.payload.get("response_status", "completed") != "completed"):
+                    raise ValueError("accepted answer requires the matching completed response from this Turn")
+                item_id = source_item_id
+            else:
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer=producer,
+                    payload={"item_id": item_id, "kind": "agent_message"},
+                )
+                self._append_and_reduce(
+                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer=producer,
+                    payload={"item_id": item_id, "payload": {"text": answer}},
+                )
             self._append_terminal_plan_state(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -816,10 +1009,11 @@ class RolloutStore:
                 turn_id=turn_id,
                 record_type="turn_completed",
                 producer=producer,
-                payload={"turn_id": turn_id},
+                payload={"turn_id": turn_id, "answer_item_id": item_id},
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def fail_turn(
         self,
         *,
@@ -944,6 +1138,7 @@ class RolloutStore:
             },
         )
 
+    @_store_operation
     def pause_turn(
         self,
         *,
@@ -979,6 +1174,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def interrupt_orphaned_turn(
         self,
         *,
@@ -1040,6 +1236,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def context_source_revision(self, turn_id: str) -> str:
         """Version every source Thread, including non-message state transitions."""
         thread_ids = {item.thread_id for item in self.list_context_items(turn_id)}
@@ -1049,9 +1246,11 @@ class RolloutStore:
         ]
         return hashlib.sha256(_canonical_json(versions).encode()).hexdigest()
 
+    @_store_operation
     def context_durable_state(self, turn_id: str) -> dict[str, Any]:
         return _context_durable_state(self, turn_id)
 
+    @_store_operation
     def record_context_compaction(
         self,
         *,
@@ -1221,6 +1420,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def cancel_turn(self, *, turn_id: str) -> TurnSnapshot:
         with self._transaction():
             turn = self._connection.execute(
@@ -1292,6 +1492,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def request_turn_cancellation(
         self,
         *,
@@ -1334,6 +1535,7 @@ class RolloutStore:
                 )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def turn_cancellation_pending(self, turn_id: str) -> bool:
         """A durable stop applies only until the next explicit execution resume."""
         return self._connection.execute(
@@ -1342,6 +1544,14 @@ class RolloutStore:
             "WHERE turn_id = ? AND record_type = 'turn_resumed'), 0) LIMIT 1", (turn_id, turn_id),
         ).fetchone() is not None
 
+    def _assert_no_pending_cancellation(self, turn_id: str) -> None:
+        # Every path that resumes a paused Turn on behalf of user input must
+        # respect a durable cancellation request; an explicit
+        # resume_cancelled_turn is the only way past it.
+        if self.turn_cancellation_pending(turn_id):
+            raise RuntimeError("Turn cancellation was requested; input was not accepted")
+
+    @_store_operation
     def resume_cancelled_turn(self, *, turn_id: str) -> TurnSnapshot:
         """Explicitly continue a quiescent cancellation without replaying results."""
         with self._transaction():
@@ -1360,6 +1570,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def request_clarification(
         self,
         *,
@@ -1392,6 +1603,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def resolve_clarification(
         self,
         *,
@@ -1401,7 +1613,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if not isinstance(response, str) or not response.strip():
             raise ValueError("clarification response must be non-empty")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             turn = self._connection.execute(
@@ -1412,6 +1624,7 @@ class RolloutStore:
                 raise KeyError(f"unknown turn: {turn_id}")
             if turn["status"] != "paused":
                 raise RuntimeError("clarification response requires a paused Turn")
+            self._assert_no_pending_cancellation(turn_id)
             interaction = self._connection.execute(
                 "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
                 (request_id, turn_id),
@@ -1455,6 +1668,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def request_choice(
         self,
         *,
@@ -1494,6 +1708,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def resolve_choice(
         self,
         *,
@@ -1503,7 +1718,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if not isinstance(selection, str) or not selection.strip():
             raise ValueError("choice selection must be non-empty")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         item_id = f"item_{uuid4().hex}"
         with self._transaction():
             turn = self._connection.execute(
@@ -1514,6 +1729,7 @@ class RolloutStore:
                 raise KeyError(f"unknown turn: {turn_id}")
             if turn["status"] != "paused":
                 raise RuntimeError("choice response requires a paused Turn")
+            self._assert_no_pending_cancellation(turn_id)
             interaction = self._connection.execute(
                 "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
                 (request_id, turn_id),
@@ -1561,6 +1777,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def prepare_model_operation(
         self,
         *,
@@ -1656,6 +1873,7 @@ class RolloutStore:
             raise RuntimeError("prepared model operation projection is missing")
         return _model_operation_snapshot(row)
 
+    @_store_operation
     def supersede_prepared_model(self, operation_id: str) -> None:
         """Close an undispatched stale request without reserving or spending budget."""
         with self._transaction():
@@ -1670,6 +1888,7 @@ class RolloutStore:
                          "error_type": "input_superseded"},
             )
 
+    @_store_operation
     def dispatch_model_attempt(
         self,
         operation_id: str,
@@ -1688,7 +1907,11 @@ class RolloutStore:
             raise TypeError("resource_request must be ResourceUsage or None")
         if type(allow_protected_budget) is not bool:
             raise TypeError("allow_protected_budget must be a bool")
-        self._assert_artifact_integrity()
+        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
+                                       (operation_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown model operation: {operation_id}")
+        self._assert_artifact_integrity(str(row["turn_id"]))
         dispatched_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -1806,6 +2029,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def expire_model_attempt_dispatch(
         self,
         *,
@@ -1868,6 +2092,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def start_model_output_channel(
         self,
         *,
@@ -1941,6 +2166,7 @@ class RolloutStore:
             raise RuntimeError("model output channel start lost its Item identity")
         return self.read_item(selected_item_id)
 
+    @_store_operation
     def mark_model_attempt_unknown(
         self,
         *,
@@ -2014,6 +2240,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def reject_model_attempt(
         self,
         *,
@@ -2151,6 +2378,7 @@ class RolloutStore:
                 },
             )
 
+    @_store_operation
     def cancel_model_attempt(
         self,
         *,
@@ -2214,8 +2442,13 @@ class RolloutStore:
             )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
-        self._assert_artifact_integrity()
+        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
+                                       (operation_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown model operation: {operation_id}")
+        self._assert_artifact_integrity(str(row["turn_id"]))
         with self._transaction():
             operation = self._connection.execute(
                 "SELECT * FROM model_operations WHERE operation_id = ?",
@@ -2261,6 +2494,7 @@ class RolloutStore:
             )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def complete_model_attempt(
         self,
         *,
@@ -2306,21 +2540,18 @@ class RolloutStore:
             ).fetchone()
             if operation is None:
                 raise KeyError(f"unknown model operation: {operation_id}")
-            attempt = self._connection.execute(
-                "SELECT * FROM model_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-            lease_current = (
-                attempt is not None
-                and attempt["lease_expires_at"] is not None
-                and observed_at <= float(attempt["lease_expires_at"])
-            )
+            # Durable state is the fencing authority. Lease expiry only opens
+            # the recovery takeover (expire_model_attempt_dispatch), which
+            # flips the status to unknown inside the same serialized
+            # transaction. While the operation still points at this attempt
+            # and generation with no committed response, this completion is
+            # authoritative even past the lease clock: a billed response must
+            # not be dropped on a timing boundary.
             is_current = (
                 operation["status"] == "dispatched"
                 and operation["active_attempt_id"] == attempt_id
                 and operation["generation"] == generation
                 and operation["response_item_id"] is None
-                and lease_current
             )
             if not is_current:
                 return False
@@ -2375,6 +2606,7 @@ class RolloutStore:
                     "operation_id": operation_id,
                     "attempt_id": attempt_id,
                     "generation": generation,
+                    "observed_at": observed_at,
                     "provider_response_id": provider_response_id,
                     "usage": frozen_usage,
                     "response_item_id": response_item_id,
@@ -2451,6 +2683,7 @@ class RolloutStore:
                 )
         return True
 
+    @_store_operation
     def list_model_operations(self, turn_id: str | None = None) -> tuple[ModelOperationSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM model_operations ORDER BY rowid").fetchall()
@@ -2461,6 +2694,7 @@ class RolloutStore:
             ).fetchall()
         return tuple(_model_operation_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_model_attempts(self, operation_id: str) -> tuple[ModelAttemptSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM model_attempts WHERE operation_id = ? ORDER BY generation",
@@ -2468,6 +2702,7 @@ class RolloutStore:
         ).fetchall()
         return tuple(_model_attempt_snapshot(row) for row in rows)
 
+    @_store_operation
     def start_budgeted_child_turn(
         self,
         *,
@@ -2605,6 +2840,7 @@ class RolloutStore:
             )
         return self.read_turn(child_turn_id)
 
+    @_store_operation
     def settle_child_budget(self, *, child_turn_id: str) -> Mapping[str, Any]:
         """Convert one terminal child's allocation into its actual subtree usage."""
 
@@ -2639,6 +2875,7 @@ class RolloutStore:
             )
         return self.read_child_budget_allocation(child_turn_id)
 
+    @_store_operation
     def read_child_budget_allocation(self, child_turn_id: str) -> Mapping[str, Any]:
         row = self._connection.execute(
             "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
@@ -2658,6 +2895,7 @@ class RolloutStore:
             }
         )
 
+    @_store_operation
     def read_budget_state(self, turn_id: str) -> BudgetState:
         """Derive the Turn budget from durable reservations and tool executions."""
 
@@ -2760,6 +2998,7 @@ class RolloutStore:
             child_reserved=child_reserved,
         )
 
+    @_store_operation
     def read_budget_reservation(self, attempt_id: str) -> BudgetReservation:
         row = self._budget_reservation_row_for_attempt(attempt_id)
         if row is None:
@@ -2849,6 +3088,7 @@ class RolloutStore:
             return
         raise ValueError(f"unsupported budget outcome: {outcome}")
 
+    @_store_operation
     def record_tool_call(
         self,
         *,
@@ -2916,6 +3156,7 @@ class RolloutStore:
             raise RuntimeError("tool call Item identity was not resolved")
         return self.read_item(item_id)
 
+    @_store_operation
     def record_tool_execution_state(
         self,
         *,
@@ -2998,6 +3239,7 @@ class RolloutStore:
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def claim_tool_operation(
         self,
         *,
@@ -3010,7 +3252,7 @@ class RolloutStore:
             raise ValueError("worker_id must be non-empty")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(self.read_tool_operation(operation_id).turn_id)
         claimed_at = time.time() if now is None else float(now)
         with self._transaction():
             operation = self._connection.execute(
@@ -3056,10 +3298,13 @@ class RolloutStore:
                     "lease_expires_at": claimed_at + lease_seconds,
                     "attempt_count": int(operation["attempt_count"]) + 1,
                     "public_item_id": public_item_id,
+                    "tool_name": str(operation["tool_name"]),
+                    "tool_call_id": str(operation["tool_call_id"]),
                 },
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def reject_ready_tool_operation(
         self,
         *,
@@ -3092,6 +3337,7 @@ class RolloutStore:
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def expire_tool_operation_claim(
         self,
         *,
@@ -3160,6 +3406,7 @@ class RolloutStore:
                 )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def mark_tool_result_missing(
         self,
         *,
@@ -3235,6 +3482,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def commit_tool_operation_outcome(
         self,
         *,
@@ -3265,12 +3513,15 @@ class RolloutStore:
             ).fetchone()
             if operation is None:
                 raise KeyError(f"unknown tool operation: {operation_id}")
-            is_current = (
+            # Same fencing rule as model attempts: expiry only authorizes the
+            # recovery takeover, which rewrites the status to unknown under
+            # the same serialized transaction. A matching claim generation and
+            # fencing token on a still-running operation stay authoritative
+            # past the lease clock.
+            is_current = bool(
                 operation["status"] == "running"
                 and int(operation["claim_generation"]) == claim_generation
                 and operation["fencing_token"] == fencing_token
-                and operation["lease_expires_at"] is not None
-                and observed_at <= float(operation["lease_expires_at"])
             )
             if not is_current:
                 return False
@@ -3331,6 +3582,7 @@ class RolloutStore:
                 )
         return is_current
 
+    @_store_operation
     def commit_tool_operation_result(
         self,
         *,
@@ -3367,6 +3619,7 @@ class RolloutStore:
             )
         return True
 
+    @_store_operation
     def resolve_tool_reconciliation(
         self,
         *,
@@ -3377,7 +3630,7 @@ class RolloutStore:
     ) -> ItemSnapshot:
         if status not in {"succeeded", "failed", "cancelled"}:
             raise ValueError("reconciled tool status is unsupported")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         if not isinstance(reconciler_revision, str) or not reconciler_revision.strip():
             raise ValueError("reconciler_revision must be non-empty")
         frozen_result = _json_object(result, field="reconciled tool result")
@@ -3499,6 +3752,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def resolve_tool_approval(
         self,
         *,
@@ -3508,7 +3762,7 @@ class RolloutStore:
     ) -> InteractionSnapshot:
         if decision not in {"approve", "deny"}:
             raise ValueError("approval decision must be approve or deny")
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         with self._transaction():
             turn = self._connection.execute(
                 "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
@@ -3569,6 +3823,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def refresh_tool_approval(self, *, turn_id: str, request: Mapping[str, Any]) -> InteractionSnapshot:
         """Replace an unexecuted approval after a policy recheck, atomically."""
         frozen_request = _json_object(request, field="approval request")
@@ -3610,6 +3865,7 @@ class RolloutStore:
                 )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def invalidate_tool_approval(
         self,
         *,
@@ -3682,6 +3938,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def invalidate_resolved_tool_approval(
         self,
         *,
@@ -3761,6 +4018,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def request_tool_approval(
         self,
         *,
@@ -3847,6 +4105,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def record_tool_result(
         self,
         *,
@@ -3999,7 +4258,13 @@ class RolloutStore:
                         "related_step_id": plan_snapshot["active_step_id"],
                         "tool_call_ids": [operation["tool_call_id"]],
                     }
-            started_payload: dict[str, Any] = {"item_id": item_id, "kind": "tool_result"}
+            started_payload: dict[str, Any] = {
+                "item_id": item_id, "kind": "tool_result",
+                "tool_name": (str(operation["tool_name"])
+                              if operation_id is not None else frozen_result.get("tool_name")),
+                "tool_call_id": (str(operation["tool_call_id"])
+                                 if operation_id is not None else frozen_result.get("tool_call_id")),
+            }
             if public_item_id is not None:
                 started_payload.update(
                     {
@@ -4088,6 +4353,7 @@ class RolloutStore:
                 )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def read_tool_operation(self, operation_id: str) -> ToolOperationSnapshot:
         row = self._connection.execute(
             "SELECT * FROM tool_operations WHERE operation_id = ?", (operation_id,)
@@ -4096,8 +4362,13 @@ class RolloutStore:
             raise KeyError(f"unknown tool operation: {operation_id}")
         return _tool_operation_snapshot(row)
 
+    @_store_operation
     def record_tool_continuation(
-        self, *, operation_id: str, key: str, result: Mapping[str, Any],
+        self,
+        *,
+        operation_id: str,
+        key: str,
+        result: Mapping[str, Any],
     ) -> ItemSnapshot:
         """Persist the owner's confirmed terminal result when its live scope closes."""
         operation = self.read_tool_operation(operation_id)
@@ -4123,6 +4394,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def record_verification(
         self,
         *,
@@ -4184,6 +4456,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def record_workspace_checkpoint(
         self,
         *,
@@ -4243,6 +4516,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def list_tool_operations(self, turn_id: str | None = None) -> tuple[ToolOperationSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM tool_operations ORDER BY rowid").fetchall()
@@ -4253,12 +4527,14 @@ class RolloutStore:
             ).fetchall()
         return tuple(_tool_operation_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_interaction(self, request_id: str) -> InteractionSnapshot:
         row = self._connection.execute("SELECT * FROM interactions WHERE request_id = ?", (request_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown interaction: {request_id}")
         return _interaction_snapshot(row)
 
+    @_store_operation
     def list_interactions(self, turn_id: str | None = None) -> tuple[InteractionSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM interactions ORDER BY rowid").fetchall()
@@ -4269,6 +4545,7 @@ class RolloutStore:
             ).fetchall()
         return tuple(_interaction_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_approvals(self, turn_id: str | None = None) -> tuple[ApprovalSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM approvals ORDER BY rowid").fetchall()
@@ -4279,8 +4556,12 @@ class RolloutStore:
             ).fetchall()
         return tuple(_approval_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_resource_usage(
-        self, turn_id: str, resource: str, initial_used: int = 0,
+        self,
+        turn_id: str,
+        resource: str,
+        initial_used: int = 0,
     ) -> dict[str, Any]:
         """Read the latest durable counter; legacy usage applies only before its first Item."""
 
@@ -4302,8 +4583,13 @@ class RolloutStore:
                     "remaining": max(0, limit - used), "item_id": str(row["item_id"])}
         return {"resource": resource, "limit": None, "used": initial_used, "remaining": None, "item_id": None}
 
+    @_store_operation
     def reserve_resource_unit(
-        self, turn_id: str, resource: str, limit: int, initial_used: int = 0,
+        self,
+        turn_id: str,
+        resource: str,
+        limit: int,
+        initial_used: int = 0,
     ) -> dict[str, Any]:
         """Commit one conservative unit before I/O, serialized across Store connections."""
 
@@ -4329,8 +4615,13 @@ class RolloutStore:
             )
         return {"resource": resource, "limit": limit, "used": used, "remaining": limit - used, "item_id": item_id}
 
+    @_store_operation
     def record_final_proposal(
-        self, *, turn_id: str, answer: str, source_item_id: str | None = None,
+        self,
+        *,
+        turn_id: str,
+        answer: str,
+        source_item_id: str | None = None,
     ) -> ItemSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
@@ -4359,6 +4650,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def record_completion_decision(
         self,
         *,
@@ -4417,12 +4709,14 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def record_completion_feedback(
         self,
         *,
         turn_id: str,
         reason: str,
         source_item_id: str | None = None,
+        reason_code: str | None = None,
     ) -> ItemSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("completion feedback reason must be non-empty")
@@ -4430,6 +4724,8 @@ class RolloutStore:
         with self._transaction():
             thread_id = self._running_turn_thread_id(turn_id)
             payload = {"text": reason}
+            if reason_code is not None:
+                payload["reason_code"] = reason_code
             if source_item_id is not None:
                 source = self.read_item(source_item_id)
                 if (source.turn_id != turn_id or source.status != "completed"
@@ -4460,28 +4756,33 @@ class RolloutStore:
             raise RuntimeError(f"turn is not running: {turn_id}")
         return str(turn["thread_id"])
 
+    @_store_operation
     def read_thread(self, thread_id: str) -> ThreadSnapshot:
         row = self._connection.execute("SELECT * FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown thread: {thread_id}")
         return _thread_snapshot(row)
 
+    @_store_operation
     def list_threads(self) -> tuple[ThreadSnapshot, ...]:
         rows = self._connection.execute("SELECT * FROM threads ORDER BY rowid").fetchall()
         return tuple(_thread_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_turn(self, turn_id: str) -> TurnSnapshot:
         row = self._connection.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown turn: {turn_id}")
         return _turn_snapshot(row)
 
+    @_store_operation
     def list_turns(self, thread_id: str | None = None) -> tuple[TurnSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM turns WHERE (? IS NULL OR thread_id = ?) ORDER BY rowid", (thread_id, thread_id),
         ).fetchall()
         return tuple(_turn_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence", (turn_id,)
@@ -4496,6 +4797,7 @@ class RolloutStore:
             raise KeyError(f"Turn has no Items: {turn_id}")
         return _item_snapshot(row)
 
+    @_store_operation
     def read_item(self, item_id: str) -> ItemSnapshot:
         row = self._connection.execute(
             "SELECT * FROM items WHERE item_id = ?",
@@ -4505,9 +4807,10 @@ class RolloutStore:
             raise KeyError(f"unknown Item: {item_id}")
         return _item_snapshot(row)
 
+    @_store_operation
     def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Visible model/recall window; the complete ledger remains separately readable."""
-        self._assert_artifact_integrity()
+        self._assert_artifact_integrity(turn_id)
         items = self.list_conversation_items(turn_id)
         start = 0
         seen = set()
@@ -4515,10 +4818,12 @@ class RolloutStore:
             if item.turn_id not in seen:
                 seen.add(item.turn_id)
                 reset = self.read_turn(item.turn_id).binding_manifest.get("context_reset")
-                if reset == {"revision": "v1", "reason": "memory_revoked"}:
+                if (isinstance(reset, Mapping) and reset.get("revision") == "v1"
+                        and reset.get("reason") == "memory_revoked"):
                     start = index
         return items[start:]
 
+    @_store_operation
     def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Read original Items through the fork point; do not load or execute artifacts."""
         turn = self._connection.execute(
@@ -4567,6 +4872,7 @@ class RolloutStore:
             )
         return tuple(_item_snapshot(row) for row in rows)
 
+    @_store_operation
     def last_record(self, thread_id: str) -> RolloutRecord | None:
         row = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence DESC LIMIT 1",
@@ -4574,6 +4880,7 @@ class RolloutStore:
         ).fetchone()
         return None if row is None else _record_snapshot(row)
 
+    @_store_operation
     def list_records(self, thread_id: str) -> tuple[RolloutRecord, ...]:
         rows = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence",
@@ -4581,21 +4888,123 @@ class RolloutStore:
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
+    def list_turn_records(self, turn_id: str) -> tuple[RolloutRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM rollout_records WHERE turn_id = ? ORDER BY record_id", (turn_id,),
+        ).fetchall()
+        return tuple(_record_snapshot(row) for row in rows)
+
+    @_store_operation
+    def read_turn_completion(self, turn_id: str) -> RolloutRecord | None:
+        """Read the terminal acceptance fact, independently of result formatting."""
+        row = self._connection.execute(
+            """SELECT * FROM rollout_records
+               WHERE turn_id = ? AND record_type = 'turn_completed' ORDER BY record_id DESC LIMIT 1""",
+            (turn_id,),
+        ).fetchone()
+        return None if row is None else _record_snapshot(row)
+
+    @_store_operation
+    def read_turn_answer(self, turn_id: str) -> ItemSnapshot:
+        """Resolve the accepted output identity; old Turns retain their original answer Item."""
+        completion = self.read_turn_completion(turn_id)
+        if completion is None:
+            raise RuntimeError("Turn has no committed answer")
+        item_id = completion.payload.get("answer_item_id")
+        if item_id is None:
+            if completion.payload_schema_version >= 3:
+                raise RuntimeError("completed Turn is missing its canonical answer reference")
+            answers = [item for item in self.list_items(turn_id) if item.kind == "agent_message"]
+            if len(answers) != 1:
+                raise RuntimeError("completed Turn has no unique canonical answer")
+            return answers[0]
+        answer = self.read_item(item_id)
+        if (answer.turn_id != turn_id or answer.status != "completed"
+                or answer.kind not in {"agent_message", "model_response"}
+                or answer.payload.get("response_status", "completed") != "completed"):
+            raise RuntimeError("completed Turn has an invalid answer reference")
+        return answer
+
+    @_store_operation
+    def list_record_tail(
+        self,
+        thread_id: str,
+        *,
+        after_thread_sequence: int = 0,
+        limit: int | None = None,
+        through_thread_sequence: int = 9223372036854775807,
+    ) -> tuple[RolloutRecord, ...]:
+        """Read a canonical suffix by its indexed sequence, with an optional record page."""
+        rows = self._connection.execute(
+            """SELECT * FROM rollout_records WHERE thread_id = ? AND thread_sequence > ? AND thread_sequence <= ?
+               ORDER BY thread_sequence LIMIT ?""",
+            (thread_id, after_thread_sequence, through_thread_sequence, -1 if limit is None else limit),
+        ).fetchall()
+        return tuple(_record_snapshot(row) for row in rows)
+
+    @_store_operation
+    def read_event_reference(
+        self,
+        record_type: Literal[
+            "item_started",
+            "item_completed",
+            "model_attempt_completed",
+            "tool_operation_result_linked",
+            "tool_operation_claimed",
+            "tool_operation_prepared",
+            "tool_operation_outcome_committed",
+            "tool_operation_migrated",
+        ],
+        identity: str,
+        *,
+        at_record_id: int | None = None,
+    ) -> RolloutRecord | None:
+        """Read one indexed canonical dependency, including legacy event identities."""
+        key = _EVENT_REFERENCE_KEYS[record_type]
+        row = self._connection.execute(
+            f"""SELECT * FROM rollout_records
+                WHERE record_type = '{record_type}' AND json_extract(payload_json, '$.{key}') = ?
+                {'' if at_record_id is None else 'AND record_id <= ?'}
+                ORDER BY record_id DESC LIMIT 1""",
+            (identity,) if at_record_id is None else (identity, at_record_id),
+        ).fetchone()
+        return None if row is None else _record_snapshot(row)
+
+    @_store_operation
+    def find_model_response_item(self, turn_id: str, text: str | None) -> str | None:
+        """Find one completed response for accepted-answer deduplication, without scanning Items."""
+        row = self._connection.execute(
+            """SELECT item_id FROM items
+               WHERE turn_id = ? AND kind = 'model_response' AND status = 'completed'
+                 AND json_extract(payload_json, '$.text') IS ? LIMIT 1""",
+            (turn_id, text),
+        ).fetchone()
+        return None if row is None else str(row["item_id"])
+
+    @_store_operation
     def list_global_records(
         self,
         *,
         after_record_id: int = 0,
+        limit: int | None = None,
+        through_record_id: int = 9223372036854775807,
     ) -> tuple[RolloutRecord, ...]:
         if isinstance(after_record_id, bool) or not isinstance(after_record_id, int):
             raise TypeError("after_record_id must be an integer")
         if after_record_id < 0:
             raise ValueError("after_record_id must be non-negative")
         rows = self._connection.execute(
-            "SELECT * FROM rollout_records WHERE record_id > ? ORDER BY record_id",
-            (after_record_id,),
+            "SELECT * FROM rollout_records WHERE record_id > ? AND record_id <= ? ORDER BY record_id LIMIT ?",
+            (after_record_id, through_record_id, -1 if limit is None else limit),
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
+    def last_global_record_id(self) -> int:
+        return int(self._connection.execute("SELECT COALESCE(MAX(record_id), 0) FROM rollout_records").fetchone()[0])
+
+    @_store_operation
     def projection_hashes(self) -> dict[str, str]:
         """Return versioned metadata digests, not proof of projection integrity.
 
@@ -4607,6 +5016,7 @@ class RolloutStore:
         ).fetchall()
         return {str(row["thread_id"]): str(row["canonical_hash"]) for row in rows}
 
+    @_store_operation
     def verify(self) -> VerificationReport:
         errors: list[str] = []
         expected = ProjectionState()
@@ -4683,25 +5093,44 @@ class RolloutStore:
             errors.append("projection metadata mismatch")
         return VerificationReport(valid=not errors, errors=tuple(errors))
 
-    def _assert_artifact_integrity(self) -> None:
-        errors = self._artifact_integrity_errors()
+    def _assert_artifact_integrity(self, turn_id: str) -> None:
+        # Dispatch validates its actual conversation references. A damaged blob
+        # in another Thread is still diagnosed by verify(), without disabling
+        # unrelated work throughout the whole store.
+        artifact_ids = {
+            str(attachment["artifact_id"])
+            for item in self.list_conversation_items(turn_id)
+            for attachment in item.payload.get("attachments", ())
+            if isinstance(attachment, Mapping) and isinstance(attachment.get("artifact_id"), str)
+        }
+        errors = self._artifact_integrity_errors(artifact_ids=artifact_ids)
         if errors:
             raise RuntimeError(f"artifact integrity check failed: {errors[0]}")
 
     def _artifact_integrity_errors(
         self,
         state: ProjectionState | None = None,
+        *, artifact_ids: set[str] | None = None,
     ) -> list[str]:
-        artifacts = (
-            state.artifacts
-            if state is not None
-            else {
+        if state is not None:
+            artifacts = state.artifacts
+        elif artifact_ids is None:
+            artifacts = {
                 row["artifact_id"]: _artifact_row_payload(row)
                 for row in self._connection.execute("SELECT * FROM artifacts")
             }
-        )
+        else:
+            artifacts = {}
+            for artifact_id in sorted(artifact_ids):
+                row = self._connection.execute("SELECT * FROM artifacts WHERE artifact_id = ?",
+                                               (artifact_id,)).fetchone()
+                if row is None:
+                    return [f"unknown artifact reference: {artifact_id}"]
+                artifacts[artifact_id] = _artifact_row_payload(row)
         errors: list[str] = []
         for artifact_id, payload in artifacts.items():
+            if artifact_ids is not None and artifact_id not in artifact_ids:
+                continue
             snapshot = ArtifactSnapshot(
                 artifact_id=str(payload["artifact_id"]),
                 thread_id=str(payload["thread_id"]),
@@ -4730,11 +5159,11 @@ class RolloutStore:
                     if not isinstance(attachment, Mapping):
                         errors.append(f"artifact attachment malformed in Item {item['item_id']}")
                         continue
-                    artifact_id = attachment.get("artifact_id")
-                    if not isinstance(artifact_id, str) or artifact_id not in artifacts:
+                    attachment_artifact_id = attachment.get("artifact_id")
+                    if not isinstance(attachment_artifact_id, str) or attachment_artifact_id not in artifacts:
                         errors.append(f"artifact attachment in Item {item['item_id']} references unknown artifact")
                         continue
-                    durable = artifacts[artifact_id]
+                    durable = artifacts[attachment_artifact_id]
                     if (
                         attachment.get("media_type") != durable["media_type"]
                         or attachment.get("name") != durable["name"]
@@ -4762,6 +5191,7 @@ class RolloutStore:
             if error is not None:
                 raise RuntimeError(f"artifact integrity check failed: {error}")
 
+    @_store_operation
     def rebuild_projections(self) -> None:
         """Rebuild projections from verified canonical records in one transaction."""
         with self._transaction():
@@ -4819,6 +5249,8 @@ class RolloutStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("transactions must run as a complete Store operation")
         self._assert_writable()
         if self._pending_transaction_records is not None:
             yield
@@ -4832,15 +5264,31 @@ class RolloutStore:
             yield
         except BaseException:
             if began:
-                self._connection.execute("ROLLBACK")
+                self._rollback_quietly()
             raise
         else:
-            self._connection.execute("COMMIT")
+            try:
+                self._connection.execute("COMMIT")
+            except BaseException:
+                # A failed COMMIT (disk full, I/O error) may leave the
+                # transaction open; roll back so the reused connection does
+                # not fail the next BEGIN IMMEDIATE with "cannot start a
+                # transaction within a transaction".
+                self._rollback_quietly()
+                raise
         finally:
             self._pending_transaction_records = None
         captured = self._captured_commits
         if captured is not None:
             captured.append(tuple(pending))
+
+    def _rollback_quietly(self) -> None:
+        # Best-effort cleanup: the caller's original exception must survive
+        # even when the connection is too broken to accept ROLLBACK.
+        try:
+            self._connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def _append_and_reduce(
         self,
@@ -4851,6 +5299,13 @@ class RolloutStore:
         producer: str,
         payload: Mapping[str, Any],
     ) -> None:
+        # The canonical completion owns its immutable event metadata. Readers
+        # never need the current Item/operation projection to explain a v3 event.
+        if record_type == "item_completed":
+            start = self.read_event_reference("item_started", str(payload["item_id"]))
+            if start is None:
+                raise RuntimeError("completed internal Item has no durable start")
+            payload = {**start.payload, **payload}
         payload_json = _canonical_json(payload)
         payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
         sequence = self._connection.execute(
@@ -4866,7 +5321,7 @@ class RolloutStore:
                 record_uuid, thread_id, turn_id, thread_sequence, record_type,
                 payload_schema_version, producer, payload_json, payload_hash,
                 created_at, committed_at_ms
-            ) VALUES (?, ?, ?, ?, ?, 2, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 3, ?, ?, ?, ?, ?)
             """,
             (
                 f"record_{uuid4().hex}",
@@ -4910,7 +5365,8 @@ class RolloutStore:
             # needs this Turn's existing Items to derive its next sequence.
             for table, key, identities, row_payload in (
                 ("turns", "turn_id", (record.turn_id,), _turn_row_payload),
-                ("items", "item_id", (record.payload.get("item_id"),), _item_row_payload),
+                ("items", "item_id", (record.payload.get("item_id"), record.payload.get("answer_item_id")),
+                 _item_row_payload),
                 (
                     "model_operations", "operation_id", (record.payload.get("operation_id"),),
                     _model_operation_row_payload,
@@ -5412,6 +5868,25 @@ class RolloutStore:
                 committed_at_ms INTEGER NOT NULL,
                 UNIQUE(thread_id, thread_sequence)
             );
+            CREATE INDEX IF NOT EXISTS rollout_records_turn_record
+                ON rollout_records(turn_id, record_id);
+            CREATE INDEX IF NOT EXISTS rollout_records_turn_completion
+                ON rollout_records(turn_id, record_id) WHERE record_type = 'turn_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_item
+                ON rollout_records(record_type, json_extract(payload_json, '$.item_id'), record_id)
+                WHERE record_type = 'item_started' OR record_type = 'item_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_model_response
+                ON rollout_records(json_extract(payload_json, '$.response_item_id'), record_id)
+                WHERE record_type = 'model_attempt_completed';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_tool_result
+                ON rollout_records(json_extract(payload_json, '$.result_item_id'), record_id)
+                WHERE record_type = 'tool_operation_result_linked';
+            CREATE INDEX IF NOT EXISTS rollout_records_event_tool_operation
+                ON rollout_records(record_type, json_extract(payload_json, '$.operation_id'), record_id)
+                WHERE record_type = 'tool_operation_claimed'
+                   OR record_type = 'tool_operation_prepared'
+                   OR record_type = 'tool_operation_outcome_committed'
+                   OR record_type = 'tool_operation_migrated';
             CREATE TABLE IF NOT EXISTS store_metadata (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -5454,6 +5929,9 @@ class RolloutStore:
                 reducer_version INTEGER NOT NULL,
                 UNIQUE(turn_id, sequence)
             );
+            CREATE INDEX IF NOT EXISTS items_model_response_text
+                ON items(turn_id, json_extract(payload_json, '$.text'))
+                WHERE kind = 'model_response' AND status = 'completed';
             CREATE TABLE IF NOT EXISTS model_operations (
                 operation_id TEXT PRIMARY KEY,
                 thread_id TEXT NOT NULL REFERENCES threads(thread_id),

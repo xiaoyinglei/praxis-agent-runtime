@@ -118,6 +118,35 @@ def test_symlink_target_requires_read_permission(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_execute_python_publish_runs_as_cancellable_blocking_phase(tmp_path, monkeypatch):
+    launcher = tmp_path / "bwrap"
+    launcher.write_text('#!/bin/sh\nexit 0\n')
+    launcher.chmod(0o755)
+    monkeypatch.setattr(shell, "_SANDBOX_PLATFORM", "linux")
+    monkeypatch.setattr(shell, "_BWRAP_PATH", str(launcher))
+    observed: list[object] = []
+    original_commit = shell._commit_linux_workspace_view
+
+    def probing_commit(*arguments: object) -> None:
+        observed.append(shell._COPY_CANCEL.get())
+        original_commit(*arguments)
+
+    monkeypatch.setattr(shell, "_commit_linux_workspace_view", probing_commit)
+    workspace = open_workspace(tmp_path / "workspace", create=True)
+
+    result = await shell._execute_managed_python(workspace, shell.ManagedPythonInput(
+        code="pass", workspace_write=True,
+    ), termination_grace_seconds=0.1)
+
+    assert result.sandbox_error is None
+    assert result.workspace_published is True
+    # The publish copy must go through _blocking_phase: an installed
+    # cancellation event proves it ran on the worker thread, off the event
+    # loop, exactly like the run_command publish path.
+    assert observed and observed[0] is not None
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("python", [False, True])
 async def test_startup_failure_does_not_publish_with_opt_in(tmp_path, monkeypatch, python):
     launcher = tmp_path / "bwrap"

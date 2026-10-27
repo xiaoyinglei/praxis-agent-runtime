@@ -16,8 +16,9 @@ class SkillPolicy:
     """Read-only policy for skill visibility and trust decisions.
 
     By default, PROJECT and EXTERNAL sources are enabled.  USER and
-    MANAGED sources are disabled (phase 2).  External skills require
-    explicit opt-in via ``trust_external_skills`` or per-skill allowlist.
+    MANAGED sources are disabled (phase 2). The external skill
+    trust opt-out via ``trust_external_skills=False`` is enforced at invocation;
+    a per-skill allowlist can explicitly trust selected external skills.
     """
 
     # Which sources are enabled
@@ -54,12 +55,12 @@ class SkillPolicy:
     def can_autoload(self, manifest: SkillManifest) -> bool:
         """Whether a skill can be auto-loaded without user approval.
 
-        PROJECT: always auto-load.
+        BUNDLED/PROJECT: always auto-load when enabled.
         EXTERNAL: auto-load if trust_external_skills is True.
         USER/MANAGED/MCP: require explicit approval (phase 2).
         """
-        if manifest.source == SkillSource.PROJECT:
+        if manifest.source in {SkillSource.BUNDLED, SkillSource.PROJECT}:
             return True
         if manifest.source == SkillSource.EXTERNAL:
-            return self.trust_external_skills
+            return self.trust_external_skills or manifest.name in self.allowed_skills
         return False

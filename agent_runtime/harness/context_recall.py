@@ -62,8 +62,8 @@ def _item_text(kind: str, payload: Mapping[str, Any], *, raw: bool) -> tuple[str
 def create_context_recall_tool(store: RolloutStore) -> Tool:
     """Create a resident read-only tool; never accept caller-provided Turn IDs or paths."""
 
-    def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:
-        items = store.list_context_items(current_tool_turn_id())
+    async def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:
+        items = await store.run_async(store.list_context_items, current_tool_turn_id())
         history_positions = {entry.item_id: index for index, entry in enumerate(items)}
         item = next(
             (item for item in items if item.item_id == arguments["item_id"] and item.status == "completed"), None
@@ -107,6 +107,7 @@ def create_context_recall_tool(store: RolloutStore) -> Tool:
                     in {
                         "user_message",
                         "agent_message",
+                        "model_response",
                         "context_message",
                         "completion_feedback",
                         "tool_result",
