@@ -18,6 +18,8 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "project"
     root.mkdir()
     run = subprocess.run
+    # Pin the initial branch: runners without init.defaultBranch default to
+    # master, and the faked gh default branch is "main".
     run(["git", "init", "--quiet", "-b", "main", str(root)], check=True)
     run(["git", "-C", str(root), "config", "user.name", "Test"], check=True)
     run(["git", "-C", str(root), "config", "user.email", "test@example.com"], check=True)
