@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -65,7 +65,7 @@ class ToolExecutionContext:
     permissions: ResolvedPermissions | None = None
     permission_provider: Callable[[], ResolvedPermissions] | None = None
     context_provider: Callable[[], ToolExecutionContext] | None = None
-    invocation_guard: Callable[[ToolCall], None] | None = None
+    invocation_guard: Callable[[ToolCall], None | Awaitable[None]] | None = None
 
     def refreshed(self) -> ToolExecutionContext:
         if self.context_provider is None:

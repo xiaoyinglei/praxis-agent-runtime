@@ -236,27 +236,47 @@ async def update_memory(
     edits. Every provider call remains an inspectable, budgeted Harness operation.
     """
     owner = uuid4().hex
-    if not store.claim_memory_job(workspace, owner=owner, now=time.time(), lease_seconds=300):
-        return {"status": "busy", "maintenance_turn_ids": []}
+    acquired = False
     turn_ids: list[str] = []
     failed = False
     deadline = asyncio.get_running_loop().time() + 240
     try:
-        state = store.read_memory_state(workspace)
-        source = _source(store, workspace, state, exclude_thread_id)
+        acquired = await store.run_async(
+            store.claim_memory_job,
+            workspace,
+            owner=owner,
+            now=time.time(),
+            lease_seconds=300,
+        )
+        if not acquired:
+            return {"status": "busy", "maintenance_turn_ids": []}
+        state = await store.run_async(store.read_memory_state, workspace)
+        source = await store.run_async(_source, store, workspace, state, exclude_thread_id)
         if source is None:
-            blocked = [key for key, value in store.read_memory_jobs(workspace).items() if _unresolved(store, value)]
-            exhausted = [key for key, value in store.read_memory_jobs(workspace).items()
-                         if value.get("status") == "budget_exhausted"]
-            waiting = [key for key, value in store.read_memory_jobs(workspace).items()
-                       if value.get("retry_after", 0) > time.time()]
+            blocked = await store.run_async(
+                lambda: [key for key, value in store.read_memory_jobs(workspace).items() if _unresolved(store, value)]
+            )
+            exhausted = await store.run_async(
+                lambda: [
+                    key
+                    for key, value in store.read_memory_jobs(workspace).items()
+                    if value.get("status") == "budget_exhausted"
+                ]
+            )
+            waiting = await store.run_async(
+                lambda: [
+                    key
+                    for key, value in store.read_memory_jobs(workspace).items()
+                    if value.get("retry_after", 0) > time.time()
+                ]
+            )
             status = ("needs_reconciliation" if blocked else "budget_exhausted" if exhausted else
                       "waiting" if waiting else "unchanged")
             return {"status": status,
                     "blocked_sources": blocked, "exhausted_sources": exhausted, "waiting_sources": waiting,
                     "maintenance_turn_ids": []}
         source_thread, revision, records, next_cursor, has_more = source
-        previous = store.read_memory_jobs(workspace).get(source_thread, {})
+        previous = await store.run_async(lambda: store.read_memory_jobs(workspace).get(source_thread, {}))
         batch_hash = hashlib.sha256(json.dumps(records, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         same_batch = previous.get("batch_hash") == batch_hash
         turn_ids = list(previous.get("turn_ids", [])) if same_batch else []
@@ -266,17 +286,31 @@ async def update_memory(
         if previous.get("status") == "budget_exhausted":
             exhausted_batches.append({key: previous[key] for key in (
                 "source_revision", "batch_hash", "turn_ids", "next_cursor") if key in previous})
-        job = store.write_memory_job(workspace, source_thread, {
-            "status": "running", "source_revision": revision, "batch_hash": batch_hash,
-            "turn_ids": turn_ids, "memory_version": state["version"],
-            "next_cursor": next_cursor, "exhausted_batches": exhausted_batches,
-            **({"candidates": cached} if cached is not None else {}),
-        }, owner=owner, expected_revision=previous.get("revision", 0))
+        job = await store.run_async(
+            store.write_memory_job,
+            workspace,
+            source_thread,
+            {
+                "status": "running",
+                "source_revision": revision,
+                "batch_hash": batch_hash,
+                "turn_ids": turn_ids,
+                "memory_version": state["version"],
+                "next_cursor": next_cursor,
+                "exhausted_batches": exhausted_batches,
+                **({"candidates": cached} if cached is not None else {}),
+            },
+            owner=owner,
+            expected_revision=previous.get("revision", 0),
+        )
         refs = {i["item_id"]: i["thread_id"] for i in records}
         extraction_refs = dict(refs)
         refs.update({ref: thread for entry in state["entries"] for ref, thread in entry["sources"].items()})
-        remaining_tokens = max(0, MEMORY_TOKEN_BUDGET - sum(
-            store.read_budget_state(t).exposure.total_tokens for t in turn_ids))
+        remaining_tokens = max(
+            0,
+            MEMORY_TOKEN_BUDGET
+            - (await store.run_async(lambda: sum(store.read_budget_state(t).exposure.total_tokens for t in turn_ids))),
+        )
 
         def validate(answer: str, purpose: str) -> list[dict[str, Any]]:
             output = _MemoryOutput.model_validate_json(redact_sensitive_text(answer))
@@ -297,10 +331,10 @@ async def update_memory(
         if (cached is None and same_batch and previous.get("memory_version") == state["version"]
                 and previous.get("source_revision") == revision):
             for previous_id in reversed(turn_ids):
-                previous_turn = store.read_turn(previous_id)
+                previous_turn = await store.run_async(store.read_turn, previous_id)
                 if (previous_turn.status == "completed"
                         and previous_turn.binding_manifest.get("maintenance_purpose") == "memory_extract"):
-                    answers = [store.read_turn_answer(previous_id).payload["text"]]
+                    answers = [(await store.run_async(store.read_turn_answer, previous_id)).payload["text"]]
                     if answers:
                         try:
                             cached = validate(answers[-1], "memory_extract")
@@ -312,7 +346,7 @@ async def update_memory(
             nonlocal remaining_tokens, job
             if remaining_tokens <= 0:
                 raise RuntimeError("memory maintenance token budget exhausted")
-            thread = store.create_thread(workspace=workspace)
+            thread = await store.run_async(store.create_thread, workspace=workspace)
             turn_id = f"turn_{uuid4().hex}"
             stage_binding = dict(binding)
             if callable(rebind := getattr(model, "rebind", None)) and "authentication_schema_version" in binding:
@@ -330,15 +364,32 @@ async def update_memory(
                                  memory_input_tokens=12_000, memory_output_tokens=3_000)
             from agent_runtime.harness.session import Session
 
-            store.start_turn(thread_id=thread.thread_id, turn_id=turn_id, binding_manifest=stage_binding,
-                             user_message=prompt + "\nDATA:\n" + json.dumps(data, ensure_ascii=False))
-            turn_ids.append(turn_id)
-            job = store.write_memory_job(workspace, source_thread, {**job, "turn_ids": turn_ids},
-                                         owner=owner, expected_revision=job["revision"])
+            def start_stage() -> None:
+                nonlocal job
+                # Creation and the job's durable ownership link are one unit.
+                with store._transaction():
+                    store.start_turn(
+                        thread_id=thread.thread_id,
+                        turn_id=turn_id,
+                        binding_manifest=stage_binding,
+                        user_message=prompt + "\nDATA:\n" + json.dumps(data, ensure_ascii=False),
+                    )
+                    committed_job = store.write_memory_job(
+                        workspace,
+                        source_thread,
+                        {**job, "turn_ids": [*turn_ids, turn_id]},
+                        owner=owner,
+                        expected_revision=job["revision"],
+                    )
+                # Observation belongs to the owner even if its waiter cancels.
+                turn_ids.append(turn_id)
+                job = committed_job
+
+            await store.run_async(start_stage)
             result = await Session.run_memory_turn(store, model, turn_id, prepare_binding=prepare_binding)
             if result.status != "completed" or not result.answer:
                 raise RuntimeError("memory model did not complete its bounded request")
-            used = store.read_budget_state(turn_id).used.total_tokens
+            used = (await store.run_async(store.read_budget_state, turn_id)).used.total_tokens
             remaining_tokens -= used
             return validate(result.answer, purpose)
 
@@ -361,8 +412,14 @@ async def update_memory(
             elif records:
                 candidates = await generate("memory_extract", rules + "Extract useful memory from this history.",
                                             records)
-                job = store.write_memory_job(workspace, source_thread, {**job, "candidates": candidates},
-                                             owner=owner, expected_revision=job["revision"])
+                job = await store.run_async(
+                    store.write_memory_job,
+                    workspace,
+                    source_thread,
+                    {**job, "candidates": candidates},
+                    owner=owner,
+                    expected_revision=job["revision"],
+                )
             else:
                 candidates = []
             existing_keys = {e["key"] for e in state["entries"]}
@@ -396,62 +453,132 @@ async def update_memory(
                    and (e["key"] in existing_keys
                         or not set(e["source_item_ids"]) & set(state["deleted_sources"]))]
         # Do not publish a result against history or contribution controls that changed during inference.
-        current = _source(store, workspace, state, exclude_thread_id)
+        current = await store.run_async(_source, store, workspace, state, exclude_thread_id)
         if current is None or current[:2] != (source_thread, revision):
             raise RuntimeError("memory source changed during extraction")
-        committed = store.commit_memory_state(workspace, expected_version=state["version"], state={
-            **state, "entries": entries,
-            "processed": {**{k: v for k, v in state["processed"].items() if k != source_thread},
-                          **({source_thread: revision} if not has_more else {})},
-            "source_cursors": {**state.get("source_cursors", {}), source_thread: next_cursor},
-            "skipped_sources": [e for e in state.get("skipped_sources", []) if e["thread_id"] != source_thread],
-            "maintenance_turn_ids": turn_ids,
-        }, claim_owner=owner, job_thread_id=source_thread,
-            job_state={**{k: v for k, v in job.items() if k != "candidates"},
-                       "status": "pending" if has_more else "done", "turn_ids": turn_ids},
-            job_revision=job["revision"])
+        committed = await store.run_async(
+            lambda: store.commit_memory_state(
+                workspace,
+                expected_version=state["version"],
+                state={
+                    **state,
+                    "entries": entries,
+                    "processed": {
+                        **{k: v for k, v in state["processed"].items() if k != source_thread},
+                        **({source_thread: revision} if not has_more else {}),
+                    },
+                    "source_cursors": {**state.get("source_cursors", {}), source_thread: next_cursor},
+                    "skipped_sources": [e for e in state.get("skipped_sources", []) if e["thread_id"] != source_thread],
+                    "maintenance_turn_ids": turn_ids,
+                },
+                claim_owner=owner,
+                job_thread_id=source_thread,
+                job_state={
+                    **{k: v for k, v in job.items() if k != "candidates"},
+                    "status": "pending" if has_more else "done",
+                    "turn_ids": turn_ids,
+                },
+                job_revision=job["revision"],
+            )
+        )
         logger.info("memory committed version=%s", committed["version"])
         return {"status": "updated", "version": committed["version"], "source_thread_id": source_thread,
                 "has_more": has_more, "maintenance_turn_ids": turn_ids}
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if not acquired:
+            raise
         failed = True
         if "job" in locals():
             job = {**job, "error_type": type(exc).__name__,
                    "error_message": redact_sensitive_text(str(exc))[:500]}
         logger.warning("memory update failed: %s", type(exc).__name__)
-        unresolved = "job" in locals() and _unresolved(store, job)
-        budget_exhausted = bool(turn_ids) and sum(store.read_budget_state(t).exposure.total_tokens
-                                                 for t in turn_ids) >= MEMORY_TOKEN_BUDGET
+        unresolved = "job" in locals() and (await store.run_async(_unresolved, store, job))
+        budget_exhausted = (
+            bool(turn_ids)
+            and (await store.run_async(lambda: sum(store.read_budget_state(t).exposure.total_tokens for t in turn_ids)))
+            >= MEMORY_TOKEN_BUDGET
+        )
         status = "needs_reconciliation" if unresolved else "budget_exhausted" if budget_exhausted else "failed"
         return {"status": status,
                 "error_type": type(exc).__name__,
                 "error_message": redact_sensitive_text(str(exc))[:500], "maintenance_turn_ids": turn_ids}
     finally:
-        try:
-            for turn_id in turn_ids:
-                turn = store.read_turn(turn_id)
-                if turn.status == "running":
-                    if _unresolved(store, {"turn_ids": [turn_id]}):
-                        store.pause_turn(turn_id=turn_id, reason="Memory provider outcome requires reconciliation.")
-                    else:
-                        store.fail_turn(turn_id=turn_id, reason_code="memory_update_interrupted",
-                                        message="Memory maintenance ended before completion.")
-            if ("job" in locals()
-                    and store.read_memory_jobs(workspace).get(source_thread, {}).get("revision") == job["revision"]):
-                try:
-                    store.write_memory_job(workspace, source_thread, {
-                        **job, "status": "needs_reconciliation" if _unresolved(store, job) else
-                        "budget_exhausted" if sum(store.read_budget_state(t).exposure.total_tokens
-                                                  for t in turn_ids) >= MEMORY_TOKEN_BUDGET else
-                        "failed" if failed else "pending",
-                        **({"retry_after": time.time() + 300} if failed and not _unresolved(store, job) else {}),
-                    }, owner=owner, expected_revision=job["revision"])
-                except RuntimeError:
-                    logger.warning("memory job ownership changed before cleanup")
-        finally:
-            store.release_memory_job(workspace, owner=owner)
+
+        async def cleanup() -> None:
+            try:
+                for turn_id in turn_ids:
+                    turn = await store.run_async(store.read_turn, turn_id)
+                    if turn.status == "running":
+                        if await store.run_async(_unresolved, store, {"turn_ids": [turn_id]}):
+                            (
+                                await store.run_async(
+                                    store.pause_turn,
+                                    turn_id=turn_id,
+                                    reason="Memory provider outcome requires reconciliation.",
+                                )
+                            )
+                        else:
+                            (
+                                await store.run_async(
+                                    store.fail_turn,
+                                    turn_id=turn_id,
+                                    reason_code="memory_update_interrupted",
+                                    message="Memory maintenance ended before completion.",
+                                )
+                            )
+                if (
+                    "job" in locals()
+                    and (
+                        await store.run_async(
+                            lambda: store.read_memory_jobs(workspace).get(source_thread, {}).get("revision")
+                        )
+                    )
+                    == job["revision"]
+                ):
+                    try:
+                        (
+                            await store.run_async(
+                                lambda: store.write_memory_job(
+                                    workspace,
+                                    source_thread,
+                                    {
+                                        **job,
+                                        "status": "needs_reconciliation"
+                                        if _unresolved(store, job)
+                                        else "budget_exhausted"
+                                        if sum(store.read_budget_state(t).exposure.total_tokens for t in turn_ids)
+                                        >= MEMORY_TOKEN_BUDGET
+                                        else "failed"
+                                        if failed
+                                        else "pending",
+                                        **(
+                                            {"retry_after": time.time() + 300}
+                                            if failed and (not _unresolved(store, job))
+                                            else {}
+                                        ),
+                                    },
+                                    owner=owner,
+                                    expected_revision=job["revision"],
+                                )
+                            )
+                        )
+                    except RuntimeError:
+                        logger.warning("memory job ownership changed before cleanup")
+            finally:
+                (await store.run_async(store.release_memory_job, workspace, owner=owner))
+
+        cleanup_task = asyncio.create_task(cleanup())
+        cancelled = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 def memory_navigation(snapshot: Mapping[str, Any], *, include_version: bool = True) -> str:
@@ -479,16 +606,18 @@ def create_memory_tool(store: RolloutStore) -> Tool:
 
     async def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:
         # This short Store-bound operation must keep the SQLite owner thread.
-        turn = store.read_turn(current_tool_turn_id())
+        turn = await store.run_async(store.read_turn, current_tool_turn_id())
         snapshot = turn.binding_manifest.get("memory_snapshot")
         if not snapshot:
             return NormalizedToolOutput(is_error=True, error_code="memory_disabled",
                                         error_message="No memory snapshot.")
         if "total_entries" in snapshot:
-            workspace = Path(store.read_thread(turn.thread_id).workspace).resolve()
+            workspace = Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
             if str(workspace) != snapshot["workspace"]:
                 raise ValueError("memory snapshot belongs to a different workspace")
-            entries = store.read_memory_state(workspace, version=snapshot["version"])["entries"]
+            entries = (await store.run_async(store.read_memory_state, workspace, version=snapshot["version"]))[
+                "entries"
+            ]
         else:
             entries = snapshot["entries"]
         if "key" in arguments:

@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import math
 import os
 import sqlite3
+import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from agent_runtime.budget import (
@@ -53,10 +57,6 @@ _EVENT_REFERENCE_KEYS = {
     "tool_operation_outcome_committed": "operation_id",
     "tool_operation_migrated": "operation_id",
 }
-
-
-class _WriterBusyError(sqlite3.OperationalError):
-    """BEGIN failed before the mutation acquired a writer or ran its body."""
 
 
 class TurnInputChangedError(RuntimeError):
@@ -261,6 +261,18 @@ class ArtifactSnapshot:
     applied_thread_sequence: int
 
 
+def _store_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
+    """Keep complete synchronous operations on the connection's owning thread."""
+
+    @wraps(method)
+    def owned(*args: P.args, **kwargs: P.kwargs) -> T:
+        store = args[0]
+        assert isinstance(store, RolloutStore)
+        return store.run_sync(lambda: method(*args, **kwargs))
+
+    return owned
+
+
 class RolloutStore:
     """Own canonical records and update projections through one reducer.
 
@@ -274,12 +286,39 @@ class RolloutStore:
         *,
         read_only: bool = False,
     ) -> None:
+        self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
+        self._owner_thread: int | None = None
+        self._admission = threading.Lock()
+        self._closing: Future[None] | None = None
+        try:
+            self.run_sync(lambda: self._initialize(path, read_only=read_only))
+        except BaseException:
+            self.close()
+            raise
+
+    @classmethod
+    async def open(cls, path: Path, *, read_only: bool = False) -> RolloutStore:
+        """Open/migrate on the Store owner without blocking the caller's loop."""
+        self = cls.__new__(cls)
+        self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
+        self._owner_thread = None
+        self._admission = threading.Lock()
+        self._closing = None
+        try:
+            await self.run_async(lambda: self._initialize(path, read_only=read_only))
+        except BaseException:
+            # Cancellation still observes initialization before closing its resource.
+            await self.aclose()
+            raise
+        return self
+
+    def _initialize(self, path: Path, *, read_only: bool) -> None:
+        self._owner_thread = threading.get_ident()
         self._path = Path(path)
         self._read_only = read_only
         self._artifact_root = self._path.with_name(f"{self._path.name}.artifacts")
         self._pending_transaction_records: list[RolloutRecord] | None = None
         self._captured_commits: list[tuple[RolloutRecord, ...]] | None = None
-        self._nonblocking_writer = False
         if read_only:
             self._connection = sqlite3.connect(
                 f"{self._path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None,
@@ -302,9 +341,91 @@ class RolloutStore:
     def __exit__(self, *_args: object) -> None:
         self.close()
 
-    def close(self) -> None:
-        self._connection.close()
+    def _submit[T](self, operation: Callable[[], T]) -> Future[T]:
+        context = contextvars.copy_context()
+        with self._admission:
+            if self._closing is not None:
+                raise sqlite3.ProgrammingError("RolloutStore is closed")
+            return self._owner.submit(context.run, operation)
 
+    def run_sync[T](self, operation: Callable[[], T]) -> T:
+        """Blocking API; compose a complete query/transaction on the same owner.
+
+        Return detached values, never SQLite cursors. Advance read generators with iterate.
+        Async consumers use run_async, including for multi-query read helpers.
+        """
+        if threading.get_ident() == self._owner_thread:
+            return operation()
+        return self._submit(operation).result()
+
+    async def run_async[**P, T](self, operation: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+        """Await one FIFO operation; cancellation waits for its real outcome.
+
+        Accepted work is never cancelled or retried. If cancellation races a
+        failure, the actual Store error wins. Otherwise cancellation propagates
+        after the operation finishes, so callers can reconcile durable state.
+        """
+        return await self._observe(self._submit(lambda: operation(*args, **kwargs)))
+
+    async def iterate[T](self, iterator: Iterator[T]) -> AsyncGenerator[T, None]:
+        """Advance a lazy read helper on the owner; materialize one result at a time."""
+        end = object()
+        try:
+            while True:
+                value = await self.run_async(next, iterator, end)
+                if value is end:
+                    return
+                yield cast(T, value)
+        finally:
+            close = getattr(iterator, "close", None)
+            if close is not None:
+                await self.run_async(close)
+
+    @staticmethod
+    async def _observe[T](future: Future[T]) -> T:
+        waiting = asyncio.wrap_future(future)
+        cancelled = False
+        while not waiting.done():
+            try:
+                await asyncio.shield(waiting)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = waiting.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    def _begin_close(self) -> Future[None]:
+        with self._admission:
+            if self._closing is None:
+
+                def close_connection() -> None:
+                    connection = getattr(self, "_connection", None)
+                    if connection is not None:
+                        connection.close()
+
+                self._closing = self._owner.submit(close_connection)
+                self._owner.shutdown(wait=False)
+            return self._closing
+
+    def close(self) -> None:
+        """Stop admission, drain accepted work and close on the owner (blocking)."""
+        if threading.get_ident() == self._owner_thread:
+            raise RuntimeError("cannot close RolloutStore from its operation")
+        self._begin_close().result()
+        self._owner.shutdown(wait=True)
+
+    async def aclose(self) -> None:
+        """Stop admission and await the same drain/close barrier asynchronously."""
+        await self._observe(self._begin_close())
+
+    async def __aenter__(self) -> RolloutStore:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        await self.aclose()
+
+    @_store_operation
     def read_memory_state(self, workspace: Path, *, version: int | None = None) -> dict[str, Any]:
         """Read workspace memory; old/read-only databases need no schema migration."""
         key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
@@ -325,10 +446,17 @@ class RolloutStore:
             raise RuntimeError("workspace memory integrity mismatch")
         return dict(state)
 
+    @_store_operation
     def commit_memory_state(
-        self, workspace: Path, *, expected_version: int, state: Mapping[str, Any],
-        claim_owner: str | None = None, job_thread_id: str | None = None,
-        job_state: Mapping[str, Any] | None = None, job_revision: int | None = None,
+        self,
+        workspace: Path,
+        *,
+        expected_version: int,
+        state: Mapping[str, Any],
+        claim_owner: str | None = None,
+        job_thread_id: str | None = None,
+        job_state: Mapping[str, Any] | None = None,
+        job_revision: int | None = None,
     ) -> dict[str, Any]:
         """CAS commit; keep immutable versions for inspection and crash recovery."""
         key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
@@ -348,14 +476,21 @@ class RolloutStore:
             self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)", (key, value))
         return committed
 
+    @_store_operation
     def read_memory_jobs(self, workspace: Path) -> dict[str, Any]:
         key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
         return {} if row is None else dict(json.loads(row["value"]))
 
+    @_store_operation
     def write_memory_job(
-        self, workspace: Path, thread_id: str, state: Mapping[str, Any], *,
-        owner: str | None = None, expected_revision: int | None = None,
+        self,
+        workspace: Path,
+        thread_id: str,
+        state: Mapping[str, Any],
+        *,
+        owner: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict[str, Any]:
         key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -371,6 +506,7 @@ class RolloutStore:
                                      (key, _canonical_json(jobs)))
         return job
 
+    @_store_operation
     def enqueue_memory_job(self, workspace: Path, thread_id: str) -> None:
         with self._transaction():
             if Path(self.read_thread(thread_id).workspace).resolve() != workspace.resolve():
@@ -387,6 +523,7 @@ class RolloutStore:
         if claim.get("owner") != owner or claim.get("expires_at", 0) <= time.time():
             raise ContextSourceChangedError("memory workspace lease is no longer owned")
 
+    @_store_operation
     def claim_memory_job(self, workspace: Path, *, owner: str, now: float, lease_seconds: float) -> bool:
         key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -397,6 +534,7 @@ class RolloutStore:
                                      (key, _canonical_json({"owner": owner, "expires_at": now + lease_seconds})))
         return True
 
+    @_store_operation
     def release_memory_job(self, workspace: Path, *, owner: str) -> None:
         key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
         with self._transaction():
@@ -409,6 +547,7 @@ class RolloutStore:
             raise sqlite3.OperationalError("attempt to write a readonly database")
 
     @property
+    @_store_operation
     def epoch(self) -> str:
         row = self._connection.execute("SELECT value FROM store_metadata WHERE key = 'store_epoch'").fetchone()
         if row is None:
@@ -416,9 +555,11 @@ class RolloutStore:
         return str(row["value"])
 
     @property
+    @_store_operation
     def artifact_root(self) -> Path:
         return self._artifact_root
 
+    @_store_operation
     def capture_mutation[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
         """Run one Store mutation and return only that transaction's records."""
 
@@ -435,26 +576,10 @@ class RolloutStore:
         return CommittedMutation(value=value, records=captured[0])
 
     async def capture_mutation_async[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
-        """Yield while waiting for the writer, retaining this connection's owner.
+        """Run the complete transaction and artifact I/O on the Store owner."""
+        return await self.run_async(lambda: self.capture_mutation(operation))
 
-        Only failed BEGIN admission is retried. Errors after mutation entry,
-        including COMMIT failures, are never replayed here.
-        """
-        timeout = int(self._connection.execute("PRAGMA busy_timeout").fetchone()[0])
-        deadline = time.monotonic() + timeout / 1000
-        while True:
-            self._connection.execute("PRAGMA busy_timeout = 0")
-            self._nonblocking_writer = True
-            try:
-                return self.capture_mutation(operation)
-            except _WriterBusyError:
-                if time.monotonic() >= deadline:
-                    raise
-            finally:
-                self._nonblocking_writer = False
-                self._connection.execute(f"PRAGMA busy_timeout = {timeout}")
-            await asyncio.sleep(min(0.01, max(0, deadline - time.monotonic())))
-
+    @_store_operation
     def commit_artifact(
         self,
         *,
@@ -520,6 +645,7 @@ class RolloutStore:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @_store_operation
     def read_artifact_metadata(self, artifact_id: str) -> ArtifactSnapshot:
         row = self._connection.execute(
             "SELECT * FROM artifacts WHERE artifact_id = ?",
@@ -529,6 +655,7 @@ class RolloutStore:
             raise KeyError(f"unknown artifact: {artifact_id}")
         return _artifact_snapshot(row)
 
+    @_store_operation
     def list_artifacts(self, turn_id: str | None = None) -> tuple[ArtifactSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM artifacts ORDER BY rowid").fetchall()
@@ -539,10 +666,12 @@ class RolloutStore:
             ).fetchall()
         return tuple(_artifact_snapshot(row) for row in rows)
 
+    @_store_operation
     def artifact_blob_path(self, artifact_id: str) -> Path:
         artifact = self.read_artifact_metadata(artifact_id)
         return self._artifact_root / "blobs" / artifact.blob_sha256
 
+    @_store_operation
     def read_artifact(self, artifact_id: str) -> bytes:
         artifact = self.read_artifact_metadata(artifact_id)
         blob = self.artifact_blob_path(artifact_id)
@@ -556,6 +685,7 @@ class RolloutStore:
             raise RuntimeError("artifact blob hash mismatch")
         return content
 
+    @_store_operation
     def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> tuple[str, ...]:
         if min_age_seconds <= 0:
             raise ValueError("artifact GC min_age_seconds must be positive")
@@ -580,6 +710,7 @@ class RolloutStore:
                     removed.append(str(candidate.relative_to(self._artifact_root)))
         return tuple(sorted(removed))
 
+    @_store_operation
     def create_thread(
         self,
         *,
@@ -606,8 +737,13 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
+    @_store_operation
     def update_session_settings(
-        self, thread_id: str, settings: Mapping[str, Any], *, expected_request_revision: int | None = None,
+        self,
+        thread_id: str,
+        settings: Mapping[str, Any],
+        *,
+        expected_request_revision: int | None = None,
     ) -> None:
         frozen = _json_object(settings, field="settings")
         with self._transaction():
@@ -627,6 +763,7 @@ class RolloutStore:
                 payload={"settings": frozen},
             )
 
+    @_store_operation
     def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
         thread_id = f"thread_{uuid4().hex}"
         with self._transaction():
@@ -656,6 +793,7 @@ class RolloutStore:
             )
         return self.read_thread(thread_id)
 
+    @_store_operation
     def start_turn(
         self,
         *,
@@ -733,6 +871,7 @@ class RolloutStore:
                 )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def user_input_revision(self, turn_id: str) -> int:
         """Count canonical user messages, independently of context compaction."""
         return int(self._connection.execute(
@@ -740,6 +879,7 @@ class RolloutStore:
             (turn_id,),
         ).fetchone()[0])
 
+    @_store_operation
     def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int | None:
         revision = request_ref.get("input_revision")
         if isinstance(revision, int) and not isinstance(revision, bool):
@@ -755,8 +895,13 @@ class RolloutStore:
         return sum(item.kind == "user_message" and item.status == "completed"
                    and item.sequence < request.sequence for item in items)
 
+    @_store_operation
     def receive_turn_input(
-        self, *, thread_id: str, turn_id: str, text: str,
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        text: str,
         input_files: tuple[Mapping[str, Any], ...] = (),
     ) -> ItemSnapshot:
         """Durably accept steering for exactly the expected active Turn."""
@@ -790,6 +935,7 @@ class RolloutStore:
                 )
         return self.read_item(item_id)
 
+    @_store_operation
     def turn_input_status(self, item_id: str) -> str:
         """Derive input consumption from ordinary model dispatches, never preparation."""
         item = self.read_item(item_id)
@@ -807,6 +953,7 @@ class RolloutStore:
         status = self.read_turn(item.turn_id).status
         return "pending" if status in {"running", "paused", "interrupted"} else "unconsumed"
 
+    @_store_operation
     def complete_turn(
         self,
         *,
@@ -866,6 +1013,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def fail_turn(
         self,
         *,
@@ -990,6 +1138,7 @@ class RolloutStore:
             },
         )
 
+    @_store_operation
     def pause_turn(
         self,
         *,
@@ -1025,6 +1174,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def interrupt_orphaned_turn(
         self,
         *,
@@ -1086,6 +1236,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def context_source_revision(self, turn_id: str) -> str:
         """Version every source Thread, including non-message state transitions."""
         thread_ids = {item.thread_id for item in self.list_context_items(turn_id)}
@@ -1095,9 +1246,11 @@ class RolloutStore:
         ]
         return hashlib.sha256(_canonical_json(versions).encode()).hexdigest()
 
+    @_store_operation
     def context_durable_state(self, turn_id: str) -> dict[str, Any]:
         return _context_durable_state(self, turn_id)
 
+    @_store_operation
     def record_context_compaction(
         self,
         *,
@@ -1267,6 +1420,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def cancel_turn(self, *, turn_id: str) -> TurnSnapshot:
         with self._transaction():
             turn = self._connection.execute(
@@ -1338,6 +1492,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def request_turn_cancellation(
         self,
         *,
@@ -1380,6 +1535,7 @@ class RolloutStore:
                 )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def turn_cancellation_pending(self, turn_id: str) -> bool:
         """A durable stop applies only until the next explicit execution resume."""
         return self._connection.execute(
@@ -1395,6 +1551,7 @@ class RolloutStore:
         if self.turn_cancellation_pending(turn_id):
             raise RuntimeError("Turn cancellation was requested; input was not accepted")
 
+    @_store_operation
     def resume_cancelled_turn(self, *, turn_id: str) -> TurnSnapshot:
         """Explicitly continue a quiescent cancellation without replaying results."""
         with self._transaction():
@@ -1413,6 +1570,7 @@ class RolloutStore:
             )
         return self.read_turn(turn_id)
 
+    @_store_operation
     def request_clarification(
         self,
         *,
@@ -1445,6 +1603,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def resolve_clarification(
         self,
         *,
@@ -1509,6 +1668,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def request_choice(
         self,
         *,
@@ -1548,6 +1708,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def resolve_choice(
         self,
         *,
@@ -1616,6 +1777,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def prepare_model_operation(
         self,
         *,
@@ -1711,6 +1873,7 @@ class RolloutStore:
             raise RuntimeError("prepared model operation projection is missing")
         return _model_operation_snapshot(row)
 
+    @_store_operation
     def supersede_prepared_model(self, operation_id: str) -> None:
         """Close an undispatched stale request without reserving or spending budget."""
         with self._transaction():
@@ -1725,6 +1888,7 @@ class RolloutStore:
                          "error_type": "input_superseded"},
             )
 
+    @_store_operation
     def dispatch_model_attempt(
         self,
         operation_id: str,
@@ -1865,6 +2029,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def expire_model_attempt_dispatch(
         self,
         *,
@@ -1927,6 +2092,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def start_model_output_channel(
         self,
         *,
@@ -2000,6 +2166,7 @@ class RolloutStore:
             raise RuntimeError("model output channel start lost its Item identity")
         return self.read_item(selected_item_id)
 
+    @_store_operation
     def mark_model_attempt_unknown(
         self,
         *,
@@ -2073,6 +2240,7 @@ class RolloutStore:
                 )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def reject_model_attempt(
         self,
         *,
@@ -2210,6 +2378,7 @@ class RolloutStore:
                 },
             )
 
+    @_store_operation
     def cancel_model_attempt(
         self,
         *,
@@ -2273,6 +2442,7 @@ class RolloutStore:
             )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
         row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
                                        (operation_id,)).fetchone()
@@ -2324,6 +2494,7 @@ class RolloutStore:
             )
         return self.list_model_attempts(operation_id)[-1]
 
+    @_store_operation
     def complete_model_attempt(
         self,
         *,
@@ -2512,6 +2683,7 @@ class RolloutStore:
                 )
         return True
 
+    @_store_operation
     def list_model_operations(self, turn_id: str | None = None) -> tuple[ModelOperationSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM model_operations ORDER BY rowid").fetchall()
@@ -2522,6 +2694,7 @@ class RolloutStore:
             ).fetchall()
         return tuple(_model_operation_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_model_attempts(self, operation_id: str) -> tuple[ModelAttemptSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM model_attempts WHERE operation_id = ? ORDER BY generation",
@@ -2529,6 +2702,7 @@ class RolloutStore:
         ).fetchall()
         return tuple(_model_attempt_snapshot(row) for row in rows)
 
+    @_store_operation
     def start_budgeted_child_turn(
         self,
         *,
@@ -2666,6 +2840,7 @@ class RolloutStore:
             )
         return self.read_turn(child_turn_id)
 
+    @_store_operation
     def settle_child_budget(self, *, child_turn_id: str) -> Mapping[str, Any]:
         """Convert one terminal child's allocation into its actual subtree usage."""
 
@@ -2700,6 +2875,7 @@ class RolloutStore:
             )
         return self.read_child_budget_allocation(child_turn_id)
 
+    @_store_operation
     def read_child_budget_allocation(self, child_turn_id: str) -> Mapping[str, Any]:
         row = self._connection.execute(
             "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
@@ -2719,6 +2895,7 @@ class RolloutStore:
             }
         )
 
+    @_store_operation
     def read_budget_state(self, turn_id: str) -> BudgetState:
         """Derive the Turn budget from durable reservations and tool executions."""
 
@@ -2821,6 +2998,7 @@ class RolloutStore:
             child_reserved=child_reserved,
         )
 
+    @_store_operation
     def read_budget_reservation(self, attempt_id: str) -> BudgetReservation:
         row = self._budget_reservation_row_for_attempt(attempt_id)
         if row is None:
@@ -2910,6 +3088,7 @@ class RolloutStore:
             return
         raise ValueError(f"unsupported budget outcome: {outcome}")
 
+    @_store_operation
     def record_tool_call(
         self,
         *,
@@ -2977,6 +3156,7 @@ class RolloutStore:
             raise RuntimeError("tool call Item identity was not resolved")
         return self.read_item(item_id)
 
+    @_store_operation
     def record_tool_execution_state(
         self,
         *,
@@ -3059,6 +3239,7 @@ class RolloutStore:
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def claim_tool_operation(
         self,
         *,
@@ -3123,6 +3304,7 @@ class RolloutStore:
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def reject_ready_tool_operation(
         self,
         *,
@@ -3155,6 +3337,7 @@ class RolloutStore:
             )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def expire_tool_operation_claim(
         self,
         *,
@@ -3223,6 +3406,7 @@ class RolloutStore:
                 )
         return self.read_tool_operation(operation_id)
 
+    @_store_operation
     def mark_tool_result_missing(
         self,
         *,
@@ -3298,6 +3482,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def commit_tool_operation_outcome(
         self,
         *,
@@ -3397,6 +3582,7 @@ class RolloutStore:
                 )
         return is_current
 
+    @_store_operation
     def commit_tool_operation_result(
         self,
         *,
@@ -3433,6 +3619,7 @@ class RolloutStore:
             )
         return True
 
+    @_store_operation
     def resolve_tool_reconciliation(
         self,
         *,
@@ -3565,6 +3752,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def resolve_tool_approval(
         self,
         *,
@@ -3635,6 +3823,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def refresh_tool_approval(self, *, turn_id: str, request: Mapping[str, Any]) -> InteractionSnapshot:
         """Replace an unexecuted approval after a policy recheck, atomically."""
         frozen_request = _json_object(request, field="approval request")
@@ -3676,6 +3865,7 @@ class RolloutStore:
                 )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def invalidate_tool_approval(
         self,
         *,
@@ -3748,6 +3938,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def invalidate_resolved_tool_approval(
         self,
         *,
@@ -3827,6 +4018,7 @@ class RolloutStore:
             )
         return self.read_interaction(str(interaction["request_id"]))
 
+    @_store_operation
     def request_tool_approval(
         self,
         *,
@@ -3913,6 +4105,7 @@ class RolloutStore:
             )
         return self.read_interaction(request_id)
 
+    @_store_operation
     def record_tool_result(
         self,
         *,
@@ -4160,6 +4353,7 @@ class RolloutStore:
                 )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def read_tool_operation(self, operation_id: str) -> ToolOperationSnapshot:
         row = self._connection.execute(
             "SELECT * FROM tool_operations WHERE operation_id = ?", (operation_id,)
@@ -4168,8 +4362,13 @@ class RolloutStore:
             raise KeyError(f"unknown tool operation: {operation_id}")
         return _tool_operation_snapshot(row)
 
+    @_store_operation
     def record_tool_continuation(
-        self, *, operation_id: str, key: str, result: Mapping[str, Any],
+        self,
+        *,
+        operation_id: str,
+        key: str,
+        result: Mapping[str, Any],
     ) -> ItemSnapshot:
         """Persist the owner's confirmed terminal result when its live scope closes."""
         operation = self.read_tool_operation(operation_id)
@@ -4195,6 +4394,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def record_verification(
         self,
         *,
@@ -4256,6 +4456,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def record_workspace_checkpoint(
         self,
         *,
@@ -4315,6 +4516,7 @@ class RolloutStore:
             )
         return self.read_item(item_id)
 
+    @_store_operation
     def list_tool_operations(self, turn_id: str | None = None) -> tuple[ToolOperationSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM tool_operations ORDER BY rowid").fetchall()
@@ -4325,12 +4527,14 @@ class RolloutStore:
             ).fetchall()
         return tuple(_tool_operation_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_interaction(self, request_id: str) -> InteractionSnapshot:
         row = self._connection.execute("SELECT * FROM interactions WHERE request_id = ?", (request_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown interaction: {request_id}")
         return _interaction_snapshot(row)
 
+    @_store_operation
     def list_interactions(self, turn_id: str | None = None) -> tuple[InteractionSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM interactions ORDER BY rowid").fetchall()
@@ -4341,6 +4545,7 @@ class RolloutStore:
             ).fetchall()
         return tuple(_interaction_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_approvals(self, turn_id: str | None = None) -> tuple[ApprovalSnapshot, ...]:
         if turn_id is None:
             rows = self._connection.execute("SELECT * FROM approvals ORDER BY rowid").fetchall()
@@ -4351,8 +4556,12 @@ class RolloutStore:
             ).fetchall()
         return tuple(_approval_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_resource_usage(
-        self, turn_id: str, resource: str, initial_used: int = 0,
+        self,
+        turn_id: str,
+        resource: str,
+        initial_used: int = 0,
     ) -> dict[str, Any]:
         """Read the latest durable counter; legacy usage applies only before its first Item."""
 
@@ -4374,8 +4583,13 @@ class RolloutStore:
                     "remaining": max(0, limit - used), "item_id": str(row["item_id"])}
         return {"resource": resource, "limit": None, "used": initial_used, "remaining": None, "item_id": None}
 
+    @_store_operation
     def reserve_resource_unit(
-        self, turn_id: str, resource: str, limit: int, initial_used: int = 0,
+        self,
+        turn_id: str,
+        resource: str,
+        limit: int,
+        initial_used: int = 0,
     ) -> dict[str, Any]:
         """Commit one conservative unit before I/O, serialized across Store connections."""
 
@@ -4401,8 +4615,13 @@ class RolloutStore:
             )
         return {"resource": resource, "limit": limit, "used": used, "remaining": limit - used, "item_id": item_id}
 
+    @_store_operation
     def record_final_proposal(
-        self, *, turn_id: str, answer: str, source_item_id: str | None = None,
+        self,
+        *,
+        turn_id: str,
+        answer: str,
+        source_item_id: str | None = None,
     ) -> ItemSnapshot:
         if not isinstance(answer, str) or not answer.strip():
             raise ValueError("answer must be non-empty")
@@ -4431,6 +4650,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def record_completion_decision(
         self,
         *,
@@ -4489,6 +4709,7 @@ class RolloutStore:
             )
         return self._latest_item(turn_id)
 
+    @_store_operation
     def record_completion_feedback(
         self,
         *,
@@ -4535,28 +4756,33 @@ class RolloutStore:
             raise RuntimeError(f"turn is not running: {turn_id}")
         return str(turn["thread_id"])
 
+    @_store_operation
     def read_thread(self, thread_id: str) -> ThreadSnapshot:
         row = self._connection.execute("SELECT * FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown thread: {thread_id}")
         return _thread_snapshot(row)
 
+    @_store_operation
     def list_threads(self) -> tuple[ThreadSnapshot, ...]:
         rows = self._connection.execute("SELECT * FROM threads ORDER BY rowid").fetchall()
         return tuple(_thread_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_turn(self, turn_id: str) -> TurnSnapshot:
         row = self._connection.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
         if row is None:
             raise KeyError(f"unknown turn: {turn_id}")
         return _turn_snapshot(row)
 
+    @_store_operation
     def list_turns(self, thread_id: str | None = None) -> tuple[TurnSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM turns WHERE (? IS NULL OR thread_id = ?) ORDER BY rowid", (thread_id, thread_id),
         ).fetchall()
         return tuple(_turn_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         rows = self._connection.execute(
             "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence", (turn_id,)
@@ -4571,6 +4797,7 @@ class RolloutStore:
             raise KeyError(f"Turn has no Items: {turn_id}")
         return _item_snapshot(row)
 
+    @_store_operation
     def read_item(self, item_id: str) -> ItemSnapshot:
         row = self._connection.execute(
             "SELECT * FROM items WHERE item_id = ?",
@@ -4580,6 +4807,7 @@ class RolloutStore:
             raise KeyError(f"unknown Item: {item_id}")
         return _item_snapshot(row)
 
+    @_store_operation
     def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Visible model/recall window; the complete ledger remains separately readable."""
         self._assert_artifact_integrity(turn_id)
@@ -4595,6 +4823,7 @@ class RolloutStore:
                     start = index
         return items[start:]
 
+    @_store_operation
     def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
         """Read original Items through the fork point; do not load or execute artifacts."""
         turn = self._connection.execute(
@@ -4643,6 +4872,7 @@ class RolloutStore:
             )
         return tuple(_item_snapshot(row) for row in rows)
 
+    @_store_operation
     def last_record(self, thread_id: str) -> RolloutRecord | None:
         row = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence DESC LIMIT 1",
@@ -4650,6 +4880,7 @@ class RolloutStore:
         ).fetchone()
         return None if row is None else _record_snapshot(row)
 
+    @_store_operation
     def list_records(self, thread_id: str) -> tuple[RolloutRecord, ...]:
         rows = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence",
@@ -4657,12 +4888,14 @@ class RolloutStore:
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
     def list_turn_records(self, turn_id: str) -> tuple[RolloutRecord, ...]:
         rows = self._connection.execute(
             "SELECT * FROM rollout_records WHERE turn_id = ? ORDER BY record_id", (turn_id,),
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_turn_completion(self, turn_id: str) -> RolloutRecord | None:
         """Read the terminal acceptance fact, independently of result formatting."""
         row = self._connection.execute(
@@ -4672,6 +4905,7 @@ class RolloutStore:
         ).fetchone()
         return None if row is None else _record_snapshot(row)
 
+    @_store_operation
     def read_turn_answer(self, turn_id: str) -> ItemSnapshot:
         """Resolve the accepted output identity; old Turns retain their original answer Item."""
         completion = self.read_turn_completion(turn_id)
@@ -4692,8 +4926,13 @@ class RolloutStore:
             raise RuntimeError("completed Turn has an invalid answer reference")
         return answer
 
+    @_store_operation
     def list_record_tail(
-        self, thread_id: str, *, after_thread_sequence: int = 0, limit: int | None = None,
+        self,
+        thread_id: str,
+        *,
+        after_thread_sequence: int = 0,
+        limit: int | None = None,
         through_thread_sequence: int = 9223372036854775807,
     ) -> tuple[RolloutRecord, ...]:
         """Read a canonical suffix by its indexed sequence, with an optional record page."""
@@ -4704,12 +4943,17 @@ class RolloutStore:
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
     def read_event_reference(
         self,
         record_type: Literal[
-            "item_started", "item_completed", "model_attempt_completed",
-            "tool_operation_result_linked", "tool_operation_claimed",
-            "tool_operation_prepared", "tool_operation_outcome_committed",
+            "item_started",
+            "item_completed",
+            "model_attempt_completed",
+            "tool_operation_result_linked",
+            "tool_operation_claimed",
+            "tool_operation_prepared",
+            "tool_operation_outcome_committed",
             "tool_operation_migrated",
         ],
         identity: str,
@@ -4727,6 +4971,7 @@ class RolloutStore:
         ).fetchone()
         return None if row is None else _record_snapshot(row)
 
+    @_store_operation
     def find_model_response_item(self, turn_id: str, text: str | None) -> str | None:
         """Find one completed response for accepted-answer deduplication, without scanning Items."""
         row = self._connection.execute(
@@ -4737,6 +4982,7 @@ class RolloutStore:
         ).fetchone()
         return None if row is None else str(row["item_id"])
 
+    @_store_operation
     def list_global_records(
         self,
         *,
@@ -4754,9 +5000,11 @@ class RolloutStore:
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
+    @_store_operation
     def last_global_record_id(self) -> int:
         return int(self._connection.execute("SELECT COALESCE(MAX(record_id), 0) FROM rollout_records").fetchone()[0])
 
+    @_store_operation
     def projection_hashes(self) -> dict[str, str]:
         """Return versioned metadata digests, not proof of projection integrity.
 
@@ -4768,6 +5016,7 @@ class RolloutStore:
         ).fetchall()
         return {str(row["thread_id"]): str(row["canonical_hash"]) for row in rows}
 
+    @_store_operation
     def verify(self) -> VerificationReport:
         errors: list[str] = []
         expected = ProjectionState()
@@ -4942,6 +5191,7 @@ class RolloutStore:
             if error is not None:
                 raise RuntimeError(f"artifact integrity check failed: {error}")
 
+    @_store_operation
     def rebuild_projections(self) -> None:
         """Rebuild projections from verified canonical records in one transaction."""
         with self._transaction():
@@ -4999,6 +5249,8 @@ class RolloutStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("transactions must run as a complete Store operation")
         self._assert_writable()
         if self._pending_transaction_records is not None:
             yield
@@ -5007,12 +5259,7 @@ class RolloutStore:
         self._pending_transaction_records = pending
         began = False
         try:
-            try:
-                self._connection.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as error:
-                if self._nonblocking_writer and getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY:
-                    raise _WriterBusyError(str(error)) from error
-                raise
+            self._connection.execute("BEGIN IMMEDIATE")
             began = True
             yield
         except BaseException:

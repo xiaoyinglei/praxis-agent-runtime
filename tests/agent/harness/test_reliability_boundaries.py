@@ -41,7 +41,7 @@ def test_corrupt_artifact_does_not_block_unrelated_turn(tmp_path):
 async def test_store_writer_wait_yields_to_event_loop(tmp_path, kind):
     with RolloutStore(tmp_path / "run.db") as store:
         thread = store.create_thread(workspace=tmp_path)
-        store._connection.execute("PRAGMA busy_timeout=150")
+        store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout=150").close())
         other = sqlite3.connect(tmp_path / "run.db", isolation_level=None)
         other.execute("BEGIN IMMEDIATE")
         executor = object.__new__(kind)
@@ -57,7 +57,7 @@ async def test_store_writer_wait_yields_to_event_loop(tmp_path, kind):
                 thread_id=thread.thread_id, user_message="new", binding_manifest={}))
             assert turn.status == "running"
             assert task.done()
-            assert store._connection.execute("PRAGMA busy_timeout").fetchone()[0] == 150
+            assert store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout").fetchone())[0] == 150
         finally:
             await task
             other.close()
@@ -124,13 +124,13 @@ def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch
             # Count only live projection, independently of the write/reducer.
             loaded.clear()
             projected.clear()
-            store._connection.set_progress_handler(sql_step, 1)
+            store.run_sync(lambda: store._connection.set_progress_handler(sql_step, 1))
             try:
                 parts = tuple((record,) for record in mutation.records) if split_items else (mutation.records,)
                 for part in parts:
                     assert RolloutEventReader(store).project_committed_batch(part) == ()
             finally:
-                store._connection.set_progress_handler(None, 0)
+                store.run_sync(lambda: store._connection.set_progress_handler(None, 0))
             total_records += len(mutation.records)
             total_loaded += len(loaded)
             total_projected += len(projected)
@@ -141,11 +141,11 @@ def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch
         # A delayed completion must find its old start by identity even after
         # many unrelated Items. Counting VM work catches hidden SQL full scans.
         sql_steps = 0
-        store._connection.set_progress_handler(sql_step, 1)
+        store.run_sync(lambda: store._connection.set_progress_handler(sql_step, 1))
         try:
             assert RolloutEventReader(store).project_committed_batch((early_completion,)) == ()
         finally:
-            store._connection.set_progress_handler(None, 0)
+            store.run_sync(lambda: store._connection.set_progress_handler(None, 0))
         assert sql_steps <= 100, sql_steps
 
 

@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.rollout import RolloutStore, _store_operation
 from agent_runtime.model_config_io import ensure_durable_directory
 from agent_runtime.user_config import user_config_directory
 
@@ -87,6 +87,7 @@ def assert_recovery_leases(*, owned: bool, leases: Iterable[float | None]) -> No
         raise ConversationBusyError("旧会话的执行租约尚未过期，暂不能接管；请确认原进程状态后再试。")
 
 
+@_store_operation
 def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False) -> None:
     """Reconcile dispatches while holding execution_owner, without redoing effects.
 

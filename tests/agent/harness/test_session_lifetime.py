@@ -239,7 +239,7 @@ async def test_failed_open_releases_store_and_model_control(tmp_path, monkeypatc
 
     stores = []
     planes = []
-    original_store = RolloutStore.__init__
+    original_store = RolloutStore._initialize
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False)
     create_plane = agent._get_model_control_plane
 
@@ -255,7 +255,7 @@ async def test_failed_open_releases_store_and_model_control(tmp_path, monkeypatc
     def fail_services(*args, **kwargs):
         raise RuntimeError("assembly failed after resources opened")
 
-    monkeypatch.setattr(RolloutStore, "__init__", record_store)
+    monkeypatch.setattr(RolloutStore, "_initialize", record_store)
     monkeypatch.setattr(agent, "_get_model_control_plane", record_plane)
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     monkeypatch.setattr(session_module, "configure_services", fail_services)

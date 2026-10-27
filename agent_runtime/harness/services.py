@@ -245,11 +245,13 @@ def configure_services(
             max_tokens_total=payload.llm_budget_total,
             max_cost_micros=payload.llm_cost_budget_micros,
         )
-        child_turn = store.read_turn(child.turn_id)
-        child_items = store.list_items(child.turn_id)
-        pending = [
-            interaction for interaction in store.list_interactions(child.turn_id) if interaction.status == "pending"
-        ]
+        child_turn = await store.run_async(store.read_turn, child.turn_id)
+        child_items = await store.run_async(store.list_items, child.turn_id)
+        pending = await store.run_async(
+            lambda: [
+                interaction for interaction in store.list_interactions(child.turn_id) if interaction.status == "pending"
+            ]
+        )
         child_pause: dict[str, object] | None = None
         if child.status == "paused":
             if len(pending) != 1:

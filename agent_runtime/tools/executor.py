@@ -845,16 +845,25 @@ class ToolExecutor:
         prepared = replace(prepared, record=started_record)
         if prepared.context.invocation_guard is not None:
             try:
-                prepared.context.invocation_guard(prepared.call)
+                guarded = prepared.context.invocation_guard(prepared.call)
+                if inspect.isawaitable(guarded):
+                    await guarded
             except ExecutionStartRejectedError as rejected:
                 return await self._finish(
                     call=prepared.call,
-                    result=_error_result(prepared.call, code=rejected.code, message=rejected.message,
-                                         retryable=rejected.retryable,
-                                         metadata=rejected.metadata),
+                    result=_error_result(
+                        prepared.call,
+                        code=rejected.code,
+                        message=rejected.message,
+                        retryable=rejected.retryable,
+                        metadata=rejected.metadata,
+                    ),
                     record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code=rejected.code),
                     prepared=prepared,
                 )
+            except asyncio.CancelledError:
+                await self._finish_cancelled(prepared, cancellation_sink)
+                raise
         if prepared.context.context_provider is not None or prepared.context.permission_provider is not None:
             try:
                 current = prepared.context.refreshed()
@@ -1091,14 +1100,18 @@ class ToolExecutor:
     async def _finish_cancelled(
         self, prepared: _PreparedExecution, cancellation_sink: ExecutionSink | None,
     ) -> None:
-        execution = await self._finish(
-            call=prepared.call,
-            result=_error_result(prepared.call, code="cancelled", message="tool execution was cancelled",
-                                 retryable=True),
-            record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code="cancelled"),
-            prepared=prepared,
-        )
-        await _emit_execution(cancellation_sink, execution)
+        async def finish() -> None:
+            execution = await self._finish(
+                call=prepared.call,
+                result=_error_result(
+                    prepared.call, code="cancelled", message="tool execution was cancelled", retryable=True
+                ),
+                record=replace(prepared.record, status=ExecutionStatus.FAILED, error_code="cancelled"),
+                prepared=prepared,
+            )
+            await _emit_execution(cancellation_sink, execution)
+
+        await _drain_task(asyncio.create_task(finish()))
 
     async def _failed_after_runner(
         self,

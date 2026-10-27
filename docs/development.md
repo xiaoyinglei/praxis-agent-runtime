@@ -32,7 +32,13 @@ Praxis 的公开入口以 CLI 为先，Python SDK 与其共享能力和执行语
 
 修复问题时先定位请求、上下文、工具结果、权限与恢复边界，再增加回归验证。不围绕某个网站、任务词、模型习惯或测试案例堆叠特判；同一个通用机制应同时解释目标案例与正常反例。
 
-工具 runner 的同步函数在阻塞 worker 中执行。持有 Session/SQLite 连接、依赖调用事件循环的短逻辑应使用 `async def`，让连接继续由原线程拥有。线程不能强制取消；执行器会保留所有权直至取得真实终态，并记录超时或取消请求。异步 runner 若正在执行不可中断的变更，应声明 `FINISH_CURRENT` 并自行等待资源终态，不能取消返回后留下后台写入。
+工具 runner 的同步函数在阻塞 worker 中执行；依赖调用事件循环的逻辑使用 `async def`。每个 `RolloutStore` 有自己的单一 owner 线程，连接创建、事务、查询、产物写入与校验、关闭都在该线程执行，并保留 SQLite 默认线程亲和检查。async 工具的 Store 回调也必须 await 持久化边界。
+
+同步构造、方法和 `close()` 是明确的 blocking API。异步调用采用 `async with await RolloutStore.open(path) as store`，用 `await store.run_async(store.read_turn, turn_id)` 读取，或用 `capture_mutation_async` 返回真实提交及其记录。多查询帮助函数应作为一个完整闭包交给 owner；不要把连接或 SQLite cursor 交给其他线程。惰性查询用 `iterate` 在 owner 逐项推进，并在 `aclosing` 作用域内使用。
+
+Store 只接纳并执行每次操作一次；SQLite 写锁等待也发生在 owner，不在事件循环中轮询或重试业务事务。实时事件在 COMMIT 后投影和通知，canonical log 与 reducer 继续是事实来源。取消等待真实操作结果后才传播，关闭停止接纳并排空已接纳操作；调用方应据持久状态判断结果，不能把取消等同回滚。
+
+线程不能强制取消；执行器会保留所有权直至取得真实终态，并记录超时或取消请求。异步 runner 若正在执行不可中断的变更，应声明 `FINISH_CURRENT` 并自行等待资源终态，不能取消返回后留下后台写入。模型 claim 期间取消且 provider 尚未调用时，记录已知未调用并释放预算；provider I/O 已开始后取消，仍按未知结果保留预算。
 
 ## 本地检查
 

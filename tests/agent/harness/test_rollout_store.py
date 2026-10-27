@@ -34,11 +34,11 @@ def test_settings_update_does_not_rewrite_historical_projections(
         historical_turns = store.list_turns()
         historical_items = tuple(store.list_items(turn.turn_id) for turn in historical_turns)
         statements: list[str] = []
-        store._connection.set_trace_callback(statements.append)
+        store.run_sync(lambda: store._connection.set_trace_callback(statements.append))
 
         store.update_session_settings(thread.thread_id, {"model_alias": "new-model"})
 
-        store._connection.set_trace_callback(None)
+        store.run_sync(lambda: store._connection.set_trace_callback(None))
         inserts = [statement for statement in statements if statement.lstrip().startswith("INSERT INTO")]
         assert len(inserts) == 3, inserts
         assert store.list_turns() == historical_turns
@@ -61,11 +61,13 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         thread_before = store.read_thread(thread.thread_id)
         hashes = store.projection_hashes()
         items = store.list_items(turn.turn_id)
-        store._connection.execute(
-            """
+        store.run_sync(
+            lambda: store._connection.execute(
+                """
             CREATE TRIGGER reject_projection_commit BEFORE UPDATE ON projection_meta
             BEGIN SELECT RAISE(ABORT, 'projection write rejected'); END
             """
+            ).close()
         )
 
         with pytest.raises(sqlite3.IntegrityError, match="projection write rejected"):
@@ -77,7 +79,7 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         assert store.list_items(turn.turn_id) == items
         assert store.projection_hashes() == hashes
         assert store.verify().valid
-        store._connection.execute("DROP TRIGGER reject_projection_commit")
+        store.run_sync(lambda: store._connection.execute("DROP TRIGGER reject_projection_commit").close())
         store.complete_turn(turn_id=turn.turn_id, answer="committed after retry")
         assert store.verify().valid
 
@@ -335,7 +337,7 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
 
 def test_connection_sets_explicit_busy_timeout(tmp_path: Path) -> None:
     with RolloutStore(tmp_path / "rollout.sqlite3") as store:
-        timeout = store._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        timeout = store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout").fetchone())[0]
         assert timeout == 30000
 
 
@@ -360,18 +362,30 @@ def test_failed_commit_does_not_leave_connection_inside_transaction(tmp_path: Pa
         store._connection = _CommitFailingConnection(store._connection)  # type: ignore[assignment]
 
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
-            with store._transaction():
-                store._connection.execute(
-                    "INSERT INTO store_metadata(key, value) VALUES ('probe', '1')",
-                )
+
+            def transaction():
+                with store._transaction():
+                    store.run_sync(
+                        lambda: store._connection.execute(
+                            "INSERT INTO store_metadata(key, value) VALUES ('probe', '1')",
+                        ).close()
+                    )
+
+            store.run_sync(transaction)
 
         assert store._connection.in_transaction is False
-        probe = store._connection.execute(
-            "SELECT value FROM store_metadata WHERE key = 'probe'",
-        ).fetchone()
+        probe = store.run_sync(
+            lambda: store._connection.execute(
+                "SELECT value FROM store_metadata WHERE key = 'probe'",
+            ).fetchone()
+        )
         assert probe is None
-        with store._transaction():
-            pass
+
+        def transaction():
+            with store._transaction():
+                pass
+
+        store.run_sync(transaction)
 
 
 def test_pending_cancellation_blocks_clarification_and_choice_resolution(tmp_path: Path) -> None:

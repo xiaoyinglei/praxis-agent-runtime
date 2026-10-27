@@ -8,6 +8,7 @@ import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import aclosing
 from dataclasses import asdict, dataclass, replace
 from functools import partial
 from types import MappingProxyType
@@ -195,19 +196,31 @@ class TurnExecutor:
             )
         )
         return await self.run_turn(
-            self.restore_turn_context(turn.turn_id),
+            (await self._store.run_async(self.restore_turn_context, turn.turn_id)),
             start_step=1,
         )
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
         mutation = await self._store.capture_mutation_async(operation)
         if self._event_dispatcher is not None:
-            for replayed in RolloutEventReader(self._store).project_committed_batch(mutation.records):
+            for replayed in await self._store.run_async(
+                RolloutEventReader(self._store).project_committed_batch, mutation.records
+            ):
                 await self._event_dispatcher.emit(
                     replayed.event,
                     cursor=replayed.cursor,
                 )
         return mutation.value
+
+    async def _commit_cancellation(self, operation: Callable[[], None]) -> None:
+        """Finish cancellation bookkeeping even when cancellation is repeated."""
+        task = asyncio.create_task(self._commit(operation))
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                pass
+        task.result()
 
     def restore_turn_context(self, turn_id: str) -> TurnContext:
         turn = self._store.read_turn(turn_id)
@@ -572,14 +585,14 @@ class TurnExecutor:
                               for message in reversed(step.messages)
                               if message.content.startswith("Runtime budget status:\n")), None)
         if step.binding_manifest.get("execution_context_policy", {}).get("revision") == "working-context-v2":
-            budget_status = self._budget_status(step.turn)
+            budget_status = await self._store.run_async(self._budget_status, step.turn)
         if context_capacity_policy(step.binding_manifest) is not None:
             if budget_status is None:
-                budget_status = self._budget_status(step.turn)
+                budget_status = await self._store.run_async(self._budget_status, step.turn)
             from agent_runtime.harness.context import RolloutContextManager
             if (isinstance(self._context_manager, RolloutContextManager)
                     and "context_projection" in prepared.request_ref):
-                limits = self._context_manager.limits(step.turn.turn_id)
+                limits = await self._store.run_async(self._context_manager.limits, step.turn.turn_id)
                 projection = {**prepared.request_ref["context_projection"],
                               "byte_guards": {"item": limits["max_item_bytes"], "total": limits["max_total_bytes"]},
                               "message_guard": limits["max_messages"]}
@@ -642,16 +655,20 @@ class TurnExecutor:
     ) -> TurnResult:
         if self._tool_orchestrator is None:
             raise RuntimeError("Turn has no ToolOrchestrator for approval resume")
-        turn = self._store.read_turn(turn_id)
-        approval_interactions = [
-            interaction for interaction in self._store.list_interactions(turn_id) if interaction.kind == "tool_approval"
-        ]
+        turn = await self._store.run_async(self._store.read_turn, turn_id)
+        approval_interactions = await self._store.run_async(
+            lambda: [
+                interaction
+                for interaction in self._store.list_interactions(turn_id)
+                if interaction.kind == "tool_approval"
+            ]
+        )
         if approval_interactions and approval_interactions[-1].status == "resolved":
             prior_decision = approval_interactions[-1].response.get("decision")
             if prior_decision != decision:
                 raise RuntimeError(f"decision conflicts with resolved approval: {prior_decision} != {decision}")
             if turn.status == "completed":
-                answer = self._store.read_turn_answer(turn_id)
+                answer = await self._store.run_async(self._store.read_turn_answer, turn_id)
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
@@ -689,18 +706,20 @@ class TurnExecutor:
         return await self.recover_committed_model_response(turn_id=turn_id)
 
     async def retry_unknown_model(self, *, turn_id: str) -> TurnResult:
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
+        turn = await self._store.run_async(self._store.read_turn, turn_id)
+        turn_context = await self._store.run_async(self.restore_turn_context, turn_id)
         if turn.status not in {"paused", "interrupted"}:
             raise RuntimeError("model retry requires a paused or interrupted Turn")
-        unknown = [
-            operation for operation in self._store.list_model_operations(turn_id) if operation.status == "unknown"
-        ]
+        unknown = await self._store.run_async(
+            lambda: [
+                operation for operation in self._store.list_model_operations(turn_id) if operation.status == "unknown"
+            ]
+        )
         if len(unknown) != 1:
             raise RuntimeError("model retry requires one unknown logical operation")
         operation = unknown[0]
-        step = self.agent_step_count(turn_id)
-        step_context = self.restore_step_context(turn_context, operation)
+        step = await self._store.run_async(self.agent_step_count, turn_id)
+        step_context = await self._store.run_async(self.restore_step_context, turn_context, operation)
         prepared = await self._prepare_step(step_context)
         if (
             prepared.request_hash != operation.request_hash
@@ -725,7 +744,10 @@ class TurnExecutor:
         if isinstance(dispatched, TurnResult):
             return dispatched
         token_budget = turn.binding_manifest.get("model_token_budget_total")
-        if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
+        if (
+            token_budget is not None
+            and (await self._store.run_async(self._consumed_model_tokens, turn_id)) > token_budget
+        ):
             return await self._fail_turn(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,
@@ -749,11 +771,14 @@ class TurnExecutor:
 
     async def recover_prepared_model(self, *, turn_id: str) -> TurnResult:
         """Resume the exact saved request when a crash preceded dispatch."""
-        turn = self.restore_turn_context(turn_id)
-        operation = self._store.list_model_operations(turn_id)[-1]
-        if operation.status != "prepared" or self._store.read_turn(turn_id).status != "running":
+        turn = await self._store.run_async(self.restore_turn_context, turn_id)
+        operation = (await self._store.run_async(self._store.list_model_operations, turn_id))[-1]
+        if (
+            operation.status != "prepared"
+            or (await self._store.run_async(self._store.read_turn, turn_id)).status != "running"
+        ):
             raise RuntimeError("prepared model recovery requires an undispatched request")
-        context = self.restore_step_context(turn, operation)
+        context = await self._store.run_async(self.restore_step_context, turn, operation)
         prepared = await self._prepare_step(context)
         if (prepared.request_hash, prepared.context_hash, prepared.tool_hash, prepared.wire_hash) != (
             operation.request_hash,
@@ -786,11 +811,11 @@ class TurnExecutor:
     async def recover_committed_model_response(self, *, turn_id: str) -> TurnResult:
         """Continue after a crash between response commit and response handling."""
 
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
+        turn = await self._store.run_async(self._store.read_turn, turn_id)
+        turn_context = await self._store.run_async(self.restore_turn_context, turn_id)
         if turn.status != "running":
             raise RuntimeError("committed response recovery requires a running Turn")
-        operations = self._store.list_model_operations(turn_id)
+        operations = await self._store.run_async(self._store.list_model_operations, turn_id)
         if not operations:
             raise RuntimeError("Turn has no committed model response to recover")
         operation = operations[-1]
@@ -798,7 +823,7 @@ class TurnExecutor:
             raise RuntimeError("latest model operation has no canonical completed response")
         if operation.request_ref.get("purpose") == "context_summary":
             return await self.run_turn(turn_context, start_step=operation.request_ref["step_snapshot"]["step"])
-        response_item = self._store.read_item(operation.response_item_id)
+        response_item = await self._store.run_async(self._store.read_item, operation.response_item_id)
         response = _response_from_committed_item(response_item)
         if response.status == "incomplete" or not response.tool_calls:
             prepared = PreparedModelCall(
@@ -808,18 +833,28 @@ class TurnExecutor:
             handled = await self._handle_model_response(
                 thread_id=turn.thread_id, turn_id=turn_id, response=response, prepared=prepared,
             )
-            return handled if handled is not None else await self.run_turn(
-                turn_context, start_step=self.agent_step_count(turn_id) + 1,
+            return (
+                handled
+                if handled is not None
+                else await self.run_turn(
+                    turn_context,
+                    start_step=(await self._store.run_async(self.agent_step_count, turn_id)) + 1,
+                )
             )
-        tool_operations = {
-            tool_operation.tool_call_id: tool_operation for tool_operation in self._store.list_tool_operations(turn_id)
-        }
+        tool_operations = await self._store.run_async(
+            lambda: {
+                tool_operation.tool_call_id: tool_operation
+                for tool_operation in self._store.list_tool_operations(turn_id)
+            }
+        )
         pending_calls: list[HarnessToolCall] = []
-        committed_results = {
-            item.payload.get("tool_call_id")
-            for item in self._store.list_items(turn_id)
-            if item.kind == "tool_result" and item.status == "completed"
-        }
+        committed_results = await self._store.run_async(
+            lambda: {
+                item.payload.get("tool_call_id")
+                for item in self._store.list_items(turn_id)
+                if item.kind == "tool_result" and item.status == "completed"
+            }
+        )
         for call in response.tool_calls:
             if call.id in committed_results:
                 continue
@@ -835,10 +870,17 @@ class TurnExecutor:
                         and tool_operation.attempt_count == 0):
                     pending_calls.append(call)
                     continue
-                if (tool_operation.status == "denied"
-                        and self._store.request_input_revision(turn_id, operation.request_ref) is not None
-                        and self._store.request_input_revision(turn_id, operation.request_ref)
-                        != self._store.user_input_revision(turn_id)):
+                if (
+                    tool_operation.status == "denied"
+                    and (
+                        await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
+                    )
+                    is not None
+                    and (
+                        await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
+                    )
+                    != (await self._store.run_async(self._store.user_input_revision, turn_id))
+                ):
                     pending_calls.append(call)
                     continue
                 if tool_operation.status in {"succeeded", "failed"}:
@@ -856,7 +898,7 @@ class TurnExecutor:
                         interaction_id=interaction.request_id,
                     )
                 raise RuntimeError("committed tool call has an uncertain operation; use tool reconciliation")
-            result_item = self._store.read_item(tool_operation.result_item_id)
+            result_item = await self._store.run_async(self._store.read_item, tool_operation.result_item_id)
             result_payload = result_item.payload
             if result_item.kind == "tool_reconciliation" and result_item.producer == "reconciler":
                 result_payload = result_item.payload.get("result", {})
@@ -868,7 +910,10 @@ class TurnExecutor:
             ):
                 raise RuntimeError("committed tool result linkage is malformed")
         token_budget = turn.binding_manifest.get("model_token_budget_total")
-        if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
+        if (
+            token_budget is not None
+            and (await self._store.run_async(self._consumed_model_tokens, turn_id)) > token_budget
+        ):
             return await self._fail_turn(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,
@@ -903,7 +948,7 @@ class TurnExecutor:
             return handled
         return await self.run_turn(
             turn_context,
-            start_step=self.agent_step_count(turn_id) + 1,
+            start_step=(await self._store.run_async(self.agent_step_count, turn_id)) + 1,
         )
 
     async def respond_interaction(
@@ -913,9 +958,9 @@ class TurnExecutor:
         request_id: str,
         response: str,
     ) -> TurnResult:
-        turn = self._store.read_turn(turn_id)
-        turn_context = self.restore_turn_context(turn_id)
-        interaction = self._store.read_interaction(request_id)
+        turn = await self._store.run_async(self._store.read_turn, turn_id)
+        turn_context = await self._store.run_async(self.restore_turn_context, turn_id)
+        interaction = await self._store.run_async(self._store.read_interaction, request_id)
         if interaction.turn_id != turn_id or interaction.kind not in {
             "clarification",
             "choice",
@@ -929,7 +974,7 @@ class TurnExecutor:
                     f"response conflicts with resolved {interaction.kind}: {prior_response!r} != {response!r}"
                 )
             if turn.status == "completed":
-                answer = self._store.read_turn_answer(turn_id)
+                answer = await self._store.run_async(self._store.read_turn_answer, turn_id)
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
@@ -955,7 +1000,7 @@ class TurnExecutor:
             )
         return await self.run_turn(
             turn_context,
-            start_step=self.agent_step_count(turn_id) + 1,
+            start_step=(await self._store.run_async(self.agent_step_count, turn_id)) + 1,
         )
 
     def agent_step_count(self, turn_id: str) -> int:
@@ -1089,15 +1134,18 @@ class TurnExecutor:
                     raise ContextBudgetExceededError("Summary exceeds its frozen serialized byte bound.",
                                                      reason_code="byte_guard")
                 return answer
-            remaining = self._store.read_budget_state(turn.turn_id).remaining("tokens")
+
+            remaining = await self._store.run_async(
+                lambda: self._store.read_budget_state(turn.turn_id).remaining("tokens")
+            )
             if remaining is not None and remaining < 1:
                 raise ContextBudgetExceededError("No model token budget remains for semantic compaction.",
                                                  reason_code="model_token_budget_exhausted")
-            context = self._summary_step(turn, step=step, source=text, plan=active_plan)
-            operations = self._store.list_model_operations(turn.turn_id)
+            context = await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=active_plan)
+            operations = await self._store.run_async(self._store.list_model_operations, turn.turn_id)
             existing = next((op for op in operations if op.request_ref.get("request_id") == context.request_id), None)
             if existing is not None and existing.status == "completed" and existing.response_item_id:
-                item = self._store.read_item(existing.response_item_id)
+                item = await self._store.run_async(self._store.read_item, existing.response_item_id)
                 if item.payload.get("response_status", "completed") != "completed":
                     raise ContextBudgetExceededError(
                         f"Previously incomplete summary cannot be reused: {item.payload.get('incomplete_reason')}.",
@@ -1113,7 +1161,7 @@ class TurnExecutor:
                     await self._prepare_step(context)
                 return validate(answer)
             if existing is not None:
-                context = self.restore_step_context(turn, existing)
+                context = await self._store.run_async(self.restore_step_context, turn, existing)
             try:
                 prepared = await self._prepare_step(context)
             except ContextBudgetExceededError as exc:
@@ -1142,10 +1190,12 @@ class TurnExecutor:
                 return await summarize(merged, merged_input=True)
             if cached_only:
                 raise ContextBudgetExceededError("No complete cached summary exists for this source.")
-            attempts = sum(
-                max(1, len(self._store.list_model_attempts(op.operation_id)))
-                for op in operations
-                if op.request_ref.get("purpose") == "context_summary"
+            attempts = await self._store.run_async(
+                lambda: sum(
+                    max(1, len(self._store.list_model_attempts(op.operation_id)))
+                    for op in operations
+                    if op.request_ref.get("purpose") == "context_summary"
+                )
             )
             if existing is None and attempts >= max_calls:
                 raise ContextBudgetExceededError("Turn summary work exhausted its frozen model-step allowance.",
@@ -1201,7 +1251,7 @@ class TurnExecutor:
         )
         if base.resource_request.input_tokens > continuation_limit:
             raise ContextBudgetExceededError("Fixed continuation exceeds its frozen input limit.")
-        probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
+        probe = await self._prepare_step(await self._store.run_async(self._summary_step, turn, step=step, source="{}"))
         plan: dict[str, Any] = {
             "policy_revision": policy.revision,
             "source_hash": source_hash,
@@ -1216,9 +1266,11 @@ class TurnExecutor:
         }
         # Empty child slots measure the fixed merge wrapper in the real native
         # or local serializer; B includes escaping in both enclosing formats.
-        merge_floor = await self._prepare_step(self._summary_step(
-            turn, step=step, source=_merge_summary_history("", ""), plan=plan,
-        ))
+        merge_floor = await self._prepare_step(
+            await self._store.run_async(
+                self._summary_step, turn, step=step, source=_merge_summary_history("", ""), plan=plan
+            )
+        )
         merge_limit = min(plan["summary_input_limit"], merge_floor.request_ref["serialized_input_bytes"]
                           + 2 * (byte_limit - _summary_serialized_bytes("")))
         nodes: list[tuple[int, int | None]] = []
@@ -1226,13 +1278,17 @@ class TurnExecutor:
         async def measure(text: str) -> dict[str, Any]:
             digest = hashlib.sha256(text.encode()).hexdigest()
             try:
-                leaf = await self._prepare_step(self._summary_step(turn, step=step, source=text, plan=plan))
+                leaf = await self._prepare_step(
+                    await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=plan)
+                )
             except ContextBudgetExceededError:
                 left, right = _split_summary_history(text)
                 children = [await measure(left), await measure(right)]
                 rates = base.request_ref.get("pricing_micros_per_1m", {})
                 cost = estimated_model_cost_micros(
-                    input_tokens=merge_limit, max_output_tokens=plan["summary_output_limit"], pricing=rates,
+                    input_tokens=merge_limit,
+                    max_output_tokens=plan["summary_output_limit"],
+                    pricing=rates,
                 )
                 nodes.append((merge_limit, cost))
                 return {"source_hash": digest, "input_limit": merge_limit, "children": children}
@@ -1241,15 +1297,19 @@ class TurnExecutor:
             return {"source_hash": digest, "input_limit": leaf.resource_request.input_tokens}
 
         plan["summary_tree"] = await measure(source)
-        used = sum(max(1, len(self._store.list_model_attempts(op.operation_id)))
-                   for op in self._store.list_model_operations(turn.turn_id)
-                   if op.request_ref.get("purpose") == "context_summary")
+        used = await self._store.run_async(
+            lambda: sum(
+                max(1, len(self._store.list_model_attempts(op.operation_id)))
+                for op in self._store.list_model_operations(turn.turn_id)
+                if op.request_ref.get("purpose") == "context_summary"
+            )
+        )
         if used + len(nodes) > plan["max_summary_calls"]:
             raise ContextBudgetExceededError("Planned summary work exceeds the Turn model-step allowance.",
                                              reason_code="model_step_budget_exhausted")
         required = (sum(tokens + plan["summary_output_limit"] for tokens, _ in nodes)
                     + plan["continuation_token_reserve"])
-        remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
+        remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
         if remaining is not None and required > remaining:
             raise ContextBudgetExceededError(
                 f"Turn cumulative token budget cannot fit summary tree plus one continuation request: "
@@ -1264,7 +1324,9 @@ class TurnExecutor:
             if continuation_cost is None or any(cost is None for _, cost in nodes):
                 raise PricingUnavailableError("Summary continuation plan requires frozen model pricing.")
             required_cost = continuation_cost + sum(cost for _, cost in nodes if cost is not None)
-            remaining_cost = self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            remaining_cost = await self._store.run_async(
+                lambda: self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            )
             if remaining_cost is not None and required_cost > remaining_cost:
                 raise ContextBudgetExceededError("Insufficient monetary budget for summary and continuation.",
                                                  reason_code="model_cost_budget_exhausted")
@@ -1284,7 +1346,7 @@ class TurnExecutor:
         byte_limit: int,
     ) -> dict[str, Any]:
         """Measure the frozen legacy summary budget without dispatch or commit."""
-        probe = await self._prepare_step(self._summary_step(turn, step=step, source="{}"))
+        probe = await self._prepare_step(await self._store.run_async(self._summary_step, turn, step=step, source="{}"))
         projection = base.request_ref.get("context_projection", {})
         max_input = projection.get("max_input_tokens")
         if not isinstance(max_input, int):
@@ -1314,7 +1376,7 @@ class TurnExecutor:
             try:
                 return [
                     await self._prepare_step(
-                        self._summary_step(turn, step=step, source=text, plan=active_plan)
+                        await self._store.run_async(self._summary_step, turn, step=step, source=text, plan=active_plan)
                     )
                 ]
             except ContextBudgetExceededError:
@@ -1323,10 +1385,12 @@ class TurnExecutor:
 
         leaves = await measure_leaves(source, plan)
         count = 2 * len(leaves) - 1
-        used = sum(
-            max(1, len(self._store.list_model_attempts(op.operation_id)))
-            for op in self._store.list_model_operations(turn.turn_id)
-            if op.request_ref.get("purpose") == "context_summary"
+        used = await self._store.run_async(
+            lambda: sum(
+                max(1, len(self._store.list_model_attempts(op.operation_id)))
+                for op in self._store.list_model_operations(turn.turn_id)
+                if op.request_ref.get("purpose") == "context_summary"
+            )
         )
         if used + count > plan["max_summary_calls"]:
             raise ContextBudgetExceededError("Planned summary work exceeds the Turn model-step allowance.",
@@ -1338,7 +1402,7 @@ class TurnExecutor:
             + continuation_input_limit
             + output
         )
-        remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
+        remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
         if remaining is not None and fixed + count * cap > remaining:
             raise ContextBudgetExceededError(
                 f"Turn cumulative token budget cannot fit summary allowance plus one continuation request: "
@@ -1384,7 +1448,9 @@ class TurnExecutor:
                 + (len(leaves) - 1) * merge_cost
                 + continuation_cost
             )
-            available_cost = self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            available_cost = await self._store.run_async(
+                lambda: self._store.read_budget_state(turn.turn_id).remaining("cost_micros")
+            )
             if available_cost is not None and required_cost > available_cost:
                 raise ContextBudgetExceededError(
                     "Insufficient monetary budget for summary and continuation.",
@@ -1411,8 +1477,11 @@ class TurnExecutor:
             candidate: ContextCompactionCandidate,
             plan: Mapping[str, Any] | None = None,
         ) -> tuple[StepContext, PreparedModelCall]:
-            context = self.capture_step_context(
-                turn, step=step, messages=candidate.messages,
+            context = await self._store.run_async(
+                self.capture_step_context,
+                turn,
+                step=step,
+                messages=candidate.messages,
                 budget_pressure=True if trigger_reason == "turn_budget_pressure" else None,
             )
             if plan is not None:
@@ -1424,7 +1493,7 @@ class TurnExecutor:
             prepared = await self._prepare_step(context)
             if target_input_tokens is not None and prepared.resource_request.input_tokens > target_input_tokens:
                 raise ContextBudgetExceededError("Compacted context exceeds its working target.")
-            remaining = normal_token_remaining(self._store.read_budget_state(turn.turn_id))
+            remaining = normal_token_remaining(await self._store.run_async(self._store.read_budget_state, turn.turn_id))
             if (
                 not context.budget_pressure
                 and remaining is not None
@@ -1438,17 +1507,24 @@ class TurnExecutor:
 
         async def commit_candidate(candidate: ContextCompactionCandidate, context: StepContext) -> None:
             await self._commit(partial(manager.commit_compaction, candidate))
-            if context.input_revision != self._store.user_input_revision(turn.turn_id):
+            if context.input_revision != (await self._store.run_async(self._store.user_input_revision, turn.turn_id)):
                 raise ContextSourceChangedError("New user input arrived during compaction commit.")
-            if manager.build(turn.turn_id) != candidate.messages:
+            if (await self._store.run_async(manager.build, turn.turn_id)) != candidate.messages:
                 raise RuntimeError("Committed context differs from the measured candidate.")
 
-        before_state = self._store.read_budget_state(turn.turn_id)
-        if isinstance(manager, RolloutContextManager) and manager.capacity_policy(turn.turn_id) is not None:
+        before_state = await self._store.run_async(self._store.read_budget_state, turn.turn_id)
+        if (
+            isinstance(manager, RolloutContextManager)
+            and (await self._store.run_async(manager.capacity_policy, turn.turn_id)) is not None
+        ):
             if before_input_tokens is None:
-                raw_messages = tuple(message for _, message in manager._projected_messages(turn.turn_id))
+                raw_messages = await self._store.run_async(
+                    lambda: tuple(message for _, message in manager._projected_messages(turn.turn_id))
+                )
                 try:
-                    before = await self._prepare_step(self.capture_step_context(turn, step=step, messages=raw_messages))
+                    before = await self._prepare_step(
+                        await self._store.run_async(self.capture_step_context, turn, step=step, messages=raw_messages)
+                    )
                 except ContextBudgetExceededError as exc:
                     before_input_tokens = getattr(exc, "input_tokens", None)
                 else:
@@ -1457,45 +1533,60 @@ class TurnExecutor:
             try:
                 if not isinstance(manager, RolloutContextManager):
                     last_failure = None
-                    for candidate in manager.compaction_candidates(turn.turn_id):
-                        try:
-                            context, prepared = await accept(candidate)
-                        except ContextBudgetExceededError as failure:
-                            last_failure = failure
-                            continue
-                        await commit_candidate(candidate, context)
-                        return context, prepared
+                    async with aclosing(
+                        self._store.iterate(await self._store.run_async(manager.compaction_candidates, turn.turn_id))
+                    ) as candidates:
+                        async for candidate in candidates:
+                            try:
+                                context, prepared = await accept(candidate)
+                            except ContextBudgetExceededError as failure:
+                                last_failure = failure
+                                continue
+                            await commit_candidate(candidate, context)
+                            return context, prepared
                     if last_failure is not None:
                         raise last_failure
                     raise ContextBudgetExceededError("No legal compaction candidate fits; original history retained.")
-                capacity_policy = manager.capacity_policy(turn.turn_id)
+                capacity_policy = await self._store.run_async(manager.capacity_policy, turn.turn_id)
                 if capacity_policy is None:
                     # Bound the whole batch against the actual serialized request.
                     # Search only local projections; these prepare calls do no I/O.
                     # Keep all call/result roles and canonical originals unchanged.
-                    retained = manager.semantic_retained_tail(turn.turn_id)
+                    retained = await self._store.run_async(manager.semantic_retained_tail, turn.turn_id)
                     protect_current = False
                     if retained:
                         try:
-                            await accept(manager.semantic_floor(turn.turn_id, retained_tail_messages=retained))
+                            await accept(
+                                await self._store.run_async(
+                                    manager.semantic_floor, turn.turn_id, retained_tail_messages=retained
+                                )
+                            )
                         except ContextBudgetExceededError:
                             pass
                         else:
                             protect_current = True
-                    low, high = 0, manager.max_tool_result_bytes(turn.turn_id)
+                    low, high = 0, (await self._store.run_async(manager.max_tool_result_bytes, turn.turn_id))
                     best = None
                     while low <= high:
                         limit = 0 if best is None and low == 0 else (low + high) // 2
                         fitting_candidate = None
-                        for bounded_candidate in manager.cheap_candidates(
-                            turn.turn_id, include_recent=not protect_current, max_result_bytes=limit,
-                        ):
-                            try:
-                                await accept(bounded_candidate)
-                            except ContextBudgetExceededError:
-                                continue
-                            fitting_candidate = bounded_candidate
-                            break
+                        async with aclosing(
+                            self._store.iterate(
+                                await self._store.run_async(
+                                    manager.cheap_candidates,
+                                    turn.turn_id,
+                                    include_recent=not protect_current,
+                                    max_result_bytes=limit,
+                                )
+                            )
+                        ) as candidates:
+                            async for bounded_candidate in candidates:
+                                try:
+                                    await accept(bounded_candidate)
+                                except ContextBudgetExceededError:
+                                    continue
+                                fitting_candidate = bounded_candidate
+                                break
                         if fitting_candidate is None:
                             if limit == 0:
                                 break
@@ -1506,29 +1597,40 @@ class TurnExecutor:
                     if best is not None:
                         context, prepared = await accept(best)
                         await self._commit(partial(manager.commit_compaction, best))
-                        if manager.build(turn.turn_id) != best.messages:
+                        if (await self._store.run_async(manager.build, turn.turn_id)) != best.messages:
                             raise RuntimeError("Committed tool projection differs from the measured candidate.")
                         return context, prepared
-                retained = manager.semantic_retained_tail(turn.turn_id)
+                retained = await self._store.run_async(manager.semantic_retained_tail, turn.turn_id)
                 try:
-                    floor = manager.semantic_floor(turn.turn_id, retained_tail_messages=retained)
+                    floor = await self._store.run_async(
+                        manager.semantic_floor, turn.turn_id, retained_tail_messages=retained
+                    )
                     _, base = await accept(floor)
                 except ContextBudgetExceededError:
                     retained = 0
-                    floor = manager.semantic_floor(turn.turn_id)
+                    floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
                     _, base = await accept(floor)
-                source_hash, source = manager.semantic_source(turn.turn_id, retained_tail_messages=retained)
+                source_hash, source = await self._store.run_async(
+                    manager.semantic_source, turn.turn_id, retained_tail_messages=retained
+                )
                 # Legacy operations predate durable budget plans. Reconstruct only
                 # fully committed summary trees; never spend tokens on this path.
-                legacy = any(
-                    op.request_ref.get("purpose") == "context_summary" and not op.request_ref.get("compaction_plan")
-                    for op in self._store.list_model_operations(turn.turn_id)
+                legacy = await self._store.run_async(
+                    lambda: any(
+                        op.request_ref.get("purpose") == "context_summary"
+                        and (not op.request_ref.get("compaction_plan"))
+                        for op in self._store.list_model_operations(turn.turn_id)
+                    )
                 )
                 if legacy:
                     try:
                         summary = await self._semantic_summary(turn, step=step, source=source, cached_only=True)
-                        candidate = manager.semantic_candidate(
-                            turn.turn_id, source_hash=source_hash, summary=summary, retained_tail_messages=retained
+                        candidate = await self._store.run_async(
+                            manager.semantic_candidate,
+                            turn.turn_id,
+                            source_hash=source_hash,
+                            summary=summary,
+                            retained_tail_messages=retained,
                         )
                         context, prepared = await accept(candidate)
                     except ContextBudgetExceededError:
@@ -1536,10 +1638,11 @@ class TurnExecutor:
                     else:
                         await commit_candidate(candidate, context)
                         return context, prepared
+                operations = await self._store.run_async(self._store.list_model_operations, turn.turn_id)
                 saved = next(
                     (
                         op.request_ref["compaction_plan"]
-                        for op in self._store.list_model_operations(turn.turn_id)
+                        for op in operations
                         if op.request_ref.get("compaction_plan", {}).get("source_hash") == source_hash
                     ),
                     None,
@@ -1550,30 +1653,49 @@ class TurnExecutor:
                 elif capacity_policy is not None:
                     try:
                         plan = await self._plan_capacity_compaction(
-                            turn, step=step, source_hash=source_hash, source=source, retained=retained,
-                            base=base, byte_allowance=manager.summary_byte_allowance(floor),
+                            turn,
+                            step=step,
+                            source_hash=source_hash,
+                            source=source,
+                            retained=retained,
+                            base=base,
+                            byte_allowance=(await self._store.run_async(manager.summary_byte_allowance, floor)),
                             target_input_tokens=target_input_tokens,
                         )
                     except (ContextBudgetExceededError, PricingUnavailableError):
                         if not retained:
                             raise
                         retained = 0
-                        floor = manager.semantic_floor(turn.turn_id)
+                        floor = await self._store.run_async(manager.semantic_floor, turn.turn_id)
                         _, base = await accept(floor)
                         plan = await self._plan_capacity_compaction(
-                            turn, step=step, source_hash=source_hash, source=source, retained=0,
-                            base=base, byte_allowance=manager.summary_byte_allowance(floor),
+                            turn,
+                            step=step,
+                            source_hash=source_hash,
+                            source=source,
+                            retained=0,
+                            base=base,
+                            byte_allowance=(await self._store.run_async(manager.summary_byte_allowance, floor)),
                             target_input_tokens=target_input_tokens,
                         )
                 else:
                     plan = await self._plan_legacy_compaction(
-                        turn, step=step, source_hash=source_hash, source=source, retained=retained,
-                        base=base, byte_limit=manager.summary_byte_allowance(floor),
+                        turn,
+                        step=step,
+                        source_hash=source_hash,
+                        source=source,
+                        retained=retained,
+                        base=base,
+                        byte_limit=(await self._store.run_async(manager.summary_byte_allowance, floor)),
                     )
                 summary = await self._semantic_summary(turn, step=step, source=source, plan=plan)
                 try:
-                    candidate = manager.semantic_candidate(
-                        turn.turn_id, source_hash=source_hash, summary=summary, retained_tail_messages=retained
+                    candidate = await self._store.run_async(
+                        manager.semantic_candidate,
+                        turn.turn_id,
+                        source_hash=source_hash,
+                        summary=summary,
+                        retained_tail_messages=retained,
                     )
                     context, prepared = await accept(candidate, plan)
                 except ContextBudgetExceededError:
@@ -1581,10 +1703,12 @@ class TurnExecutor:
                         raise
                     # The frozen source includes this exchange. Reuse the SAME
                     # summary, dropping only its redundant verbatim replay.
-                    candidate = manager.semantic_candidate(turn.turn_id, source_hash=source_hash, summary=summary)
+                    candidate = await self._store.run_async(
+                        manager.semantic_candidate, turn.turn_id, source_hash=source_hash, summary=summary
+                    )
                     context, prepared = await accept(candidate, plan)
                 if capacity_policy is not None:
-                    state = self._store.read_budget_state(turn.turn_id)
+                    state = await self._store.run_async(self._store.read_budget_state, turn.turn_id)
                     diagnostics = {
                         **prepared.request_ref["context_projection"],
                         "compacted": True,
@@ -1594,8 +1718,9 @@ class TurnExecutor:
                         "summary_calls": state.used.model_calls - before_state.used.model_calls,
                         "summary_tokens": state.used.total_tokens - before_state.used.total_tokens,
                         "summary_cost_micros": state.used.cost_micros - before_state.used.cost_micros
-                        if prepared.request_ref.get("pricing_known") else "unknown",
-                        "budget_status": self._budget_status(turn),
+                        if prepared.request_ref.get("pricing_known")
+                        else "unknown",
+                        "budget_status": (await self._store.run_async(self._budget_status, turn)),
                     }
                     candidate = replace(candidate, payload_json=json.dumps({
                         **json.loads(candidate.payload_json), "capacity_diagnostics": diagnostics,
@@ -1610,8 +1735,10 @@ class TurnExecutor:
                 # arrives. First try its current projection rather than
                 # demanding another reduction of an already compact history.
                 try:
-                    context = self.capture_step_context(
-                        turn, step=step,
+                    context = await self._store.run_async(
+                        self.capture_step_context,
+                        turn,
+                        step=step,
                         budget_pressure=True if trigger_reason == "turn_budget_pressure" else None,
                     )
                     prepared = await self._prepare_step(context)
@@ -1658,7 +1785,9 @@ class TurnExecutor:
         effective_step_budget = min(self._max_steps, step_budget)
         step = start_step
         while step <= effective_step_budget:
-            remaining_tokens = self._store.read_budget_state(turn_id).remaining("tokens")
+            remaining_tokens = await self._store.run_async(
+                lambda: self._store.read_budget_state(turn_id).remaining("tokens")
+            )
             if remaining_tokens is not None and remaining_tokens < 1:
                 return await self._fail_turn(
                     thread_id=thread_id,
@@ -1666,13 +1795,15 @@ class TurnExecutor:
                     reason_code="model_token_budget_exhausted",
                     message="Turn exhausted its frozen model token budget.",
                 )
-            reactive = self.pending_context_overflow(turn_id)
+            reactive = await self._store.run_async(self.pending_context_overflow, turn_id)
             if reactive:
-                rejections = sum(
-                    record.turn_id == turn_id
-                    and record.record_type == "model_attempt_rejected"
-                    and record.payload.get("error_type") == "context_overflow"
-                    for record in self._store.list_records(thread_id)
+                rejections = await self._store.run_async(
+                    lambda: sum(
+                        record.turn_id == turn_id
+                        and record.record_type == "model_attempt_rejected"
+                        and (record.payload.get("error_type") == "context_overflow")
+                        for record in self._store.list_records(thread_id)
+                    )
                 )
                 if rejections > 1:
                     return await self._fail_turn(
@@ -1685,16 +1816,20 @@ class TurnExecutor:
                 if reactive:
                     raise ContextBudgetExceededError("Provider rejected the previous context.",
                                                      reason_code="model_context_window_exceeded")
-                step_context = self.capture_step_context(turn_context, step=step)
+                step_context = await self._store.run_async(self.capture_step_context, turn_context, step=step)
                 # Preparation may request compaction, but it cannot rewrite the
                 # provider transcript itself. Session commits that transition.
                 prepared = await self._prepare_step(step_context)
                 model_binding = turn_context.binding_manifest.get("binding", turn_context.binding_manifest)
                 definition = model_binding.get("definition", model_binding)
                 working_limit = definition.get("auto_compact_token_limit")
-                if (isinstance(working_limit, int) and not isinstance(working_limit, bool) and working_limit > 0
-                        and prepared.resource_request.input_tokens > working_limit
-                        and self._proactive_compaction_available(turn_id)):
+                if (
+                    isinstance(working_limit, int)
+                    and not isinstance(working_limit, bool)
+                    and working_limit > 0
+                    and prepared.resource_request.input_tokens > working_limit
+                    and (await self._store.run_async(self._proactive_compaction_available, turn_id))
+                ):
                     # A working-set target is optional, unlike provider admission.
                     # Keep large protected user inputs usable when they cannot be summarized.
                     try:
@@ -1704,9 +1839,11 @@ class TurnExecutor:
                             target_input_tokens=working_limit * 4 // 5,
                         )
                     except (ContextBudgetExceededError, ContextSourceChangedError, PricingUnavailableError):
-                        step_context = self.capture_step_context(turn_context, step=step)
+                        step_context = await self._store.run_async(self.capture_step_context, turn_context, step=step)
                         prepared = await self._prepare_step(step_context)
-                normal_remaining = normal_token_remaining(self._store.read_budget_state(turn_id))
+                normal_remaining = normal_token_remaining(
+                    await self._store.run_async(self._store.read_budget_state, turn_id)
+                )
                 if normal_remaining is not None and prepared.resource_request.total_tokens * 2 > normal_remaining:
                     # Admission to one request is insufficient for a tool loop:
                     # its result (or Stop feedback) still needs another input
@@ -1714,10 +1851,13 @@ class TurnExecutor:
                     # independently of the provider's much larger context window.
                     from agent_runtime.harness.context import RolloutContextManager
 
-                    step_context = self.capture_step_context(turn_context, step=step, budget_pressure=True)
+                    step_context = await self._store.run_async(
+                        self.capture_step_context, turn_context, step=step, budget_pressure=True
+                    )
                     prepared = await self._prepare_step(step_context)
-                    if (isinstance(self._context_manager, RolloutContextManager)
-                            and self._proactive_compaction_available(turn_id)):
+                    if isinstance(self._context_manager, RolloutContextManager) and (
+                        await self._store.run_async(self._proactive_compaction_available, turn_id)
+                    ):
                         try:
                             step_context, prepared = await self._prepare_compacted_step(
                                 turn_context, step=step, trigger_reason="turn_budget_pressure",
@@ -1728,15 +1868,17 @@ class TurnExecutor:
                             # admit the whole summary+continuation before I/O.
                             # Keep originals and try an honest pressured answer
                             # when no useful affordable summary can be produced.
-                            step_context = self.capture_step_context(turn_context, step=step, budget_pressure=True)
+                            step_context = await self._store.run_async(
+                                self.capture_step_context, turn_context, step=step, budget_pressure=True
+                            )
                             prepared = await self._prepare_step(step_context)
                 if not step_context.budget_pressure:
-                    normal_remaining = normal_token_remaining(self._store.read_budget_state(turn_id))
+                    normal_remaining = normal_token_remaining(
+                        await self._store.run_async(self._store.read_budget_state, turn_id)
+                    )
                     if normal_remaining is not None and prepared.resource_request.total_tokens > normal_remaining:
-                        step_context = self.capture_step_context(
-                            turn_context,
-                            step=step,
-                            budget_pressure=True,
+                        step_context = await self._store.run_async(
+                            self.capture_step_context, turn_context, step=step, budget_pressure=True
                         )
                         prepared = await self._prepare_step(step_context)
             except _SummaryStoppedError as stopped:
@@ -1775,7 +1917,7 @@ class TurnExecutor:
             if reactive:
                 step_context = replace(step_context, request_id=f"{turn_id}:step:{step}:context-retry:1")
                 prepared = await self._prepare_step(step_context)
-            if step_context.input_revision != self._store.user_input_revision(turn_id):
+            if step_context.input_revision != (await self._store.run_async(self._store.user_input_revision, turn_id)):
                 continue  # Preparation yielded; recapture all newly received input.
             durable_request_ref = {
                 **prepared.request_ref,
@@ -1807,7 +1949,10 @@ class TurnExecutor:
                 return await self.run_turn(turn_context, start_step=step)
             if isinstance(dispatched, TurnResult):
                 return dispatched
-            if token_budget is not None and self._consumed_model_tokens(turn_id) > token_budget:
+            if (
+                token_budget is not None
+                and (await self._store.run_async(self._consumed_model_tokens, turn_id)) > token_budget
+            ):
                 return await self._fail_turn(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -1828,7 +1973,7 @@ class TurnExecutor:
             thread_id=thread_id,
             turn_id=turn_id,
             reason_code="model_step_budget_exhausted",
-            message=self._step_budget_receipt(turn_id, effective_step_budget),
+            message=(await self._store.run_async(self._step_budget_receipt, turn_id, effective_step_budget)),
         )
 
     def _step_budget_receipt(self, turn_id: str, limit: int) -> str:
@@ -1889,6 +2034,25 @@ class TurnExecutor:
                     allow_protected_budget=allow_protected_budget,
                 )
             )
+        except asyncio.CancelledError:
+            # The Store observed the claim's real outcome, but provider dispatch
+            # has not been called. Release that known unspent reservation.
+            def reject_undispatched() -> None:
+                with self._store._transaction():
+                    claimed = self._store.list_model_attempts(operation.operation_id)[-1]
+                    if claimed.status == "dispatched" and claimed.claim_owner == self._worker_id:
+                        self._store.reject_model_attempt(
+                            operation_id=operation.operation_id,
+                            attempt_id=claimed.attempt_id,
+                            generation=claimed.generation,
+                            reason="cancelled before provider dispatch",
+                        )
+                    self._store.request_turn_cancellation(
+                        turn_id=turn_id, reason="Turn task cancelled before provider dispatch"
+                    )
+
+            await self._commit_cancellation(reject_undispatched)
+            raise
         except TurnInputChangedError:
             await self._commit(lambda: self._store.supersede_prepared_model(operation.operation_id))
             raise
@@ -2036,30 +2200,28 @@ class TurnExecutor:
                 status="paused",
             )
         except asyncio.CancelledError as exc:
-            await asyncio.shield(
-                self._commit(
-                    partial(
-                        self._store.request_turn_cancellation,
+            error_type = type(exc).__name__
+
+            def record_unknown() -> None:
+                with self._store._transaction():
+                    self._store.request_turn_cancellation(
                         turn_id=turn_id,
                         reason="Turn task cancelled while provider outcome was unknown",
                     )
-                )
-            )
-            await self._commit(
-                partial(
-                    self._store.mark_model_attempt_unknown,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    error_type=type(exc).__name__,
-                    error_message=("model dispatch was cancelled after provider I/O began"),
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
-                )
-            )
+                    self._store.mark_model_attempt_unknown(
+                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
+                        generation=attempt.generation,
+                        error_type=error_type,
+                        error_message="model dispatch was cancelled after provider I/O began",
+                        channel_content={
+                            "agent_message": "".join(streamed_content["text"]),
+                            "reasoning": "".join(streamed_content["reasoning"]),
+                            "plan": "".join(streamed_content["plan"]),
+                        },
+                    )
+
+            await self._commit_cancellation(record_unknown)
             raise
         except Exception as exc:
             # The HarnessModel contract owns provider-outcome classification.
@@ -2136,18 +2298,25 @@ class TurnExecutor:
         response: HarnessModelResponse,
         prepared: PreparedModelCall,
     ) -> TurnResult | None:
-        revision = self._store.request_input_revision(turn_id, prepared.request_ref)
-        if (revision is not None and revision != self._store.user_input_revision(turn_id)
-                and (response.status == "incomplete" or not response.tool_calls)):
+        revision = await self._store.run_async(self._store.request_input_revision, turn_id, prepared.request_ref)
+        if (
+            revision is not None
+            and revision != (await self._store.run_async(self._store.user_input_revision, turn_id))
+            and (response.status == "incomplete" or not response.tool_calls)
+        ):
             return None
         if response.status == "incomplete":
-            policy = self._store.read_turn(turn_id).binding_manifest.get("model_response_recovery", {})
+            policy = await self._store.run_async(
+                lambda: self._store.read_turn(turn_id).binding_manifest.get("model_response_recovery", {})
+            )
             # Count canonical committed outcomes, not process-local retries.
             # One retry per Turn; summaries and unknown transport outcomes have
             # separate recovery contracts. Every retry spends an ordinary step.
-            incomplete = sum(
-                item.kind == "model_response" and item.payload.get("response_status") == "incomplete"
-                for item in self._store.list_items(turn_id)
+            incomplete = await self._store.run_async(
+                lambda: sum(
+                    item.kind == "model_response" and item.payload.get("response_status") == "incomplete"
+                    for item in self._store.list_items(turn_id)
+                )
             )
             if (isinstance(policy, Mapping) and policy.get("revision") == "restart-step-v1"
                     and type(policy.get("max_retries")) is int and policy["max_retries"] == 1
@@ -2171,7 +2340,7 @@ class TurnExecutor:
                     self._store.request_turn_cancellation, turn_id=turn_id,
                     reason="Turn task cancelled during tool execution",
                 )))
-                if self._store.read_turn(turn_id).status == "running":
+                if (await self._store.run_async(self._store.read_turn, turn_id)).status == "running":
                     await asyncio.shield(self._commit(partial(
                         self._store.pause_turn, turn_id=turn_id, reason="tool execution was interrupted",
                     )))
@@ -2185,43 +2354,61 @@ class TurnExecutor:
                     interaction_id=pause.interaction_id,
                 )
             return await self._after_tool_batch(
-                thread_id=thread_id, turn_id=turn_id,
-                source_item_id=self._store.list_model_operations(turn_id)[-1].response_item_id,
+                thread_id=thread_id,
+                turn_id=turn_id,
+                source_item_id=(await self._store.run_async(self._store.list_model_operations, turn_id))[
+                    -1
+                ].response_item_id,
             )
         return await self._finish_answer(
             thread_id=thread_id,
             turn_id=turn_id,
             answer=response.text,
             input_revision=revision,
-            source_item_id=self._store.list_model_operations(turn_id)[-1].response_item_id,
+            source_item_id=(await self._store.run_async(self._store.list_model_operations, turn_id))[
+                -1
+            ].response_item_id,
         )
 
     async def _after_tool_batch(
         self, *, thread_id: str, turn_id: str, source_item_id: str | None,
     ) -> TurnResult | None:
         """Apply the same durable post-tool transition during execution and recovery."""
-        turn = self._store.read_turn(turn_id)
+        turn = await self._store.run_async(self._store.read_turn, turn_id)
         if turn.status == "paused":
-            pending = [i for i in self._store.list_interactions(turn_id) if i.status == "pending"]
+            pending = await self._store.run_async(
+                lambda: [i for i in self._store.list_interactions(turn_id) if i.status == "pending"]
+            )
             if len(pending) != 1:
                 raise RuntimeError("paused tool execution has no unique interaction")
             return TurnResult(thread_id=thread_id, turn_id=turn_id, answer=None,
                               status="paused", interaction_id=pending[0].request_id)
         if source_item_id is None:
             raise RuntimeError("tool batch has no committed model response")
-        operation = self._store.list_model_operations(turn_id)[-1]
-        revision = self._store.request_input_revision(turn_id, operation.request_ref)
-        if revision is not None and revision != self._store.user_input_revision(turn_id):
+        operation = (await self._store.run_async(self._store.list_model_operations, turn_id))[-1]
+        revision = await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
+        if revision is not None and revision != (await self._store.run_async(self._store.user_input_revision, turn_id)):
             return None
-        items = self._store.list_items(turn_id)
+        items = await self._store.run_async(self._store.list_items, turn_id)
         if any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == source_item_id
                for i in items):
             return None  # A committed recovery grant belongs to this batch, not a new attempt.
-        call_ids = {call["id"] for call in self._store.read_item(source_item_id).payload.get("tool_calls", ())}
-        failure = next((result for _, result in reversed(self._canonical_tool_results(turn_id))
-                        if result.get("tool_call_id") in call_ids and result.get("is_error") is True
-                        and result.get("error_code") != "input_superseded"), None)
-        if failure is None or not self._repeated_tool_failure(turn_id):
+        call_ids = await self._store.run_async(
+            lambda: {call["id"] for call in self._store.read_item(source_item_id).payload.get("tool_calls", ())}
+        )
+        failure = await self._store.run_async(
+            lambda: next(
+                (
+                    result
+                    for _, result in reversed(self._canonical_tool_results(turn_id))
+                    if result.get("tool_call_id") in call_ids
+                    and result.get("is_error") is True
+                    and (result.get("error_code") != "input_superseded")
+                ),
+                None,
+            )
+        )
+        if failure is None or not (await self._store.run_async(self._repeated_tool_failure, turn_id)):
             return None
         feedback = json.dumps({
             "reason_code": "repeated_tool_failure_recovery",
@@ -2375,9 +2562,12 @@ class TurnExecutor:
         input_revision: int | None = None,
         source_item_id: str | None = None,
     ) -> TurnResult | None:
-        if input_revision is not None and self._store.user_input_revision(turn_id) != input_revision:
+        if (
+            input_revision is not None
+            and (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision
+        ):
             return None
-        items = self._store.list_items(turn_id)
+        items = await self._store.run_async(self._store.list_items, turn_id)
         proposal_item = next((i for i in items if i.kind == "final_proposal" and source_item_id is not None
                               and i.payload.get("source_item_id") == source_item_id), None)
         if proposal_item is None:
@@ -2395,8 +2585,10 @@ class TurnExecutor:
         decision_item = next((i for i in items if i.kind == "completion_decision"
                               and i.payload.get("proposal_item_id") == proposal.item_id), None)
         if decision_item is None:
-            decision = self._completion_gate.evaluate(proposal)
-            if decision.action == "continue" and self._completion_continuation_limit_reached(turn_id):
+            decision = await self._store.run_async(self._completion_gate.evaluate, proposal)
+            if decision.action == "continue" and (
+                await self._store.run_async(self._completion_continuation_limit_reached, turn_id)
+            ):
                 decision = replace(
                     decision, action="fail", reason_code="completion_continuation_limit",
                     reason=("Completion checks exhausted their consecutive continuation allowance without a tool "
@@ -2416,7 +2608,10 @@ class TurnExecutor:
         else:
             decision = CompletionDecision(**{key: value for key, value in decision_item.payload.items()
                                              if key != "proposal_item_id"})
-        if input_revision is not None and self._store.user_input_revision(turn_id) != input_revision:
+        if (
+            input_revision is not None
+            and (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision
+        ):
             return None
         if decision.action == "continue":
             if not any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == decision_item.item_id

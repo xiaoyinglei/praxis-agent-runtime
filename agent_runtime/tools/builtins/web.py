@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import inspect
 import json
 import os
 import re
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -291,15 +292,24 @@ def _contains_credential(value: object, credential: str) -> bool:
     return False
 
 
+async def _await_callback[T](value: T | Awaitable[T]) -> T:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
 def create_web_tools(
-    client: PublicWebClient, *, save_source: Callable[[bytes], str], load_source: Callable[[str], bytes],
+    client: PublicWebClient,
+    *,
+    save_source: Callable[[bytes], str | Awaitable[str]],
+    load_source: Callable[[str], bytes | Awaitable[bytes]],
     search_key: str | None = None,
     search_provider: str | None = None,
-    before_request: Callable[[], None] | None = None,
+    before_request: Callable[[], None | Awaitable[None]] | None = None,
     cache_scope: Callable[[], str | None] = lambda: None,
-    resource_limits: Callable[[], WebLimits] | None = None,
-    budget_status: Callable[[], dict[str, Any]] | None = None,
-    failure_lookup: Callable[[str, str], dict[str, Any] | None] | None = None,
+    resource_limits: Callable[[], WebLimits | Awaitable[WebLimits]] | None = None,
+    budget_status: Callable[[], dict[str, Any] | Awaitable[dict[str, Any]]] | None = None,
+    failure_lookup: Callable[[str, str], dict[str, Any] | None | Awaitable[dict[str, Any] | None]] | None = None,
 ) -> tuple[Tool, ...]:
     provider = search_provider if search_provider is not None else ("brave" if search_key is not None else None)
     if provider not in {None, "deepseek", "brave", "tavily"}:
@@ -330,7 +340,7 @@ def create_web_tools(
             params["freshness"] = request.freshness
         try:
             if before_request is not None:
-                before_request()
+                (await _await_callback(before_request()))
             assert search_key is not None
             if provider == "deepseek":
                 response = await client.post_json(search_endpoint, {
@@ -402,9 +412,9 @@ def create_web_tools(
                 error_code="web_search_invalid_response", error_message="Search provider returned an invalid response.",
             ).model_dump(mode="json")
 
-    def read_saved_source(source_id: str) -> WebSource:
+    async def read_saved_source(source_id: str) -> WebSource:
         try:
-            blob = load_source(source_id)
+            blob = await _await_callback(load_source(source_id))
             if len(blob) > 5_000_000:
                 raise ValueError("oversized snapshot")
             source = WebSource.model_validate_json(blob)
@@ -425,7 +435,7 @@ def create_web_tools(
         if initial_response is not None:
             options["initial_response"] = initial_response
         if resource_limits is not None:
-            options["limits"] = resource_limits()
+            options["limits"] = await _await_callback(resource_limits())
         return await render_public_page(client, url, **options)
 
     async def fetch_uncached(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
@@ -447,7 +457,7 @@ def create_web_tools(
                 cache_hit = source_id is not None
             if request.url is not None and (source_id is None or request.refresh):
                 if before_request is not None:
-                    before_request()
+                    (await _await_callback(before_request()))
                 request_attempted = True
                 if provider == "deepseek":
                     assert search_key is not None
@@ -479,7 +489,7 @@ def create_web_tools(
                         raw_content_type=response.content_type,
                         raw_content_hash=hashlib.sha256(response.body).hexdigest(),
                     )
-                    source_id = save_source(source.model_dump_json().encode())
+                    source_id = await _await_callback(save_source(source.model_dump_json().encode()))
                 else:
                     if request.render is True:
                         response = await render_page(request.url)
@@ -500,7 +510,7 @@ def create_web_tools(
                                                 if response.render_diagnostics else None),
                         )
                         # Archive each response before parsing or trying the browser.
-                        source_id = save_source(source.model_dump_json().encode())
+                        source_id = await _await_callback(save_source(source.model_dump_json().encode()))
                         try:
                             extracted = await extract_content_async(response.body, response.content_type, response.url)
                             source = source.model_copy(update={
@@ -518,7 +528,7 @@ def create_web_tools(
                                 'extraction_method': 'failed', 'extraction_error_code': error.code,
                                 'extraction_error_message': str(error),
                             })
-                        source_id = save_source(source.model_dump_json().encode())
+                        source_id = await _await_callback(save_source(source.model_dump_json().encode()))
                         if (attempt == 0 and request.render == 'auto' and request.view != 'raw'
                                 and source.extraction_error_code == 'web_content_empty'
                                 and response.content_type.split(';', 1)[0].strip().lower()
@@ -536,20 +546,20 @@ def create_web_tools(
                 network_bytes = response.network_bytes
             else:
                 assert source_id is not None
-                source = read_saved_source(source_id)
+                source = await read_saved_source(source_id)
             acquisition_completed = True
             assert source is not None
             output = _read_source(source, request, source_id=source_id or "", network_bytes=network_bytes,
                                   cache_hit=cache_hit, connection_mode=connection_mode)
             baseline = None
             if request.compare_to_source_id is not None:
-                baseline = read_saved_source(request.compare_to_source_id)
+                baseline = await read_saved_source(request.compare_to_source_id)
             output.comparison = compare_saved_sources(
                 source.model_dump(mode="json"), None if baseline is None else baseline.model_dump(mode="json"),
                 current_source_id=source_id or "", baseline_source_id=request.compare_to_source_id,
             )
             output.request_attempted = request_attempted
-            output.request_budget = budget_status() if budget_status is not None else None
+            output.request_budget = (await _await_callback(budget_status())) if budget_status is not None else None
             return _fit_output(output, request, accounting).model_dump(mode="json")
         except PublicWebError as error:
             diagnostics_source_id = None
@@ -560,19 +570,28 @@ def create_web_tools(
                     extraction_method="failed", extraction_error_code=error.code, extraction_error_message=str(error),
                     render_mode=mode, render_diagnostics=dict(error.render_diagnostics),
                 )
-                diagnostics_source_id = save_source(diagnostic_source.model_dump_json().encode())
+                diagnostics_source_id = await _await_callback(save_source(diagnostic_source.model_dump_json().encode()))
             output = WebFetchOutput(
-                source_id=source_id, url=source.url if source else request.url or "",
+                source_id=source_id,
+                url=source.url if source else request.url or "",
                 content_hash=source.content_hash if source else "",
-                error_code=error.code, error_message=str(error),
+                error_code=error.code,
+                error_message=str(error),
                 request_attempted=request_attempted,
-                request_budget=budget_status() if budget_status is not None else None,
-                connection_mode=(connection_mode if source is not None and error.connection_mode == 'unknown'
-                                 else error.connection_mode), failure_stage=error.failure_stage,
+                request_budget=(await _await_callback(budget_status())) if budget_status is not None else None,
+                connection_mode=(
+                    connection_mode
+                    if source is not None and error.connection_mode == "unknown"
+                    else error.connection_mode
+                ),
+                failure_stage=error.failure_stage,
                 render_mode=source.render_mode if acquisition_completed and source else mode,
                 static_source_id=static_source_id or (source.static_source_id if source else None),
-                network_bytes=(int(error.render_diagnostics.get('wire_bytes', network_bytes))
-                               if error.render_diagnostics else network_bytes),
+                network_bytes=(
+                    int(error.render_diagnostics.get("wire_bytes", network_bytes))
+                    if error.render_diagnostics
+                    else network_bytes
+                ),
                 render_diagnostics=dict(error.render_diagnostics) if error.render_diagnostics else None,
                 diagnostics_source_id=diagnostics_source_id,
             )
@@ -589,18 +608,29 @@ def create_web_tools(
     async def fetch(arguments: Mapping[str, JsonValue]) -> dict[str, Any]:
         request = fetch_model.model_validate(arguments)
         mode = fetch_acquisition_mode(request, provider)
-        condition = (cache_scope(), request.url, mode,
-                     resource_limits().model_dump_json() if resource_limits is not None else None)
+        condition = (
+            cache_scope(),
+            request.url,
+            mode,
+            (await _await_callback(resource_limits())).model_dump_json() if resource_limits is not None else None,
+        )
         async with fetch_lock:
             if request.url is not None and not request.refresh:
                 previous = failed_fetches.get(condition)
                 if previous is None and failure_lookup is not None:
-                    previous = failure_lookup(request.url, mode)
+                    previous = await _await_callback(failure_lookup(request.url, mode))
                 if previous is not None and previous.get("error_code") in _CACHEABLE_FETCH_ERRORS:
-                    cached_output = WebFetchOutput.model_validate({
-                        **previous, "cache_hit": True, "network_bytes": 0, "request_attempted": False,
-                        "request_budget": budget_status() if budget_status is not None else None,
-                    })
+                    cached_output = WebFetchOutput.model_validate(
+                        {
+                            **previous,
+                            "cache_hit": True,
+                            "network_bytes": 0,
+                            "request_attempted": False,
+                            "request_budget": (await _await_callback(budget_status()))
+                            if budget_status is not None
+                            else None,
+                        }
+                    )
                     return _fit_output(cached_output, request, accounting).model_dump(mode="json")
             output = await fetch_uncached(arguments)
             if request.url is not None and output["error_code"] in _CACHEABLE_FETCH_ERRORS:
@@ -616,11 +646,16 @@ def create_web_tools(
         key = (cache_scope(), request.model_dump_json())
         async with search_lock:
             if key in search_cache:
-                return {**search_cache[key], "network_bytes": 0, "cache_hit": True, "request_attempted": False,
-                        "request_budget": budget_status() if budget_status is not None else None}
+                return {
+                    **search_cache[key],
+                    "network_bytes": 0,
+                    "cache_hit": True,
+                    "request_attempted": False,
+                    "request_budget": (await _await_callback(budget_status())) if budget_status is not None else None,
+                }
             output = await search_uncached(arguments)
             output["request_attempted"] = provider is not None and output["error_code"] != "web_request_budget_exceeded"
-            output["request_budget"] = budget_status() if budget_status is not None else None
+            output["request_budget"] = (await _await_callback(budget_status())) if budget_status is not None else None
             original_results = output["results"]
             bounded_results = []
             result_bytes = 0

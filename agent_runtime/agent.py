@@ -92,7 +92,7 @@ class Agent:
         selection_requester = validate_model_switch_requester(_selection_requester)
         self.model = model
         self.checkpoint_db = checkpoint_db
-    
+
         workspace = (Path.cwd() if workspace_path is None else Path(workspace_path))
         self.workspace_path = (workspace.expanduser().resolve())
         for value in (permissions, managed_permissions):
@@ -241,11 +241,16 @@ class Agent:
         """Persist guidance without opening a model; target must still be active."""
         from agent_runtime.harness import RolloutStore
 
-        with RolloutStore(self._harness_database()) as store:
-            turn = store.read_turn(expected_turn_id)
-            if Path(store.read_thread(turn.thread_id).workspace).resolve() != self._workspace_path():
+        async with await RolloutStore.open(self._harness_database()) as store:
+            turn = await store.run_async(store.read_turn, expected_turn_id)
+            if (
+                Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
+                != self._workspace_path()
+            ):
                 raise RuntimeError("Turn belongs to a different workspace security domain")
-            return store.receive_turn_input(thread_id=turn.thread_id, turn_id=expected_turn_id, text=text)
+            return await store.run_async(
+                store.receive_turn_input, thread_id=turn.thread_id, turn_id=expected_turn_id, text=text
+            )
 
     def input_status(self, item_id: str) -> str:
         """Inspect a steering receipt without model I/O."""
@@ -345,11 +350,19 @@ class Agent:
         database = self._harness_database()
         rows: list[dict[str, object]] = []
         if database.exists():
-            with RolloutStore(database, read_only=True) as store:
-                threads = (thread_id,) if thread_id is not None else tuple(
-                    dict.fromkeys(turn.thread_id for turn in store.list_turns())
+            async with await RolloutStore.open(database, read_only=True) as store:
+                threads = (
+                    (thread_id,)
+                    if thread_id is not None
+                    else tuple(
+                        dict.fromkeys(
+                            await store.run_async(lambda: tuple(turn.thread_id for turn in store.list_turns()))
+                        )
+                    )
                 )
-                rows = [row for current in threads for row in thread_checkpoint_rows(store, current)]
+                rows = await store.run_async(
+                    lambda: [row for current in threads for row in thread_checkpoint_rows(store, current)]
+                )
         # Restore anchors live only in the shadow repository (restores happen
         # outside Turns), so merge them in or a rewind could not be undone.
         from agent_runtime.checkpoints import CheckpointService
@@ -386,8 +399,10 @@ class Agent:
         from agent_runtime.checkpoints import CheckpointService
         from agent_runtime.harness import RolloutStore
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            active = await store.run_async(
+                lambda: [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
+            )
         if active:
             raise RuntimeError(
                 "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再回滚。"
@@ -426,9 +441,15 @@ class Agent:
         from agent_runtime.git_delivery import GitDelivery
         from agent_runtime.harness import RolloutStore
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}
-                      and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()]
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            active = await store.run_async(
+                lambda: [
+                    turn.turn_id
+                    for turn in store.list_turns()
+                    if turn.status in {"running", "paused"}
+                    and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()
+                ]
+            )
         if active:
             raise RuntimeError(
                 "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再提交。"
@@ -472,9 +493,15 @@ class Agent:
         from agent_runtime.git_delivery import GitDelivery
         from agent_runtime.harness import RolloutStore
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            active = [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}
-                      and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()]
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            active = await store.run_async(
+                lambda: [
+                    turn.turn_id
+                    for turn in store.list_turns()
+                    if turn.status in {"running", "paused"}
+                    and Path(store.read_thread(turn.thread_id).workspace).resolve() == self._workspace_path()
+                ]
+            )
         if active:
             raise RuntimeError(
                 "存在未结束的 Turn（运行中或等待输入），请先完成、取消或恢复后再发布。"
@@ -539,39 +566,42 @@ class Agent:
                 recover_owner_loss,
             )
 
-            with RolloutStore(self._harness_database()) as store:
-                turn = store.read_turn(turn_id)
-                thread = store.read_thread(turn.thread_id)
+            async with await RolloutStore.open(self._harness_database()) as store:
+                turn = await store.run_async(store.read_turn, turn_id)
+                thread = await store.run_async(store.read_thread, turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
                     raise RuntimeError("turn belongs to a different workspace security domain")
                 with execution_owner(self._harness_database(), thread.thread_id):
                     if expected_request_id is not None:
                         from agent_runtime.harness.recovery import recovery_plan
-                        if recovery_plan(store, turn_id).request_id != expected_request_id:
+
+                        if (await store.run_async(recovery_plan, store, turn_id)).request_id != expected_request_id:
                             raise ValueError("recovery request changed; inspect current state before responding")
                     from agent_runtime.harness.command_recovery import cancel_commands
-                    recovered = store.capture_mutation(lambda: recover_owner_loss(store, turn_id, abort=True))
+
+                    recovered = await store.run_async(
+                        store.capture_mutation, lambda: recover_owner_loss(store, turn_id, abort=True)
+                    )
                     await cancel_commands(self, turn_id)
                     from agent_runtime.harness.recovery import recovery_plan
-                    plan = recovery_plan(store, turn_id)
+
+                    plan = await store.run_async(recovery_plan, store, turn_id)
                     if not plan.accepts("abort"):
                         raise ConversationRecoveryRequiredError(f"取消未完成：{plan.reason_code}；请先核对执行状态。")
-                    mutation = store.capture_mutation(lambda: store.cancel_turn(turn_id=turn_id))
+                    mutation = await store.run_async(store.capture_mutation, lambda: store.cancel_turn(turn_id=turn_id))
                     cancelled = mutation.value
-                    result = AgentResult._from_harness(
+                    result = await store.run_async(
+                        AgentResult._from_harness,
                         TurnResult(
-                            thread_id=cancelled.thread_id,
-                            turn_id=cancelled.turn_id,
-                            answer=None,
-                            status="cancelled",
+                            thread_id=cancelled.thread_id, turn_id=cancelled.turn_id, answer=None, status="cancelled"
                         ),
                         store=store,
                     )
                     if event_sink is not None:
                         dispatcher = TurnEventDispatcher()
                         dispatcher.subscribe_controlling_sink(event_sink)
-                        for replayed in RolloutEventReader(store).project_committed_batch(
-                            (*recovered.records, *mutation.records)
+                        for replayed in await store.run_async(
+                            RolloutEventReader(store).project_committed_batch, (*recovered.records, *mutation.records)
                         ):
                             await dispatcher.emit(replayed.event, cursor=replayed.cursor)
             return result
@@ -589,38 +619,52 @@ class Agent:
         from agent_runtime.harness.recovery import recovery_plan
         from agent_runtime.harness.rollout import RolloutStore
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            turn = store.read_turn(turn_id)
-            if Path(store.read_thread(turn.thread_id).workspace).resolve() != self._workspace_path():
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            turn = await store.run_async(store.read_turn, turn_id)
+            if (
+                Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
+                != self._workspace_path()
+            ):
                 raise RuntimeError("turn belongs to a different workspace security domain")
             try:
                 with execution_owner(self._harness_database(), turn.thread_id):
-                    return recovery_plan(store, turn_id).as_dict()
+                    return (await store.run_async(recovery_plan, store, turn_id)).as_dict()
             except ConversationBusyError:
-                return {"turn_id": turn_id, "status": turn.status, "actions": [],
-                        "reason_code": "execution_active", "evidence_ids": [turn_id], "request_id": None,
-                        "requires_input": False, "question": None, "choices": []}
+                return {
+                    "turn_id": turn_id,
+                    "status": turn.status,
+                    "actions": [],
+                    "reason_code": "execution_active",
+                    "evidence_ids": [turn_id],
+                    "request_id": None,
+                    "requires_input": False,
+                    "question": None,
+                    "choices": [],
+                }
 
     async def read_result(self, turn_id: str) -> AgentResult:
         from agent_runtime.harness import RolloutStore, TurnResult
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            turn = store.read_turn(turn_id)
-            thread = store.read_thread(turn.thread_id)
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            turn = await store.run_async(store.read_turn, turn_id)
+            thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
                 raise RuntimeError("turn belongs to a different workspace security domain")
             answer: str | None = None
             if turn.status == "completed":
-                answer = str(store.read_turn_answer(turn_id).payload["text"])
-            pending = next(
-                (
-                    interaction.request_id
-                    for interaction in reversed(store.list_interactions(turn_id))
-                    if interaction.status == "pending"
-                ),
-                None,
+                answer = str((await store.run_async(store.read_turn_answer, turn_id)).payload["text"])
+            pending = await store.run_async(
+                lambda: next(
+                    (
+                        interaction.request_id
+                        for interaction in reversed(store.list_interactions(turn_id))
+                        if interaction.status == "pending"
+                    ),
+                    None,
+                )
             )
-            return AgentResult._from_harness(
+            return await store.run_async(
+                AgentResult._from_harness,
                 TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn.turn_id,
@@ -696,20 +740,16 @@ class Agent:
     async def pending_input(self, turn_id: str) -> AgentPause | None:
         from agent_runtime.harness import RolloutStore, TurnResult
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
-            turn = store.read_turn(turn_id)
-            thread = store.read_thread(turn.thread_id)
+        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+            turn = await store.run_async(store.read_turn, turn_id)
+            thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
                 raise RuntimeError("turn belongs to a different workspace security domain")
             if turn.status != "paused":
                 return None
-            projected = AgentResult._from_harness(
-                TurnResult(
-                    thread_id=thread.thread_id,
-                    turn_id=turn_id,
-                    answer=None,
-                    status="paused",
-                ),
+            projected = await store.run_async(
+                AgentResult._from_harness,
+                TurnResult(thread_id=thread.thread_id, turn_id=turn_id, answer=None, status="paused"),
                 store=store,
             )
             return projected.pause
@@ -768,7 +808,7 @@ class Agent:
                 }
             )
         return tuple(values)
-    
+
     def _get_model_control_plane(self) -> ModelControlPlane:
         from agent_runtime.runtime.builder import build_model_control_plane
 
