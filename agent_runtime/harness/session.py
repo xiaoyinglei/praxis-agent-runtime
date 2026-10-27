@@ -18,6 +18,7 @@ from agent_runtime.approval import ApprovalMode, CommandGrant
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.core.generation_settings import ModelRequestPreferences
 from agent_runtime.harness.context import validate_tool_history
+from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.ownership import (
     OWNERSHIP_REVISION,
     ConversationBusyError,
@@ -601,8 +602,7 @@ class Session:
                 self._apply_tool_context()
                 raise
 
-        executor = await self.store.run_async(self._executor)
-        return await executor._commit(receive)
+        return await commit_and_publish(self.store, receive, self.event_dispatcher)
 
     def input_status(self, item_id: str) -> str:
         """pending/applied means received/dispatched, not model understanding."""

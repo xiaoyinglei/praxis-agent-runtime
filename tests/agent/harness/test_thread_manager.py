@@ -119,7 +119,8 @@ async def test_clarification_continues_with_current_model_when_initial_model_is_
 
 
 @pytest.mark.anyio
-async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Path) -> None:
+async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: {"date": "2026-10-27"})
     model = EchoHistoryModel()
     options = dict(database=tmp_path / "rollout.sqlite3", workspace=tmp_path, model=model)
     async with await Session.open(**options) as source:

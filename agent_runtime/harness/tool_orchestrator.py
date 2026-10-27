@@ -24,7 +24,7 @@ from agent_runtime.checkpoints import (
 )
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
-from agent_runtime.harness.events import RolloutEventReader
+from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
 from agent_runtime.harness.verification import classify_tool_verification
 from agent_runtime.streaming.events import (
@@ -302,16 +302,7 @@ class ToolOrchestrator:
         return True
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = await self._store.capture_mutation_async(operation)
-        if self._event_dispatcher is not None:
-            for replayed in await self._store.run_async(
-                RolloutEventReader(self._store).project_committed_batch, mutation.records
-            ):
-                await self._event_dispatcher.emit(
-                    replayed.event,
-                    cursor=replayed.cursor,
-                )
-        return mutation.value
+        return await commit_and_publish(self._store, operation, self._event_dispatcher)
 
     def update_execution_context(self, context: ToolExecutionContext) -> None:
         self._execution_context = context

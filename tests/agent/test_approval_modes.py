@@ -142,7 +142,7 @@ async def test_session_grant_applies_next_turn_can_revoke_and_is_not_saved(tmp_p
         result = await session.resume(result.turn_id, "allow_session")
         assert result.status == "done"
         assert len(session.approval_grants()) == 1
-        with pytest.raises(RuntimeError, match="pending state"):
+        with pytest.raises(RuntimeError, match="approval_already_resolved"):
             await session.resume(result.turn_id, "allow_session")
         assert len(session.approval_grants()) == 1
         assert (await session.submit("run again")).status == "done"
@@ -181,7 +181,7 @@ async def test_session_grant_is_rejected_if_not_offered(tmp_path):
     async with await command_session(tmp_path, mode="ask", network=True) as session:
         result = await session.submit("run")
         assert "allow_session" not in result.pause.options
-        with pytest.raises(ValueError, match="does not offer"):
+        with pytest.raises(RuntimeError, match="tool_approval_required"):
             await session.resume(result.turn_id, "allow_session")
         assert session.approval_grants() == ()
         assert session.store.read_turn(result.turn_id).status == "paused"

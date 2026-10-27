@@ -81,19 +81,21 @@ async def test_read_result_of_old_turn_without_validation_metadata_is_not_evalua
         if legacy_decision:
             proposal = store.record_final_proposal(turn_id=turn.turn_id, answer="old answer")
             # Replay the historical canonical shape, before validation metadata existed.
-            with store._transaction():
-                store._append_and_reduce(
-                    thread_id=thread.thread_id, turn_id=turn.turn_id,
-                    record_type="item_started", producer="verifier",
-                    payload={"item_id": "legacy-decision", "kind": "completion_decision"},
-                )
-                store._append_and_reduce(
-                    thread_id=thread.thread_id, turn_id=turn.turn_id,
-                    record_type="item_completed", producer="verifier",
-                    payload={"item_id": "legacy-decision", "payload": {
-                        "proposal_item_id": proposal.item_id, "action": "accept", "reason": "legacy",
-                    }},
-                )
+            def seed_legacy_decision():
+                with store._transaction():
+                    store._append_and_reduce(
+                        thread_id=thread.thread_id, turn_id=turn.turn_id,
+                        record_type="item_started", producer="verifier",
+                        payload={"item_id": "legacy-decision", "kind": "completion_decision"},
+                    )
+                    store._append_and_reduce(
+                        thread_id=thread.thread_id, turn_id=turn.turn_id,
+                        record_type="item_completed", producer="verifier",
+                        payload={"item_id": "legacy-decision", "payload": {
+                            "proposal_item_id": proposal.item_id, "action": "accept", "reason": "legacy",
+                        }},
+                    )
+            store.run_sync(seed_legacy_decision)
         store.complete_turn(turn_id=turn.turn_id, answer="old answer")
         assert store.verify().valid
     agent = Agent(checkpoint_db=database, workspace_path=tmp_path)

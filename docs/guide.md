@@ -512,14 +512,19 @@ agent run "查找 DeepSeek Search API 官方文档" \
 四个入口 `run/chat/resume/recover` 均支持这两个参数，也可通过 `PRAXIS_WEB_SEARCH_PROVIDER` / `PRAXIS_WEB_SEARCH_KEY_FILE` 设置。Python SDK 对应：
 
 ```python
+import asyncio
 from pathlib import Path
 from agent_runtime import Agent
 
-agent = Agent(
-    web_search_provider="deepseek",
-    web_search_key_file=Path.home() / ".config/praxis/deepseek.key",
-)
-result = await agent.run("查找 DeepSeek Search API 官方文档", allow_web_tools=True)
+async def main():
+    agent = Agent(
+        web_search_provider="deepseek",
+        web_search_key_file=Path.home() / ".config/praxis/deepseek.key",
+    )
+    result = await agent.run("查找 DeepSeek Search API 官方文档", allow_web_tools=True)
+    print(result.answer)
+
+asyncio.run(main())
 ```
 
 恢复未完成 Turn 时，搜索和读取工具须与原执行版本一致，并提供原服务的密钥文件；密钥不会写入 Turn 记录。DeepSeek 搜索的新版本为 `builtin-public-web-search-deepseek-v2`，托管读取为 `builtin-public-web-fetch-deepseek-v1`；旧的直接抓取待执行操作不能静默切成托管获取。Bing HTML 搜索已移除。

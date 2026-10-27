@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -28,6 +28,7 @@ from agent_runtime.streaming.events import (
     turn_resumed,
     turn_started,
 )
+from agent_runtime.streaming.sink import TurnEventDispatcher
 
 _PUBLIC_ITEM_KINDS = frozenset(
     {
@@ -129,6 +130,20 @@ class ReplayEvent:
 
 
 RolloutEvent = ReplayEvent
+
+
+async def commit_and_publish[T](
+    store: RolloutStore,
+    operation: Callable[[], T],
+    dispatcher: TurnEventDispatcher | None,
+) -> T:
+    """Admit the mutation first, then publish only its committed records."""
+    mutation = await store.capture_mutation_async(operation)
+    if dispatcher is not None:
+        events = await store.run_async(RolloutEventReader(store).project_committed_batch, mutation.records)
+        for replayed in events:
+            await dispatcher.emit(replayed.event, cursor=replayed.cursor)
+    return mutation.value
 
 
 class RolloutEventReader:

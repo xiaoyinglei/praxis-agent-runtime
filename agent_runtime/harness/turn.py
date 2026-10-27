@@ -23,7 +23,7 @@ from agent_runtime.budget import (
     normal_token_remaining,
 )
 from agent_runtime.budget.pricing import estimated_model_cost_micros
-from agent_runtime.harness.events import RolloutEventReader
+from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.protocol import (
     DEFAULT_MAX_STEPS,
     BindingProvider,
@@ -201,16 +201,7 @@ class TurnExecutor:
         )
 
     async def _commit[T](self, operation: Callable[[], T]) -> T:
-        mutation = await self._store.capture_mutation_async(operation)
-        if self._event_dispatcher is not None:
-            for replayed in await self._store.run_async(
-                RolloutEventReader(self._store).project_committed_batch, mutation.records
-            ):
-                await self._event_dispatcher.emit(
-                    replayed.event,
-                    cursor=replayed.cursor,
-                )
-        return mutation.value
+        return await commit_and_publish(self._store, operation, self._event_dispatcher)
 
     async def _commit_cancellation(self, operation: Callable[[], None]) -> None:
         """Finish cancellation bookkeeping even when cancellation is repeated."""
