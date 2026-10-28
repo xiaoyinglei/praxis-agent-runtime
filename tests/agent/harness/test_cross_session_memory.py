@@ -502,15 +502,16 @@ def test_expired_worker_cannot_publish_cursor_or_mutate_job(tmp_path):
 
     with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, _ = seed(store, tmp_path)
-        assert store.claim_memory_job(tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
-        assert store.claim_memory_job(tmp_path, owner="new", now=time.time(), lease_seconds=300)
-        job = store.write_memory_job(tmp_path, thread.thread_id, {"status": "running"}, owner="new")
+        old = store.claim_memory_job(tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
+        new = store.claim_memory_job(tmp_path, owner="new", now=time.time(), lease_seconds=300)
+        assert old is not None and new is not None
+        job = store.write_memory_job(tmp_path, thread.thread_id, {"status": "running"}, claim=new)
         with pytest.raises(ContextSourceChangedError):
-            store.write_memory_job(tmp_path, thread.thread_id, {"status": "done"}, owner="old")
+            store.write_memory_job(tmp_path, thread.thread_id, {"status": "done"}, claim=old)
         with pytest.raises(ContextSourceChangedError):
             store.commit_memory_state(tmp_path, expected_version=0,
                                       state={**store.read_memory_state(tmp_path), "source_cursors": {"bad": 1}},
-                                      claim_owner="old", job_thread_id=thread.thread_id,
+                                      claim=old, job_thread_id=thread.thread_id,
                                       job_state={"status": "done"}, job_revision=job["revision"])
         assert store.read_memory_state(tmp_path)["version"] == 0
         assert store.read_memory_jobs(tmp_path)[thread.thread_id] == job

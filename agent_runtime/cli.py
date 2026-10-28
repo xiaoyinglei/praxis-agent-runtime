@@ -214,7 +214,7 @@ logger = logging.getLogger(__name__)
 
 @agent_app.command("memory")
 def agent_memory(
-    action: Annotated[Literal["status", "configure", "update", "delete", "remember", "edit", "explain"],
+    action: Annotated[Literal["status", "configure", "update", "delete", "remember", "edit", "explain", "relocate"],
                       typer.Argument()] = "status",
     workspace: Annotated[Path, typer.Option("--workspace")] = Path("."),
     checkpoint_db: Annotated[Path, typer.Option("--checkpoint-db")] = DEFAULT_CHECKPOINT_PATH,
@@ -225,6 +225,7 @@ def agent_memory(
     title: Annotated[str | None, typer.Option("--title")] = None,
     kind: Annotated[Literal["preference", "fact", "reference"] | None, typer.Option("--kind")] = None,
     expected_version: Annotated[int | None, typer.Option("--expected-version", min=0)] = None,
+    from_workspace: Annotated[Path | None, typer.Option("--from-workspace")] = None,
     model: Annotated[str | None, typer.Option("--model")] = None,
 ) -> None:
     """工作区跨聊天记忆：检查、配置、有限更新或删除；默认不开启。"""
@@ -234,6 +235,13 @@ def agent_memory(
                   model_session_path=None, enable_workspace_mcp=False)
     if action == "status":
         result = agent.memories()
+    elif action == "relocate":
+        if from_workspace is None:
+            raise typer.BadParameter("relocate requires --from-workspace")
+        try:
+            result = agent.relocate_memory(from_workspace, expected_version=expected_version)
+        except (OSError, KeyError, ValueError, RuntimeError) as exc:
+            raise typer.BadParameter(str(exc)) from None
     elif action == "configure":
         if use is None and generate is None:
             raise typer.BadParameter("configure requires --use/--no-use or --generate/--no-generate")

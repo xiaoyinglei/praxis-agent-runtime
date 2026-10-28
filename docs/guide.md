@@ -476,6 +476,28 @@ uv run agent memory configure --no-use --no-generate
 
 只有允许贡献的聊天会成为自动记忆来源；历史聊天不会因为打开默认设置就自动获得贡献授权。新 Turn 使用固定记忆版本，当前任务中的修改不会改变它已有的读取快照。记忆中的历史信息仍需按当前事实核对，不构成新的授权。
 
+工作区移动或改名后，先关闭旧路径和新路径下的所有 Session，再显式迁移记忆绑定。记忆由本机稳定的 scope 标识隔离，工作区路径是可迁移的绑定；程序不会根据目录名称或内容自动猜测身份。迁移保留 scope、记忆版本与内容，只更新路径绑定及其 generation；历史 Thread、Turn 和已冻结的记忆快照保留原值。
+
+```bash
+cd /new/project
+uv run agent memory relocate --from-workspace /old/project --workspace /new/project \
+  --checkpoint-db /new/project/.praxis/checkpoints.sqlite --expected-version 3
+```
+
+`--checkpoint-db` 必须指向原来保存记忆的同一个数据库：随项目移动的数据库使用移动后的文件路径，项目外的数据库使用原路径。省略时仍使用当前目录下的 `.praxis/checkpoints.sqlite`，不会自动寻找旧数据库；数据库不存在时直接拒绝，不创建空库。旧工作区目录可以已不存在，新工作区必须是现有目录，两者的规范路径必须不同。`--expected-version` 可选，用于拒绝记忆版本已变化的迁移。已有目标绑定、未知来源或任一路径仍有打开的 Session 时也会拒绝；该命令不初始化模型或调用 provider。
+
+Python SDK 使用相同数据库和规则：
+
+```python
+from pathlib import Path
+from agent_runtime import Agent
+
+agent = Agent(workspace_path=Path("/new/project"),
+              checkpoint_db=Path("/new/project/.praxis/checkpoints.sqlite"))
+binding = agent.relocate_memory(Path("/old/project"), expected_version=3)
+print(binding)  # scope_id, previous_workspace, workspace, version, binding_generation
+```
+
 私有文档 RAG 是独立、可选的检索能力：
 
 ```bash

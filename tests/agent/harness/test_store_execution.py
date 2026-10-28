@@ -529,8 +529,9 @@ async def test_cancelled_memory_claim_releases_the_actual_lease(tmp_path, monkey
             release.set()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert await store.run_async(original, tmp_path, owner="next-owner", now=time.time(), lease_seconds=300)
-            await store.run_async(store.release_memory_job, tmp_path, owner="next-owner")
+            claim = await store.run_async(original, tmp_path, owner="next-owner", now=time.time(), lease_seconds=300)
+            assert claim is not None
+            await store.run_async(store.release_memory_job, tmp_path, claim=claim)
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)

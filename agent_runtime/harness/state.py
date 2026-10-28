@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Self
+from typing import TYPE_CHECKING, Any, Literal, Self
 from uuid import uuid4
 
 from agent_runtime.budget import (
@@ -60,6 +60,9 @@ from agent_runtime.streaming.events import (
     derive_plan_public_item_id,
     derive_reconciliation_public_item_id,
 )
+
+if TYPE_CHECKING:
+    from agent_runtime.harness.memory_identity import MemoryClaim
 
 
 def _state_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
@@ -370,39 +373,46 @@ class RuntimeState:
         return self.read_artifact_metadata(artifact_id)
 
     @_state_operation
-    def read_memory_state(self, workspace: Path, *, version: int | None = None) -> dict[str, Any]:
+    def read_memory_state(
+        self, workspace: Path, *, version: int | None = None, scope_id: str | None = None,
+    ) -> dict[str, Any]:
         """Read workspace memory; old/read-only databases need no schema migration."""
-        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        if version == 0:
-            return {
-                "version": 0,
-                "entries": [],
-                "processed": {},
-                "deleted_keys": [],
-                "deleted_sources": [],
-                "use_memories": False,
-                "generate_memories": False,
-            }
-        if version is not None and version > 0:
-            key += f":version:{version}"
-        row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
-        if row is None:
+        with self.persistence.read_snapshot():
+            from agent_runtime.harness.memory_identity import memory_namespace
+
+            if scope_id is not None and self.persistence.metadata("memory-scope:" + scope_id) is None:
+                raise KeyError("unknown memory scope")
+            key = "memory:" + (scope_id if scope_id is not None else memory_namespace(self, workspace))
+            if version == 0:
+                return {
+                    "version": 0,
+                    "entries": [],
+                    "processed": {},
+                    "deleted_keys": [],
+                    "deleted_sources": [],
+                    "use_memories": False,
+                    "generate_memories": False,
+                }
             if version is not None and version > 0:
-                raise KeyError("unknown workspace memory version")
-            return {
-                "version": 0,
-                "entries": [],
-                "processed": {},
-                "deleted_keys": [],
-                "deleted_sources": [],
-                "use_memories": False,
-                "generate_memories": False,
-            }
-        envelope = json.loads(row["value"])
-        state = envelope["state"]
-        if hashlib.sha256(_canonical_json(state).encode()).hexdigest() != envelope["sha256"]:
-            raise RuntimeError("workspace memory integrity mismatch")
-        return dict(state)
+                key += f":version:{version}"
+            row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
+            if row is None:
+                if version is not None and version > 0:
+                    raise KeyError("unknown workspace memory version")
+                return {
+                    "version": 0,
+                    "entries": [],
+                    "processed": {},
+                    "deleted_keys": [],
+                    "deleted_sources": [],
+                    "use_memories": False,
+                    "generate_memories": False,
+                }
+            envelope = json.loads(row["value"])
+            state = envelope["state"]
+            if hashlib.sha256(_canonical_json(state).encode()).hexdigest() != envelope["sha256"]:
+                raise RuntimeError("workspace memory integrity mismatch")
+            return dict(state)
 
     @_state_operation
     def commit_memory_state(
@@ -411,19 +421,21 @@ class RuntimeState:
         *,
         expected_version: int,
         state: Mapping[str, Any],
-        claim_owner: str | None = None,
+        claim: MemoryClaim | None = None,
         job_thread_id: str | None = None,
         job_state: Mapping[str, Any] | None = None,
         job_revision: int | None = None,
     ) -> dict[str, Any]:
         """CAS commit; keep immutable versions for inspection and crash recovery."""
-        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        from agent_runtime.harness.memory_identity import memory_namespace
+
         with self.persistence.transaction():
-            if claim_owner is not None:
-                self._assert_memory_claim(workspace, claim_owner)
+            if claim is not None:
+                self._assert_memory_claim(workspace, claim)
+            key = "memory:" + memory_namespace(self, workspace, create=True)
             if job_thread_id is not None and job_state is not None:
                 self.write_memory_job(
-                    workspace, job_thread_id, job_state, owner=claim_owner, expected_revision=job_revision
+                    workspace, job_thread_id, job_state, claim=claim, expected_revision=job_revision
                 )
             if self.read_memory_state(workspace)["version"] != expected_version:
                 raise ContextSourceChangedError("workspace memory changed before commit")
@@ -437,9 +449,12 @@ class RuntimeState:
 
     @_state_operation
     def read_memory_jobs(self, workspace: Path) -> dict[str, Any]:
-        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
-        return {} if row is None else dict(json.loads(row["value"]))
+        with self.persistence.read_snapshot():
+            from agent_runtime.harness.memory_identity import memory_namespace
+
+            key = "memory-jobs:" + memory_namespace(self, workspace)
+            row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
+            return {} if row is None else dict(json.loads(row["value"]))
 
     @_state_operation
     def write_memory_job(
@@ -448,13 +463,15 @@ class RuntimeState:
         thread_id: str,
         state: Mapping[str, Any],
         *,
-        owner: str | None = None,
+        claim: MemoryClaim | None = None,
         expected_revision: int | None = None,
     ) -> dict[str, Any]:
-        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+        from agent_runtime.harness.memory_identity import memory_namespace
+
         with self.persistence.transaction():
-            if owner is not None:
-                self._assert_memory_claim(workspace, owner)
+            if claim is not None:
+                self._assert_memory_claim(workspace, claim)
+            key = "memory-jobs:" + memory_namespace(self, workspace, create=True)
             jobs = self.read_memory_jobs(workspace)
             revision = jobs.get(thread_id, {}).get("revision", 0)
             if expected_revision is not None and revision != expected_revision:
@@ -466,40 +483,78 @@ class RuntimeState:
 
     @_state_operation
     def enqueue_memory_job(self, workspace: Path, thread_id: str) -> None:
+        from agent_runtime.harness.memory_identity import thread_in_memory_scope
+
         with self.persistence.transaction():
-            if Path(self.read_thread(thread_id).workspace).resolve() != workspace.resolve():
+            if not thread_in_memory_scope(self, workspace, thread_id):
                 raise ValueError("memory job belongs to a different workspace")
             job = self.read_memory_jobs(workspace).get(thread_id, {})
             if job.get("status") in {"pending", "running", "needs_reconciliation", "failed"}:
                 return
             self.write_memory_job(workspace, thread_id, {"status": "pending", "turn_ids": []})
 
-    def _assert_memory_claim(self, workspace: Path, owner: str) -> None:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
-        claim = {} if row is None else json.loads(row["value"])
-        if claim.get("owner") != owner or claim.get("expires_at", 0) <= time.time():
+    def _assert_memory_claim(self, workspace: Path, claim: MemoryClaim) -> None:
+        scope = self.memory_scope(workspace)
+        if (scope is None or scope["scope_id"] != claim.scope_id
+                or scope["binding_generation"] != claim.binding_generation):
+            raise ContextSourceChangedError("memory workspace binding changed")
+        raw = self.persistence.metadata("memory-job:" + claim.scope_id)
+        lease = {} if raw is None else json.loads(raw)
+        if (lease.get("owner") != claim.owner or lease.get("expires_at", 0) <= time.time()
+                or lease.get("lease_id") != claim.lease_id
+                or lease.get("scope_id") != claim.scope_id
+                or lease.get("binding_generation") != claim.binding_generation):
             raise ContextSourceChangedError("memory workspace lease is no longer owned")
 
     @_state_operation
-    def claim_memory_job(self, workspace: Path, *, owner: str, now: float, lease_seconds: float) -> bool:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+    def claim_memory_job(
+        self, workspace: Path, *, owner: str, now: float, lease_seconds: float,
+    ) -> MemoryClaim | None:
+        from agent_runtime.harness.memory_identity import MemoryClaim, memory_namespace
+
         with self.persistence.transaction():
+            key = "memory-job:" + memory_namespace(self, workspace)
             row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
             if row is not None and json.loads(row["value"])["expires_at"] > now:
-                return False
+                return None
+            namespace = memory_namespace(self, workspace, create=True)
+            scope = self.memory_scope(workspace)
+            assert scope is not None
+            claim = MemoryClaim(namespace, scope["binding_generation"], owner, uuid4().hex)
             self.persistence.put_metadata(
-                key, _canonical_json({"owner": owner, "expires_at": now + lease_seconds}), replace=True
+                "memory-job:" + namespace,
+                _canonical_json({"owner": owner, "expires_at": now + lease_seconds,
+                                 "scope_id": claim.scope_id, "binding_generation": claim.binding_generation,
+                                 "lease_id": claim.lease_id}),
+                replace=True,
             )
-        return True
+        return claim
 
     @_state_operation
-    def release_memory_job(self, workspace: Path, *, owner: str) -> None:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
+    def release_memory_job(self, workspace: Path, *, claim: MemoryClaim) -> None:
         with self.persistence.transaction():
-            row = {"value": value} if (value := self.persistence.metadata(key)) is not None else None
-            if row is not None and json.loads(row["value"])["owner"] == owner:
-                self.persistence.delete_metadata(key)
+            try:
+                self._assert_memory_claim(workspace, claim)
+            except ContextSourceChangedError:
+                return
+            self.persistence.delete_metadata("memory-job:" + claim.scope_id)
+
+    def memory_scope(self, workspace: Path) -> dict[str, Any] | None:
+        from agent_runtime.harness.memory_identity import memory_scope
+
+        return memory_scope(self, workspace)
+
+    def thread_in_memory_scope(self, workspace: Path, thread_id: str) -> bool:
+        from agent_runtime.harness.memory_identity import thread_in_memory_scope
+
+        return thread_in_memory_scope(self, workspace, thread_id)
+
+    def relocate_memory(
+        self, *, previous_workspace: Path, workspace: Path, expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        from agent_runtime.harness.memory_identity import relocate_memory
+
+        return relocate_memory(self, previous_workspace, workspace, expected_version=expected_version)
 
     @_state_operation
     def create_thread(
@@ -526,6 +581,9 @@ class RuntimeState:
                 producer="runtime",
                 payload={"workspace": str(resolved_workspace)},
             )
+            from agent_runtime.harness.memory_identity import bind_memory_thread
+
+            bind_memory_thread(self, thread_id, resolved_workspace)
         return self.read_thread(thread_id)
 
     @_state_operation
@@ -576,6 +634,9 @@ class RuntimeState:
                     "fork_turn_id": from_turn_id,
                 },
             )
+            from agent_runtime.harness.memory_identity import bind_memory_thread
+
+            bind_memory_thread(self, thread_id, Path(source["workspace"]))
         return self.read_thread(thread_id)
 
     @_state_operation

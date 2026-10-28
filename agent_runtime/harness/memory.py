@@ -19,8 +19,9 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
+from agent_runtime.harness.memory_identity import MemoryClaim, thread_in_memory_scope, thread_memory_scope
 from agent_runtime.harness.protocol import BoundHarnessModel
-from agent_runtime.harness.state import RuntimeState
+from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -63,18 +64,41 @@ class _MemoryOutput(BaseModel):
     entries: list[MemoryEntry] = Field(max_length=MAX_MEMORY_ENTRIES)
 
 
+@_state_operation
 def memory_snapshot(store: RuntimeState, workspace: Path, *, navigation_only: bool = False) -> dict[str, Any]:
-    state = store.read_memory_state(workspace)
-    entries = state["entries"]
-    if navigation_only:
-        content = [{key: entry.get(key) for key in ("key", "title", "text", "kind")} for entry in entries]
-        content_revision = hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-        return {"version": state["version"], "workspace": str(workspace.resolve()),
-                "content_revision": content_revision,
-                "total_entries": len(entries),
-                "entries": [{"key": e["key"], "title": e["title"]} for e in entries[-MAX_MEMORY_ENTRIES:]]}
-    # Do not put processing cursors, controls, or deleted content in model context.
-    return {"version": state["version"], "workspace": str(workspace.resolve()), "entries": entries}
+    with store.persistence.read_snapshot():
+        state = store.read_memory_state(workspace)
+        scope = store.memory_scope(workspace)
+        identity = {"scope_id": scope["scope_id"]} if scope is not None else {}
+        entries = state["entries"]
+        if navigation_only:
+            content = [{key: entry.get(key) for key in ("key", "title", "text", "kind")} for entry in entries]
+            content_revision = hashlib.sha256(
+                json.dumps(content, ensure_ascii=False, sort_keys=True).encode(),
+            ).hexdigest()
+            return {**identity, "version": state["version"], "workspace": str(workspace.resolve()),
+                    "content_revision": content_revision,
+                    "total_entries": len(entries),
+                    "entries": [{"key": e["key"], "title": e["title"]} for e in entries[-MAX_MEMORY_ENTRIES:]]}
+        # Do not put processing cursors, controls, or deleted content in model context.
+        return {**identity, "version": state["version"], "workspace": str(workspace.resolve()), "entries": entries}
+
+
+@_state_operation
+def read_frozen_memory_state(
+    store: RuntimeState, *, thread_id: str, snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a Turn's pinned memory through its durable thread association."""
+    with store.persistence.read_snapshot():
+        association = thread_memory_scope(store, thread_id)
+        scope_id = snapshot.get("scope_id", association)
+        workspace = Path(snapshot["workspace"]).resolve()
+        if scope_id is not None:
+            if scope_id != association:
+                raise ValueError("memory snapshot belongs to a different scope")
+        elif Path(store.read_thread(thread_id).workspace).resolve() != workspace:
+            raise ValueError("memory snapshot belongs to a different workspace")
+        return store.read_memory_state(workspace, version=snapshot["version"], scope_id=scope_id)
 
 
 def memory_context_revoked(
@@ -91,8 +115,11 @@ def memory_context_revoked(
         return False
     if current is None:
         return True
-    old = store.read_memory_state(workspace, version=previous["version"])
-    new = store.read_memory_state(workspace, version=current["version"])
+    old_scope, new_scope = previous.get("scope_id"), current.get("scope_id")
+    if old_scope != new_scope or (old_scope is None and previous["workspace"] != current["workspace"]):
+        return True
+    old = store.read_memory_state(workspace, version=previous["version"], scope_id=old_scope)
+    new = store.read_memory_state(workspace, version=current["version"], scope_id=new_scope)
     removed = {entry["key"] for entry in old["entries"]} - {entry["key"] for entry in new["entries"]}
     forgotten = set(new.get("deleted_sources", ())) - set(old.get("deleted_sources", ()))
     return bool(removed or forgotten)
@@ -164,7 +191,7 @@ def _source(
         record.committed_at_ms if (record := store.last_record(t.thread_id)) else 0))
     jobs = store.read_memory_jobs(workspace)
     for thread in threads:
-        if (thread.thread_id == exclude or Path(thread.workspace).resolve() != workspace.resolve()
+        if (thread.thread_id == exclude or not thread_in_memory_scope(store, workspace, thread.thread_id)
                 or thread.parent_thread_id is not None or thread.active_turn_id is not None or not thread.head_turn_id):
             continue
         if _unresolved(store, jobs.get(thread.thread_id, {})):
@@ -236,18 +263,18 @@ async def update_memory(
     edits. Every provider call remains an inspectable, budgeted Harness operation.
     """
     owner = uuid4().hex
-    acquired = False
+    acquired: MemoryClaim | None = None
     turn_ids: list[str] = []
     failed = False
     deadline = asyncio.get_running_loop().time() + 240
+
+    def acquire() -> None:
+        nonlocal acquired
+        # Retain the accepted result even if cancellation interrupts its observer.
+        acquired = store.claim_memory_job(workspace, owner=owner, now=time.time(), lease_seconds=300)
+
     try:
-        acquired = await store.run_async(
-            store.claim_memory_job,
-            workspace,
-            owner=owner,
-            now=time.time(),
-            lease_seconds=300,
-        )
+        await store.run_async(acquire)
         if not acquired:
             return {"status": "busy", "maintenance_turn_ids": []}
         state = await store.run_async(store.read_memory_state, workspace)
@@ -300,7 +327,7 @@ async def update_memory(
                 "exhausted_batches": exhausted_batches,
                 **({"candidates": cached} if cached is not None else {}),
             },
-            owner=owner,
+            claim=acquired,
             expected_revision=previous.get("revision", 0),
         )
         refs = {i["item_id"]: i["thread_id"] for i in records}
@@ -378,7 +405,7 @@ async def update_memory(
                         workspace,
                         source_thread,
                         {**job, "turn_ids": [*turn_ids, turn_id]},
-                        owner=owner,
+                        claim=acquired,
                         expected_revision=job["revision"],
                     )
                 # Observation belongs to the owner even if its waiter cancels.
@@ -417,7 +444,7 @@ async def update_memory(
                     workspace,
                     source_thread,
                     {**job, "candidates": candidates},
-                    owner=owner,
+                    claim=acquired,
                     expected_revision=job["revision"],
                 )
             else:
@@ -471,7 +498,7 @@ async def update_memory(
                     "skipped_sources": [e for e in state.get("skipped_sources", []) if e["thread_id"] != source_thread],
                     "maintenance_turn_ids": turn_ids,
                 },
-                claim_owner=owner,
+                claim=acquired,
                 job_thread_id=source_thread,
                 job_state={
                     **{k: v for k, v in job.items() if k != "candidates"},
@@ -507,6 +534,8 @@ async def update_memory(
     finally:
 
         async def cleanup() -> None:
+            if acquired is None:
+                return
             try:
                 for turn_id in turn_ids:
                     turn = await store.run_async(store.read_turn, turn_id)
@@ -559,7 +588,7 @@ async def update_memory(
                                             else {}
                                         ),
                                     },
-                                    owner=owner,
+                                    claim=acquired,
                                     expected_revision=job["revision"],
                                 )
                             )
@@ -567,7 +596,7 @@ async def update_memory(
                     except RuntimeError:
                         logger.warning("memory job ownership changed before cleanup")
             finally:
-                (await store.run_async(store.release_memory_job, workspace, owner=owner))
+                (await store.run_async(store.release_memory_job, workspace, claim=acquired))
 
         cleanup_task = asyncio.create_task(cleanup())
         cancelled = False
@@ -612,12 +641,9 @@ def create_memory_tool(store: RuntimeState) -> Tool:
             return NormalizedToolOutput(is_error=True, error_code="memory_disabled",
                                         error_message="No memory snapshot.")
         if "total_entries" in snapshot:
-            workspace = Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
-            if str(workspace) != snapshot["workspace"]:
-                raise ValueError("memory snapshot belongs to a different workspace")
-            entries = (await store.run_async(store.read_memory_state, workspace, version=snapshot["version"]))[
-                "entries"
-            ]
+            entries = (await store.run_async(
+                read_frozen_memory_state, store, thread_id=turn.thread_id, snapshot=snapshot,
+            ))["entries"]
         else:
             entries = snapshot["entries"]
         if "key" in arguments:

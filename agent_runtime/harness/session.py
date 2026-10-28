@@ -516,6 +516,7 @@ class Session:
             previous = thread.head_turn_id or thread.fork_turn_id
             if previous is not None:
                 from agent_runtime.harness.memory import memory_context_revoked
+                from agent_runtime.harness.memory_identity import thread_memory_scope
 
                 # Any earlier snapshot in the visible window may have supplied
                 # recalled data. An intermediate updated/disabled snapshot does
@@ -525,9 +526,18 @@ class Session:
                 for source_turn_id in dict.fromkeys(item.turn_id for item in reversed(visible)):
                     previous_turn = await self.store.run_async(self.store.read_turn, source_turn_id)
                     old = previous_turn.binding_manifest.get("memory_snapshot")
-                    if old is None or old["version"] in versions:
+                    if old is None:
                         continue
-                    versions.add(old["version"])
+                    if "scope_id" not in old:
+                        scope_id = await self.store.run_async(
+                            thread_memory_scope, self.store, previous_turn.thread_id,
+                        )
+                        if scope_id is not None:
+                            old = {**old, "scope_id": scope_id}
+                    identity = (old.get("scope_id", old["workspace"]), old["version"])
+                    if identity in versions:
+                        continue
+                    versions.add(identity)
                     if await self.store.run_async(
                         memory_context_revoked, self.store, self.workspace_path, old, current_memory
                     ):

@@ -7,7 +7,7 @@ import hashlib
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -273,13 +273,19 @@ class Agent:
                     "use_memories": self.memory.use_memories if self.memory is not None else False,
                     "generate_memories": self.memory.generate_memories if self.memory is not None else False}
         with RuntimeState.open_sync(database, read_only=True) as store:
-            state = store.read_memory_state(self.workspace_path)
-            return {**memory_snapshot(store, self.workspace_path),
-                    "maintenance_jobs": {key: {name: value for name, value in job.items() if name != "candidates"}
-                                         for key, job in store.read_memory_jobs(self.workspace_path).items()},
-                    "use_memories": self.memory.use_memories if self.memory is not None else state["use_memories"],
-                    "generate_memories": self.memory.generate_memories if self.memory is not None
-                    else state["generate_memories"]}
+            def read() -> dict[str, object]:
+                with store.persistence.read_snapshot():
+                    state = store.read_memory_state(self.workspace_path)
+                    return {**memory_snapshot(store, self.workspace_path),
+                            "maintenance_jobs": {key: {name: value for name, value in job.items()
+                                                       if name != "candidates"}
+                                                 for key, job in store.read_memory_jobs(self.workspace_path).items()},
+                            "use_memories": self.memory.use_memories if self.memory is not None
+                            else state["use_memories"],
+                            "generate_memories": self.memory.generate_memories if self.memory is not None
+                            else state["generate_memories"]}
+
+            return store.run_sync(read)
 
     def configure_memory(self, config: MemoryConfig) -> dict[str, object]:
         """Persist workspace defaults; independent use and contribution controls."""
@@ -292,6 +298,32 @@ class Agent:
             result = configure_memory(store, self.workspace_path, config)
         self.memory = config
         return result
+
+    def relocate_memory(self, previous_workspace: Path, *,
+                        expected_version: int | None = None) -> dict[str, object]:
+        """Rebind memory after moving a workspace, using its existing database.
+
+        Both workspace paths must be idle. The source directory may no longer
+        exist; historical Threads and Turns retain their original workspace.
+        """
+        from agent_runtime.harness.ownership import workspace_owner
+        from agent_runtime.harness.state import RuntimeState
+
+        previous = Path(previous_workspace).expanduser().resolve()
+        workspace = self.workspace_path
+        if previous == workspace:
+            raise ValueError("previous and current workspace must be different directories")
+        if not workspace.is_dir():
+            raise ValueError("current workspace must be an existing directory")
+        database = self._harness_database()
+        if not database.is_file():
+            raise FileNotFoundError(f"memory relocation requires an existing database: {database}")
+        with ExitStack() as locks:
+            for path in sorted((previous, workspace)):
+                locks.enter_context(workspace_owner(path, exclusive=True))
+            with RuntimeState.open_sync(database) as store:
+                return store.relocate_memory(previous_workspace=previous, workspace=workspace,
+                                             expected_version=expected_version)
 
     def delete_memory(self, key: str) -> dict[str, object]:
         from agent_runtime.harness.memory import delete_memory
