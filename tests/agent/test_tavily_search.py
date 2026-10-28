@@ -206,7 +206,7 @@ def test_sdk_rejects_invalid_search_configuration_before_model_io(provider, key)
 async def test_tavily_sdk_resume_preserves_provider_and_never_persists_key(tmp_path, monkeypatch):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from tests.agent.test_web_product import FetchThenAnswer
 
     requests = []
@@ -230,7 +230,7 @@ async def test_tavily_sdk_resume_preserves_provider_and_never_persists_key(tmp_p
     assert result.status == "done"
     assert len(requests) == 1
     assert requests[0].url.host == "api.tavily.com"
-    with RolloutStore(options["checkpoint_db"]) as store:
+    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
         items = store.list_items(result.turn_id)
         output = next(item.payload["structured_content"] for item in items if item.kind == "tool_result")
         assert output["provider"] == "tavily"

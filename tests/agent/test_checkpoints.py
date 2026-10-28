@@ -99,8 +99,8 @@ async def test_renamed_anchor_is_listed_and_undoable(workspace: Path, tmp_path: 
     agent = Agent(workspace_path=workspace, checkpoint_db=tmp_path / "absent.sqlite")
     [row] = await agent.list_checkpoints()
     assert row["checkpoint_id"] == anchor
-    from agent_runtime.harness import RolloutStore
-    with RolloutStore(tmp_path / "absent.sqlite"):
+    from agent_runtime.harness import RuntimeState
+    async with (await RuntimeState.open(tmp_path / "absent.sqlite")):
         pass
     await agent.rewind(anchor)
     assert target.read_text() == "two"

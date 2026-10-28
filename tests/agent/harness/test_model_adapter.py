@@ -22,10 +22,9 @@ from agent_runtime.harness import (
     ControlPlaneHarnessModel,
     GatewayHarnessModel,
     HarnessMessage,
-    HarnessModelDelta,
     HarnessModelRequest,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
 from agent_runtime.model_definition import (
@@ -45,12 +44,21 @@ from agent_runtime.modeling.contracts import (
     LLMStageBudget,
     normalize_llm_usage,
 )
+from agent_runtime.modeling.events import (
+    ModelEvent,
+    ModelOutput,
+    ModelOutputCompleted,
+    ModelOutputDelta,
+    ModelOutputStarted,
+    ModelResponseCompleted,
+    ModelResponseStarted,
+    ModelStreamState,
+    emit_model_event,
+)
 from agent_runtime.modeling.gateway import (
     AgentModelResponse,
     LLMBudgetExceededError,
     LLMGateway,
-    ProviderDelta,
-    ProviderDeltaChannel,
     StreamChunk,
     llm_budget_scope,
     model_request_input_text,
@@ -93,73 +101,60 @@ class CapturingGateway:
         )
 
 
+async def _stream_gateway_fragments(kwargs, fragments):
+    request = kwargs["request"]
+    sink = kwargs.get("event_sink")
+    assert kwargs.get("stream") is True
+    assert callable(sink)
+    state = ModelStreamState()
+
+    async def emit(event):
+        state.accept(event)
+        await emit_model_event(sink, event)
+
+    await emit(ModelResponseStarted())
+    for kind, fragment in fragments:
+        if kind not in {output.output_id for output in state.outputs}:
+            await emit(ModelOutputStarted(ModelOutput(kind, kind)))
+        await emit(ModelOutputDelta(kind, kind, fragment))
+    for output in state.outputs:
+        await emit(ModelOutputCompleted(output))
+    usage = normalize_llm_usage(
+        input_tokens=3, output_tokens=2, input_tokens_include_cache=True, usage_source="provider"
+    )
+    await emit(ModelResponseCompleted(usage=usage.model_dump(mode="json"), stop_reason="stop"))
+    return AgentModelResponse(
+        turn=ToolUseResult(
+            text="real gateway answer",
+            reasoning_content="".join(output.content for output in state.outputs if output.kind == "reasoning") or None,
+            stop_reason=StopReason.END_TURN,
+            raw_stop_reason="stop",
+        ),
+        usage=usage,
+        outputs=state.outputs,
+        provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
+        serializer_revision="openai-wire-v1",
+        wire_kind="openai-compatible",
+    )
+
+
 class NativeTextDeltaGateway(CapturingGateway):
     def __init__(self) -> None:
         super().__init__()
         self.callback_returns = 0
 
     async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
-        request = kwargs["request"]
-        delta_sink = kwargs.get("delta_sink")
-        assert kwargs.get("stream") is True
-        assert callable(delta_sink)
-        for fragment in ("real ", "gateway answer"):
-            emitted = delta_sink(ProviderDelta(ProviderDeltaChannel.TEXT, fragment))
-            if emitted is not None:
-                await emitted
-            self.callback_returns += 1
-        return AgentModelResponse(
-            turn=ToolUseResult(
-                text="real gateway answer",
-                stop_reason=StopReason.END_TURN,
-                raw_stop_reason="stop",
-            ),
-            usage=normalize_llm_usage(
-                input_tokens=3,
-                output_tokens=2,
-                input_tokens_include_cache=True,
-                usage_source="provider",
-            ),
-            provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
-            serializer_revision="openai-wire-v1",
-            wire_kind="openai-compatible",
-        )
+        result = await _stream_gateway_fragments(kwargs, (("text", "real "), ("text", "gateway answer")))
+        self.callback_returns = 2
+        return result
 
 
 class NativeReasoningPlanGateway(CapturingGateway):
     async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
-        request = kwargs["request"]
-        delta_sink = kwargs.get("delta_sink")
-        assert kwargs.get("stream") is True
-        assert callable(delta_sink)
-        fragments = (
-            (ProviderDeltaChannel.REASONING, "inspect "),
-            (ProviderDeltaChannel.REASONING, "evidence"),
-            (ProviderDeltaChannel.PLAN, "patch "),
-            (ProviderDeltaChannel.PLAN, "and verify"),
-            (ProviderDeltaChannel.TEXT, "real gateway answer"),
-        )
-        for channel, fragment in fragments:
-            emitted = delta_sink(ProviderDelta(channel, fragment))
-            if emitted is not None:
-                await emitted
-        return AgentModelResponse(
-            turn=ToolUseResult(
-                text="real gateway answer",
-                reasoning_content="inspect evidence",
-                stop_reason=StopReason.END_TURN,
-                raw_stop_reason="stop",
-            ),
-            usage=normalize_llm_usage(
-                input_tokens=3,
-                output_tokens=7,
-                input_tokens_include_cache=True,
-                usage_source="provider",
-            ),
-            provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
-            serializer_revision="openai-wire-v1",
-            wire_kind="openai-compatible",
-        )
+        return await _stream_gateway_fragments(kwargs, (
+            ("reasoning", "inspect "), ("reasoning", "evidence"),
+            ("plan", "patch "), ("plan", "and verify"), ("text", "real gateway answer"),
+        ))
 
 
 class FastSyncStreamingProvider:
@@ -476,13 +471,13 @@ async def test_native_text_deltas_are_awaited_and_keep_one_item_id(
             )
         )
 
-        turn_started = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        item_started_event = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        first_delta = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        second_delta = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        item_completed_event = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        turn_completed = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        result = await asyncio.wait_for(running, timeout=0.5)
+        events = []
+        while not events or events[-1].type is not EventType.TURN_COMPLETED:
+            events.append(await asyncio.wait_for(stream.receive(), timeout=1.0))
+        result = await asyncio.wait_for(running, timeout=1.0)
+        turn_started, turn_completed = events[0], events[-1]
+        output_events = [event for event in events if event.item_kind is TurnItemKind.AGENT_MESSAGE]
+        item_started_event, first_delta, second_delta, item_completed_event = output_events
 
     assert gateway.callback_returns == 2
     assert turn_started.type is EventType.TURN_STARTED
@@ -660,15 +655,15 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
             binding_manifest={"model_id": "test-model"},
         )
     )
-    deltas: list[HarnessModelDelta] = []
+    deltas: list[ModelEvent] = []
 
-    async def capture(delta: HarnessModelDelta) -> None:
+    async def capture(delta: ModelEvent) -> None:
         deltas.append(delta)
 
-    response = await model.dispatch(prepared, delta_sink=capture)
+    response = await model.dispatch(prepared, event_sink=capture)
 
     assert response.text == "one complete response"
-    assert [(delta.channel, delta.content) for delta in deltas] == [
+    assert [(delta.delta_kind, delta.content) for delta in deltas if isinstance(delta, ModelOutputDelta)] == [
         ("text", "one complete response")
     ]
 
@@ -818,7 +813,7 @@ def test_compaction_changes_the_actual_provider_wire_and_preserves_critical_fact
 ),
         instructions=("Answer the user directly.",),
     )
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=thread.thread_id,
@@ -1004,7 +999,7 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
 def test_legacy_binding_replays_but_provider_resume_fails_closed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,

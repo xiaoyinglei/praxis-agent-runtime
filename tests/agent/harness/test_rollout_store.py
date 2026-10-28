@@ -11,7 +11,7 @@ from threading import Barrier
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 
 ROOT = Path(__file__).parents[3]
 VERIFY_SCRIPT = ROOT / "scripts" / "verify_agent_rollout.py"
@@ -22,7 +22,7 @@ def test_settings_update_does_not_rewrite_historical_projections(
     tmp_path: Path, history_size: int,
 ) -> None:
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         for _ in range(history_size):
             turn = store.start_turn(
@@ -34,11 +34,11 @@ def test_settings_update_does_not_rewrite_historical_projections(
         historical_turns = store.list_turns()
         historical_items = tuple(store.list_items(turn.turn_id) for turn in historical_turns)
         statements: list[str] = []
-        store.run_sync(lambda: store._connection.set_trace_callback(statements.append))
+        store.run_sync(lambda: store.persistence._connection.set_trace_callback(statements.append))
 
         store.update_session_settings(thread.thread_id, {"model_alias": "new-model"})
 
-        store.run_sync(lambda: store._connection.set_trace_callback(None))
+        store.run_sync(lambda: store.persistence._connection.set_trace_callback(None))
         inserts = [statement for statement in statements if statement.lstrip().startswith("INSERT INTO")]
         assert len(inserts) == 3, inserts
         assert store.list_turns() == historical_turns
@@ -52,7 +52,7 @@ def test_settings_update_does_not_rewrite_historical_projections(
 
 def test_incremental_projection_failure_rolls_back_record_and_changed_entities(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id, user_message="atomic update", binding_manifest={},
@@ -62,7 +62,7 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         hashes = store.projection_hashes()
         items = store.list_items(turn.turn_id)
         store.run_sync(
-            lambda: store._connection.execute(
+            lambda: store.persistence._connection.execute(
                 """
             CREATE TRIGGER reject_projection_commit BEFORE UPDATE ON projection_meta
             BEGIN SELECT RAISE(ABORT, 'projection write rejected'); END
@@ -79,7 +79,7 @@ def test_incremental_projection_failure_rolls_back_record_and_changed_entities(t
         assert store.list_items(turn.turn_id) == items
         assert store.projection_hashes() == hashes
         assert store.verify().valid
-        store.run_sync(lambda: store._connection.execute("DROP TRIGGER reject_projection_commit").close())
+        store.run_sync(lambda: store.persistence._connection.execute("DROP TRIGGER reject_projection_commit").close())
         store.complete_turn(turn_id=turn.turn_id, answer="committed after retry")
         assert store.verify().valid
 
@@ -88,7 +88,7 @@ def test_committed_mutation_returns_only_records_after_commit(tmp_path: Path) ->
     database = tmp_path / "rollout.sqlite3"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         mutation = store.capture_mutation(lambda: store.create_thread(workspace=workspace))
         [record] = mutation.records
         assert mutation.value.thread_id == record.thread_id
@@ -106,7 +106,7 @@ def test_start_turn_persists_records_and_rebuildable_projections(tmp_path: Path)
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -131,7 +131,7 @@ def test_start_turn_persists_records_and_rebuildable_projections(tmp_path: Path)
         assert [record.thread_sequence for record in records] == [1, 2, 3, 4]
         assert store.verify().valid is True
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         assert reopened.read_turn(turn.turn_id) == turn
         assert reopened.verify().valid is True
 
@@ -141,7 +141,7 @@ def test_projection_corruption_is_detected_and_rebuilt_from_records(tmp_path: Pa
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -175,7 +175,7 @@ def test_projection_metadata_binds_hash_reducer_and_record_position(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         store.start_turn(
             thread_id=thread.thread_id,
@@ -213,7 +213,7 @@ def test_two_fresh_processes_rebuild_identical_prefix_to_identical_hash(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     source = tmp_path / "source.sqlite3"
-    with RolloutStore(source) as store:
+    with RuntimeState.open_sync(source) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -258,7 +258,7 @@ def test_rebuild_rejects_an_unregistered_payload_schema_version(tmp_path: Path) 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         with sqlite3.connect(database) as corruptor:
             corruptor.execute(
@@ -267,7 +267,7 @@ def test_rebuild_rejects_an_unregistered_payload_schema_version(tmp_path: Path) 
             )
 
         with pytest.raises(
-            ValueError,
+            RuntimeError,
             match="unsupported RolloutRecord payload schema version",
         ):
             store.rebuild_projections()
@@ -278,7 +278,7 @@ def test_complete_turn_commits_answer_before_releasing_thread(tmp_path: Path) ->
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=thread.thread_id,
@@ -308,12 +308,12 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite3"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id = store.create_thread(workspace=workspace).thread_id
     barrier = Barrier(2)
 
     def compete(message: str) -> str:
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             barrier.wait()
             try:
                 return store.start_turn(
@@ -329,15 +329,15 @@ def test_two_connections_cannot_start_two_active_turns(tmp_path: Path) -> None:
 
     assert results.count("busy") == 1
     assert len([result for result in results if result != "busy"]) == 1
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         active_turn_id = store.read_thread(thread_id).active_turn_id
         assert active_turn_id in results
         assert store.verify().valid is True
 
 
 def test_connection_sets_explicit_busy_timeout(tmp_path: Path) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
-        timeout = store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout").fetchone())[0]
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+        timeout = store.run_sync(lambda: store.persistence._connection.execute("PRAGMA busy_timeout").fetchone())[0]
         assert timeout == 30000
 
 
@@ -358,31 +358,31 @@ def test_failed_commit_does_not_leave_connection_inside_transaction(tmp_path: Pa
         def __getattr__(self, name: str) -> object:
             return getattr(self._connection, name)
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
-        store._connection = _CommitFailingConnection(store._connection)  # type: ignore[assignment]
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
+        store.persistence._connection = _CommitFailingConnection(store.persistence._connection)  # type: ignore[assignment]
 
         with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
 
             def transaction():
-                with store._transaction():
+                with store.persistence.transaction():
                     store.run_sync(
-                        lambda: store._connection.execute(
+                        lambda: store.persistence._connection.execute(
                             "INSERT INTO store_metadata(key, value) VALUES ('probe', '1')",
                         ).close()
                     )
 
             store.run_sync(transaction)
 
-        assert store._connection.in_transaction is False
+        assert store.persistence._connection.in_transaction is False
         probe = store.run_sync(
-            lambda: store._connection.execute(
+            lambda: store.persistence._connection.execute(
                 "SELECT value FROM store_metadata WHERE key = 'probe'",
             ).fetchone()
         )
         assert probe is None
 
         def transaction():
-            with store._transaction():
+            with store.persistence.transaction():
                 pass
 
         store.run_sync(transaction)
@@ -391,7 +391,7 @@ def test_failed_commit_does_not_leave_connection_inside_transaction(tmp_path: Pa
 def test_pending_cancellation_blocks_clarification_and_choice_resolution(tmp_path: Path) -> None:
     (tmp_path / "one").mkdir()
     (tmp_path / "two").mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         # One active turn per thread: keep each scenario on its own thread.
         first = store.start_turn(
             thread_id=store.create_thread(workspace=tmp_path / "one").thread_id,

@@ -558,6 +558,21 @@ class TerminalToolEventDisplay:
             self._render_legacy_error(event)
         elif event.type is EventType.PLAN_UPDATED:
             self._render_plan(event)
+        elif event.type is EventType.MODEL_ATTEMPT_UPDATED:
+            status = event.data.get("status")
+            if event.data.get("response_status") == "incomplete":
+                self._activity_status = "模型输出未完成"
+                self._write_line("↻ 模型输出未完成，本次输出不会作为完整执行步骤提交。")
+            elif status in {"prepared", "retry_prepared", "dispatched", "responding"}:
+                self._activity_status = "等待模型" if status != "retry_prepared" else "重试模型请求"
+            elif status == "unknown":
+                self._activity_status = "模型结果待核对"
+        elif event.type is EventType.INTERACTION_REQUESTED:
+            self._activity_status = "等待用户"
+        elif event.type in {EventType.INTERACTION_RESOLVED, EventType.INTERACTION_INVALIDATED}:
+            self._activity_status = "继续执行"
+        elif event.type is EventType.CONTEXT_COMPACTION_STARTED:
+            self._activity_status = "整理上下文"
         elif event.type is EventType.TURN_STARTED and isinstance(event.data.get("context_capacity_policy"), Mapping):
             policy = event.data["context_capacity_policy"]
             assert isinstance(policy, Mapping)
@@ -602,11 +617,17 @@ class TerminalToolEventDisplay:
                     f"Web 请求={status.get('web_requests_remaining', 'unset')} · "
                     f"token={status.get('tokens_remaining', 'unset')}"
                 )
-        elif event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data:
-            data = event.data
+        elif event.type is EventType.CONTEXT_COMPACTION_COMPLETED or (
+            event.type is EventType.COMPACT_LAYER and "trigger_reason" in event.data
+        ):
+            diagnostics = event.data.get("capacity_diagnostics", event.data)
+            data = diagnostics if isinstance(diagnostics, Mapping) else {}
+            if event.data.get("status", "completed") != "completed":
+                self._activity_status = "上下文整理未完成"
+                return
             self._render_context_status(
                 "compaction",
-                f"语义压缩 {data['trigger_reason']}: 输入 {data.get('before_input_tokens', 'unknown')} → "
+                f"语义压缩 {data.get('trigger_reason', '')}: 输入 {data.get('before_input_tokens', 'unknown')} → "
                 f"{data.get('after_input_tokens', 'unknown')} · 摘要请求={data.get('summary_calls', 'unknown')} · "
                 f"token={data.get('summary_tokens', 'unknown')}"
             )
@@ -654,6 +675,9 @@ class TerminalToolEventDisplay:
             self._started_at = None
 
     def _render_item_start(self, event: StreamEvent) -> None:
+        if event.item_kind is TurnItemKind.TOOL_CALL:
+            self._activity_status = "生成工具请求"
+            return
         if event.item_kind is TurnItemKind.AGENT_MESSAGE:
             self._answer_has_text = False
             self._pending_answer_whitespace = ""
@@ -679,6 +703,9 @@ class TerminalToolEventDisplay:
     def _render_item_delta(self, event: StreamEvent) -> None:
         delta = event.data.get("delta")
         if not isinstance(delta, str) or not delta:
+            return
+        if event.delta_kind is ItemDeltaKind.TOOL_ARGUMENTS:
+            self._activity_status = "生成工具参数"
             return
         if event.delta_kind is ItemDeltaKind.TEXT:
             self._render_text(delta)
@@ -726,6 +753,9 @@ class TerminalToolEventDisplay:
                 self._write_line(f"… {state.name}: {progress}")
 
     def _render_item_completed(self, event: StreamEvent) -> None:
+        if event.item_kind is TurnItemKind.TOOL_CALL:
+            self._activity_status = "工具请求已生成"
+            return
         if event.item_kind is TurnItemKind.PLAN:
             self._render_plan(event)
             return

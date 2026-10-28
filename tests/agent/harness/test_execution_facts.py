@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
@@ -48,7 +48,7 @@ async def test_python_output_file_cannot_invent_verification_metadata(tmp_path: 
 async def test_read_count_never_forces_an_edit_or_hides_tools(tmp_path: Path, revision):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "state.db") as store:
+    async with (await RuntimeState.open(tmp_path / "state.db")) as store:
         policy = {"require_workspace_change": True}
         if revision is not None:
             policy["revision"] = revision
@@ -71,7 +71,7 @@ async def test_v2_reads_do_not_create_automatic_verification_certificates(tmp_pa
     runtime = open_workspace(tmp_path / "workspace", create=True)
     workspace = runtime.root
     (workspace / "module.py").write_text("value = 1\n")
-    with RolloutStore(tmp_path / "state.db") as store:
+    async with (await RuntimeState.open(tmp_path / "state.db")) as store:
         turn = store.start_turn(thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="read only", binding_manifest={"completion_policy": {"revision": "completion-v2"}})
         tool = _tools(runtime)["read_file"]

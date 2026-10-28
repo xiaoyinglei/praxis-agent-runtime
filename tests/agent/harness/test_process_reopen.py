@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.budget import ResourceUsage
-from agent_runtime.harness import RolloutStore, Session
+from agent_runtime.harness import RuntimeState, Session
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
 
@@ -50,9 +50,9 @@ class Waiting(ReopenModel):
                             for m in request.messages)):
             raise ContextCompactionRequiredError(input_tokens=1000, max_input_tokens=500, retained_tail_messages=1)
         return super().prepare(request)
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         if not self.armed:
-            return replace(await super().dispatch(prepared, delta_sink=delta_sink), text="previous answer " * 1000)
+            return replace(await super().dispatch(prepared, event_sink=event_sink), text="previous answer " * 1000)
         print("DISPATCHED", flush=True)
         await asyncio.Event().wait()
 async def main():
@@ -76,7 +76,7 @@ asyncio.run(main())
         assert ready.strip() == "DISPATCHED"
         child.send_signal(stop_signal)
         await asyncio.to_thread(child.wait, 10)
-        with RolloutStore(database, read_only=True) as store:
+        async with (await RuntimeState.open(database, read_only=True)) as store:
             turn_id = store.read_thread(thread_id.strip()).active_turn_id
             assert turn_id is not None
             assert store.list_model_operations(turn_id)[-1].status in {"dispatched", "unknown"}
@@ -111,7 +111,7 @@ async def test_live_worker_cannot_be_stolen_or_receive_rejected_followup(tmp_pat
     started = asyncio.Event()
 
     class Waiting(PublicHarnessModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             started.set()
             await asyncio.Event().wait()
 
@@ -147,7 +147,7 @@ async def test_legacy_unexpired_dispatch_is_not_claimed(tmp_path):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old worker", binding_manifest={})
         operation = store.prepare_model_operation(turn_id=turn.turn_id, request_hash="r", context_hash="c",
@@ -257,7 +257,7 @@ async def test_resumed_execution_accepts_live_steering_and_a_second_cancellation
     started = asyncio.Event()
 
     class Waiting(PublicHarnessModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             started.set()
             await asyncio.Event().wait()
 
@@ -292,7 +292,7 @@ async def test_pre_dispatch_orphan_abort_and_invalid_action(tmp_path, action):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "state.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="original",
                                binding_manifest={"execution_ownership": OWNERSHIP_REVISION})

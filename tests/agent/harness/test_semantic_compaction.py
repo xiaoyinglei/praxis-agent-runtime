@@ -4,14 +4,14 @@ import asyncio
 import json
 from pathlib import Path
 
-from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
 from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
 
 def test_recompaction_uses_committed_memory_and_new_history_not_raw_archive(tmp_path: Path):
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -32,7 +32,7 @@ def test_recompaction_uses_committed_memory_and_new_history_not_raw_archive(tmp_
 
 
 def test_full_history_is_chunked_and_internal_summaries_are_durable(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -69,7 +69,7 @@ def test_full_history_is_chunked_and_internal_summaries_are_durable(tmp_path: Pa
 def test_latest_tool_evidence_survives_semantic_compaction_verbatim(tmp_path: Path):
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(
@@ -106,7 +106,7 @@ def test_summary_with_exhausted_budget_stops_before_adapter(tmp_path: Path, monk
 
     from agent_runtime.harness.protocol import ContextBudgetExceededError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         model, gateway = model_for()
         runner = TurnExecutor(
@@ -126,7 +126,7 @@ def test_summary_with_exhausted_budget_stops_before_adapter(tmp_path: Path, monk
 
 def test_committed_summary_is_reused_after_restart_before_compaction(tmp_path: Path):
     database = tmp_path / "r.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -140,7 +140,7 @@ def test_committed_summary_is_reused_after_restart_before_compaction(tmp_path: P
         )
         assert manager.semantic_source(turn.turn_id) == (source_hash, source)
         assert summary
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         manager = RolloutContextManager(store)
         model, gateway = model_for()
         runner = TurnExecutor(
@@ -155,19 +155,19 @@ def test_committed_summary_is_reused_after_restart_before_compaction(tmp_path: P
 def test_provider_overflow_retries_once_with_a_new_durable_request(tmp_path: Path):
     from agent_runtime.harness.protocol import ModelContextOverflowError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for(100000)
         original_dispatch = model.dispatch
         agent_calls = []
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref.get("purpose") != "context_summary":
                 agent_calls.append(prepared.request_ref["request_id"])
                 if len(agent_calls) == 1:
                     raise ModelContextOverflowError("provider context window rejected")
-            return await original_dispatch(prepared, delta_sink=delta_sink)
+            return await original_dispatch(prepared, event_sink=event_sink)
 
         model.dispatch = dispatch
         runner = TurnExecutor(
@@ -187,18 +187,18 @@ def test_provider_overflow_retries_once_with_a_new_durable_request(tmp_path: Pat
 def test_second_provider_overflow_stops_without_retry_loop(tmp_path: Path):
     from agent_runtime.harness.protocol import ModelContextOverflowError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for(100000)
         original_dispatch = model.dispatch
         calls = []
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref.get("purpose") != "context_summary":
                 calls.append(prepared.request_ref["request_id"])
                 raise ModelContextOverflowError("still too large")
-            return await original_dispatch(prepared, delta_sink=delta_sink)
+            return await original_dispatch(prepared, event_sink=event_sink)
 
         model.dispatch = dispatch
         runner = TurnExecutor(
@@ -216,7 +216,7 @@ def test_second_provider_overflow_stops_without_retry_loop(tmp_path: Path):
 
 
 def test_request_inside_effective_provider_budget_does_not_apply_another_percentage(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -247,20 +247,20 @@ def test_request_inside_effective_provider_budget_does_not_apply_another_percent
 def test_unknown_summary_retry_preserves_internal_purpose(tmp_path: Path):
     from agent_runtime.harness.protocol import ModelDispatchOutcomeUnknownError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for()
         original_dispatch = model.dispatch
         calls = []
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             calls.append(prepared.request_ref["request_id"])
             if len(calls) == 1:
                 assert prepared.request_ref["purpose"] == "context_summary"
-                assert delta_sink is None
+                assert event_sink is None
                 raise ModelDispatchOutcomeUnknownError("connection lost after dispatch")
-            return await original_dispatch(prepared, delta_sink=delta_sink)
+            return await original_dispatch(prepared, event_sink=event_sink)
 
         model.dispatch = dispatch
         runner = TurnExecutor(
@@ -283,7 +283,7 @@ def test_crash_after_summary_prepare_recovers_same_operation(tmp_path: Path):
     import pytest
 
     database = tmp_path / "r.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, _ = model_for()
@@ -303,7 +303,7 @@ def test_crash_after_summary_prepare_recovers_same_operation(tmp_path: Path):
             asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         [prepared] = store.list_model_operations(turn.turn_id)
         assert prepared.status == "prepared"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         model, gateway = model_for()
         runner = TurnExecutor(
             thread_id=thread.thread_id,
@@ -323,7 +323,7 @@ def test_crash_after_summary_prepare_recovers_same_operation(tmp_path: Path):
 def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: Path):
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         for index in range(5):
             seed(
@@ -367,16 +367,16 @@ def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: 
 def test_incomplete_summary_never_commits_a_context_transition(tmp_path: Path):
     from agent_runtime.harness import HarnessModelResponse
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
         original = manager.build(turn.turn_id)
         model, _ = model_for()
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             assert prepared.request_ref["purpose"] == "context_summary"
-            assert delta_sink is None
+            assert event_sink is None
             return HarnessModelResponse(
                 text="cut off",
                 provider_response_id="partial",
@@ -399,14 +399,14 @@ def test_incomplete_summary_never_commits_a_context_transition(tmp_path: Path):
 def test_oversized_generated_summary_is_rejected_without_length_ladder(tmp_path: Path):
     from agent_runtime.harness import HarnessModelResponse
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, _ = model_for(100000)
         original_dispatch = model.dispatch
         summaries = []
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref["purpose"] == "context_summary":
                 summaries.append(prepared.request_ref["step_snapshot"]["messages"][0]["content"])
                 return HarnessModelResponse(
@@ -416,7 +416,7 @@ def test_oversized_generated_summary_is_rejected_without_length_ladder(tmp_path:
                     provider_response_id="summary",
                     usage={},
                 )
-            return await original_dispatch(prepared, delta_sink=delta_sink)
+            return await original_dispatch(prepared, event_sink=event_sink)
 
         model.dispatch = dispatch
         manager = RolloutContextManager(store, max_total_bytes=5000)

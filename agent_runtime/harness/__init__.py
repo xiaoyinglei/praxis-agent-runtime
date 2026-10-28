@@ -20,8 +20,6 @@ from agent_runtime.harness.protocol import (
     ContextSourceChangedError,
     HarnessMessage,
     HarnessModel,
-    HarnessModelDelta,
-    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
@@ -32,28 +30,42 @@ from agent_runtime.harness.protocol import (
     ToolRouter,
     TurnResult,
 )
-from agent_runtime.harness.rollout import (
+from agent_runtime.harness.records import (
     ArtifactSnapshot,
     CommittedMutation,
     ItemSnapshot,
     ModelAttemptSnapshot,
     ModelOperationSnapshot,
     RolloutRecord,
-    RolloutStore,
     ThreadSnapshot,
     ToolOperationSnapshot,
     TurnSnapshot,
     VerificationReport,
 )
+from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.session import Session
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.tool_orchestrator import (
     ToolOrchestrator,
     ToolReconciliationOutcome,
 )
 from agent_runtime.harness.tool_router import DurableToolRouter, StaticToolRouter
 from agent_runtime.harness.turn import StepContext, TurnContext, TurnExecutor
+from agent_runtime.modeling.events import (
+    ModelEvent,
+    ModelEventSink,
+    ModelOutput,
+    ModelOutputCompleted,
+    ModelOutputDelta,
+    ModelOutputStarted,
+    ModelResponseCompleted,
+    ModelResponseStarted,
+    ModelStreamState,
+)
 
 __all__ = [
+    "ModelEvent", "ModelEventSink", "ModelOutput", "ModelOutputStarted", "ModelOutputDelta",
+    "ModelOutputCompleted", "ModelResponseStarted", "ModelResponseCompleted", "ModelStreamState",
     "ArtifactSnapshot",
     "BindingProvider",
     "BoundHarnessModel",
@@ -72,8 +84,6 @@ __all__ = [
     "HarnessMessage",
     "GatewayHarnessModel",
     "HarnessModel",
-    "HarnessModelDelta",
-    "HarnessModelDeltaSink",
     "HarnessModelRequest",
     "HarnessModelResponse",
     "HarnessToolCall",
@@ -89,6 +99,7 @@ __all__ = [
     "RolloutContextManager",
     "RolloutEvent",
     "RolloutEventReader",
+    "RuntimeState",
     "RolloutStore",
     "ThreadSnapshot",
     "StaticToolRouter",

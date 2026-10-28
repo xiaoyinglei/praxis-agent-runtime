@@ -139,8 +139,18 @@ class OpenAICompatibleChatGenerator:
         authoritative_stop = False
         final_reason = "end_turn"
         reported_usage = None
+        provider_response_id = None
+        response_started = False
         try:
             for response_chunk in stream:
+                observed_id = getattr(response_chunk, "id", None)
+                if isinstance(observed_id, str) and observed_id:
+                    if provider_response_id is not None and provider_response_id != observed_id:
+                        raise ValueError("provider changed response identity during stream")
+                    provider_response_id = observed_id
+                if not response_started:
+                    response_started = True
+                    yield {"type": "response_start", "provider_response_id": provider_response_id}
                 usage = _openai_response_usage(response_chunk)
                 if usage is not None:
                     reported_usage = usage
@@ -151,13 +161,24 @@ class OpenAICompatibleChatGenerator:
                 delta = choice.delta
                 content = getattr(delta, "content", None)
                 if content:
-                    yield {"type": "text_delta", "content": str(content)}
+                    yield {"type": "text_delta", "content": str(content), "provider_response_id": provider_response_id}
                 reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
                 if reasoning:
-                    yield {"type": "thinking_delta", "content": str(reasoning)}
+                    yield {
+                        "type": "thinking_delta",
+                        "content": str(reasoning),
+                        "provider_response_id": provider_response_id,
+                    }
                 plan = getattr(delta, "plan", None)
                 if plan:
-                    yield {"type": "plan_delta", "content": str(plan)}
+                    yield {"type": "plan_delta", "content": str(plan), "provider_response_id": provider_response_id}
+                refusal = getattr(delta, "refusal", None)
+                if refusal:
+                    yield {
+                        "type": "refusal_delta",
+                        "content": str(refusal),
+                        "provider_response_id": provider_response_id,
+                    }
                 for tool_call in getattr(delta, "tool_calls", None) or ():
                     index = int(tool_call.index)
                     function = tool_call.function
@@ -169,6 +190,7 @@ class OpenAICompatibleChatGenerator:
                             "type": "tool_use_start",
                             "tool_name": tool_name,
                             "tool_id": tool_id,
+                            "provider_response_id": provider_response_id,
                         }
                     if function.arguments:
                         tool_id, _tool_name = tool_blocks[index]
@@ -186,7 +208,12 @@ class OpenAICompatibleChatGenerator:
                     authoritative_stop = True
             if not authoritative_stop:
                 raise ConnectionError("OpenAI-compatible stream ended without a finish reason")
-            yield {"type": "message_stop", "stop_reason": final_reason, "usage": reported_usage}
+            yield {
+                "type": "message_stop",
+                "stop_reason": final_reason,
+                "usage": reported_usage,
+                "provider_response_id": provider_response_id,
+            }
         finally:
             close = getattr(stream, "close", None)
             if callable(close):
@@ -251,14 +278,18 @@ def _is_complete_chat_response(value: object) -> bool:
 def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
     """Normalize providers that ignore stream=True and return one completion."""
 
+    provider_response_id = getattr(response, "id", None)
     choice = response.choices[0]  # type: ignore[attr-defined]
     message = choice.message
     reasoning = getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None)
     if reasoning:
-        yield {"type": "thinking_delta", "content": str(reasoning)}
+        yield {"type": "thinking_delta", "content": str(reasoning), "provider_response_id": provider_response_id}
     content = getattr(message, "content", None)
     if content:
-        yield {"type": "text_delta", "content": str(content)}
+        yield {"type": "text_delta", "content": str(content), "provider_response_id": provider_response_id}
+    refusal = getattr(message, "refusal", None)
+    if refusal:
+        yield {"type": "refusal_delta", "content": str(refusal), "provider_response_id": provider_response_id}
     tool_calls = getattr(message, "tool_calls", None) or ()
     for index, tool_call in enumerate(tool_calls):
         tool_id = str(tool_call.id or f"tool-{index}")
@@ -279,6 +310,7 @@ def _complete_response_chunks(response: object) -> Iterator[dict[str, object]]:
         "type": "message_stop",
         "stop_reason": _stream_stop_reason(str(choice.finish_reason or "unknown")),
         "usage": _openai_response_usage(response),
+        "provider_response_id": provider_response_id,
     }
 
 

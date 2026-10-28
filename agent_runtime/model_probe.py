@@ -23,7 +23,8 @@ from agent_runtime.core.model_request import (
 from agent_runtime.model_credentials import resolve_model_credential
 from agent_runtime.model_definition import ModelExecutionDefinition
 from agent_runtime.modeling.contracts import LLMCallStage
-from agent_runtime.modeling.gateway import LLMGateway, ProviderDelta, ProviderDeltaChannel
+from agent_runtime.modeling.events import ModelEvent, ModelOutputDelta
+from agent_runtime.modeling.gateway import LLMGateway
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -146,9 +147,9 @@ class ModelProbe:
     ) -> int:
         delta_count = 0
 
-        def record_delta(delta: ProviderDelta) -> None:
+        def record_delta(delta: ModelEvent) -> None:
             nonlocal delta_count
-            if delta.channel is ProviderDeltaChannel.TEXT and delta.content:
+            if isinstance(delta, ModelOutputDelta) and delta.delta_kind == "text" and delta.content:
                 delta_count += 1
 
         request = _probe_request(definition=definition, tools=(), tool_choice=ToolChoice.none())
@@ -161,7 +162,7 @@ class ModelProbe:
                 provider=resolved.provider,
                 supports_native_tools=(resolved.capabilities.supports_native_tools),
                 stream=True,
-                delta_sink=record_delta,
+                event_sink=record_delta,
             ),
             definition=definition,
         )

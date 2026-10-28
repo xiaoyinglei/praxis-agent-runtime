@@ -16,10 +16,10 @@ from pathlib import Path
 from agent_runtime import Agent
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
-    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
+    ModelEventSink,
     PreparedModelCall,
 )
 from agent_runtime.result import AgentResult
@@ -143,9 +143,9 @@ class _SmokeModel:
         self,
         prepared: PreparedModelCall,
         *,
-        delta_sink: HarnessModelDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
-        del delta_sink
+        del event_sink
         step = int(prepared.request_ref["step"])
         if self.case.name == "direct_answer":
             return _response(text="4", step=step)

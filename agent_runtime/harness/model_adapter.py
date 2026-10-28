@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import inspect
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -32,11 +31,8 @@ from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextCompactionRequiredError,
     HarnessMessage,
-    HarnessModelDelta,
-    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ModelContextOverflowError,
     ModelDispatchCancelledError,
     ModelDispatchOutcomeUnknownError,
@@ -44,16 +40,22 @@ from agent_runtime.harness.protocol import (
     PreparedModelCall,
 )
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, context_capacity_policy
+from agent_runtime.modeling.events import (
+    ModelEvent,
+    ModelEventSink,
+    ModelStreamState,
+    emit_model_event,
+)
 from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
-    ProviderDelta,
+    _emit_complete_model_response,
     model_request_input_text,
 )
 from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request, stable_prompt_cache_key
 from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
-from agent_runtime.tools.tool import JsonValue
+from agent_runtime.tools.tool import JsonValue, _thaw_json
 
 
 @dataclass(frozen=True, slots=True)
@@ -294,7 +296,7 @@ class GatewayHarnessModel:
         self,
         prepared: PreparedModelCall,
         *,
-        delta_sink: HarnessModelDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
         payload = prepared.dispatch_payload
         if not isinstance(payload, _GatewayDispatch):
@@ -303,24 +305,11 @@ class GatewayHarnessModel:
         gateway = resolved.gateway
         if gateway is None:
             raise RuntimeError("resolved model gateway disappeared before dispatch")
-        streamed_content: dict[str, list[str]] = {
-            "text": [],
-            "reasoning": [],
-            "plan": [],
-        }
+        stream_state = ModelStreamState()
 
-        async def forward_delta(delta: ProviderDelta) -> None:
-            streamed_content[delta.channel.value].append(delta.content)
-            if delta_sink is None:
-                return
-            emitted = delta_sink(
-                HarnessModelDelta(
-                    channel=delta.channel.value,
-                    content=delta.content,
-                )
-            )
-            if inspect.isawaitable(emitted):
-                await emitted
+        async def forward_event(event: ModelEvent) -> None:
+            stream_state.accept(event)
+            await emit_model_event(event_sink, event)
 
         try:
             response = await gateway.agenerate_model_request(
@@ -328,8 +317,8 @@ class GatewayHarnessModel:
                 request=payload.request,
                 provider=resolved.provider,
                 supports_native_tools=resolved.capabilities.supports_native_tools,
-                stream=delta_sink is not None,
-                delta_sink=forward_delta if delta_sink is not None else None,
+                stream=event_sink is not None,
+                event_sink=forward_event if event_sink is not None else None,
                 ledger=None,
                 lease_id=f"{payload.request.request_id}:provider",
                 inherit_budget_ledger=False,
@@ -362,40 +351,47 @@ class GatewayHarnessModel:
             raise
         if response.provider_wire_hash != payload.wire_hash:
             raise RuntimeError("provider wire changed between prepare and dispatch")
-        if response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}:
-            return HarnessModelResponse(
-                text=response.turn.text,
-                provider_response_id=None,
-                usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
-                tool_calls=(),
-                status="incomplete",
-                incomplete_reason=("max_output_tokens" if response.turn.stop_reason is StopReason.MAX_TOKENS
-                                   else response.turn.raw_stop_reason or "unknown"),
-                reasoning_content=(response.turn.reasoning_content or "".join(streamed_content["reasoning"]) or None),
-                plan_content="".join(streamed_content["plan"]) or None,
-            )
-        if response.turn.stop_reason is StopReason.TOOL_USE and not response.turn.tool_calls:
-            raise RuntimeError("tool-use stop reason did not include tool calls")
-        if response.turn.stop_reason is StopReason.END_TURN and response.turn.tool_calls:
-            raise RuntimeError("end-turn response unexpectedly included tool calls")
-        if not response.turn.text.strip() and not response.turn.tool_calls:
-            raise RuntimeError("model returned neither text nor tool calls")
-        return HarnessModelResponse(
-            text=response.turn.text,
-            provider_response_id=None,
+        if event_sink is not None:
+            if not stream_state.started:
+                await _emit_complete_model_response(forward_event, response)
+            if not stream_state.completed:
+                raise ModelDispatchOutcomeUnknownError("model stream ended without a terminal response")
+            if stream_state.outputs != response.outputs:
+                raise RuntimeError("model stream output snapshots disagree with the terminal response")
+            if stream_state.provider_response_id != response.provider_response_id:
+                raise RuntimeError("model stream response identity disagrees with the terminal response")
+        incomplete = response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+        if not incomplete:
+            if response.turn.stop_reason is StopReason.TOOL_USE and not response.turn.tool_calls:
+                raise RuntimeError("tool-use stop reason did not include tool calls")
+            if response.turn.stop_reason is StopReason.END_TURN and response.turn.tool_calls:
+                raise RuntimeError("end-turn response unexpectedly included tool calls")
+            if not response.turn.text.strip() and not response.turn.tool_calls:
+                raise RuntimeError("model returned neither text nor tool calls")
+        result = HarnessModelResponse(
+            provider_response_id=response.provider_response_id,
             usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
-            tool_calls=tuple(
-                HarnessToolCall(
-                    id=call.id,
-                    name=call.name,
-                    arguments=call.input,
-                    argument_error=call.argument_error,
-                )
-                for call in response.turn.tool_calls
-            ),
-            reasoning_content=(response.turn.reasoning_content or "".join(streamed_content["reasoning"]) or None),
-            plan_content="".join(streamed_content["plan"]) or None,
+            outputs=response.outputs,
+            stop_reason=response.turn.raw_stop_reason or response.turn.stop_reason.value,
+            status="incomplete" if incomplete else "completed",
+            incomplete_reason=(
+                "max_output_tokens"
+                if response.turn.stop_reason is StopReason.MAX_TOKENS
+                else response.turn.raw_stop_reason or "unknown"
+            )
+            if incomplete
+            else None,
         )
+        if event_sink is not None:
+            stream_state.validate_response(
+                outputs=result.outputs,
+                provider_response_id=result.provider_response_id,
+                usage=result.usage,
+                status=result.status,
+                incomplete_reason=result.incomplete_reason,
+                stop_reason=result.stop_reason,
+            )
+        return result
 
 
 class ControlPlaneHarnessModel:
@@ -475,7 +471,7 @@ class ControlPlaneHarnessModel:
         self,
         prepared: PreparedModelCall,
         *,
-        delta_sink: HarnessModelDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
         payload = prepared.dispatch_payload
         if not isinstance(payload, _GatewayDispatch):
@@ -484,7 +480,7 @@ class ControlPlaneHarnessModel:
             model_id=str(prepared.request_ref["model_id"]),
             resolved=payload.resolved,
             instructions=self._instructions,
-        ).dispatch(prepared, delta_sink=delta_sink)
+        ).dispatch(prepared, event_sink=event_sink)
 
 
 _AUTHENTICATED_MODEL_BINDING_FIELDS = frozenset(
@@ -560,11 +556,12 @@ def _model_messages(
                 role=role,  # type: ignore[arg-type]
                 content=message.content,
                 reasoning_content=message.reasoning_content,
+                outputs=message.outputs,
                 tool_calls=tuple(
                     ModelToolCall(
                         id=call.id,
                         name=call.name,
-                        input=dict(call.arguments),
+                        input=cast(dict[str, Any], _thaw_json(call.arguments)),
                         argument_error=call.argument_error,
                     )
                     for call in message.tool_calls

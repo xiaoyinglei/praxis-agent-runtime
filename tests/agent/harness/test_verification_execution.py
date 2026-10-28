@@ -130,14 +130,14 @@ def test_executed_assertion_does_not_invent_file_coverage(tmp_path):
 
 
 def test_unrelated_assertions_do_not_verify_the_changed_file(tmp_path):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         for target in ["other.py", "module.py"]:
             _commit_tool_result(
@@ -197,14 +197,14 @@ def test_managed_runner_does_not_overwrite_task_files(tmp_path):
 
 
 def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -228,14 +228,14 @@ def test_saved_verification_is_reassessed_against_bound_source_result(tmp_path):
 
 
 def test_mismatched_call_and_operation_cannot_attest_saved_verification(tmp_path, monkeypatch):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.completion import DeliveryCompletionGate
     from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
     from tests.agent.harness.test_verification_feedback import _start_changed_turn
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         record_call = store.record_tool_call
 

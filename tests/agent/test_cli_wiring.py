@@ -20,7 +20,7 @@ from agent_runtime.cli import (
     _load_knowledge_config,
     agent_app,
 )
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.model_probe import ModelProbe, ModelProbeEvidence, ProbeLevel
 from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
 from agent_runtime.models import ModelControlPlane
@@ -882,7 +882,7 @@ def test_agent_chat_followup_restores_workspace_but_uses_current_session_model(
         storage_root=tmp_path / "knowledge",
         vector_backend="sqlite",
     )
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=turn_workspace)
         previous = store.start_turn(
             thread_id=thread.thread_id,

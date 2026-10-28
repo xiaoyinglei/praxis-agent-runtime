@@ -9,7 +9,7 @@ import pytest
 
 from agent_runtime.harness import (
     RolloutEventReader,
-    RolloutStore,
+    RuntimeState,
     ToolOrchestrator,
     ToolReconciliationOutcome,
 )
@@ -27,7 +27,7 @@ def test_reconciliation_item_parents_unknown_attempt_without_rerun(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     runner_calls = 1
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -136,7 +136,7 @@ def test_fresh_process_interrupts_a_pre_dispatch_orphan_only_after_maintenance(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as crashed_process:
+    with RuntimeState.open_sync(database) as crashed_process:
         thread = crashed_process.create_thread(workspace=workspace)
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
@@ -144,7 +144,7 @@ def test_fresh_process_interrupts_a_pre_dispatch_orphan_only_after_maintenance(
             binding_manifest={"model_id": "model-v1"},
         )
 
-    with RolloutStore(database) as recovery_process:
+    with RuntimeState.open_sync(database) as recovery_process:
         with pytest.raises(RuntimeError, match="maintenance confirmation"):
             recovery_process.interrupt_orphaned_turn(
                 turn_id=turn.turn_id,
@@ -172,7 +172,7 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -188,7 +188,7 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
             request_ref={"request_id": "request-1"},
         )
 
-    with RolloutStore(database) as recovery_process:
+    with RuntimeState.open_sync(database) as recovery_process:
         with pytest.raises(RuntimeError, match="durable operations"):
             recovery_process.interrupt_orphaned_turn(
                 turn_id=turn.turn_id,
@@ -204,7 +204,7 @@ def test_recovery_cli_records_an_interrupted_turn_in_a_fresh_process(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as crashed_process:
+    with RuntimeState.open_sync(database) as crashed_process:
         thread = crashed_process.create_thread(workspace=workspace)
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
@@ -236,6 +236,6 @@ def test_recovery_cli_records_an_interrupted_turn_in_a_fresh_process(
         "thread_id": thread.thread_id,
         "turn_id": turn.turn_id,
     }
-    with RolloutStore(database) as verified:
+    with RuntimeState.open_sync(database) as verified:
         assert verified.read_turn(turn.turn_id).status == "interrupted"
         assert verified.verify().valid is True

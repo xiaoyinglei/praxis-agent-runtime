@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutContextManager, RolloutStore
+from agent_runtime.harness import RolloutContextManager, RuntimeState
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_compaction_consistency import start
 
@@ -24,7 +24,7 @@ def test_parallel_result_admission_keeps_all_calls_and_archives_originals(tmp_pa
     from tests.agent.harness.test_compaction_consistency import Accept, model_for
 
     path = tmp_path / "batch-admission.db"
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         thread, turn = start(store, tmp_path)
         calls = [{"id": str(i), "name": "read", "arguments": {"path": f"{i}.md"}} for i in range(3)]
         seed(store, turn_id=turn.turn_id, kind="model_response", payload={"text": "Read", "tool_calls": calls})
@@ -51,14 +51,14 @@ def test_parallel_result_admission_keeps_all_calls_and_archives_originals(tmp_pa
             assert "truncated" in message.content and item.item_id in message.content
             assert store.read_item(item.item_id).payload == item.payload
         assert len([m for m in projected if m.tool_calls][0].tool_calls) == 3
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         assert RolloutContextManager(store).build(turn.turn_id) == projected
         assert store.verify().valid
 
 
 def test_elision_preserves_message_structure_and_restarts(tmp_path: Path):
     path = tmp_path / "r.db"
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         _, turn = start(store, tmp_path)
         exchange(store, turn.turn_id, "old", "old detail " * 1000)
         exchange(store, turn.turn_id, "middle-1", "intermediate result")
@@ -75,7 +75,7 @@ def test_elision_preserves_message_structure_and_restarts(tmp_path: Path):
         manager.commit_compaction(candidate)
         assert manager.build(turn.turn_id) == candidate.messages
         assert any("old detail " * 1000 in str(i.payload) for i in store.list_context_items(turn.turn_id))
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         assert RolloutContextManager(store).build(turn.turn_id) == candidate.messages
         assert store.verify().valid
 
@@ -86,7 +86,7 @@ def test_later_batch_admission_preserves_earlier_evidence_prefixes(tmp_path):
     from agent_runtime.harness import TurnExecutor
     from tests.agent.harness.test_compaction_consistency import Accept, model_for
 
-    with RolloutStore(tmp_path / "successive.db") as store:
+    with RuntimeState.open_sync(tmp_path / "successive.db") as store:
         thread, turn = start(store, tmp_path)
         for i in range(3):
             exchange(store, turn.turn_id, str(i), f"RULE_{i}: " + "samples " * 2000)
@@ -113,7 +113,7 @@ def test_old_history_is_summarized_instead_of_starving_current_tool_result(tmp_p
     from agent_runtime.harness import TurnExecutor
     from tests.agent.harness.test_compaction_consistency import Accept, model_for
 
-    with RolloutStore(tmp_path / "working-set.db") as store:
+    with RuntimeState.open_sync(tmp_path / "working-set.db") as store:
         thread, turn = start(store, tmp_path)
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "old finding " * 320})
         content = "Exact current file tail needed for patching.\n" * 25
@@ -131,7 +131,7 @@ def test_old_history_is_summarized_instead_of_starving_current_tool_result(tmp_p
 
 
 def test_new_elision_and_semantic_compaction_do_not_resurrect_old_results(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         exchange(store, turn.turn_id, "old", "old detail " * 1000)
         exchange(store, turn.turn_id, "middle-1", "intermediate result")
@@ -156,7 +156,7 @@ def test_new_elision_and_semantic_compaction_do_not_resurrect_old_results(tmp_pa
 
 def test_elision_after_summary_preserves_summary_and_survives_next_summary(tmp_path: Path):
     path = tmp_path / "r.db"
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         _, turn = start(store, tmp_path)
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "history " * 1000})
         manager = RolloutContextManager(store)
@@ -168,7 +168,7 @@ def test_elision_after_summary_preserves_summary_and_survives_next_summary(tmp_p
         exchange(store, turn.turn_id, "recent", "Current file")
         manager.commit_compaction(next(manager.cheap_candidates(turn.turn_id)))
         assert any("Keep decision A." in m.content for m in manager.build(turn.turn_id))
-    with RolloutStore(path) as store:
+    with RuntimeState.open_sync(path) as store:
         manager = RolloutContextManager(store)
         assert any("Keep decision A." in m.content for m in manager.build(turn.turn_id))
         source_hash, source = manager.semantic_source(turn.turn_id)
@@ -184,7 +184,7 @@ def test_elision_after_summary_preserves_summary_and_survives_next_summary(tmp_p
 
 @pytest.mark.parametrize("trailing_kind", ["context_message", "user_message"])
 def test_latest_exchange_is_protected_when_other_messages_follow(tmp_path: Path, trailing_kind):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         exchange(store, turn.turn_id, "recent", "recent detail " * 1000)
         seed(store, turn_id=turn.turn_id, kind=trailing_kind, payload={"text": "Continue with that evidence."})
@@ -197,7 +197,7 @@ def test_tool_admission_probes_do_not_dispatch_model_requests(tmp_path: Path):
     from agent_runtime.harness import TurnExecutor
     from tests.agent.harness.test_compaction_consistency import Accept, model_for
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         exchange(store, turn.turn_id, "old", "old detail " * 2000)
         exchange(store, turn.turn_id, "recent", "Current file")
@@ -215,7 +215,7 @@ def test_zero_retained_tail_is_summarized_without_synthetic_tool_replay(tmp_path
     from tests.agent.harness.test_compaction_consistency import long_history, start
 
     database = tmp_path / "semantic-replay.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(store, turn_id=turn.turn_id, kind="model_response", payload={
@@ -232,6 +232,6 @@ def test_zero_retained_tail_is_summarized_without_synthetic_tool_replay(tmp_path
         assert "tool_result_overrides" not in json.loads(candidate.payload_json)
         manager.commit_compaction(candidate)
         expected = candidate.messages
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert RolloutContextManager(store, max_total_bytes=5000).build(turn.turn_id) == expected
         assert store.verify().valid

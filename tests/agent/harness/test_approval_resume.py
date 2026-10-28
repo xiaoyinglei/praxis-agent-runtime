@@ -16,10 +16,11 @@ from agent_runtime.harness import (
     HarnessToolCall,
     PreparedModelCall,
     RolloutEventReader,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
 from agent_runtime.result import AgentResult
+from agent_runtime.streaming.events import TurnItemKind
 from agent_runtime.tools.integrations.knowledge import KnowledgeSearchOutput
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
@@ -75,7 +76,7 @@ class WriteThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
             return HarnessModelResponse(
@@ -313,8 +314,14 @@ async def test_denied_write_resumes_model_without_invoking_runner(tmp_path: Path
         assert len(model.requests) == 2
         assert runtime.store.verify().valid is True
         replayed = RolloutEventReader(runtime.store).read(resumed.thread_id)
+        proposals = [entry.event for entry in replayed if entry.event.type.value == "item_started"
+                     and entry.event.item_kind is TurnItemKind.TOOL_CALL]
+        assert len(proposals) == 1
+        assert proposals[0].data["tool_call_id"] == "write-call-1"
+        assert proposals[0].data["execution_started"] is False
         assert not any(
             result.event.type.value == "item_started"
+            and result.event.item_kind is TurnItemKind.TOOL
             and result.event.data.get("tool_call_id") == "write-call-1"
             for result in replayed
         )
@@ -517,7 +524,7 @@ async def test_two_sqlite_connections_cannot_resolve_one_approval_twice(
         paused = await runtime.submit("write approved.txt")
 
     def resolve() -> str:
-        store = RolloutStore(database)
+        store = RuntimeState.open_sync(database)
         try:
             try:
                 interaction = store.resolve_tool_approval(
@@ -540,7 +547,7 @@ async def test_two_sqlite_connections_cannot_resolve_one_approval_twice(
         )
 
     assert sorted(outcomes) == ["approve", "lost"]
-    with RolloutStore(database) as verifier:
+    async with (await RuntimeState.open(database)) as verifier:
         [interaction] = verifier.list_interactions(paused.turn_id)
         assert interaction.version == 2
         assert interaction.status == "resolved"

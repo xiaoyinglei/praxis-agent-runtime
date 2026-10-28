@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from agent_runtime.harness.ownership import OWNERSHIP_REVISION, ConversationBusyError, assert_recovery_leases
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,7 @@ class RecoveryPlan:
                 "choices": list(self.choices)}
 
 
-def pending_context_overflow(store: RolloutStore, turn_id: str) -> bool:
+def pending_context_overflow(store: RuntimeState, turn_id: str) -> bool:
     operations = [op for op in store.list_model_operations(turn_id)
                   if op.request_ref.get("purpose") != "context_summary"]
     return bool(operations and any(
@@ -50,7 +50,7 @@ def pending_context_overflow(store: RolloutStore, turn_id: str) -> bool:
     ))
 
 
-def pending_input_supersession(store: RolloutStore, turn_id: str) -> bool:
+def pending_input_supersession(store: RuntimeState, turn_id: str) -> bool:
     operations = store.list_model_operations(turn_id)
     if not operations or operations[-1].status != "failed":
         return False
@@ -63,7 +63,7 @@ def pending_input_supersession(store: RolloutStore, turn_id: str) -> bool:
     )
 
 
-def recovery_plan(store: RolloutStore, turn_id: str) -> RecoveryPlan:
+def recovery_plan(store: RuntimeState, turn_id: str) -> RecoveryPlan:
     turn = store.read_turn(turn_id)
     models = store.list_model_operations(turn_id)
     tools = store.list_tool_operations(turn_id)

@@ -4,14 +4,14 @@ import json
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 
 
 def test_explicit_correction_is_versioned_and_forget_can_be_explicitly_reversed(tmp_path):
     from agent_runtime.harness.memory import delete_memory
     from agent_runtime.harness.memory_management import edit_memory, explain_memory, remember_memory
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         first = remember_memory(
             store, tmp_path, key="tests", title="Test command", text="Use pytest.", kind="preference"
         )
@@ -36,9 +36,9 @@ def test_explicit_correction_is_versioned_and_forget_can_be_explicitly_reversed(
 
 def test_stale_manual_edit_is_rejected_without_creating_audit_turn(tmp_path):
     from agent_runtime.harness.memory_management import edit_memory, remember_memory
-    from agent_runtime.harness.rollout import ContextSourceChangedError
+    from agent_runtime.harness.protocol import ContextSourceChangedError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         remember_memory(store, tmp_path, key="k", title="Title", text="first")
         before = store.list_turns()
         with pytest.raises(ContextSourceChangedError):
@@ -53,7 +53,7 @@ async def test_automatic_history_cannot_overwrite_explicit_correction(tmp_path):
     from agent_runtime.harness.memory_management import remember_memory
     from tests.agent.harness.test_cross_session_memory import MemoryModel, seed
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         remember_memory(store, tmp_path, key="environment", title="Command runner", text="Use make.", kind="preference")
         seed(store, tmp_path, text="old source: use uv")
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
@@ -104,7 +104,7 @@ async def test_management_tool_uses_current_user_provenance_and_rejects_stale_wr
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -147,7 +147,7 @@ async def test_readonly_tool_policy_cannot_mutate_memory(tmp_path):
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -187,7 +187,7 @@ async def test_empty_memory_exposes_version_through_read_for_first_explicit_writ
             self.requests.append(request)
             return super().prepare(request)
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step == 1:
                 call = HarnessToolCall(id="read", name="read_memory", arguments={})

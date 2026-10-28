@@ -39,7 +39,7 @@ from pathlib import Path
 
 from agent_runtime.git_delivery import BASE_CONFIG_SUFFIX, git_environment
 from agent_runtime.harness.ownership import ConversationBusyError, execution_owner, workspace_owner
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.workspace_stores import registered_workspace_stores
 
 WORKTREE_BRANCH_PREFIX = "worktree/"
@@ -276,7 +276,7 @@ class WorktreeManager:
                 for database in sorted(databases):
                     if not database.exists():
                         continue
-                    with RolloutStore(database, read_only=True) as store:
+                    with RuntimeState.open_sync(database, read_only=True) as store:
                         for thread in store.list_threads():
                             locks.enter_context(execution_owner(database, thread.thread_id))
                         if not force and any(

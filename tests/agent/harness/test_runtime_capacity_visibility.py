@@ -1,7 +1,7 @@
 """Capacity accounting stays outside the model conversation for new Turns."""
 from dataclasses import replace
 
-from agent_runtime.harness import HarnessMessage, HarnessModelRequest, RolloutStore
+from agent_runtime.harness import HarnessMessage, HarnessModelRequest, RuntimeState
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMStageBudget
 from agent_runtime.modeling.gateway import model_request_input_text
 from tests.agent.harness.test_affordable_tool_continuation import file_runner
@@ -10,7 +10,7 @@ POLICY = {"revision": "working-context-v2", "cache_continuity": "append-v1"}
 
 
 def test_output_reservation_changes_metadata_without_changing_input(tmp_path):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         runner, _, gateway = file_runner(store, tmp_path)
 
         def budget(stage, *, kwargs=None):
@@ -42,7 +42,7 @@ def test_output_reservation_changes_metadata_without_changing_input(tmp_path):
 
 
 def test_runtime_only_warns_when_actionable_state_changes(tmp_path):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         runner, turn, _ = file_runner(store, tmp_path)
         context = runner.restore_turn_context(turn.turn_id)
         context = replace(context, binding_manifest={**context.binding_manifest, "execution_context_policy": POLICY})

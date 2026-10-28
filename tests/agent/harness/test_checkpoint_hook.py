@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.checkpoints import CheckpointService
-from agent_runtime.harness import RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RuntimeState, ToolOrchestrator
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
@@ -94,7 +94,7 @@ def _call(name: str, arguments: Mapping[str, JsonValue]) -> ToolCall:
 
 
 def _orchestrator(
-    store: RolloutStore, workspace: Path, checkpoints: CheckpointService | None,
+    store: RuntimeState, workspace: Path, checkpoints: CheckpointService | None,
 ) -> ToolOrchestrator:
     registry = ToolRegistry()
     registry.register(_file_tool(workspace))
@@ -106,7 +106,7 @@ def _orchestrator(
     )
 
 
-def _turn(store: RolloutStore, workspace: Path, message: str) -> str:
+def _turn(store: RuntimeState, workspace: Path, message: str) -> str:
     thread = store.create_thread(workspace=workspace)
     return store.start_turn(
         thread_id=thread.thread_id,
@@ -115,7 +115,7 @@ def _turn(store: RolloutStore, workspace: Path, message: str) -> str:
     ).turn_id
 
 
-def _pre_write_items(store: RolloutStore, turn_id: str) -> list[str]:
+def _pre_write_items(store: RuntimeState, turn_id: str) -> list[str]:
     return [
         str(item.payload.get("checkpoint_id"))
         for item in store.list_items(turn_id)
@@ -137,7 +137,7 @@ async def test_write_call_snapshots_pre_turn_state(tmp_path: Path) -> None:
     workspace.mkdir()
     (workspace / "a.txt").write_text("before")
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "change the file")
         orchestrator = _orchestrator(store, workspace, service)
         result = await _execute_with_approval(orchestrator, turn_id, _call(
@@ -155,7 +155,7 @@ async def test_one_checkpoint_per_turn_across_batches(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "two writes")
         orchestrator = _orchestrator(store, workspace, service)
         await _execute_with_approval(orchestrator, turn_id, _call(
@@ -171,7 +171,7 @@ async def test_read_only_calls_do_not_checkpoint(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "no writes")
         orchestrator = _orchestrator(store, workspace, service)
         results = await orchestrator.execute_batch(turn_id=turn_id, calls=(
@@ -186,7 +186,7 @@ async def test_invalid_arguments_do_not_checkpoint(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "broken call")
         orchestrator = _orchestrator(store, workspace, service)
         results = await orchestrator.execute_batch(turn_id=turn_id, calls=(
@@ -199,7 +199,7 @@ async def test_invalid_arguments_do_not_checkpoint(tmp_path: Path) -> None:
 async def test_unavailable_service_never_blocks_the_write(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "still writes")
         orchestrator = _orchestrator(store, workspace, None)
         result = await _execute_with_approval(orchestrator, turn_id, _call(
@@ -216,7 +216,7 @@ async def test_agent_facade_rewind_restores_workspace(tmp_path: Path) -> None:
     workspace.mkdir()
     (workspace / "a.txt").write_text("original")
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn_id = store.start_turn(
             thread_id=thread.thread_id,
@@ -243,7 +243,7 @@ async def test_agent_facade_rewind_restores_workspace(tmp_path: Path) -> None:
 async def test_agent_facade_rewind_refuses_active_turn(tmp_path: Path) -> None:
     workspace = tmp_path / "project"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         store.start_turn(
             thread_id=thread.thread_id,
@@ -263,7 +263,7 @@ async def test_rewind_anchor_is_listed_and_undoable(tmp_path: Path) -> None:
     workspace.mkdir()
     (workspace / "a.txt").write_text("v1")
     service = CheckpointService(workspace)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn_id = store.start_turn(
             thread_id=thread.thread_id,
@@ -300,7 +300,7 @@ async def test_broken_checkpoint_storage_never_blocks_the_write(tmp_path: Path) 
     blocker = tmp_path / "blocked-shadow"
     blocker.write_text("regular file blocking the shadow repository")
     service = CheckpointService(workspace, shadow_root=blocker)
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         turn_id = _turn(store, workspace, "write despite broken safety net")
         orchestrator = _orchestrator(store, workspace, service)
         result = await _execute_with_approval(orchestrator, turn_id, _call(

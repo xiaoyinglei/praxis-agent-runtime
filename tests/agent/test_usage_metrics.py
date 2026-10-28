@@ -7,13 +7,13 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from agent_runtime.result import AgentUsage
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 
 class ReadTwiceThenAnswer(PatchThenAnswerModel):
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         await asyncio.sleep(0.003)
         first = prepared.request_ref["request_id"].endswith(":step:1")
         return HarnessModelResponse(
@@ -51,7 +51,7 @@ async def test_public_usage_counts_actual_local_tools_and_survives_reopen_and_re
     assert "native=2(1err/" in output
     assert "startup=unknown" in output
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         budget = store.read_budget_state(result.turn_id)
         assert budget.used.tool_calls == 2
         assert budget.used.tool_ms == round(result.usage.tool_latency_ms)
@@ -67,7 +67,7 @@ async def test_public_usage_counts_actual_local_tools_and_survives_reopen_and_re
 @pytest.mark.anyio
 async def test_old_turn_without_observed_metrics_keeps_unknown_timing(tmp_path, capsys):
     database = tmp_path / "old.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
         store.complete_turn(turn_id=turn.turn_id, answer="old answer")
@@ -92,7 +92,7 @@ async def test_public_approval_recovery_counts_only_the_one_executed_call(tmp_pa
     paused = await first.run("change value.txt", require_workspace_change=False)
     assert paused.status == "paused"
     assert paused.usage.tool_calls == paused.usage.native_calls == 0
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_budget_state(paused.turn_id).used.tool_calls == 0
 
     recovered = Agent(**options)
@@ -104,7 +104,7 @@ async def test_public_approval_recovery_counts_only_the_one_executed_call(tmp_pa
     assert result.usage.native_errors == 0
     assert result.usage.total_tokens == 8
     assert result.usage.tool_latency_ms > 0
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         budget = store.read_budget_state(result.turn_id)
         assert budget.used.tool_calls == 1
         assert store.verify().valid
@@ -129,7 +129,7 @@ async def test_reconciled_unknown_execution_does_not_count_the_replacement_resul
         origin=ToolCallOrigin(request_id="request", toolset_revision="tools", exposed_tool_names=("read_file",)),
     )
     record = ToolExecutionRecord.prepare(call, tool)
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
         store.record_tool_call(turn_id=turn.turn_id, tool_call_id=call.tool_call_id, tool_name=call.tool_name,
@@ -156,7 +156,7 @@ async def test_reconciled_unknown_execution_does_not_count_the_replacement_resul
         assert before.used.tool_calls == 1
         assert before.used.tool_ms == 7
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         orchestrator = ToolOrchestrator(store=store, tools={"read_file": tool},
                                         execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path))
         orchestrator.reconcile(turn_id=turn.turn_id, outcome=ToolReconciliationOutcome(
@@ -191,7 +191,7 @@ async def test_mcp_adapter_observed_success_and_failure_project_separate_usage(t
         read_only_hint=True,
     ),), caller)
     database = tmp_path / "mcp.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="MCP calls", binding_manifest={})
         orchestrator = ToolOrchestrator(
@@ -220,8 +220,8 @@ async def test_mcp_adapter_observed_success_and_failure_project_separate_usage(t
 
 
 class DetailedUsageReads(ReadTwiceThenAnswer):
-    async def dispatch(self, prepared, *, delta_sink=None):
-        response = await super().dispatch(prepared, delta_sink=delta_sink)
+    async def dispatch(self, prepared, *, event_sink=None):
+        response = await super().dispatch(prepared, event_sink=event_sink)
         factor = 1 if prepared.request_ref["request_id"].endswith(":step:1") else 2
         return replace(response, usage={
             "input_tokens": 1000 * factor, "output_tokens": 100 * factor,
@@ -247,7 +247,7 @@ async def test_public_usage_projects_cache_and_reasoning_without_double_counting
     assert usage.cache_write_input_tokens == 0
     assert usage.reasoning_tokens == 90
     assert usage.usage_complete is True
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         store.rebuild_projections()
         assert store.verify().valid
     assert (await agent.read_result(result.turn_id)).usage == usage
@@ -273,7 +273,7 @@ async def test_explicit_unknown_cache_usage_does_not_become_legacy_zero(tmp_path
     from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
     class UnknownCache(PublicHarnessModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse(text="answer", provider_response_id=None, usage={
                 "input_tokens": 4, "output_tokens": 3, "cached_input_tokens": 0,
                 "cache_read_input_tokens": None,
@@ -307,7 +307,7 @@ def test_usage_summary_is_visible_for_every_result_status_without_verbose(tmp_pa
     from agent_runtime.harness import TurnResult
     from agent_runtime.result import AgentResult
 
-    with RolloutStore(tmp_path / "summary.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "summary.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="task", binding_manifest={})
         result = AgentResult._from_harness(
@@ -339,7 +339,7 @@ async def test_incomplete_output_and_its_retry_are_both_in_the_usage_summary(tmp
     from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
     class Truncated(PublicHarnessModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse(text="", provider_response_id=None,
                                         status="incomplete", incomplete_reason="max_output_tokens",
                                         usage={"input_tokens": 100, "output_tokens": 32,

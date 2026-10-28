@@ -39,6 +39,7 @@ docs/superpowers/
 !/docs/runtime-recovery.md
 !/docs/runtime-termination.md
 !/docs/runtime-context.md
+!/docs/runtime-events.md
 !/docs/macos-command-sessions.md
 !/docs/interactive-steering.md
 !/docs/model-request-settings.md

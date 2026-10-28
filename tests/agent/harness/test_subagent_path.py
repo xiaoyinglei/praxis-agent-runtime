@@ -64,7 +64,7 @@ class ParentChildModel:
             dispatch_payload=request,
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request = prepared.dispatch_payload
         assert isinstance(request, HarnessModelRequest)
         initial = request.messages[0].content

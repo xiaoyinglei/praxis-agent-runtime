@@ -35,7 +35,7 @@ def measure(operation: Callable[[], Any], samples: int) -> dict[str, float]:
 def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int) -> dict[str, Any]:
     sys.path.insert(0, str(runtime))
     import agent_runtime
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     if not Path(agent_runtime.__file__).resolve().is_relative_to(runtime):
         raise RuntimeError("benchmark imported a different runtime source")
@@ -47,7 +47,7 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
     with tempfile.TemporaryDirectory(prefix="praxis-history-benchmark-") as directory:
         workspace = Path(directory)
         database = workspace / "rollout.sqlite3"
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             thread = store.create_thread(workspace=workspace)
             count = 0
             for size in sizes:
@@ -69,12 +69,12 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
                     work += 1
                     return 0
 
-                store._connection.set_progress_handler(progress, 1)
+                store.persistence._connection.set_progress_handler(progress, 1)
                 statements: list[str] = []
-                store._connection.set_trace_callback(statements.append)
+                store.persistence._connection.set_trace_callback(statements.append)
                 settings()
-                store._connection.set_trace_callback(None)
-                store._connection.set_progress_handler(None, 0)
+                store.persistence._connection.set_trace_callback(None)
+                store.persistence._connection.set_progress_handler(None, 0)
                 result["settings_vm_steps"] = work
                 result["settings_inserts"] = sum(s.lstrip().startswith("INSERT INTO") for s in statements)
                 active = store.start_turn(
@@ -97,7 +97,7 @@ def benchmark(runtime: Path, sizes: list[int], payload_bytes: int, samples: int)
                 result["full_verify"] = measure(verify, samples)
 
                 def reopen() -> None:
-                    with RolloutStore(database) as reopened:
+                    with RuntimeState.open_sync(database) as reopened:
                         report = reopened.verify()
                         if not report.valid:
                             raise RuntimeError(str(report.errors))

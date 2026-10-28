@@ -48,6 +48,7 @@ source_modules =
     agent_runtime.harness.protocol
     agent_runtime.harness.reducer
     agent_runtime.harness.rollout
+    agent_runtime.harness.state
     agent_runtime.harness.tool_orchestrator
     agent_runtime.harness.tool_router
 forbidden_modules =
@@ -64,3 +65,22 @@ forbidden_modules =
     agent_runtime.harness.services
     agent_runtime.harness.session
     agent_runtime.harness.turn
+
+[importlinter:contract:rollout_persistence_has_no_business_policy]
+name = Rollout persistence does not own runtime business policy
+type = forbidden
+source_modules =
+    agent_runtime.harness.rollout
+    agent_runtime.harness.rollout_integrity
+    agent_runtime.harness.rollout_backup
+forbidden_modules =
+    agent_runtime.harness.state
+    agent_runtime.harness.protocol
+    agent_runtime.harness.session
+    agent_runtime.harness.turn
+    agent_runtime.harness.tool_orchestrator
+    agent_runtime.budget
+    agent_runtime.approval
+    agent_runtime.planning
+    agent_runtime.modeling
+allow_indirect_imports = true

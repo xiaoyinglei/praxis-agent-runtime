@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore, TurnExecutor
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, TurnExecutor
 from agent_runtime.harness import rollout as rollout_module
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
@@ -25,7 +25,7 @@ def _turn(store, workspace):
 
 
 def test_corrupt_artifact_does_not_block_unrelated_turn(tmp_path):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         old = _turn(store, tmp_path)
         artifact = store.commit_artifact(turn_id=old.turn_id, content=b"old", media_type="text/plain", name="old")
         store.artifact_blob_path(artifact.artifact_id).unlink()
@@ -39,9 +39,9 @@ def test_corrupt_artifact_does_not_block_unrelated_turn(tmp_path):
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", [TurnExecutor, ToolOrchestrator])
 async def test_store_writer_wait_yields_to_event_loop(tmp_path, kind):
-    with RolloutStore(tmp_path / "run.db") as store:
+    async with (await RuntimeState.open(tmp_path / "run.db")) as store:
         thread = store.create_thread(workspace=tmp_path)
-        store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout=150").close())
+        store.run_sync(lambda: store.persistence._connection.execute("PRAGMA busy_timeout=150").close())
         other = sqlite3.connect(tmp_path / "run.db", isolation_level=None)
         other.execute("BEGIN IMMEDIATE")
         executor = object.__new__(kind)
@@ -57,14 +57,17 @@ async def test_store_writer_wait_yields_to_event_loop(tmp_path, kind):
                 thread_id=thread.thread_id, user_message="new", binding_manifest={}))
             assert turn.status == "running"
             assert task.done()
-            assert store.run_sync(lambda: store._connection.execute("PRAGMA busy_timeout").fetchone())[0] == 150
+            assert (
+                store.run_sync(lambda: store.persistence._connection.execute("PRAGMA busy_timeout").fetchone())[0]
+                == 150
+            )
         finally:
             await task
             other.close()
 
 
 def test_live_projection_does_not_reload_completed_turns(tmp_path, monkeypatch):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         reader = RolloutEventReader(store)
         for _ in range(12):
@@ -89,7 +92,7 @@ def test_live_projection_does_not_reload_completed_turns(tmp_path, monkeypatch):
 @pytest.mark.parametrize("batches", [24, 48])
 @pytest.mark.parametrize("split_items", [False, True])
 def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch, batches, split_items):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         turn = _turn(store, tmp_path)
         early_completion = next(record for record in store.list_turn_records(turn.turn_id)
                                 if record.record_type == "item_completed")
@@ -124,13 +127,13 @@ def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch
             # Count only live projection, independently of the write/reducer.
             loaded.clear()
             projected.clear()
-            store.run_sync(lambda: store._connection.set_progress_handler(sql_step, 1))
+            store.run_sync(lambda: store.persistence._connection.set_progress_handler(sql_step, 1))
             try:
                 parts = tuple((record,) for record in mutation.records) if split_items else (mutation.records,)
                 for part in parts:
                     assert RolloutEventReader(store).project_committed_batch(part) == ()
             finally:
-                store.run_sync(lambda: store._connection.set_progress_handler(None, 0))
+                store.run_sync(lambda: store.persistence._connection.set_progress_handler(None, 0))
             total_records += len(mutation.records)
             total_loaded += len(loaded)
             total_projected += len(projected)
@@ -141,11 +144,11 @@ def test_long_turn_live_projection_work_tracks_new_records(tmp_path, monkeypatch
         # A delayed completion must find its old start by identity even after
         # many unrelated Items. Counting VM work catches hidden SQL full scans.
         sql_steps = 0
-        store.run_sync(lambda: store._connection.set_progress_handler(sql_step, 1))
+        store.run_sync(lambda: store.persistence._connection.set_progress_handler(sql_step, 1))
         try:
             assert RolloutEventReader(store).project_committed_batch((early_completion,)) == ()
         finally:
-            store.run_sync(lambda: store._connection.set_progress_handler(None, 0))
+            store.run_sync(lambda: store.persistence._connection.set_progress_handler(None, 0))
         assert sql_steps <= 100, sql_steps
 
 
@@ -158,7 +161,7 @@ async def test_live_projection_matches_replay_across_tool_commits_and_reopened_t
     def no_history(*args, **kwargs):
         pytest.fail("live delivery must not load Turn or Thread history")
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         executor = object.__new__(TurnExecutor)
         executor._store, executor._event_dispatcher = store, dispatcher
@@ -192,7 +195,7 @@ async def test_live_projection_matches_replay_across_tool_commits_and_reopened_t
             interaction = await executor._commit(lambda: store.request_clarification(
                 turn_id=turn.turn_id, question="continue?"))
 
-    with RolloutStore(database) as reopened:
+    async with (await RuntimeState.open(database)) as reopened:
         executor = object.__new__(TurnExecutor)
         executor._store, executor._event_dispatcher = reopened, dispatcher
         with monkeypatch.context() as patch:
@@ -227,7 +230,7 @@ async def test_externalized_output_commits_durable_artifact_and_reopens(tmp_path
     tool = replace(_read_tool(workspace=tmp_path), max_model_output_bytes=4096,
                    normalize_output=lambda _: NormalizedToolOutput(
                        content=(ToolContentBlock(type="text", data={"text": body}),)))
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _turn(store, tmp_path)
         orchestrator = ToolOrchestrator(store=store, tools={"read_file": tool},
                                        execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path))
@@ -245,7 +248,7 @@ async def test_externalized_output_commits_durable_artifact_and_reopens(tmp_path
         assert store.verify().valid
         store.rebuild_projections()
         assert store.verify().valid
-    with RolloutStore(database) as reopened:
+    async with (await RuntimeState.open(database)) as reopened:
         assert all(json.loads(reopened.read_artifact(reference))["content"][0]["data"]["text"] == body
                    for reference in references)
         assert reopened.verify().valid
@@ -258,7 +261,7 @@ async def test_public_agent_large_file_output_survives_next_dispatch_and_reopen(
     (tmp_path / "large.txt").write_text(body)
 
     class ReadThenAnswer(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             first = prepared.request_ref["request_id"].endswith(":step:1")
             return HarnessModelResponse(
                 text="" if first else "file inspected", provider_response_id="read" if first else "answer",
@@ -275,7 +278,7 @@ async def test_public_agent_large_file_output_survives_next_dispatch_and_reopen(
     assert result.status == "done", result.diagnostics
     assert len(result.tool_calls) == 1
     assert not result.tool_calls[0].is_error and result.tool_calls[0].truncated
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         [artifact] = store.list_artifacts(result.turn_id)
         assert json.loads(store.read_artifact(artifact.artifact_id))["structured_content"]["content"] == body
         assert store.verify().valid
@@ -288,7 +291,7 @@ async def test_public_agent_large_file_output_survives_next_dispatch_and_reopen(
 @pytest.mark.parametrize("batch", [False, True])
 async def test_cancel_during_artifact_admission_commits_completed_result(tmp_path, batch):
     database = tmp_path / "run.db"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         other = sqlite3.connect(database, isolation_level=None)
         turn = _turn(store, tmp_path)
 

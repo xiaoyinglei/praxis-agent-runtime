@@ -34,6 +34,17 @@ class EventType(StrEnum):
     ITEM_DELTA = "item_delta"
     ITEM_COMPLETED = "item_completed"
 
+    # Runtime decisions and execution facts; these are not provider events.
+    MODEL_ATTEMPT_UPDATED = "model_attempt_updated"
+    TOOL_OPERATION_UPDATED = "tool_operation_updated"
+    INTERACTION_REQUESTED = "interaction_requested"
+    INTERACTION_RESOLVED = "interaction_resolved"
+    INTERACTION_INVALIDATED = "interaction_invalidated"
+    CONTEXT_COMPACTION_STARTED = "context_compaction_started"
+    CONTEXT_COMPACTION_COMPLETED = "context_compaction_completed"
+    COMPLETION_DECIDED = "completion_decided"
+    VERIFICATION_COMPLETED = "verification_completed"
+
     # ── LLM 流式输出 ──────────────────────────────────────
     TEXT_DELTA = "text_delta"  # 文本增量
     THINKING_DELTA = "thinking_delta"  # 思考增量（extended thinking，可选）
@@ -66,6 +77,8 @@ class TurnItemKind(StrEnum):
     AGENT_MESSAGE = "agent_message"
     REASONING = "reasoning"
     PLAN = "plan"
+    TOOL_CALL = "tool_call"  # Generated proposal, not tool execution.
+    REFUSAL = "refusal"
     TOOL = "tool"
     COMMAND = "command"
     RECONCILIATION = "reconciliation"
@@ -76,6 +89,7 @@ class ItemDeltaKind(StrEnum):
     TEXT = "text"
     REASONING = "reasoning"
     PLAN = "plan"
+    TOOL_ARGUMENTS = "tool_arguments"
     TOOL_PROGRESS = "tool_progress"
     COMMAND_STDOUT = "command_stdout"
     COMMAND_STDERR = "command_stderr"
@@ -93,9 +107,12 @@ def derive_model_public_item_id(
     turn_id: str,
     model_attempt_id: str,
     channel: str,
+    output_id: str | None = None,
 ) -> str:
-    if channel not in {"agent_message", "reasoning", "plan"}:
+    if channel not in {"agent_message", "reasoning", "reasoning_summary", "plan", "tool_call", "refusal"}:
         raise ValueError(f"unsupported model Item channel: {channel}")
+    if output_id is not None:
+        return _derived_public_item_id("model-output", turn_id, model_attempt_id, output_id)
     return _derived_public_item_id(
         "model",
         turn_id,
@@ -165,6 +182,17 @@ _TURN_EVENTS = frozenset(
 _ITEM_EVENTS = frozenset(
     {EventType.ITEM_STARTED, EventType.ITEM_DELTA, EventType.ITEM_COMPLETED}
 )
+_RUNTIME_EVENTS = frozenset({
+    EventType.MODEL_ATTEMPT_UPDATED,
+    EventType.TOOL_OPERATION_UPDATED,
+    EventType.INTERACTION_REQUESTED,
+    EventType.INTERACTION_RESOLVED,
+    EventType.INTERACTION_INVALIDATED,
+    EventType.CONTEXT_COMPACTION_STARTED,
+    EventType.CONTEXT_COMPACTION_COMPLETED,
+    EventType.COMPLETION_DECIDED,
+    EventType.VERIFICATION_COMPLETED,
+})
 
 
 @dataclass(frozen=True)
@@ -201,6 +229,58 @@ class StreamEvent:
             self._validate_turn_event()
         elif self.type in _ITEM_EVENTS:
             self._validate_item_event()
+        elif self.type in _RUNTIME_EVENTS:
+            self._validate_runtime_event()
+
+    def _validate_runtime_event(self) -> None:
+        self._validate_turn_event()
+
+        def required_string(name: str) -> str:
+            value = self.data.get(name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be a non-empty string for {self.type.value}")
+            return value
+
+        if self.type is EventType.TOOL_OPERATION_UPDATED:
+            required_string("operation_id")
+            required_string("transition")
+        elif self.type is EventType.MODEL_ATTEMPT_UPDATED:
+            required_string("operation_id")
+            required_string("attempt_id")
+            generation = self.data.get("generation")
+            if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+                raise ValueError("model attempt generation must be a positive integer")
+            if required_string("status") not in {
+                "prepared", "retry_prepared", "dispatched", "responding", "completed", "rejected",
+                "cancelled", "unknown", "late_response",
+            }:
+                raise ValueError("unsupported model attempt status")
+        elif self.type in {
+            EventType.INTERACTION_REQUESTED, EventType.INTERACTION_RESOLVED, EventType.INTERACTION_INVALIDATED,
+        }:
+            required_string("request_id")
+            if self.type is EventType.INTERACTION_REQUESTED:
+                required_string("kind")
+                if not isinstance(self.data.get("request"), Mapping):
+                    raise ValueError("interaction request must be an object")
+            else:
+                required_string("status")
+        elif self.type in {EventType.CONTEXT_COMPACTION_STARTED, EventType.CONTEXT_COMPACTION_COMPLETED}:
+            required_string("compaction_id")
+            if self.type is EventType.CONTEXT_COMPACTION_COMPLETED:
+                if required_string("status") not in {"completed", "failed", "cancelled", "outcome_unknown"}:
+                    raise ValueError("unsupported compaction status")
+        elif self.type is EventType.COMPLETION_DECIDED:
+            required_string("proposal_item_id")
+            if required_string("action") not in {"accept", "continue", "pause", "fail"}:
+                raise ValueError("unsupported completion action")
+            if required_string("validation_status") not in {"not_evaluated", "passed", "failed"}:
+                raise ValueError("unsupported validation status")
+        elif self.type is EventType.VERIFICATION_COMPLETED:
+            required_string("operation_id")
+            required_string("source_result_item_id")
+            required_string("verification_kind")
+            required_string("verifier")
 
     def _validate_turn_event(self) -> None:
         if not self.turn_id:

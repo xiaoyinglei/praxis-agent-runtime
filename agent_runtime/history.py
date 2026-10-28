@@ -9,7 +9,8 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
+from agent_runtime.harness.records import ItemSnapshot
+from agent_runtime.harness.state import RuntimeState
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +29,7 @@ def list_chat_sessions(database: Path, *, workspace: Path) -> tuple[ChatSessionS
     if not database.exists():
         return ()
     expected_workspace = workspace.expanduser().resolve()
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         sessions = []
         for thread in store.list_threads():
             if Path(thread.workspace).resolve() != expected_workspace:
@@ -63,7 +64,7 @@ def read_chat_messages(
     aliases of model output; compatibility deduplication is limited to those Turns.
     Incomplete output is not presented as a finished assistant answer.
     """
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         thread = store.read_thread(thread_id)
         if Path(thread.workspace).resolve() != workspace.expanduser().resolve():
             raise ValueError("会话属于其他工作区")
@@ -113,7 +114,7 @@ def list_history_turns(database: Path, *, limit: int = 20) -> list[dict[str, Any
     """List recent Turn identities and statuses without prompts or arguments."""
 
     _validate_limit(limit)
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         return [
             {
                 "thread_id": turn.thread_id,
@@ -137,7 +138,7 @@ def read_history(
     """Locate canonical ToolResults; omit tool arguments, content and arbitrary metadata."""
 
     _validate_limit(limit)
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         items: tuple[ItemSnapshot, ...]
         if item_id is not None:
             items = (store.read_item(item_id),)

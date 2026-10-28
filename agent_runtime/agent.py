@@ -7,7 +7,7 @@ import hashlib
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Sequence
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
@@ -30,7 +30,7 @@ from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSI
 
 if TYPE_CHECKING:
     from agent_runtime.harness import BoundHarnessModel, Session
-    from agent_runtime.harness.rollout import ItemSnapshot
+    from agent_runtime.harness.records import ItemSnapshot
     from agent_runtime.runtime.mcp import MCPConfigTrustDecision
     from agent_runtime.tools.builtins.shell import RunCommandOutput
 
@@ -239,9 +239,9 @@ class Agent:
 
     async def steer(self, text: str, *, expected_turn_id: str) -> ItemSnapshot:
         """Persist guidance without opening a model; target must still be active."""
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
-        async with await RolloutStore.open(self._harness_database()) as store:
+        async with await RuntimeState.open(self._harness_database()) as store:
             turn = await store.run_async(store.read_turn, expected_turn_id)
             if (
                 Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
@@ -254,9 +254,9 @@ class Agent:
 
     def input_status(self, item_id: str) -> str:
         """Inspect a steering receipt without model I/O."""
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
-        with RolloutStore(self._harness_database()) as store:
+        with RuntimeState.open_sync(self._harness_database()) as store:
             item = store.read_item(item_id)
             if Path(store.read_thread(item.thread_id).workspace).resolve() != self._workspace_path():
                 raise RuntimeError("input belongs to a different workspace security domain")
@@ -265,48 +265,80 @@ class Agent:
     def memories(self) -> dict[str, object]:
         """Inspect this workspace's memory without opening a model or creating state."""
         from agent_runtime.harness.memory import memory_snapshot
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
         database = self._harness_database()
         if not database.exists():
             return {"version": 0, "workspace": str(self.workspace_path), "entries": [],
                     "use_memories": self.memory.use_memories if self.memory is not None else False,
                     "generate_memories": self.memory.generate_memories if self.memory is not None else False}
-        with RolloutStore(database, read_only=True) as store:
-            state = store.read_memory_state(self.workspace_path)
-            return {**memory_snapshot(store, self.workspace_path),
-                    "maintenance_jobs": {key: {name: value for name, value in job.items() if name != "candidates"}
-                                         for key, job in store.read_memory_jobs(self.workspace_path).items()},
-                    "use_memories": self.memory.use_memories if self.memory is not None else state["use_memories"],
-                    "generate_memories": self.memory.generate_memories if self.memory is not None
-                    else state["generate_memories"]}
+        with RuntimeState.open_sync(database, read_only=True) as store:
+            def read() -> dict[str, object]:
+                with store.persistence.read_snapshot():
+                    state = store.read_memory_state(self.workspace_path)
+                    return {**memory_snapshot(store, self.workspace_path),
+                            "maintenance_jobs": {key: {name: value for name, value in job.items()
+                                                       if name != "candidates"}
+                                                 for key, job in store.read_memory_jobs(self.workspace_path).items()},
+                            "use_memories": self.memory.use_memories if self.memory is not None
+                            else state["use_memories"],
+                            "generate_memories": self.memory.generate_memories if self.memory is not None
+                            else state["generate_memories"]}
+
+            return store.run_sync(read)
 
     def configure_memory(self, config: MemoryConfig) -> dict[str, object]:
         """Persist workspace defaults; independent use and contribution controls."""
         from agent_runtime.harness.memory import configure_memory
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
         if not isinstance(config, MemoryConfig):
             raise TypeError("config must be MemoryConfig")
-        with RolloutStore(self._harness_database()) as store:
+        with RuntimeState.open_sync(self._harness_database()) as store:
             result = configure_memory(store, self.workspace_path, config)
         self.memory = config
         return result
 
+    def relocate_memory(self, previous_workspace: Path, *,
+                        expected_version: int | None = None) -> dict[str, object]:
+        """Rebind memory after moving a workspace, using its existing database.
+
+        Both workspace paths must be idle. The source directory may no longer
+        exist; historical Threads and Turns retain their original workspace.
+        """
+        from agent_runtime.harness.ownership import workspace_owner
+        from agent_runtime.harness.state import RuntimeState
+
+        previous = Path(previous_workspace).expanduser().resolve()
+        workspace = self.workspace_path
+        if previous == workspace:
+            raise ValueError("previous and current workspace must be different directories")
+        if not workspace.is_dir():
+            raise ValueError("current workspace must be an existing directory")
+        database = self._harness_database()
+        if not database.is_file():
+            raise FileNotFoundError(f"memory relocation requires an existing database: {database}")
+        with ExitStack() as locks:
+            for path in sorted((previous, workspace)):
+                locks.enter_context(workspace_owner(path, exclusive=True))
+            with RuntimeState.open_sync(database) as store:
+                return store.relocate_memory(previous_workspace=previous, workspace=workspace,
+                                             expected_version=expected_version)
+
     def delete_memory(self, key: str) -> dict[str, object]:
         from agent_runtime.harness.memory import delete_memory
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
-        with RolloutStore(self._harness_database()) as store:
+        with RuntimeState.open_sync(self._harness_database()) as store:
             return delete_memory(store, self.workspace_path, key)
 
     def remember_memory(self, key: str, text: str, *, title: str | None = None,
                         kind: Literal["preference", "fact", "reference"] = "fact",
                         expected_version: int | None = None) -> dict[str, object]:
         from agent_runtime.harness.memory_management import remember_memory
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
-        with RolloutStore(self._harness_database()) as store:
+        with RuntimeState.open_sync(self._harness_database()) as store:
             return remember_memory(store, self.workspace_path, key=key, title=title or key, text=text,
                                    kind=kind, expected_version=expected_version)
 
@@ -314,17 +346,17 @@ class Agent:
                     kind: Literal["preference", "fact", "reference"] | None = None,
                     expected_version: int | None = None) -> dict[str, object]:
         from agent_runtime.harness.memory_management import edit_memory
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
-        with RolloutStore(self._harness_database()) as store:
+        with RuntimeState.open_sync(self._harness_database()) as store:
             return edit_memory(store, self.workspace_path, key=key, title=title, text=text,
                                kind=kind, expected_version=expected_version)
 
     def explain_memory(self, key: str, *, offset: int = 0, limit: int = 8) -> dict[str, object]:
         from agent_runtime.harness.memory_management import explain_memory
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
-        with RolloutStore(self._harness_database(), read_only=True) as store:
+        with RuntimeState.open_sync(self._harness_database(), read_only=True) as store:
             return explain_memory(store, self.workspace_path, key=key, offset=offset, limit=limit)
 
     async def refresh_memory(self) -> dict[str, object]:
@@ -345,12 +377,12 @@ class Agent:
     async def list_checkpoints(self, *, thread_id: str | None = None) -> list[dict[str, object]]:
         """List workspace checkpoints recorded for this workspace's Threads."""
         from agent_runtime.checkpoints import _numeric, thread_checkpoint_rows
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
         database = self._harness_database()
         rows: list[dict[str, object]] = []
         if database.exists():
-            async with await RolloutStore.open(database, read_only=True) as store:
+            async with await RuntimeState.open(database, read_only=True) as store:
                 threads = (
                     (thread_id,)
                     if thread_id is not None
@@ -397,9 +429,9 @@ class Agent:
         restoring underneath live execution would corrupt its workspace views.
         """
         from agent_runtime.checkpoints import CheckpointService
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [turn.turn_id for turn in store.list_turns() if turn.status in {"running", "paused"}]
             )
@@ -439,9 +471,9 @@ class Agent:
         actual terminal outcome and raises DeliveryInterruptedError with its result.
         """
         from agent_runtime.git_delivery import GitDelivery
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [
                     turn.turn_id
@@ -491,9 +523,9 @@ class Agent:
         confirmed the previewed change set, and refuses while Turns are active.
         """
         from agent_runtime.git_delivery import GitDelivery
-        from agent_runtime.harness import RolloutStore
+        from agent_runtime.harness import RuntimeState
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             active = await store.run_async(
                 lambda: [
                     turn.turn_id
@@ -556,7 +588,7 @@ class Agent:
         event_sink: AgentEventSink | None = None,
         expected_request_id: str | None = None,
     ) -> AgentResult:
-        from agent_runtime.harness import RolloutStore, TurnResult
+        from agent_runtime.harness import RuntimeState, TurnResult
 
         if action == "abort":
             from agent_runtime.harness import RolloutEventReader
@@ -566,7 +598,7 @@ class Agent:
                 recover_owner_loss,
             )
 
-            async with await RolloutStore.open(self._harness_database()) as store:
+            async with await RuntimeState.open(self._harness_database()) as store:
                 turn = await store.run_async(store.read_turn, turn_id)
                 thread = await store.run_async(store.read_thread, turn.thread_id)
                 if Path(thread.workspace).resolve() != self._workspace_path():
@@ -617,9 +649,9 @@ class Agent:
         """
         from agent_runtime.harness.ownership import ConversationBusyError, execution_owner
         from agent_runtime.harness.recovery import recovery_plan
-        from agent_runtime.harness.rollout import RolloutStore
+        from agent_runtime.harness.state import RuntimeState
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             if (
                 Path((await store.run_async(store.read_thread, turn.thread_id)).workspace).resolve()
@@ -643,9 +675,9 @@ class Agent:
                 }
 
     async def read_result(self, turn_id: str) -> AgentResult:
-        from agent_runtime.harness import RolloutStore, TurnResult
+        from agent_runtime.harness import RuntimeState, TurnResult
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():
@@ -738,9 +770,9 @@ class Agent:
             dispatcher.close()
 
     async def pending_input(self, turn_id: str) -> AgentPause | None:
-        from agent_runtime.harness import RolloutStore, TurnResult
+        from agent_runtime.harness import RuntimeState, TurnResult
 
-        async with await RolloutStore.open(self._harness_database(), read_only=True) as store:
+        async with await RuntimeState.open(self._harness_database(), read_only=True) as store:
             turn = await store.run_async(store.read_turn, turn_id)
             thread = await store.run_async(store.read_thread, turn.thread_id)
             if Path(thread.workspace).resolve() != self._workspace_path():

@@ -5,13 +5,13 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.budget import BudgetLimitExceededError, ReservationStatus, ResourceUsage
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 
 
-def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RolloutStore, str]:
+def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RuntimeState, str]:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = RolloutStore(tmp_path / "rollout.sqlite")
+    store = RuntimeState.open_sync(tmp_path / "rollout.sqlite")
     thread = store.create_thread(workspace=workspace)
     turn = store.start_turn(
         thread_id=thread.thread_id,
@@ -21,7 +21,7 @@ def _store(tmp_path: Path, *, tokens: int = 100) -> tuple[RolloutStore, str]:
     return store, turn.turn_id
 
 
-def _prepare(store: RolloutStore, turn_id: str, request_id: str):
+def _prepare(store: RuntimeState, turn_id: str, request_id: str):
     return store.prepare_model_operation(
         turn_id=turn_id,
         request_hash=f"request:{request_id}",

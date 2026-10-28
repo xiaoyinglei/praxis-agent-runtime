@@ -25,12 +25,11 @@ from agent_runtime.modeling.contracts import (
     LLMStageBudget,
     LLMUsage,
 )
+from agent_runtime.modeling.events import ModelEvent, ModelOutputDelta
 from agent_runtime.modeling.gateway import (
     LLMContextOverflowError,
     LLMGateway,
     LLMToolCallValidationError,
-    ProviderDelta,
-    ProviderDeltaChannel,
     StreamChunk,
 )
 from agent_runtime.tools.tool import (
@@ -894,7 +893,7 @@ async def test_gateway_adapts_one_canonical_request_to_local_envelope(provider: 
 @pytest.mark.anyio
 async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
     request = _canonical_request()
-    deltas: list[ProviderDelta] = []
+    deltas: list[ModelEvent] = []
 
     result = await _gateway(
         _CanonicalStreamingGenerator(),
@@ -906,16 +905,14 @@ async def test_streaming_canonical_request_uses_final_provider_usage() -> None:
         provider="openai-compatible",
         supports_native_tools=True,
         stream=True,
-        delta_sink=deltas.append,
+        event_sink=deltas.append,
     )
 
     assert result.turn.text == "stream answer"
     assert result.usage.cache_read_input_tokens == 9
     assert result.usage.usage_source == "provider"
-    assert deltas == [
-        ProviderDelta(ProviderDeltaChannel.REASONING, "inspect evidence"),
-        ProviderDelta(ProviderDeltaChannel.PLAN, "read then answer"),
-        ProviderDelta(ProviderDeltaChannel.TEXT, "stream answer"),
+    assert [(event.delta_kind, event.content) for event in deltas if isinstance(event, ModelOutputDelta)] == [
+        ("reasoning", "inspect evidence"), ("plan", "read then answer"), ("text", "stream answer"),
     ]
 
 
@@ -1019,3 +1016,184 @@ async def test_streaming_fallback_preserves_reasoning_for_next_tool_turn() -> No
 
     assert result.turn.reasoning_content == "Inspect the source before editing."
     assert result.turn.tool_calls[0].name == "read_file"
+
+
+@pytest.mark.anyio
+async def test_model_events_preserve_native_same_kind_blocks_and_signature() -> None:
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {"type": "message_start", "provider_response_id": "response-native"}
+            yield {"type": "content_block_start", "output_kind": "text", "block_index": 0}
+            yield {"type": "text_delta", "block_index": 0, "content": "first"}
+            yield {"type": "content_block_stop", "block_index": 0}
+            yield {"type": "content_block_start", "output_kind": "text", "block_index": 1}
+            yield {"type": "text_delta", "block_index": 1, "content": "second"}
+            yield {"type": "content_block_stop", "block_index": 1}
+            yield {"type": "content_block_start", "output_kind": "reasoning", "block_index": 2}
+            yield {"type": "thinking_delta", "block_index": 2, "content": "summary"}
+            yield {"type": "signature_delta", "block_index": 2, "content": "opaque"}
+            yield {"type": "content_block_stop", "block_index": 2}
+            yield {"type": "message_stop", "stop_reason": "end_turn"}
+
+    events = []
+    result = await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True, stream=True, event_sink=events.append,
+    )
+    assert result.provider_response_id == "response-native"
+    assert [(output.output_id, output.kind, output.content) for output in result.outputs] == [
+        ("block:0", "text", "first"), ("block:1", "text", "second"), ("block:2", "reasoning", "summary"),
+    ]
+    assert result.outputs[2].provider_data["signature"] == "opaque"
+    assert result.turn.text == "firstsecond"
+
+
+@pytest.mark.anyio
+async def test_model_snapshot_retains_refusal_and_provider_identity_without_sink() -> None:
+    response = SimpleNamespace(id="response-refusal", choices=[SimpleNamespace(
+        finish_reason="stop", message=SimpleNamespace(content=None, refusal="I cannot do that.", tool_calls=[]),
+    )], usage={"prompt_tokens": 10, "completion_tokens": 2})
+    gateway = _gateway(_openai_generator_for_response(response), max_input_tokens=2000, model_context_tokens=4000)
+    result = await gateway.agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True,
+    )
+    assert result.provider_response_id == "response-refusal"
+    assert result.outputs[0].kind == "refusal"
+    assert result.outputs[0].content == "I cannot do that."
+    assert result.turn.text == "I cannot do that."
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens"])
+async def test_native_tool_output_ids_route_interleaved_call_and_block_references(stop_reason) -> None:
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {
+                "type": "tool_use_start", "output_id": "native-one", "tool_id": "call-one",
+                "tool_name": "read_file", "block_index": 3,
+            }
+            yield {
+                "type": "tool_use_start", "output_id": "native-two", "tool_id": "call-two",
+                "tool_name": "read_file", "block_index": 7,
+            }
+            yield {"type": "tool_input_delta", "tool_id": "call-one", "content": '{"path":'}
+            yield {"type": "tool_input_delta", "block_index": 7, "content": '{"path":"two.py"}'}
+            yield {"type": "tool_input_delta", "block_index": 3, "content": '"one.py"}'}
+            yield {"type": "content_block_stop", "tool_id": "call-two"}
+            yield {"type": "content_block_stop", "tool_id": "call-one"}
+            yield {"type": "message_stop", "stop_reason": stop_reason}
+
+    events = []
+    result = await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+        stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+        supports_native_tools=True, stream=True, event_sink=events.append,
+    )
+    assert [(output.output_id, output.tool_call_id, output.arguments["path"]) for output in result.outputs] == [
+        ("native-one", "call-one", "one.py"), ("native-two", "call-two", "two.py"),
+    ]
+    assert [(event.output_id, event.content) for event in events if isinstance(event, ModelOutputDelta)] == [
+        ("native-one", '{"path":'), ("native-two", '{"path":"two.py"}'), ("native-one", '"one.py"}'),
+    ]
+    expected_calls = ["call-one", "call-two"] if stop_reason == "tool_use" else []
+    assert [call.id for call in result.turn.tool_calls] == expected_calls
+
+
+@pytest.mark.anyio
+async def test_native_tool_identity_references_cannot_point_at_different_outputs() -> None:
+    class Generator:
+        def stream_with_tools(self, **kwargs):
+            yield {"type": "tool_use_start", "output_id": "native-one", "tool_id": "call-one", "tool_name": "read_file"}
+            yield {"type": "tool_use_start", "output_id": "native-two", "tool_id": "call-two", "tool_name": "read_file"}
+            yield {"type": "tool_input_delta", "output_id": "native-one", "tool_id": "call-two", "content": "{}"}
+            yield {"type": "message_stop", "stop_reason": "tool_use"}
+
+    with pytest.raises(ValueError, match="identity references disagree"):
+        await _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000).agenerate_model_request(
+            stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(), provider="openai-compatible",
+            supports_native_tools=True, stream=True,
+        )
+
+
+def test_openai_sse_reports_response_start_once_before_content() -> None:
+    from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
+
+    def chunk(*, content=None, finish_reason=None, choices=True):
+        return SimpleNamespace(
+            id="response-before-content",
+            choices=[SimpleNamespace(delta=SimpleNamespace(content=content), finish_reason=finish_reason)]
+            if choices else [],
+            usage=None,
+        )
+
+    responses = [chunk(choices=False), chunk(), chunk(content="answer"), chunk(finish_reason="stop")]
+    generator = OpenAICompatibleChatGenerator.__new__(OpenAICompatibleChatGenerator)
+    generator.chat_model_name = "test-model"
+    generator._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: iter(responses),
+    )))
+
+    chunks = list(generator.stream_with_tools(messages=[], tools=[]))
+
+    assert chunks[0] == {"type": "response_start", "provider_response_id": "response-before-content"}
+    assert [part["type"] for part in chunks] == ["response_start", "text_delta", "message_stop"]
+    assert chunks[1]["content"] == "answer"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("metadata_only", [False, True])
+async def test_openai_early_sse_identity_survives_gateway_runtime_failure_and_reopen(
+    tmp_path, metadata_only, monkeypatch,
+) -> None:
+    from agent_runtime.harness import RolloutEventReader, RuntimeState, Session
+    from agent_runtime.modeling.chat import OpenAICompatibleChatGenerator
+    from tests.agent.harness.test_model_adapter import BoundGatewayHarnessModel, _resolved_model
+
+    monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "config"))
+
+    def responses():
+        yield SimpleNamespace(
+            id="response-before-content",
+            choices=[] if metadata_only else [SimpleNamespace(
+                delta=SimpleNamespace(role="assistant", content=None), finish_reason=None,
+            )],
+            usage=None,
+        )
+        raise ConnectionError("transport lost before the first output")
+
+    generator = OpenAICompatibleChatGenerator.__new__(OpenAICompatibleChatGenerator)
+    generator.chat_model_name = "test-model"
+    generator._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **kwargs: responses(),
+    )))
+    gateway = LLMGateway(
+        generator=generator,
+        token_accounting=_WordTokenAccounting(),
+        model_context_tokens=8192,
+        stage_budgets={LLMCallStage.AGENT_STEP: LLMStageBudget(
+            max_input_tokens=4096, max_output_tokens=128, safety_margin_tokens=32,
+        )},
+    )
+    model = BoundGatewayHarnessModel(
+        model_id="test-model",
+        resolved=_resolved_model(gateway=gateway, max_output_tokens=128),
+        instructions=("Answer the request.",),
+    )
+    database = tmp_path / "run.sqlite3"
+    async with await Session.open(database=database, workspace=tmp_path, model=model) as session:
+        result = await session.submit("inspect")
+        assert result.status == "paused"
+        thread_id = session.thread_id
+
+    async with await RuntimeState.open(database) as state:
+        [operation] = await state.run_async(state.list_model_operations)
+        [attempt] = await state.run_async(state.list_model_attempts, operation.operation_id)
+        assert attempt.status == "unknown"
+        assert attempt.provider_response_id == "response-before-content"
+        replay = await state.run_async(RolloutEventReader(state).read, thread_id)
+        responding = [entry.event for entry in replay if entry.event.data.get("status") == "responding"]
+        assert len(responding) == 1
+        assert responding[0].data["provider_response_id"] == "response-before-content"
+        assert not any(entry.event_type in {"item_started", "item_completed"}
+                       and entry.event.item_kind is not None
+                       and entry.event.item_kind.value == "agent_message" for entry in replay)

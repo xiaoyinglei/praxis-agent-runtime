@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 
 import agent_runtime.harness as harness
-from agent_runtime.harness import RolloutEventReader, RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RolloutEventReader, RuntimeState, ToolOrchestrator
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.registry import ToolRegistry
 from agent_runtime.tools.tool import (
@@ -32,7 +32,7 @@ from agent_runtime.tools.tool import (
 )
 
 
-def _ready_operation(store: RolloutStore, turn_id: str) -> str:
+def _ready_operation(store: RuntimeState, turn_id: str) -> str:
     values = {
         "turn_id": turn_id,
         "operation_id": "toolop-1",
@@ -50,11 +50,11 @@ def _ready_operation(store: RolloutStore, turn_id: str) -> str:
     return "toolop-1"
 
 
-class FaultingToolResultStore(RolloutStore):
-    def __init__(self, database: Path) -> None:
+class FaultingToolResultStore(RuntimeState):
+    def __init__(self) -> None:
         self._fault_at: int | None = None
         self._append_count = 0
-        super().__init__(database)
+        super().__init__()
 
     def arm_fault(self, append_number: int) -> None:
         self._fault_at = append_number
@@ -89,7 +89,7 @@ def test_tool_success_faults_are_atomic_at_every_substep(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with FaultingToolResultStore(tmp_path / "rollout.sqlite3") as store:
+    with FaultingToolResultStore.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -139,7 +139,7 @@ def test_stale_fencing_token_appends_nothing_and_releases_no_foreign_claim(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -182,7 +182,7 @@ def test_conflicting_resource_claims_are_serialized_across_threads(
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
     target = workspace / "shared.txt"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turns = [
             store.start_turn(
                 thread_id=store.create_thread(workspace=workspace).thread_id,
@@ -252,7 +252,7 @@ def test_compatible_read_claims_can_overlap_on_the_same_resource(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "shared.txt"
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         operation_ids: list[str] = []
         for index in range(2):
             turn = store.start_turn(
@@ -356,7 +356,7 @@ def test_conflicting_orchestrator_never_enters_the_second_runner(
     registry = ToolRegistry()
     registry.register(tool)
     tools = registry.freeze()
-    with RolloutStore(database) as setup:
+    with RuntimeState.open_sync(database) as setup:
         turns = [
             setup.start_turn(
                 thread_id=setup.create_thread(workspace=workspace).thread_id,
@@ -367,7 +367,7 @@ def test_conflicting_orchestrator_never_enters_the_second_runner(
         ]
 
     def execute(turn_id: str, owner: str) -> ToolResult:
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             return asyncio.run(
                 ToolOrchestrator(
                     store=store,
@@ -404,7 +404,7 @@ def test_conflicting_orchestrator_never_enters_the_second_runner(
     assert second.is_error is True
     assert second.error_code == "resource_busy"
     assert runner_calls == ["first"]
-    with RolloutStore(database) as verifier:
+    with RuntimeState.open_sync(database) as verifier:
         operations = verifier.list_tool_operations()
         assert sorted(operation.status for operation in operations) == [
             "failed",
@@ -425,7 +425,7 @@ def test_fresh_store_recovers_expired_running_operation_to_unknown_pause(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as first:
+    with RuntimeState.open_sync(database) as first:
         thread = first.create_thread(workspace=workspace)
         turn = first.start_turn(
             thread_id=thread.thread_id,
@@ -440,7 +440,7 @@ def test_fresh_store_recovers_expired_running_operation_to_unknown_pause(
             lease_seconds=5.0,
         )
 
-    with RolloutStore(database) as restarted:
+    with RuntimeState.open_sync(database) as restarted:
         recovered = restarted.expire_tool_operation_claim(
             operation_id=operation_id,
             now=106.0,
@@ -462,7 +462,7 @@ def test_trusted_reconciler_commits_unknown_success_without_replaying_runner(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -532,7 +532,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as setup:
+    with RuntimeState.open_sync(database) as setup:
         thread = setup.create_thread(workspace=workspace)
         turn = setup.start_turn(
             thread_id=thread.thread_id,
@@ -593,7 +593,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
     )
 
     def execute_in_old_worker() -> None:
-        with RolloutStore(database) as worker_store:
+        with RuntimeState.open_sync(database) as worker_store:
             orchestrator = ToolOrchestrator(
                 store=worker_store,
                 tools=tools,
@@ -609,7 +609,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
     with ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(execute_in_old_worker)
         assert started.wait(timeout=5.0)
-        with RolloutStore(database) as recovery:
+        with RuntimeState.open_sync(database) as recovery:
             [running] = recovery.list_tool_operations(turn.turn_id)
             assert running.status == "running"
             assert running.lease_expires_at is not None
@@ -622,7 +622,7 @@ def test_live_stale_worker_cannot_commit_after_recovery_fences_claim(
         with pytest.raises(RuntimeError, match="stale worker"):
             future.result(timeout=5.0)
 
-    with RolloutStore(database) as verifier:
+    with RuntimeState.open_sync(database) as verifier:
         [operation] = verifier.list_tool_operations(turn.turn_id)
         assert operation.status == "unknown"
         assert not any(
@@ -640,7 +640,7 @@ def test_commit_past_lease_boundary_settles_undisplaced_claim(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,

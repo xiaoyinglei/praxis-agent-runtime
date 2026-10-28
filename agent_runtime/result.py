@@ -12,7 +12,8 @@ from agent_runtime.tools.tool import JsonValue
 
 if TYPE_CHECKING:
     from agent_runtime.harness.protocol import TurnResult
-    from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
+    from agent_runtime.harness.records import ItemSnapshot
+    from agent_runtime.harness.state import RuntimeState
 
 type AgentResultStatus = Literal["done", "paused", "failed"]
 type AgentValidationStatus = Literal["not_evaluated", "passed", "failed"]
@@ -161,7 +162,7 @@ class AgentResult:
         cls,
         result: TurnResult,
         *,
-        store: RolloutStore,
+        store: RuntimeState,
         files: tuple[str, ...] = (),
     ) -> AgentResult:
         turn = store.read_turn(result.turn_id)

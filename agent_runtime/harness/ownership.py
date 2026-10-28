@@ -10,7 +10,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from agent_runtime.harness.rollout import RolloutStore, _store_operation
+from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.model_config_io import ensure_durable_directory
 from agent_runtime.user_config import user_config_directory
 
@@ -87,8 +87,8 @@ def assert_recovery_leases(*, owned: bool, leases: Iterable[float | None]) -> No
         raise ConversationBusyError("旧会话的执行租约尚未过期，暂不能接管；请确认原进程状态后再试。")
 
 
-@_store_operation
-def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False) -> None:
+@_state_operation
+def recover_owner_loss(store: RuntimeState, turn_id: str, *, abort: bool = False) -> None:
     """Reconcile dispatches while holding execution_owner, without redoing effects.
 
     New Turns promise the OS lock. Legacy workers did not hold it, so only their
@@ -106,7 +106,7 @@ def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False
         *(attempt.lease_expires_at for attempt in attempts.values()),
         *(op.lease_expires_at for op in tools),
     ))
-    with store._transaction():
+    with store.persistence.transaction():
         for operation in models:
             attempt = attempts[operation.operation_id]
             store.mark_model_attempt_unknown(operation_id=operation.operation_id,
@@ -134,7 +134,7 @@ def recover_owner_loss(store: RolloutStore, turn_id: str, *, abort: bool = False
                 store.pause_turn(turn_id=turn_id, reason="Previous execution owner stopped; abort requested")
 
 
-def _close_unstarted_calls(store: RolloutStore, turn_id: str) -> None:
+def _close_unstarted_calls(store: RuntimeState, turn_id: str) -> None:
     """Close provider tool groups without executing calls abandoned before start."""
     operations = {op.tool_call_id: op for op in store.list_tool_operations(turn_id)}
     results = {item.payload.get("tool_call_id") for item in store.list_items(turn_id) if item.kind == "tool_result"}

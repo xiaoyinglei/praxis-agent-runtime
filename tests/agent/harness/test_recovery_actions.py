@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.ownership import OWNERSHIP_REVISION, execution_owner
 
 
@@ -16,7 +16,7 @@ def _start(store, workspace):
 @pytest.mark.anyio
 async def test_public_recovery_inspection_is_read_only_and_never_loads_model(tmp_path, monkeypatch):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _start(store, tmp_path)
         before = store.list_records(turn.thread_id)
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
@@ -25,7 +25,7 @@ async def test_public_recovery_inspection_is_read_only_and_never_loads_model(tmp
     assert state["actions"] == ["continue", "abort"]
     assert state["reason_code"] == "before_first_dispatch"
     assert turn.turn_id in state["evidence_ids"]
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.list_records(turn.thread_id) == before
         store.pause_turn(turn_id=turn.turn_id, reason="no recoverable continuation")
     state = await agent.recovery_state(turn.turn_id)
@@ -36,7 +36,7 @@ async def test_public_recovery_inspection_is_read_only_and_never_loads_model(tmp
 @pytest.mark.anyio
 async def test_recovery_answers_one_identified_request_and_reports_required_input(tmp_path):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _start(store, tmp_path)
         request = store.request_clarification(turn_id=turn.turn_id, question="Which output?")
     state = await Agent(workspace_path=tmp_path, checkpoint_db=database).recovery_state(turn.turn_id)
@@ -50,7 +50,7 @@ async def test_recovery_answers_one_identified_request_and_reports_required_inpu
 @pytest.mark.anyio
 async def test_active_owner_does_not_advertise_recovery_actions(tmp_path):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _start(store, tmp_path)
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database)
     with execution_owner(database, turn.thread_id):
@@ -62,7 +62,7 @@ async def test_active_owner_does_not_advertise_recovery_actions(tmp_path):
 @pytest.mark.anyio
 async def test_legacy_dispatch_keeps_its_unexpired_lease(tmp_path):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
         operation = store.prepare_model_operation(turn_id=turn.turn_id, request_hash="r", context_hash="c",
@@ -76,7 +76,7 @@ async def test_legacy_dispatch_keeps_its_unexpired_lease(tmp_path):
 @pytest.mark.anyio
 async def test_legacy_running_turn_without_owner_contract_does_not_offer_abort(tmp_path):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
     state = await Agent(workspace_path=tmp_path, checkpoint_db=database).recovery_state(turn.turn_id)
@@ -87,7 +87,7 @@ async def test_legacy_running_turn_without_owner_contract_does_not_offer_abort(t
 @pytest.mark.parametrize("choice", [False, True])
 async def test_cancelled_pending_input_offers_only_abort(tmp_path, choice):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _start(store, tmp_path)
         if choice:
             store.request_choice(turn_id=turn.turn_id, question="Output?", options=("csv", "xlsx"))
@@ -105,7 +105,7 @@ async def test_cancelled_pending_input_offers_only_abort(tmp_path, choice):
 @pytest.mark.anyio
 async def test_unknown_tool_effect_is_not_approval_or_retry(tmp_path):
     database = tmp_path / "run.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = _start(store, tmp_path)
         values = dict(turn_id=turn.turn_id, operation_id="effect", tool_call_id="call", tool_name="write_file",
                       arguments_digest="args", execution_revision="write-v1", idempotent=False,
@@ -158,7 +158,7 @@ async def test_cancelled_approval_cannot_execute_the_previously_offered_action(t
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", PatchThenAnswerModel)
     paused = await agent.run("change value.txt", require_workspace_change=False)
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         store.request_turn_cancellation(turn_id=paused.turn_id)
     assert (await agent.recovery_state(paused.turn_id))["actions"] == ["abort"]
     with pytest.raises(RuntimeError, match="cancellation_pending"):

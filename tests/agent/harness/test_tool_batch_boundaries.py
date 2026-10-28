@@ -32,7 +32,7 @@ async def test_write_observation_belongs_to_admitted_runner(tmp_path: Path, same
             await written.wait()
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = await asyncio.to_thread(_setup,
         tmp_path, run, context_changes={"allow_write_tools": True},
         tool_changes={
             "static_effects": frozenset({ToolEffect.WRITE_WORKSPACE}),
@@ -76,7 +76,7 @@ async def test_finish_current_cancellation_preserves_results_and_stops_admission
         await finish.wait()
         return {"text": args["path"]}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = await asyncio.to_thread(_setup,
         tmp_path, run, context_changes={"max_parallel_calls": limit},
         tool_changes={"interrupt_behavior": InterruptBehavior.FINISH_CURRENT, "concurrency_safe": parallel},
     )
@@ -125,7 +125,7 @@ async def test_provider_group_uses_frozen_order_while_ledger_keeps_completion_or
         return {"text": args["path"]}
 
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
                 return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=(
                     HarnessToolCall(id="slow", name="read_file", arguments={"path": "0"}),
@@ -167,7 +167,9 @@ async def test_cancellation_after_claim_before_runner_commits_known_cancelled_re
         started.append(args["path"])
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run, tool_changes={"concurrency_safe": parallel})
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, tool_changes={"concurrency_safe": parallel}
+    )
     dispatcher = TurnEventDispatcher()
     dispatcher.subscribe_controlling_sink(Sink())
     orchestrator.attach_event_dispatcher(dispatcher)
@@ -205,7 +207,7 @@ async def test_cancel_and_reopen_retains_results_without_repeating_approved_or_f
         return {"text": args["path"]}
 
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             if self.requests[-1].step == 1:
                 return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
                     HarnessToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
@@ -271,7 +273,7 @@ async def test_call_failure_does_not_cancel_independent_siblings(tmp_path: Path,
         completed.append(args["path"])
         return {"text": args["path"]}
 
-    store, turn, original, calls = _setup(tmp_path, run)
+    store, turn, original, calls = await asyncio.to_thread(_setup, tmp_path, run)
     tool = replace(original._tools["read_file"], timeout_seconds=0.03)
     orchestrator = ToolOrchestrator(store=store, tools={"read_file": tool}, execution_context=ToolExecutionContext(
         workspace_root=tmp_path, cwd=tmp_path, max_parallel_calls=2,
@@ -319,7 +321,7 @@ async def test_cancel_during_completed_runner_output_collection_preserves_durabl
         return {"text": "done"}
 
     monkeypatch.setattr(executor_module, "workspace_tree_sha256", snapshot)
-    store, turn, orchestrator, calls = _setup(tmp_path, run, tool_changes={
+    store, turn, orchestrator, calls = await asyncio.to_thread(_setup, tmp_path, run, tool_changes={
         "static_effects": frozenset({ToolEffect.WRITE_WORKSPACE}),
         "resolve_use": lambda args: ResolvedToolUse(effects=frozenset({ToolEffect.WRITE_WORKSPACE}),
             targets=(ToolTarget(kind="workspace_path", value=str(workspace / "result.txt")),)),
@@ -400,7 +402,9 @@ async def test_result_commit_fault_stops_batch_and_drains_started_sibling(tmp_pa
         finally:
             exited.append(args["path"])
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run, context_changes={"max_parallel_calls": 2})
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, context_changes={"max_parallel_calls": 2}
+    )
     original_commit = store.commit_tool_operation_result
 
     def fail_one_commit(**kwargs):
@@ -438,7 +442,9 @@ async def test_repeated_cancellation_drains_cooperative_runner_cleanup(tmp_path:
             await release.wait()
             cleaned.set()
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run, context_changes={"max_parallel_calls": 1})
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, context_changes={"max_parallel_calls": 1}
+    )
     with store:
         task = asyncio.create_task(orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls))
         await asyncio.wait_for(entered.wait(), 1)

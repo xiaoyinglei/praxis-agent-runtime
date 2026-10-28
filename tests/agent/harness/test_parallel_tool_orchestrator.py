@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 from test_tool_orchestrator import _read_tool
 
-from agent_runtime.harness import RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RuntimeState, ToolOrchestrator
 from agent_runtime.harness.tool_orchestrator import ToolApprovalRequiredError
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
 
 def _setup(tmp_path, run, *, context_changes=None, tool_changes=None):
-    store = RolloutStore(tmp_path / "rollout.sqlite3")
+    store = RuntimeState.open_sync(tmp_path / "rollout.sqlite3")
     thread = store.create_thread(workspace=tmp_path)
     turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
     tool = replace(_read_tool(workspace=tmp_path), run=run, timeout_seconds=2, **(tool_changes or {}))
@@ -53,7 +53,9 @@ async def test_batch_really_overlaps_and_returns_ordered_durable_results(tmp_pat
         active -= 1
         return {"text": args["path"]}
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run, context_changes={"max_parallel_calls": 2})
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, context_changes={"max_parallel_calls": 2},
+    )
     with store:
         results = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
         assert maximum == 2
@@ -70,14 +72,14 @@ async def test_batch_approval_preflight_never_starts_sibling_runner(tmp_path: Pa
         started.append(args["path"])
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = (await asyncio.to_thread(_setup,
         tmp_path,
         run,
         context_changes={
             "require_confirmation_for": frozenset({"read_file"}),
             "approved_tool_call_ids": frozenset({"call-0"}),
         },
-    )
+    ))
     with store:
         with pytest.raises(ToolApprovalRequiredError):
             await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
@@ -102,7 +104,9 @@ async def test_batch_cancellation_drains_and_commits_all_started_runners(tmp_pat
         finally:
             exited.add(args["path"])
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run, context_changes={"max_parallel_calls": 2})
+    store, turn, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, context_changes={"max_parallel_calls": 2},
+    )
     with store:
         task = asyncio.create_task(orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls))
         await asyncio.wait_for(barrier.wait(), 1)
@@ -131,7 +135,7 @@ async def test_batch_conflicting_targets_serialize_without_resource_busy(tmp_pat
         active -= 1
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = (await asyncio.to_thread(_setup,
         tmp_path,
         run,
         context_changes={"allow_write_tools": True},
@@ -142,7 +146,7 @@ async def test_batch_conflicting_targets_serialize_without_resource_busy(tmp_pat
                 targets=(ToolTarget(kind="workspace_path", value=str(tmp_path / "same.txt")),),
             ),
         },
-    )
+    ))
     with store:
         results = await orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls)
         assert maximum == 1
@@ -182,14 +186,14 @@ async def test_mixed_batch_runs_both_read_segments_in_parallel_around_write(tmp_
                 active.remove(call)
         return {"text": target.read_text()}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = (await asyncio.to_thread(_setup,
         tmp_path, run,
         context_changes={"allow_write_tools": True, "max_parallel_calls": 2},
         tool_changes={"resolve_use": lambda args: ResolvedToolUse(
             effects=frozenset({ToolEffect.WRITE_WORKSPACE if args["path"] == "2" else ToolEffect.READ_WORKSPACE}),
             targets=(ToolTarget(kind="workspace_path", value=str(target)),),
         )},
-    )
+    ))
     calls = tuple(replace(calls[0], tool_call_id=f"call-{i}", arguments={"path": str(i)}) for i in range(5))
     if exclusive_writer:
         read_tool = orchestrator._tools["read_file"]
@@ -225,9 +229,9 @@ async def test_batch_remote_unknown_pauses_before_starting_later_calls(tmp_path:
         await finish.wait()
         return {"text": "remote done"}
 
-    store, turn, orchestrator, calls = _setup(
+    store, turn, orchestrator, calls = (await asyncio.to_thread(_setup,
         tmp_path, run, tool_changes={"cancellation_mode": CancellationMode.REMOTE_BEST_EFFORT, "idempotent": False}
-    )
+    ))
     with store:
         task = asyncio.create_task(orchestrator.execute_batch(turn_id=turn.turn_id, calls=calls))
         await asyncio.wait_for(started.wait(), 1)
@@ -254,7 +258,7 @@ async def test_batch_reads_remain_available_for_all_completion_policies(tmp_path
         count += 1
         return {"text": "ok"}
 
-    store, turn, orchestrator, calls = _setup(tmp_path, run)
+    store, turn, orchestrator, calls = (await asyncio.to_thread(_setup, tmp_path, run))
     with store:
         # A separate Turn freezes the actual workspace-change completion policy.
         thread = store.create_thread(workspace=tmp_path)
@@ -296,7 +300,7 @@ async def test_actual_turn_batch_overlap_and_approval_resumes_every_sibling(tmp_
         return {"text": "ok"}
 
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             if len(self.requests) == 1:
                 return HarnessModelResponse(
                     text="",
@@ -350,7 +354,9 @@ async def test_workspace_change_policy_still_allows_parallel_reads_within_budget
         await asyncio.wait_for(barrier.wait(), 1)
         return {"text": "ok"}
 
-    store, _, orchestrator, calls = _setup(tmp_path, run, context_changes={"max_parallel_calls": 2})
+    store, _, orchestrator, calls = await asyncio.to_thread(
+        _setup, tmp_path, run, context_changes={"max_parallel_calls": 2},
+    )
     with store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(

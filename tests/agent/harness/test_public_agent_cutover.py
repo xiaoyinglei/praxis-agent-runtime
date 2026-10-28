@@ -17,7 +17,7 @@ from agent_runtime.harness import (
     ModelDispatchCancelledError,
     PreparedModelCall,
     RolloutEventReader,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
 from agent_runtime.harness import session as harness_session
@@ -55,7 +55,7 @@ class PublicHarnessModel:
             request_ref={"step": request.step},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="answer from replacement harness",
@@ -65,13 +65,40 @@ class PublicHarnessModel:
 
 
 class FailingPublicHarnessModel(PublicHarnessModel):
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ConnectionError("provider connection ended after dispatch")
 
 
+def assert_answer_event_contract(events: list[StreamEvent]) -> None:
+    """One answer retains content lifecycle and the Runtime decisions around it."""
+    assert [event.type for event in events] == [
+        EventType.TURN_STARTED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.ITEM_STARTED,
+        EventType.ITEM_COMPLETED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.COMPLETION_DECIDED,
+        EventType.TURN_COMPLETED,
+    ]
+    attempts = [event for event in events if event.type is EventType.MODEL_ATTEMPT_UPDATED]
+    assert [event.data["status"] for event in attempts] == ["prepared", "dispatched", "completed"]
+    assert len({event.data["operation_id"] for event in attempts}) == 1
+    assert len({event.data["attempt_id"] for event in attempts}) == 1
+    assert {event.data["generation"] for event in attempts} == {1}
+    assert attempts[-1].data["response_status"] == "completed"
+    items = [event for event in events if event.type in {EventType.ITEM_STARTED, EventType.ITEM_COMPLETED}]
+    assert items[0].item_id == items[1].item_id
+    assert {event.item_kind for event in items} == {TurnItemKind.AGENT_MESSAGE}
+    decision = next(event for event in events if event.type is EventType.COMPLETION_DECIDED)
+    assert decision.data["action"] == "accept"
+    assert decision.data["validation_status"] == "not_evaluated"
+    assert decision.data["proposal_item_id"]
+
+
 class IncompletePublicHarnessModel(PublicHarnessModel):
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="partial public answer",
@@ -104,7 +131,7 @@ async def test_public_read_result_after_disconnect_never_constructs_model_runtim
     replayed = await agent.read_result(committed.turn_id)
 
     assert replayed == committed
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.verify().valid is True
 
 
@@ -188,7 +215,7 @@ async def test_public_agent_can_explicitly_disable_workspace_mcp_discovery_and_f
     )
 
     assert result.status == "done"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(result.turn_id).binding_manifest["mcp_policy"] == {"workspace_discovery_enabled": False}
 
 
@@ -263,7 +290,7 @@ class PatchThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -289,7 +316,7 @@ class PatchThenAnswerModel:
 
 
 class DestructivePythonThenAnswerModel(PatchThenAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -333,7 +360,7 @@ async def test_public_step_budget_and_legacy_alias_freeze_the_same_limit(tmp_pat
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     result = await agent.run("direct answer", require_workspace_change=False, **limits)
     assert result.status == "done"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(result.turn_id).binding_manifest["model_step_budget"] == 2
 
 
@@ -352,7 +379,7 @@ class BlockingPublicModel(PublicHarnessModel):
         self.dispatch_started = asyncio.Event()
         self.release_dispatch = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.dispatch_started.set()
         await self.release_dispatch.wait()
@@ -367,7 +394,7 @@ class AcknowledgedStreamCancelModel(PublicHarnessModel):
     def __init__(self) -> None:
         self.dispatch_started = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.dispatch_started.set()
         try:
@@ -383,7 +410,7 @@ class BlockingResumeModel(PatchThenAnswerModel):
         self.resume_dispatch_started = asyncio.Event()
         self.release_resume_dispatch = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return await super().dispatch(prepared)
         self.resume_dispatch_started.set()
@@ -396,7 +423,7 @@ class BlockingResumeModel(PatchThenAnswerModel):
 
 
 class PlanThenAnswerModel(PatchThenAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="",
@@ -457,15 +484,10 @@ async def test_public_agent_uses_rollout_harness_not_legacy_service(
     assert result.status == "done"
     assert result.thread_id != result.turn_id
     assert result.workspace_path == str(workspace.resolve())
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(result.turn_id).thread_id == result.thread_id
         assert store.verify().valid is True
-    assert [event.type for event in events] == [
-        EventType.TURN_STARTED,
-        EventType.ITEM_STARTED,
-        EventType.ITEM_COMPLETED,
-        EventType.TURN_COMPLETED,
-    ]
+    assert_answer_event_contract(events)
     assert {event.turn_id for event in events} == {result.turn_id}
 
 
@@ -502,7 +524,7 @@ async def test_public_resume_approves_the_same_durable_harness_turn(
     assert resumed.status == "done"
     assert resumed.answer == "patched through replacement harness"
     assert target.read_text(encoding="utf-8") == "after"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         [operation] = store.list_tool_operations(paused.turn_id)
         assert operation.status == "succeeded"
         assert store.verify().valid is True
@@ -553,7 +575,7 @@ async def test_public_resume_restores_the_frozen_tool_execution_policy(
     assert paused.status == "paused"
     assert executions == []
     assert target.read_text(encoding="utf-8") == "before"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         policy = store.read_turn(paused.turn_id).binding_manifest["tool_execution_policy"]
         assert policy["allow_write_tools"] is True
         assert policy["allow_execute_tools"] is True
@@ -586,7 +608,7 @@ async def test_public_abort_cancels_only_a_safely_paused_turn(
 
     assert cancelled.status == "failed"
     assert target.read_text(encoding="utf-8") == "before"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(paused.turn_id).status == "cancelled"
         assert store.list_tool_operations(paused.turn_id)[0].status == "cancelled"
         assert store.list_interactions(paused.turn_id)[0].status == "resolved"
@@ -613,7 +635,7 @@ async def test_public_agent_freezes_and_durably_enforces_model_budget(
 
     assert result.status == "failed"
     assert result.answer and "尚未完成" in result.answer
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         turn = store.read_turn(result.turn_id)
         assert turn.status == "failed"
         assert turn.binding_manifest["model_step_budget"] == 1
@@ -666,7 +688,7 @@ async def test_public_agent_binds_explicit_workspace_mcp_trust_to_the_turn(
 
     result = await agent.run("use the exact trusted config", require_workspace_change=False)
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         policy = store.read_turn(result.turn_id).binding_manifest["mcp_policy"]
     assert policy == {
         "workspace_discovery_enabled": True,
@@ -704,7 +726,7 @@ async def test_public_agent_references_files_without_copying_as_canonical_input_
     ]
     assert len(attachment_messages) == 1
     assert "brief.txt" in attachment_messages[0]
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         input_items = [item for item in store.list_items(result.turn_id) if item.kind == "input_file"]
         assert len(input_items) == 1
         assert input_items[0].payload["path"] == str(source.resolve())
@@ -797,12 +819,12 @@ async def test_original_attachment_is_readable_by_real_tools_and_live_deny_revok
                 "request_id": f"{request.turn_id}:{request.step}",
                 "toolset_revision": toolset_revision_for_tools(request.tools),
                 "exposed_tool_names": [tool.definition.name for tool in request.tools]})
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
                 return HarnessModelResponse(text="", provider_response_id="read-response", usage={}, tool_calls=(
                     HarnessToolCall(id="read-original", name="read_file", arguments={"path": str(first)}),
                 ))
-            return await super().dispatch(prepared, delta_sink=delta_sink)
+            return await super().dispatch(prepared, event_sink=event_sink)
     model = ReadingModel()
     agent = Agent(checkpoint_db=tmp_path / "read.sqlite3", workspace_path=workspace)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
@@ -915,12 +937,7 @@ async def test_public_astream_replays_events_from_canonical_rollout(
         )
     ]
 
-    assert [event.type for event in events] == [
-        EventType.TURN_STARTED,
-        EventType.ITEM_STARTED,
-        EventType.ITEM_COMPLETED,
-        EventType.TURN_COMPLETED,
-    ]
+    assert_answer_event_contract(events)
     assert len({event.turn_id for event in events}) == 1
 
 
@@ -973,7 +990,7 @@ async def test_confirmed_stream_cancel_commits_request_then_turn_aborted(
     await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
     await stream.aclose()
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         replayed = [
             entry.event
             for entry in RolloutEventReader(store).read_global()
@@ -984,9 +1001,16 @@ async def test_confirmed_stream_cancel_commits_request_then_turn_aborted(
 
     assert [event.type for event in replayed] == [
         EventType.TURN_STARTED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.MODEL_ATTEMPT_UPDATED,
         EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.MODEL_ATTEMPT_UPDATED,
         EventType.TURN_ABORTED,
     ]
+    attempts = [event for event in replayed if event.type is EventType.MODEL_ATTEMPT_UPDATED]
+    assert [event.data["status"] for event in attempts] == ["prepared", "dispatched", "cancelled"]
+    assert len({event.data["attempt_id"] for event in attempts}) == 1
+    assert len({event.data["operation_id"] for event in attempts}) == 1
     assert turn.status == "cancelled"
     assert thread.active_turn_id is None
 
@@ -1011,7 +1035,7 @@ async def test_unconfirmed_stream_cancel_retains_interrupted_turn_for_reconcilia
     await asyncio.wait_for(model.dispatch_started.wait(), timeout=1.0)
     await stream.aclose()
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         replayed = [
             entry.event
             for entry in RolloutEventReader(store).read_global()
@@ -1022,9 +1046,16 @@ async def test_unconfirmed_stream_cancel_retains_interrupted_turn_for_reconcilia
 
     assert [event.type for event in replayed] == [
         EventType.TURN_STARTED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.MODEL_ATTEMPT_UPDATED,
         EventType.TURN_CANCELLATION_REQUESTED,
+        EventType.MODEL_ATTEMPT_UPDATED,
         EventType.TURN_PAUSED,
     ]
+    attempts = [event for event in replayed if event.type is EventType.MODEL_ATTEMPT_UPDATED]
+    assert [event.data["status"] for event in attempts] == ["prepared", "dispatched", "unknown"]
+    assert len({event.data["attempt_id"] for event in attempts}) == 1
+    assert len({event.data["operation_id"] for event in attempts}) == 1
     assert replayed[-1].data["reason"] == "outcome_unknown"
     assert turn.status == "interrupted"
     assert thread.active_turn_id == turn.turn_id
@@ -1068,12 +1099,7 @@ async def test_public_event_sink_receives_committed_events_during_the_turn(
     model.release_dispatch.set()
     result = await run
     assert result.answer == "live stream answer"
-    assert [event.type for event in events] == [
-        EventType.TURN_STARTED,
-        EventType.ITEM_STARTED,
-        EventType.ITEM_COMPLETED,
-        EventType.TURN_COMPLETED,
-    ]
+    assert_answer_event_contract(events)
 
 
 @pytest.mark.anyio
@@ -1095,14 +1121,14 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
                 sink_started.set()
                 await release_sink.wait()
 
-    original_init = RolloutStore.__init__
+    original_init = RuntimeState.__init__
 
-    def reject_record_listener(self: RolloutStore, *args: object, **kwargs: object) -> None:
+    def reject_record_listener(self: RuntimeState, *args: object, **kwargs: object) -> None:
         assert kwargs.get("record_listener") is None
         original_init(self, *args, **kwargs)
 
-    monkeypatch.setattr(RolloutStore, "__init__", reject_record_listener)
-    monkeypatch.setattr(harness_session, "RolloutStore", RolloutStore)
+    monkeypatch.setattr(RuntimeState, "__init__", reject_record_listener)
+    monkeypatch.setattr(harness_session, "RuntimeState", RuntimeState)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     running = asyncio.create_task(
         agent.run(
@@ -1116,7 +1142,7 @@ async def test_public_stream_awaits_post_commit_batch_without_record_listener_qu
         async with asyncio.timeout(5):
             await sink_started.wait()
             assert model.dispatch_started.is_set() is False
-            with RolloutStore(database) as committed_store:
+            async with (await RuntimeState.open(database)) as committed_store:
                 turns = committed_store.list_turns()
                 assert len(turns) == 1
                 assert turns[0].status == "running"
@@ -1244,7 +1270,7 @@ async def test_cli_arun_sink_and_astream_share_identical_v2_lifecycle(
         (tmp_path / "cli.sqlite3", cli_result, cli_capture.events),
         (tmp_path / "sink.sqlite3", sink_result, sink_capture.events),
     ):
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             replayed = RolloutEventReader(store).read(result.thread_id)
         assert [(event.type, event.item_id) for event in live] == [
             (entry.event.type, entry.event.item_id) for entry in replayed
@@ -1288,10 +1314,20 @@ async def test_public_runtime_emits_v2_only_without_implicit_legacy_duplicates(
         EventType.ITEM_STARTED,
         EventType.ITEM_DELTA,
         EventType.ITEM_COMPLETED,
+        EventType.MODEL_ATTEMPT_UPDATED,
+        EventType.TOOL_OPERATION_UPDATED,
+        EventType.INTERACTION_REQUESTED,
+        EventType.INTERACTION_RESOLVED,
+        EventType.INTERACTION_INVALIDATED,
+        EventType.CONTEXT_COMPACTION_STARTED,
+        EventType.CONTEXT_COMPACTION_COMPLETED,
+        EventType.COMPLETION_DECIDED,
+        EventType.VERIFICATION_COMPLETED,
     }
     assert capture.events
     assert all(event.protocol_version == 2 for event in capture.events)
     assert all(event.type in v2_types for event in capture.events)
+    assert_answer_event_contract(capture.events)
     assert len([event for event in capture.events if event.type is EventType.ITEM_COMPLETED]) == 1
 
 
@@ -1346,7 +1382,7 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -1372,7 +1408,7 @@ async def test_public_abort_of_interrupted_turn_does_not_construct_model_runtime
 
     assert result.status == "failed"
     assert result.stop_reason == "cancelled"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(turn.turn_id).status == "cancelled"
 
 
@@ -1384,7 +1420,7 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "praxis.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -1406,7 +1442,7 @@ async def test_public_resume_rejects_incompatible_migrated_turn_before_runtime(
     with pytest.raises(RuntimeError, match="incompatible legacy Turn"):
         await agent.resume(turn.turn_id, "allow_once")
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(turn.turn_id).status == "paused"
         assert store.read_thread(thread.thread_id).active_turn_id == turn.turn_id
 

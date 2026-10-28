@@ -170,7 +170,7 @@ async def test_legacy_heuristic_labels_do_not_control_snapshot_reads(tmp_path):
 
 @pytest.mark.parametrize('error', [False, True])
 def test_compaction_model_projection_preserves_execution_facts(tmp_path, error):
-    from agent_runtime.harness import RolloutContextManager, RolloutStore
+    from agent_runtime.harness import RolloutContextManager, RuntimeState
     from tests.agent.harness.test_compaction_consistency import start
     from tests.agent.harness.test_tool_result_elision import seed
 
@@ -180,7 +180,7 @@ def test_compaction_model_projection_preserves_execution_facts(tmp_path, error):
                'render_mode': 'http', 'connection_mode': 'direct', 'failure_stage': 'extraction'} if error else
               {'query': 'Python OR Rust', 'provider': 'deepseek', 'result_status': 'results',
                'results': [{'url': 'https://docs.python.org', 'title': 'Python', 'snippet': 'Reference'}]})
-    with RolloutStore(tmp_path / 'r.db') as store:
+    with RuntimeState.open_sync(tmp_path / 'r.db') as store:
         _, turn = start(store, tmp_path)
         seed(store, turn_id=turn.turn_id, kind='model_response', payload={
             'text': 'Investigation history. ' * 2000,

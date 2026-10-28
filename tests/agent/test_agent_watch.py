@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ from pytest import MonkeyPatch
 
 from agent_runtime.cli import _watch_command
 from agent_runtime.git_delivery import CheckRun, GitDelivery, PullRequestChecks
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.result import AgentResult, AgentUsage
 
 pytestmark = pytest.mark.anyio
@@ -73,7 +74,7 @@ def workspace(tmp_path: Path) -> Path:
 
 
 def _seed_thread(workspace: Path, database: Path) -> str:
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn_id = store.start_turn(
             thread_id=thread.thread_id,
@@ -133,7 +134,7 @@ async def test_watch_failure_hands_report_to_latest_thread(
         ),
     )
     database = tmp_path / "rollout.sqlite3"
-    thread_id = _seed_thread(workspace, database)
+    thread_id = (await asyncio.to_thread(_seed_thread, workspace, database))
     submitted: list[tuple[str | None, str]] = []
     monkeypatch.setattr(
         "agent_runtime.cli._create_agent_facade",

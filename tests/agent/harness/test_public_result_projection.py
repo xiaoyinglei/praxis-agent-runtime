@@ -12,7 +12,7 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RolloutStore,
+    RuntimeState,
     Session,
     TurnResult,
 )
@@ -68,7 +68,7 @@ class PublicAnswerModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="public harness answer",
@@ -95,7 +95,7 @@ async def test_interrupted_model_exposes_public_retry_prompt(tmp_path):
     class InterruptedModel(PublicAnswerModel):
         attempts = 0
 
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             self.attempts += 1
             if self.attempts == 1:
                 raise ConnectionError("OpenAI-compatible stream ended without a finish reason")
@@ -257,5 +257,5 @@ async def test_completed_result_is_read_after_disconnect_without_rerunning_model
     with patch.object(reader, "_model_factory", side_effect=AssertionError("read must not open a model")):
         replayed = await reader.read_result(committed.turn_id)
     assert replayed == committed
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.verify().valid is True

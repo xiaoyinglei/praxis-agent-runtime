@@ -11,15 +11,16 @@ from uuid import uuid4
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.memory import MemoryEntry
+from agent_runtime.harness.memory_identity import thread_in_memory_scope
 from agent_runtime.harness.protocol import ContextSourceChangedError
-from agent_runtime.harness.rollout import RolloutStore, _store_operation
+from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.tools.tool import JsonValue, NormalizedToolOutput, Tool
 
 MemoryKind = Literal["preference", "fact", "reference"]
 
 
 def record_revision(
-    store: RolloutStore,
+    store: RuntimeState,
     state: dict[str, Any],
     entry: Mapping[str, Any],
     *,
@@ -50,9 +51,9 @@ def record_revision(
     return stamped
 
 
-@_store_operation
+@_state_operation
 def _write(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     action: str,
@@ -63,7 +64,7 @@ def _write(
     expected_version: int | None,
     source_item_ids: Sequence[str] | None,
 ) -> dict[str, Any]:
-    with store._transaction():
+    with store.persistence.transaction():
         state = store.read_memory_state(workspace)
         if expected_version is not None and expected_version != state["version"]:
             raise ContextSourceChangedError("memory changed before explicit edit")
@@ -98,7 +99,7 @@ def _write(
             item = store.read_item(ref)
             if (
                 item.kind != "user_message"
-                or Path(store.read_thread(item.thread_id).workspace).resolve() != workspace.resolve()
+                or not thread_in_memory_scope(store, workspace, item.thread_id)
             ):
                 raise ValueError("explicit memory provenance must be a user message in this workspace")
             refs[ref] = item.thread_id
@@ -114,7 +115,7 @@ def _write(
 
 
 def remember_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
@@ -138,7 +139,7 @@ def remember_memory(
 
 
 def edit_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
@@ -162,17 +163,18 @@ def edit_memory(
 
 
 def explain_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
     version: int | None = None,
+    scope_id: str | None = None,
     offset: int = 0,
     limit: int = 8,
 ) -> dict[str, Any]:
     if offset < 0 or not 1 <= limit <= 8:
         raise ValueError("history offset must be nonnegative and limit between 1 and 8")
-    state = store.read_memory_state(workspace, version=version)
+    state = store.read_memory_state(workspace, version=version, scope_id=scope_id)
     entry = next((e for e in state["entries"] if e["key"] == key), None)
     history = list(reversed(state.get("entry_history", {}).get(key, [])))
     if entry is None and not history and key not in state["deleted_keys"]:
@@ -188,7 +190,7 @@ def explain_memory(
     }
 
 
-def create_memory_management_tool(store: RolloutStore) -> Tool:
+def create_memory_management_tool(store: RuntimeState) -> Tool:
     from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
     from agent_runtime.tools.tool import (
         CancellationMode,
@@ -227,69 +229,66 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         workspace = Path(thread.workspace).resolve()
         action, key = arguments["action"], arguments["key"]
         if action == "explain":
+            from agent_runtime.harness.memory import read_frozen_memory_state
+            from agent_runtime.harness.memory_identity import thread_memory_scope
+
             snapshot = turn.binding_manifest.get("memory_snapshot")
             if snapshot is None:
                 raise ValueError("no memory snapshot")
+            await store.run_async(read_frozen_memory_state, store, thread_id=turn.thread_id, snapshot=snapshot)
+            scope_id = await store.run_async(thread_memory_scope, store, turn.thread_id)
             result = await store.run_async(
                 explain_memory,
                 store,
                 workspace,
                 key=key,
                 version=snapshot["version"],
+                scope_id=scope_id,
                 offset=arguments.get("offset", 0),
                 limit=arguments.get("limit", 8),
             )
         else:
             if thread.parent_thread_id is not None or turn.binding_manifest.get("budget_parent_turn_id"):
                 raise ValueError("child agents cannot make explicit user memory edits")
-            sources = await store.run_async(
-                lambda: [
-                    i.item_id
-                    for i in store.list_items(turn.turn_id)
-                    if i.kind == "user_message" and i.status == "completed" and i.producer == "user"
-                ]
-            )
-            if not sources:
-                raise ValueError("a current user message is required for explicit memory edits")
-            if "expected_version" not in arguments:
-                raise ValueError("writes require expected_version from the memory snapshot or last edit result")
-            if action == "forget":
-                result = await store.run_async(
-                    delete_memory, store, workspace, key, expected_version=arguments["expected_version"]
-                )
-                result = {"version": result["version"], "forgotten_key": key}
-            else:
-                if "text" not in arguments:
-                    raise ValueError("remember/edit require text")
-                kwargs: dict[str, Any] = {
-                    "key": key,
-                    "text": arguments["text"],
-                    "source_item_ids": sources[-1:],
-                    "expected_version": arguments["expected_version"],
-                }
-                if action == "remember":
-                    result = await store.run_async(
-                        remember_memory,
-                        store,
-                        workspace,
-                        title=arguments.get("title", key),
-                        kind=arguments.get("kind", "fact"),
-                        **kwargs,
-                    )
-                else:
-                    result = await store.run_async(
-                        edit_memory,
-                        store,
-                        workspace,
-                        title=arguments.get("title"),
-                        kind=arguments.get("kind"),
-                        **kwargs,
-                    )
-                result = {
-                    "version": result["version"],
-                    "entry": next(e for e in result["entries"] if e["key"] == key),
-                    "snapshot_policy": "Current Turn stays frozen. New Turns use this version.",
-                }
+            def write() -> dict[str, Any]:
+                with store.persistence.transaction():
+                    if not thread_in_memory_scope(store, workspace, turn.thread_id):
+                        raise ContextSourceChangedError("memory workspace binding changed before explicit edit")
+                    sources = [
+                        i.item_id for i in store.list_items(turn.turn_id)
+                        if i.kind == "user_message" and i.status == "completed" and i.producer == "user"
+                    ]
+                    if not sources:
+                        raise ValueError("a current user message is required for explicit memory edits")
+                    if "expected_version" not in arguments:
+                        raise ValueError("writes require expected_version from the memory snapshot or last edit result")
+                    if action == "forget":
+                        changed = delete_memory(store, workspace, key, expected_version=arguments["expected_version"])
+                        return {"version": changed["version"], "forgotten_key": key}
+                    if "text" not in arguments:
+                        raise ValueError("remember/edit require text")
+                    kwargs: dict[str, Any] = {
+                        "key": key,
+                        "text": arguments["text"],
+                        "source_item_ids": sources[-1:],
+                        "expected_version": arguments["expected_version"],
+                    }
+                    if action == "remember":
+                        changed = remember_memory(
+                            store, workspace, title=arguments.get("title", key),
+                            kind=arguments.get("kind", "fact"), **kwargs,
+                        )
+                    else:
+                        changed = edit_memory(
+                            store, workspace, title=arguments.get("title"), kind=arguments.get("kind"), **kwargs,
+                        )
+                    return {
+                        "version": changed["version"],
+                        "entry": next(e for e in changed["entries"] if e["key"] == key),
+                        "snapshot_policy": "Current Turn stays frozen. New Turns use this version.",
+                    }
+
+            result = await store.run_async(write)
         return NormalizedToolOutput(
             content=(ToolContentBlock(type="text", data={"text": json.dumps(result, ensure_ascii=False)}),)
         )
@@ -322,7 +321,7 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         static_effects=frozenset(),
         resolve_use=lambda a: ResolvedToolUse(
             effects=frozenset() if a["action"] == "explain" else frozenset({ToolEffect.WRITE_WORKSPACE}),
-            targets=(ToolTarget(kind="workspace_path", value=str(store._path.resolve())),)
+            targets=(ToolTarget(kind="workspace_path", value=str(store.persistence.path.resolve())),)
             if a["action"] != "explain"
             else (),
         ),

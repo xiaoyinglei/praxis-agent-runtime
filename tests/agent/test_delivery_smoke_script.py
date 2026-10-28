@@ -94,7 +94,7 @@ async def test_delivery_smoke_explicit_acceptance_rejects_missing_or_unexecuted_
              'unreached_assertion': (patch, unexecuted)}[scenario]
 
     class Model(module._SmokeModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             step = int(prepared.request_ref['step'])
             if step <= len(calls):
                 return module._response(text='', step=step, tool_calls=(calls[step - 1],))

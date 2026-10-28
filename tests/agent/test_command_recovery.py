@@ -244,7 +244,7 @@ class CrashResumeModel(PatchThenAnswerModel):
 @pytest.mark.parametrize("abort", [False, True])
 async def test_public_sdk_restores_ledger_authorized_job_after_sigkill(tmp_path, monkeypatch, inspector, abort):
     from agent_runtime import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -280,7 +280,7 @@ asyncio.run(main())
         await asyncio.to_thread(process.wait)
         agent = Agent(workspace_path=workspace, checkpoint_db=database, enable_workspace_mcp=False)
         monkeypatch.setattr(agent, "_model_factory", CrashResumeModel)
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             launch = next(i for i in store.list_items(turn_id) if i.kind == "tool_result")
             key = launch.payload["structured_content"]["session_id"]
         if inspector == "sdk":
@@ -303,7 +303,7 @@ asyncio.run(main())
         if abort:
             result = await agent.resume(turn_id, "abort")
             assert result.status == "failed"  # Public AgentResult maps cancelled Turn to failed.
-            with RolloutStore(database) as store:
+            async with (await RuntimeState.open(database)) as store:
                 assert store.read_turn(turn_id).status == "cancelled"
                 terminal = next(i for i in store.list_items(turn_id) if i.kind == "tool_continuation")
                 assert terminal.payload["structured_content"]["status"] == "cancelled"
@@ -312,7 +312,7 @@ asyncio.run(main())
             return
         result = await agent.resume(turn_id, "allow_once")
         assert result.status == "done", result
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             outputs = [i.payload for i in store.list_items(turn_id) if i.kind == "tool_result"]
             assert outputs[-1]["structured_content"]["stdout"] == "readydone"
             origin = outputs[-1]["metadata"]["runtime_workspace_origin_operation_id"]

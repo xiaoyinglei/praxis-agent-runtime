@@ -9,12 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutEventReader, RolloutStore
+from agent_runtime.harness import RolloutEventReader, RuntimeState
 from agent_runtime.streaming import events as stream_events
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 
 
-def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
+def _start_turn(store: RuntimeState, workspace: Path) -> tuple[str, str]:
     thread = store.create_thread(workspace=workspace)
     turn = store.start_turn(
         thread_id=thread.thread_id,
@@ -25,7 +25,7 @@ def _start_turn(store: RolloutStore, workspace: Path) -> tuple[str, str]:
 
 
 def _complete_model_response(
-    store: RolloutStore,
+    store: RuntimeState,
     *,
     turn_id: str,
     text: str,
@@ -79,7 +79,7 @@ def test_unknown_internal_item_kind_fails_closed(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, _turn_id = _start_turn(store, workspace)
         record = next(
             record
@@ -117,7 +117,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
         operation = store.prepare_model_operation(
             turn_id=turn_id,
@@ -227,7 +227,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
         plan_public_id = plan_completion.payload["public_item_id"]
         assert plan_public_id
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         persisted = reopened.list_records(thread_id)
         assert next(
             record.payload["public_item_ids"]
@@ -273,7 +273,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             ),
         )
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         with pytest.raises(RuntimeError, match="persisted public Item ID mismatch"):
             RolloutEventReader(reopened).read(thread_id)
 
@@ -281,7 +281,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
 def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="one answer")
         source = store.list_model_operations(turn_id)[0].response_item_id
@@ -295,7 +295,7 @@ def test_accepted_answer_does_not_duplicate_model_response(tmp_path: Path) -> No
 
 @pytest.mark.parametrize("same_answer", [False, True])
 def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: Path, monkeypatch, same_answer) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, tmp_path)
         _complete_model_response(store, turn_id=turn_id, text="model answer")
         for _ in range(48):
@@ -318,11 +318,11 @@ def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: 
         with monkeypatch.context() as patch:
             patch.setattr(store, "list_records", no_history)
             patch.setattr(store, "list_turn_records", no_history)
-            store.run_sync(lambda: store._connection.set_progress_handler(sql_step, 1))
+            store.run_sync(lambda: store.persistence._connection.set_progress_handler(sql_step, 1))
             try:
                 live = RolloutEventReader(store).project_committed_batch(mutation.records)
             finally:
-                store.run_sync(lambda: store._connection.set_progress_handler(None, 0))
+                store.run_sync(lambda: store.persistence._connection.set_progress_handler(None, 0))
         replayed = tuple(event for event in RolloutEventReader(store).read(thread_id)
                          if event.record_id in {record.record_id for record in mutation.records})
         assert [(event.cursor, replace(event.event, sequence=0)) for event in live] == [
@@ -335,7 +335,7 @@ def test_live_accepted_answer_uses_bounded_context_and_matches_replay(tmp_path: 
 def test_migrated_answer_projects_exactly_one_legacy_message(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -374,7 +374,7 @@ def test_command_execution_does_not_create_a_second_command_outcome(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
         store.record_tool_call(
             turn_id=turn_id,
@@ -427,7 +427,7 @@ def test_command_execution_does_not_create_a_second_command_outcome(
         duplicate_id = "legacy-command-activity"
 
         def transaction():
-            with store._transaction():
+            with store.persistence.transaction():
                 store._append_and_reduce(
                     thread_id=thread_id,
                     turn_id=turn_id,
@@ -486,7 +486,7 @@ def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, _turn_id = _start_turn(store, workspace)
         committed = next(
             record
@@ -503,13 +503,13 @@ def test_live_timestamp_is_unix_epoch_and_replay_uses_committed_timestamp(
 def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
 
         with pytest.raises(ValueError, match="unsupported record type"):
 
             def transaction():
-                with store._transaction():
+                with store.persistence.transaction():
                     store._append_and_reduce(
                         thread_id=thread_id,
                         turn_id=turn_id,
@@ -536,7 +536,7 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
         _complete_model_response(store, turn_id=turn_id, text="legacy model answer")
         store.record_tool_call(
@@ -652,7 +652,7 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
             (event.cursor, replace(event.event, sequence=0)) for event in first_replay
         ]
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         assert reopened.verify().valid is True
         second_replay = RolloutEventReader(reopened).read(thread_id)
 
@@ -678,7 +678,7 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
 def test_migrated_model_response_projects_one_legacy_message(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
         migrated = record_migrated_context_item(
             store,
@@ -723,7 +723,7 @@ def test_pre_identity_migrated_model_response_upcasts_to_legacy_message(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
         migrated = record_migrated_context_item(
             store,
@@ -765,7 +765,7 @@ def test_pre_identity_migrated_model_response_upcasts_to_legacy_message(
                 ),
             )
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         reopened.rebuild_projections()
         assert reopened.verify().valid is True
         replayed = RolloutEventReader(reopened).read(thread_id)

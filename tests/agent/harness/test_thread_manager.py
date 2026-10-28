@@ -13,9 +13,10 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
+from agent_runtime.modeling.events import ModelOutput
 
 
 class EchoHistoryModel:
@@ -44,7 +45,7 @@ class EchoHistoryModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         return HarnessModelResponse(
             text=f"answer-{len(self.requests)}",
             provider_response_id=f"response-{len(self.requests)}",
@@ -92,7 +93,9 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
             "agent_steps_remaining"] > 0
         assert model.requests[1].messages == (
             *model.requests[0].messages,
-            HarnessMessage(role="assistant", content="answer-1"),
+            HarnessMessage(
+                role="assistant", content="answer-1", outputs=(ModelOutput("text", "text", content="answer-1"),),
+            ),
             HarnessMessage(role="user", content="second"),
         )
         assert session.store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
@@ -134,7 +137,9 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
             assert branch.store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
             assert model.requests[2].messages == (
                 *model.requests[0].messages,
-                HarnessMessage(role="assistant", content="answer-1"),
+                HarnessMessage(
+                    role="assistant", content="answer-1", outputs=(ModelOutput("text", "text", content="answer-1"),),
+                ),
                 HarnessMessage(role="user", content="branch"),
             )
             assert source.store.read_thread(source.thread_id).head_turn_id == second.turn_id
@@ -154,7 +159,7 @@ async def test_child_binding_and_durable_turn_share_identity(tmp_path: Path) -> 
 def test_fork_from_non_head_turn_has_an_exact_history_cutoff(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         source = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=source.thread_id,

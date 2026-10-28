@@ -44,7 +44,7 @@ class PlanningModel(_UpdatePlanThenAnswerModel):
         self.requests.append(request)
         return super().prepare(request)
 
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         step = prepared.request_ref["step"]
         if step in (1, 3) and (step == 1 or self.reconcile):
             return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
@@ -90,12 +90,12 @@ async def test_unfinished_advisory_plan_does_not_exhaust_last_step(tmp_path):
 def test_working_context_compacts_before_provider_window(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import Accept, long_history
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway
 
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="Preserve the public API", binding_manifest={
             "context_capacity_policy": ContextCapacityPolicy().model_dump(),
@@ -123,7 +123,7 @@ async def test_permission_failure_identity_survives_tool_and_argument_changes(tm
     from agent_runtime.permission_policy import PathRule, PermissionPolicy
 
     class Model(PlanningModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step == 5:
                 return HarnessModelResponse(
@@ -159,12 +159,12 @@ async def test_permission_failure_identity_survives_tool_and_argument_changes(tm
 def test_working_target_keeps_large_protected_user_task_usable(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import Accept
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway
 
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="protected task " * 2000, binding_manifest={
             "context_capacity_policy": ContextCapacityPolicy().model_dump(),
@@ -218,12 +218,12 @@ def test_plan_tool_has_one_active_step_invariant():
 def test_incomplete_summary_preserves_originals_and_only_blocks_required_compaction(tmp_path, mandatory):
     import asyncio
 
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import Accept, long_history
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway
 
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="Finish the task", binding_manifest={
             "context_capacity_policy": ContextCapacityPolicy().model_dump(),
@@ -238,7 +238,7 @@ def test_incomplete_summary_preserves_originals_and_only_blocks_required_compact
         ), instructions=("Follow task",))
         summary_calls = []
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref["purpose"] == "context_summary":
                 summary_calls.append(prepared.request_ref["request_id"])
                 return HarnessModelResponse(text="INCOMPLETE_NOT_MEMORY", provider_response_id=None, usage={},
@@ -264,17 +264,17 @@ def test_incomplete_summary_preserves_originals_and_only_blocks_required_compact
 def test_failed_optional_compaction_state_survives_restart_and_resets_with_window(tmp_path):
     import asyncio
 
-    from agent_runtime.harness import ContextBudgetExceededError, RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import ContextBudgetExceededError, RolloutContextManager, RuntimeState, TurnExecutor
     from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
     database = tmp_path / "rollout.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
         model, _ = model_for(100000)
 
-        async def dispatch(prepared, *, delta_sink=None):
+        async def dispatch(prepared, *, event_sink=None):
             return HarnessModelResponse(text="partial", provider_response_id=None, usage={},
                                         status="incomplete", incomplete_reason="max_output_tokens")
 
@@ -286,7 +286,7 @@ def test_failed_optional_compaction_state_survives_restart_and_resets_with_windo
                                                 source=manager.semantic_source(turn.turn_id)[1]))
         assert store.read_turn(turn.turn_id).status == "running"
         assert not runner._proactive_compaction_available(turn.turn_id)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         manager = RolloutContextManager(store)
         model, _ = model_for(100000)
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=model,
@@ -304,7 +304,7 @@ def test_failed_optional_compaction_state_survives_restart_and_resets_with_windo
 def test_single_affordable_request_keeps_tools_without_reserving_two_maximum_rounds(tmp_path, budget):
     import asyncio
 
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from agent_runtime.modeling.contracts import ContextCapacityPolicy
     from tests.agent.harness.test_compaction_consistency import Accept
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway
@@ -314,7 +314,7 @@ def test_single_affordable_request_keeps_tools_without_reserving_two_maximum_rou
         def select(self, **kwargs):
             return (_tool(),)
 
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="task " * 4000, binding_manifest={
             "context_capacity_policy": ContextCapacityPolicy().model_dump(),

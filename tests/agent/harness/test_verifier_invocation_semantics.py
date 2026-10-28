@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.verification import assess_tool_verification
 from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
@@ -28,7 +28,7 @@ def test_actual_ruff_failure_suppression_cannot_pass_delivery_gate(tmp_path: Pat
     ordinary = subprocess.run([ruff, "check", "--isolated", "module.py"], cwd=workspace, capture_output=True, text=True)
     assert ordinary.returncode == 1
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,

@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 
@@ -21,7 +21,7 @@ class FetchThenAnswer(PatchThenAnswerModel):
         self.requests.append(request)
         return super().prepare(request)
 
-    async def dispatch(self, prepared, *, delta_sink: object = None):
+    async def dispatch(self, prepared, *, event_sink: object = None):
         if prepared.request_ref["request_id"].endswith(":step:1"):
             return HarnessModelResponse(
                 text="", provider_response_id="fetch-call", usage={},
@@ -44,7 +44,7 @@ async def test_product_unconfigured_search_reports_error_without_network_or_star
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     result = await agent.run("Search public docs", require_workspace_change=False)
     assert result.status == "done"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [item.payload for item in store.list_items(result.turn_id) if item.kind == "tool_result"]
         assert len(outputs) == 1
         assert outputs[0]["error_code"] == "web_search_not_configured"
@@ -78,7 +78,7 @@ async def test_deepseek_resume_preserves_original_search_binding(tmp_path, monke
     resumed = await second.resume(paused.turn_id, "allow_once")
     assert resumed.status == "done"
     assert len(hits) == 1 and hits[0].url.host == "api.deepseek.com"
-    with RolloutStore(options["checkpoint_db"]) as store:
+    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
         operation = store.list_tool_operations(resumed.turn_id)[0]
         assert operation.execution_revision == "builtin-public-web-search-deepseek-v2"
 
@@ -106,7 +106,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     assert result.status == "done"
     assert {"web_search", "web_fetch"}.issubset({t.definition.name for t in model.requests[0].tools})
     assert model.requests[0].binding_manifest["tool_execution_policy"]["allow_web_tools"] is True
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         artifacts = store.list_artifacts(result.turn_id)
         assert len(artifacts) == 2
         tool_output = next(i.payload['structured_content'] for i in store.list_items(result.turn_id)
@@ -125,7 +125,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     restored = await agent2.run("Continue saved source", require_workspace_change=False)
     assert restored.status == "done"
     assert len(requests) == 1
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [item.payload for item in store.list_items(restored.turn_id) if item.kind == "tool_result"]
         assert len(outputs) == 1
         assert outputs[0]["is_error"] is False
@@ -133,7 +133,7 @@ async def test_product_fetch_persists_source_and_reopens_without_network(tmp_pat
     other = Agent(workspace_path=tmp_path / "other-workspace", checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(other, "_model_factory", lambda: FetchThenAnswer({"source_id": source_id}))
     denied = await other.run("Read another workspace snapshot", require_workspace_change=False)
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [item.payload for item in store.list_items(denied.turn_id) if item.kind == "tool_result"]
         assert outputs[0]["error_code"] == "web_source_unavailable"
     assert len(requests) == 1
@@ -187,7 +187,7 @@ async def test_search_resume_in_new_agent_uses_explicit_external_credential(tmp_
     resumed = await second.resume(paused.turn_id, "allow_once")
     assert resumed.status == "done"
     assert len(requests) == 1
-    with RolloutStore(options["checkpoint_db"]) as store:
+    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
         outputs = [item.payload for item in store.list_items(resumed.turn_id) if item.kind == "tool_result"]
         assert outputs[-1]["is_error"] is False
         assert "fake-search-secret-credential" not in repr(store.list_items(resumed.turn_id))
@@ -309,7 +309,7 @@ async def test_product_search_budget_is_persisted_and_credential_is_not(tmp_path
     key.chmod(0o400)
 
     class RepeatedSearch(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref["request_id"].rsplit(":", 1)[-1])
             if step <= 33:
                 return HarnessModelResponse(text="", provider_response_id=f"search-{step}", usage={},
@@ -324,7 +324,7 @@ async def test_product_search_budget_is_persisted_and_credential_is_not(tmp_path
     result = await agent.run("Look up docs", allow_web_tools=True, require_workspace_change=False, max_turns=40)
     assert result.status == "done"
     assert len(hits) == 32
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [item.payload for item in store.list_items(result.turn_id) if item.kind == "tool_result"]
         assert outputs[-1]["error_code"] == "web_request_budget_exceeded"
         assert len(store.list_tool_operations(result.turn_id)) == 33

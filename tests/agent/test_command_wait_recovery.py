@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(
@@ -89,7 +89,7 @@ asyncio.run(main())
         assert thread_id
         async with asyncio.timeout(10):
             while True:
-                with RolloutStore(database, read_only=True) as store:
+                async with (await RuntimeState.open(database, read_only=True)) as store:
                     turn_id = store.read_thread(thread_id).active_turn_id
                     operations = store.list_tool_operations(turn_id) if turn_id else ()
                 if ((workspace / "counter").exists()
@@ -108,7 +108,7 @@ asyncio.run(main())
             from agent_runtime.harness.ownership import ConversationRecoveryRequiredError
             from agent_runtime.tools.builtins import command_worker
             (workspace / "release").touch()
-            with RolloutStore(database, read_only=True) as store:
+            async with (await RuntimeState.open(database, read_only=True)) as store:
                 launch = next(item for item in store.list_items(turn_id)
                               if item.kind == "tool_result" and item.payload.get("tool_name") == "run_command")
                 key = launch.payload["structured_content"]["session_id"]
@@ -124,7 +124,7 @@ asyncio.run(main())
             else:
                 result = await agent.resume(turn_id, "continue")
                 assert result.status == "paused" and result.pause.kind == "tool_reconciliation"
-            with RolloutStore(database) as store:
+            async with (await RuntimeState.open(database)) as store:
                 assert store.read_turn(turn_id).status == "paused"
                 assert any(op.status == "unknown" for op in store.list_tool_operations(turn_id))
                 assert store.verify().valid
@@ -148,7 +148,7 @@ asyncio.run(main())
         assert result.status == "done", result.pause or result.diagnostics
         assert result.answer == "Observed original command"
         assert (workspace / "counter").read_text() == "x"
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             assert store.verify().valid
             wait = next(op for op in store.list_tool_operations(turn_id) if op.tool_name == "manage_command")
             assert wait.status == "succeeded" and not wait.requires_reconciliation

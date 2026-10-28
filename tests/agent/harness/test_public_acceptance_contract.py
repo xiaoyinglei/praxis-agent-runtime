@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel, PublicHarnessModel
 
 
@@ -16,7 +16,7 @@ def test_default_sdk_turn_ends_without_claiming_task_acceptance(tmp_path, monkey
     result = asyncio.run(agent.run("Explain this concept", max_steps=2))
     assert result.status == "done"
     assert result.validation_status == "not_evaluated"
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         policy = store.read_turn(result.turn_id).binding_manifest["completion_policy"]
         assert policy == {"revision": "completion-v2", "require_workspace_change": False, "acceptance_command": None}
 
@@ -89,7 +89,7 @@ def test_public_explicit_command_uses_actual_execution_without_name_whitelist(
             ],
         )
         assert (result.exit_code == 0) is passed, result.output
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert turn.binding_manifest["completion_policy"]["acceptance_command"] == command
         assert (turn.status == "completed") is passed
@@ -148,7 +148,7 @@ def test_approval_recovery_keeps_the_original_acceptance_contract_and_budget(tmp
     result = asyncio.run(fresh.resume(paused.turn_id, "allow_once"))
     assert result.status == "done"
     assert result.validation_status == "passed" and result.validation_scope == "acceptance_command"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         policy = store.read_turn(result.turn_id).binding_manifest["completion_policy"]
         assert policy["acceptance_command"] == command
         assert store.read_budget_state(result.turn_id).limits.tokens == 100_000

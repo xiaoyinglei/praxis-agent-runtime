@@ -5,7 +5,7 @@ import json
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, PreparedModelCall, RolloutStore, Session
+from agent_runtime.harness import HarnessModelResponse, PreparedModelCall, RuntimeState, Session
 
 
 class MemoryModel:
@@ -23,7 +23,7 @@ class MemoryModel:
         self.requests.append(request)
         return PreparedModelCall("r", "c", "t", "w", {"purpose": request.purpose})
 
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         request = self.requests[-1]
         if request.purpose == "memory_extract":
             source = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
@@ -54,7 +54,7 @@ async def test_memory_update_is_durable_and_an_independent_chat_uses_a_frozen_sn
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=model, binding={"model_id": "test"})
         assert result["status"] == "updated"
@@ -88,7 +88,7 @@ async def test_workspace_isolation_contribution_control_and_delete_does_not_resu
     other = tmp_path / "other"
     other.mkdir()
     model = MemoryModel()
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path, contributes=False)
         seed(store, other)
         assert (await update_memory(store, workspace=tmp_path, model=model, binding={})) ["status"] == "unchanged"
@@ -106,7 +106,7 @@ async def test_failed_consolidation_preserves_previous_memory_and_records_failur
     from agent_runtime.harness.memory import memory_snapshot, update_memory
 
     model = MemoryModel()
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         await update_memory(store, workspace=tmp_path, model=model, binding={})
         before = memory_snapshot(store, tmp_path)
@@ -124,11 +124,11 @@ async def test_model_cannot_forge_memory_source_ids(tmp_path):
     from agent_runtime.harness.memory import memory_snapshot, update_memory
 
     class ForgingModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse(json.dumps({"entries": [{"key": "bad", "title": "bad", "text": "bad",
                                                                  "source_item_ids": ["unavailable"]}]}), None, {})
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=ForgingModel(), binding={})
         assert result["status"] == "failed"
@@ -160,13 +160,13 @@ async def test_concurrent_maintenance_claims_only_one_worker(tmp_path):
     entered, release = asyncio.Event(), asyncio.Event()
 
     class WaitingModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             entered.set()
             await release.wait()
-            return await super().dispatch(prepared, delta_sink=delta_sink)
+            return await super().dispatch(prepared, event_sink=event_sink)
 
     database = tmp_path / "r.db"
-    with RolloutStore(database) as first, RolloutStore(database) as second:
+    async with (await RuntimeState.open(database)) as first, (await RuntimeState.open(database)) as second:
         seed(first, tmp_path)
         worker = asyncio.create_task(update_memory(first, workspace=tmp_path, model=WaitingModel(), binding={}))
         await entered.wait()
@@ -184,7 +184,7 @@ async def test_read_memory_uses_frozen_entries_and_cannot_read_raw_other_chat_it
     from agent_runtime.tools.permissions import ToolExecutionContext
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
         thread = store.create_thread(workspace=tmp_path)
@@ -222,7 +222,7 @@ def test_memory_cli_status_is_readonly_and_controls_are_independent(tmp_path):
     assert not database.exists()
     result = runner.invoke(agent_app, ["memory", "configure", "--use", "--no-generate", *common])
     assert result.exit_code == 0, result.output
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         state = store.read_memory_state(tmp_path)
         assert state["use_memories"] and not state["generate_memories"]
 
@@ -233,13 +233,13 @@ async def test_long_history_is_consumed_in_complete_batches_across_reopens(tmp_p
 
     database = tmp_path / "r.db"
     model = MemoryModel()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread, turn = seed(store, tmp_path, text="中文 and escaped \"data\" " * 5000)
         original = next(i for i in store.list_items(turn.turn_id) if i.kind == "user_message")
         expected = json.dumps(dict(original.payload), ensure_ascii=False)
     fragments = []
     for _ in range(20):
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             result = await update_memory(store, workspace=tmp_path, model=model, binding={})
         assert result["status"] == "updated"
         request = next(r for r in reversed(model.requests) if r.purpose == "memory_extract")
@@ -251,7 +251,7 @@ async def test_long_history_is_consumed_in_complete_batches_across_reopens(tmp_p
     else:
         pytest.fail("source must make bounded progress")
     assert len(fragments) > 1 and "".join(fragments) == expected
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert (await update_memory(store, workspace=tmp_path, model=model, binding={})) ["status"] == "unchanged"
         later = store.start_turn(thread_id=thread.thread_id, user_message="new allowed fact",
                                  binding_manifest={"memory_generation_allowed": True})
@@ -270,7 +270,7 @@ async def test_snapshot_failure_returns_diagnostic_without_phantom_turn_cleanup(
         def snapshot(self, **identity):
             raise ValueError("cannot bind model")
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=BrokenSnapshot(), binding={})
         assert result["status"] == "failed"
@@ -289,14 +289,14 @@ async def test_reopened_chat_obeys_new_workspace_controls_without_extracting_dis
                                   require_workspace_change=False) as session:
         await session.submit("private old turn")
         thread_id = session.thread_id
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         configure_memory(store, tmp_path, MemoryConfig())
     async with await Session.open(database=database, workspace=tmp_path, model=model, thread_id=thread_id,
                                   _background_memory=False, require_workspace_change=False) as session:
         assert session.memory_config.generate_memories
         assert session.store.read_thread(thread_id).settings["memory_generation_allowed"]
         await session.submit("new allowed turn")
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         result = await update_memory(store, workspace=tmp_path, model=model, binding={})
         assert result["status"] == "updated"
     extraction = next(r for r in model.requests if r.purpose == "memory_extract")
@@ -313,7 +313,7 @@ async def test_memory_maintenance_runs_the_existing_model_ready_hook(tmp_path):
     async def ready(binding):
         calls.append(binding["maintenance_purpose"])
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={}, prepare_binding=ready)
         assert result["status"] == "updated"
@@ -325,7 +325,7 @@ async def test_later_correction_replaces_the_previous_entry(tmp_path):
     from agent_runtime.harness.memory import memory_snapshot, update_memory
 
     class CorrectionModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             request = self.requests[-1]
             if request.purpose == "memory_extract":
                 data = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
@@ -333,9 +333,9 @@ async def test_later_correction_replaces_the_previous_entry(tmp_path):
                     "key": "environment", "title": "Command runner", "text": data[0]["payload"]["text"],
                     "source_item_ids": [data[0]["item_id"]],
                 }]}), None, {})
-            return await super().dispatch(prepared, delta_sink=delta_sink)
+            return await super().dispatch(prepared, event_sink=event_sink)
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path, text="Use pip.")
         model = CorrectionModel()
         await update_memory(store, workspace=tmp_path, model=model, binding={})
@@ -359,7 +359,7 @@ async def test_memory_budget_rejects_dispatch_before_provider_call(tmp_path):
         async def dispatch(self, *args, **kwargs):
             pytest.fail("provider must not be called above the maintenance budget")
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=OverBudget(), binding={})
         assert result["status"] == "failed"
@@ -373,11 +373,11 @@ async def test_cancelled_provider_outcome_is_not_reissued_and_other_sources_can_
     entered = asyncio.Event()
 
     class SlowModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             entered.set()
             await asyncio.Event().wait()
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         task = asyncio.create_task(update_memory(store, workspace=tmp_path, model=SlowModel(), binding={}))
         await entered.wait()
@@ -406,7 +406,7 @@ async def test_metadata_only_model_snapshot_gets_maintenance_identity(tmp_path):
         assert binding["thread_id"].startswith("thread_")
         assert binding["turn_id"].startswith("turn_")
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
         result = await update_memory(store, workspace=tmp_path, model=MetadataOnly(), binding={}, prepare_binding=ready)
         assert result["status"] == "updated"
@@ -423,7 +423,7 @@ async def test_terminal_chat_enqueues_durable_work_for_next_session(tmp_path):
                                   require_workspace_change=False) as first:
         await first.submit("Remember a stable project convention")
         source_thread = first.thread_id
-    with RolloutStore(database, read_only=True) as store:
+    async with (await RuntimeState.open(database, read_only=True)) as store:
         jobs = store.read_memory_jobs(tmp_path)
         assert jobs[source_thread]["status"] == "pending"
     async with await Session.open(database=database, workspace=tmp_path, model=model,
@@ -442,7 +442,7 @@ async def test_index_is_bounded_and_details_use_the_frozen_version(tmp_path):
     from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
 
     database = tmp_path / "r.db"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         source, turn = seed(store, tmp_path)
         source_id = store.list_items(turn.turn_id)[0].item_id
         state = store.read_memory_state(tmp_path)
@@ -477,7 +477,7 @@ async def test_old_size_skip_is_migrated_without_reextracting_normal_processed_h
 
     from agent_runtime.harness.memory import MAX_SOURCE_BYTES, update_memory
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         thread, turn = seed(store, tmp_path, text="big" * 20000)
         turns = store.list_turns(thread.thread_id)
         revision = hashlib.sha256(json.dumps({
@@ -498,19 +498,20 @@ async def test_old_size_skip_is_migrated_without_reextracting_normal_processed_h
 def test_expired_worker_cannot_publish_cursor_or_mutate_job(tmp_path):
     import time
 
-    from agent_runtime.harness.rollout import ContextSourceChangedError
+    from agent_runtime.harness.protocol import ContextSourceChangedError
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, _ = seed(store, tmp_path)
-        assert store.claim_memory_job(tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
-        assert store.claim_memory_job(tmp_path, owner="new", now=time.time(), lease_seconds=300)
-        job = store.write_memory_job(tmp_path, thread.thread_id, {"status": "running"}, owner="new")
+        old = store.claim_memory_job(tmp_path, owner="old", now=time.time() - 10, lease_seconds=1)
+        new = store.claim_memory_job(tmp_path, owner="new", now=time.time(), lease_seconds=300)
+        assert old is not None and new is not None
+        job = store.write_memory_job(tmp_path, thread.thread_id, {"status": "running"}, claim=new)
         with pytest.raises(ContextSourceChangedError):
-            store.write_memory_job(tmp_path, thread.thread_id, {"status": "done"}, owner="old")
+            store.write_memory_job(tmp_path, thread.thread_id, {"status": "done"}, claim=old)
         with pytest.raises(ContextSourceChangedError):
             store.commit_memory_state(tmp_path, expected_version=0,
                                       state={**store.read_memory_state(tmp_path), "source_cursors": {"bad": 1}},
-                                      claim_owner="old", job_thread_id=thread.thread_id,
+                                      claim=old, job_thread_id=thread.thread_id,
                                       job_state={"status": "done"}, job_revision=job["revision"])
         assert store.read_memory_state(tmp_path)["version"] == 0
         assert store.read_memory_jobs(tmp_path)[thread.thread_id] == job
@@ -527,7 +528,7 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
             entered.set()
             await asyncio.Event().wait()
     first = MemoryModel()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread, _ = seed(store, tmp_path)
         worker = asyncio.create_task(update_memory(store, workspace=tmp_path, model=first, binding={},
                                                   prepare_binding=ready))
@@ -538,7 +539,7 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
         assert store.read_memory_jobs(tmp_path)[thread.thread_id]["status"] == "pending"
         assert store.read_memory_state(tmp_path)["version"] == 0
     second = MemoryModel()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         result = await update_memory(store, workspace=tmp_path, model=second, binding={})
         assert result["status"] == "updated"
         assert [r.purpose for r in second.requests] == ["memory_consolidate"]
@@ -546,7 +547,7 @@ async def test_completed_extraction_is_reused_after_cancel_before_consolidation_
 
 
 def test_version_zero_never_falls_back_to_current_memory(tmp_path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         state = store.read_memory_state(tmp_path)
         store.commit_memory_state(tmp_path, expected_version=0, state={**state, "entries": [{"key": "new"}]})
         assert store.read_memory_state(tmp_path, version=0)["entries"] == []
@@ -559,7 +560,7 @@ async def test_completed_extraction_recovers_across_candidate_cache_crash_window
     from agent_runtime.harness.memory import update_memory
 
     database = tmp_path / "r.db"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         seed(store, tmp_path)
         write = store.write_memory_job
         def crash_before_cache(*args, **kwargs):
@@ -569,7 +570,7 @@ async def test_completed_extraction_recovers_across_candidate_cache_crash_window
         monkeypatch.setattr(store, "write_memory_job", crash_before_cache)
         with pytest.raises(asyncio.CancelledError):
             await update_memory(store, workspace=tmp_path, model=MemoryModel(), binding={})
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         model = MemoryModel()
         assert (await update_memory(store, workspace=tmp_path, model=model, binding={}))["status"] == "updated"
         assert [r.purpose for r in model.requests] == ["memory_consolidate"]
@@ -580,9 +581,9 @@ async def test_exhausted_batch_does_not_block_other_sources_or_reset_its_budget(
     from agent_runtime.harness.memory import update_memory
 
     class InvalidModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         blocked, _ = seed(store, tmp_path)
         safe, _ = seed(store, tmp_path, text="later safe convention")
         first = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
@@ -602,7 +603,7 @@ async def test_exhausted_batch_does_not_block_other_sources_or_reset_its_budget(
 async def test_new_topic_preserves_a_bank_larger_than_navigation_capacity(tmp_path):
     from agent_runtime.harness.memory import update_memory
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         source, turn = seed(store, tmp_path)
         source_id = store.list_items(turn.turn_id)[0].item_id
         originals = [{"key": f"topic-{n}", "title": f"Topic {n}", "text": f"stable original {n}",
@@ -622,10 +623,10 @@ async def test_exhausted_memory_batch_stays_blocked_but_new_source_revision_can_
     from agent_runtime.harness.memory import update_memory
 
     class InvalidModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         source, _ = seed(store, tmp_path, text="old material " * (5000 if large_old_source else 1))
         for attempt in range(2):
             result = await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={})
@@ -665,10 +666,10 @@ async def test_appending_history_cannot_refund_the_same_failed_memory_batch(tmp_
     from agent_runtime.harness.memory import update_memory
 
     class InvalidModel(MemoryModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         source, _ = seed(store, tmp_path, text="unchanged first batch " * 5000)
         assert (await update_memory(store, workspace=tmp_path, model=InvalidModel(), binding={}))["status"] == "failed"
         previous = store.read_memory_jobs(tmp_path)[source.thread_id]

@@ -7,7 +7,7 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import CompletionDecision, RolloutStore, Session, TurnResult
+from agent_runtime.harness import CompletionDecision, RuntimeState, Session, TurnResult
 from agent_runtime.result import AgentResult, AgentUsage
 from agent_runtime.terminal_app import _ConversationOutput
 from agent_runtime.terminal_ui import Conversation
@@ -17,7 +17,7 @@ from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 @pytest.mark.anyio
 async def test_false_research_answer_ends_without_becoming_validated(tmp_path, monkeypatch):
     class FalseAnswer(PublicHarnessModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             from agent_runtime.harness import HarnessModelResponse
             return HarnessModelResponse(
                 text="The moon is made of cheese.",
@@ -37,7 +37,7 @@ async def test_false_research_answer_ends_without_becoming_validated(tmp_path, m
     replayed = await agent.read_result(result.turn_id)
     assert replayed.validation_status == "not_evaluated"
     assert replayed.validation_scope is None
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         [decision] = [item for item in store.list_items(result.turn_id) if item.kind == "completion_decision"]
         assert decision.payload["validation_status"] == "not_evaluated"
         assert decision.payload["validation_scope"] is None
@@ -53,7 +53,7 @@ def test_legacy_custom_gate_action_does_not_invent_validation(action):
 
 @pytest.mark.parametrize("validation_status", ["not_evaluated", "passed", "failed"])
 def test_canonical_decision_projects_explicit_validation(tmp_path: Path, validation_status):
-    with RolloutStore(tmp_path / "projection.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "projection.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="answer", binding_manifest={})
         proposal = store.record_final_proposal(turn_id=turn.turn_id, answer="answer")
@@ -75,14 +75,14 @@ def test_canonical_decision_projects_explicit_validation(tmp_path: Path, validat
 @pytest.mark.parametrize("legacy_decision", [False, True])
 async def test_read_result_of_old_turn_without_validation_metadata_is_not_evaluated(tmp_path, legacy_decision):
     database = tmp_path / "old.sqlite"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
         if legacy_decision:
             proposal = store.record_final_proposal(turn_id=turn.turn_id, answer="old answer")
             # Replay the historical canonical shape, before validation metadata existed.
             def seed_legacy_decision():
-                with store._transaction():
+                with store.persistence.transaction():
                     store._append_and_reduce(
                         thread_id=thread.thread_id, turn_id=turn.turn_id,
                         record_type="item_started", producer="verifier",

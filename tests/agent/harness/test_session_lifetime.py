@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
-from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
+from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel, assert_answer_event_contract
 
 
 def test_frozen_model_resolution_reuses_provider_and_closes_it_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -265,7 +265,7 @@ async def test_failed_open_releases_store_and_model_control(tmp_path, monkeypatc
     assert len(planes) == len(stores) == 1
     assert planes[0]._closed
     with pytest.raises(sqlite3.ProgrammingError):
-        stores[0].list_threads()
+        stores[0].rows('threads')
 
 
 @pytest.mark.anyio
@@ -319,25 +319,18 @@ async def test_cancelled_model_turn_keeps_session_open_for_natural_followup(tmp_
 
 @pytest.mark.anyio
 async def test_one_shot_stream_does_not_drop_buffered_events_after_session_close(tmp_path, monkeypatch):
-    from agent_runtime.streaming.events import EventType
-
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", PublicHarnessModel)
     events = []
     async for event in agent.stream("slow consumer", require_workspace_change=False):
         events.append(event)
         await asyncio.sleep(0.02)
-    assert [event.type for event in events] == [
-        EventType.TURN_STARTED,
-        EventType.ITEM_STARTED,
-        EventType.ITEM_COMPLETED,
-        EventType.TURN_COMPLETED,
-    ]
+    assert_answer_event_contract(events)
 
 
 @pytest.mark.anyio
 async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
-    from agent_runtime.harness import RolloutStore, Session
+    from agent_runtime.harness import RuntimeState, Session
     from tests.agent.harness.test_subagent_budget import AcceptAnswer, BlockingAnswerModel
 
     model = BlockingAnswerModel()
@@ -376,7 +369,7 @@ async def test_close_waits_for_direct_child_and_its_budget_settlement(tmp_path):
             model.release.set()
             await asyncio.wait_for(asyncio.gather(child, closing, return_exceptions=True), timeout=1)
         result = child.result()
-        with RolloutStore(database) as store:
+        async with (await RuntimeState.open(database)) as store:
             assert store.read_child_budget_allocation(result.turn_id)["status"] == "settled"
             assert store.read_budget_state(parent.turn_id).used.total_tokens == 5
 

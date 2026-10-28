@@ -184,7 +184,7 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
 
     from agent_runtime import Agent
     from agent_runtime import cli as cli_module
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
     from tests.agent.harness.test_subagent_budget import SmallAnswerModel
 
     class InspectModel(SmallAnswerModel):
@@ -199,7 +199,7 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
                 "exposed_tool_names": [tool.definition.name for tool in request.tools],
             })
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             messages = prepared.dispatch_payload.messages
             results = [m for m in messages if m.role == "tool"]
             if not results:
@@ -248,7 +248,7 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
         ])
         assert result.exit_code == 0, result.output
     assert model.grid is not None
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.verify().valid
 
 

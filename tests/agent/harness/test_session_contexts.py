@@ -6,7 +6,7 @@ from agent_runtime.harness import (
     DeliveryCompletionGate,
     HarnessMessage,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     StepContext,
     TurnContext,
     TurnExecutor,
@@ -17,7 +17,7 @@ class _UnusedModel:
     def prepare(self, request):  # type: ignore[no-untyped-def]
         raise AssertionError("capture_step_context must not call the provider")
 
-    async def dispatch(self, prepared, *, delta_sink: object = None):  # type: ignore[no-untyped-def]
+    async def dispatch(self, prepared, *, event_sink: object = None):  # type: ignore[no-untyped-def]
         raise AssertionError("capture_step_context must not call the provider")
 
 
@@ -46,7 +46,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
     monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: next(clocks))
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -98,7 +98,7 @@ def test_session_captures_one_immutable_request_view_per_step(tmp_path: Path, mo
 def test_session_rejects_a_turn_from_another_thread(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         first = store.create_thread(workspace=workspace)
         second = store.create_thread(workspace=workspace)
         foreign_turn = store.start_turn(

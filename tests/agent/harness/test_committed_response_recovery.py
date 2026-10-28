@@ -15,7 +15,7 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     PreparedModelCall,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     StaticToolRouter,
     ToolOrchestrator,
     TurnExecutor,
@@ -99,7 +99,7 @@ class AnswerAfterRecovery:
             request_ref={"request_id": f"recovery:{request.step}"},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="Recovered tool call was consumed exactly once.",
@@ -119,7 +119,7 @@ class FrozenBinding:
         return {"model_id": "model-v1", "model_step_budget": 2}
 
 
-class CrashBeforeToolResultStore(RolloutStore):
+class CrashBeforeToolResultStore(RuntimeState):
     def record_tool_result(self, **_kwargs):  # type: ignore[no-untyped-def]
         raise RuntimeError("injected crash before ToolResult commit")
 
@@ -138,7 +138,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
     tools = registry.freeze()
     toolset_revision = toolset_revision_for_tools(tuple(tools.values()))
 
-    with RolloutStore(database) as crashed_process:
+    with RuntimeState.open_sync(database) as crashed_process:
         thread = crashed_process.create_thread(workspace=workspace)
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
@@ -203,7 +203,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             )
             assert calls == ["README.md"]
 
-    with RolloutStore(database) as recovered_process:
+    with RuntimeState.open_sync(database) as recovered_process:
         model = AnswerAfterRecovery()
         session = TurnExecutor(
             thread_id=turn.thread_id,
@@ -251,7 +251,7 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
     registry.register(_read_tool(calls, workspace))
     tools = registry.freeze()
     toolset_revision = toolset_revision_for_tools(tuple(tools.values()))
-    with CrashBeforeToolResultStore(database) as crashed_process:
+    with CrashBeforeToolResultStore.open_sync(database) as crashed_process:
         thread = crashed_process.create_thread(workspace=workspace)
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
@@ -318,7 +318,7 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
         assert rolled_back_outcome.result_item_id is None
         assert calls == ["README.md"]
 
-    with RolloutStore(database) as recovered_process:
+    with RuntimeState.open_sync(database) as recovered_process:
         [expired_claim] = recovered_process.list_tool_operations(turn.turn_id)
         assert expired_claim.lease_expires_at is not None
         recovered_process.expire_tool_operation_claim(

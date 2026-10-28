@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from agent_runtime.harness.protocol import HarnessMessage
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.tools.tool import Tool
 
 
@@ -36,7 +36,7 @@ class DurableToolRouter:
     def __init__(
         self,
         *,
-        store: RolloutStore,
+        store: RuntimeState,
         tools: Mapping[str, Tool],
         resident_names: tuple[str, ...],
         discoverable_names: tuple[str, ...],

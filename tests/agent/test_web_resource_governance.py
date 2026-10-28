@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from agent_runtime.tools.web_http import PublicWebClient
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 from tests.agent.test_web_tools import web_tools
@@ -86,7 +86,7 @@ async def test_public_agent_reports_persisted_remaining_budget_and_config(tmp_pa
         **kwargs, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(
             200, text='source facts', headers={'content-type': 'text/plain'}))))
     class ReadPages(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step <= 3:
                 return HarnessModelResponse(text='', provider_response_id=f'read-{step}', usage={},
@@ -100,7 +100,7 @@ async def test_public_agent_reports_persisted_remaining_budget_and_config(tmp_pa
     monkeypatch.setattr(agent, '_model_factory', lambda: ReadPages())
     result = await agent.run('Read three sources', allow_web_tools=True, require_workspace_change=False)
     assert result.status == 'done' and len(hits) == 2
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(result.turn_id).binding_manifest['web_limits']['turn_requests'] == 2
         outputs = [i.payload['structured_content'] for i in store.list_items(result.turn_id) if i.kind == 'tool_result']
         assert outputs[0]['request_budget']['remaining'] == 1
@@ -164,7 +164,7 @@ async def test_resume_cannot_raise_frozen_web_budget(tmp_path, monkeypatch):
     monkeypatch.setattr(second, '_model_factory', lambda: FetchThenAnswer({'url': 'https://example.com/a'}))
     resumed = await second.resume(paused.turn_id, 'allow_once')
     assert resumed.status == 'done' and len(hits) == 1
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(resumed.turn_id).binding_manifest['web_limits']['turn_requests'] == 1
         outputs = [i.payload['structured_content'] for i in store.list_items(resumed.turn_id)
                    if i.kind == 'tool_result']
@@ -199,7 +199,7 @@ async def test_failure_evidence_is_reused_after_new_process_resume(tmp_path, mon
     monkeypatch.setattr(web_http, 'PublicWebClient', lambda **kwargs: PublicWebClient(
         **kwargs, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(403))))
     class FailedReadThenPause(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step in {1, 3}:
                 return HarnessModelResponse(text='', provider_response_id=f'read-{step}', usage={},
@@ -220,7 +220,7 @@ async def test_failure_evidence_is_reused_after_new_process_resume(tmp_path, mon
     monkeypatch.setattr(second, '_model_factory', lambda: FailedReadThenPause())
     resumed = await second.resume(paused.turn_id, 'deny')
     assert resumed.status == 'done' and len(hits) == 1
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [i.payload['structured_content'] for i in store.list_items(resumed.turn_id)
                    if i.kind == 'tool_result' and i.payload['tool_name'] == 'web_fetch']
         assert outputs[-1]['cache_hit'] is True
@@ -238,7 +238,7 @@ async def test_parallel_batch_consumes_only_available_budget_and_denial_is_not_u
         **kwargs, transport=httpx.MockTransport(lambda req: hits.append(req) or httpx.Response(
             200, text='acquired source', headers={'content-type': 'text/plain'}))))
     class ParallelPages(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             if prepared.request_ref['request_id'].endswith(':step:1'):
                 return HarnessModelResponse(text='', provider_response_id='parallel', usage={}, tool_calls=tuple(
                     HarnessToolCall(id=f'read-{index}', name='web_fetch', arguments={
@@ -251,7 +251,7 @@ async def test_parallel_batch_consumes_only_available_budget_and_denial_is_not_u
     monkeypatch.setattr(agent, '_model_factory', lambda: ParallelPages())
     result = await agent.run('Read three pages', allow_web_tools=True, require_workspace_change=False)
     assert result.status == 'done' and len(hits) == 2
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [i.payload['structured_content'] for i in store.list_items(result.turn_id) if i.kind == 'tool_result']
         assert sum(o['request_attempted'] for o in outputs) == 2
         assert sum(o['error_code'] == 'web_request_budget_exceeded' for o in outputs) == 1
@@ -325,7 +325,7 @@ async def test_invalid_fetch_history_does_not_block_a_later_valid_public_agent_f
             200, text='Valid source facts', headers={'content-type': 'text/plain'}))))
 
     class InvalidThenValid(PatchThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step == 1:
                 return HarnessModelResponse(text='', provider_response_id='invalid', usage={}, tool_calls=(
@@ -344,7 +344,7 @@ async def test_invalid_fetch_history_does_not_block_a_later_valid_public_agent_f
     result = await agent.run('Read a source', allow_web_tools=True, require_workspace_change=False)
     assert result.status == 'done'
     assert [str(request.url) for request in hits] == ['https://example.com/valid']
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         outputs = [item.payload for item in store.list_items(result.turn_id) if item.kind == 'tool_result']
         assert outputs[0]['is_error'] is True
         assert outputs[1]['is_error'] is False

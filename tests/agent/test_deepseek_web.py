@@ -218,7 +218,7 @@ async def test_hosted_fetch_retains_source_limit_and_byte_budget_pagination():
 async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp_path, monkeypatch):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from tests.agent.test_web_product import FetchThenAnswer
 
     hits = []
@@ -239,7 +239,7 @@ async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp
     monkeypatch.setattr(second, "_model_factory", lambda: FetchThenAnswer({"url": "https://example.com/doc"}))
     opened = await second.resume(paused.turn_id, "allow_once")
     assert opened.status == "done" and len(hits) == 1
-    with RolloutStore(options["checkpoint_db"]) as store:
+    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
         items = store.list_items(opened.turn_id)
         output = next(item.payload["structured_content"] for item in items if item.kind == "tool_result")
         source_id = output["source_id"]
@@ -252,7 +252,7 @@ async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp
     monkeypatch.setattr(third, "_model_factory", lambda: FetchThenAnswer({"source_id": source_id, "find": "Target"}))
     found = await third.run("Find in the saved source", require_workspace_change=False)
     assert found.status == "done" and len(hits) == 1
-    with RolloutStore(options["checkpoint_db"]) as store:
+    async with (await RuntimeState.open(options["checkpoint_db"])) as store:
         output = next(item.payload["structured_content"] for item in store.list_items(found.turn_id)
                       if item.kind == "tool_result")
         assert output["source_id"] == source_id and output["content_hash"] == digest

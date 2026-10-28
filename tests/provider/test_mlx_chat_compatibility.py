@@ -22,11 +22,14 @@ def test_mlx_reasoning_field_stays_in_reasoning_channel(stream):
         )
     )
     chunks = list(generator.stream_with_tools(messages=[], tools=[]))
-    assert {c["type"]: c.get("content") for c in chunks} == {
+    expected = {
         "thinking_delta": "provider reasoning",
         "text_delta": "answer",
         "message_stop": None,
     }
+    if stream:
+        expected["response_start"] = None
+    assert {c["type"]: c.get("content") for c in chunks} == expected
     if not stream:
         turn = parse_openai_response(response)
         assert turn.reasoning_content == "provider reasoning"

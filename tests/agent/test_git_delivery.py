@@ -212,9 +212,9 @@ async def test_ignored_files_do_not_count_as_changes(repo: Path) -> None:
 
 async def test_agent_facade_commit_requires_idle_turns(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=repo)
         store.start_turn(
             thread_id=thread.thread_id,
@@ -229,9 +229,9 @@ async def test_agent_facade_commit_requires_idle_turns(repo: Path, tmp_path: Pat
 
 async def test_agent_facade_commit_returns_delivery_summary(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=repo)
         turn_id = store.start_turn(
             thread_id=thread.thread_id,
@@ -371,12 +371,12 @@ async def test_push_failure_surfaces_credential_hint(repo: Path, tmp_path: Path)
 
 async def test_agent_facade_open_pull_request_requires_idle_turns(repo: Path, tmp_path: Path) -> None:
     from agent_runtime.agent import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     remote = _bare_remote(tmp_path, "remote-github.com.git")
     _git(repo, "remote", "add", "origin", str(remote))
     _git(repo, "push", "-q", "-u", "origin", "HEAD")
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=repo)
         store.start_turn(
             thread_id=thread.thread_id,

@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     GatewayHarnessModel,
     HarnessMessage,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     ToolOrchestrator,
     TurnExecutor,
 )
@@ -155,7 +155,7 @@ def file_runner(
 @pytest.mark.parametrize("prior_usage", [0, 699_862])
 def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tmp_path, path, body, prior_usage):
     database = tmp_path / "rollout.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner, turn, gateway = file_runner(store, tmp_path, path=path, body=body, prior_usage=prior_usage)
         prepared = asyncio.run(
             runner._prepare_step(runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1))
@@ -174,7 +174,7 @@ def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tm
         assert store.read_budget_state(turn.turn_id).used.total_tokens <= 900_000
         assert store.verify().valid
         context = runner.restore_turn_context(turn.turn_id)
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
         for op in operations:
@@ -188,7 +188,7 @@ def test_affordable_file_work_continues_with_measured_usage_and_frozen_replay(tm
 
 
 def test_last_affordable_tool_result_survives_budget_stop_without_more_provider_io(tmp_path):
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=100_000, consume_ceiling=True)
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert (tmp_path / "result.txt").read_text() == "verified\n"
@@ -203,7 +203,7 @@ def test_last_affordable_tool_result_survives_budget_stop_without_more_provider_
 
 
 def test_unaffordable_input_performs_no_provider_or_tool_io(tmp_path):
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=20_000)
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
         assert result.status == "failed"
@@ -216,7 +216,7 @@ def test_unaffordable_input_performs_no_provider_or_tool_io(tmp_path):
 
 @pytest.mark.parametrize("revision", ["working-context-v1", "working-context-v2"])
 def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_path, revision):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         runner, turn, gateway = file_runner(store, tmp_path, budget=100_000)
 
         def effective_budget(stage, *, kwargs=None):
@@ -262,7 +262,7 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
             request_ref=prepared.request_ref,
         )
         context = runner.restore_turn_context(turn.turn_id)
-    with RolloutStore(tmp_path / "run.db") as reopened:
+    with RuntimeState.open_sync(tmp_path / "run.db") as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
         replay = asyncio.run(runner._prepare_step(runner.restore_step_context(context, operation)))
@@ -277,7 +277,7 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
 
 def test_old_prepared_final_only_snapshot_keeps_exact_request_after_reopen(tmp_path):
     database = tmp_path / "rollout.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner, turn, gateway = file_runner(store, tmp_path)
         context = runner.restore_turn_context(turn.turn_id)
         step = runner.capture_step_context(context, step=1, budget_pressure=True)
@@ -293,7 +293,7 @@ def test_old_prepared_final_only_snapshot_keeps_exact_request_after_reopen(tmp_p
             wire_hash=prepared.wire_hash,
             request_ref=prepared.request_ref,
         )
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner._store = store
         runner._context_manager = RolloutContextManager(store)
         restored = runner.restore_step_context(context, op)

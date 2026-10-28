@@ -42,7 +42,7 @@ class KnowledgeModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
             return HarnessModelResponse(
@@ -82,7 +82,7 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
         )
         return super().prepare(request)
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
             return HarnessModelResponse(
@@ -202,8 +202,8 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
     tmp_path: Path, groundedness: bool, insufficient: bool,
 ) -> None:
     class ContradictingModel(KnowledgeModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
-            response = await super().dispatch(prepared, delta_sink=delta_sink)
+        async def dispatch(self, prepared, *, event_sink: object = None):
+            response = await super().dispatch(prepared, event_sink=event_sink)
             if response.tool_calls:
                 return response
             return HarnessModelResponse(
