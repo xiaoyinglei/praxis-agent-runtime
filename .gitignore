@@ -36,6 +36,7 @@ docs/superpowers/
 /docs/*
 !/docs/guide.md
 !/docs/development.md
+!/docs/rollout-storage.md
 !/docs/runtime-recovery.md
 !/docs/runtime-termination.md
 !/docs/runtime-context.md

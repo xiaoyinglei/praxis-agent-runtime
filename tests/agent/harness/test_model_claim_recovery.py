@@ -32,7 +32,7 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
                 context_hash="context-hash",
                 tool_hash="tool-hash",
                 wire_hash="wire-hash",
-                request_ref={"request_id": f"{turn.turn_id}:step:1"},
+                request_ref={"input_revision": 1, "request_id": f"{turn.turn_id}:step:1"},
             )
             prepared.wait()
             try:
@@ -59,7 +59,7 @@ def test_two_processes_share_one_logical_model_operation_and_only_one_dispatches
                 context_hash="context-hash",
                 tool_hash="tool-hash",
                 wire_hash="wire-hash",
-                request_ref={"request_id": f"{turn.turn_id}:step:1"},
+                request_ref={"input_revision": 1, "request_id": f"{turn.turn_id}:step:1"},
             )
         assert verifier.verify().valid is True
 
@@ -83,7 +83,7 @@ def test_fresh_store_recovers_expired_model_dispatch_and_fences_late_response(
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": "request-1"},
+            request_ref={"input_revision": 1, "request_id": "request-1"},
         )
         attempt = first.dispatch_model_attempt(
             operation.operation_id,
@@ -136,7 +136,7 @@ def test_completion_past_lease_boundary_commits_while_takeover_has_not_run(
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": "request-1"},
+            request_ref={"input_revision": 1, "request_id": "request-1"},
         )
         attempt = store.dispatch_model_attempt(
             operation.operation_id,

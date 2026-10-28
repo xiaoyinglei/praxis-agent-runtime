@@ -31,6 +31,7 @@ from agent_runtime.harness.protocol import (
     TurnResult,
 )
 from agent_runtime.harness.records import (
+    ArtifactGCReport,
     ArtifactSnapshot,
     CommittedMutation,
     ItemSnapshot,
@@ -64,6 +65,7 @@ from agent_runtime.modeling.events import (
 )
 
 __all__ = [
+    "ArtifactGCReport",
     "ModelEvent", "ModelEventSink", "ModelOutput", "ModelOutputStarted", "ModelOutputDelta",
     "ModelOutputCompleted", "ModelResponseStarted", "ModelResponseCompleted", "ModelStreamState",
     "ArtifactSnapshot",

@@ -77,6 +77,14 @@ class VerificationReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactGCReport:
+    """Filesystem cleanup may partially succeed; removed files stay removed."""
+
+    removed: tuple[str, ...]
+    errors: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ModelOperationSnapshot:
     operation_id: str
     thread_id: str

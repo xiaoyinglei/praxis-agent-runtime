@@ -38,7 +38,7 @@ Praxis 的公开入口以 CLI 为先，Python SDK 与其共享能力和执行语
 
 业务操作使用 `with RuntimeState.open_sync(path) as state` 或 `async with await RuntimeState.open(path) as state`，异步读取用 `await state.run_async(state.read_turn, turn_id)`。`state.persistence` 是实际存储对象；纯维护可以直接打开 `RolloutStore`。两者均无参、非阻塞构造，显式打开，未打开时拒绝操作，关闭可安全重复。同步打开在事件循环线程上立即报错，须改用异步工厂。存储子类必须保持无参、非阻塞构造。
 
-一次业务操作在 owner 内读取受保护状态、检查不变量，并通过 `with state.persistence.transaction()` 决定原子提交范围；跨 Turn、预算或审批的多个事实仍共同提交。存储层追加事实、运行 reducer、写投影，然后 COMMIT；`capture_mutation_async` 返回本次真实提交的记录，通知只从这些记录派生。artifact 安装与引用持有和 GC 相同的写事务边界，顺序仍是 blob fsync/rename 在先、数据库引用提交在后。
+一次业务操作在 owner 内读取受保护状态、检查不变量，并通过 `with state.persistence.transaction()` 决定原子提交范围；跨 Turn、预算或审批的多个事实仍共同提交。存储层追加事实、运行 reducer、写投影，然后 COMMIT；`capture_mutation_async` 返回本次真实提交的记录，通知只从这些记录派生。artifact 安装与引用持有和 GC 相同的写事务边界，顺序仍是 blob fsync/rename 在先、数据库引用提交在后。文件输入、内存边界、跨进程互斥和 GC 部分失败契约见 [Rollout 与 Artifact 存储](rollout-storage.md)。
 
 同步方法和 `close()` 是明确的 blocking API。多查询帮助函数应作为一个完整闭包交给 owner；不要把连接或 SQLite cursor 交给其他线程。惰性查询用 `iterate` 在 owner 逐项推进，并在 `aclosing` 作用域内使用。`open/open_sync` 的 `max_pending_operations` 缺省为 128，计入正在执行的操作；容量满时 `StoreBusyError` 明确表示此次工作未被接纳。关闭屏障不受容量限制，不丢弃已接纳工作。
 

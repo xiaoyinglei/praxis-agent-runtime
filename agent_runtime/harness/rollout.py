@@ -5,9 +5,12 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import io
 import json
+import math
 import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
@@ -17,10 +20,11 @@ from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, Self, cast
+from typing import Any, BinaryIO, Literal, Self, cast
 from uuid import uuid4
 
 from agent_runtime.harness.records import (
+    ArtifactGCReport,
     ArtifactSnapshot,
     CommittedMutation,
     RolloutRecord,
@@ -413,25 +417,50 @@ class RolloutStore:
             self._rollback_quietly()
 
     @_store_operation
-    def install_blob(self, content: bytes, *, fault_injector: Callable[[str], None] | None = None) -> str:
-        """Install content durably; the caller commits its reference afterwards."""
+    def install_blob(
+        self, content: bytes | Path, *, expected_sha256: str | None = None,
+        fault_injector: Callable[[str], None] | None = None,
+    ) -> tuple[str, int]:
+        """Copy, hash and install an immutable blob under the reference/GC lock.
+
+        Paths are copied in bounded chunks, never linked or moved. Return the
+        digest and size of the actual copied bytes, not source-file metadata.
+        The caller must commit its reference in this same write transaction.
+        """
         self.assert_writable()
-        if not isinstance(content, bytes):
-            raise TypeError("artifact content must be bytes")
-        digest = hashlib.sha256(content).hexdigest()
+        if self._pending_transaction_records is None:
+            raise RuntimeError("artifact installation requires a write transaction")
+        if not isinstance(content, (bytes, Path)):
+            raise TypeError("artifact content must be bytes or a Path")
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in expected_sha256)
+        ):
+            raise ValueError("expected_sha256 must be a lowercase SHA-256 hex digest")
         blobs, temporary = self._artifact_root / "blobs", self._artifact_root / "tmp"
         blobs.mkdir(parents=True, exist_ok=True)
         temporary.mkdir(parents=True, exist_ok=True)
-        candidate, blob = temporary / f"{uuid4().hex}.tmp", blobs / digest
+        # Persist newly created directory entries before committing references.
+        _fsync_directory(self._artifact_root.parent)
+        _fsync_directory(self._artifact_root)
+        candidate = temporary / f"{uuid4().hex}.tmp"
+        digest, size = hashlib.sha256(), 0
         try:
-            with candidate.open("xb") as stream:
-                stream.write(content)
+            with _open_artifact_content(content) as source, candidate.open("xb") as stream:
+                while chunk := source.read(1024 * 1024):
+                    digest.update(chunk)
+                    size += len(chunk)
+                    stream.write(chunk)
                 stream.flush()
                 os.fsync(stream.fileno())
             if fault_injector is not None:
                 fault_injector("after_temp_fsync")
+            sha256 = digest.hexdigest()
+            if expected_sha256 is not None and sha256 != expected_sha256:
+                raise RuntimeError("artifact source hash mismatch")
+            blob = blobs / sha256
             if blob.exists():
-                if _file_sha256(blob) != digest or blob.stat().st_size != len(content):
+                if _file_sha256(blob) != sha256 or blob.stat().st_size != size:
                     raise RuntimeError("content-addressed artifact blob is corrupt")
                 candidate.unlink()
             else:
@@ -439,7 +468,7 @@ class RolloutStore:
                 _fsync_directory(blobs)
             if fault_injector is not None:
                 fault_injector("after_rename")
-            return digest
+            return sha256, size
         finally:
             candidate.unlink(missing_ok=True)
 
@@ -522,10 +551,18 @@ class RolloutStore:
         return content
 
     @_store_operation
-    def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> tuple[str, ...]:
-        if min_age_seconds <= 0:
-            raise ValueError("artifact GC min_age_seconds must be positive")
+    def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> ArtifactGCReport:
+        """Delete only unreferenced, aged files under the install/reference lock.
+
+        SQLite serializes reference checks with all compliant writers, including
+        other processes. Filesystem deletions are irreversible: collect per-file
+        failures and return actual progress rather than imply rollback restored it.
+        Database/lock failures still raise; no files are touched before BEGIN.
+        """
+        if (isinstance(min_age_seconds, bool) or not math.isfinite(min_age_seconds) or min_age_seconds <= 0):
+            raise ValueError("artifact GC min_age_seconds must be a finite positive number")
         removed: list[str] = []
+        errors: list[str] = []
         with self.transaction():
             referenced = {
                 str(row["blob_sha256"]) for row in self._connection.execute("SELECT blob_sha256 FROM artifacts")
@@ -535,16 +572,33 @@ class RolloutStore:
                 (self._artifact_root / "tmp", False),
                 (self._artifact_root / "blobs", True),
             ):
-                if not directory.is_dir():
-                    continue
-                for candidate in directory.iterdir():
-                    if not candidate.is_file() or candidate.stat().st_mtime > cutoff:
+                changed = False
+                try:
+                    if not directory.is_dir():
                         continue
-                    if keep_referenced and candidate.name in referenced:
-                        continue
-                    candidate.unlink()
-                    removed.append(str(candidate.relative_to(self._artifact_root)))
-        return tuple(sorted(removed))
+                    for candidate in directory.iterdir():
+                        relative = str(candidate.relative_to(self._artifact_root))
+                        try:
+                            if keep_referenced and candidate.name in referenced:
+                                continue
+                            if not candidate.is_file() or candidate.stat().st_mtime > cutoff:
+                                continue
+                            candidate.unlink()
+                            removed.append(relative)
+                            changed = True
+                        except FileNotFoundError:
+                            continue  # Already absent is an idempotent cleanup outcome.
+                        except OSError as error:
+                            errors.append(f"{relative}: {type(error).__name__}: {error}")
+                except OSError as error:
+                    errors.append(f"{directory.name}: {type(error).__name__}: {error}")
+                finally:
+                    if changed:
+                        try:
+                            _fsync_directory(directory)
+                        except OSError as error:
+                            errors.append(f"{directory.name}: deletion durability failed: {error}")
+        return ArtifactGCReport(removed=tuple(sorted(removed)), errors=tuple(sorted(errors)))
 
     @_store_operation
     def last_record(self, thread_id: str) -> RolloutRecord | None:
@@ -1825,6 +1879,32 @@ def _artifact_row_payload(row: sqlite3.Row) -> dict[str, Any]:
         "applied_thread_sequence": row["applied_thread_sequence"],
         "reducer_version": row["reducer_version"],
     }
+
+
+@contextmanager
+def _open_artifact_content(content: bytes | Path) -> Iterator[BinaryIO]:
+    if isinstance(content, bytes):
+        with io.BytesIO(content) as stream:
+            yield stream
+        return
+    # Reject pipes/devices on the opened descriptor; a pre-open path stat alone
+    # could race replacement and block the sole owner indefinitely.
+    descriptor = os.open(content, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("artifact source must be a regular file")
+        source = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with source as stream:
+        yield stream
+        after = os.fstat(stream.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_size, after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            raise RuntimeError("artifact source changed during copy")
 
 
 def _file_sha256(path: Path) -> str:

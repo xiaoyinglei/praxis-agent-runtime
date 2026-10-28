@@ -4,6 +4,7 @@ import asyncio
 import json
 import sqlite3
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -31,7 +32,8 @@ def test_corrupt_artifact_does_not_block_unrelated_turn(tmp_path):
         store.artifact_blob_path(artifact.artifact_id).unlink()
         current = _turn(store, tmp_path)
         operation = store.prepare_model_operation(turn_id=current.turn_id, request_hash="r", context_hash="c",
-                                                  tool_hash="t", wire_hash="w", request_ref={"request_id": "new"})
+                                                  tool_hash="t", wire_hash="w",
+                                                  request_ref={"input_revision": 1, "request_id": "new"})
         assert store.dispatch_model_attempt(operation.operation_id).status == "dispatched"
         assert not store.verify().valid  # Global audit still diagnoses the damaged archive.
 
@@ -172,7 +174,7 @@ async def test_live_projection_matches_replay_across_tool_commits_and_reopened_t
                 thread_id=thread.thread_id, user_message="inspect", binding_manifest={}))
             operation = await executor._commit(lambda: store.prepare_model_operation(
                 turn_id=turn.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
-                request_ref={"request_id": "model-request"},
+                request_ref={"input_revision": 1, "request_id": "model-request"},
             ))
             attempt = await executor._commit(lambda: store.dispatch_model_attempt(operation.operation_id))
             await executor._commit(lambda: store.complete_model_attempt(
@@ -304,10 +306,12 @@ async def test_cancel_during_artifact_admission_commits_completed_result(tmp_pat
                                        execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path))
         original_sink = orchestrator._executor._artifact_sink
         reached_sink = asyncio.Event()
+        admitted_sources = []
 
-        async def blocked_sink(content, media_type, name):
+        async def blocked_sink(content, media_type, name, expected_sha256):
+            admitted_sources.append(content)
             reached_sink.set()
-            return await original_sink(content, media_type, name)
+            return await original_sink(content, media_type, name, expected_sha256)
 
         orchestrator._executor._artifact_sink = blocked_sink
         call = ToolCall(tool_call_id="read", tool_name="read_file", arguments={"path": "present.txt"},
@@ -332,5 +336,6 @@ async def test_cancel_during_artifact_admission_commits_completed_result(tmp_pat
         assert not result.payload["is_error"]
         assert result.payload["metadata"]["execution_cancellation_requested"]
         [artifact] = store.list_artifacts(turn.turn_id)
+        assert all(isinstance(source, Path) for source in admitted_sources)
         assert json.loads(store.read_artifact(artifact.artifact_id))["content"][0]["data"]["text"] == "x" * 10000
         assert store.verify().valid

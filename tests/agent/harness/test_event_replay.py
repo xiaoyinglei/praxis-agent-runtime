@@ -309,7 +309,7 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
             context_hash="c" * 64,
             tool_hash="t" * 64,
             wire_hash="w" * 64,
-            request_ref={"request_id": f"{turn_id}:step:1"},
+            request_ref={"input_revision": 1, "request_id": f"{turn_id}:step:1"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id)
         start_model_output(

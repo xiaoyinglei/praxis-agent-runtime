@@ -46,7 +46,7 @@ def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
                 op = store.prepare_model_operation(
                     turn_id=turn.turn_id, request_hash=f"request-{index}", context_hash="context",
                     tool_hash="tools", wire_hash=f"wire-{index}",
-                    request_ref={"purpose": "context_summary", "request_id": f"old-{index}"},
+                    request_ref={"input_revision": 1, "purpose": "context_summary", "request_id": f"old-{index}"},
                 )
                 attempt = store.dispatch_model_attempt(op.operation_id, worker_id="test", lease_seconds=60)
                 store.complete_model_attempt(operation_id=op.operation_id, attempt_id=attempt.attempt_id,

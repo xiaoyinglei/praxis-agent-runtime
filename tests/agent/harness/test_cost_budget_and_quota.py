@@ -181,7 +181,7 @@ def test_cost_limit_is_enforced_by_durable_budget_state(tmp_path: Path) -> None:
             context_hash="c",
             tool_hash="t",
             wire_hash="w",
-            request_ref={"request_id": "req"},
+            request_ref={"input_revision": 1, "request_id": "req"},
         )
         with pytest.raises(BudgetLimitExceededError) as raised:
             store.dispatch_model_attempt(

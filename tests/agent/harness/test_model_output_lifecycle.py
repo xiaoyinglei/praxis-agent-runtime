@@ -45,7 +45,7 @@ def _attempt(state: RuntimeState, workspace: Path):
         context_hash="context",
         tool_hash="tools",
         wire_hash="wire",
-        request_ref={"request_id": "request"},
+        request_ref={"input_revision": 1, "request_id": "request"},
     )
     attempt = state.dispatch_model_attempt(operation.operation_id, worker_id="worker", lease_seconds=30)
     return operation, attempt

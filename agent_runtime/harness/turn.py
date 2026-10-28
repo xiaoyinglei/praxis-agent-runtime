@@ -122,6 +122,7 @@ class StepContext:
     messages: tuple[HarnessMessage, ...]
     tools: tuple[Tool, ...]
     model_token_budget_remaining: int | None
+    input_revision: int
     budget_pressure: bool = False
     purpose: str = "agent_step"
     request_id: str | None = None
@@ -129,7 +130,6 @@ class StepContext:
     output_token_limit: int | None = None
     compaction_plan: Mapping[str, Any] | None = None
     continuation_summary_role: str | None = None
-    input_revision: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "binding_manifest", MappingProxyType(copy.deepcopy(dict(self.binding_manifest))))
@@ -234,6 +234,8 @@ class TurnExecutor:
         turn = self._store.read_turn(turn_id)
         if turn.thread_id != self.thread_id:
             raise RuntimeError("Turn belongs to a different Session")
+        if turn.status in {"running", "paused", "interrupted"}:
+            self._store.validate_turn_model_requests(turn_id)
         return TurnContext(
             thread_id=self.thread_id,
             turn_id=turn.turn_id,
@@ -661,6 +663,7 @@ class TurnExecutor:
         self, *, turn_id: str, decision: str,
         on_session_grant: Callable[[CommandGrant], None] | None = None,
     ) -> TurnResult:
+        await self._store.run_async(self._store.validate_turn_model_requests, turn_id)
         if self._tool_orchestrator is None:
             raise RuntimeError("Turn has no ToolOrchestrator for approval resume")
         turn = await self._store.run_async(self._store.read_turn, turn_id)
@@ -883,10 +886,6 @@ class TurnExecutor:
                     and (
                         await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
                     )
-                    is not None
-                    and (
-                        await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
-                    )
                     != (await self._store.run_async(self._store.user_input_revision, turn_id))
                 ):
                     pending_calls.append(call)
@@ -1101,6 +1100,7 @@ class TurnExecutor:
             tools=tools,
             continuation_summary_role=summary_role,
             model_token_budget_remaining=self._store.read_budget_state(turn.turn_id).remaining("tokens"),
+            input_revision=self._store.user_input_revision(turn.turn_id),
             purpose="context_summary",
             request_id=f"{turn.turn_id}:context-summary:{digest}",
             output_token_limit=output_limit,
@@ -1779,6 +1779,7 @@ class TurnExecutor:
         *,
         start_step: int,
     ) -> TurnResult:
+        await self._store.run_async(self._store.validate_turn_model_requests, turn_context.turn_id)
         thread_id = turn_context.thread_id
         turn_id = turn_context.turn_id
         binding_manifest = turn_context.binding_manifest
@@ -2341,8 +2342,7 @@ class TurnExecutor:
     ) -> TurnResult | None:
         revision = await self._store.run_async(self._store.request_input_revision, turn_id, prepared.request_ref)
         if (
-            revision is not None
-            and revision != (await self._store.run_async(self._store.user_input_revision, turn_id))
+            revision != (await self._store.run_async(self._store.user_input_revision, turn_id))
             and (response.status == "incomplete" or not response.tool_calls)
         ):
             return None
@@ -2428,7 +2428,7 @@ class TurnExecutor:
             raise RuntimeError("tool batch has no committed model response")
         operation = (await self._store.run_async(self._store.list_model_operations, turn_id))[-1]
         revision = await self._store.run_async(self._store.request_input_revision, turn_id, operation.request_ref)
-        if revision is not None and revision != (await self._store.run_async(self._store.user_input_revision, turn_id)):
+        if revision != (await self._store.run_async(self._store.user_input_revision, turn_id)):
             return None
         items = await self._store.run_async(self._store.list_items, turn_id)
         if any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == source_item_id
@@ -2600,13 +2600,10 @@ class TurnExecutor:
         thread_id: str,
         turn_id: str,
         answer: str,
-        input_revision: int | None = None,
+        input_revision: int,
         source_item_id: str | None = None,
     ) -> TurnResult | None:
-        if (
-            input_revision is not None
-            and (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision
-        ):
+        if (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision:
             return None
         items = await self._store.run_async(self._store.list_items, turn_id)
         proposal_item = next((i for i in items if i.kind == "final_proposal" and source_item_id is not None
@@ -2649,10 +2646,7 @@ class TurnExecutor:
         else:
             decision = CompletionDecision(**{key: value for key, value in decision_item.payload.items()
                                              if key != "proposal_item_id"})
-        if (
-            input_revision is not None
-            and (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision
-        ):
+        if (await self._store.run_async(self._store.user_input_revision, turn_id)) != input_revision:
             return None
         if decision.action == "continue":
             if not any(i.kind == "completion_feedback" and i.payload.get("source_item_id") == decision_item.item_id

@@ -80,7 +80,7 @@ def _prepare(store: RuntimeState, turn_id: str, request_id: str):
         context_hash=f"context:{request_id}",
         tool_hash=f"tools:{request_id}",
         wire_hash=f"wire:{request_id}",
-        request_ref={"request_id": request_id},
+        request_ref={"input_revision": 1, "request_id": request_id},
     )
 
 

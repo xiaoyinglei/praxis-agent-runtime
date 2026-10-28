@@ -31,6 +31,7 @@ from agent_runtime.budget import (
 from agent_runtime.harness.protocol import ContextSourceChangedError
 from agent_runtime.harness.records import (
     ApprovalSnapshot,
+    ArtifactGCReport,
     ArtifactSnapshot,
     CommittedMutation,
     InteractionSnapshot,
@@ -194,7 +195,7 @@ class RuntimeState:
     def read_artifact(self, artifact_id: str) -> bytes:
         return self.persistence.read_artifact(artifact_id)
 
-    def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> tuple[str, ...]:
+    def gc_unreferenced_artifacts(self, *, min_age_seconds: float = 3600.0) -> ArtifactGCReport:
         return self.persistence.gc_unreferenced_artifacts(min_age_seconds=min_age_seconds)
 
     def last_record(self, thread_id: str) -> RolloutRecord | None:
@@ -337,11 +338,20 @@ class RuntimeState:
         self,
         *,
         turn_id: str,
-        content: bytes,
+        content: bytes | Path,
         media_type: str,
         name: str,
+        expected_sha256: str | None = None,
         fault_injector: Callable[[str], None] | None = None,
     ) -> ArtifactSnapshot:
+        """Retain bytes or copy a file, then atomically commit its durable identity.
+
+        A Path is copied on the Store owner with bounded memory. The caller owns
+        the source and must keep it unchanged until this operation completes.
+        Filesystem installation precedes SQLite commit; failures may leave an
+        unreferenced blob for GC, never a reference to an incomplete file.
+        expected_sha256 binds a mutable file source to previously observed bytes.
+        """
         self.persistence.assert_writable()
         if not isinstance(media_type, str) or not media_type.strip():
             raise ValueError("artifact media_type must be non-empty")
@@ -352,7 +362,9 @@ class RuntimeState:
             thread_id = self._running_turn_thread_id(turn_id)
             # GC holds the same write boundary. It cannot unlink an old orphan
             # after we verify/reinstall it but before its reference commits.
-            blob_sha256 = self.persistence.install_blob(content, fault_injector=fault_injector)
+            blob_sha256, size_bytes = self.persistence.install_blob(
+                content, expected_sha256=expected_sha256, fault_injector=fault_injector,
+            )
             self._append_and_reduce(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -361,7 +373,7 @@ class RuntimeState:
                 payload={
                     "artifact_id": artifact_id,
                     "blob_sha256": blob_sha256,
-                    "size_bytes": len(content),
+                    "size_bytes": size_bytes,
                     "media_type": media_type,
                     "name": name,
                 },
@@ -723,28 +735,21 @@ class RuntimeState:
         )
 
     @_state_operation
-    def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int | None:
+    def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int:
+        """Require the producer's explicit revision; never infer it from history."""
         revision = request_ref.get("input_revision")
-        if isinstance(revision, int) and not isinstance(revision, bool):
-            return revision
-        # Pre-steering rollouts have no version field. Their canonical request
-        # Item still establishes which user messages preceded that request.
-        items = self.list_items(turn_id)
-        request = next(
-            (
-                item
-                for item in items
-                if item.kind == "model_request"
-                and item.payload.get("request_ref", {}).get("request_id") == request_ref.get("request_id")
-            ),
-            None,
-        )
-        if request is None:
-            return None
-        return sum(
-            item.kind == "user_message" and item.status == "completed" and item.sequence < request.sequence
-            for item in items
-        )
+        if type(revision) is not int or revision < 1:
+            raise ValueError(
+                f"Turn {turn_id}: model request input_revision must be a positive integer; "
+                "unsupported requests cannot be resumed; start a new Turn."
+            )
+        return revision
+
+    @_state_operation
+    def validate_turn_model_requests(self, turn_id: str) -> None:
+        """Reject unsupported persisted requests before recovery changes state."""
+        for operation in self.list_model_operations(turn_id):
+            self.request_input_revision(turn_id, operation.request_ref)
 
     @_state_operation
     def receive_turn_input(
@@ -811,9 +816,11 @@ class RuntimeState:
             )
         }
         for operation in self.list_model_operations(item.turn_id):
+            revision = operation.request_ref.get("input_revision")
             if (
                 operation.request_ref.get("purpose") == "agent_step"
-                and (operation.request_ref.get("input_revision") or 0) >= item.payload["input_revision"]
+                and type(revision) is int and revision > 0
+                and revision >= item.payload["input_revision"]
                 and operation.operation_id in dispatched
             ):
                 return "applied"
@@ -1638,6 +1645,7 @@ class RuntimeState:
         if not all(isinstance(value, str) and value for value in hashes.values()):
             raise ValueError("model operation hashes must be non-empty strings")
         frozen_ref = _json_object(request_ref, field="request_ref")
+        self.request_input_revision(turn_id, frozen_ref)
         request_id = frozen_ref.get("request_id")
         if not isinstance(request_id, str) or not request_id.strip():
             raise ValueError("model request_ref.request_id must be a non-empty string")
@@ -1761,7 +1769,6 @@ class RuntimeState:
             revision = self.request_input_revision(str(operation["turn_id"]), request_ref)
             if (
                 request_ref.get("purpose") == "agent_step"
-                and revision is not None
                 and revision != self.user_input_revision(str(operation["turn_id"]))
             ):
                 raise TurnInputChangedError("new user input before model dispatch")

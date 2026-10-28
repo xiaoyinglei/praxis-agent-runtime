@@ -66,7 +66,7 @@ async def test_legacy_dispatch_keeps_its_unexpired_lease(tmp_path):
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old", binding_manifest={})
         operation = store.prepare_model_operation(turn_id=turn.turn_id, request_hash="r", context_hash="c",
-            tool_hash="t", wire_hash="w", request_ref={"request_id": "old"})
+            tool_hash="t", wire_hash="w", request_ref={"input_revision": 1, "request_id": "old"})
         store.dispatch_model_attempt(operation.operation_id)
     state = await Agent(workspace_path=tmp_path, checkpoint_db=database).recovery_state(turn.turn_id)
     assert state["actions"] == []

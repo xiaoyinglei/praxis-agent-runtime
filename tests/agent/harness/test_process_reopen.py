@@ -151,7 +151,7 @@ async def test_legacy_unexpired_dispatch_is_not_claimed(tmp_path):
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="old worker", binding_manifest={})
         operation = store.prepare_model_operation(turn_id=turn.turn_id, request_hash="r", context_hash="c",
-            tool_hash="t", wire_hash="w", request_ref={"request_id": "legacy"})
+            tool_hash="t", wire_hash="w", request_ref={"input_revision": 1, "request_id": "legacy"})
         store.dispatch_model_attempt(operation.operation_id, worker_id="legacy", lease_seconds=300)
     async with await Session.open(database=database, workspace=workspace, model=PublicHarnessModel(),
                                  thread_id=thread.thread_id, _background_memory=False) as session:
@@ -171,7 +171,8 @@ async def test_committed_but_unstarted_tool_group_is_closed_without_execution(tm
         old = session.store.start_turn(thread_id=session.thread_id, user_message="old task",
             binding_manifest={"execution_ownership": OWNERSHIP_REVISION})
         operation = session.store.prepare_model_operation(turn_id=old.turn_id, request_hash="r", context_hash="c",
-            tool_hash="t", wire_hash="w", request_ref={"request_id": "old-response", "purpose": "agent_step"})
+            tool_hash="t", wire_hash="w",
+            request_ref={"input_revision": 1, "request_id": "old-response", "purpose": "agent_step"})
         attempt = session.store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
         session.store.complete_model_attempt(operation_id=operation.operation_id, attempt_id=attempt.attempt_id,
             generation=attempt.generation, text="planned tool", provider_response_id="old", usage={},

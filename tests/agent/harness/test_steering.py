@@ -283,8 +283,7 @@ async def test_input_after_request_preparation_does_not_send_old_request(tmp_pat
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("tool_response", [False, True])
-@pytest.mark.parametrize("legacy", [False, True])
-async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path, monkeypatch, tool_response, legacy):
+async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path, monkeypatch, tool_response):
     from agent_runtime.harness import TurnExecutor
 
     invoked = []
@@ -294,15 +293,6 @@ async def test_reopen_after_committed_response_does_not_revive_old_work(tmp_path
         model.release.set()
     options = dict(database=tmp_path / "run.db", workspace=tmp_path, model=model, tools={"read_file": tool})
     async with await Session.open(**options) as session:
-        if legacy:
-            original = session.store.prepare_model_operation
-
-            def prepare(**kwargs):
-                ref = {k: v for k, v in kwargs["request_ref"].items() if k != "input_revision"}
-                ref["step_snapshot"] = {k: v for k, v in ref["step_snapshot"].items() if k != "input_revision"}
-                return original(**{**kwargs, "request_ref": ref})
-
-            session.store.prepare_model_operation = prepare
         async def crash(*args, **kwargs):
             raise RuntimeError("crash after response commit")
 

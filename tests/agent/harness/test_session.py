@@ -838,7 +838,7 @@ def test_late_model_attempt_cannot_commit_a_second_response(tmp_path: Path) -> N
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": f"{turn.turn_id}:step:1", "message_count": 1},
+            request_ref={"input_revision": 1, "request_id": f"{turn.turn_id}:step:1", "message_count": 1},
         )
         first = store.dispatch_model_attempt(operation.operation_id)
         store.mark_model_attempt_unknown(
@@ -896,7 +896,7 @@ def test_model_completion_faults_are_atomic_at_every_substep(
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": f"{turn.turn_id}:step:1"},
+            request_ref={"input_revision": 1, "request_id": f"{turn.turn_id}:step:1"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id)
         for channel in ("reasoning", "plan"):
@@ -948,7 +948,7 @@ def test_stale_model_generation_appends_nothing(tmp_path: Path) -> None:
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": f"{turn.turn_id}:step:1"},
+            request_ref={"input_revision": 1, "request_id": f"{turn.turn_id}:step:1"},
         )
         stale = store.dispatch_model_attempt(operation.operation_id)
         store.mark_model_attempt_unknown(

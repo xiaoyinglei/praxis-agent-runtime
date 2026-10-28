@@ -102,8 +102,10 @@ def read_chat_messages(
                         and text == final_answers.get(item.turn_id)):
                     continue
                 operation = committed_responses[item.item_id]
-                revision = store.request_input_revision(item.turn_id, operation.request_ref)
-                if (not item.payload.get("tool_calls") and revision is not None
+                # Reading retained facts grants no execution authority. Only
+                # explicit valid revisions participate in supersession filtering.
+                revision = operation.request_ref.get("input_revision")
+                if (not item.payload.get("tool_calls") and type(revision) is int and revision > 0
                         and revision < store.user_input_revision(item.turn_id)):
                     continue  # Retained in the ledger, superseded as a completion.
                 messages.append(("answer", text))

@@ -321,7 +321,7 @@ async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tm
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=adapter,
                               context_manager=RolloutContextManager(store), completion_gate=Accept())
         turn = runner.restore_turn_context(record.turn_id)
-        fork = StepContext(turn=turn, step=1,
+        fork = StepContext(turn=turn, step=1, input_revision=store.user_input_revision(record.turn_id),
             binding_manifest={**turn.binding_manifest, "summary_cache_fork": True},
             messages=(HarnessMessage(role="user", content="Summarize only. Do not call tools."),),
             tools=(tool,), model_token_budget_remaining=None, purpose="context_summary", request_id="summary-test")

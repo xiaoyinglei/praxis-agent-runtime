@@ -36,7 +36,7 @@ def _complete_model_response(
         context_hash=f"context-{turn_id}",
         tool_hash=f"tools-{turn_id}",
         wire_hash=f"wire-{turn_id}",
-        request_ref={"request_id": f"request-{turn_id}"},
+        request_ref={"input_revision": 1, "request_id": f"request-{turn_id}"},
     )
     attempt = store.dispatch_model_attempt(
         operation.operation_id,
@@ -125,7 +125,7 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             context_hash="context-hash",
             tool_hash="tool-hash",
             wire_hash="wire-hash",
-            request_ref={"request_id": "request-1"},
+            request_ref={"input_revision": 1, "request_id": "request-1"},
         )
         prepared = next(
             record

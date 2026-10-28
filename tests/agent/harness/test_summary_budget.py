@@ -158,7 +158,7 @@ def test_summary_dispatch_preserves_continuation_headroom_after_reopen(tmp_path:
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={
+            request_ref={"input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {"continuation_token_reserve": 40},
@@ -193,7 +193,7 @@ def test_unknown_summary_retry_cannot_reset_frozen_call_allowance(tmp_path: Path
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={
+            request_ref={"input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {
@@ -234,7 +234,7 @@ def test_summary_cannot_consume_continuation_monetary_budget(tmp_path: Path):
             context_hash="context",
             tool_hash="tool",
             wire_hash="wire",
-            request_ref={
+            request_ref={"input_revision": 1,
                 "request_id": "summary",
                 "purpose": "context_summary",
                 "compaction_plan": {

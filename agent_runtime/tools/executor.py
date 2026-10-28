@@ -218,7 +218,12 @@ class _LiveContinuation:
 
 
 class ToolExecutor:
-    """The sole validation-to-ToolResult execution choke point."""
+    """The sole validation-to-ToolResult execution choke point.
+
+    artifact_sink receives (source_path, media_type, name, expected_sha256).
+    It must copy and verify the preserved file before returning its durable
+    ArtifactReference; the executor retains completion ownership while awaiting it.
+    """
 
     def __init__(
         self,
@@ -230,7 +235,7 @@ class ToolExecutor:
         approval_resolver: ApprovalResolver | None = None,
         output_validator: OutputValidator | None = None,
         externalizer: Externalizer | None = None,
-        artifact_sink: Callable[[bytes, str, str], Awaitable[ArtifactReference]] | None = None,
+        artifact_sink: Callable[[Path, str, str, str], Awaitable[ArtifactReference]] | None = None,
         trace_sink: TraceSink | None = None,
     ) -> None:
         copied: dict[str, Tool] = {}
@@ -1091,7 +1096,9 @@ class ToolExecutor:
         if self._artifact_sink is not None:
             local = output.attachments[-1]
             assert local.media_type is not None and local.name is not None
-            reference = await self._artifact_sink(preserved, local.media_type, local.name)
+            digest = output.metadata["full_output_sha256"]
+            assert isinstance(digest, str)
+            reference = await self._artifact_sink(preserved, local.media_type, local.name, digest)
             if not isinstance(reference, ArtifactReference):
                 raise TypeError("artifact_sink must return an ArtifactReference")
             output = replace(output, attachments=(*output.attachments[:-1], reference))
@@ -1396,7 +1403,7 @@ def _validate_normalized_output(
 
 def _preserve_full_output(
     tool: Tool, output: NormalizedToolOutput, context: ToolExecutionContext,
-) -> tuple[NormalizedToolOutput, bytes]:
+) -> tuple[NormalizedToolOutput, Path]:
     from agent_runtime.tools.builtins.file_access import atomic_bytes
 
     payload = {
@@ -1422,7 +1429,7 @@ def _preserve_full_output(
     return (replace(output, content=(summary,), structured_content=None,
                     attachments=(*output.attachments, reference),
                     metadata={**dict(output.metadata), "full_output_path": str(path),
-                              "full_output_sha256": digest, "output_truncated": True}), raw)
+                              "full_output_sha256": digest, "output_truncated": True}), path)
 
 
 def _bound_model_output(

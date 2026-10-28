@@ -151,7 +151,7 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             context_hash="c" * 64,
             tool_hash=toolset_revision,
             wire_hash="w" * 64,
-            request_ref={
+            request_ref={"input_revision": 1,
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],
@@ -264,7 +264,7 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
             context_hash="c" * 64,
             tool_hash=toolset_revision,
             wire_hash="w" * 64,
-            request_ref={
+            request_ref={"input_revision": 1,
                 "request_id": f"{turn.turn_id}:step:1",
                 "toolset_revision": toolset_revision,
                 "exposed_tool_names": ["read_file"],

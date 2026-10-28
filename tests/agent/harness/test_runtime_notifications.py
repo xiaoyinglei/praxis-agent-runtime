@@ -153,7 +153,7 @@ def test_incomplete_response_remains_visible_without_invalidating_completed_outp
             context_hash="context-1",
             tool_hash="tools-1",
             wire_hash="wire-1",
-            request_ref={"request_id": "request-1"},
+            request_ref={"input_revision": 1, "request_id": "request-1"},
         )
         attempt = state.dispatch_model_attempt(operation.operation_id, worker_id="worker-1", lease_seconds=30)
         assert state.complete_model_attempt(

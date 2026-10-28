@@ -1230,6 +1230,8 @@ class Session:
             turn = await self.store.run_async(self.store.read_turn, turn_id)
             if turn.thread_id != self.thread_id:
                 raise RuntimeError("Turn belongs to a different Session")
+            if action != "abort" and turn.status in {"running", "paused", "interrupted"}:
+                await self.store.run_async(self.store.validate_turn_model_requests, turn_id)
             if (
                 expected_request_id is not None
                 and (await self.store.run_async(recovery_plan, self.store, turn_id)).request_id != expected_request_id

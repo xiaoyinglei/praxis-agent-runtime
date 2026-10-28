@@ -86,6 +86,13 @@ def recovery_plan(store: RuntimeState, turn_id: str) -> RecoveryPlan:
             return plan("approval_resolved", (), "approval_already_resolved", resolved[-1].request_id,
                         request_id=resolved[-1].request_id)
         return plan("terminal", (), "turn_terminal")
+    for operation in models:
+        try:
+            store.request_input_revision(turn_id, operation.request_ref)
+        except ValueError:
+            # Keep safe cancellation available, but never execute unsupported
+            # persisted requests or guess which user inputs they consumed.
+            return plan("unsupported_request", (), "input_revision_unsupported", operation.operation_id)
     if any(item.kind == "tool_reconciliation" for item in pending) or any(op.status == "unknown" for op in uncertain):
         request_id = next((item.request_id for item in pending if item.kind == "tool_reconciliation"), None)
         return plan("reconcile", (), "tool_outcome_unknown", *(op.operation_id for op in uncertain),
@@ -109,7 +116,7 @@ def recovery_plan(store: RuntimeState, turn_id: str) -> RecoveryPlan:
             actions: tuple[str, ...] = ("allow_once", "deny", "recheck")
             if request.request.get("session_grant"):
                 actions = ("allow_once", "allow_session", "deny", "recheck")
-            if models and store.request_input_revision(turn_id, models[-1].request_ref) is not None:
+            if models:
                 if store.user_input_revision(turn_id) != store.request_input_revision(turn_id, models[-1].request_ref):
                     actions += ("continue",)
             return plan("approval", actions, "tool_approval_required", request.request_id,

@@ -185,7 +185,7 @@ def test_orphan_recovery_refuses_any_turn_with_a_durable_operation(tmp_path: Pat
             context_hash="c" * 64,
             tool_hash="t" * 64,
             wire_hash="w" * 64,
-            request_ref={"request_id": "request-1"},
+            request_ref={"input_revision": 1, "request_id": "request-1"},
         )
 
     with RuntimeState.open_sync(database) as recovery_process:

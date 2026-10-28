@@ -84,7 +84,7 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
         turn = store.start_turn(thread_id=thread.thread_id, user_message="original question", binding_manifest={})
         operation = store.prepare_model_operation(
             turn_id=turn.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
-            request_ref={"request_id": "fixture"},
+            request_ref={"input_revision": 1, "request_id": "fixture"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id, now=1)
         assert store.complete_model_attempt(
@@ -360,7 +360,7 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
                                binding_manifest={"execution_ownership": OWNERSHIP_REVISION})
         operation = store.prepare_model_operation(
             turn_id=old.turn_id, request_hash="r", context_hash="c", tool_hash="t", wire_hash="w",
-            request_ref={"request_id": "old-request", "purpose": "agent_step"},
+            request_ref={"input_revision": 1, "request_id": "old-request", "purpose": "agent_step"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
         assert store.complete_model_attempt(

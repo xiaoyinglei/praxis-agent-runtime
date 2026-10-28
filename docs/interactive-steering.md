@@ -64,7 +64,7 @@ asyncio.run(main())
 
 `applied` 按持久化的普通模型 dispatch 记录判定，不按 prepared 请求或摘要请求判定。它表示请求已进入执行，不证明远端模型已理解，或传输/采样最终成功。`unconsumed` 的原文仍保存在 Rollout，调用者可在明确的新 Turn 中重新提交。
 
-未包含输入版本的历史请求，按其 canonical model_request Item 之前的 user_message 推导版本；新增输入不能让恢复执行旧工具或接受旧答案。明确未发送的过时 prepared 请求可以恢复到下一步；unknown 请求/工具仍走原有恢复与 reconciliation 契约。
+每个持久化模型请求（包括摘要请求）必须显式包含正整数 `input_revision`；布尔值、缺失值和其他类型均拒绝。旧格式请求不再根据历史 Item 推算版本，恢复入口在模型准备、owner 接管和执行前明确报错，提示新建 Turn。可安全取消的旧 Turn 仍可 abort，已有数据库不会被删除或静默改写。明确未发送的过时 prepared 请求可以恢复到下一步；unknown 请求/工具仍走原有恢复与 reconciliation 契约。
 
 ## 验证记录
 

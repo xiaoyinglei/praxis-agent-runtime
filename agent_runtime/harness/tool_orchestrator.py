@@ -203,12 +203,15 @@ class ToolOrchestrator:
         self._instruction_targets: dict[tuple[str, str], tuple[ToolTarget, ...]] = {}
         self._instruction_snapshots: dict[str, Mapping[str, Any]] = {}
 
-    async def _save_output_artifact(self, content: bytes, media_type: str, name: str) -> ArtifactReference:
+    async def _save_output_artifact(
+        self, source: Path, media_type: str, name: str, expected_sha256: str,
+    ) -> ArtifactReference:
         # The Store remains the sole owner of durable artifact identities.
-        # Executor workers hand back bytes, never a file URI masquerading as one.
+        # A local source file is copied and verified before it becomes a durable
+        # identity; its URI is never returned as a canonical artifact reference.
         turn_id = current_tool_turn_id()
         artifact = await self._commit(lambda: self._store.commit_artifact(
-            turn_id=turn_id, content=content, media_type=media_type, name=name,
+            turn_id=turn_id, content=source, media_type=media_type, name=name, expected_sha256=expected_sha256,
         ))
         return ArtifactReference(artifact.artifact_id, artifact.media_type, artifact.name)
 
@@ -359,8 +362,7 @@ class ToolOrchestrator:
 
     def input_superseded(self, turn_id: str, call: ToolCall) -> bool:
         snapshot = self._step_snapshot(turn_id, call)
-        revision = None if snapshot is None else snapshot.get("input_revision")
-        return revision is not None and revision != self._store.user_input_revision(turn_id)
+        return snapshot is not None and snapshot["input_revision"] != self._store.user_input_revision(turn_id)
 
     def _guard_input(self, turn_id: str, call: ToolCall) -> None:
         if self.input_superseded(turn_id, call):

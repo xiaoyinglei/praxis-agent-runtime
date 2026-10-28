@@ -297,7 +297,7 @@ def test_terminal_maintenance_turn_with_unresolved_model_operation_blocks_reloca
             context_hash="context",
             tool_hash="tools",
             wire_hash="wire",
-            request_ref={"request_id": "maintenance-request"},
+            request_ref={"input_revision": 1, "request_id": "maintenance-request"},
         )
         attempt = state.dispatch_model_attempt(operation.operation_id)
         state.fail_turn(turn_id=turn.turn_id, reason_code="worker_failed", message="worker stopped")

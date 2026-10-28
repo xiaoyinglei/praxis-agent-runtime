@@ -135,7 +135,11 @@ def test_artifact_install_and_reference_share_the_gc_write_boundary(tmp_path):
     with RuntimeState.open_sync(database) as state, RuntimeState.open_sync(database) as collector:
         thread = state.create_thread(workspace=tmp_path)
         turn = state.start_turn(thread_id=thread.thread_id, user_message='artifact', binding_manifest={})
-        digest = state.persistence.install_blob(b'old orphan')
+        def install_orphan():
+            with state.persistence.transaction():
+                return state.persistence.install_blob(b'old orphan')[0]
+
+        digest = state.run_sync(install_orphan)
         blob = state.artifact_root / 'blobs' / digest
         os.utime(blob, (1, 1))
         collector.run_sync(lambda: collector.persistence._connection.execute('PRAGMA busy_timeout=1').close())
@@ -150,7 +154,8 @@ def test_artifact_install_and_reference_share_the_gc_write_boundary(tmp_path):
             fault_injector=collect_during_install,
         )
         assert state.read_artifact(artifact.artifact_id) == b'old orphan'
-        assert collector.gc_unreferenced_artifacts(min_age_seconds=1) == ()
+        report = collector.gc_unreferenced_artifacts(min_age_seconds=1)
+        assert report.removed == () and report.errors == ()
 
 
 def test_legacy_upgrade_preserves_valid_cross_thread_artifact_reference(tmp_path):
