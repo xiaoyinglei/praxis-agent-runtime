@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
 from agent_runtime.harness.context_recall import create_context_recall_tool
@@ -33,7 +33,7 @@ class PlainModel:
             request_ref={"message_count": len(request.messages)},
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         return HarnessModelResponse(
             text="composed answer",
             provider_response_id="response-composed",
@@ -95,11 +95,11 @@ async def test_harness_facade_uses_composed_thread_manager_path(tmp_path: Path) 
 
 
 @pytest.mark.anyio
-async def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Path) -> None:
+async def test_full_audit_detects_non_head_projection_log_drift(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -113,13 +113,17 @@ async def test_composition_refuses_to_run_with_projection_log_drift(tmp_path: Pa
             ('{"text":"projection drift"}', item.item_id),
         )
 
-    with pytest.raises(RuntimeError, match="projection integrity"):
-        await Session.open(
+    # Opening validates the current head without scanning every historical Item.
+    # The explicit full audit must still detect corruption of an older projection.
+    async with await Session.open(
             database=database,
             workspace=workspace,
             model=PlainModel(),
             completion_gate=AcceptAnswer(),
-        )
+        ) as runtime:
+        report = await runtime.store.run_async(runtime.store.verify)
+        assert report.valid is False
+        assert any("projection" in error for error in report.errors)
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.verify().valid is False

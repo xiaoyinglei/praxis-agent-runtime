@@ -8,7 +8,7 @@ import json
 import pytest
 
 from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
-from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
 from agent_runtime.modeling.contracts import normalize_llm_usage
 from agent_runtime.modeling.gateway import AgentModelResponse, model_request_input_text
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -89,7 +89,7 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
         raise Crash()
 
     database = tmp_path / "run.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner, turn, initial_gateway = file_runner(store, tmp_path)
         monkeypatch.setattr(initial_gateway, "agenerate_model_request", gateway.agenerate_model_request)
         if restart:
@@ -102,7 +102,7 @@ def test_bad_call_feedback_then_corrected_file_action_survives_restart(tmp_path,
         else:
             result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
             assert result.status == "completed"
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         runner._store = reopened
         runner._context_manager = RolloutContextManager(reopened)
         runner._tool_orchestrator._store = reopened

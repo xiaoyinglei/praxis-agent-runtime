@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import RolloutContextManager, RolloutEventReader, RolloutStore
+from agent_runtime.harness import RolloutContextManager, RolloutEventReader, RuntimeState
 from agent_runtime.harness import rollout as rollout_module
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.history import read_chat_messages
@@ -26,7 +26,7 @@ def _turn(store, workspace, thread_id=None):
 
 
 def test_turn_completion_references_the_original_output_without_copying_it(tmp_path):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         turn = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=turn.turn_id, text="answer")
         source = store.list_model_operations(turn.turn_id)[0].response_item_id
@@ -43,7 +43,7 @@ def test_turn_completion_references_the_original_output_without_copying_it(tmp_p
 
 
 def test_equal_text_does_not_merge_independent_outputs(tmp_path):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         turn = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=turn.turn_id, text="same")
         store.complete_turn(turn_id=turn.turn_id, answer="same")
@@ -57,7 +57,7 @@ def test_equal_text_does_not_merge_independent_outputs(tmp_path):
 
 
 def test_repeated_answer_across_turns_survives_live_and_replay(tmp_path):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         first = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=first.turn_id, text="same")
         store.complete_turn(turn_id=first.turn_id, answer="same")
@@ -72,7 +72,7 @@ def test_repeated_answer_across_turns_survives_live_and_replay(tmp_path):
 
 
 def test_followup_context_uses_accepted_output_identity_and_excludes_unaccepted_text(tmp_path):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         first = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=first.turn_id, text="the answer is 42")
         source = store.list_model_operations(first.turn_id)[0].response_item_id
@@ -86,7 +86,7 @@ def test_followup_context_uses_accepted_output_identity_and_excludes_unaccepted_
 
 
 def test_fork_and_compaction_keep_the_accepted_output_as_the_original_item(tmp_path):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         first = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=first.turn_id, text="accepted answer")
         source = store.list_model_operations(first.turn_id)[0].response_item_id
@@ -126,14 +126,14 @@ async def test_public_agent_reopens_with_one_original_answer_in_followup_context
                for message in requests[-1].messages) == 1
     assert await second_agent.read_result(first.turn_id) == first
     assert await second_agent.read_result(second.turn_id) == second
-    with RolloutStore(database, read_only=True) as store:
+    async with (await RuntimeState.open(database, read_only=True)) as store:
         assert not any(item.kind == "agent_message" for item in store.list_items(first.turn_id))
         assert not any(item.kind == "agent_message" for item in store.list_items(second.turn_id))
 
 
 @pytest.mark.parametrize("wrong_turn", [False, True])
 def test_answer_reference_rejection_rolls_back_the_entire_completion(tmp_path, wrong_turn):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         first = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=first.turn_id, text="answer")
         source = store.list_model_operations(first.turn_id)[0].response_item_id
@@ -152,7 +152,7 @@ def test_answer_reference_rejection_rolls_back_the_entire_completion(tmp_path, w
 
 
 def test_current_records_are_self_contained_even_after_their_projections_are_unavailable(tmp_path, monkeypatch):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         turn = _turn(store, tmp_path)
         _complete_model_response(store, turn_id=turn.turn_id, text="answer")
         records = store.list_records(turn.thread_id)
@@ -170,7 +170,7 @@ def test_current_records_are_self_contained_even_after_their_projections_are_una
 
 @pytest.mark.anyio
 async def test_tool_event_history_ignores_current_operation_state(tmp_path, monkeypatch):
-    with RolloutStore(tmp_path / "events.db") as store:
+    async with (await RuntimeState.open(tmp_path / "events.db")) as store:
         turn = _turn(store, tmp_path)
         orchestrator = ToolOrchestrator(
             store=store, tools={"read_file": _read_tool(workspace=tmp_path)},
@@ -198,7 +198,7 @@ async def test_tool_event_history_ignores_current_operation_state(tmp_path, monk
 
 @pytest.mark.parametrize("global_tail", [False, True])
 def test_cursor_tail_loads_only_new_records_and_uses_a_storage_page(tmp_path, monkeypatch, global_tail):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         first = _turn(store, tmp_path)
         for _ in range(48):
             store.reserve_resource_unit(first.turn_id, "reads", 256)
@@ -237,7 +237,7 @@ def test_cursor_tail_loads_only_new_records_and_uses_a_storage_page(tmp_path, mo
 @pytest.mark.parametrize("global_tail", [False, True])
 def test_history_read_freezes_its_upper_bound_before_concurrent_append(tmp_path, monkeypatch, global_tail):
     database = tmp_path / "events.db"
-    with RolloutStore(database) as store, RolloutStore(database) as writer:
+    with RuntimeState.open_sync(database) as store, RuntimeState.open_sync(database) as writer:
         turn = _turn(store, tmp_path)
         reader = RolloutEventReader(store)
         expected = reader.read(turn.thread_id)
@@ -257,12 +257,15 @@ def test_history_read_freezes_its_upper_bound_before_concurrent_append(tmp_path,
         assert _events(actual) == _events(expected)
         following = (reader.read_global(after_record_id=expected[-1].record_id) if global_tail
                      else reader.read(turn.thread_id, after=expected[-1].cursor))
-        assert [event.event.type.value for event in following] == ["turn_paused"]
+        assert [event.event.type.value for event in following] == ["interaction_requested", "turn_paused"]
+        assert following[0].data["kind"] == "clarification"
+        assert following[0].data["request"] == {"question": "continue?"}
+        assert following[1].data["request_id"] == following[0].data["request_id"]
 
 
 @pytest.mark.parametrize("global_tail", [False, True])
 def test_storage_pages_concatenate_to_the_same_event_history(tmp_path, global_tail):
-    with RolloutStore(tmp_path / "events.db") as store:
+    with RuntimeState.open_sync(tmp_path / "events.db") as store:
         turn = _turn(store, tmp_path)
         store.complete_turn(turn_id=turn.turn_id, answer="first")
         later = _turn(store, tmp_path, turn.thread_id)

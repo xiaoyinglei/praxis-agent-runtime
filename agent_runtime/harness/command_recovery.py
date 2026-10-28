@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.permission_policy import ResolvedPermissions
 from agent_runtime.tools.builtins.command_sessions import DurableCommandSessions, ManageCommandInput
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 async def cancel_commands(agent: Agent, turn_id: str) -> None:
     """Abort must reconcile detached processes before declaring the Turn cancelled."""
-    async with await RolloutStore.open(agent._harness_database(), read_only=True) as store:
+    async with await RuntimeState.open(agent._harness_database(), read_only=True) as store:
         keys = []
         for operation in await store.run_async(store.list_tool_operations, turn_id):
             if operation.tool_name != "run_command" or operation.status != "succeeded" or not operation.result_item_id:
@@ -39,7 +39,7 @@ async def manage_command(agent: Agent, turn_id: str, session_id: str, *,
                          offset: int = 0, max_bytes: int = 16000) -> RunCommandOutput:
     request = ManageCommandInput(session_id=session_id, action=action, wait_seconds=wait_seconds,
                                  stream=stream, offset=offset, max_bytes=max_bytes)
-    async with await RolloutStore.open(agent._harness_database()) as store:
+    async with await RuntimeState.open(agent._harness_database()) as store:
         if not (await store.run_async(store.verify)).valid:
             raise RuntimeError("Rollout integrity check failed")
         turn = await store.run_async(store.read_turn, turn_id)

@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from agent_runtime.modeling.events import ModelOutput, output_to_payload
 from agent_runtime.tools.tool import JsonValue, _thaw_json, json_schema_output
 
 if TYPE_CHECKING:
@@ -99,6 +100,7 @@ class ModelMessage:
     reasoning_content: str | None = None
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None  # required when role="tool"
+    outputs: tuple[ModelOutput, ...] = ()
 
 
 # ── Tool use result ──
@@ -106,8 +108,8 @@ class ModelMessage:
 
 class ToolUseResult(BaseModel):
     """Model output after a turn.  The loop kernel uses ``stop_reason``
-    (the normalized enum) for control flow; ``raw_stop_reason`` is
-    debug-only and must NOT enter checkpoints."""
+    (the normalized enum) for control flow. ``raw_stop_reason`` preserves
+    provider terminal metadata; it does not authorize Runtime execution."""
 
     tool_calls: list[ToolCall] = Field(default_factory=list)
     text: str = ""
@@ -134,6 +136,10 @@ def snapshot_model_message(message: ModelMessage) -> ModelMessage:
             )
     if message.tool_calls and message.role != "assistant":
         raise ValueError("only assistant messages may contain tool calls")
+    if message.outputs and message.role != "assistant":
+        raise ValueError("only assistant messages may contain model outputs")
+    if not isinstance(message.outputs, tuple) or any(not isinstance(output, ModelOutput) for output in message.outputs):
+        raise TypeError("message outputs must be a tuple of ModelOutput values")
     if message.role == "tool":
         if not isinstance(message.tool_call_id, str) or not message.tool_call_id:
             raise ValueError("tool messages require tool_call_id")
@@ -164,6 +170,7 @@ def snapshot_model_message(message: ModelMessage) -> ModelMessage:
         reasoning_content=message.reasoning_content,
         tool_calls=tuple(calls),
         tool_call_id=message.tool_call_id,
+        outputs=message.outputs,
     )
 
 
@@ -250,6 +257,10 @@ def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
     }
     if snapshotted.reasoning_content is not None:
         payload["reasoning_content"] = snapshotted.reasoning_content
+    if snapshotted.outputs:
+        payload["outputs"] = json_schema_output(
+            None, cast(JsonValue, [output_to_payload(output) for output in snapshotted.outputs])
+        )
     return payload
 
 

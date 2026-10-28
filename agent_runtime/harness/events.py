@@ -8,7 +8,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from agent_runtime.harness.rollout import RolloutRecord, RolloutStore
+from agent_runtime.harness.records import RolloutRecord
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.modeling.contracts import context_capacity_policy
 from agent_runtime.streaming.events import (
     EventType,
@@ -36,6 +37,7 @@ _PUBLIC_ITEM_KINDS = frozenset(
         "model_response",
         "model_reasoning",
         "model_plan",
+        "model_output",
         "tool_result",
         "tool_reconciliation",
         "command_execution",
@@ -73,14 +75,6 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
         "budget_unknown",
         "budget_child_allocated",
         "budget_child_settled",
-        "model_operation_prepared",
-        "model_retry_prepared",
-        "model_attempt_dispatched",
-        "model_attempt_completed",
-        "model_attempt_late_response",
-        "model_attempt_rejected",
-        "model_attempt_cancelled",
-        "model_attempt_unknown",
         "tool_operation_prepared",
         "tool_operation_migrated",
         "tool_operation_status_changed",
@@ -94,13 +88,22 @@ _SUPPRESSED_RECORD_TYPES = frozenset(
         "tool_operation_approval_requested",
         "tool_operation_approval_resolved",
         "tool_operation_superseded",
-        "interaction_requested",
-        "interaction_resolved",
-        "approval_invalidated",
     }
 )
 _CURSOR_VERSION = 1
-_SCHEMA_EPOCH = "harness-canonical-stream-v3"
+_SCHEMA_EPOCH = "harness-canonical-stream-v4"
+
+_MODEL_ATTEMPT_TRANSITIONS = {
+    "model_operation_prepared": "prepared",
+    "model_retry_prepared": "retry_prepared",
+    "model_attempt_dispatched": "dispatched",
+    "model_response_started": "responding",
+    "model_attempt_completed": "completed",
+    "model_attempt_rejected": "rejected",
+    "model_attempt_cancelled": "cancelled",
+    "model_attempt_unknown": "unknown",
+    "model_attempt_late_response": "late_response",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +136,7 @@ RolloutEvent = ReplayEvent
 
 
 async def commit_and_publish[T](
-    store: RolloutStore,
+    store: RuntimeState,
     operation: Callable[[], T],
     dispatcher: TurnEventDispatcher | None,
 ) -> T:
@@ -149,7 +152,7 @@ async def commit_and_publish[T](
 class RolloutEventReader:
     """Read independent Thread tails or one global record-id tail."""
 
-    def __init__(self, store: RolloutStore) -> None:
+    def __init__(self, store: RuntimeState) -> None:
         self._store = store
 
     def read(
@@ -308,8 +311,16 @@ class RolloutEventReader:
         lifecycle = self._project_lifecycle(record)
         if lifecycle is not None:
             return (lifecycle,)
+        notification = self._project_runtime_notification(record)
+        if notification is not None:
+            return (notification,)
         item_id = record.payload.get("item_id")
         kind = record.payload.get("kind")
+        if kind in {"model_response", "model_reasoning", "model_plan"} and (
+            record.payload.get("output_protocol") == "model-outputs-v1"
+            or record.payload.get("payload", {}).get("output_protocol") == "model-outputs-v1"
+        ):
+            return ()
         if record.record_type == "tool_operation_claimed":
             operation_id = record.payload.get("operation_id")
             public_item_id = record.payload.get("public_item_id")
@@ -353,9 +364,6 @@ class RolloutEventReader:
             if not isinstance(item_id, str) or not isinstance(kind, str):
                 raise RuntimeError("completed internal Item has no durable start")
             payload = record.payload.get("payload", {})
-            if kind == "context_compaction" and isinstance(payload.get("capacity_diagnostics"), Mapping):
-                return (StreamEvent(type=EventType.COMPACT_LAYER, turn_id=record.turn_id or "",
-                                    data=dict(payload["capacity_diagnostics"])),)
             if kind == "model_request":
                 request_ref = payload.get("request_ref", {})
                 projection = request_ref.get("context_projection", {})
@@ -378,6 +386,85 @@ class RolloutEventReader:
         raise RuntimeError(f"unknown durable Rollout record type: {record.record_type!r}")
 
     @staticmethod
+    def _project_runtime_notification(record: RolloutRecord) -> StreamEvent | None:
+        """Publish decisions from their committed record, never current mutable state."""
+        payload = record.payload
+        data: dict[str, Any]
+        event_type: EventType
+        if record.record_type in {
+            "tool_operation_prepared", "tool_operation_status_changed", "tool_operation_start_rejected",
+            "tool_operation_claim_expired", "tool_operation_result_missing", "tool_operation_superseded",
+            "tool_operation_outcome_committed", "tool_operation_reconciled",
+        }:
+            event_type = EventType.TOOL_OPERATION_UPDATED
+            data = {key: payload[key] for key in (
+                "operation_id", "tool_call_id", "tool_name", "request_id", "status", "reason", "error_code",
+                "claim_generation", "attempt_count", "requires_reconciliation", "committed_execution_status",
+                "reconciler_revision", "duration_ms",
+            ) if key in payload}
+            data["transition"] = record.record_type.removeprefix("tool_operation_")
+        elif record.record_type in _MODEL_ATTEMPT_TRANSITIONS:
+            event_type = EventType.MODEL_ATTEMPT_UPDATED
+            data = {key: payload[key] for key in (
+                "operation_id", "attempt_id", "generation", "previous_attempt_id",
+                "provider_response_id", "usage", "reason", "error_type", "error_message",
+                "response_status", "incomplete_reason", "stop_reason",
+            ) if key in payload}
+            data["status"] = _MODEL_ATTEMPT_TRANSITIONS[record.record_type]
+        elif record.record_type == "interaction_requested":
+            event_type = EventType.INTERACTION_REQUESTED
+            data = {key: payload[key] for key in ("request_id", "kind", "operation_id", "request") if key in payload}
+        elif record.record_type in {"interaction_resolved", "approval_invalidated"}:
+            event_type = (EventType.INTERACTION_RESOLVED if record.record_type == "interaction_resolved"
+                          else EventType.INTERACTION_INVALIDATED)
+            data = {key: payload[key] for key in (
+                "request_id", "kind", "operation_id", "version", "reason", "approval_status",
+            ) if key in payload}
+            response = payload.get("response", {})
+            if isinstance(response, Mapping) and response.get("decision") in {"approve", "deny", "cancel"}:
+                data["decision"] = response["decision"]
+            action = response.get("action") if isinstance(response, Mapping) else None
+            if action in {"abort", "recheck"}:
+                data["action"] = action
+            data["status"] = ("invalidated" if record.record_type == "approval_invalidated"
+                              or payload.get("approval_status") == "invalidated" or action == "recheck"
+                              else "cancelled" if action == "abort"
+                              or isinstance(response, Mapping) and response.get("cancelled") is True
+                              else "resolved")
+        elif record.record_type == "item_started" and payload.get("kind") == "context_compaction":
+            event_type = EventType.CONTEXT_COMPACTION_STARTED
+            data = {"compaction_id": payload.get("item_id")}
+        elif record.record_type == "item_completed" and payload.get("kind") == "context_compaction":
+            event_type = EventType.CONTEXT_COMPACTION_COMPLETED
+            body = payload.get("payload", {})
+            data = {key: body[key] for key in (
+                "context_version", "covered_item_ids", "covered_item_refs", "covered_sequence_ranges",
+                "capacity_diagnostics", "preserved_item_ids", "source_revision", "algorithm_revision",
+                "reason", "error",
+            ) if key in body}
+            data.update(compaction_id=payload.get("item_id"),
+                        status="completed" if payload.get("status", "success") == "success" else payload["status"])
+        elif record.record_type == "item_completed" and payload.get("kind") == "completion_decision":
+            event_type = EventType.COMPLETION_DECIDED
+            body = payload.get("payload", {})
+            data = {key: body[key] for key in (
+                "proposal_item_id", "action", "reason", "validation_status", "validation_scope", "reason_code",
+            ) if key in body}
+            data.setdefault("validation_status", "not_evaluated")
+        elif record.record_type == "item_completed" and payload.get("kind") == "verification":
+            event_type = EventType.VERIFICATION_COMPLETED
+            body = payload.get("payload", {})
+            data = {key: body[key] for key in (
+                "operation_id", "tool_call_id", "arguments_digest", "source_result_item_id",
+                "verification_kind", "verifier", "verified_resources",
+            ) if key in body}
+        else:
+            return None
+        if not record.turn_id:
+            raise RuntimeError("Runtime notification is missing turn_id")
+        return StreamEvent(type=event_type, turn_id=record.turn_id, data=data)
+
+    @staticmethod
     def _project_lifecycle(record: RolloutRecord) -> StreamEvent | None:
         turn_id = record.turn_id
         if record.record_type == "turn_started":
@@ -398,11 +485,19 @@ class RolloutEventReader:
             if turn_id is None:
                 raise RuntimeError("turn_paused record is missing turn_id")
             reason = record.payload.get("reason", "interaction_required")
-            return turn_paused(turn_id, reason=str(reason))
+            event = turn_paused(turn_id, reason=str(reason))
+            return replace(event, data={**event.data, **{
+                key: record.payload[key] for key in ("request_id", "operation_id", "attempt_id")
+                if key in record.payload
+            }})
         if record.record_type == "turn_resumed":
             if turn_id is None:
                 raise RuntimeError("turn_resumed record is missing turn_id")
-            return turn_resumed(turn_id)
+            event = turn_resumed(turn_id)
+            return replace(event, data={**event.data, **{
+                key: record.payload[key] for key in ("request_id", "operation_id", "attempt_id")
+                if key in record.payload
+            }})
         if record.record_type == "turn_cancellation_requested":
             if turn_id is None:
                 raise RuntimeError("turn_cancellation_requested record is missing turn_id")
@@ -466,6 +561,7 @@ class RolloutEventReader:
             item_id=public_item_id,
             item_kind=item_kind,
             iteration=_iteration(record.payload),
+            data=_public_output_data(record) if kind == "model_output" else None,
             parent_item_id=(
                 str(record.payload["parent_item_id"])
                 if isinstance(record.payload.get("parent_item_id"), str)
@@ -507,7 +603,9 @@ class RolloutEventReader:
         if not isinstance(payload, Mapping):
             raise RuntimeError("public Item completion payload is malformed")
         status, error = _record_item_status(record.payload)
-        if item_kind is TurnItemKind.AGENT_MESSAGE:
+        if kind == "model_output":
+            data = _public_output_data(record)
+        elif item_kind is TurnItemKind.AGENT_MESSAGE:
             data = {
                 "content": payload.get("text", payload.get("content", "")),
                 "tool_calls": payload.get("tool_calls", ()),
@@ -580,6 +678,14 @@ class RolloutEventReader:
                 )
         attempt_id = payload.get("attempt_id")
         channel = payload.get("channel")
+        output_id = payload.get("output_id")
+        if payload.get("kind") == "model_output":
+            if not isinstance(attempt_id, str) or not isinstance(output_id, str):
+                raise RuntimeError("model output is missing durable output identity")
+            output_kind = payload.get("output_kind")
+            channel = "agent_message" if output_kind == "text" else output_kind
+            if not isinstance(channel, str):
+                raise RuntimeError("model output is missing output_kind")
         if isinstance(attempt_id, str) and isinstance(channel, str):
             cls._require_public_item_id(
                 payload.get("public_item_id"),
@@ -587,6 +693,7 @@ class RolloutEventReader:
                     turn_id=record.turn_id,
                     model_attempt_id=attempt_id,
                     channel=channel,
+                    output_id=output_id if isinstance(output_id, str) else None,
                 ),
             )
         operation_id = payload.get("operation_id")
@@ -725,6 +832,20 @@ def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:
             raise RuntimeError(f"persisted public Item kind is unsupported: {persisted!r}") from None
     if record.producer == "migration" and kind == "model_response":
         return TurnItemKind.LEGACY_MESSAGE
+    if kind == "model_output":
+        output_kind = record.payload.get("output_kind")
+        mapping = {
+            "text": TurnItemKind.AGENT_MESSAGE,
+            "reasoning": TurnItemKind.REASONING,
+            "reasoning_summary": TurnItemKind.REASONING,
+            "plan": TurnItemKind.PLAN,
+            "tool_call": TurnItemKind.TOOL_CALL,
+            "refusal": TurnItemKind.REFUSAL,
+        }
+        try:
+            return mapping[str(output_kind)]
+        except KeyError:
+            raise RuntimeError(f"unsupported model output kind: {output_kind!r}") from None
     mapping = {
         "agent_message": TurnItemKind.LEGACY_MESSAGE,
         "model_response": TurnItemKind.AGENT_MESSAGE,
@@ -737,6 +858,21 @@ def _public_item_kind(record: RolloutRecord, *, kind: str) -> TurnItemKind:
         return mapping[kind]
     except KeyError:
         raise RuntimeError(f"internal Item kind has no public projection: {kind!r}") from None
+
+
+def _public_output_data(record: RolloutRecord) -> dict[str, Any]:
+    body = record.payload.get("payload", {})
+    output = body.get("output", record.payload.get("output", {}))
+    if not isinstance(output, Mapping):
+        raise RuntimeError("model output snapshot is malformed")
+    data = {key: output[key] for key in (
+        "output_id", "content", "tool_call_id", "tool_name", "arguments", "argument_error",
+    ) if key in output}
+    data["output_id"] = record.payload["output_id"]
+    data["output_kind"] = record.payload["output_kind"]
+    if record.payload["output_kind"] == "tool_call":
+        data["execution_started"] = False
+    return data
 
 
 def _iteration(payload: Mapping[str, Any]) -> int:

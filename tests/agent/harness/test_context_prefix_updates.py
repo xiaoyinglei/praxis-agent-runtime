@@ -130,11 +130,11 @@ async def test_context_changes_append_to_serialized_history(tmp_path, mode):
 @pytest.mark.anyio
 @pytest.mark.parametrize("change", ["delete", "disable", "disable_legacy_gap", "delete_legacy_enabled_gap"])
 async def test_memory_revocation_starts_a_new_context_window_and_survives_reopen(tmp_path, change):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.memory_management import remember_memory
 
     database = tmp_path / "run.db"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         remember_memory(store, tmp_path, key="secret", title="Sensitive heading", text="PRIVATE_MEMORY_BODY")
 
     class MemoryReader(Probe):
@@ -308,11 +308,11 @@ async def test_tool_discovery_survives_reopen_but_obeys_fork_cutoff(tmp_path):
 
 @pytest.mark.anyio
 async def test_memory_body_change_appends_navigation_even_when_title_is_unchanged(tmp_path):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.memory_management import edit_memory, remember_memory
 
     database = tmp_path / "run.db"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         remember_memory(store, tmp_path, key="runner", title="Runner", text="old body")
     model = Probe("answer")
     async with await Session.open(

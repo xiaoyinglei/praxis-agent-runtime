@@ -35,7 +35,7 @@ class ChangingModel:
             request_ref={"model_id": request.binding_manifest["model_id"]},
         )
 
-    async def dispatch(self, prepared, *, delta_sink: object = None):
+    async def dispatch(self, prepared, *, event_sink: object = None):
         self.selected = "second"
         if self.unknown_once:
             self.unknown_once = False
@@ -151,7 +151,7 @@ async def test_live_session_model_switch_captures_authenticated_step_bindings(tm
     async with await Session.open(agent=agent, completion_gate=ContinueOnce()) as session:
         original_dispatch = model.dispatch
 
-        async def dispatch(prepared, *, delta_sink: object = None):
+        async def dispatch(prepared, *, event_sink: object = None):
             session.switch_model("second")
             return await original_dispatch(prepared)
 
@@ -207,7 +207,7 @@ async def test_policy_update_during_request_applies_to_next_step_and_survives_re
     ) as session:
         original_dispatch = model.dispatch
 
-        async def dispatch(prepared, *, delta_sink: object = None):
+        async def dispatch(prepared, *, event_sink: object = None):
             session.update_tool_policy(allow_write_tools=True)
             return await original_dispatch(prepared)
 
@@ -259,7 +259,7 @@ async def test_policy_change_while_sampling_does_not_rewrite_that_requests_tools
     ) as session:
         original_dispatch = model.dispatch
 
-        async def dispatch(prepared, *, delta_sink: object = None):
+        async def dispatch(prepared, *, event_sink: object = None):
             session.update_tool_policy(allow_write_tools=True)
             return await original_dispatch(prepared)
 
@@ -318,7 +318,7 @@ async def test_child_inherits_originating_step_while_parent_next_step_uses_updat
         def snapshot(self, *, thread_id, turn_id):
             return {**super().snapshot(thread_id=thread_id, turn_id=turn_id), "model_id": self.selected}
 
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             request = prepared.dispatch_payload
             if request.step == 2 and not request.messages[0].content.startswith("child task"):
                 self.selected = "second"

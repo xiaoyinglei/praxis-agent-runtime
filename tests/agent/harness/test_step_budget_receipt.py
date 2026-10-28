@@ -16,7 +16,7 @@ class ReadingModel(_UpdatePlanThenAnswerModel):
         self.requests.append(request)
         return super().prepare(request)
 
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         step = prepared.request_ref["step"]
         if step == self.finish_at:
             return HarnessModelResponse(text="finished", provider_response_id=None, usage={})

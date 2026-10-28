@@ -88,7 +88,7 @@ async def test_repeated_url_reuses_snapshot_and_does_not_repeat_network(tmp_path
 async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, monkeypatch, extraction_error):
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import Accept, model_for, start
     from tests.agent.test_web_product import FetchThenAnswer
@@ -104,7 +104,7 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, '_model_factory', lambda: model)
     result = await agent.run('Read external evidence', allow_web_tools=True, require_workspace_change=False)
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         item = next(i for i in store.list_items(result.turn_id) if i.kind == 'tool_result')
         expected = item.payload['structured_content']
         thread, turn = start(store, tmp_path)
@@ -200,14 +200,14 @@ async def test_search_retains_backend_results_and_unverified_freshness(tmp_path)
 
 
 def test_semantic_summary_and_zero_body_elision_keep_source_identity(tmp_path):
-    from agent_runtime.harness import RolloutContextManager, RolloutStore
+    from agent_runtime.harness import RolloutContextManager, RuntimeState
     from tests.agent.harness.test_compaction_consistency import start
     from tests.agent.harness.test_tool_result_elision import exchange
 
     source = {'source_id': 'artifact_' + 'a' * 32, 'url': 'https://example.com/source',
               'content': '1: evidence\n' * 200, 'start_line': 1, 'next_line': 201,
               'source_truncated': False, 'truncated': True, 'content_hash': 'b' * 64}
-    with RolloutStore(tmp_path / 'r.db') as store:
+    with RuntimeState.open_sync(tmp_path / 'r.db') as store:
         _, turn = start(store, tmp_path)
         exchange(store, turn.turn_id, 'page', json.dumps({'structured_content': source}))
         exchange(store, turn.turn_id, 'recent', 'Recent work ' * 1000)
@@ -225,7 +225,7 @@ def test_semantic_summary_and_zero_body_elision_keep_source_identity(tmp_path):
         manager.commit_compaction(summary)
         assert source['source_id'] in str(manager.build(turn.turn_id))
         assert store.verify().valid
-    with RolloutStore(tmp_path / 'r.db') as store:
+    with RuntimeState.open_sync(tmp_path / 'r.db') as store:
         assert source['source_id'] in str(RolloutContextManager(store).build(turn.turn_id))
 
 

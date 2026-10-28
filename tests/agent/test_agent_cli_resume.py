@@ -9,7 +9,7 @@ import typer
 
 from agent_runtime import cli
 from agent_runtime.agent import Agent
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.result import (
     AgentPause,
     AgentResult,
@@ -25,7 +25,7 @@ def _persist_cli_turn(
     binding_manifest: Mapping[str, object] | None = None,
 ) -> str:
     workspace.mkdir(exist_ok=True)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -183,7 +183,7 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
     database = tmp_path / "agent.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -202,7 +202,7 @@ def test_cli_abort_releases_legacy_paused_turn_without_binding_projection(
         )
 
     assert exc_info.value.exit_code == 1
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.read_turn(turn.turn_id).status == "cancelled"
         assert store.read_thread(thread.thread_id).active_turn_id is None
 
@@ -214,7 +214,7 @@ async def test_public_resume_rejects_explicit_unavailable_session_model_before_i
     database = tmp_path / "agent.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -347,7 +347,7 @@ def test_recover_inspection_prints_only_real_actions(tmp_path, monkeypatch, caps
     database = tmp_path / "run.sqlite"
     workspace = tmp_path / "workspace"
     turn_id = _persist_cli_turn(database, workspace)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         if kind == "choice":
             request = store.request_choice(turn_id=turn_id, question="Which output?", options=("csv", "xlsx"))
         else:
@@ -367,7 +367,7 @@ def test_recover_inspection_prints_only_real_actions(tmp_path, monkeypatch, caps
     else:
         assert "--action continue" not in output
         assert "no_resume_point" in output
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.list_records(store.read_turn(turn_id).thread_id) == before
 
 

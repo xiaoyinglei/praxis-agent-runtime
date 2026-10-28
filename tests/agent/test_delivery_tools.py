@@ -275,7 +275,7 @@ async def test_session_cancellation_records_the_real_git_commit(workspace, tmp_p
                 tool_hash=toolset_revision_for_tools(request.tools), request_ref={
                     "request_id": "delivery-test", "toolset_revision": toolset_revision_for_tools(request.tools),
                     "exposed_tool_names": [tool.definition.name for tool in request.tools]})
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             return HarnessModelResponse(
                 text="", provider_response_id="delivery-response", usage={"input_tokens": 1, "output_tokens": 1},
                 tool_calls=(HarnessToolCall(id="commit-call", name="commit_changes",

@@ -7,14 +7,15 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from agent_runtime.harness.protocol import CompletionDecision, CompletionProposal
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, ToolOperationSnapshot
+from agent_runtime.harness.records import ItemSnapshot, ToolOperationSnapshot
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.verification import assess_tool_verification
 
 
 class DeliveryCompletionGate:
     """Validate required workspace-change evidence, not answer correctness."""
 
-    def __init__(self, store: RolloutStore) -> None:
+    def __init__(self, store: RuntimeState) -> None:
         self._store = store
 
     def evaluate(self, proposal: CompletionProposal) -> CompletionDecision:

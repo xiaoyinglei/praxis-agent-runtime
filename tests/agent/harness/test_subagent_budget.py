@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
     PreparedModelCall,
-    RolloutStore,
+    RuntimeState,
     Session,
 )
 
@@ -54,7 +54,7 @@ class SmallAnswerModel(FixedBindingProvider):
             ),
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         return HarnessModelResponse(
             text="child answer",
@@ -68,7 +68,7 @@ class BlockingAnswerModel(SmallAnswerModel):
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         self.started.set()
         await self.release.wait()
@@ -80,13 +80,13 @@ class BlockingAnswerModel(SmallAnswerModel):
 
 
 class UnknownAnswerModel(SmallAnswerModel):
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         raise ConnectionError("provider outcome is unknown")
 
 
 def _running_parent(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     token_budget: int,
@@ -112,7 +112,7 @@ async def test_completed_child_charges_actual_usage_and_releases_unused_allocati
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         parent = _running_parent(store, workspace, token_budget=100)
         async with await Session.open(
             database=tmp_path / "rollout.sqlite3", workspace=workspace, model=SmallAnswerModel(),
@@ -158,7 +158,7 @@ async def test_child_inherits_frozen_parent_web_limits_with_independent_turn_usa
 
     limits = WebLimits(turn_requests=1, browser_requests=7, browser_network_bytes=2_000_000).model_dump(mode="json")
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         parent = store.start_turn(thread_id=thread.thread_id, user_message="parent", binding_manifest={
             "model_id": "test-model", "model_step_budget": 8, "model_token_budget_total": 100,
@@ -182,7 +182,7 @@ def test_active_child_allocation_prevents_parallel_budget_oversell(
     async def scenario() -> None:
         workspace = tmp_path / "workspace"
         workspace.mkdir()
-        with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+        async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
             parent = _running_parent(store, workspace, token_budget=100)
             model = BlockingAnswerModel()
             async with await Session.open(
@@ -230,7 +230,7 @@ async def test_unknown_child_keeps_parent_allocation_locked(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         parent = _running_parent(store, workspace, token_budget=100)
         async with await Session.open(
             database=tmp_path / "rollout.sqlite3", workspace=workspace, model=UnknownAnswerModel(),

@@ -12,14 +12,14 @@ from uuid import uuid4
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.memory import MemoryEntry
 from agent_runtime.harness.protocol import ContextSourceChangedError
-from agent_runtime.harness.rollout import RolloutStore, _store_operation
+from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.tools.tool import JsonValue, NormalizedToolOutput, Tool
 
 MemoryKind = Literal["preference", "fact", "reference"]
 
 
 def record_revision(
-    store: RolloutStore,
+    store: RuntimeState,
     state: dict[str, Any],
     entry: Mapping[str, Any],
     *,
@@ -50,9 +50,9 @@ def record_revision(
     return stamped
 
 
-@_store_operation
+@_state_operation
 def _write(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     action: str,
@@ -63,7 +63,7 @@ def _write(
     expected_version: int | None,
     source_item_ids: Sequence[str] | None,
 ) -> dict[str, Any]:
-    with store._transaction():
+    with store.persistence.transaction():
         state = store.read_memory_state(workspace)
         if expected_version is not None and expected_version != state["version"]:
             raise ContextSourceChangedError("memory changed before explicit edit")
@@ -114,7 +114,7 @@ def _write(
 
 
 def remember_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
@@ -138,7 +138,7 @@ def remember_memory(
 
 
 def edit_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
@@ -162,7 +162,7 @@ def edit_memory(
 
 
 def explain_memory(
-    store: RolloutStore,
+    store: RuntimeState,
     workspace: Path,
     *,
     key: str,
@@ -188,7 +188,7 @@ def explain_memory(
     }
 
 
-def create_memory_management_tool(store: RolloutStore) -> Tool:
+def create_memory_management_tool(store: RuntimeState) -> Tool:
     from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
     from agent_runtime.tools.tool import (
         CancellationMode,
@@ -322,7 +322,7 @@ def create_memory_management_tool(store: RolloutStore) -> Tool:
         static_effects=frozenset(),
         resolve_use=lambda a: ResolvedToolUse(
             effects=frozenset() if a["action"] == "explain" else frozenset({ToolEffect.WRITE_WORKSPACE}),
-            targets=(ToolTarget(kind="workspace_path", value=str(store._path.resolve())),)
+            targets=(ToolTarget(kind="workspace_path", value=str(store.persistence.path.resolve())),)
             if a["action"] != "explain"
             else (),
         ),

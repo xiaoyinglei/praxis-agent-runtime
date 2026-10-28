@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore, ToolOrchestrator
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, ToolOrchestrator
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.tool_router import StaticToolRouter
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -17,7 +17,7 @@ from tests.agent.harness.test_tool_orchestrator import _read_tool
 
 @pytest.mark.parametrize("task", ["preserve API constraints", "compare archived research evidence"])
 def test_turn_budget_compacts_while_summary_and_continuation_still_fit(tmp_path, task):
-    with RolloutStore(tmp_path / "headroom.db") as store:
+    with RuntimeState.open_sync(tmp_path / "headroom.db") as store:
         runner, turn, gateway = capacity_runner(
             store, tmp_path, tokens=95_000, messages=2000, summary="Applied work; verification still required."
         )
@@ -45,7 +45,7 @@ def test_turn_budget_compacts_while_summary_and_continuation_still_fit(tmp_path,
 
 
 def test_ample_turn_budget_keeps_history_and_output_ceiling(tmp_path):
-    with RolloutStore(tmp_path / "ample.db") as store:
+    with RuntimeState.open_sync(tmp_path / "ample.db") as store:
         runner, turn, gateway = capacity_runner(store, tmp_path, tokens=1_200_000, messages=2000)
         seed(store, turn_id=turn.turn_id, kind="agent_message", payload={"text": "history" * 5500})
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
@@ -57,7 +57,7 @@ def test_ample_turn_budget_keeps_history_and_output_ceiling(tmp_path):
 @pytest.mark.parametrize("check_passed", [True, False])
 def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_path, check_passed):
     database = tmp_path / "delivery.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner, turn, gateway = capacity_runner(
             store, tmp_path, tokens=100_000, messages=2000, summary="Changed value.txt; retain recorded check outcome."
         )
@@ -91,7 +91,7 @@ def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_pa
         runner._completion_gate = DeliveryCompletionGate(store)
         context = runner.restore_turn_context(turn.turn_id)
         # Reopen from durable state, as approval recovery does; no budget reset.
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         runner._store = reopened
         runner._context_manager = type(runner._context_manager)(reopened)
         runner._completion_gate = DeliveryCompletionGate(reopened)
@@ -112,7 +112,7 @@ def test_repeated_real_file_tool_results_keep_an_affordable_summary_escape_path(
     """Grow the real transcript and charge measured inputs, not constant fake usage."""
     for index in range(6):
         (tmp_path / f"{index}.txt").write_text(f"evidence {index}: " + "data " * 2000)
-    with RolloutStore(tmp_path / "loop.db") as store:
+    with RuntimeState.open_sync(tmp_path / "loop.db") as store:
         runner, turn, _gateway = capacity_runner(
             store, tmp_path, tokens=220_000, messages=2000, summary="Retain objective and already-read evidence."
         )

@@ -211,7 +211,7 @@ def test_deepseek_cli_runs_real_agent_tool_and_persists_sources(
     import agent_runtime.tools.web_http as http_module
     from agent_runtime import Agent
     from agent_runtime.cli import agent_app
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from tests.agent.test_web_product import FetchThenAnswer
 
     hits = []
@@ -237,7 +237,7 @@ def test_deepseek_cli_runs_real_agent_tool_and_persists_sources(
     ])
     assert result.exit_code == 0, result.output
     assert len(hits) == 1 and hits[0].url.host == "api.deepseek.com"
-    with RolloutStore(workspace / ".praxis/checkpoints.sqlite") as store:
+    with RuntimeState.open_sync(workspace / ".praxis/checkpoints.sqlite") as store:
         turn = store.list_turns()[0]
         items = store.list_items(turn.turn_id)
         output = next(item.payload["structured_content"] for item in items if item.kind == "tool_result")

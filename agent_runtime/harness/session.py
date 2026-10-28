@@ -37,14 +37,15 @@ from agent_runtime.harness.protocol import (
     ToolRouter,
     TurnResult,
 )
+from agent_runtime.harness.records import ItemSnapshot
 from agent_runtime.harness.recovery import recovery_plan
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
 from agent_runtime.harness.services import (
     SessionBindingProvider,
     _tool_execution_policy_snapshot,
     configure_services,
     restore_tool_policy,
 )
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator, current_tool_binding
 from agent_runtime.harness.turn import TurnExecutor
 from agent_runtime.permission_policy import NetworkPolicy, PermissionPolicy, ResolvedPermissions
@@ -78,7 +79,7 @@ class Session:
     """
 
     tool_execution_context: ToolExecutionContext
-    store: RolloutStore
+    store: RuntimeState
     database: Path
     workspace_path: Path
     thread_id: str
@@ -166,7 +167,15 @@ class Session:
             self.database = Path(database)
             self.workspace_path = Path(workspace).resolve()
             self._stack.enter_context(workspace_owner(self.workspace_path))
-            self.store = await self._stack.enter_async_context(await RolloutStore.open(self.database))
+            self.store = await self._stack.enter_async_context(await RuntimeState.open(self.database))
+            if sum(value is not None for value in (previous_turn_id, frozen_turn_id, thread_id)) > 1:
+                raise ValueError("choose one conversation anchor")
+            integrity = await self.store.run_async(
+                self.store.validate_conversation, thread_id=thread_id,
+                turn_id=frozen_turn_id or previous_turn_id,
+            )
+            if not integrity.valid:
+                raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(integrity.errors))
             from agent_runtime.harness.workspace_stores import register_workspace_store
 
             (await self.store.run_async(register_workspace_store, self.workspace_path, self.database))
@@ -184,11 +193,6 @@ class Session:
                 self.memory_config = self.memory_config.model_copy(update={
                     "use_memories": "memory_snapshot" in original,
                 })
-            integrity = await self.store.run_async(self.store.verify)
-            if not integrity.valid:
-                raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(integrity.errors))
-            if sum(value is not None for value in (previous_turn_id, frozen_turn_id, thread_id)) > 1:
-                raise ValueError("choose one conversation anchor")
             anchor = frozen_turn_id or previous_turn_id
             if anchor is not None:
                 turn = await self.store.run_async(self.store.read_turn, anchor)
@@ -384,7 +388,7 @@ class Session:
             return
 
         def pause_cancelled() -> None:
-            with self.store._transaction():
+            with self.store.persistence.transaction():
                 self.store.request_turn_cancellation(turn_id=active, reason="Session execution task was cancelled")
                 if self.store.read_turn(active).status == "running":
                     self.store.pause_turn(turn_id=active, reason="Execution task was cancelled")
@@ -588,7 +592,7 @@ class Session:
             try:
                 # Settings, input revision and file Items commit together. A rejected
                 # input must not leave an unacknowledged permission grant behind.
-                with self.store._transaction():
+                with self.store.persistence.transaction():
                     if self.store.read_thread(self.thread_id).active_turn_id != expected_turn_id:
                         raise RuntimeError("expected Turn is no longer active; input was not accepted")
                     values = self.attach_files(files) if files else ()
@@ -632,7 +636,7 @@ class Session:
 
     @staticmethod
     async def run_memory_turn(
-        store: RolloutStore, model: BoundHarnessModel, turn_id: str,
+        store: RuntimeState, model: BoundHarnessModel, turn_id: str,
         *, prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
     ) -> TurnResult:
         """Compose a tool-free maintenance Turn through the same execution owner."""

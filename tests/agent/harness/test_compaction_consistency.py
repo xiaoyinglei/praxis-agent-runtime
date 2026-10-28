@@ -11,7 +11,7 @@ from agent_runtime.harness import (
     GatewayHarnessModel,
     HarnessModelRequest,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     TurnExecutor,
 )
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
@@ -49,7 +49,7 @@ def long_history(store, turn):
 
 
 def test_single_turn_compacts_and_dispatches(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for()
@@ -74,7 +74,7 @@ def test_single_turn_compacts_and_dispatches(tmp_path: Path):
 
 
 def test_durable_boundary_preserves_tool_group(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         seed(
             store,
@@ -111,7 +111,7 @@ def test_durable_boundary_preserves_tool_group(tmp_path: Path):
 
 
 def test_candidate_rebuild_and_stale_commit(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -138,7 +138,7 @@ def test_candidate_rebuild_and_stale_commit(tmp_path: Path):
 
 
 def test_unfit_candidate_does_not_commit(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for(100)
@@ -158,7 +158,7 @@ def test_unfit_candidate_does_not_commit(tmp_path: Path):
 
 def test_repeated_compaction_reopen_and_fork(tmp_path: Path):
     database = tmp_path / "r.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(
@@ -185,19 +185,19 @@ def test_repeated_compaction_reopen_and_fork(tmp_path: Path):
         assert sum(m.content.startswith("Context compaction:") for m in expected) == 1
         assert "notes.txt" in next(m.content for m in expected if m.role == "context")
         assert store.verify().valid
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert RolloutContextManager(store).build(follow.turn_id) == expected
 
 
 def test_other_connection_invalidates_candidate_on_non_message_state(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
         candidate = list(
             manager.compaction_candidates(turn.turn_id, summary="Test summary of the completed findings.")
         )[-1]
-        with RolloutStore(tmp_path / "r.db") as other:
+        with RuntimeState.open_sync(tmp_path / "r.db") as other:
             other.record_tool_execution_state(
                 turn_id=turn.turn_id,
                 operation_id="op-new",
@@ -217,7 +217,7 @@ def test_other_connection_invalidates_candidate_on_non_message_state(tmp_path: P
 
 
 def test_candidate_messages_do_not_share_mutable_tool_arguments(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(
@@ -246,7 +246,7 @@ def test_candidate_messages_do_not_share_mutable_tool_arguments(tmp_path: Path):
 
 @pytest.mark.parametrize("limits", [{"max_messages": 5}, {"max_item_bytes": 1800}, {"max_total_bytes": 6000}])
 def test_local_limits_also_use_precommit_candidates(tmp_path: Path, limits):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         model, gateway = model_for(9000)
@@ -264,7 +264,7 @@ def test_local_limits_also_use_precommit_candidates(tmp_path: Path, limits):
 
 
 def test_previous_explicit_facts_survive_automatic_compaction(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -290,7 +290,7 @@ def test_previous_explicit_facts_survive_automatic_compaction(tmp_path: Path):
 
 
 def test_successful_tool_operations_are_not_pending_state(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         kwargs = dict(
             turn_id=turn.turn_id,
@@ -320,7 +320,7 @@ def test_successful_tool_operations_are_not_pending_state(tmp_path: Path):
 
 
 def test_changed_source_is_replanned_before_dispatch(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
 
@@ -350,7 +350,7 @@ def test_changed_source_is_replanned_before_dispatch(tmp_path: Path):
 
 
 def test_uncertain_tool_group_is_not_covered(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         call = seed(
@@ -406,7 +406,7 @@ def test_uncertain_tool_group_is_not_covered(tmp_path: Path):
 
 
 def test_retained_successful_tool_result_is_not_clipped(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(
@@ -441,7 +441,7 @@ def test_resume_after_compaction_commit_does_not_repeat_it(
              "timezone": "UTC", "utc_offset": "+00:00"}
     monkeypatch.setattr("agent_runtime.harness.turn.capture_runtime_clock", lambda: clock)
     model, gateway = model_for()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -474,7 +474,7 @@ def test_resume_after_compaction_commit_does_not_repeat_it(
                 **clock, "current_time": "2032-01-01T00:00:01+00:00", "current_date": "2032-01-01"
             })
         # Process loss after compaction, either before or after saving the Step.
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert RolloutContextManager(store).build(turn.turn_id) == candidate.messages
         model, gateway = model_for()
         runner = TurnExecutor(
@@ -509,7 +509,7 @@ def test_mid_turn_summary_follows_current_user_in_projection_and_provider_wire(t
     from agent_runtime.modeling.openai_wire import _message_payloads
 
     database = tmp_path / "order.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -523,7 +523,7 @@ def test_mid_turn_summary_follows_current_user_in_projection_and_provider_wire(t
         assert [m.role for m in candidate.messages] == ["user", "context"]
         manager.commit_compaction(candidate)
         expected = candidate.messages
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         messages = RolloutContextManager(store).build(turn.turn_id)
         assert messages == expected
         model, _ = model_for()
@@ -537,7 +537,7 @@ def test_mid_turn_summary_follows_current_user_in_projection_and_provider_wire(t
 
 
 def test_old_automatic_user_text_is_summarized_not_pinned_forever(tmp_path: Path):
-    with RolloutStore(tmp_path / "facts.db") as store:
+    with RuntimeState.open_sync(tmp_path / "facts.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         old = store.start_turn(
             thread_id=thread.thread_id, user_message="old request details " * 400, binding_manifest={}
@@ -557,7 +557,7 @@ def test_old_automatic_user_text_is_summarized_not_pinned_forever(tmp_path: Path
 
 
 def test_summary_input_includes_recent_exchange_even_when_replayed_verbatim(tmp_path: Path):
-    with RolloutStore(tmp_path / "tail-source.db") as store:
+    with RuntimeState.open_sync(tmp_path / "tail-source.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         seed(

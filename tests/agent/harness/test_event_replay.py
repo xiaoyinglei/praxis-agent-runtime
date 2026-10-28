@@ -11,19 +11,21 @@ from pathlib import Path
 import pytest
 
 import agent_runtime.harness as harness
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
+from agent_runtime.harness.model_outputs import start_model_output
+from agent_runtime.modeling.events import ModelOutput
 from agent_runtime.streaming import events
 from agent_runtime.streaming import sink as stream_sinks
 from agent_runtime.streaming.events import StreamEvent
 
 
-def _reader(store: RolloutStore):
+def _reader(store: RuntimeState):
     reader_type = getattr(harness, "RolloutEventReader", None)
     assert reader_type is not None, "Harness must expose a durable event reader"
     return reader_type(store)
 
 
-def _start_turn(store: RolloutStore, workspace: Path, message: str) -> tuple[str, str]:
+def _start_turn(store: RuntimeState, workspace: Path, message: str) -> tuple[str, str]:
     thread = store.create_thread(workspace=workspace)
     turn = store.start_turn(
         thread_id=thread.thread_id,
@@ -36,7 +38,7 @@ def _start_turn(store: RolloutStore, workspace: Path, message: str) -> tuple[str
 def test_replay_returns_event_and_separate_thread_cursor(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, _turn_id = _start_turn(store, workspace, "canonical replay")
         replayed = _reader(store).read(thread_id)
 
@@ -52,7 +54,7 @@ def test_replay_returns_event_and_separate_thread_cursor(tmp_path: Path) -> None
 def test_thread_cursor_rejects_schema_epoch_mismatch(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, _turn_id = _start_turn(store, workspace, "schema cursor")
         reader = _reader(store)
         cursor = reader.read(thread_id)[-1].cursor
@@ -74,7 +76,7 @@ def test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         first_thread, _ = _start_turn(store, workspace, "first cursor")
         second_thread, _ = _start_turn(store, workspace, "second cursor")
         reader = _reader(store)
@@ -108,7 +110,7 @@ def test_thread_cursor_rejects_cross_thread_ahead_and_store_epoch_mismatch(
 def test_malformed_cursor_returns_actionable_full_resync_error(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, _turn_id = _start_turn(store, workspace, "malformed cursor")
 
         with pytest.raises(ValueError, match="full resync"):
@@ -118,7 +120,7 @@ def test_malformed_cursor_returns_actionable_full_resync_error(tmp_path: Path) -
 def test_global_tailer_accepts_only_after_record_id(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         first_thread, _ = _start_turn(store, workspace, "first global record")
         after_record_id = store.list_records(first_thread)[-1].record_id
         second_thread, _ = _start_turn(store, workspace, "second global record")
@@ -133,7 +135,7 @@ def test_global_tailer_accepts_only_after_record_id(tmp_path: Path) -> None:
 def test_global_tailer_rejects_negative_record_id(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         _start_turn(store, workspace, "negative global record")
 
         with pytest.raises(ValueError, match="non-negative"):
@@ -146,7 +148,7 @@ def test_global_tailer_fails_closed_on_incomplete_unknown_item_kind(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, _turn_id = _start_turn(store, workspace, "unknown global item")
         start = next(record for record in store.list_records(thread_id) if record.record_type == "item_started")
         payload = {"item_id": start.payload["item_id"], "kind": "future_internal_kind"}
@@ -209,7 +211,7 @@ async def test_lagging_passive_observer_detaches_without_blocking_control() -> N
 async def test_lagging_observer_does_not_change_another_observers_cursor(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread_id, turn_id = _start_turn(store, workspace, "observer cursor isolation")
         store.complete_turn(turn_id=turn_id, answer="durable answer")
         committed = _reader(store).read(thread_id)
@@ -248,7 +250,7 @@ def test_thread_cursor_replays_the_same_committed_tail_after_restart(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace, "persist events")
         initial = _reader(store).read(thread_id)
         acknowledged = initial[-1].cursor
@@ -258,7 +260,7 @@ def test_thread_cursor_replays_the_same_committed_tail_after_restart(
             after=acknowledged,
         )
 
-    with RolloutStore(database) as restarted:
+    with RuntimeState.open_sync(database) as restarted:
         replayed = _reader(restarted).read(
             thread_id,
             after=acknowledged,
@@ -299,7 +301,7 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace, "persist model channels")
         operation = store.prepare_model_operation(
             turn_id=turn_id,
@@ -310,17 +312,19 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
             request_ref={"request_id": f"{turn_id}:step:1"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id)
-        store.start_model_output_channel(
+        start_model_output(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            channel="reasoning",
+            output=ModelOutput("reasoning", "reasoning"),
         )
-        store.start_model_output_channel(
+        start_model_output(
+            store,
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            channel="plan",
+            output=ModelOutput("plan", "plan"),
         )
         assert store.complete_model_attempt(
             operation_id=operation.operation_id,
@@ -331,6 +335,9 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
             usage={"input_tokens": 4, "output_tokens": 3},
             reasoning_content="durable reasoning",
             plan_content="durable plan",
+            outputs=(ModelOutput("reasoning", "reasoning", "durable reasoning"),
+                     ModelOutput("plan", "plan", "durable plan"),
+                     ModelOutput("text", "text", "final answer")),
         )
         expected = [
             replay.event
@@ -340,7 +347,7 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
             in {events.TurnItemKind.REASONING, events.TurnItemKind.PLAN}
         ]
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         replayed = [
             replay.event
             for replay in _reader(reopened).read(thread_id)
@@ -368,7 +375,7 @@ def test_thread_cursors_are_independent_and_reject_the_wrong_thread(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         first_thread, first_turn = _start_turn(store, workspace, "first")
         second_thread, second_turn = _start_turn(store, workspace, "second")
         reader = _reader(store)
@@ -386,7 +393,7 @@ def test_thread_cursors_are_independent_and_reject_the_wrong_thread(
 def test_global_tailer_uses_record_id_not_thread_sequence(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         first_thread, _ = _start_turn(store, workspace, "first")
         first_record_id = store.list_records(first_thread)[-1].record_id
         second_thread, _ = _start_turn(store, workspace, "second")
@@ -403,7 +410,7 @@ def test_item_lifecycle_events_are_derived_from_one_committed_record_sequence(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace, "trace item lifecycle")
         store.complete_turn(turn_id=turn_id, answer="durable answer")
 
@@ -426,7 +433,7 @@ def test_post_commit_delivery_crash_does_not_lose_replayable_events(
     database = tmp_path / "rollout.sqlite3"
     attempted: list[int] = []
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace, "survive delivery crash")
         with pytest.raises(RuntimeError, match="injected delivery crash"):
             mutation = store.capture_mutation(
@@ -441,7 +448,7 @@ def test_post_commit_delivery_crash_does_not_lose_replayable_events(
         assert attempted == [committed_count - 2, committed_count - 1, committed_count]
         assert store.verify().valid is True
 
-    with RolloutStore(database) as restarted:
+    with RuntimeState.open_sync(database) as restarted:
         replayed = _reader(restarted).read(thread_id)
 
         assert len(replayed) == 4
@@ -451,7 +458,7 @@ def test_post_commit_delivery_crash_does_not_lose_replayable_events(
 
 
 def test_preexecution_tool_rejection_is_visible_and_replayable(tmp_path):
-    with RolloutStore(tmp_path / "rejected.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rejected.sqlite") as store:
         thread_id, turn_id = _start_turn(store, tmp_path, "explain with code")
         result = store.record_tool_result(turn_id=turn_id, operation_id=None, result={
             "tool_call_id": "rejected-call", "tool_name": "run_command", "is_error": True,

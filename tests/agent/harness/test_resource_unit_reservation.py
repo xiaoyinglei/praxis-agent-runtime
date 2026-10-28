@@ -12,11 +12,11 @@ import httpx
 import pytest
 
 from agent_runtime.harness.events import RolloutEventReader
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 
 
 def _turn(database: Path, workspace: Path) -> str:
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         return store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={}).turn_id
 
@@ -24,11 +24,11 @@ def _turn(database: Path, workspace: Path) -> str:
 def test_two_connections_atomically_reserve_only_two_units_and_reopen(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite"
     turn_id = _turn(database, tmp_path)
-    assert hasattr(RolloutStore, "reserve_resource_unit")
+    assert hasattr(RuntimeState, "reserve_resource_unit")
     barrier = Barrier(2)
 
     def reserve(count: int) -> list[dict[str, object] | str]:
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             barrier.wait(timeout=5)
             outcomes: list[dict[str, object] | str] = []
             for _ in range(count):
@@ -45,7 +45,7 @@ def test_two_connections_atomically_reserve_only_two_units_and_reopen(tmp_path: 
     successes = [outcome for outcome in outcomes if isinstance(outcome, dict)]
     assert sorted(outcome["used"] for outcome in successes) == [1, 2]
     assert outcomes.count("resource_limit_exceeded") == 1
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         usage = reopened.read_resource_usage(turn_id, "network_attempts", initial_used=99)
         assert usage["used"] == 2
         assert usage["remaining"] == 0
@@ -58,20 +58,20 @@ def test_two_connections_atomically_reserve_only_two_units_and_reopen(tmp_path: 
 def test_legacy_usage_is_only_applied_to_first_reservation_and_events_are_suppressed(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite"
     turn_id = _turn(database, tmp_path)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.read_resource_usage(turn_id, "network_attempts", initial_used=1)["used"] == 1
         mutation = store.capture_mutation(
             lambda: store.reserve_resource_unit(turn_id, "network_attempts", 3, initial_used=1)
         )
         assert mutation.value["used"] == 2
         assert RolloutEventReader(store).project_committed_batch(mutation.records) == ()
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         usage = reopened.reserve_resource_unit(turn_id, "network_attempts", 3, initial_used=200)
         assert usage["used"] == 3
         assert usage["remaining"] == 0
         assert reopened.read_item(usage["item_id"]).payload == {"resource": "network_attempts", "limit": 3, "used": 3}
         assert reopened.verify().valid
-    with RolloutStore(database, read_only=True) as reader:
+    with RuntimeState.open_sync(database, read_only=True) as reader:
         assert reader.read_resource_usage(turn_id, "network_attempts")["used"] == 3
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             reader.reserve_resource_unit(turn_id, "network_attempts", 3)
@@ -84,15 +84,15 @@ def test_committed_units_survive_process_exit_without_closing_store(tmp_path: Pa
 import os
 import sys
 from pathlib import Path
-from agent_runtime.harness.rollout import RolloutStore
-store = RolloutStore(Path(sys.argv[1]))
+from agent_runtime.harness.state import RuntimeState
+store = RuntimeState.open_sync(Path(sys.argv[1]))
 store.reserve_resource_unit(sys.argv[2], "network_attempts", 2)
 store.reserve_resource_unit(sys.argv[2], "network_attempts", 2)
 os._exit(17)
 """
     crashed = subprocess.run([sys.executable, "-c", program, str(database), turn_id], timeout=10, check=False)
     assert crashed.returncode == 17
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         assert reopened.read_resource_usage(turn_id, "network_attempts")["used"] == 2
         assert reopened.verify().valid
 
@@ -104,7 +104,7 @@ os._exit(17)
 def test_invalid_reservations_do_not_append_records(tmp_path: Path, resource: str, limit: int, initial: int) -> None:
     database = tmp_path / "rollout.sqlite"
     turn_id = _turn(database, tmp_path)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         before = store.list_items(turn_id)
         with pytest.raises(ValueError):
             store.reserve_resource_unit(turn_id, resource, limit, initial_used=initial)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agent_runtime.harness import CompletionProposal, RolloutStore
+from agent_runtime.harness import CompletionProposal, RuntimeState
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.verification import classify_tool_verification
 
@@ -15,7 +15,7 @@ _FORGED_VERIFICATION_COMMANDS = (
 
 
 def _commit_tool_result(
-    store: RolloutStore,
+    store: RuntimeState,
     *,
     turn_id: str,
     call_id: str,
@@ -105,7 +105,7 @@ def _commit_tool_result(
         )
 
 
-def _proposal(store: RolloutStore, turn_id: str) -> CompletionProposal:
+def _proposal(store: RuntimeState, turn_id: str) -> CompletionProposal:
     item = store.record_final_proposal(turn_id=turn_id, answer="done")
     turn = store.read_turn(turn_id)
     return CompletionProposal(
@@ -121,7 +121,7 @@ def test_model_or_unlinked_tool_cannot_forge_completion_evidence(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="change and verify",
@@ -157,7 +157,7 @@ def test_verification_must_happen_after_the_latest_workspace_change(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "module.py"
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="change and verify",
@@ -224,7 +224,7 @@ def test_command_text_markers_cannot_forge_verification_evidence(
     workspace.mkdir()
     target = workspace / "module.py"
     target.write_text("value = 1\n", encoding="utf-8")
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="change and verify",
@@ -278,7 +278,7 @@ def test_targeted_read_can_verify_the_same_file_but_not_an_unrelated_file(
     workspace.mkdir()
     target = workspace / "module.py"
     unrelated = workspace / "notes.txt"
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="replace the exact text and verify it",
@@ -355,7 +355,7 @@ def test_directly_running_a_pytest_file_is_rejected_with_actionable_feedback(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "module.py"
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="change and verify",
@@ -405,7 +405,7 @@ def test_valid_data_inspection_verifies_the_changed_artifact(tmp_path: Path) -> 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "summary.json"
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=workspace).thread_id,
             user_message="create and verify data artifact",
@@ -473,7 +473,7 @@ def test_inline_python_source_alone_does_not_attest_assertion_execution() -> Non
 
 
 def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="run command",
             binding_manifest={"completion_policy": {"revision": "completion-v2", "require_workspace_change": False}},
@@ -501,7 +501,7 @@ def test_live_command_must_be_observed_terminal_before_completion(tmp_path):
 
 
 def test_acceptance_command_uses_linked_terminal_session_result(tmp_path):
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         turn = store.start_turn(
             thread_id=store.create_thread(workspace=tmp_path).thread_id, user_message="verify command",
             binding_manifest={"completion_policy": {

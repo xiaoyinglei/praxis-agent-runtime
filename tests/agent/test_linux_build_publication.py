@@ -286,7 +286,7 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
     from typer.testing import CliRunner
 
     from agent_runtime import Agent, cli
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
     from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
     class BuildOnce(PatchThenAnswerModel):
@@ -326,14 +326,14 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
         runner = CliRunner()
         runner.invoke(cli.agent_app, ["run", "Build", "--max-steps", "3", "--disable-workspace-mcp",
                                      "--non-interactive", "--rollout-db", str(database)])
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             turn = store.list_turns()[-1]
             assert turn.status == "paused"
         result = runner.invoke(cli.agent_app, ["recover", turn.turn_id, "--action", "allow_once",
                                               "--rollout-db", str(database)])
         assert result.exit_code == 0, result.output
     assert (workspace / "built").read_text() == "artifact"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         results = [i.payload for i in store.list_items(turn.turn_id) if i.kind == "tool_result"]
         assert len(results) == 1

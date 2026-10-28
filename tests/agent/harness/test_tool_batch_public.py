@@ -17,7 +17,7 @@ from tests.agent.harness.test_tool_orchestrator import ToolThenAnswerModel
 
 
 class PublicBatchModel(ToolThenAnswerModel):
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         if not any(m.role == "tool" for m in self.requests[-1].messages):
             return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=(
                 HarnessToolCall(id="invalid", name="read_file", arguments={}),
@@ -66,9 +66,9 @@ def test_native_batch_uses_same_semantics_across_public_entrypoints_and_new_turn
     assert [m["tool_call_id"] for m in wire_before.payload["messages"] if m["role"] == "tool"] == [
         "invalid", "missing", "first", "second",
     ]
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
-    with RolloutStore(agent.checkpoint_db) as store:
+    with RuntimeState.open_sync(agent.checkpoint_db) as store:
         results = [i.payload for i in store.list_items(request.turn_id) if i.kind == "tool_result"]
         by_id = {r["tool_call_id"]: r for r in results}
         assert by_id["invalid"]["error_code"] == "invalid_arguments"

@@ -23,7 +23,8 @@ def _constructor_owners(name: str) -> set[Path]:
 
 
 def test_rollout_reducer_and_tool_runtime_each_have_one_behavior_owner() -> None:
-    assert _sources_containing("self._append_and_reduce(") == {Path("agent_runtime/harness/rollout.py")}
+    assert _sources_containing("self._append_and_reduce(") == {Path("agent_runtime/harness/state.py")}
+    assert _sources_containing("INSERT INTO rollout_records (") == {Path("agent_runtime/harness/rollout.py")}
     assert _constructor_owners("ToolExecutor") == {Path("agent_runtime/harness/tool_orchestrator.py")}
     assert _sources_containing("tool.run(arguments)") == {Path("agent_runtime/tools/executor.py")}
     assert _sources_containing("executor = TurnExecutor(") == {Path("agent_runtime/harness/session.py")}
@@ -38,7 +39,7 @@ def test_session_owns_resources_and_turn_executor_borrows_them() -> None:
     assert "class StepContext:" in turn
     assert "self._stack = AsyncExitStack()" in session
     assert "self._active_turn_lock = asyncio.Lock()" in session
-    assert "RolloutStore(" not in turn
+    assert "RuntimeState(" not in turn
     assert "AsyncExitStack" not in turn
     for removed in ("composition.py", "thread_manager.py", "facade.py"):
         assert not (RUNTIME / "harness" / removed).exists()

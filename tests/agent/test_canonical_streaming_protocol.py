@@ -10,16 +10,16 @@ import pytest
 import agent_runtime
 from agent_runtime.agent import Agent
 from agent_runtime.harness import (
-    HarnessModelDelta,
-    HarnessModelDeltaSink,
     HarnessModelRequest,
     HarnessModelResponse,
+    ModelEventSink,
     PreparedModelCall,
     RolloutEventReader,
-    RolloutStore,
+    RuntimeState,
 )
 from agent_runtime.streaming import events
 from agent_runtime.streaming import sink as stream_sinks
+from tests.agent.harness.model_fixtures import emit_response
 
 
 def test_v2_protocol_types_and_wire_values_are_public() -> None:
@@ -31,6 +31,8 @@ def test_v2_protocol_types_and_wire_values_are_public() -> None:
         "command",
         "reconciliation",
         "legacy_message",
+        "tool_call",
+        "refusal",
     }
     assert {member.value for member in events.ItemDeltaKind} == {
         "text",
@@ -39,6 +41,7 @@ def test_v2_protocol_types_and_wire_values_are_public() -> None:
         "tool_progress",
         "command_stdout",
         "command_stderr",
+        "tool_arguments",
     }
     assert {member.value for member in events.ItemStatus} == {
         "success",
@@ -240,7 +243,7 @@ async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> N
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         store.start_turn(
             thread_id=thread.thread_id,
@@ -255,7 +258,7 @@ async def test_raising_sink_cannot_rollback_committed_event(tmp_path: Path) -> N
         with pytest.raises(stream_sinks.EventChannelClosed, match="sink failed"):
             await dispatcher.emit(committed)
 
-    with RolloutStore(database) as reopened:
+    async with (await RuntimeState.open(database)) as reopened:
         replayed = RolloutEventReader(reopened).read(thread.thread_id)
         assert replayed[0].event == committed
         assert reopened.verify().valid is True
@@ -281,7 +284,7 @@ async def test_never_returning_sink_is_cancelled_within_grace() -> None:
 def test_harness_rollout_reader_returns_canonical_stream_events(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         store.start_turn(
             thread_id=thread.thread_id,
@@ -315,20 +318,14 @@ class _StaticHarnessModel:
         self,
         prepared: PreparedModelCall,
         *,
-        delta_sink: HarnessModelDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
         del prepared
-        if delta_sink is not None:
-            emitted = delta_sink(
-                HarnessModelDelta(channel="text", content="canonical answer")
-            )
-            if emitted is not None:
-                await emitted
-        return HarnessModelResponse(
-            text="canonical answer",
-            provider_response_id="response-v2",
-            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
-        )
+        response = HarnessModelResponse(text="canonical answer", provider_response_id="response-v2",
+                                        usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+        if event_sink is not None:
+            await emit_response(event_sink, response)
+        return response
 
     def ensure_available(self, binding, *, thread_id, turn_id):
         pass
@@ -351,7 +348,10 @@ async def test_harness_public_stream_uses_canonical_v2_items(tmp_path: Path) -> 
         require_workspace_change=False,
     )
 
-    assert [event.type for event in sink.events] == [
+    assert [event.type for event in sink.events if event.type in {
+        events.EventType.TURN_STARTED, events.EventType.ITEM_STARTED, events.EventType.ITEM_DELTA,
+        events.EventType.ITEM_COMPLETED, events.EventType.TURN_COMPLETED,
+    }] == [
         events.EventType.TURN_STARTED,
         events.EventType.ITEM_STARTED,
         events.EventType.ITEM_DELTA,

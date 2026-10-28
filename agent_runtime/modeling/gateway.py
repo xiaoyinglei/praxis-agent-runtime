@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import queue as thread_queue
 import threading
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import uuid4
 
@@ -26,6 +24,19 @@ from agent_runtime.modeling.contracts import (
     LLMStageBudget,
     LLMUsage,
     normalize_llm_usage,
+)
+from agent_runtime.modeling.events import (
+    ModelEventSink,
+    ModelOutput,
+    ModelOutputCompleted,
+    ModelOutputDelta,
+    ModelOutputKind,
+    ModelOutputStarted,
+    ModelResponseCompleted,
+    ModelResponseStarted,
+    ModelStreamState,
+    emit_model_event,
+    output_to_payload,
 )
 from agent_runtime.modeling.local_agent_wire import (
     parse_local_agent_response,
@@ -53,25 +64,12 @@ class StreamChunk:
     tool_id: str = ""
     stop_reason: str = ""  # "end_turn" | "tool_use" | "max_tokens"
     usage: LLMUsage | None = None
+    output_id: str = ""
+    output_kind: str = ""
+    block_index: int | None = None
+    provider_response_id: str | None = None
+    provider_data: Mapping[str, Any] | None = None
 
-
-class ProviderDeltaChannel(StrEnum):
-    """Provider-visible model output channels."""
-
-    TEXT = "text"
-    REASONING = "reasoning"
-    PLAN = "plan"
-
-
-@dataclass(frozen=True, slots=True)
-class ProviderDelta:
-    """One honest provider delta, before it becomes a Turn Item delta."""
-
-    channel: ProviderDeltaChannel
-    content: str
-
-
-ProviderDeltaSink = Callable[[ProviderDelta], None | Awaitable[None]]
 
 _PROVIDER_BRIDGE_MAXSIZE = 64
 _PROVIDER_BRIDGE_POLL_SECONDS = 0.005
@@ -86,6 +84,17 @@ class AgentModelResponse:
     provider_wire_hash: str
     serializer_revision: str
     wire_kind: str
+    outputs: tuple[ModelOutput, ...] = ()
+    provider_response_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.outputs:
+            object.__setattr__(self, "outputs", _outputs_from_turn(self.turn))
+        if len({output.output_id for output in self.outputs}) != len(self.outputs):
+            raise ValueError("model output IDs must be unique within a response")
+        text = "".join(output.content for output in self.outputs if output.kind in {"text", "refusal"})
+        reasoning = "".join(output.content for output in self.outputs if output.kind == "reasoning") or None
+        object.__setattr__(self, "turn", self.turn.model_copy(update={"text": text, "reasoning_content": reasoning}))
 
 
 class TokenAccounting(Protocol):
@@ -266,7 +275,7 @@ class LLMGateway:
         provider: str,
         supports_native_tools: bool,
         stream: bool = False,
-        delta_sink: ProviderDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
         ledger: AsyncBudgetLedger | None = None,
         lease_id: str | None = None,
         inherit_budget_ledger: bool = True,
@@ -323,18 +332,16 @@ class LLMGateway:
             )
             if effective_ledger is not None:
                 await effective_ledger.commit(effective_lease_id, usage.total_tokens)
-            if stream and turn.text and delta_sink is not None:
-                await _emit_provider_delta(
-                    delta_sink,
-                    ProviderDelta(ProviderDeltaChannel.TEXT, turn.text),
-                )
-            return AgentModelResponse(
+            response = AgentModelResponse(
                 turn=turn,
                 usage=usage,
                 provider_wire_hash=local_wire.provider_wire_hash,
                 serializer_revision=local_wire.serializer_revision,
                 wire_kind=provider,
             )
+            if stream:
+                await _emit_complete_model_response(event_sink, response)
+            return response
 
         wire = serialize_openai_request(request)
         payload = _plain_wire_mapping(wire.payload)
@@ -364,95 +371,45 @@ class LLMGateway:
                 quota_model=request.settings.model,
                 kwargs=provider_kwargs,
             )
-            text = ""
-            reasoning_content = ""
-            calls: list[ToolCall] = []
-            active_tool_id = ""
-            tool_names: dict[str, str] = {}
-            tool_arguments: dict[str, str] = {}
-            completed_tool_ids: set[str] = set()
-            stop_reason = "unknown"
-            final_usage: LLMUsage | None = None
+            assembled = _ModelChunkAssembler(event_sink)
             async for chunk in chunks:
-                if chunk.type == "text_delta":
-                    text += chunk.content
-                    if delta_sink is not None:
-                        await _emit_provider_delta(
-                            delta_sink,
-                            ProviderDelta(
-                                ProviderDeltaChannel.TEXT,
-                                chunk.content,
-                            ),
-                        )
-                elif chunk.type == "thinking_delta":
-                    reasoning_content += chunk.content
-                    if delta_sink is not None:
-                        await _emit_provider_delta(
-                            delta_sink,
-                            ProviderDelta(
-                                ProviderDeltaChannel.REASONING,
-                                chunk.content,
-                            ),
-                        )
-                elif chunk.type == "plan_delta":
-                    if delta_sink is not None:
-                        await _emit_provider_delta(
-                            delta_sink,
-                            ProviderDelta(
-                                ProviderDeltaChannel.PLAN,
-                                chunk.content,
-                            ),
-                        )
-                elif chunk.type == "tool_use_start":
-                    active_tool_id = chunk.tool_id or f"call_{len(tool_names) + 1}"
-                    tool_names[active_tool_id] = chunk.tool_name
-                    tool_arguments[active_tool_id] = ""
-                elif chunk.type == "tool_input_delta":
-                    tool_id = chunk.tool_id or active_tool_id
-                    if tool_id in tool_arguments:
-                        tool_arguments[tool_id] += chunk.content
-                elif chunk.type == "content_block_stop":
-                    tool_id = chunk.tool_id or active_tool_id
-                    tool_name = tool_names.get(tool_id, "")
-                    if not tool_name or tool_id in completed_tool_ids:
-                        continue
-                    completed_tool_ids.add(tool_id)
-                    if active_tool_id == tool_id:
-                        active_tool_id = ""
-                elif chunk.type == "message_stop":
-                    stop_reason = chunk.stop_reason or "unknown"
-                    final_usage = chunk.usage
-            if final_usage is None:
-                raise RuntimeError("canonical streaming call ended without usage")
-            # A block stop alone is not a completed model step. Wait for the
-            # authoritative terminal reason before decoding any tool fragments.
-            if stop_reason in {"tool_use", "tool_calls"}:
-                for tool_id, name in tool_names.items():
-                    if tool_id in completed_tool_ids:
-                        arguments, argument_error = decode_tool_arguments(tool_arguments[tool_id])
-                        calls.append(ToolCall(id=tool_id, name=name, input=arguments, argument_error=argument_error))
-            normalized_stop = (
-                StopReason.MAX_TOKENS
-                if stop_reason == "max_tokens"
-                else StopReason.TOOL_USE
-                if stop_reason in {"tool_use", "tool_calls"}
-                else StopReason.END_TURN
-                if stop_reason in {"end_turn", "stop"}
-                else StopReason.INCOMPLETE
-            )
+                await assembled.accept(chunk)
+            if assembled.usage is None or not assembled.state.completed:
+                raise RuntimeError("canonical streaming call ended without a terminal response and usage")
+            stop_reason = assembled.stop_reason
+            normalized_stop = _normalized_stop(stop_reason)
+            calls = [
+                ToolCall(
+                    id=cast(str, output.tool_call_id),
+                    name=cast(str, output.tool_name),
+                    input=output_to_payload(output)["arguments"],
+                    argument_error=output.argument_error,
+                )
+                for output in assembled.state.outputs
+                if output.kind == "tool_call"
+                and output.arguments is not None
+                and normalized_stop is StopReason.TOOL_USE
+            ]
             turn = ToolUseResult(
                 tool_calls=calls,
-                text=text,
-                reasoning_content=reasoning_content or None,
+                text="".join(
+                    output.content for output in assembled.state.outputs if output.kind in {"text", "refusal"}
+                ),
+                reasoning_content="".join(
+                    output.content for output in assembled.state.outputs if output.kind == "reasoning"
+                )
+                or None,
                 stop_reason=normalized_stop,
                 raw_stop_reason=stop_reason,
             )
             return AgentModelResponse(
                 turn=turn,
-                usage=final_usage,
+                usage=assembled.usage,
                 provider_wire_hash=wire.provider_wire_hash,
                 serializer_revision=wire.serializer_revision,
                 wire_kind="openai",
+                outputs=assembled.state.outputs,
+                provider_response_id=assembled.state.provider_response_id,
             )
 
         accounted_prompt = wire.serialized_json
@@ -508,6 +465,8 @@ class LLMGateway:
             provider_wire_hash=wire.provider_wire_hash,
             serializer_revision=wire.serializer_revision,
             wire_kind="openai",
+            outputs=_outputs_from_chat_response(provider_result.value, turn),
+            provider_response_id=_provider_field(provider_result.value, "id"),
         )
 
     async def agenerate_text(
@@ -1107,13 +1066,255 @@ def _render_messages_as_prompt(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-async def _emit_provider_delta(
-    sink: ProviderDeltaSink,
-    delta: ProviderDelta,
-) -> None:
-    emitted = sink(delta)
-    if inspect.isawaitable(emitted):
-        await emitted
+def _normalized_stop(stop_reason: str) -> StopReason:
+    return (
+        StopReason.MAX_TOKENS if stop_reason in {"max_tokens", "length"}
+        else StopReason.TOOL_USE if stop_reason in {"tool_use", "tool_calls"}
+        else StopReason.END_TURN if stop_reason in {"end_turn", "stop"}
+        else StopReason.INCOMPLETE
+    )
+
+
+def _provider_field(value: object, name: str, default: Any = None) -> Any:
+    return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+
+def _outputs_from_chat_response(raw: object, turn: ToolUseResult) -> tuple[ModelOutput, ...]:
+    """Preserve available Chat output objects, including unexecuted tool input."""
+    choices = _provider_field(raw, "choices", ())
+    message = _provider_field(choices[0], "message")
+    outputs = []
+    if turn.reasoning_content:
+        opaque = _provider_field(message, "reasoning_details")
+        outputs.append(ModelOutput("reasoning", "reasoning", turn.reasoning_content,
+                                   provider_data={"reasoning_details": opaque} if opaque is not None else {}))
+    if turn.text:
+        outputs.append(ModelOutput("text", "text", turn.text))
+    refusal = _provider_field(message, "refusal")
+    if isinstance(refusal, str) and refusal:
+        outputs.append(ModelOutput("refusal", "refusal", refusal))
+    for index, raw_call in enumerate(_provider_field(message, "tool_calls", ()) or (), start=1):
+        function = _provider_field(raw_call, "function")
+        call_id = _provider_field(raw_call, "id") or f"call_{index}"
+        name = _provider_field(function, "name", "")
+        raw_arguments = _provider_field(function, "arguments", "{}")
+        arguments, error = decode_tool_arguments(raw_arguments)
+        content = raw_arguments if isinstance(raw_arguments, str) else json.dumps(raw_arguments, ensure_ascii=False)
+        outputs.append(
+            ModelOutput(
+                f"tool:{call_id}",
+                "tool_call",
+                content,
+                tool_call_id=call_id,
+                tool_name=name,
+                arguments=arguments,
+                argument_error=error,
+            )
+        )
+    return tuple(outputs)
+
+
+def _outputs_from_turn(turn: ToolUseResult) -> tuple[ModelOutput, ...]:
+    """One aggregate object per available flat field; no invented boundaries."""
+    outputs = []
+    if turn.reasoning_content:
+        outputs.append(ModelOutput("reasoning", "reasoning", turn.reasoning_content))
+    if turn.text:
+        outputs.append(ModelOutput("text", "text", turn.text))
+    for call in turn.tool_calls:
+        outputs.append(
+            ModelOutput(
+                f"tool:{call.id}",
+                "tool_call",
+                json.dumps(call.input, ensure_ascii=False),
+                tool_call_id=call.id,
+                tool_name=call.name,
+                arguments=call.input,
+                argument_error=call.argument_error,
+            )
+        )
+    return tuple(outputs)
+
+
+def _response_terminal(response: AgentModelResponse) -> ModelResponseCompleted:
+    incomplete = response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+    return ModelResponseCompleted(
+        provider_response_id=response.provider_response_id,
+        usage=response.usage.model_dump(mode="json"),
+        stop_reason=response.turn.raw_stop_reason or response.turn.stop_reason.value,
+        status="incomplete" if incomplete else "completed",
+        incomplete_reason=(
+            "max_output_tokens"
+            if response.turn.stop_reason is StopReason.MAX_TOKENS
+            else response.turn.raw_stop_reason or "unknown"
+        )
+        if incomplete
+        else None,
+    )
+
+
+async def _emit_complete_model_response(sink: ModelEventSink | None, response: AgentModelResponse) -> None:
+    await emit_model_event(sink, ModelResponseStarted(response.provider_response_id))
+    for output in response.outputs:
+        await emit_model_event(sink, ModelOutputStarted(replace(output, content="", arguments=None)))
+        if output.content:
+            await emit_model_event(sink, ModelOutputDelta(output.output_id, output.delta_kind, output.content))
+        await emit_model_event(sink, ModelOutputCompleted(output))
+    await emit_model_event(sink, _response_terminal(response))
+
+
+class _ModelChunkAssembler:
+    """Translate provider chunks into one validated, ordered model stream."""
+
+    def __init__(self, sink: ModelEventSink | None) -> None:
+        self.sink = sink
+        self.state = ModelStreamState()
+        self.usage: LLMUsage | None = None
+        self.stop_reason = "unknown"
+        self._blocks: dict[int, str] = {}
+        self._tool_outputs: dict[str, str] = {}
+        self._active: str | None = None
+        self._active_tool: str | None = None
+        self._closed: set[str] = set()
+
+    async def _emit(self, event: Any) -> None:
+        self.state.accept(event)
+        await emit_model_event(self.sink, event)
+
+    def _get(self, output_id: str) -> ModelOutput:
+        return next(output for output in self.state.outputs if output.output_id == output_id)
+
+    def _identity(self, chunk: StreamChunk, kind: str) -> str:
+        references = [chunk.output_id] if chunk.output_id else []
+        if chunk.block_index is not None and chunk.block_index in self._blocks:
+            references.append(self._blocks[chunk.block_index])
+        if chunk.tool_id in self._tool_outputs:
+            references.append(self._tool_outputs[chunk.tool_id])
+        if len(set(references)) > 1:
+            raise ValueError("provider output identity references disagree")
+        if references:
+            return references[0]
+        if chunk.block_index is not None:
+            return f"block:{chunk.block_index}"
+        if chunk.tool_id:
+            return f"tool:{chunk.tool_id}"
+        if kind == "tool_call" and self._active_tool is not None:
+            return self._active_tool
+        candidate = kind
+        existing = {output.output_id for output in self.state.outputs}
+        index = 1
+        while candidate in self._closed:
+            index += 1
+            candidate = f"{kind}:{index}"
+        return candidate if candidate in existing or kind != "tool_call" else f"tool:{len(existing) + 1}"
+
+    async def _start(self, chunk: StreamChunk, kind: str) -> str:
+        output_id = self._identity(chunk, kind)
+        existing = {output.output_id for output in self.state.outputs}
+        if output_id not in existing:
+            await self._emit(
+                ModelOutputStarted(
+                    ModelOutput(
+                        output_id,
+                        cast(ModelOutputKind, kind),
+                        tool_call_id=(chunk.tool_id or output_id) if kind == "tool_call" else None,
+                        tool_name=chunk.tool_name if kind == "tool_call" else None,
+                        provider_data=chunk.provider_data or {},
+                    )
+                )
+            )
+        elif output_id in self._closed:
+            raise ValueError("provider reused a completed output identity")
+        elif self._get(output_id).kind != kind:
+            raise ValueError("provider output kind changed")
+        if chunk.block_index is not None:
+            self._blocks[chunk.block_index] = output_id
+        self._active = output_id
+        if kind == "tool_call":
+            call_id = self._get(output_id).tool_call_id
+            if call_id is not None:
+                self._tool_outputs[call_id] = output_id
+            self._active_tool = output_id
+        return output_id
+
+    async def _finish(self, output_id: str, *, complete_tool: bool) -> None:
+        output = self._get(output_id)
+        if output.kind == "tool_call" and complete_tool:
+            arguments, error = decode_tool_arguments(output.content)
+            output = replace(output, arguments=arguments, argument_error=error)
+        await self._emit(ModelOutputCompleted(output))
+        self._closed.add(output_id)
+        if self._active_tool == output_id:
+            self._active_tool = None
+
+    async def accept(self, chunk: StreamChunk) -> None:
+        if not self.state.started:
+            await self._emit(ModelResponseStarted(chunk.provider_response_id))
+        if chunk.provider_response_id:
+            if self.state.provider_response_id and self.state.provider_response_id != chunk.provider_response_id:
+                raise ValueError("provider changed response identity")
+            self.state.provider_response_id = chunk.provider_response_id
+        kinds = {
+            "text_delta": "text",
+            "thinking_delta": "reasoning",
+            "reasoning_summary_delta": "reasoning_summary",
+            "plan_delta": "plan",
+            "refusal_delta": "refusal",
+        }
+        if chunk.type in kinds:
+            kind = kinds[chunk.type]
+            output_id = await self._start(chunk, kind)
+            await self._emit(ModelOutputDelta(output_id, self._get(output_id).delta_kind, chunk.content))
+        elif chunk.type in {"content_block_start", "output_start", "tool_use_start"}:
+            kind = "tool_call" if chunk.type == "tool_use_start" or chunk.tool_name else chunk.output_kind or "text"
+            output_id = await self._start(chunk, kind)
+            if chunk.content:
+                await self._emit(ModelOutputDelta(output_id, self._get(output_id).delta_kind, chunk.content))
+        elif chunk.type == "tool_input_delta":
+            output_id = self._identity(chunk, "tool_call")
+            await self._emit(ModelOutputDelta(output_id, "tool_arguments", chunk.content))
+        elif chunk.type == "signature_delta":
+            signature_output_id = chunk.output_id or (
+                self._blocks.get(chunk.block_index) if chunk.block_index is not None else self._active
+            )
+            if signature_output_id is None:
+                raise ValueError("signature delta has no active output")
+            await self._emit(ModelOutputDelta(signature_output_id, "signature", chunk.content))
+        elif chunk.type in {"content_block_stop", "output_stop"}:
+            stopping_output_id = (
+                self._identity(chunk, "tool_call")
+                if chunk.output_id or chunk.block_index is not None or chunk.tool_id
+                else self._active_tool or self._active
+            )
+            if stopping_output_id is None:
+                raise ValueError("provider output stop has no active output")
+            await self._finish(stopping_output_id, complete_tool=True)
+        elif chunk.type == "message_stop":
+            self.stop_reason = chunk.stop_reason or "unknown"
+            self.usage = chunk.usage
+            if self.usage is None:
+                raise RuntimeError("canonical streaming call ended without usage")
+            for output in self.state.outputs:
+                if output.output_id not in self._closed:
+                    await self._finish(output.output_id, complete_tool=False)
+            incomplete = _normalized_stop(self.stop_reason) in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+            await self._emit(
+                ModelResponseCompleted(
+                    provider_response_id=self.state.provider_response_id,
+                    usage=self.usage.model_dump(mode="json"),
+                    stop_reason=self.stop_reason,
+                    status="incomplete" if incomplete else "completed",
+                    incomplete_reason=(
+                        "max_output_tokens"
+                        if _normalized_stop(self.stop_reason) is StopReason.MAX_TOKENS
+                        else self.stop_reason
+                    )
+                    if incomplete
+                    else None,
+                )
+            )
+        elif chunk.type not in {"message_start", "response_start"}:
+            raise ValueError(f"unsupported provider chunk type: {chunk.type}")
 
 
 def _request_provider_stream_cancel(generator: object) -> None:
@@ -1232,9 +1433,6 @@ __all__ = [
     "LLMGateway",
     "LLMGatewayError",
     "LLMToolCallValidationError",
-    "ProviderDelta",
-    "ProviderDeltaChannel",
-    "ProviderDeltaSink",
     "StreamChunk",
     "current_llm_budget_ledger",
     "llm_budget_scope",

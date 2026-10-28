@@ -14,7 +14,7 @@ from agent_runtime.harness import (
     HarnessModelResponse,
     PreparedModelCall,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     TurnExecutor,
 )
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item
@@ -23,7 +23,7 @@ from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=thread.thread_id,
@@ -52,7 +52,7 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -67,7 +67,7 @@ def test_context_manager_rejects_an_oversized_item_before_provider_serialization
 def test_context_manager_enforces_total_bytes_and_message_count(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -96,7 +96,7 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -143,7 +143,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
         async def dispatch(
             self,
             prepared: PreparedModelCall,
-         *, delta_sink: object = None) -> HarnessModelResponse:
+         *, event_sink: object = None) -> HarnessModelResponse:
             del prepared
             self.dispatch_calls += 1
             raise AssertionError("oversized context must not reach provider I/O")
@@ -153,7 +153,7 @@ async def test_context_budget_failure_fails_turn_without_calling_model(
             del proposal
             return CompletionDecision(action="accept", reason="accepted")
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         model = NeverCalledModel()
         result = await TurnExecutor(
@@ -186,7 +186,7 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         "unresolved_work": ["run full suite"],
         "uncertain_side_effects": [],
     }
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=thread.thread_id,
@@ -239,7 +239,7 @@ def test_budget_compaction_is_durable_and_preserves_user_constraints_as_data(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         first = store.start_turn(
             thread_id=thread.thread_id,
@@ -278,7 +278,7 @@ def test_compaction_requires_a_prefix_and_explicit_critical_fact_categories(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -311,7 +311,7 @@ def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Pat
     from agent_runtime.harness.model_adapter import _model_messages
 
     db = tmp_path / "reasoning.sqlite"
-    with RolloutStore(db) as store:
+    with RuntimeState.open_sync(db) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="inspect", binding_manifest={})
         operation = store.prepare_model_operation(
@@ -325,7 +325,7 @@ def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Pat
             reasoning_content="Inspect the selected file.",
             tool_calls=({"id": "call", "name": "read_file", "arguments": {"path": "main.py"}},),
         )
-    with RolloutStore(db) as store:
+    with RuntimeState.open_sync(db) as store:
         messages = RolloutContextManager(store).build(turn.turn_id)
         assistant = _model_messages(messages)[-1]
         assert assistant.reasoning_content == "Inspect the selected file."

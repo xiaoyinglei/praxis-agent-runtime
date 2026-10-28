@@ -1103,7 +1103,7 @@ class TerminalChatApp:
         ]
 
     async def prompt(self, *, approval: bool = False) -> str:
-        self._refresh_inputs()
+        await self._refresh_inputs()
         if not approval:
             await self.flush_scrollback()
         self.status = "等待确认" if approval else "就绪"
@@ -1123,7 +1123,7 @@ class TerminalChatApp:
         self.status = "工作中"
         async def refresh() -> None:
             while True:
-                self._refresh_inputs()
+                await self._refresh_inputs()
                 self.invalidate()
                 await asyncio.sleep(1)
         refresh_task = asyncio.create_task(refresh())
@@ -1132,7 +1132,7 @@ class TerminalChatApp:
         finally:
             if self._input_tasks:
                 await asyncio.gather(*tuple(self._input_tasks))
-            self._refresh_inputs()
+            await self._refresh_inputs()
             refresh_task.cancel()
             with suppress(asyncio.CancelledError):
                 await refresh_task
@@ -1157,20 +1157,22 @@ class TerminalChatApp:
             block = self.view._add(Block("notice"))
             block.append("补充已接收 · 等待应用\n")
             self._input_receipts[identity] = block
-            self._refresh_inputs()
+            await self._refresh_inputs()
             if self._approval is not None:
                 state = self._approval
                 if not state.future.done():
                     state.pressed = None
                     state.future.set_result("continue")
 
-    def _refresh_inputs(self) -> None:
+    async def _refresh_inputs(self) -> None:
         if self.input_status is None:
             return
         for identity, block in tuple(self._input_receipts.items()):
             try:
-                status = self.input_status(identity)
+                status = await asyncio.to_thread(self.input_status, identity)
             except (KeyError, RuntimeError):
+                continue
+            if self._input_receipts.get(identity) is not block:
                 continue
             if status == "pending":
                 continue

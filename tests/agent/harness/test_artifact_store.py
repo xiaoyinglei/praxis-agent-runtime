@@ -8,14 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 
 
 class InjectedArtifactCrashError(RuntimeError):
     pass
 
 
-def _turn(store: RolloutStore, workspace: Path) -> str:
+def _turn(store: RuntimeState, workspace: Path) -> str:
     thread = store.create_thread(workspace=workspace)
     return store.start_turn(
         thread_id=thread.thread_id,
@@ -46,7 +46,7 @@ def test_artifact_write_before_reference_survives_every_crash_boundary(
         if observed == phase:
             raise InjectedArtifactCrashError(phase)
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn_id = _turn(store, workspace)
         with pytest.raises(InjectedArtifactCrashError, match=phase):
             store.commit_artifact(
@@ -57,7 +57,7 @@ def test_artifact_write_before_reference_survives_every_crash_boundary(
                 fault_injector=crash,
             )
 
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         artifacts = reopened.list_artifacts(turn_id)
         assert bool(artifacts) is committed
         if committed:
@@ -94,12 +94,12 @@ def test_fresh_process_crash_never_leaves_a_record_pointing_to_partial_blob(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn_id = _turn(store, workspace)
     script = """
 import os
 from pathlib import Path
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 
 database = Path(os.environ["ARTIFACT_TEST_DATABASE"])
 turn_id = os.environ["ARTIFACT_TEST_TURN"]
@@ -109,7 +109,7 @@ def crash(observed: str) -> None:
     if observed == phase:
         os._exit(97)
 
-with RolloutStore(database) as store:
+with RuntimeState.open_sync(database) as store:
     store.commit_artifact(
         turn_id=turn_id,
         content=b"fresh process artifact",
@@ -133,7 +133,7 @@ with RolloutStore(database) as store:
     )
 
     assert completed.returncode == 97, completed.stderr
-    with RolloutStore(database) as reopened:
+    with RuntimeState.open_sync(database) as reopened:
         artifacts = reopened.list_artifacts(turn_id)
         assert bool(artifacts) is committed
         assert reopened.verify().valid is True
@@ -149,7 +149,7 @@ def test_corrupt_referenced_artifact_fails_verify_and_blocks_dispatch(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn_id = _turn(store, workspace)
         artifact = store.commit_artifact(
             turn_id=turn_id,
@@ -197,7 +197,7 @@ def test_corrupt_referenced_artifact_fails_verify_and_blocks_dispatch(
 def test_tool_result_cannot_reference_an_unknown_artifact(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn_id = _turn(store, workspace)
         with pytest.raises(RuntimeError, match="unknown artifact"):
             store.record_tool_result(

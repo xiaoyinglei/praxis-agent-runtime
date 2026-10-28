@@ -106,10 +106,10 @@ class CommandModel:
         from tests.agent.harness.test_approval_resume import WriteThenAnswerModel
 
         class Model(WriteThenAnswerModel):
-            async def dispatch(self, prepared, *, delta_sink=None):
-                response = await super().dispatch(prepared, delta_sink=delta_sink)
+            async def dispatch(self, prepared, *, event_sink=None):
+                response = await super().dispatch(prepared, event_sink=event_sink)
                 if response.tool_calls:
-                    return replace(response, tool_calls=(HarnessToolCall(
+                    return replace(response, outputs=(), tool_calls=(HarnessToolCall(
                         id="command-call", name=tool_name, arguments=arguments,
                     ),))
                 return response
@@ -208,14 +208,14 @@ async def test_auto_edit_performs_real_file_io(tmp_path):
 @pytest.mark.anyio
 async def test_public_sdk_mode_reaches_real_tool_executor(tmp_path, monkeypatch):
     from agent_runtime import Agent
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "public.sqlite3",
                   model_session_path=None, enable_workspace_mcp=False, approval_mode="auto")
     monkeypatch.setattr(agent, "_model_factory", lambda: CommandModel({"command": "printf hello"}))
     result = await agent.run("run bounded command")
     assert result.status == "done"
-    with RolloutStore(agent.checkpoint_db) as store:
+    async with (await RuntimeState.open(agent.checkpoint_db)) as store:
         [operation] = store.list_tool_operations(result.turn_id)
         assert operation.status == "succeeded"
         assert store.read_turn(result.turn_id).binding_manifest["tool_execution_policy"]["approval_mode"] == "auto"
@@ -552,9 +552,9 @@ async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_
     await cli._chat_facade_loop(agent, max_tokens_total=None, _ui=ui)
     assert ui.approvals == 1
     assert ui.approval_mode == agent.approval_mode == "full"
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
-    with RolloutStore(agent.checkpoint_db, read_only=True) as store:
+    async with (await RuntimeState.open(agent.checkpoint_db, read_only=True)) as store:
         turns = store.list_turns()
         [operation] = store.list_tool_operations(turns[0].turn_id)
         assert operation.status == "succeeded" and operation.attempt_count == 1
@@ -564,12 +564,12 @@ async def test_chat_f4_callback_updates_live_session_and_rechecks_without_extra_
 @pytest.mark.parametrize("before_reopen", [[], ["/permissions mode full"]])
 async def test_chat_reopen_does_not_inherit_another_chats_mode(tmp_path, monkeypatch, before_reopen):
     from agent_runtime import cli
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from tests.agent.test_agent_cli_resume import _result
     from tests.agent.test_cli_chat_commands import _model_spec, _SessionFactory
 
     database = tmp_path / "chat.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="saved ask chat",
                                 binding_manifest={"model_id": None})

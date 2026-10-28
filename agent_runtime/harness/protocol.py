@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 from agent_runtime.budget import ResourceUsage
-from agent_runtime.tools.tool import JsonValue, Tool
+from agent_runtime.modeling.events import (
+    ModelEventSink,
+    ModelOutput,
+    ModelOutputKind,
+    output_from_payload,
+    output_to_payload,
+)
+from agent_runtime.tools.tool import JsonValue, Tool, _thaw_json, json_schema_output
 
 DEFAULT_MAX_STEPS = 128
 
@@ -29,25 +36,42 @@ class HarnessMessage:
     tool_call_id: str | None = None
     reasoning_content: str | None = None
     context_category: Literal["continuation_summary"] | None = None
+    outputs: tuple[ModelOutput, ...] = ()
 
 
 def restore_harness_message(payload: Mapping[str, Any]) -> HarnessMessage:
-    """Decode saved messages; only old snapshots require presentation migration."""
-    category = payload.get("context_category")
-    if (
-        "context_category" not in payload
-        and payload["role"] == "context"
-        and payload["content"].startswith("Context compaction:\n")
-    ):
-        category = "continuation_summary"
+    """Restore saved message fields and nested tool calls."""
     return HarnessMessage(
         role=payload["role"],
         content=payload["content"],
         tool_calls=tuple(HarnessToolCall(**call) for call in payload.get("tool_calls", ())),
         tool_call_id=payload.get("tool_call_id"),
         reasoning_content=payload.get("reasoning_content"),
-        context_category=category,
+        context_category=payload.get("context_category"),
+        outputs=tuple(output_from_payload(output) for output in payload.get("outputs", ())),
     )
+
+
+def harness_tool_call_payload(call: HarnessToolCall) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "name": call.name,
+        "arguments": _thaw_json(call.arguments),
+        "argument_error": call.argument_error,
+    }
+
+
+def harness_message_payload(message: HarnessMessage) -> dict[str, Any]:
+    """Serialize immutable model snapshots without dataclass deep-copying mappings."""
+    return {
+        "role": message.role,
+        "content": message.content,
+        "tool_calls": [harness_tool_call_payload(call) for call in message.tool_calls],
+        "tool_call_id": message.tool_call_id,
+        "reasoning_content": message.reasoning_content,
+        "context_category": message.context_category,
+        "outputs": [output_to_payload(output) for output in message.outputs],
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,38 +120,101 @@ class PreparedModelCall:
 
 @dataclass(frozen=True, slots=True)
 class HarnessModelResponse:
-    text: str
-    provider_response_id: str | None
-    usage: Mapping[str, Any]
+    """An authoritative ordered output snapshot plus convenience projections.
+
+    The text constructor is retained for simple model implementations. When
+    outputs are supplied they own content and tool calls; conflicting nonempty
+    projections are rejected rather than silently creating two sources of truth.
+    """
+
+    text: str = ""
+    provider_response_id: str | None = None
+    usage: Mapping[str, Any] = field(default_factory=dict)
     tool_calls: tuple[HarnessToolCall, ...] = ()
     status: Literal["completed", "incomplete"] = "completed"
     incomplete_reason: str | None = None
     reasoning_content: str | None = None
     plan_content: str | None = None
+    outputs: tuple[ModelOutput, ...] = ()
+    stop_reason: str | None = None
 
     def __post_init__(self) -> None:
+        if self.status not in {"completed", "incomplete"}:
+            raise ValueError("unsupported model response status")
         if self.status == "completed" and self.incomplete_reason is not None:
             raise ValueError("completed model response cannot have an incomplete reason")
         if self.status == "incomplete" and not self.incomplete_reason:
             raise ValueError("incomplete model response requires a reason")
-        if self.reasoning_content is not None and not isinstance(
-            self.reasoning_content, str
-        ):
+        if self.reasoning_content is not None and not isinstance(self.reasoning_content, str):
             raise TypeError("model reasoning content must be a string or None")
         if self.plan_content is not None and not isinstance(self.plan_content, str):
             raise TypeError("model plan content must be a string or None")
+        if not self.outputs:
+            outputs = []
+            contents: tuple[tuple[ModelOutputKind, str | None], ...] = (
+                ("reasoning", self.reasoning_content),
+                ("plan", self.plan_content),
+                ("text", self.text),
+            )
+            for kind, content in contents:
+                if content:
+                    outputs.append(ModelOutput(output_id=kind, kind=kind, content=content))
+            for call in self.tool_calls:
+                outputs.append(
+                    ModelOutput(
+                        output_id=f"tool:{call.id}",
+                        kind="tool_call",
+                        tool_call_id=call.id,
+                        tool_name=call.name,
+                        arguments=call.arguments,
+                        argument_error=call.argument_error,
+                        content=json.dumps(_thaw_json(call.arguments), ensure_ascii=False),
+                    )
+                )
+            object.__setattr__(self, "outputs", tuple(outputs))
+        if len({output.output_id for output in self.outputs}) != len(self.outputs):
+            raise ValueError("model output IDs must be unique within a response")
+        text = "".join(output.content for output in self.outputs if output.kind in {"text", "refusal"})
+        reasoning = "".join(output.content for output in self.outputs if output.kind == "reasoning") or None
+        plan = "".join(output.content for output in self.outputs if output.kind == "plan") or None
+        calls = (
+            tuple(
+                HarnessToolCall(
+                    id=cast(str, output.tool_call_id),
+                    name=cast(str, output.tool_name),
+                    arguments=cast(Mapping[str, JsonValue], output.arguments),
+                    argument_error=output.argument_error,
+                )
+                for output in self.outputs
+                if output.kind == "tool_call" and output.arguments is not None
+            )
+            if self.status == "completed"
+            else ()
+        )
+        for name, value in (
+            ("text", text),
+            ("reasoning_content", reasoning),
+            ("plan_content", plan),
+            ("tool_calls", calls),
+        ):
+            supplied = getattr(self, name)
+            if name == "tool_calls":
 
+                def call_payload(calls: tuple[HarnessToolCall, ...]) -> JsonValue:
+                    return json_schema_output(
+                        None, cast(JsonValue, [harness_tool_call_payload(call) for call in calls])
+                    )
 
-@dataclass(frozen=True, slots=True)
-class HarnessModelDelta:
-    channel: Literal["text", "reasoning", "plan"]
-    content: str
-
-
-HarnessModelDeltaSink = Callable[
-    [HarnessModelDelta],
-    None | Awaitable[None],
-]
+                disagrees = (
+                    self.status == "completed"
+                    and bool(supplied)
+                    and call_payload(supplied) != call_payload(cast(tuple[HarnessToolCall, ...], value))
+                )
+            else:
+                disagrees = bool(supplied) and supplied != value
+            if disagrees:
+                raise ValueError(f"model response {name} conflicts with ordered outputs")
+            object.__setattr__(self, name, value)
 
 
 class HarnessModel(Protocol):
@@ -137,7 +224,7 @@ class HarnessModel(Protocol):
         self,
         prepared: PreparedModelCall,
         *,
-        delta_sink: HarnessModelDeltaSink | None = None,
+        event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse: ...
 
 
@@ -225,7 +312,8 @@ class ContextCompactionRequiredError(ContextBudgetExceededError):
         self.retained_tail_messages = retained_tail_messages
         super().__init__(
             "Committed context requires durable compaction before provider dispatch: "
-            f"{input_tokens} > {max_input_tokens} input tokens.", reason_code=reason_code
+            f"{input_tokens} > {max_input_tokens} input tokens.",
+            reason_code=reason_code,
         )
 
 

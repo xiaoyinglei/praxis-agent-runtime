@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.protocol import BoundHarnessModel
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.tools.tool import (
     CancellationMode,
     InterruptBehavior,
@@ -63,7 +63,7 @@ class _MemoryOutput(BaseModel):
     entries: list[MemoryEntry] = Field(max_length=MAX_MEMORY_ENTRIES)
 
 
-def memory_snapshot(store: RolloutStore, workspace: Path, *, navigation_only: bool = False) -> dict[str, Any]:
+def memory_snapshot(store: RuntimeState, workspace: Path, *, navigation_only: bool = False) -> dict[str, Any]:
     state = store.read_memory_state(workspace)
     entries = state["entries"]
     if navigation_only:
@@ -78,7 +78,7 @@ def memory_snapshot(store: RolloutStore, workspace: Path, *, navigation_only: bo
 
 
 def memory_context_revoked(
-    store: RolloutStore, workspace: Path,
+    store: RuntimeState, workspace: Path,
     previous: Mapping[str, Any] | None, current: Mapping[str, Any] | None,
 ) -> bool:
     """A new Turn cannot carry recalled data across a removal or opt-out.
@@ -98,14 +98,14 @@ def memory_context_revoked(
     return bool(removed or forgotten)
 
 
-def configure_memory(store: RolloutStore, workspace: Path, config: MemoryConfig) -> dict[str, Any]:
+def configure_memory(store: RuntimeState, workspace: Path, config: MemoryConfig) -> dict[str, Any]:
     state = store.read_memory_state(workspace)
     return store.commit_memory_state(workspace, expected_version=state["version"],
                                      state={**state, **config.model_dump(),
                                             "control_version": state.get("control_version", 0) + 1})
 
 
-def delete_memory(store: RolloutStore, workspace: Path, key: str,
+def delete_memory(store: RuntimeState, workspace: Path, key: str,
                   *, expected_version: int | None = None) -> dict[str, Any]:
     state = store.read_memory_state(workspace)
     if expected_version is not None and state["version"] != expected_version:
@@ -126,7 +126,7 @@ def delete_memory(store: RolloutStore, workspace: Path, key: str,
     return store.commit_memory_state(workspace, expected_version=state["version"], state=state)
 
 
-def _unresolved(store: RolloutStore, job: Mapping[str, Any]) -> bool:
+def _unresolved(store: RuntimeState, job: Mapping[str, Any]) -> bool:
     return any(op.status in {"running", "unknown"}
                for turn_id in job.get("turn_ids", []) for op in store.list_model_operations(turn_id))
 
@@ -158,7 +158,7 @@ def _fragments(record: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _source(
-    store: RolloutStore, workspace: Path, state: Mapping[str, Any], exclude: str | None,
+    store: RuntimeState, workspace: Path, state: Mapping[str, Any], exclude: str | None,
 ) -> tuple[str, str, list[dict[str, Any]], dict[str, Any], bool] | None:
     threads = sorted(store.list_threads(), key=lambda t: (
         record.committed_at_ms if (record := store.last_record(t.thread_id)) else 0))
@@ -226,7 +226,7 @@ def _source(
 
 
 async def update_memory(
-    store: RolloutStore, *, workspace: Path, model: BoundHarnessModel,
+    store: RuntimeState, *, workspace: Path, model: BoundHarnessModel,
     binding: Mapping[str, Any], exclude_thread_id: str | None = None,
     prepare_binding: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
@@ -367,7 +367,7 @@ async def update_memory(
             def start_stage() -> None:
                 nonlocal job
                 # Creation and the job's durable ownership link are one unit.
-                with store._transaction():
+                with store.persistence.transaction():
                     store.start_turn(
                         thread_id=thread.thread_id,
                         turn_id=turn_id,
@@ -594,7 +594,7 @@ def memory_navigation(snapshot: Mapping[str, Any], *, include_version: bool = Tr
     }, ensure_ascii=False)
 
 
-def create_memory_tool(store: RolloutStore) -> Tool:
+def create_memory_tool(store: RuntimeState) -> Tool:
     from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
 
     schema: Mapping[str, JsonValue] = {"type": "object", "properties": {

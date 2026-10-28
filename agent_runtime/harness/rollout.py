@@ -1,4 +1,4 @@
-"""Append-only rollout truth with rebuildable SQLite projections."""
+"""SQLite and immutable blob persistence, independent of runtime decisions."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import hashlib
 import json
-import math
 import os
 import sqlite3
 import threading
@@ -14,39 +13,42 @@ import time
 from collections.abc import AsyncGenerator, Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import wraps
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Literal, cast
+from typing import Any, Literal, Self, cast
 from uuid import uuid4
 
-from agent_runtime.budget import (
-    BudgetLimitExceededError,
-    BudgetLimits,
-    BudgetReservation,
-    BudgetState,
-    ReservationStatus,
-    ResourceUsage,
-    ensure_token_headroom,
-    normal_token_remaining,
-    resource_usage_from_model_usage,
+from agent_runtime.harness.records import (
+    ArtifactSnapshot,
+    CommittedMutation,
+    RolloutRecord,
+    VerificationReport,
 )
-from agent_runtime.budget import (
-    reserve as reserve_budget,
-)
-from agent_runtime.harness.protocol import ContextSourceChangedError
 from agent_runtime.harness.reducer import ProjectionState, apply_record
-from agent_runtime.planning import PlanStep
-from agent_runtime.streaming.events import (
-    derive_model_public_item_id,
-    derive_operation_public_item_id,
-    derive_plan_public_item_id,
-    derive_reconciliation_public_item_id,
-)
 
 _REDUCER_VERSION = 1
+_PROJECTIONS = {
+    "threads": ("thread_id", "rowid"),
+    "turns": ("turn_id", "rowid"),
+    "items": ("item_id", "sequence"),
+    "model_operations": ("operation_id", "rowid"),
+    "model_attempts": ("attempt_id", "generation"),
+    "budget_reservations": ("reservation_id", "rowid"),
+    "child_budget_allocations": ("allocation_id", "rowid"),
+    "tool_operations": ("operation_id", "rowid"),
+    "interactions": ("request_id", "rowid"),
+    "approvals": ("request_id", "rowid"),
+    "artifacts": ("artifact_id", "rowid"),
+    "rollout_records": ("record_id", "record_id"),
+}
+
+
+class StoreBusyError(RuntimeError):
+    """The owner has reached its admission capacity; no work was accepted."""
+
+
 _EVENT_REFERENCE_KEYS = {
     "item_started": "item_id",
     "item_completed": "item_id",
@@ -59,208 +61,6 @@ _EVENT_REFERENCE_KEYS = {
 }
 
 
-class TurnInputChangedError(RuntimeError):
-    """A response no longer covers the active Turn's received user input."""
-
-
-def _validate_resource_usage_input(resource: str, initial_used: int) -> None:
-    if not isinstance(resource, str) or not resource.strip() or len(resource) > 120:
-        raise ValueError("resource must be a non-empty name of at most 120 characters")
-    if type(initial_used) is not int or initial_used < 0:
-        raise ValueError("initial resource usage must be a non-negative integer")
-
-
-def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
-    return {
-        channel: derive_model_public_item_id(
-            turn_id=turn_id,
-            model_attempt_id=attempt_id,
-            channel=channel,
-        )
-        for channel in ("agent_message", "reasoning", "plan")
-    }
-
-
-def _model_channel_content(
-    content: Mapping[str, str] | None,
-) -> dict[str, str]:
-    if content is None:
-        return {}
-    allowed = {"agent_message", "reasoning", "plan"}
-    frozen: dict[str, str] = {}
-    for channel, value in content.items():
-        if channel not in allowed:
-            raise ValueError(f"unsupported model output channel: {channel}")
-        if not isinstance(value, str):
-            raise TypeError(f"model {channel} content must be a string")
-        frozen[channel] = value
-    return frozen
-
-
-class ResourceClaimConflictError(RuntimeError):
-    """Another running or unknown operation owns an incompatible resource."""
-
-
-@dataclass(frozen=True, slots=True)
-class ThreadSnapshot:
-    thread_id: str
-    workspace: str
-    parent_thread_id: str | None
-    fork_turn_id: str | None
-    active_turn_id: str | None
-    head_turn_id: str | None
-    head_version: int
-    settings: Mapping[str, Any]
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class TurnSnapshot:
-    turn_id: str
-    thread_id: str
-    status: str
-    terminal_reason_code: str | None
-    terminal_message: str | None
-    predecessor_turn_id: str | None
-    turn_index: int
-    binding_manifest: Mapping[str, Any]
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class ItemSnapshot:
-    item_id: str
-    thread_id: str
-    turn_id: str
-    sequence: int
-    kind: str
-    status: str
-    producer: str
-    payload: Mapping[str, Any]
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class RolloutRecord:
-    record_id: int
-    record_uuid: str
-    thread_id: str
-    turn_id: str | None
-    thread_sequence: int
-    record_type: str
-    payload_schema_version: int
-    producer: str
-    payload: Mapping[str, Any]
-    payload_hash: str
-    committed_at_ms: int
-
-
-@dataclass(frozen=True, slots=True)
-class CommittedMutation[T]:
-    """A mutation result paired with exactly its committed Rollout records."""
-
-    value: T
-    records: tuple[RolloutRecord, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class VerificationReport:
-    valid: bool
-    errors: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class ModelOperationSnapshot:
-    operation_id: str
-    thread_id: str
-    turn_id: str
-    status: str
-    active_attempt_id: str
-    generation: int
-    request_hash: str
-    context_hash: str
-    tool_hash: str
-    wire_hash: str
-    request_ref: Mapping[str, Any]
-    response_item_id: str | None
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class ModelAttemptSnapshot:
-    attempt_id: str
-    operation_id: str
-    generation: int
-    status: str
-    provider_response_id: str | None
-    usage: Mapping[str, Any]
-    claim_owner: str | None
-    lease_expires_at: float | None
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class ToolOperationSnapshot:
-    operation_id: str
-    thread_id: str
-    turn_id: str
-    tool_call_id: str
-    tool_name: str
-    arguments_digest: str
-    execution_revision: str
-    effects: tuple[str, ...]
-    resources: tuple[Mapping[str, Any], ...]
-    idempotent: bool
-    status: str
-    attempt_count: int
-    error_code: str | None
-    requires_reconciliation: bool
-    result_item_id: str | None
-    approval_request_id: str | None
-    claim_generation: int
-    fencing_token: str | None
-    claim_owner: str | None
-    lease_expires_at: float | None
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class InteractionSnapshot:
-    request_id: str
-    thread_id: str
-    turn_id: str
-    kind: str
-    status: str
-    version: int
-    operation_id: str | None
-    request: Mapping[str, Any]
-    response: Mapping[str, Any]
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class ApprovalSnapshot:
-    request_id: str
-    thread_id: str
-    turn_id: str
-    operation_id: str
-    status: str
-    scope: Mapping[str, Any]
-    applied_thread_sequence: int
-
-
-@dataclass(frozen=True, slots=True)
-class ArtifactSnapshot:
-    artifact_id: str
-    thread_id: str
-    turn_id: str
-    blob_sha256: str
-    size_bytes: int
-    media_type: str
-    name: str
-    applied_thread_sequence: int
-
-
 def _store_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
     """Keep complete synchronous operations on the connection's owning thread."""
 
@@ -268,48 +68,59 @@ def _store_operation[**P, T](method: Callable[P, T]) -> Callable[P, T]:
     def owned(*args: P.args, **kwargs: P.kwargs) -> T:
         store = args[0]
         assert isinstance(store, RolloutStore)
+        store._ensure_open()
         return store.run_sync(lambda: method(*args, **kwargs))
 
     return owned
 
 
 class RolloutStore:
-    """Own canonical records and update projections through one reducer.
+    """Own SQLite, append-only facts, projection I/O and immutable blob storage.
 
-    read_only uses SQLite mode=ro and rejects business/artifact mutations. SQLite
-    may create WAL/SHM protocol files while reading; active WAL commits stay visible.
+    No Turn, approval, budget or tool decisions live here. Use RuntimeState for
+    those operations. No-argument construction performs no I/O.
     """
 
-    def __init__(
-        self,
-        path: Path,
-        *,
-        read_only: bool = False,
-    ) -> None:
+    def __init__(self) -> None:
         self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
         self._owner_thread: int | None = None
         self._admission = threading.Lock()
         self._closing: Future[None] | None = None
+        self._initialized = False
+        self._pending_operations = 0
+        self._max_pending_operations = 128
+
+    @classmethod
+    def open_sync(cls, path: Path, *, read_only: bool = False, max_pending_operations: int = 128) -> Self:
+        """Open/migrate on the owner; reject use on an event-loop thread."""
         try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("use await RolloutStore.open(...) on an event-loop thread")
+        self = cls()
+        try:
+            self._set_capacity(max_pending_operations)
             self.run_sync(lambda: self._initialize(path, read_only=read_only))
         except BaseException:
             self.close()
             raise
+        self._initialized = True
+        return self
 
     @classmethod
-    async def open(cls, path: Path, *, read_only: bool = False) -> RolloutStore:
+    async def open(cls, path: Path, *, read_only: bool = False, max_pending_operations: int = 128) -> Self:
         """Open/migrate on the Store owner without blocking the caller's loop."""
-        self = cls.__new__(cls)
-        self._owner = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-store")
-        self._owner_thread = None
-        self._admission = threading.Lock()
-        self._closing = None
+        self = cls()
         try:
+            self._set_capacity(max_pending_operations)
             await self.run_async(lambda: self._initialize(path, read_only=read_only))
         except BaseException:
             # Cancellation still observes initialization before closing its resource.
             await self.aclose()
             raise
+        self._initialized = True
         return self
 
     def _initialize(self, path: Path, *, read_only: bool) -> None:
@@ -321,7 +132,9 @@ class RolloutStore:
         self._captured_commits: list[tuple[RolloutRecord, ...]] | None = None
         if read_only:
             self._connection = sqlite3.connect(
-                f"{self._path.resolve().as_uri()}?mode=ro", uri=True, isolation_level=None,
+                f"{self._path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
             )
         else:
             self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,8 +147,17 @@ class RolloutStore:
             self._connection.execute("PRAGMA foreign_keys = ON")
             self._connection.execute("PRAGMA journal_mode = WAL")
             self._create_schema()
+        self._columns = {
+            table: {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")} | {"rowid"}
+            for table in _PROJECTIONS
+        }
 
-    def __enter__(self) -> RolloutStore:
+    def _ensure_open(self) -> None:
+        if not self._initialized:
+            raise RuntimeError("RolloutStore is not opened; use open_sync(...) or await open(...)")
+
+    def __enter__(self) -> Self:
+        self._ensure_open()
         return self
 
     def __exit__(self, *_args: object) -> None:
@@ -343,10 +165,31 @@ class RolloutStore:
 
     def _submit[T](self, operation: Callable[[], T]) -> Future[T]:
         context = contextvars.copy_context()
+
+        def accepted() -> T:
+            try:
+                return context.run(operation)
+            finally:
+                with self._admission:
+                    self._pending_operations -= 1
+
         with self._admission:
             if self._closing is not None:
                 raise sqlite3.ProgrammingError("RolloutStore is closed")
-            return self._owner.submit(context.run, operation)
+            if self._pending_operations >= self._max_pending_operations:
+                raise StoreBusyError("RolloutStore operation capacity reached; no work was accepted")
+            self._pending_operations += 1
+            try:
+                future = self._owner.submit(accepted)
+            except BaseException:
+                self._pending_operations -= 1
+                raise
+        return future
+
+    def _set_capacity(self, value: int) -> None:
+        if type(value) is not int or value < 1:
+            raise ValueError("max_pending_operations must be a positive integer")
+        self._max_pending_operations = value
 
     def run_sync[T](self, operation: Callable[[], T]) -> T:
         """Blocking API; compose a complete query/transaction on the same owner.
@@ -419,132 +262,191 @@ class RolloutStore:
         """Stop admission and await the same drain/close barrier asynchronously."""
         await self._observe(self._begin_close())
 
-    async def __aenter__(self) -> RolloutStore:
+    async def __aenter__(self) -> Self:
+        self._ensure_open()
         return self
 
     async def __aexit__(self, *_args: object) -> None:
         await self.aclose()
 
-    @_store_operation
-    def read_memory_state(self, workspace: Path, *, version: int | None = None) -> dict[str, Any]:
-        """Read workspace memory; old/read-only databases need no schema migration."""
-        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        if version == 0:
-            return {"version": 0, "entries": [], "processed": {}, "deleted_keys": [],
-                    "deleted_sources": [], "use_memories": False, "generate_memories": False}
-        if version is not None and version > 0:
-            key += f":version:{version}"
-        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
-        if row is None:
-            if version is not None and version > 0:
-                raise KeyError("unknown workspace memory version")
-            return {"version": 0, "entries": [], "processed": {}, "deleted_keys": [],
-                    "deleted_sources": [], "use_memories": False, "generate_memories": False}
-        envelope = json.loads(row["value"])
-        state = envelope["state"]
-        if hashlib.sha256(_canonical_json(state).encode()).hexdigest() != envelope["sha256"]:
-            raise RuntimeError("workspace memory integrity mismatch")
-        return dict(state)
-
-    @_store_operation
-    def commit_memory_state(
-        self,
-        workspace: Path,
-        *,
-        expected_version: int,
-        state: Mapping[str, Any],
-        claim_owner: str | None = None,
-        job_thread_id: str | None = None,
-        job_state: Mapping[str, Any] | None = None,
-        job_revision: int | None = None,
-    ) -> dict[str, Any]:
-        """CAS commit; keep immutable versions for inspection and crash recovery."""
-        key = "memory:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        with self._transaction():
-            if claim_owner is not None:
-                self._assert_memory_claim(workspace, claim_owner)
-            if job_thread_id is not None and job_state is not None:
-                self.write_memory_job(workspace, job_thread_id, job_state, owner=claim_owner,
-                                      expected_revision=job_revision)
-            if self.read_memory_state(workspace)["version"] != expected_version:
-                raise ContextSourceChangedError("workspace memory changed before commit")
-            committed = _json_object({**state, "version": expected_version + 1}, field="memory state")
-            value = _canonical_json({"state": committed,
-                                     "sha256": hashlib.sha256(_canonical_json(committed).encode()).hexdigest()})
-            self._connection.execute("INSERT INTO store_metadata(key, value) VALUES (?, ?)",
-                                     (f"{key}:version:{expected_version + 1}", value))
-            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)", (key, value))
-        return committed
-
-    @_store_operation
-    def read_memory_jobs(self, workspace: Path) -> dict[str, Any]:
-        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
-        return {} if row is None else dict(json.loads(row["value"]))
-
-    @_store_operation
-    def write_memory_job(
-        self,
-        workspace: Path,
-        thread_id: str,
-        state: Mapping[str, Any],
-        *,
-        owner: str | None = None,
-        expected_revision: int | None = None,
-    ) -> dict[str, Any]:
-        key = "memory-jobs:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        with self._transaction():
-            if owner is not None:
-                self._assert_memory_claim(workspace, owner)
-            jobs = self.read_memory_jobs(workspace)
-            revision = jobs.get(thread_id, {}).get("revision", 0)
-            if expected_revision is not None and revision != expected_revision:
-                raise ContextSourceChangedError("memory job changed before commit")
-            job = _json_object({**state, "revision": revision + 1}, field="memory job")
-            jobs[thread_id] = job
-            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)",
-                                     (key, _canonical_json(jobs)))
-        return job
-
-    @_store_operation
-    def enqueue_memory_job(self, workspace: Path, thread_id: str) -> None:
-        with self._transaction():
-            if Path(self.read_thread(thread_id).workspace).resolve() != workspace.resolve():
-                raise ValueError("memory job belongs to a different workspace")
-            job = self.read_memory_jobs(workspace).get(thread_id, {})
-            if job.get("status") in {"pending", "running", "needs_reconciliation", "failed"}:
-                return
-            self.write_memory_job(workspace, thread_id, {"status": "pending", "turn_ids": []})
-
-    def _assert_memory_claim(self, workspace: Path, owner: str) -> None:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
-        claim = {} if row is None else json.loads(row["value"])
-        if claim.get("owner") != owner or claim.get("expires_at", 0) <= time.time():
-            raise ContextSourceChangedError("memory workspace lease is no longer owned")
-
-    @_store_operation
-    def claim_memory_job(self, workspace: Path, *, owner: str, now: float, lease_seconds: float) -> bool:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        with self._transaction():
-            row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
-            if row is not None and json.loads(row["value"])["expires_at"] > now:
-                return False
-            self._connection.execute("INSERT OR REPLACE INTO store_metadata(key, value) VALUES (?, ?)",
-                                     (key, _canonical_json({"owner": owner, "expires_at": now + lease_seconds})))
-        return True
-
-    @_store_operation
-    def release_memory_job(self, workspace: Path, *, owner: str) -> None:
-        key = "memory-job:" + hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()
-        with self._transaction():
-            row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
-            if row is not None and json.loads(row["value"])["owner"] == owner:
-                self._connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
-
-    def _assert_writable(self) -> None:
+    def assert_writable(self) -> None:
         if self._read_only:
             raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    @property
+    def path(self) -> Path:
+        self._ensure_open()
+        return self._path
+
+    def _selection(
+        self,
+        table: str,
+        where: Mapping[str, Any] | None,
+        payload_fields: Mapping[str, Any] | None = None,
+    ) -> tuple[str, list[Any]]:
+        if table not in _PROJECTIONS:
+            raise ValueError(f"unknown durable view: {table}")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for fields, is_payload in ((where or {}, False), (payload_fields or {}, True)):
+            for field, value in fields.items():
+                if is_payload:
+                    if table != "rollout_records" and table != "items":
+                        raise ValueError("payload lookup requires a fact or Item view")
+                    if not field.isidentifier():
+                        raise ValueError("invalid payload field")
+                    column = f"json_extract(payload_json, '$.{field}')"
+                else:
+                    if field not in self._columns[table]:
+                        raise ValueError(f"unknown durable field: {table}.{field}")
+                    column = field
+                if isinstance(value, tuple):
+                    clauses.append(f"{column} IN ({','.join('?' for _ in value)})" if value else "0")
+                    parameters.extend(value)
+                else:
+                    clauses.append(f"{column} IS ?")
+                    parameters.append(value)
+        return (" WHERE " + " AND ".join(clauses) if clauses else ""), parameters
+
+    @_store_operation
+    def rows(
+        self,
+        table: str,
+        *,
+        where: Mapping[str, Any] | None = None,
+        payload_fields: Mapping[str, Any] | None = None,
+        order_by: str | None = None,
+        newest: bool = False,
+        limit: int | None = None,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Read detached, decoded view rows. Equality/IN are the only filters.
+
+        This small fixed-schema primitive owns SQL and JSON representation.
+        Callers choose which facts matter and interpret their business state.
+        """
+        selection, parameters = self._selection(table, where, payload_fields)
+        order = order_by or _PROJECTIONS[table][1]
+        if order not in self._columns[table]:
+            raise ValueError(f"unknown ordering field: {table}.{order}")
+        sql = f"SELECT * FROM {table}{selection} ORDER BY {order}" + (" DESC" if newest else "")
+        if limit is not None:
+            if type(limit) is not int or limit < 1:
+                raise ValueError("view limit must be a positive integer")
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        return tuple(_decoded_row(row) for row in self._connection.execute(sql, parameters))
+
+    def first(self, table: str, **selection: Any) -> Mapping[str, Any] | None:
+        rows = self.rows(table, **{**selection, "limit": 1})
+        return rows[0] if rows else None
+
+    @_store_operation
+    def count(self, table: str, *, where: Mapping[str, Any] | None = None) -> int:
+        selection, parameters = self._selection(table, where)
+        return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}{selection}", parameters).fetchone()[0])
+
+    @_store_operation
+    def maximum(self, table: str, field: str, *, where: Mapping[str, Any] | None = None) -> int:
+        selection, parameters = self._selection(table, where)
+        if field not in self._columns[table]:
+            raise ValueError(f"unknown durable field: {table}.{field}")
+        return int(
+            self._connection.execute(
+                f"SELECT COALESCE(MAX({field}), 0) FROM {table}{selection}",
+                parameters,
+            ).fetchone()[0]
+        )
+
+    @_store_operation
+    def turn_with_workspace(self, turn_id: str) -> Mapping[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT turns.*, threads.workspace FROM turns JOIN threads USING(thread_id) WHERE turn_id = ?",
+            (turn_id,),
+        ).fetchone()
+        return _decoded_row(row) if row is not None else None
+
+    @_store_operation
+    def conversation_rows(self, thread_id: str, through_turn_index: int) -> tuple[Mapping[str, Any], ...]:
+        return tuple(
+            _decoded_row(row)
+            for row in self._connection.execute(
+                "SELECT items.* FROM items JOIN turns USING(turn_id) "
+                "WHERE turns.thread_id = ? AND turns.turn_index <= ? ORDER BY turns.turn_index, items.sequence",
+                (thread_id, through_turn_index),
+            )
+        )
+
+    @_store_operation
+    def metadata(self, key: str) -> str | None:
+        row = self._connection.execute("SELECT value FROM store_metadata WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row is not None else None
+
+    @_store_operation
+    def put_metadata(self, key: str, value: str, *, replace: bool = True) -> None:
+        if self._pending_transaction_records is None:
+            raise RuntimeError("metadata write requires a transaction")
+        sql = "INSERT OR REPLACE" if replace else "INSERT"
+        self._connection.execute(f"{sql} INTO store_metadata(key, value) VALUES (?, ?)", (key, value))
+
+    @_store_operation
+    def delete_metadata(self, key: str) -> None:
+        if self._pending_transaction_records is None:
+            raise RuntimeError("metadata write requires a transaction")
+        self._connection.execute("DELETE FROM store_metadata WHERE key = ?", (key,))
+
+    @contextmanager
+    def read_snapshot(self) -> Iterator[None]:
+        """A coherent SQLite snapshot, borrowing an existing transaction safely.
+
+        Must surround a complete owner operation. A nested audit never commits
+        or rolls back its caller's read/write transaction and takes no write lock.
+        """
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("read snapshots must run as a complete Store operation")
+        if self._connection.in_transaction:
+            yield
+            return
+        self._connection.execute("BEGIN")
+        try:
+            yield
+        finally:
+            self._rollback_quietly()
+
+    @_store_operation
+    def install_blob(self, content: bytes, *, fault_injector: Callable[[str], None] | None = None) -> str:
+        """Install content durably; the caller commits its reference afterwards."""
+        self.assert_writable()
+        if not isinstance(content, bytes):
+            raise TypeError("artifact content must be bytes")
+        digest = hashlib.sha256(content).hexdigest()
+        blobs, temporary = self._artifact_root / "blobs", self._artifact_root / "tmp"
+        blobs.mkdir(parents=True, exist_ok=True)
+        temporary.mkdir(parents=True, exist_ok=True)
+        candidate, blob = temporary / f"{uuid4().hex}.tmp", blobs / digest
+        try:
+            with candidate.open("xb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if fault_injector is not None:
+                fault_injector("after_temp_fsync")
+            if blob.exists():
+                if _file_sha256(blob) != digest or blob.stat().st_size != len(content):
+                    raise RuntimeError("content-addressed artifact blob is corrupt")
+                candidate.unlink()
+            else:
+                os.replace(candidate, blob)
+                _fsync_directory(blobs)
+            if fault_injector is not None:
+                fault_injector("after_rename")
+            return digest
+        finally:
+            candidate.unlink(missing_ok=True)
+
+    def backup(self, destination: Path) -> Path:
+        from agent_runtime.harness.rollout_backup import backup_store
+
+        return backup_store(self, destination)
 
     @property
     @_store_operation
@@ -578,72 +480,6 @@ class RolloutStore:
     async def capture_mutation_async[T](self, operation: Callable[[], T]) -> CommittedMutation[T]:
         """Run the complete transaction and artifact I/O on the Store owner."""
         return await self.run_async(lambda: self.capture_mutation(operation))
-
-    @_store_operation
-    def commit_artifact(
-        self,
-        *,
-        turn_id: str,
-        content: bytes,
-        media_type: str,
-        name: str,
-        fault_injector: Callable[[str], None] | None = None,
-    ) -> ArtifactSnapshot:
-        """Durably write an immutable blob before appending its canonical reference."""
-
-        self._assert_writable()
-        if not isinstance(content, bytes):
-            raise TypeError("artifact content must be bytes")
-        if not isinstance(media_type, str) or not media_type.strip():
-            raise ValueError("artifact media_type must be non-empty")
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("artifact name must be non-empty")
-        blob_sha256 = hashlib.sha256(content).hexdigest()
-        artifact_id = f"artifact_{uuid4().hex}"
-        blob_directory = self._artifact_root / "blobs"
-        temporary_directory = self._artifact_root / "tmp"
-        blob_directory.mkdir(parents=True, exist_ok=True)
-        temporary_directory.mkdir(parents=True, exist_ok=True)
-        temporary = temporary_directory / f"{uuid4().hex}.tmp"
-        blob = blob_directory / blob_sha256
-        try:
-            with temporary.open("xb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            if fault_injector is not None:
-                fault_injector("after_temp_fsync")
-            if blob.exists():
-                if _file_sha256(blob) != blob_sha256 or blob.stat().st_size != len(content):
-                    raise RuntimeError("content-addressed artifact blob is corrupt")
-                temporary.unlink()
-            else:
-                os.replace(temporary, blob)
-                _fsync_directory(blob_directory)
-            if fault_injector is not None:
-                fault_injector("after_rename")
-            with self._transaction():
-                thread_id = self._running_turn_thread_id(turn_id)
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="artifact_committed",
-                    producer="runtime",
-                    payload={
-                        "artifact_id": artifact_id,
-                        "blob_sha256": blob_sha256,
-                        "size_bytes": len(content),
-                        "media_type": media_type,
-                        "name": name,
-                    },
-                )
-                if fault_injector is not None:
-                    fault_injector("before_sqlite_commit")
-            if fault_injector is not None:
-                fault_injector("after_sqlite_commit")
-            return self.read_artifact_metadata(artifact_id)
-        finally:
-            temporary.unlink(missing_ok=True)
 
     @_store_operation
     def read_artifact_metadata(self, artifact_id: str) -> ArtifactSnapshot:
@@ -690,7 +526,7 @@ class RolloutStore:
         if min_age_seconds <= 0:
             raise ValueError("artifact GC min_age_seconds must be positive")
         removed: list[str] = []
-        with self._transaction():
+        with self.transaction():
             referenced = {
                 str(row["blob_sha256"]) for row in self._connection.execute("SELECT blob_sha256 FROM artifacts")
             }
@@ -711,4168 +547,6 @@ class RolloutStore:
         return tuple(sorted(removed))
 
     @_store_operation
-    def create_thread(
-        self,
-        *,
-        workspace: Path,
-        thread_id: str | None = None,
-    ) -> ThreadSnapshot:
-        self._assert_writable()
-        resolved_workspace = Path(workspace).resolve()
-        if not resolved_workspace.is_dir():
-            raise ValueError("workspace must be an existing directory")
-        if thread_id is not None and (not isinstance(thread_id, str) or not thread_id.strip()):
-            raise ValueError("thread_id must be non-empty when provided")
-        thread_id = thread_id or f"thread_{uuid4().hex}"
-        from agent_runtime.harness.workspace_stores import register_workspace_store
-
-        register_workspace_store(resolved_workspace, self._path)
-        with self._transaction():
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=None,
-                record_type="thread_created",
-                producer="runtime",
-                payload={"workspace": str(resolved_workspace)},
-            )
-        return self.read_thread(thread_id)
-
-    @_store_operation
-    def update_session_settings(
-        self,
-        thread_id: str,
-        settings: Mapping[str, Any],
-        *,
-        expected_request_revision: int | None = None,
-    ) -> None:
-        frozen = _json_object(settings, field="settings")
-        with self._transaction():
-            thread = self.read_thread(thread_id)
-            if (expected_request_revision is not None
-                    and thread.settings.get("request_settings_revision", 0) != expected_request_revision):
-                from agent_runtime.model_config_io import ConfigVersionConflict
-
-                raise ConfigVersionConflict(
-                    "Request settings changed in another Session; reopen before changing settings"
-                )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=None,
-                record_type="session_settings_updated",
-                producer="runtime",
-                payload={"settings": frozen},
-            )
-
-    @_store_operation
-    def fork_thread(self, *, from_turn_id: str) -> ThreadSnapshot:
-        thread_id = f"thread_{uuid4().hex}"
-        with self._transaction():
-            source = self._connection.execute(
-                """
-                SELECT turns.thread_id, turns.status, threads.workspace
-                FROM turns
-                JOIN threads ON threads.thread_id = turns.thread_id
-                WHERE turns.turn_id = ?
-                """,
-                (from_turn_id,),
-            ).fetchone()
-            if source is None:
-                raise KeyError(f"unknown fork Turn: {from_turn_id}")
-            if source["status"] not in {"completed", "failed", "cancelled"}:
-                raise RuntimeError("only a terminal Turn can be a fork point")
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=None,
-                record_type="thread_forked",
-                producer="runtime",
-                payload={
-                    "workspace": source["workspace"],
-                    "parent_thread_id": source["thread_id"],
-                    "fork_turn_id": from_turn_id,
-                },
-            )
-        return self.read_thread(thread_id)
-
-    @_store_operation
-    def start_turn(
-        self,
-        *,
-        thread_id: str,
-        user_message: str,
-        binding_manifest: Mapping[str, Any],
-        input_files: tuple[Mapping[str, Any], ...] = (),
-        turn_id: str | None = None,
-        turn_producer: str = "runtime",
-    ) -> TurnSnapshot:
-        if not isinstance(user_message, str) or not user_message.strip():
-            raise ValueError("user_message must be non-empty")
-        frozen_manifest = _json_object(binding_manifest, field="binding_manifest")
-        frozen_input_files = tuple(_json_object(value, field="input file") for value in input_files)
-        if turn_id is not None and (not isinstance(turn_id, str) or not turn_id):
-            raise ValueError("turn_id must be non-empty when provided")
-        if not isinstance(turn_producer, str) or not turn_producer:
-            raise ValueError("turn_producer must be non-empty")
-        turn_id = turn_id or f"turn_{uuid4().hex}"
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread = self._connection.execute(
-                "SELECT active_turn_id, head_turn_id FROM threads WHERE thread_id = ?",
-                (thread_id,),
-            ).fetchone()
-            if thread is None:
-                raise KeyError(f"unknown thread: {thread_id}")
-            if thread["active_turn_id"] is not None:
-                raise RuntimeError(f"thread already has an active turn: {thread_id}")
-            turn_index = self._connection.execute(
-                "SELECT COALESCE(MAX(turn_index), 0) + 1 FROM turns WHERE thread_id = ?",
-                (thread_id,),
-            ).fetchone()[0]
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_started",
-                producer=turn_producer,
-                payload={
-                    "turn_id": turn_id,
-                    "predecessor_turn_id": thread["head_turn_id"],
-                    "turn_index": turn_index,
-                    "binding_manifest": frozen_manifest,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="user",
-                payload={"item_id": item_id, "kind": "user_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="user",
-                payload={"item_id": item_id, "payload": {"text": user_message}},
-            )
-            for input_file in frozen_input_files:
-                input_item_id = f"item_{uuid4().hex}"
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_started",
-                    producer="user",
-                    payload={"item_id": input_item_id, "kind": "input_file"},
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_completed",
-                    producer="user",
-                    payload={"item_id": input_item_id, "payload": input_file},
-                )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def user_input_revision(self, turn_id: str) -> int:
-        """Count canonical user messages, independently of context compaction."""
-        return int(self._connection.execute(
-            "SELECT COUNT(*) FROM items WHERE turn_id = ? AND kind = 'user_message' AND status = 'completed'",
-            (turn_id,),
-        ).fetchone()[0])
-
-    @_store_operation
-    def request_input_revision(self, turn_id: str, request_ref: Mapping[str, Any]) -> int | None:
-        revision = request_ref.get("input_revision")
-        if isinstance(revision, int) and not isinstance(revision, bool):
-            return revision
-        # Pre-steering rollouts have no version field. Their canonical request
-        # Item still establishes which user messages preceded that request.
-        items = self.list_items(turn_id)
-        request = next((item for item in items if item.kind == "model_request"
-                        and item.payload.get("request_ref", {}).get("request_id")
-                        == request_ref.get("request_id")), None)
-        if request is None:
-            return None
-        return sum(item.kind == "user_message" and item.status == "completed"
-                   and item.sequence < request.sequence for item in items)
-
-    @_store_operation
-    def receive_turn_input(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        text: str,
-        input_files: tuple[Mapping[str, Any], ...] = (),
-    ) -> ItemSnapshot:
-        """Durably accept steering for exactly the expected active Turn."""
-        if not isinstance(text, str) or not text.strip():
-            raise ValueError("input must be non-empty")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread = self.read_thread(thread_id)
-            turn = self.read_turn(turn_id) if thread.active_turn_id == turn_id else None
-            if turn is None or turn.status not in {"running", "paused", "interrupted"}:
-                raise RuntimeError("expected Turn is no longer active; input was not accepted")
-            self._assert_no_pending_cancellation(turn_id)
-            revision = self.user_input_revision(turn_id) + 1
-            self._append_and_reduce(
-                thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
-                payload={"item_id": item_id, "kind": "user_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
-                payload={"item_id": item_id, "payload": {"text": text, "input_revision": revision}},
-            )
-            for value in input_files:
-                file_id = f"item_{uuid4().hex}"
-                self._append_and_reduce(
-                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="user",
-                    payload={"item_id": file_id, "kind": "input_file"},
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="user",
-                    payload={"item_id": file_id, "payload": _json_object(value, field="input file")},
-                )
-        return self.read_item(item_id)
-
-    @_store_operation
-    def turn_input_status(self, item_id: str) -> str:
-        """Derive input consumption from ordinary model dispatches, never preparation."""
-        item = self.read_item(item_id)
-        if item.kind != "user_message" or "input_revision" not in item.payload:
-            raise ValueError("Item is not a steering receipt")
-        dispatched = {json.loads(row["payload_json"]).get("operation_id") for row in self._connection.execute(
-            "SELECT payload_json FROM rollout_records WHERE turn_id = ? AND record_type = 'model_attempt_dispatched'",
-            (item.turn_id,),
-        ).fetchall()}
-        for operation in self.list_model_operations(item.turn_id):
-            if (operation.request_ref.get("purpose") == "agent_step"
-                    and (operation.request_ref.get("input_revision") or 0) >= item.payload["input_revision"]
-                    and operation.operation_id in dispatched):
-                return "applied"
-        status = self.read_turn(item.turn_id).status
-        return "pending" if status in {"running", "paused", "interrupted"} else "unconsumed"
-
-    @_store_operation
-    def complete_turn(
-        self,
-        *,
-        turn_id: str,
-        answer: str,
-        producer: str = "runtime",
-        expected_input_revision: int | None = None,
-        source_item_id: str | None = None,
-    ) -> TurnSnapshot:
-        if not isinstance(answer, str) or not answer.strip():
-            raise ValueError("answer must be non-empty")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            if (expected_input_revision is not None
-                    and self.user_input_revision(turn_id) != expected_input_revision):
-                raise TurnInputChangedError("new user input superseded this final answer")
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError(f"turn is not running: {turn_id}")
-            thread_id = turn["thread_id"]
-            active = self._connection.execute(
-                "SELECT active_turn_id FROM threads WHERE thread_id = ?", (thread_id,)
-            ).fetchone()
-            if active["active_turn_id"] != turn_id:
-                raise RuntimeError(f"turn does not own the thread active slot: {turn_id}")
-            if source_item_id is not None:
-                source = self.read_item(source_item_id)
-                if (source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed"
-                        or source.payload.get("text") != answer
-                        or source.payload.get("response_status", "completed") != "completed"):
-                    raise ValueError("accepted answer requires the matching completed response from this Turn")
-                item_id = source_item_id
-            else:
-                self._append_and_reduce(
-                    thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer=producer,
-                    payload={"item_id": item_id, "kind": "agent_message"},
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer=producer,
-                    payload={"item_id": item_id, "payload": {"text": answer}},
-                )
-            self._append_terminal_plan_state(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                status="complete",
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_completed",
-                producer=producer,
-                payload={"turn_id": turn_id, "answer_item_id": item_id},
-            )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def fail_turn(
-        self,
-        *,
-        turn_id: str,
-        reason_code: str,
-        message: str,
-    ) -> TurnSnapshot:
-        if not isinstance(reason_code, str) or not reason_code.strip():
-            raise ValueError("Turn failure reason_code must be non-empty")
-        if not isinstance(message, str) or not message.strip():
-            raise ValueError("Turn failure message must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError("only a running Turn can fail")
-            active = self._connection.execute(
-                "SELECT active_turn_id FROM threads WHERE thread_id = ?",
-                (turn["thread_id"],),
-            ).fetchone()
-            if active is None or active["active_turn_id"] != turn_id:
-                raise RuntimeError("failed Turn does not own the Thread active slot")
-            self._append_terminal_plan_state(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                status="blocked",
-                message=message.strip(),
-            )
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                record_type="turn_failed",
-                producer="verifier",
-                payload={
-                    "turn_id": turn_id,
-                    "reason_code": reason_code.strip(),
-                    "message": message.strip(),
-                },
-            )
-        return self.read_turn(turn_id)
-
-    def _append_terminal_plan_state(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        status: str,
-        message: str | None = None,
-    ) -> None:
-        latest = self._connection.execute(
-            """
-            SELECT payload_json FROM items
-            WHERE turn_id = ? AND kind = 'plan_state' AND status = 'completed'
-            ORDER BY sequence DESC LIMIT 1
-            """,
-            (turn_id,),
-        ).fetchone()
-        if latest is None:
-            return
-        payload = json.loads(latest["payload_json"])
-        raw_plan = payload.get("plan")
-        if not isinstance(raw_plan, Mapping):
-            raise RuntimeError("canonical plan_state payload is malformed")
-        revision = int(raw_plan["revision"]) + 1
-        steps = [
-            dict(step)
-            for step in raw_plan.get("steps", ())
-            if isinstance(step, Mapping)
-        ]
-        if status == "complete" and any(step.get("status") not in {"completed", "skipped"} for step in steps):
-            status = "needs_replan"
-        plan = {
-            **dict(raw_plan),
-            "revision": revision,
-            "status": status,
-            "active_step_id": None,
-            "steps": steps,
-        }
-        event_type = "completed" if status == "complete" else status
-        event = {
-            "event_type": event_type,
-            "message": message
-            or (
-                "Plan completed as reported; task validation is separate." if status == "complete" else (
-                    "Turn accepted with unfinished plan steps; review remaining work."
-                    if status == "needs_replan" else "Plan blocked by the failed Turn; reported steps retained."
-                )
-            ),
-            "tool_call_ids": [],
-        }
-        item_id = f"item_{uuid4().hex}"
-        public_item_id = derive_plan_public_item_id(
-            turn_id=turn_id,
-            revision=revision,
-        )
-        self._append_and_reduce(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            record_type="item_started",
-            producer="runtime",
-            payload={
-                "item_id": item_id,
-                "kind": "plan_state",
-                "public_item_id": public_item_id,
-                "revision": revision,
-            },
-        )
-        self._append_and_reduce(
-            thread_id=thread_id,
-            turn_id=turn_id,
-            record_type="item_completed",
-            producer="runtime",
-            payload={
-                "item_id": item_id,
-                "public_item_id": public_item_id,
-                "revision": revision,
-                "payload": {"plan": plan, "event": event},
-            },
-        )
-
-    @_store_operation
-    def pause_turn(
-        self,
-        *,
-        turn_id: str,
-        reason: str,
-        producer: str = "runtime",
-    ) -> TurnSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Turn pause reason must be non-empty")
-        if not isinstance(producer, str) or not producer.strip():
-            raise ValueError("Turn pause producer must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError("only a running Turn can pause")
-            active = self._connection.execute(
-                "SELECT active_turn_id FROM threads WHERE thread_id = ?",
-                (turn["thread_id"],),
-            ).fetchone()
-            if active is None or active["active_turn_id"] != turn_id:
-                raise RuntimeError("paused Turn does not own the Thread active slot")
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                record_type="turn_paused",
-                producer=producer,
-                payload={"turn_id": turn_id, "reason": reason},
-            )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def interrupt_orphaned_turn(
-        self,
-        *,
-        turn_id: str,
-        reason: str,
-        maintenance_confirmed: bool,
-    ) -> TurnSnapshot:
-        """Recover only the safe gap before any model/tool operation exists."""
-
-        if not maintenance_confirmed:
-            raise RuntimeError(
-                "orphan recovery requires explicit maintenance confirmation that the prior worker is stopped"
-            )
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("Turn interruption reason must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError("orphan recovery requires a running Turn")
-            active = self._connection.execute(
-                "SELECT active_turn_id FROM threads WHERE thread_id = ?",
-                (turn["thread_id"],),
-            ).fetchone()
-            if active is None or active["active_turn_id"] != turn_id:
-                raise RuntimeError("orphaned Turn does not own the Thread active slot")
-            operation_count = 0
-            for table in (
-                "model_operations",
-                "tool_operations",
-                "interactions",
-                "approvals",
-            ):
-                row = self._connection.execute(
-                    f"SELECT COUNT(*) AS count FROM {table} WHERE turn_id = ?",
-                    (turn_id,),
-                ).fetchone()
-                operation_count += int(row["count"])
-            if operation_count:
-                raise RuntimeError(
-                    "pre-dispatch orphan recovery refuses Turns with durable operations; "
-                    "use operation-specific reconciliation"
-                )
-            self._append_and_reduce(
-                thread_id=str(turn["thread_id"]),
-                turn_id=turn_id,
-                record_type="turn_interrupted",
-                producer="recovery",
-                payload={
-                    "turn_id": turn_id,
-                    "reason": reason,
-                    "maintenance_confirmed": True,
-                    "recovery_scope": "pre_dispatch_orphan",
-                },
-            )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def context_source_revision(self, turn_id: str) -> str:
-        """Version every source Thread, including non-message state transitions."""
-        thread_ids = {item.thread_id for item in self.list_context_items(turn_id)}
-        thread_ids.add(self.read_turn(turn_id).thread_id)
-        versions = [
-            (thread_id, self.read_thread(thread_id).applied_thread_sequence) for thread_id in sorted(thread_ids)
-        ]
-        return hashlib.sha256(_canonical_json(versions).encode()).hexdigest()
-
-    @_store_operation
-    def context_durable_state(self, turn_id: str) -> dict[str, Any]:
-        return _context_durable_state(self, turn_id)
-
-    @_store_operation
-    def record_context_compaction(
-        self,
-        *,
-        turn_id: str,
-        covered_item_ids: tuple[str, ...],
-        summary: str,
-        preserved_facts: Mapping[str, Any],
-        artifact_refs: tuple[Mapping[str, Any], ...] = (),
-        context_version: int,
-        preserved_item_ids: tuple[str, ...] = (),
-        expected_source_revision: str | None = None,
-        durable_state: Mapping[str, Any] | None = None,
-        algorithm_revision: str | None = None,
-        tool_result_overrides: Mapping[str, str] | None = None,
-        capacity_diagnostics: Mapping[str, Any] | None = None,
-    ) -> ItemSnapshot:
-        """Append an auditable replacement for one committed context prefix."""
-
-        if not covered_item_ids or any(not isinstance(item_id, str) or not item_id for item_id in covered_item_ids):
-            raise ValueError("compaction must cover non-empty Item IDs")
-        if len(set(covered_item_ids)) != len(covered_item_ids):
-            raise ValueError("compaction covered Item IDs must be unique")
-        if not isinstance(summary, str) or not summary.strip():
-            raise ValueError("compaction summary must be non-empty")
-        if isinstance(context_version, bool) or not isinstance(context_version, int) or context_version < 1:
-            raise ValueError("context_version must be a positive integer")
-
-        with self._transaction():
-            if (
-                expected_source_revision is not None
-                and self.context_source_revision(turn_id) != expected_source_revision
-            ):
-                raise ContextSourceChangedError("Context source changed before compaction commit.")
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError("context compaction requires a running Turn")
-            visible_items = tuple(item for item in self.list_context_items(turn_id) if item.status == "completed")
-            visible_ids = tuple(item.item_id for item in visible_items)
-            if visible_ids[: len(covered_item_ids)] != covered_item_ids:
-                raise ValueError("compaction must cover a contiguous context prefix in exact order")
-            if len(set(preserved_item_ids)) != len(preserved_item_ids) or any(
-                item_id not in covered_item_ids for item_id in preserved_item_ids
-            ):
-                raise ValueError("preserved Items must belong to the covered prefix")
-            if algorithm_revision in {"semantic-compaction-v5", "semantic-compaction-v6"}:
-                pending: set[tuple[str, str]] = set()
-                replay_results: set[str] = set()
-                for item in visible_items:
-                    if item.item_id not in preserved_item_ids:
-                        continue
-                    if item.kind == "model_response" and item.payload.get("tool_calls"):
-                        if pending:
-                            raise ValueError("preserved tool exchanges must be complete")
-                        pending.update((item.turn_id, call["id"]) for call in item.payload["tool_calls"])
-                    elif item.kind == "tool_result":
-                        key = (item.turn_id, item.payload.get("tool_call_id"))
-                        if key not in pending:
-                            raise ValueError("preserved tool result must have its original call")
-                        pending.remove(key)
-                        replay_results.add(item.item_id)
-                    elif item.kind != "user_message" or pending:
-                        raise ValueError("only user Items and complete tool exchanges can be preserved")
-                if pending or (algorithm_revision == "semantic-compaction-v5"
-                               and replay_results != set(tool_result_overrides or {})):
-                    raise ValueError("preserved tool exchanges require all paired archived results")
-                for source_turn in {item.turn_id for item in visible_items if item.item_id in replay_results}:
-                    if any(op.result_item_id in replay_results and (op.requires_reconciliation or
-                           op.status not in {"succeeded", "failed", "denied", "cancelled"})
-                           for op in self.list_tool_operations(source_turn)):
-                        raise ValueError("unsettled tool results cannot be archived in semantic replay")
-            elif any(item.kind != "user_message" for item in visible_items if item.item_id in preserved_item_ids):
-                raise ValueError("only user Items can be preserved inside a covered prefix")
-
-            if tool_result_overrides is not None:
-                covered_by_id = {item.item_id: item for item in visible_items[: len(covered_item_ids)]}
-                if not tool_result_overrides or any(
-                    target not in covered_by_id
-                    or covered_by_id[target].kind != "tool_result"
-                    or not isinstance(content, str)
-                    or not content
-                    for target, content in tool_result_overrides.items()
-                ):
-                    raise ValueError("tool result overrides require completed covered tool Items and nonempty text")
-
-            frozen_facts = _json_object(
-                preserved_facts,
-                field="compaction preserved_facts",
-            )
-            required_fact_categories = {
-                "architecture_and_safety_constraints",
-                "file_changes",
-                "verification_results",
-                "unresolved_work",
-                "uncertain_side_effects",
-            }
-            missing_categories = sorted(required_fact_categories - frozen_facts.keys())
-            if missing_categories:
-                raise ValueError(f"compaction preserved_facts lacks critical fact categories: {missing_categories}")
-            frozen_artifacts = tuple(_json_object(value, field="compaction artifact ref") for value in artifact_refs)
-            covered_items = visible_items[: len(covered_item_ids)]
-            covered_refs = [
-                {
-                    "item_id": item.item_id,
-                    "thread_id": item.thread_id,
-                    "turn_id": item.turn_id,
-                    "item_sequence": item.sequence,
-                    "applied_thread_sequence": item.applied_thread_sequence,
-                    "payload_sha256": hashlib.sha256(_canonical_json(dict(item.payload)).encode()).hexdigest(),
-                }
-                for item in covered_items
-            ]
-            grouped_sequences: dict[str, list[int]] = {}
-            for item in covered_items:
-                grouped_sequences.setdefault(item.thread_id, []).append(item.applied_thread_sequence)
-            covered_ranges = [
-                {
-                    "thread_id": thread_id,
-                    "start_thread_sequence": min(sequences),
-                    "end_thread_sequence": max(sequences),
-                }
-                for thread_id, sequences in grouped_sequences.items()
-            ]
-            frozen_state = (
-                _context_durable_state(self, turn_id)
-                if durable_state is None
-                else _json_object(durable_state, field="compaction durable_state")
-            )
-            item_id = f"item_{uuid4().hex}"
-            payload = {
-                "context_version": context_version,
-                "covered_item_ids": list(covered_item_ids),
-                "covered_item_refs": covered_refs,
-                "covered_sequence_ranges": covered_ranges,
-                "summary": summary,
-                "preserved_facts": frozen_facts,
-                "artifact_refs": list(frozen_artifacts),
-                "durable_state": frozen_state,
-            }
-            if tool_result_overrides is not None:
-                payload["tool_result_overrides"] = dict(tool_result_overrides)
-            if capacity_diagnostics is not None:
-                payload["capacity_diagnostics"] = _json_object(capacity_diagnostics, field="capacity diagnostics")
-            if expected_source_revision is not None:
-                payload.update(
-                    source_revision=expected_source_revision,
-                    preserved_item_ids=list(preserved_item_ids),
-                    algorithm_revision=algorithm_revision,
-                )
-            self._append_and_reduce(
-                thread_id=str(turn["thread_id"]),
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="runtime",
-                payload={"item_id": item_id, "kind": "context_compaction"},
-            )
-            self._append_and_reduce(
-                thread_id=str(turn["thread_id"]),
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="runtime",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self._latest_item(turn_id)
-
-    @_store_operation
-    def cancel_turn(self, *, turn_id: str) -> TurnSnapshot:
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] not in {"paused", "interrupted"}:
-                raise RuntimeError("only a safely paused or interrupted Turn can be cancelled")
-            thread_id = str(turn["thread_id"])
-            unsafe_operation = self._connection.execute(
-                """
-                SELECT operation_id, status FROM tool_operations
-                WHERE turn_id = ? AND status IN ('running', 'unknown')
-                ORDER BY rowid LIMIT 1
-                """,
-                (turn_id,),
-            ).fetchone()
-            if unsafe_operation is not None:
-                raise RuntimeError(
-                    f"cancel cannot discard a running or unknown tool operation: {unsafe_operation['operation_id']}"
-                )
-            pending = self._connection.execute(
-                """
-                SELECT * FROM interactions
-                WHERE turn_id = ? AND status = 'pending'
-                ORDER BY rowid
-                """,
-                (turn_id,),
-            ).fetchall()
-            for interaction in pending:
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="interaction_resolved",
-                    producer="user",
-                    payload={
-                        "request_id": interaction["request_id"],
-                        "version": int(interaction["version"]) + 1,
-                        "response": {"action": "abort"},
-                        "approval_status": "denied",
-                    },
-                )
-                if interaction["operation_id"] is not None:
-                    operation = self._connection.execute(
-                        "SELECT status FROM tool_operations WHERE operation_id = ?",
-                        (interaction["operation_id"],),
-                    ).fetchone()
-                    if operation is None or operation["status"] != "awaiting_approval":
-                        raise RuntimeError("cancel cannot discard a started or unknown tool operation")
-                    self._append_and_reduce(
-                        thread_id=thread_id,
-                        turn_id=turn_id,
-                        record_type="tool_operation_approval_resolved",
-                        producer="runtime",
-                        payload={
-                            "operation_id": interaction["operation_id"],
-                            "request_id": interaction["request_id"],
-                            "status": "cancelled",
-                        },
-                    )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_cancelled",
-                producer="user",
-                payload={"turn_id": turn_id},
-            )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def request_turn_cancellation(
-        self,
-        *,
-        turn_id: str,
-        producer: str = "runtime",
-        reason: str = "controlling stream closed",
-    ) -> TurnSnapshot:
-        """Append the durable request before live work receives cancellation."""
-
-        if not isinstance(producer, str) or not producer.strip():
-            raise ValueError("cancellation producer must be non-empty")
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("cancellation reason must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] not in {"running", "paused", "interrupted"}:
-                return self.read_turn(turn_id)
-            thread_id = str(turn["thread_id"])
-            active = self._connection.execute(
-                "SELECT active_turn_id FROM threads WHERE thread_id = ?",
-                (thread_id,),
-            ).fetchone()
-            if active is None or active["active_turn_id"] != turn_id:
-                raise RuntimeError("cancellation request cannot target a foreign active slot")
-            if not self.turn_cancellation_pending(turn_id):
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="turn_cancellation_requested",
-                    producer=producer.strip(),
-                    payload={
-                        "turn_id": turn_id,
-                        "reason": reason.strip()[:2_000],
-                    },
-                )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def turn_cancellation_pending(self, turn_id: str) -> bool:
-        """A durable stop applies only until the next explicit execution resume."""
-        return self._connection.execute(
-            "SELECT 1 FROM rollout_records WHERE turn_id = ? AND record_type = 'turn_cancellation_requested' "
-            "AND record_id > COALESCE((SELECT MAX(record_id) FROM rollout_records "
-            "WHERE turn_id = ? AND record_type = 'turn_resumed'), 0) LIMIT 1", (turn_id, turn_id),
-        ).fetchone() is not None
-
-    def _assert_no_pending_cancellation(self, turn_id: str) -> None:
-        # Every path that resumes a paused Turn on behalf of user input must
-        # respect a durable cancellation request; an explicit
-        # resume_cancelled_turn is the only way past it.
-        if self.turn_cancellation_pending(turn_id):
-            raise RuntimeError("Turn cancellation was requested; input was not accepted")
-
-    @_store_operation
-    def resume_cancelled_turn(self, *, turn_id: str) -> TurnSnapshot:
-        """Explicitly continue a quiescent cancellation without replaying results."""
-        with self._transaction():
-            turn = self.read_turn(turn_id)
-            if turn.status != "paused" or not self.turn_cancellation_pending(turn_id):
-                raise RuntimeError("Turn has no paused cancellation to resume")
-            if self.read_thread(turn.thread_id).active_turn_id != turn_id:
-                raise RuntimeError("cancelled Turn does not own the active slot")
-            if (any(item.status == "pending" for item in self.list_interactions(turn_id))
-                    or any(op.status in {"running", "unknown"} for op in self.list_tool_operations(turn_id))
-                    or any(op.status in {"dispatched", "unknown"} for op in self.list_model_operations(turn_id))):
-                raise RuntimeError("pending or uncertain execution must be resolved before resume")
-            self._append_and_reduce(
-                thread_id=turn.thread_id, turn_id=turn_id, record_type="turn_resumed",
-                producer="user", payload={"turn_id": turn_id, "reason": "explicit cancellation resume"},
-            )
-        return self.read_turn(turn_id)
-
-    @_store_operation
-    def request_clarification(
-        self,
-        *,
-        turn_id: str,
-        question: str,
-    ) -> InteractionSnapshot:
-        if not isinstance(question, str) or not question.strip():
-            raise ValueError("clarification question must be non-empty")
-        request_id = f"interaction_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_requested",
-                producer="verifier",
-                payload={
-                    "request_id": request_id,
-                    "kind": "clarification",
-                    "operation_id": None,
-                    "request": {"question": question},
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_paused",
-                producer="verifier",
-                payload={"turn_id": turn_id, "request_id": request_id},
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def resolve_clarification(
-        self,
-        *,
-        turn_id: str,
-        request_id: str,
-        response: str,
-    ) -> InteractionSnapshot:
-        if not isinstance(response, str) or not response.strip():
-            raise ValueError("clarification response must be non-empty")
-        self._assert_artifact_integrity(turn_id)
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "paused":
-                raise RuntimeError("clarification response requires a paused Turn")
-            self._assert_no_pending_cancellation(turn_id)
-            interaction = self._connection.execute(
-                "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
-                (request_id, turn_id),
-            ).fetchone()
-            if interaction is None:
-                raise KeyError(f"unknown clarification request: {request_id}")
-            if interaction["kind"] != "clarification" or interaction["status"] != "pending":
-                raise RuntimeError("interaction is not a pending clarification")
-            thread_id = str(turn["thread_id"])
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_resolved",
-                producer="user",
-                payload={
-                    "request_id": request_id,
-                    "version": int(interaction["version"]) + 1,
-                    "response": {"text": response},
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="user",
-                payload={"item_id": item_id, "kind": "user_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="user",
-                payload={"item_id": item_id, "payload": {"text": response}},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_resumed",
-                producer="runtime",
-                payload={"turn_id": turn_id, "request_id": request_id},
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def request_choice(
-        self,
-        *,
-        turn_id: str,
-        question: str,
-        options: tuple[str, ...],
-    ) -> InteractionSnapshot:
-        if not isinstance(question, str) or not question.strip():
-            raise ValueError("choice question must be non-empty")
-        if (
-            len(options) < 2
-            or any(not isinstance(option, str) or not option.strip() for option in options)
-            or len(set(options)) != len(options)
-        ):
-            raise ValueError("choice options must contain at least two unique non-empty values")
-        request_id = f"interaction_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_requested",
-                producer="runtime",
-                payload={
-                    "request_id": request_id,
-                    "kind": "choice",
-                    "operation_id": None,
-                    "request": {"question": question, "options": list(options)},
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_paused",
-                producer="runtime",
-                payload={"turn_id": turn_id, "request_id": request_id},
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def resolve_choice(
-        self,
-        *,
-        turn_id: str,
-        request_id: str,
-        selection: str,
-    ) -> InteractionSnapshot:
-        if not isinstance(selection, str) or not selection.strip():
-            raise ValueError("choice selection must be non-empty")
-        self._assert_artifact_integrity(turn_id)
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "paused":
-                raise RuntimeError("choice response requires a paused Turn")
-            self._assert_no_pending_cancellation(turn_id)
-            interaction = self._connection.execute(
-                "SELECT * FROM interactions WHERE request_id = ? AND turn_id = ?",
-                (request_id, turn_id),
-            ).fetchone()
-            if interaction is None:
-                raise KeyError(f"unknown choice request: {request_id}")
-            if interaction["kind"] != "choice" or interaction["status"] != "pending":
-                raise RuntimeError("interaction is not a pending choice")
-            request = json.loads(interaction["request_json"])
-            options = request.get("options")
-            if not isinstance(options, list) or selection not in options:
-                raise ValueError("choice selection is not one of the frozen options")
-            thread_id = str(turn["thread_id"])
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_resolved",
-                producer="user",
-                payload={
-                    "request_id": request_id,
-                    "version": int(interaction["version"]) + 1,
-                    "response": {"selection": selection},
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="user",
-                payload={"item_id": item_id, "kind": "user_message"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="user",
-                payload={"item_id": item_id, "payload": {"text": selection}},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_resumed",
-                producer="runtime",
-                payload={"turn_id": turn_id, "request_id": request_id},
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def prepare_model_operation(
-        self,
-        *,
-        turn_id: str,
-        request_hash: str,
-        context_hash: str,
-        tool_hash: str,
-        wire_hash: str,
-        request_ref: Mapping[str, Any],
-    ) -> ModelOperationSnapshot:
-        hashes = {
-            "request_hash": request_hash,
-            "context_hash": context_hash,
-            "tool_hash": tool_hash,
-            "wire_hash": wire_hash,
-        }
-        if not all(isinstance(value, str) and value for value in hashes.values()):
-            raise ValueError("model operation hashes must be non-empty strings")
-        frozen_ref = _json_object(request_ref, field="request_ref")
-        request_id = frozen_ref.get("request_id")
-        if not isinstance(request_id, str) or not request_id.strip():
-            raise ValueError("model request_ref.request_id must be a non-empty string")
-        operation_id = f"modelop_{uuid4().hex}"
-        attempt_id = f"attempt_{uuid4().hex}"
-        request_item_id = f"item_{uuid4().hex}"
-        selected_operation_id = operation_id
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError(f"turn is not running: {turn_id}")
-            thread_id = turn["thread_id"]
-            matches = [
-                row
-                for row in self._connection.execute(
-                    "SELECT * FROM model_operations WHERE turn_id = ? ORDER BY rowid",
-                    (turn_id,),
-                ).fetchall()
-                if json.loads(row["request_ref_json"]).get("request_id") == request_id
-            ]
-            if len(matches) > 1:
-                raise RuntimeError(f"duplicate durable model request identity: {request_id}")
-            if matches:
-                existing = matches[0]
-                existing_hashes = {name: existing[name] for name in hashes}
-                existing_ref = json.loads(existing["request_ref_json"])
-                if existing_hashes != hashes or existing_ref != frozen_ref:
-                    raise RuntimeError(f"model request identity reused with conflicting payload: {request_id}")
-                selected_operation_id = str(existing["operation_id"])
-            else:
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="model_operation_prepared",
-                    producer="runtime",
-                    payload={
-                        "operation_id": operation_id,
-                        "attempt_id": attempt_id,
-                        "generation": 1,
-                        "public_item_ids": _model_public_item_ids(
-                            turn_id=turn_id,
-                            attempt_id=attempt_id,
-                        ),
-                        **hashes,
-                        "request_ref": frozen_ref,
-                    },
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_started",
-                    producer="runtime",
-                    payload={"item_id": request_item_id, "kind": "model_request"},
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_completed",
-                    producer="runtime",
-                    payload={
-                        "item_id": request_item_id,
-                        "payload": {**hashes, "request_ref": frozen_ref},
-                    },
-                )
-        row = self._connection.execute(
-            "SELECT * FROM model_operations WHERE operation_id = ?",
-            (selected_operation_id,),
-        ).fetchone()
-        if row is None:
-            raise RuntimeError("prepared model operation projection is missing")
-        return _model_operation_snapshot(row)
-
-    @_store_operation
-    def supersede_prepared_model(self, operation_id: str) -> None:
-        """Close an undispatched stale request without reserving or spending budget."""
-        with self._transaction():
-            operation = next(op for op in self.list_model_operations() if op.operation_id == operation_id)
-            if operation.status != "prepared":
-                raise RuntimeError("only an undispatched prepared model can be superseded")
-            self._append_and_reduce(
-                thread_id=operation.thread_id, turn_id=operation.turn_id,
-                record_type="model_attempt_rejected", producer="runtime",
-                payload={"operation_id": operation_id, "attempt_id": operation.active_attempt_id,
-                         "generation": operation.generation, "reason": "new user input before dispatch",
-                         "error_type": "input_superseded"},
-            )
-
-    @_store_operation
-    def dispatch_model_attempt(
-        self,
-        operation_id: str,
-        *,
-        worker_id: str = "direct-model-worker",
-        lease_seconds: float = 300.0,
-        now: float | None = None,
-        resource_request: ResourceUsage | None = None,
-        allow_protected_budget: bool = False,
-    ) -> ModelAttemptSnapshot:
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            raise ValueError("model worker_id must be non-empty")
-        if lease_seconds <= 0:
-            raise ValueError("model lease_seconds must be positive")
-        if resource_request is not None and not isinstance(resource_request, ResourceUsage):
-            raise TypeError("resource_request must be ResourceUsage or None")
-        if type(allow_protected_budget) is not bool:
-            raise TypeError("allow_protected_budget must be a bool")
-        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
-                                       (operation_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"unknown model operation: {operation_id}")
-        self._assert_artifact_integrity(str(row["turn_id"]))
-        dispatched_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if operation["status"] != "prepared":
-                raise RuntimeError(f"model operation is not prepared: {operation_id}")
-            request_ref = json.loads(operation["request_ref_json"])
-            revision = self.request_input_revision(str(operation["turn_id"]), request_ref)
-            if (request_ref.get("purpose") == "agent_step" and revision is not None
-                    and revision != self.user_input_revision(str(operation["turn_id"]))):
-                raise TurnInputChangedError("new user input before model dispatch")
-            plan = request_ref.get("compaction_plan")
-            if request_ref.get("purpose") == "context_summary" and plan is not None:
-                summary_ops = [
-                    op
-                    for op in self.list_model_operations(str(operation["turn_id"]))
-                    if op.request_ref.get("purpose") == "context_summary"
-                ]
-                for limit_key, selected in (
-                    ("max_summary_calls", summary_ops),
-                    (
-                        "planned_summary_calls",
-                        [
-                            op
-                            for op in summary_ops
-                            if op.request_ref.get("compaction_plan", {}).get("plan_id") == plan.get("plan_id")
-                        ],
-                    ),
-                ):
-                    limit = plan.get(limit_key)
-                    if limit is None:  # Legacy prepared records may lack the new call bound.
-                        continue
-                    if type(limit) is not int or limit < 1:
-                        raise ValueError("summary call allowance must be a positive integer")
-                    dispatched = sum(
-                        attempt.status != "prepared"
-                        for op in selected
-                        for attempt in self.list_model_attempts(op.operation_id)
-                    )
-                    if dispatched >= limit:
-                        raise BudgetLimitExceededError(
-                            resource="model_calls", limit=limit, current_exposure=dispatched, requested=1
-                        )
-            reservation_id: str | None = None
-            if resource_request is not None:
-                attempt_id = str(operation["active_attempt_id"])
-                reservation_id = f"reservation_{attempt_id}"
-                budget_state = self.read_budget_state(str(operation["turn_id"]))
-                continuation_reserve = 0
-                if request_ref.get("purpose") == "context_summary" and plan is not None:
-                    continuation_reserve = plan.get("continuation_token_reserve")
-                    if type(continuation_reserve) is not int or continuation_reserve < 1:
-                        raise ValueError("summary plan must preserve a positive continuation token reserve")
-                    continuation_cost = plan.get("continuation_cost_reserve", 0)
-                    if type(continuation_cost) is not int or continuation_cost < 0:
-                        raise ValueError("summary continuation cost reserve must be non-negative")
-                    cost_limit = budget_state.limits.cost_micros
-                    requested_cost = resource_request.cost_micros + continuation_cost
-                    if cost_limit is not None and budget_state.exposure.cost_micros + requested_cost > cost_limit:
-                        raise BudgetLimitExceededError(
-                            resource="cost_micros",
-                            limit=cost_limit,
-                            current_exposure=budget_state.exposure.cost_micros,
-                            requested=requested_cost,
-                        )
-                ensure_token_headroom(
-                    budget_state,
-                    requested_tokens=resource_request.total_tokens + continuation_reserve,
-                    allow_protected=allow_protected_budget and not continuation_reserve,
-                )
-                mutation = reserve_budget(
-                    budget_state,
-                    reservation_id=reservation_id,
-                    operation_id=operation_id,
-                    attempt_id=attempt_id,
-                    amount=resource_request,
-                )
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="budget_reserved",
-                    producer="runtime",
-                    payload={
-                        "reservation_id": reservation_id,
-                        "scope_id": mutation.reservation.scope_id,
-                        "operation_id": operation_id,
-                        "attempt_id": attempt_id,
-                        "reserved": resource_request.to_dict(),
-                    },
-                )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_attempt_dispatched",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "attempt_id": operation["active_attempt_id"],
-                    "generation": operation["generation"],
-                    "claim_owner": worker_id,
-                    "lease_expires_at": dispatched_at + lease_seconds,
-                },
-            )
-            if reservation_id is not None:
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="budget_dispatched",
-                    producer="runtime",
-                    payload={"reservation_id": reservation_id},
-                )
-        return self.list_model_attempts(operation_id)[-1]
-
-    @_store_operation
-    def expire_model_attempt_dispatch(
-        self,
-        *,
-        operation_id: str,
-        now: float | None = None,
-    ) -> ModelAttemptSnapshot:
-        observed_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if operation["status"] != "dispatched":
-                raise RuntimeError("only a dispatched model attempt can expire")
-            attempt = self._connection.execute(
-                "SELECT * FROM model_attempts WHERE attempt_id = ?",
-                (operation["active_attempt_id"],),
-            ).fetchone()
-            if attempt is None:
-                raise RuntimeError("active model attempt projection is missing")
-            expires_at = attempt["lease_expires_at"]
-            if expires_at is None or observed_at <= float(expires_at):
-                raise RuntimeError("model attempt dispatch lease has not expired")
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_attempt_unknown",
-                producer="recovery",
-                payload={
-                    "operation_id": operation_id,
-                    "attempt_id": attempt["attempt_id"],
-                    "generation": attempt["generation"],
-                    "reason": "dispatch lease expired",
-                    "observed_at": observed_at,
-                },
-            )
-            self._append_budget_outcome(
-                operation=operation,
-                attempt_id=str(attempt["attempt_id"]),
-                outcome="unknown",
-                producer="recovery",
-            )
-            turn = self._connection.execute(
-                "SELECT status FROM turns WHERE turn_id = ?",
-                (operation["turn_id"],),
-            ).fetchone()
-            if turn is not None and turn["status"] == "running":
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="turn_interrupted",
-                    producer="recovery",
-                    payload={
-                        "turn_id": operation["turn_id"],
-                        "operation_id": operation_id,
-                        "reason": "model outcome unknown after lease expiry",
-                    },
-                )
-        return self.list_model_attempts(operation_id)[-1]
-
-    @_store_operation
-    def start_model_output_channel(
-        self,
-        *,
-        operation_id: str,
-        attempt_id: str,
-        generation: int,
-        channel: str,
-    ) -> ItemSnapshot:
-        kind_by_channel = {
-            "agent_message": "model_response",
-            "reasoning": "model_reasoning",
-            "plan": "model_plan",
-        }
-        kind = kind_by_channel.get(channel)
-        if kind is None:
-            raise ValueError(f"unsupported model output channel: {channel}")
-        selected_item_id: str | None = None
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if json.loads(operation["request_ref_json"]).get("purpose") == "context_summary":
-                raise RuntimeError("context summary must not publish model output channels")
-            if not (
-                operation["status"] == "dispatched"
-                and operation["active_attempt_id"] == attempt_id
-                and operation["generation"] == generation
-            ):
-                raise RuntimeError("model output channel requires the active dispatched attempt")
-            existing = self._connection.execute(
-                """
-                SELECT payload_json
-                FROM rollout_records
-                WHERE turn_id = ?
-                  AND record_type = 'item_started'
-                  AND json_extract(payload_json, '$.attempt_id') = ?
-                  AND json_extract(payload_json, '$.channel') = ?
-                ORDER BY record_id
-                """,
-                (operation["turn_id"], attempt_id, channel),
-            ).fetchall()
-            if len(existing) > 1:
-                raise RuntimeError("model output channel has duplicate durable starts")
-            if existing:
-                payload = json.loads(existing[0]["payload_json"])
-                selected_item_id = str(payload["item_id"])
-            else:
-                selected_item_id = f"item_{uuid4().hex}"
-                public_item_id = derive_model_public_item_id(
-                    turn_id=str(operation["turn_id"]),
-                    model_attempt_id=attempt_id,
-                    channel=channel,
-                )
-                self._append_and_reduce(
-                    thread_id=str(operation["thread_id"]),
-                    turn_id=str(operation["turn_id"]),
-                    record_type="item_started",
-                    producer="model",
-                    payload={
-                        "item_id": selected_item_id,
-                        "kind": kind,
-                        "attempt_id": attempt_id,
-                        "channel": channel,
-                        "public_item_id": public_item_id,
-                    },
-                )
-        if selected_item_id is None:
-            raise RuntimeError("model output channel start lost its Item identity")
-        return self.read_item(selected_item_id)
-
-    @_store_operation
-    def mark_model_attempt_unknown(
-        self,
-        *,
-        operation_id: str,
-        attempt_id: str,
-        generation: int,
-        error_type: str | None = None,
-        error_message: str | None = None,
-        channel_content: Mapping[str, str] | None = None,
-    ) -> ModelAttemptSnapshot:
-        if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
-            raise ValueError("model dispatch error_type must be non-empty")
-        if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
-            raise ValueError("model dispatch error_message must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if not (
-                operation["status"] == "dispatched"
-                and operation["active_attempt_id"] == attempt_id
-                and operation["generation"] == generation
-            ):
-                raise RuntimeError("only the active dispatched model attempt can become unknown")
-            payload: dict[str, Any] = {
-                "operation_id": operation_id,
-                "attempt_id": attempt_id,
-                "generation": generation,
-            }
-            if error_type is not None:
-                payload["error_type"] = error_type.strip()
-            if error_message is not None:
-                payload["error_message"] = error_message.strip()[:2_000]
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_attempt_unknown",
-                producer="runtime",
-                payload=payload,
-            )
-            self._append_budget_outcome(
-                operation=operation,
-                attempt_id=attempt_id,
-                outcome="unknown",
-            )
-            self._close_started_model_output_channels(
-                operation=operation,
-                attempt_id=attempt_id,
-                status="outcome_unknown",
-                error=(error_message.strip()[:2_000] if error_message is not None else "model outcome is unknown"),
-                channel_content=frozen_channel_content,
-            )
-            turn = self._connection.execute(
-                "SELECT status FROM turns WHERE turn_id = ?", (operation["turn_id"],)
-            ).fetchone()
-            if turn is not None and turn["status"] == "running":
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="turn_interrupted",
-                    producer="runtime",
-                    payload={
-                        "turn_id": operation["turn_id"],
-                        "operation_id": operation_id,
-                        "reason": "outcome_unknown",
-                    },
-                )
-        return self.list_model_attempts(operation_id)[-1]
-
-    @_store_operation
-    def reject_model_attempt(
-        self,
-        *,
-        operation_id: str,
-        attempt_id: str,
-        generation: int,
-        reason: str,
-        error_type: str | None = None,
-        error_message: str | None = None,
-        channel_content: Mapping[str, str] | None = None,
-        budget_outcome: str = "released",
-    ) -> ModelAttemptSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("model rejection reason must be non-empty")
-        if budget_outcome not in {"released", "unknown"}:
-            raise ValueError("model rejection budget_outcome is unsupported")
-        if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
-            raise ValueError("model rejection error_type must be non-empty")
-        if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
-            raise ValueError("model rejection error_message must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if not (
-                operation["status"] == "dispatched"
-                and operation["active_attempt_id"] == attempt_id
-                and operation["generation"] == generation
-            ):
-                raise RuntimeError("only the active dispatched model attempt can be rejected")
-            payload: dict[str, Any] = {
-                "operation_id": operation_id,
-                "attempt_id": attempt_id,
-                "generation": generation,
-                "reason": reason,
-            }
-            if error_type is not None:
-                payload["error_type"] = error_type.strip()[:120]
-            if error_message is not None:
-                payload["error_message"] = error_message.strip()[:2_000]
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_attempt_rejected",
-                producer="runtime",
-                payload=payload,
-            )
-            self._append_budget_outcome(
-                operation=operation,
-                attempt_id=attempt_id,
-                outcome=budget_outcome,
-            )
-            self._close_started_model_output_channels(
-                operation=operation,
-                attempt_id=attempt_id,
-                status="failed",
-                error=(error_message.strip()[:2_000] if error_message is not None else reason.strip()[:2_000]),
-                channel_content=frozen_channel_content,
-            )
-        return self.list_model_attempts(operation_id)[-1]
-
-    def _close_started_model_output_channels(
-        self,
-        *,
-        operation: sqlite3.Row,
-        attempt_id: str,
-        status: str,
-        error: str,
-        channel_content: Mapping[str, str],
-    ) -> None:
-        if status not in {"failed", "cancelled", "outcome_unknown"}:
-            raise ValueError("model Item terminal status is unsupported")
-        started = self._connection.execute(
-            """
-            SELECT payload_json
-            FROM rollout_records
-            WHERE turn_id = ?
-              AND record_type = 'item_started'
-              AND json_extract(payload_json, '$.attempt_id') = ?
-              AND json_extract(payload_json, '$.channel') IN (
-                  'agent_message', 'reasoning', 'plan'
-              )
-            ORDER BY record_id
-            """,
-            (operation["turn_id"], attempt_id),
-        ).fetchall()
-        seen_channels: set[str] = set()
-        for row in started:
-            start_payload = json.loads(row["payload_json"])
-            channel = str(start_payload["channel"])
-            if channel in seen_channels:
-                raise RuntimeError(f"model {channel} channel has duplicate durable starts")
-            seen_channels.add(channel)
-            item_id = str(start_payload["item_id"])
-            completed = self._connection.execute(
-                """
-                SELECT 1
-                FROM rollout_records
-                WHERE turn_id = ?
-                  AND record_type = 'item_completed'
-                  AND json_extract(payload_json, '$.item_id') = ?
-                LIMIT 1
-                """,
-                (operation["turn_id"], item_id),
-            ).fetchone()
-            if completed is not None:
-                continue
-            content = channel_content.get(channel, "")
-            item_payload: dict[str, Any]
-            if channel == "agent_message":
-                item_payload = {"text": content, "tool_calls": ()}
-            else:
-                item_payload = {"content": content}
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="item_completed",
-                producer="model",
-                payload={
-                    "item_id": item_id,
-                    "attempt_id": attempt_id,
-                    "channel": channel,
-                    "public_item_id": derive_model_public_item_id(
-                        turn_id=str(operation["turn_id"]),
-                        model_attempt_id=attempt_id,
-                        channel=channel,
-                    ),
-                    "status": status,
-                    "error": error,
-                    "payload": item_payload,
-                },
-            )
-
-    @_store_operation
-    def cancel_model_attempt(
-        self,
-        *,
-        operation_id: str,
-        attempt_id: str,
-        generation: int,
-        reason: str,
-        channel_content: Mapping[str, str] | None = None,
-    ) -> ModelAttemptSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("model cancellation reason must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if not (
-                operation["status"] == "dispatched"
-                and operation["active_attempt_id"] == attempt_id
-                and operation["generation"] == generation
-            ):
-                raise RuntimeError("only the active dispatched model attempt can be cancelled")
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="model_attempt_cancelled",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "attempt_id": attempt_id,
-                    "generation": generation,
-                    "reason": reason.strip()[:2_000],
-                },
-            )
-            # Provider-side cancellation does not prove zero billing. Keep the
-            # reservation as uncertain exposure unless usage is later reconciled.
-            self._append_budget_outcome(
-                operation=operation,
-                attempt_id=attempt_id,
-                outcome="unknown",
-            )
-            self._close_started_model_output_channels(
-                operation=operation,
-                attempt_id=attempt_id,
-                status="cancelled",
-                error=reason.strip()[:2_000],
-                channel_content=frozen_channel_content,
-            )
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="turn_cancelled",
-                producer="runtime",
-                payload={
-                    "turn_id": str(operation["turn_id"]),
-                    "reason": reason.strip()[:2_000],
-                },
-            )
-        return self.list_model_attempts(operation_id)[-1]
-
-    @_store_operation
-    def prepare_model_retry(self, operation_id: str) -> ModelAttemptSnapshot:
-        row = self._connection.execute("SELECT turn_id FROM model_operations WHERE operation_id = ?",
-                                       (operation_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"unknown model operation: {operation_id}")
-        self._assert_artifact_integrity(str(row["turn_id"]))
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            if operation["status"] != "unknown":
-                raise RuntimeError(f"model operation is not unknown: {operation_id}")
-            attempt_id = f"attempt_{uuid4().hex}"
-            generation = operation["generation"] + 1
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_retry_prepared",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "previous_attempt_id": operation["active_attempt_id"],
-                    "attempt_id": attempt_id,
-                    "generation": generation,
-                    "public_item_ids": _model_public_item_ids(
-                        turn_id=str(operation["turn_id"]),
-                        attempt_id=attempt_id,
-                    ),
-                },
-            )
-            turn = self._connection.execute(
-                "SELECT status FROM turns WHERE turn_id = ?",
-                (operation["turn_id"],),
-            ).fetchone()
-            if turn is None or turn["status"] not in {"paused", "interrupted"}:
-                raise RuntimeError("model retry requires a paused or interrupted Turn")
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="turn_resumed",
-                producer="runtime",
-                payload={
-                    "turn_id": operation["turn_id"],
-                    "operation_id": operation_id,
-                },
-            )
-        return self.list_model_attempts(operation_id)[-1]
-
-    @_store_operation
-    def complete_model_attempt(
-        self,
-        *,
-        operation_id: str,
-        attempt_id: str,
-        generation: int,
-        text: str,
-        provider_response_id: str | None,
-        usage: Mapping[str, Any],
-        tool_calls: tuple[Mapping[str, Any], ...] = (),
-        response_status: str = "completed",
-        incomplete_reason: str | None = None,
-        reasoning_content: str | None = None,
-        plan_content: str | None = None,
-        now: float | None = None,
-    ) -> bool:
-        if not isinstance(text, str):
-            raise TypeError("model response text must be a string")
-        frozen_tool_calls = tuple(_json_object(call, field="model tool call") for call in tool_calls)
-        if response_status not in {"completed", "incomplete"}:
-            raise ValueError("model response status is unsupported")
-        if response_status == "completed" and incomplete_reason is not None:
-            raise ValueError("completed model response cannot have an incomplete reason")
-        if response_status == "incomplete" and (
-            not isinstance(incomplete_reason, str) or not incomplete_reason.strip()
-        ):
-            raise ValueError("incomplete model response requires a reason")
-        if response_status == "completed" and not text.strip() and not frozen_tool_calls:
-            raise ValueError("model response must contain text or tool calls")
-        for channel, content in (
-            ("reasoning", reasoning_content),
-            ("plan", plan_content),
-        ):
-            if content is not None and not isinstance(content, str):
-                raise TypeError(f"model {channel} content must be a string or None")
-        frozen_usage = _json_object(usage, field="usage")
-        response_item_id: str | None = None
-        observed_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM model_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown model operation: {operation_id}")
-            # Durable state is the fencing authority. Lease expiry only opens
-            # the recovery takeover (expire_model_attempt_dispatch), which
-            # flips the status to unknown inside the same serialized
-            # transaction. While the operation still points at this attempt
-            # and generation with no committed response, this completion is
-            # authoritative even past the lease clock: a billed response must
-            # not be dropped on a timing boundary.
-            is_current = (
-                operation["status"] == "dispatched"
-                and operation["active_attempt_id"] == attempt_id
-                and operation["generation"] == generation
-                and operation["response_item_id"] is None
-            )
-            if not is_current:
-                return False
-            internal_summary = json.loads(operation["request_ref_json"]).get("purpose") == "context_summary"
-            started_channels = self._connection.execute(
-                """
-                SELECT payload_json
-                FROM rollout_records
-                WHERE turn_id = ?
-                  AND record_type = 'item_started'
-                  AND json_extract(payload_json, '$.attempt_id') = ?
-                  AND json_extract(payload_json, '$.channel') IN (
-                      'agent_message', 'reasoning', 'plan'
-                  )
-                ORDER BY record_id
-                """,
-                (operation["turn_id"], attempt_id),
-            ).fetchall()
-            started_by_channel: dict[str, Mapping[str, Any]] = {}
-            for row in started_channels:
-                payload = json.loads(row["payload_json"])
-                channel = str(payload["channel"])
-                if channel in started_by_channel:
-                    raise RuntimeError(f"model {channel} channel has duplicate durable starts")
-                started_by_channel[channel] = payload
-            if internal_summary and started_by_channel:
-                raise RuntimeError("context summary must not have public output channels")
-            started_response = started_by_channel.get("agent_message")
-            if started_response is not None:
-                response_item_id = str(started_response["item_id"])
-            else:
-                response_item_id = f"item_{uuid4().hex}"
-            public_item_id = derive_model_public_item_id(
-                turn_id=str(operation["turn_id"]),
-                model_attempt_id=attempt_id,
-                channel="agent_message",
-            )
-            public_metadata = (
-                {}
-                if internal_summary
-                else {
-                    "channel": "agent_message",
-                    "public_item_id": public_item_id,
-                }
-            )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="model_attempt_completed",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "attempt_id": attempt_id,
-                    "generation": generation,
-                    "observed_at": observed_at,
-                    "provider_response_id": provider_response_id,
-                    "usage": frozen_usage,
-                    "response_item_id": response_item_id,
-                    **({} if internal_summary else {"public_item_id": public_item_id}),
-                },
-            )
-            self._append_budget_outcome(
-                operation=operation,
-                attempt_id=attempt_id,
-                outcome="settled",
-                usage=frozen_usage,
-            )
-            if started_response is None:
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="item_started",
-                    producer="model",
-                    payload={
-                        "item_id": response_item_id,
-                        "kind": "context_summary_response" if internal_summary else "model_response",
-                        "attempt_id": attempt_id,
-                        **public_metadata,
-                    },
-                )
-            result_order = self.read_turn(str(operation["turn_id"])).binding_manifest.get(
-                "execution_context_policy", {},
-            ).get("tool_result_order")
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="item_completed",
-                producer="model",
-                payload={
-                    "item_id": response_item_id,
-                    "attempt_id": attempt_id,
-                    **public_metadata,
-                    "payload": {
-                        "text": text,
-                        "tool_calls": frozen_tool_calls,
-                        **({"tool_result_order": "call-v1"} if result_order == "call-v1" else {}),
-                        "provider_response_id": provider_response_id,
-                        "usage": frozen_usage,
-                        "response_status": response_status,
-                        "incomplete_reason": incomplete_reason,
-                        **({"reasoning_content": reasoning_content} if reasoning_content else {}),
-                    },
-                },
-            )
-            for channel, content in (
-                ("reasoning", reasoning_content),
-                ("plan", plan_content),
-            ):
-                started = started_by_channel.get(channel)
-                if started is None:
-                    continue
-                public_channel_item_id = derive_model_public_item_id(
-                    turn_id=str(operation["turn_id"]),
-                    model_attempt_id=attempt_id,
-                    channel=channel,
-                )
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="item_completed",
-                    producer="model",
-                    payload={
-                        "item_id": str(started["item_id"]),
-                        "attempt_id": attempt_id,
-                        "channel": channel,
-                        "public_item_id": public_channel_item_id,
-                        "payload": {"content": content or ""},
-                    },
-                )
-        return True
-
-    @_store_operation
-    def list_model_operations(self, turn_id: str | None = None) -> tuple[ModelOperationSnapshot, ...]:
-        if turn_id is None:
-            rows = self._connection.execute("SELECT * FROM model_operations ORDER BY rowid").fetchall()
-        else:
-            rows = self._connection.execute(
-                "SELECT * FROM model_operations WHERE turn_id = ? ORDER BY rowid",
-                (turn_id,),
-            ).fetchall()
-        return tuple(_model_operation_snapshot(row) for row in rows)
-
-    @_store_operation
-    def list_model_attempts(self, operation_id: str) -> tuple[ModelAttemptSnapshot, ...]:
-        rows = self._connection.execute(
-            "SELECT * FROM model_attempts WHERE operation_id = ? ORDER BY generation",
-            (operation_id,),
-        ).fetchall()
-        return tuple(_model_attempt_snapshot(row) for row in rows)
-
-    @_store_operation
-    def start_budgeted_child_turn(
-        self,
-        *,
-        parent_turn_id: str,
-        child_thread_id: str,
-        child_turn_id: str,
-        user_message: str,
-        binding_manifest: Mapping[str, Any],
-        requested_tokens: int | None,
-        requested_cost_micros: int | None,
-    ) -> TurnSnapshot:
-        """Atomically carve a child budget from the parent and start its Turn.
-
-        The allocation record and child Turn live on the child Thread so this
-        mutation remains one canonical Thread batch while SQLite's write lock
-        serializes competing allocations from the same parent.
-        """
-
-        if not isinstance(parent_turn_id, str) or not parent_turn_id.strip():
-            raise ValueError("parent_turn_id must be non-empty")
-        if not isinstance(child_thread_id, str) or not child_thread_id.strip():
-            raise ValueError("child_thread_id must be non-empty")
-        if not isinstance(child_turn_id, str) or not child_turn_id.strip():
-            raise ValueError("child_turn_id must be non-empty")
-        if requested_tokens is not None and (
-            isinstance(requested_tokens, bool) or not isinstance(requested_tokens, int) or requested_tokens < 1
-        ):
-            raise ValueError("requested child token budget must be positive or None")
-        if requested_cost_micros is not None and (
-            isinstance(requested_cost_micros, bool)
-            or not isinstance(requested_cost_micros, int)
-            or requested_cost_micros < 1
-        ):
-            raise ValueError("requested child cost budget must be positive or None")
-        frozen_binding = _json_object(binding_manifest, field="binding_manifest")
-        allocation_id = f"child_budget_{child_turn_id}"
-
-        with self._transaction():
-            parent = self._connection.execute(
-                """
-                SELECT turns.*, threads.workspace
-                FROM turns
-                JOIN threads ON threads.thread_id = turns.thread_id
-                WHERE turns.turn_id = ?
-                """,
-                (parent_turn_id,),
-            ).fetchone()
-            if parent is None:
-                raise KeyError(f"unknown parent Turn: {parent_turn_id}")
-            if parent["status"] != "running":
-                raise RuntimeError("child budget can only be allocated from a running parent Turn")
-
-            parent_state = self.read_budget_state(parent_turn_id)
-            remaining = normal_token_remaining(parent_state)
-            if remaining is not None:
-                if requested_tokens is None:
-                    if remaining < 1:
-                        limit = parent_state.limits.tokens
-                        if limit is None:
-                            raise RuntimeError("parent token limit disappeared")
-                        raise BudgetLimitExceededError(
-                            resource="tokens",
-                            limit=limit,
-                            current_exposure=limit,
-                            requested=1,
-                        )
-                    granted_tokens: int | None = remaining
-                else:
-                    if requested_tokens > remaining:
-                        limit = parent_state.limits.tokens
-                        if limit is None:
-                            raise RuntimeError("parent token limit disappeared")
-                        raise BudgetLimitExceededError(
-                            resource="tokens",
-                            limit=limit,
-                            current_exposure=limit - remaining,
-                            requested=requested_tokens,
-                        )
-                    granted_tokens = requested_tokens
-            else:
-                granted_tokens = requested_tokens
-
-            remaining_cost = parent_state.remaining("cost_micros")
-            if remaining_cost is not None:
-                if requested_cost_micros is None:
-                    raise ValueError("child cost budget is required when the parent Turn has a cost cap")
-                if requested_cost_micros > remaining_cost:
-                    limit = parent_state.limits.cost_micros
-                    if limit is None:
-                        raise RuntimeError("parent cost limit disappeared")
-                    raise BudgetLimitExceededError(
-                        resource="cost_micros",
-                        limit=limit,
-                        current_exposure=limit - remaining_cost,
-                        requested=requested_cost_micros,
-                    )
-                granted_cost_micros: int | None = requested_cost_micros
-            else:
-                granted_cost_micros = requested_cost_micros
-
-            self.create_thread(
-                workspace=Path(str(parent["workspace"])),
-                thread_id=child_thread_id,
-            )
-            root_turn_id = parent_turn_id
-            parent_binding = json.loads(parent["binding_manifest_json"])
-            inherited_root = parent_binding.get("budget_root_turn_id")
-            if isinstance(inherited_root, str) and inherited_root:
-                root_turn_id = inherited_root
-            child_binding = dict(frozen_binding)
-            child_binding["budget_root_turn_id"] = root_turn_id
-            child_binding["budget_parent_turn_id"] = parent_turn_id
-            child_binding["budget_allocation_id"] = allocation_id
-            child_binding["model_token_budget_total"] = granted_tokens
-            child_binding["model_cost_budget_total_micros"] = granted_cost_micros
-
-            self._append_and_reduce(
-                thread_id=child_thread_id,
-                turn_id=None,
-                record_type="budget_child_allocated",
-                producer="runtime",
-                payload={
-                    "allocation_id": allocation_id,
-                    "parent_turn_id": parent_turn_id,
-                    "child_turn_id": child_turn_id,
-                    "allocated_tokens": granted_tokens,
-                    "allocated_cost_micros": granted_cost_micros,
-                },
-            )
-            self.start_turn(
-                thread_id=child_thread_id,
-                turn_id=child_turn_id,
-                user_message=user_message,
-                binding_manifest=child_binding,
-            )
-        return self.read_turn(child_turn_id)
-
-    @_store_operation
-    def settle_child_budget(self, *, child_turn_id: str) -> Mapping[str, Any]:
-        """Convert one terminal child's allocation into its actual subtree usage."""
-
-        with self._transaction():
-            row = self._connection.execute(
-                "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
-                (child_turn_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"child Turn has no parent budget allocation: {child_turn_id}")
-            if row["status"] == "settled":
-                return self.read_child_budget_allocation(child_turn_id)
-            if row["status"] != "active":
-                raise RuntimeError("child budget allocation is not active")
-            turn = self.read_turn(child_turn_id)
-            if turn.status not in {"completed", "failed", "cancelled"}:
-                raise RuntimeError("child budget can only settle after a terminal Turn")
-            state = self.read_budget_state(child_turn_id)
-            zero = ResourceUsage()
-            if state.reserved != zero or state.uncertain != zero or state.child_reserved != zero:
-                raise RuntimeError("child budget still has unresolved exposure")
-            actual = state.used + ResourceUsage(subagents=1)
-            self._append_and_reduce(
-                thread_id=str(row["thread_id"]),
-                turn_id=child_turn_id,
-                record_type="budget_child_settled",
-                producer="runtime",
-                payload={
-                    "allocation_id": str(row["allocation_id"]),
-                    "actual": actual.to_dict(),
-                },
-            )
-        return self.read_child_budget_allocation(child_turn_id)
-
-    @_store_operation
-    def read_child_budget_allocation(self, child_turn_id: str) -> Mapping[str, Any]:
-        row = self._connection.execute(
-            "SELECT * FROM child_budget_allocations WHERE child_turn_id = ?",
-            (child_turn_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"child Turn has no parent budget allocation: {child_turn_id}")
-        return MappingProxyType(
-            {
-                "allocation_id": str(row["allocation_id"]),
-                "parent_turn_id": str(row["parent_turn_id"]),
-                "child_turn_id": str(row["child_turn_id"]),
-                "allocated_tokens": row["allocated_tokens"],
-                "allocated_cost_micros": row["allocated_cost_micros"],
-                "actual": ResourceUsage.from_dict(json.loads(row["actual_json"])),
-                "status": str(row["status"]),
-            }
-        )
-
-    @_store_operation
-    def read_budget_state(self, turn_id: str) -> BudgetState:
-        """Derive the Turn budget from durable reservations and tool executions."""
-
-        turn = self.read_turn(turn_id)
-        raw_limit = turn.binding_manifest.get("model_token_budget_total")
-        if raw_limit is None:
-            token_limit: int | None = None
-        elif isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 0:
-            raise RuntimeError("frozen model token budget is invalid")
-        else:
-            token_limit = raw_limit
-
-        raw_cost_limit = turn.binding_manifest.get("model_cost_budget_total_micros")
-        if raw_cost_limit is None:
-            cost_limit: int | None = None
-        elif isinstance(raw_cost_limit, bool) or not isinstance(raw_cost_limit, int) or raw_cost_limit < 0:
-            raise RuntimeError("frozen model cost budget is invalid")
-        else:
-            cost_limit = raw_cost_limit
-
-        used = ResourceUsage()
-        reserved = ResourceUsage()
-        uncertain = ResourceUsage()
-        child_reserved = ResourceUsage()
-        tracked_attempt_ids: set[str] = set()
-        rows = self._connection.execute(
-            "SELECT * FROM budget_reservations WHERE turn_id = ? ORDER BY rowid",
-            (turn_id,),
-        ).fetchall()
-        for row in rows:
-            tracked_attempt_ids.add(str(row["attempt_id"]))
-            reserved_usage = ResourceUsage.from_dict(json.loads(row["reserved_json"]))
-            status = ReservationStatus(str(row["status"]))
-            if status in {ReservationStatus.RESERVED, ReservationStatus.DISPATCHED}:
-                reserved = reserved + reserved_usage
-            elif status is ReservationStatus.UNKNOWN:
-                uncertain = uncertain + reserved_usage
-            elif status is ReservationStatus.SETTLED:
-                used = used + ResourceUsage.from_dict(json.loads(row["actual_json"]))
-
-        # Compatibility for Turns created before durable reservations existed.
-        # Once an attempt is tracked by a reservation, its usage is sourced only
-        # from that reservation projection to avoid double-counting.
-        for operation in self.list_model_operations(turn_id):
-            for attempt in self.list_model_attempts(operation.operation_id):
-                if attempt.attempt_id in tracked_attempt_ids or attempt.status != "completed":
-                    continue
-                used = used + resource_usage_from_model_usage(attempt.usage)
-
-        # Claims count execution attempts, including failed/unknown outcomes.
-        # Result Items can be replaced during reconciliation, so they are not
-        # counters. Fenced outcomes preserve each observed duration only once.
-        tool_ms = sum(
-            float(record.payload.get("duration_ms") or 0)
-            for record in self.list_records(turn.thread_id)
-            if record.turn_id == turn_id
-            and record.record_type == "tool_operation_outcome_committed"
-        )
-        used = used + ResourceUsage(
-            tool_calls=sum(operation.attempt_count for operation in self.list_tool_operations(turn_id)),
-            tool_ms=round(tool_ms),
-        )
-
-        for row in self._connection.execute(
-            "SELECT * FROM child_budget_allocations WHERE parent_turn_id = ? ORDER BY rowid",
-            (turn_id,),
-        ):
-            if row["status"] == "active":
-                allocated_tokens = row["allocated_tokens"]
-                if allocated_tokens is not None:
-                    if (
-                        isinstance(allocated_tokens, bool)
-                        or not isinstance(allocated_tokens, int)
-                        or allocated_tokens < 0
-                    ):
-                        raise RuntimeError("durable child token allocation is invalid")
-                child_reserved = child_reserved + ResourceUsage(
-                    # Child allocations reserve fungible total-token capacity.
-                    # input_tokens is only the carrier so ResourceUsage.total_tokens
-                    # can participate in the existing BudgetState arithmetic.
-                    input_tokens=allocated_tokens or 0,
-                    cost_micros=(row["allocated_cost_micros"] or 0),
-                    subagents=1,
-                )
-            elif row["status"] == "settled":
-                used = used + ResourceUsage.from_dict(json.loads(row["actual_json"]))
-            else:
-                raise RuntimeError("durable child budget status is unsupported")
-
-        parent_scope_id = turn.binding_manifest.get("budget_parent_turn_id")
-        if not isinstance(parent_scope_id, str) or not parent_scope_id:
-            parent_scope_id = None
-        return BudgetState(
-            scope_id=turn_id,
-            parent_scope_id=parent_scope_id,
-            limits=BudgetLimits(tokens=token_limit, cost_micros=cost_limit),
-            used=used,
-            reserved=reserved,
-            uncertain=uncertain,
-            child_reserved=child_reserved,
-        )
-
-    @_store_operation
-    def read_budget_reservation(self, attempt_id: str) -> BudgetReservation:
-        row = self._budget_reservation_row_for_attempt(attempt_id)
-        if row is None:
-            raise KeyError(f"model attempt has no budget reservation: {attempt_id}")
-        return BudgetReservation(
-            reservation_id=str(row["reservation_id"]),
-            scope_id=str(row["scope_id"]),
-            operation_id=str(row["operation_id"]),
-            attempt_id=str(row["attempt_id"]),
-            reserved=ResourceUsage.from_dict(json.loads(row["reserved_json"])),
-            status=ReservationStatus(str(row["status"])),
-        )
-
-    def _budget_reservation_row_for_attempt(
-        self,
-        attempt_id: str,
-    ) -> sqlite3.Row | None:
-        row = self._connection.execute(
-            "SELECT * FROM budget_reservations WHERE attempt_id = ?",
-            (attempt_id,),
-        ).fetchone()
-        if row is not None and not isinstance(row, sqlite3.Row):
-            raise RuntimeError("budget reservation query returned an invalid row")
-        return row
-
-    def _append_budget_outcome(
-        self,
-        *,
-        operation: sqlite3.Row,
-        attempt_id: str,
-        outcome: str,
-        usage: Mapping[str, Any] | None = None,
-        producer: str = "runtime",
-    ) -> None:
-        row = self._budget_reservation_row_for_attempt(attempt_id)
-        if row is None:
-            return
-        reservation_id = str(row["reservation_id"])
-        status = ReservationStatus(str(row["status"]))
-        if outcome == "settled":
-            if status not in {
-                ReservationStatus.RESERVED,
-                ReservationStatus.DISPATCHED,
-                ReservationStatus.UNKNOWN,
-            }:
-                raise RuntimeError("budget reservation cannot be settled")
-            if usage is None:
-                raise RuntimeError("settled budget requires provider usage")
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="budget_settled",
-                producer=producer,
-                payload={
-                    "reservation_id": reservation_id,
-                    "actual": resource_usage_from_model_usage(usage).to_dict(),
-                },
-            )
-            return
-        if outcome == "released":
-            if status not in {
-                ReservationStatus.RESERVED,
-                ReservationStatus.DISPATCHED,
-                ReservationStatus.UNKNOWN,
-            }:
-                raise RuntimeError("budget reservation cannot be released")
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="budget_released",
-                producer=producer,
-                payload={"reservation_id": reservation_id},
-            )
-            return
-        if outcome == "unknown":
-            if status is ReservationStatus.UNKNOWN:
-                return
-            if status is not ReservationStatus.DISPATCHED:
-                raise RuntimeError("only a dispatched budget can become unknown")
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="budget_unknown",
-                producer=producer,
-                payload={"reservation_id": reservation_id},
-            )
-            return
-        raise ValueError(f"unsupported budget outcome: {outcome}")
-
-    @_store_operation
-    def record_tool_call(
-        self,
-        *,
-        turn_id: str,
-        tool_call_id: str,
-        tool_name: str,
-        arguments: Mapping[str, Any],
-        origin: Mapping[str, Any],
-        argument_error: str | None = None,
-    ) -> ItemSnapshot:
-        if not tool_call_id or not tool_name:
-            raise ValueError("tool call identity must be non-empty")
-        frozen_arguments = _json_object(arguments, field="tool arguments")
-        frozen_origin = _json_object(origin, field="tool call origin")
-        expected_payload = {
-            "tool_call_id": tool_call_id,
-            "tool_name": tool_name,
-            "arguments": frozen_arguments,
-            "origin": frozen_origin,
-        }
-        if argument_error is not None:
-            if not isinstance(argument_error, str):
-                raise TypeError("argument_error must be a string or None")
-            expected_payload["argument_error"] = argument_error
-        item_id: str | None = None
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            matches = self._connection.execute(
-                """
-                SELECT item_id, payload_json, status FROM items
-                WHERE turn_id = ? AND kind = 'tool_call'
-                ORDER BY sequence
-                """,
-                (turn_id,),
-            ).fetchall()
-            same_identity = [
-                row for row in matches if json.loads(row["payload_json"]).get("tool_call_id") == tool_call_id
-            ]
-            if len(same_identity) > 1:
-                raise RuntimeError("tool call identity has multiple canonical Items")
-            if same_identity:
-                existing = same_identity[0]
-                if existing["status"] != "completed" or _canonical_json(
-                    json.loads(existing["payload_json"])
-                ) != _canonical_json(expected_payload):
-                    raise RuntimeError("tool call identity conflicts with committed payload")
-                item_id = str(existing["item_id"])
-            else:
-                item_id = f"item_{uuid4().hex}"
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_started",
-                    producer="model",
-                    payload={"item_id": item_id, "kind": "tool_call"},
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_completed",
-                    producer="model",
-                    payload={"item_id": item_id, "payload": expected_payload},
-                )
-        if item_id is None:
-            raise RuntimeError("tool call Item identity was not resolved")
-        return self.read_item(item_id)
-
-    @_store_operation
-    def record_tool_execution_state(
-        self,
-        *,
-        turn_id: str,
-        operation_id: str,
-        tool_call_id: str,
-        tool_name: str,
-        arguments_digest: str,
-        execution_revision: str,
-        idempotent: bool,
-        status: str,
-        attempt_count: int,
-        error_code: str | None,
-        requires_reconciliation: bool,
-        effects: tuple[str, ...] = (),
-        resources: tuple[Mapping[str, Any], ...] = (),
-    ) -> ToolOperationSnapshot:
-        allowed = {"prepared", "ready"}
-        if status not in allowed:
-            raise ValueError(f"unsupported tool operation status: {status}")
-        frozen_effects = _string_tuple(effects, field="tool effects")
-        frozen_resources = _resource_tuple(resources)
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            existing = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            payload = {
-                "operation_id": operation_id,
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "arguments_digest": arguments_digest,
-                "execution_revision": execution_revision,
-                "effects": frozen_effects,
-                "resources": frozen_resources,
-                "idempotent": idempotent,
-                "status": status,
-                "attempt_count": attempt_count,
-                "error_code": error_code,
-                "requires_reconciliation": requires_reconciliation,
-            }
-            if existing is None:
-                if status != "prepared":
-                    raise RuntimeError("first durable tool operation state must be prepared")
-                prior_call = self._connection.execute(
-                    "SELECT operation_id FROM tool_operations WHERE turn_id = ? AND tool_call_id = ?",
-                    (turn_id, tool_call_id),
-                ).fetchone()
-                if prior_call is not None:
-                    raise RuntimeError(f"tool call already has an operation: {prior_call['operation_id']}")
-                record_type = "tool_operation_prepared"
-            else:
-                immutable = {
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "arguments_digest": arguments_digest,
-                    "execution_revision": execution_revision,
-                    "idempotent": int(idempotent),
-                    "effects_json": _canonical_json(frozen_effects),
-                    "resources_json": _canonical_json(frozen_resources),
-                }
-                if any(existing[name] != value for name, value in immutable.items()):
-                    raise RuntimeError("tool operation identity changed across states")
-                current_status = str(existing["status"])
-                allowed_next = {"prepared": {"ready"}}
-                if current_status not in allowed_next:
-                    raise RuntimeError("prepared-state API cannot mutate claimed or terminal operation")
-                if status not in allowed_next[current_status]:
-                    raise RuntimeError(f"invalid tool operation transition: {current_status} -> {status}")
-                if attempt_count < int(existing["attempt_count"]):
-                    raise RuntimeError("tool operation attempt count cannot decrease")
-                record_type = "tool_operation_status_changed"
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type=record_type,
-                producer="runtime",
-                payload=payload,
-            )
-        return self.read_tool_operation(operation_id)
-
-    @_store_operation
-    def claim_tool_operation(
-        self,
-        *,
-        operation_id: str,
-        worker_id: str,
-        lease_seconds: float,
-        now: float | None = None,
-    ) -> ToolOperationSnapshot:
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            raise ValueError("worker_id must be non-empty")
-        if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
-        self._assert_artifact_integrity(self.read_tool_operation(operation_id).turn_id)
-        claimed_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            if operation["status"] != "ready":
-                raise RuntimeError("only a ready tool operation can be claimed")
-            requested_resources = tuple(json.loads(operation["resources_json"]))
-            active_operations = self._connection.execute(
-                """
-                SELECT operation_id, resources_json
-                FROM tool_operations
-                WHERE operation_id != ? AND status IN ('running', 'unknown')
-                """,
-                (operation_id,),
-            ).fetchall()
-            for active in active_operations:
-                active_resources = tuple(json.loads(active["resources_json"]))
-                if _resource_sets_conflict(requested_resources, active_resources):
-                    raise ResourceClaimConflictError(
-                        f"resource claim conflict with operation: {active['operation_id']}"
-                    )
-            generation = int(operation["claim_generation"]) + 1
-            fencing_token = f"fence_{uuid4().hex}"
-            public_item_id = derive_operation_public_item_id(
-                turn_id=str(operation["turn_id"]),
-                operation_id=operation_id,
-                attempt_generation=generation,
-            )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="tool_operation_claimed",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "claim_generation": generation,
-                    "fencing_token": fencing_token,
-                    "claim_owner": worker_id,
-                    "lease_expires_at": claimed_at + lease_seconds,
-                    "attempt_count": int(operation["attempt_count"]) + 1,
-                    "public_item_id": public_item_id,
-                    "tool_name": str(operation["tool_name"]),
-                    "tool_call_id": str(operation["tool_call_id"]),
-                },
-            )
-        return self.read_tool_operation(operation_id)
-
-    @_store_operation
-    def reject_ready_tool_operation(
-        self,
-        *,
-        operation_id: str,
-        error_code: str,
-    ) -> ToolOperationSnapshot:
-        if not isinstance(error_code, str) or not error_code:
-            raise ValueError("start rejection error_code must be non-empty")
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            if operation["status"] != "ready":
-                raise RuntimeError("only a ready tool operation can be rejected")
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="tool_operation_start_rejected",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "status": "failed",
-                    "attempt_count": operation["attempt_count"],
-                    "error_code": error_code,
-                    "requires_reconciliation": False,
-                },
-            )
-        return self.read_tool_operation(operation_id)
-
-    @_store_operation
-    def expire_tool_operation_claim(
-        self,
-        *,
-        operation_id: str,
-        now: float | None = None,
-    ) -> ToolOperationSnapshot:
-        observed_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            if operation["status"] != "running":
-                raise RuntimeError("only a running tool operation claim can expire")
-            expires_at = operation["lease_expires_at"]
-            if expires_at is None or observed_at <= float(expires_at):
-                raise RuntimeError("tool operation claim has not expired")
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="tool_operation_claim_expired",
-                producer="recovery",
-                payload={
-                    "operation_id": operation_id,
-                    "claim_generation": operation["claim_generation"],
-                    "fencing_token": operation["fencing_token"],
-                    "observed_at": observed_at,
-                },
-            )
-            request_id = f"interaction_{uuid4().hex}"
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="interaction_requested",
-                producer="recovery",
-                payload={
-                    "request_id": request_id,
-                    "kind": "tool_reconciliation",
-                    "operation_id": operation_id,
-                    "request": {
-                        "reason": "tool outcome unknown after lease expiry",
-                        "claim_generation": operation["claim_generation"],
-                        "claim_owner": operation["claim_owner"],
-                        "idempotent": bool(operation["idempotent"]),
-                    },
-                },
-            )
-            turn = self._connection.execute(
-                "SELECT status FROM turns WHERE turn_id = ?",
-                (operation["turn_id"],),
-            ).fetchone()
-            if turn is not None and turn["status"] == "running":
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="turn_paused",
-                    producer="recovery",
-                    payload={
-                        "turn_id": operation["turn_id"],
-                        "operation_id": operation_id,
-                        "request_id": request_id,
-                        "reason": "tool outcome unknown after lease expiry",
-                    },
-                )
-        return self.read_tool_operation(operation_id)
-
-    @_store_operation
-    def mark_tool_result_missing(
-        self,
-        *,
-        operation_id: str,
-    ) -> InteractionSnapshot:
-        """Pause when execution outcome committed but its canonical result did not."""
-
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            if operation["status"] not in {"succeeded", "failed"}:
-                raise RuntimeError("missing-result recovery requires a committed execution outcome")
-            if operation["result_item_id"] is not None:
-                raise RuntimeError("tool operation already has a canonical result")
-            turn = self._connection.execute(
-                "SELECT status FROM turns WHERE turn_id = ?",
-                (operation["turn_id"],),
-            ).fetchone()
-            if turn is None or turn["status"] != "running":
-                raise RuntimeError("missing-result recovery requires a running Turn")
-            existing = self._connection.execute(
-                """
-                SELECT request_id FROM interactions
-                WHERE turn_id = ? AND kind = 'tool_reconciliation' AND status = 'pending'
-                """,
-                (operation["turn_id"],),
-            ).fetchall()
-            if existing:
-                raise RuntimeError("tool reconciliation is already pending")
-            prior_status = str(operation["status"])
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="tool_operation_result_missing",
-                producer="recovery",
-                payload={
-                    "operation_id": operation_id,
-                    "committed_execution_status": prior_status,
-                },
-            )
-            request_id = f"interaction_{uuid4().hex}"
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="interaction_requested",
-                producer="recovery",
-                payload={
-                    "request_id": request_id,
-                    "kind": "tool_reconciliation",
-                    "operation_id": operation_id,
-                    "request": {
-                        "reason": "tool execution outcome committed but ToolResult is missing",
-                        "committed_execution_status": prior_status,
-                        "idempotent": bool(operation["idempotent"]),
-                    },
-                },
-            )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="turn_paused",
-                producer="recovery",
-                payload={
-                    "turn_id": operation["turn_id"],
-                    "operation_id": operation_id,
-                    "request_id": request_id,
-                    "reason": "canonical ToolResult is missing after execution",
-                },
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def commit_tool_operation_outcome(
-        self,
-        *,
-        operation_id: str,
-        claim_generation: int,
-        fencing_token: str,
-        status: str,
-        attempt_count: int,
-        error_code: str | None,
-        requires_reconciliation: bool,
-        duration_ms: float | None = None,
-        now: float | None = None,
-    ) -> bool:
-        if status not in {"succeeded", "failed", "unknown"}:
-            raise ValueError(f"unsupported claimed tool outcome: {status}")
-        if duration_ms is not None and (
-            isinstance(duration_ms, bool)
-            or not isinstance(duration_ms, (int, float))
-            or not math.isfinite(duration_ms)
-            or duration_ms < 0
-        ):
-            raise ValueError("tool duration must be finite and non-negative")
-        observed_at = time.time() if now is None else float(now)
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (operation_id,),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            # Same fencing rule as model attempts: expiry only authorizes the
-            # recovery takeover, which rewrites the status to unknown under
-            # the same serialized transaction. A matching claim generation and
-            # fencing token on a still-running operation stay authoritative
-            # past the lease clock.
-            is_current = bool(
-                operation["status"] == "running"
-                and int(operation["claim_generation"]) == claim_generation
-                and operation["fencing_token"] == fencing_token
-            )
-            if not is_current:
-                return False
-            public_item_id = derive_operation_public_item_id(
-                turn_id=str(operation["turn_id"]),
-                operation_id=operation_id,
-                attempt_generation=claim_generation,
-            )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=operation["turn_id"],
-                record_type="tool_operation_outcome_committed",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "claim_generation": claim_generation,
-                    "fencing_token": fencing_token,
-                    "status": status,
-                    "attempt_count": attempt_count,
-                    "error_code": error_code,
-                    "requires_reconciliation": requires_reconciliation,
-                    "observed_at": observed_at,
-                    "public_item_id": public_item_id,
-                    "duration_ms": duration_ms,
-                },
-            )
-            if is_current and status == "unknown":
-                request_id = f"interaction_{uuid4().hex}"
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="interaction_requested",
-                    producer="runtime",
-                    payload={
-                        "request_id": request_id,
-                        "kind": "tool_reconciliation",
-                        "operation_id": operation_id,
-                        "request": {
-                            "reason": "tool execution outcome is unknown",
-                            "error_code": error_code,
-                            "claim_generation": claim_generation,
-                            "claim_owner": operation["claim_owner"],
-                            "idempotent": bool(operation["idempotent"]),
-                        },
-                    },
-                )
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="turn_paused",
-                    producer="runtime",
-                    payload={
-                        "turn_id": operation["turn_id"],
-                        "operation_id": operation_id,
-                        "request_id": request_id,
-                        "reason": "tool execution outcome is unknown",
-                    },
-                )
-        return is_current
-
-    @_store_operation
-    def commit_tool_operation_result(
-        self,
-        *,
-        turn_id: str,
-        operation_id: str,
-        claim_generation: int,
-        fencing_token: str,
-        status: str,
-        attempt_count: int,
-        error_code: str | None,
-        requires_reconciliation: bool,
-        result: Mapping[str, Any],
-        duration_ms: float | None = None,
-        now: float | None = None,
-    ) -> bool:
-        with self._transaction():
-            accepted = self.commit_tool_operation_outcome(
-                operation_id=operation_id,
-                claim_generation=claim_generation,
-                fencing_token=fencing_token,
-                status=status,
-                attempt_count=attempt_count,
-                error_code=error_code,
-                requires_reconciliation=requires_reconciliation,
-                duration_ms=duration_ms,
-                now=now,
-            )
-            if not accepted:
-                return False
-            self.record_tool_result(
-                turn_id=turn_id,
-                operation_id=operation_id,
-                result=result,
-            )
-        return True
-
-    @_store_operation
-    def resolve_tool_reconciliation(
-        self,
-        *,
-        turn_id: str,
-        status: str,
-        result: Mapping[str, Any],
-        reconciler_revision: str,
-    ) -> ItemSnapshot:
-        if status not in {"succeeded", "failed", "cancelled"}:
-            raise ValueError("reconciled tool status is unsupported")
-        self._assert_artifact_integrity(turn_id)
-        if not isinstance(reconciler_revision, str) or not reconciler_revision.strip():
-            raise ValueError("reconciler_revision must be non-empty")
-        frozen_result = _json_object(result, field="reconciled tool result")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "paused":
-                raise RuntimeError("tool reconciliation requires a paused Turn")
-            pending = self._connection.execute(
-                """
-                SELECT * FROM interactions
-                WHERE turn_id = ? AND kind = 'tool_reconciliation' AND status = 'pending'
-                ORDER BY rowid
-                """,
-                (turn_id,),
-            ).fetchall()
-            if len(pending) != 1:
-                raise RuntimeError("reconciliation requires exactly one pending interaction")
-            interaction = pending[0]
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ?",
-                (interaction["operation_id"],),
-            ).fetchone()
-            if operation is None or operation["status"] != "unknown":
-                raise RuntimeError("reconciliation interaction is not bound to an unknown operation")
-            thread_id = str(turn["thread_id"])
-            parent_item_id = derive_operation_public_item_id(
-                turn_id=turn_id,
-                operation_id=str(operation["operation_id"]),
-                attempt_generation=int(operation["claim_generation"]),
-            )
-            public_item_id = derive_reconciliation_public_item_id(
-                turn_id=turn_id,
-                operation_id=str(operation["operation_id"]),
-                reconciler_revision=reconciler_revision,
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_resolved",
-                producer="reconciler",
-                payload={
-                    "request_id": interaction["request_id"],
-                    "version": int(interaction["version"]) + 1,
-                    "response": {
-                        "status": status,
-                        "reconciler_revision": reconciler_revision,
-                    },
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_reconciled",
-                producer="reconciler",
-                payload={
-                    "operation_id": operation["operation_id"],
-                    "status": status,
-                    "error_code": frozen_result.get("error_code"),
-                    "reconciler_revision": reconciler_revision,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="reconciler",
-                payload={
-                    "item_id": item_id,
-                    "kind": "tool_reconciliation",
-                    "operation_id": str(operation["operation_id"]),
-                    "public_item_id": public_item_id,
-                    "parent_item_id": parent_item_id,
-                    "reconciler_revision": reconciler_revision,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="reconciler",
-                payload={
-                    "item_id": item_id,
-                    "operation_id": str(operation["operation_id"]),
-                    "public_item_id": public_item_id,
-                    "parent_item_id": parent_item_id,
-                    "reconciler_revision": reconciler_revision,
-                    "payload": {
-                        "status": status,
-                        "result": frozen_result,
-                        "reconciler_revision": reconciler_revision,
-                    },
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_result_linked",
-                producer="reconciler",
-                payload={
-                    "operation_id": operation["operation_id"],
-                    "result_item_id": item_id,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_resumed",
-                producer="reconciler",
-                payload={
-                    "turn_id": turn_id,
-                    "request_id": interaction["request_id"],
-                },
-            )
-        return self._latest_item(turn_id)
-
-    @_store_operation
-    def resolve_tool_approval(
-        self,
-        *,
-        turn_id: str,
-        decision: str,
-        policy_recheck: bool = False,
-    ) -> InteractionSnapshot:
-        if decision not in {"approve", "deny"}:
-            raise ValueError("approval decision must be approve or deny")
-        self._assert_artifact_integrity(turn_id)
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "paused":
-                raise RuntimeError(f"turn is not paused: {turn_id}")
-            pending = self._connection.execute(
-                """
-                SELECT * FROM interactions
-                WHERE turn_id = ? AND kind = 'tool_approval' AND status = 'pending'
-                ORDER BY rowid
-                """,
-                (turn_id,),
-            ).fetchall()
-            if len(pending) != 1:
-                raise RuntimeError("resume requires exactly one pending tool approval")
-            interaction = pending[0]
-            operation = self._connection.execute(
-                "SELECT status FROM tool_operations WHERE operation_id = ?",
-                (interaction["operation_id"],),
-            ).fetchone()
-            if operation is None or operation["status"] != "awaiting_approval":
-                raise RuntimeError("pending approval is not bound to an awaiting operation")
-            thread_id = str(turn["thread_id"])
-            approval_status = "approved" if decision == "approve" else "denied"
-            operation_status = "ready" if decision == "approve" else "denied"
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_resolved",
-                producer="user",
-                payload={
-                    "request_id": interaction["request_id"],
-                    "version": int(interaction["version"]) + 1,
-                    "response": {"decision": decision, **({"policy_recheck": True} if policy_recheck else {})},
-                    "approval_status": approval_status,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_approval_resolved",
-                producer="runtime",
-                payload={
-                    "operation_id": interaction["operation_id"],
-                    "request_id": interaction["request_id"],
-                    "status": operation_status,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_resumed",
-                producer="runtime",
-                payload={"turn_id": turn_id, "request_id": interaction["request_id"]},
-            )
-        return self.read_interaction(str(interaction["request_id"]))
-
-    @_store_operation
-    def refresh_tool_approval(self, *, turn_id: str, request: Mapping[str, Any]) -> InteractionSnapshot:
-        """Replace an unexecuted approval after a policy recheck, atomically."""
-        frozen_request = _json_object(request, field="approval request")
-        request_id = f"interaction_{uuid4().hex}"
-        with self._transaction():
-            turn = self.read_turn(turn_id)
-            candidates = [self.read_interaction(op.approval_request_id) for op in self.list_tool_operations(turn_id)
-                          if op.status in {"awaiting_approval", "ready"} and op.approval_request_id is not None]
-            if turn.status not in {"paused", "running"} or len(candidates) != 1:
-                raise RuntimeError("approval refresh requires one unexecuted operation")
-            previous = candidates[0]
-            if previous.status == "resolved" and previous.response.get("policy_recheck") is not True:
-                raise RuntimeError("only a policy recheck can reopen a resolved approval")
-            if previous.status == "pending":
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="interaction_resolved", producer="runtime",
-                    payload={"request_id": previous.request_id, "version": previous.version + 1,
-                             "response": {"action": "recheck"}, "approval_status": "invalidated"},
-                )
-            else:
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="approval_invalidated", producer="runtime",
-                    payload={"request_id": previous.request_id, "reason": "policy recheck requires confirmation"},
-                )
-            self._append_and_reduce(
-                thread_id=turn.thread_id, turn_id=turn_id, record_type="interaction_requested", producer="runtime",
-                payload={"request_id": request_id, "kind": "tool_approval",
-                         "operation_id": previous.operation_id, "request": frozen_request},
-            )
-            self._append_and_reduce(
-                thread_id=turn.thread_id, turn_id=turn_id,
-                record_type="tool_operation_approval_requested", producer="runtime",
-                payload={"operation_id": previous.operation_id, "request_id": request_id},
-            )
-            if turn.status == "running":
-                self._append_and_reduce(
-                    thread_id=turn.thread_id, turn_id=turn_id, record_type="turn_paused", producer="runtime",
-                    payload={"turn_id": turn_id, "request_id": request_id},
-                )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def invalidate_tool_approval(
-        self,
-        *,
-        turn_id: str,
-        reason: str,
-    ) -> InteractionSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("approval invalidation reason must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "paused":
-                raise RuntimeError(f"turn is not paused: {turn_id}")
-            pending = self._connection.execute(
-                """
-                SELECT * FROM interactions
-                WHERE turn_id = ? AND kind = 'tool_approval' AND status = 'pending'
-                ORDER BY rowid
-                """,
-                (turn_id,),
-            ).fetchall()
-            if len(pending) != 1:
-                raise RuntimeError("invalidation requires one pending tool approval")
-            interaction = pending[0]
-            operation = self._connection.execute(
-                "SELECT status FROM tool_operations WHERE operation_id = ?",
-                (interaction["operation_id"],),
-            ).fetchone()
-            if operation is None or operation["status"] != "awaiting_approval":
-                raise RuntimeError("approval is not bound to an awaiting operation")
-            thread_id = str(turn["thread_id"])
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_resolved",
-                producer="user",
-                payload={
-                    "request_id": interaction["request_id"],
-                    "version": int(interaction["version"]) + 1,
-                    "response": {
-                        "decision": "approve",
-                        "invalidation_reason": reason,
-                    },
-                    "approval_status": "approved",
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="approval_invalidated",
-                producer="runtime",
-                payload={
-                    "request_id": interaction["request_id"],
-                    "reason": reason,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_superseded",
-                producer="runtime",
-                payload={
-                    "operation_id": interaction["operation_id"],
-                    "request_id": interaction["request_id"],
-                    "reason": reason,
-                },
-            )
-        return self.read_interaction(str(interaction["request_id"]))
-
-    @_store_operation
-    def invalidate_resolved_tool_approval(
-        self,
-        *,
-        turn_id: str,
-        reason: str,
-    ) -> InteractionSnapshot:
-        """Invalidate an approved ready operation after crash-time revalidation."""
-
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("approval invalidation reason must be non-empty")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            if turn["status"] != "running":
-                raise RuntimeError("resolved approval recovery requires a running Turn")
-            interaction = self._connection.execute(
-                """
-                SELECT * FROM interactions
-                WHERE turn_id = ? AND kind = 'tool_approval' AND status = 'resolved'
-                ORDER BY rowid DESC LIMIT 1
-                """,
-                (turn_id,),
-            ).fetchone()
-            if (
-                interaction is None
-                or json.loads(interaction["response_json"]).get("decision") != "approve"
-                or interaction["operation_id"] is None
-            ):
-                raise RuntimeError("no resolved approved operation can be invalidated")
-            operation = self._connection.execute(
-                "SELECT status FROM tool_operations WHERE operation_id = ?",
-                (interaction["operation_id"],),
-            ).fetchone()
-            approval = self._connection.execute(
-                "SELECT status FROM approvals WHERE request_id = ?",
-                (interaction["request_id"],),
-            ).fetchone()
-            if (
-                operation is None
-                or operation["status"] != "ready"
-                or approval is None
-                or approval["status"] != "approved"
-            ):
-                raise RuntimeError("resolved approval is not bound to a ready operation")
-            thread_id = str(turn["thread_id"])
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="approval_invalidated",
-                producer="runtime",
-                payload={
-                    "request_id": interaction["request_id"],
-                    "reason": reason,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_superseded",
-                producer="runtime",
-                payload={"operation_id": interaction["operation_id"]},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_paused",
-                producer="recovery",
-                payload={
-                    "turn_id": turn_id,
-                    "request_id": interaction["request_id"],
-                    "reason": reason,
-                },
-            )
-        return self.read_interaction(str(interaction["request_id"]))
-
-    @_store_operation
-    def request_tool_approval(
-        self,
-        *,
-        turn_id: str,
-        operation_id: str,
-        tool_call_id: str,
-        tool_name: str,
-        arguments_digest: str,
-        execution_revision: str,
-        idempotent: bool,
-        request: Mapping[str, Any],
-        effects: tuple[str, ...] = (),
-        resources: tuple[Mapping[str, Any], ...] = (),
-    ) -> InteractionSnapshot:
-        frozen_request = _json_object(request, field="approval request")
-        frozen_effects = _string_tuple(effects, field="tool effects")
-        frozen_resources = _resource_tuple(resources)
-        request_id = f"interaction_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            prior_call = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE turn_id = ? AND tool_call_id = ?",
-                (turn_id, tool_call_id),
-            ).fetchone()
-            if prior_call is not None:
-                if (prior_call["status"] != "ready" or prior_call["approval_request_id"] is None
-                        or prior_call["arguments_digest"] != arguments_digest
-                        or prior_call["execution_revision"] != execution_revision
-                        or prior_call["tool_name"] != tool_name
-                        or tuple(json.loads(prior_call["effects_json"])) != frozen_effects
-                        or tuple(json.loads(prior_call["resources_json"])) != frozen_resources):
-                    raise RuntimeError(f"tool call already has an operation: {prior_call['operation_id']}")
-                # A second scope (e.g. network) must reuse the unstarted operation.
-                operation_id = str(prior_call["operation_id"])
-            else:
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="tool_operation_prepared",
-                    producer="runtime",
-                    payload={
-                        "operation_id": operation_id,
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                        "arguments_digest": arguments_digest,
-                        "execution_revision": execution_revision,
-                        "effects": frozen_effects,
-                        "resources": frozen_resources,
-                        "idempotent": idempotent,
-                        "status": "prepared",
-                        "attempt_count": 0,
-                        "error_code": None,
-                        "requires_reconciliation": False,
-                    },
-                )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="interaction_requested",
-                producer="runtime",
-                payload={
-                    "request_id": request_id,
-                    "kind": "tool_approval",
-                    "operation_id": operation_id,
-                    "request": frozen_request,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="tool_operation_approval_requested",
-                producer="runtime",
-                payload={
-                    "operation_id": operation_id,
-                    "request_id": request_id,
-                },
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="turn_paused",
-                producer="runtime",
-                payload={"turn_id": turn_id, "request_id": request_id},
-            )
-        return self.read_interaction(request_id)
-
-    @_store_operation
-    def record_tool_result(
-        self,
-        *,
-        turn_id: str,
-        operation_id: str | None,
-        result: Mapping[str, Any],
-    ) -> ItemSnapshot:
-        frozen_result = _json_object(result, field="tool result")
-        self._validate_artifact_references(frozen_result)
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id, status FROM turns WHERE turn_id = ?",
-                (turn_id,),
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            thread_id = str(turn["thread_id"])
-            if operation_id is not None:
-                operation = self._connection.execute(
-                    "SELECT * FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
-                    (operation_id, turn_id),
-                ).fetchone()
-                if operation is None:
-                    raise KeyError(f"unknown tool operation: {operation_id}")
-                if operation["status"] not in {
-                    "succeeded",
-                    "failed",
-                    "denied",
-                    "cancelled",
-                    "unknown",
-                }:
-                    raise RuntimeError("tool result requires a terminal operation state")
-                paused_unknown = turn["status"] == "paused" and operation["status"] == "unknown"
-                if paused_unknown:
-                    reconciliation = self._connection.execute(
-                        """
-                        SELECT request_id FROM interactions
-                        WHERE turn_id = ? AND operation_id = ?
-                          AND kind = 'tool_reconciliation' AND status = 'pending'
-                        """,
-                        (turn_id, operation_id),
-                    ).fetchall()
-                    if len(reconciliation) != 1:
-                        raise RuntimeError("paused unknown tool result requires one reconciliation interaction")
-                elif turn["status"] != "running":
-                    raise RuntimeError(f"turn is not running: {turn_id}")
-            elif turn["status"] != "running":
-                raise RuntimeError(f"turn is not running: {turn_id}")
-            public_item_id: str | None = None
-            plan_public_item_id: str | None = None
-            plan_snapshot: Mapping[str, Any] | None = None
-            plan_event: Mapping[str, Any] | None = None
-            plan_item_id: str | None = None
-            if operation_id is not None:
-                attempt_generation = int(operation["claim_generation"])
-                if attempt_generation > 0:
-                    public_item_id = derive_operation_public_item_id(
-                        turn_id=turn_id,
-                        operation_id=operation_id,
-                        attempt_generation=attempt_generation,
-                    )
-                if operation["tool_name"] == "update_plan" and frozen_result.get("is_error") is not True:
-                    structured = frozen_result.get("structured_content")
-                    provider_revision = structured.get("revision") if isinstance(structured, Mapping) else None
-                    if (
-                        isinstance(provider_revision, bool)
-                        or not isinstance(provider_revision, int)
-                        or provider_revision < 0
-                    ):
-                        raise RuntimeError("successful update_plan result requires a canonical revision")
-                    call = self._connection.execute(
-                        """
-                        SELECT payload_json FROM items
-                        WHERE turn_id = ? AND kind = 'tool_call' AND status = 'completed'
-                        ORDER BY sequence
-                        """,
-                        (turn_id,),
-                    ).fetchall()
-                    matching_calls = [
-                        json.loads(row["payload_json"])
-                        for row in call
-                        if json.loads(row["payload_json"]).get("tool_call_id") == operation["tool_call_id"]
-                    ]
-                    if len(matching_calls) != 1:
-                        raise RuntimeError("successful update_plan result requires one canonical ToolCall")
-                    arguments = matching_calls[0].get("arguments")
-                    if not isinstance(arguments, Mapping):
-                        raise RuntimeError("successful update_plan ToolCall arguments are malformed")
-                    prior_revisions = self._connection.execute(
-                        "SELECT COUNT(*) FROM items WHERE turn_id = ? AND kind = 'plan_state'",
-                        (turn_id,),
-                    ).fetchone()[0]
-                    revision = int(prior_revisions) + 1
-                    plan_public_item_id = derive_plan_public_item_id(
-                        turn_id=turn_id,
-                        revision=revision,
-                    )
-                    plan_item_id = f"item_{uuid4().hex}"
-                    raw_steps = arguments.get("plan", [])
-                    steps: list[dict[str, Any]] = []
-                    if isinstance(raw_steps, (list, tuple)):
-                        for index, raw_step in enumerate(raw_steps, start=1):
-                            if not isinstance(raw_step, Mapping):
-                                continue
-                            status = raw_step.get("status")
-                            normalized_status: Literal["pending", "in_progress", "completed"]
-                            if status in {"pending", "completed"}:
-                                normalized_status = status
-                            elif status == "in_progress":
-                                normalized_status = "in_progress"
-                            else:
-                                continue
-                            step = PlanStep(
-                                step_id=str(raw_step.get("step_id") or f"step_{index}"),
-                                title=str(raw_step.get("step", "")),
-                                status=normalized_status,
-                            )
-                            steps.append(step.model_dump())
-                    objective_row = self._connection.execute(
-                        """
-                        SELECT payload_json FROM items
-                        WHERE turn_id = ? AND kind = 'user_message'
-                        ORDER BY sequence LIMIT 1
-                        """,
-                        (turn_id,),
-                    ).fetchone()
-                    objective_payload = json.loads(objective_row["payload_json"]) if objective_row is not None else {}
-                    plan_snapshot = {
-                        "revision": revision,
-                        "objective": objective_payload.get("text", "Current task"),
-                        "status": "active",
-                        "active_step_id": next(
-                            (step["step_id"] for step in steps if step["status"] == "in_progress"),
-                            next(
-                                (step["step_id"] for step in steps if step["status"] == "pending"),
-                                None,
-                            ),
-                        ),
-                        "steps": steps,
-                        "summary": arguments.get("explanation"),
-                    }
-                    plan_event = {
-                        "event_type": "llm_update",
-                        "message": (
-                            arguments.get("explanation")
-                            if isinstance(arguments.get("explanation"), str)
-                            else "Applied update_plan tool update."
-                        ),
-                        "related_step_id": plan_snapshot["active_step_id"],
-                        "tool_call_ids": [operation["tool_call_id"]],
-                    }
-            started_payload: dict[str, Any] = {
-                "item_id": item_id, "kind": "tool_result",
-                "tool_name": (str(operation["tool_name"])
-                              if operation_id is not None else frozen_result.get("tool_name")),
-                "tool_call_id": (str(operation["tool_call_id"])
-                                 if operation_id is not None else frozen_result.get("tool_call_id")),
-            }
-            if public_item_id is not None:
-                started_payload.update(
-                    {
-                        "operation_id": operation_id,
-                        "attempt_generation": attempt_generation,
-                        "public_item_id": public_item_id,
-                    }
-                )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="tool",
-                payload=started_payload,
-            )
-            completed_payload: dict[str, Any] = {
-                "item_id": item_id,
-                "payload": frozen_result,
-            }
-            if public_item_id is not None:
-                completed_payload.update(
-                    {
-                        "operation_id": operation_id,
-                        "attempt_generation": attempt_generation,
-                        "public_item_id": public_item_id,
-                    }
-                )
-                public_status = {
-                    "succeeded": "success",
-                    "cancelled": "cancelled",
-                    "unknown": "outcome_unknown",
-                }.get(str(operation["status"]), "failed")
-                completed_payload["status"] = public_status
-                if public_status in {"failed", "outcome_unknown"}:
-                    completed_payload["error"] = str(operation["error_code"] or "tool execution failed")
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="tool",
-                payload=completed_payload,
-            )
-            if (
-                plan_item_id is not None
-                and plan_public_item_id is not None
-                and plan_snapshot is not None
-                and plan_event is not None
-            ):
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_started",
-                    producer="runtime",
-                    payload={
-                        "item_id": plan_item_id,
-                        "kind": "plan_state",
-                        "public_item_id": plan_public_item_id,
-                        "revision": plan_snapshot["revision"],
-                    },
-                )
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="item_completed",
-                    producer="runtime",
-                    payload={
-                        "item_id": plan_item_id,
-                        "public_item_id": plan_public_item_id,
-                        "revision": plan_snapshot["revision"],
-                        "payload": {
-                            "plan": plan_snapshot,
-                            "event": plan_event,
-                        },
-                    },
-                )
-            if operation_id is not None:
-                self._append_and_reduce(
-                    thread_id=thread_id,
-                    turn_id=turn_id,
-                    record_type="tool_operation_result_linked",
-                    producer="runtime",
-                    payload={
-                        "operation_id": operation_id,
-                        "result_item_id": item_id,
-                    },
-                )
-        return self._latest_item(turn_id)
-
-    @_store_operation
-    def read_tool_operation(self, operation_id: str) -> ToolOperationSnapshot:
-        row = self._connection.execute(
-            "SELECT * FROM tool_operations WHERE operation_id = ?", (operation_id,)
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"unknown tool operation: {operation_id}")
-        return _tool_operation_snapshot(row)
-
-    @_store_operation
-    def record_tool_continuation(
-        self,
-        *,
-        operation_id: str,
-        key: str,
-        result: Mapping[str, Any],
-    ) -> ItemSnapshot:
-        """Persist the owner's confirmed terminal result when its live scope closes."""
-        operation = self.read_tool_operation(operation_id)
-        if operation.result_item_id is None:
-            raise RuntimeError("continuation requires a committed launch result")
-        for item in self.list_items(operation.turn_id):
-            if item.kind == "tool_continuation" and item.payload.get("operation_id") == operation_id:
-                return item
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            self._append_and_reduce(
-                thread_id=operation.thread_id, turn_id=operation.turn_id,
-                record_type="item_started", producer="runtime",
-                payload={"item_id": item_id, "kind": "tool_continuation"},
-            )
-            self._append_and_reduce(
-                thread_id=operation.thread_id, turn_id=operation.turn_id,
-                record_type="item_completed", producer="runtime",
-                payload={"item_id": item_id, "payload": {
-                    **dict(result), "operation_id": operation_id, "key": key,
-                    "source_result_item_id": operation.result_item_id,
-                }},
-            )
-        return self.read_item(item_id)
-
-    @_store_operation
-    def record_verification(
-        self,
-        *,
-        turn_id: str,
-        operation_id: str,
-        kind: str,
-        verifier: str,
-        verified_resources: tuple[str, ...] = (),
-    ) -> ItemSnapshot:
-        if kind not in {"test", "static_analysis", "assertion", "inspection"}:
-            raise ValueError(f"unsupported verification kind: {kind}")
-        if not isinstance(verifier, str) or not verifier.strip():
-            raise ValueError("verification verifier must be non-empty")
-        with self._transaction():
-            operation = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE operation_id = ? AND turn_id = ?",
-                (operation_id, turn_id),
-            ).fetchone()
-            if operation is None:
-                raise KeyError(f"unknown tool operation: {operation_id}")
-            if operation["status"] != "succeeded" or operation["result_item_id"] is None:
-                raise RuntimeError("verification requires a committed successful ToolResult")
-            existing_rows = self._connection.execute(
-                """
-                SELECT * FROM items
-                WHERE turn_id = ? AND kind = 'verification' AND status = 'completed'
-                ORDER BY sequence
-                """,
-                (turn_id,),
-            ).fetchall()
-            for row in existing_rows:
-                payload = json.loads(row["payload_json"])
-                if payload.get("operation_id") == operation_id:
-                    return _item_snapshot(row)
-
-            item_id = f"item_{uuid4().hex}"
-            payload = {
-                "operation_id": operation_id,
-                "tool_call_id": operation["tool_call_id"],
-                "arguments_digest": operation["arguments_digest"],
-                "source_result_item_id": operation["result_item_id"],
-                "verification_kind": kind,
-                "verifier": verifier.strip(),
-                "verified_resources": list(verified_resources),
-            }
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="runtime",
-                payload={"item_id": item_id, "kind": "verification"},
-            )
-            self._append_and_reduce(
-                thread_id=operation["thread_id"],
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="runtime",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self.read_item(item_id)
-
-    @_store_operation
-    def record_workspace_checkpoint(
-        self,
-        *,
-        turn_id: str,
-        checkpoint_id: str,
-        trigger: str,
-        tree_sha256: str | None = None,
-        changed_file_count: int = 0,
-        wall_time: float = 0.0,
-    ) -> ItemSnapshot:
-        """Persist the Turn's workspace checkpoint; one pre_write item per Turn."""
-        if trigger not in {"pre_write", "restore"}:
-            raise ValueError(f"unsupported checkpoint trigger: {trigger}")
-        if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
-            raise ValueError("checkpoint_id must be a non-empty string")
-        with self._transaction():
-            turn = self._connection.execute(
-                "SELECT thread_id FROM turns WHERE turn_id = ?", (turn_id,)
-            ).fetchone()
-            if turn is None:
-                raise KeyError(f"unknown turn: {turn_id}")
-            existing_rows = self._connection.execute(
-                """
-                SELECT * FROM items
-                WHERE turn_id = ? AND kind = 'workspace_checkpoint' AND status = 'completed'
-                ORDER BY sequence
-                """,
-                (turn_id,),
-            ).fetchall()
-            for row in existing_rows:
-                payload = json.loads(row["payload_json"])
-                if payload.get("checkpoint_id") == checkpoint_id or (
-                    trigger == "pre_write" and payload.get("trigger") == "pre_write"
-                ):
-                    return _item_snapshot(row)
-            item_id = f"item_{uuid4().hex}"
-            payload = {
-                "checkpoint_id": checkpoint_id,
-                "trigger": trigger,
-                "tree_sha256": tree_sha256,
-                "changed_file_count": changed_file_count,
-                "wall_time": wall_time,
-            }
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="runtime",
-                payload={"item_id": item_id, "kind": "workspace_checkpoint"},
-            )
-            self._append_and_reduce(
-                thread_id=turn["thread_id"],
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="runtime",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self.read_item(item_id)
-
-    @_store_operation
-    def list_tool_operations(self, turn_id: str | None = None) -> tuple[ToolOperationSnapshot, ...]:
-        if turn_id is None:
-            rows = self._connection.execute("SELECT * FROM tool_operations ORDER BY rowid").fetchall()
-        else:
-            rows = self._connection.execute(
-                "SELECT * FROM tool_operations WHERE turn_id = ? ORDER BY rowid",
-                (turn_id,),
-            ).fetchall()
-        return tuple(_tool_operation_snapshot(row) for row in rows)
-
-    @_store_operation
-    def read_interaction(self, request_id: str) -> InteractionSnapshot:
-        row = self._connection.execute("SELECT * FROM interactions WHERE request_id = ?", (request_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"unknown interaction: {request_id}")
-        return _interaction_snapshot(row)
-
-    @_store_operation
-    def list_interactions(self, turn_id: str | None = None) -> tuple[InteractionSnapshot, ...]:
-        if turn_id is None:
-            rows = self._connection.execute("SELECT * FROM interactions ORDER BY rowid").fetchall()
-        else:
-            rows = self._connection.execute(
-                "SELECT * FROM interactions WHERE turn_id = ? ORDER BY rowid",
-                (turn_id,),
-            ).fetchall()
-        return tuple(_interaction_snapshot(row) for row in rows)
-
-    @_store_operation
-    def list_approvals(self, turn_id: str | None = None) -> tuple[ApprovalSnapshot, ...]:
-        if turn_id is None:
-            rows = self._connection.execute("SELECT * FROM approvals ORDER BY rowid").fetchall()
-        else:
-            rows = self._connection.execute(
-                "SELECT * FROM approvals WHERE turn_id = ? ORDER BY rowid",
-                (turn_id,),
-            ).fetchall()
-        return tuple(_approval_snapshot(row) for row in rows)
-
-    @_store_operation
-    def read_resource_usage(
-        self,
-        turn_id: str,
-        resource: str,
-        initial_used: int = 0,
-    ) -> dict[str, Any]:
-        """Read the latest durable counter; legacy usage applies only before its first Item."""
-
-        _validate_resource_usage_input(resource, initial_used)
-        self.read_turn(turn_id)
-        rows = self._connection.execute(
-            """SELECT item_id, payload_json FROM items
-               WHERE turn_id = ? AND kind = 'resource_usage' AND status = 'completed' AND producer = 'runtime'
-               ORDER BY sequence DESC""", (turn_id,),
-        )
-        for row in rows:
-            payload = json.loads(row["payload_json"])
-            if payload.get("resource") != resource:
-                continue
-            used, limit = payload.get("used"), payload.get("limit")
-            if type(used) is not int or type(limit) is not int or not 0 <= used <= limit <= 256 or limit < 1:
-                raise RuntimeError("canonical resource_usage payload is malformed")
-            return {"resource": resource, "limit": limit, "used": used,
-                    "remaining": max(0, limit - used), "item_id": str(row["item_id"])}
-        return {"resource": resource, "limit": None, "used": initial_used, "remaining": None, "item_id": None}
-
-    @_store_operation
-    def reserve_resource_unit(
-        self,
-        turn_id: str,
-        resource: str,
-        limit: int,
-        initial_used: int = 0,
-    ) -> dict[str, Any]:
-        """Commit one conservative unit before I/O, serialized across Store connections."""
-
-        _validate_resource_usage_input(resource, initial_used)
-        if type(limit) is not int or not 1 <= limit <= 256:
-            raise ValueError("resource limit must be an integer between 1 and 256")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            usage = self.read_resource_usage(turn_id, resource, initial_used)
-            if usage["limit"] is not None and usage["limit"] != limit:
-                raise ValueError("resource_limit_mismatch")
-            if usage["used"] >= limit:
-                raise ValueError("resource_limit_exceeded")
-            used = usage["used"] + 1
-            self._append_and_reduce(
-                thread_id=thread_id, turn_id=turn_id, record_type="item_started", producer="runtime",
-                payload={"item_id": item_id, "kind": "resource_usage"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id, turn_id=turn_id, record_type="item_completed", producer="runtime",
-                payload={"item_id": item_id, "payload": {"resource": resource, "limit": limit, "used": used}},
-            )
-        return {"resource": resource, "limit": limit, "used": used, "remaining": limit - used, "item_id": item_id}
-
-    @_store_operation
-    def record_final_proposal(
-        self,
-        *,
-        turn_id: str,
-        answer: str,
-        source_item_id: str | None = None,
-    ) -> ItemSnapshot:
-        if not isinstance(answer, str) or not answer.strip():
-            raise ValueError("answer must be non-empty")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            payload = {"text": answer}
-            if source_item_id is not None:
-                source = self.read_item(source_item_id)
-                if source.turn_id != turn_id or source.kind != "model_response" or source.status != "completed":
-                    raise RuntimeError("final proposal requires a completed model response from this Turn")
-                payload["source_item_id"] = source_item_id
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="model",
-                payload={"item_id": item_id, "kind": "final_proposal"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="model",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self._latest_item(turn_id)
-
-    @_store_operation
-    def record_completion_decision(
-        self,
-        *,
-        turn_id: str,
-        proposal_item_id: str,
-        action: str,
-        reason: str,
-        validation_status: str = "not_evaluated",
-        validation_scope: str | None = None,
-        reason_code: str | None = None,
-    ) -> ItemSnapshot:
-        if action not in {"accept", "continue", "pause", "fail"}:
-            raise ValueError(f"unsupported completion action: {action}")
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("completion reason must be non-empty")
-        if validation_status not in {"not_evaluated", "passed", "failed"}:
-            raise ValueError(f"unsupported completion validation status: {validation_status}")
-        if validation_scope is not None and (
-            not isinstance(validation_scope, str) or not validation_scope.strip()
-        ):
-            raise ValueError("completion validation scope must be non-empty or None")
-        if reason_code is not None and (not isinstance(reason_code, str) or not reason_code.strip()):
-            raise ValueError("completion reason code must be non-empty or None")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            proposal = self._connection.execute(
-                "SELECT kind, status FROM items WHERE item_id = ? AND turn_id = ?",
-                (proposal_item_id, turn_id),
-            ).fetchone()
-            if proposal is None or proposal["kind"] != "final_proposal" or proposal["status"] != "completed":
-                raise RuntimeError("completion decision requires a completed final proposal")
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="verifier",
-                payload={"item_id": item_id, "kind": "completion_decision"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="verifier",
-                payload={
-                    "item_id": item_id,
-                    "payload": {
-                        "proposal_item_id": proposal_item_id,
-                        "action": action,
-                        "reason": reason,
-                        "validation_status": validation_status,
-                        "validation_scope": validation_scope,
-                        **({"reason_code": reason_code} if reason_code is not None else {}),
-                    },
-                },
-            )
-        return self._latest_item(turn_id)
-
-    @_store_operation
-    def record_completion_feedback(
-        self,
-        *,
-        turn_id: str,
-        reason: str,
-        source_item_id: str | None = None,
-        reason_code: str | None = None,
-    ) -> ItemSnapshot:
-        if not isinstance(reason, str) or not reason.strip():
-            raise ValueError("completion feedback reason must be non-empty")
-        item_id = f"item_{uuid4().hex}"
-        with self._transaction():
-            thread_id = self._running_turn_thread_id(turn_id)
-            payload = {"text": reason}
-            if reason_code is not None:
-                payload["reason_code"] = reason_code
-            if source_item_id is not None:
-                source = self.read_item(source_item_id)
-                if (source.turn_id != turn_id or source.status != "completed"
-                        or source.kind not in {"model_response", "completion_decision"}):
-                    raise RuntimeError("feedback requires a completed source from this Turn")
-                payload["source_item_id"] = source_item_id
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_started",
-                producer="verifier",
-                payload={"item_id": item_id, "kind": "completion_feedback"},
-            )
-            self._append_and_reduce(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                record_type="item_completed",
-                producer="verifier",
-                payload={"item_id": item_id, "payload": payload},
-            )
-        return self._latest_item(turn_id)
-
-    def _running_turn_thread_id(self, turn_id: str) -> str:
-        turn = self._connection.execute("SELECT thread_id, status FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
-        if turn is None:
-            raise KeyError(f"unknown turn: {turn_id}")
-        if turn["status"] != "running":
-            raise RuntimeError(f"turn is not running: {turn_id}")
-        return str(turn["thread_id"])
-
-    @_store_operation
-    def read_thread(self, thread_id: str) -> ThreadSnapshot:
-        row = self._connection.execute("SELECT * FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"unknown thread: {thread_id}")
-        return _thread_snapshot(row)
-
-    @_store_operation
-    def list_threads(self) -> tuple[ThreadSnapshot, ...]:
-        rows = self._connection.execute("SELECT * FROM threads ORDER BY rowid").fetchall()
-        return tuple(_thread_snapshot(row) for row in rows)
-
-    @_store_operation
-    def read_turn(self, turn_id: str) -> TurnSnapshot:
-        row = self._connection.execute("SELECT * FROM turns WHERE turn_id = ?", (turn_id,)).fetchone()
-        if row is None:
-            raise KeyError(f"unknown turn: {turn_id}")
-        return _turn_snapshot(row)
-
-    @_store_operation
-    def list_turns(self, thread_id: str | None = None) -> tuple[TurnSnapshot, ...]:
-        rows = self._connection.execute(
-            "SELECT * FROM turns WHERE (? IS NULL OR thread_id = ?) ORDER BY rowid", (thread_id, thread_id),
-        ).fetchall()
-        return tuple(_turn_snapshot(row) for row in rows)
-
-    @_store_operation
-    def list_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
-        rows = self._connection.execute(
-            "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence", (turn_id,)
-        ).fetchall()
-        return tuple(_item_snapshot(row) for row in rows)
-
-    def _latest_item(self, turn_id: str) -> ItemSnapshot:
-        row = self._connection.execute(
-            "SELECT * FROM items WHERE turn_id = ? ORDER BY sequence DESC LIMIT 1", (turn_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"Turn has no Items: {turn_id}")
-        return _item_snapshot(row)
-
-    @_store_operation
-    def read_item(self, item_id: str) -> ItemSnapshot:
-        row = self._connection.execute(
-            "SELECT * FROM items WHERE item_id = ?",
-            (item_id,),
-        ).fetchone()
-        if row is None:
-            raise KeyError(f"unknown Item: {item_id}")
-        return _item_snapshot(row)
-
-    @_store_operation
-    def list_context_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
-        """Visible model/recall window; the complete ledger remains separately readable."""
-        self._assert_artifact_integrity(turn_id)
-        items = self.list_conversation_items(turn_id)
-        start = 0
-        seen = set()
-        for index, item in enumerate(items):
-            if item.turn_id not in seen:
-                seen.add(item.turn_id)
-                reset = self.read_turn(item.turn_id).binding_manifest.get("context_reset")
-                if (isinstance(reset, Mapping) and reset.get("revision") == "v1"
-                        and reset.get("reason") == "memory_revoked"):
-                    start = index
-        return items[start:]
-
-    @_store_operation
-    def list_conversation_items(self, turn_id: str) -> tuple[ItemSnapshot, ...]:
-        """Read original Items through the fork point; do not load or execute artifacts."""
-        turn = self._connection.execute(
-            "SELECT thread_id, turn_index FROM turns WHERE turn_id = ?", (turn_id,)
-        ).fetchone()
-        if turn is None:
-            raise KeyError(f"unknown turn: {turn_id}")
-        segments: list[tuple[str, int]] = []
-        segment_thread_id = str(turn["thread_id"])
-        segment_turn_index = int(turn["turn_index"])
-        while True:
-            segments.append((segment_thread_id, segment_turn_index))
-            thread = self._connection.execute(
-                "SELECT parent_thread_id, fork_turn_id FROM threads WHERE thread_id = ?",
-                (segment_thread_id,),
-            ).fetchone()
-            if thread is None:
-                raise RuntimeError("context Thread projection is missing")
-            parent_thread_id = thread["parent_thread_id"]
-            fork_turn_id = thread["fork_turn_id"]
-            if parent_thread_id is None and fork_turn_id is None:
-                break
-            if parent_thread_id is None or fork_turn_id is None:
-                raise RuntimeError("fork ancestry projection is incomplete")
-            fork_turn = self._connection.execute(
-                "SELECT thread_id, turn_index FROM turns WHERE turn_id = ?",
-                (fork_turn_id,),
-            ).fetchone()
-            if fork_turn is None or fork_turn["thread_id"] != parent_thread_id:
-                raise RuntimeError("fork point does not belong to its parent Thread")
-            segment_thread_id = str(parent_thread_id)
-            segment_turn_index = int(fork_turn["turn_index"])
-        rows: list[sqlite3.Row] = []
-        for ancestor_thread_id, cutoff in reversed(segments):
-            rows.extend(
-                self._connection.execute(
-                    """
-                    SELECT items.*
-                    FROM items
-                    JOIN turns ON turns.turn_id = items.turn_id
-                    WHERE turns.thread_id = ? AND turns.turn_index <= ?
-                    ORDER BY turns.turn_index, items.sequence
-                    """,
-                    (ancestor_thread_id, cutoff),
-                ).fetchall()
-            )
-        return tuple(_item_snapshot(row) for row in rows)
-
-    @_store_operation
     def last_record(self, thread_id: str) -> RolloutRecord | None:
         row = self._connection.execute(
             "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence DESC LIMIT 1",
@@ -4891,7 +565,8 @@ class RolloutStore:
     @_store_operation
     def list_turn_records(self, turn_id: str) -> tuple[RolloutRecord, ...]:
         rows = self._connection.execute(
-            "SELECT * FROM rollout_records WHERE turn_id = ? ORDER BY record_id", (turn_id,),
+            "SELECT * FROM rollout_records WHERE turn_id = ? ORDER BY record_id",
+            (turn_id,),
         ).fetchall()
         return tuple(_record_snapshot(row) for row in rows)
 
@@ -4904,27 +579,6 @@ class RolloutStore:
             (turn_id,),
         ).fetchone()
         return None if row is None else _record_snapshot(row)
-
-    @_store_operation
-    def read_turn_answer(self, turn_id: str) -> ItemSnapshot:
-        """Resolve the accepted output identity; old Turns retain their original answer Item."""
-        completion = self.read_turn_completion(turn_id)
-        if completion is None:
-            raise RuntimeError("Turn has no committed answer")
-        item_id = completion.payload.get("answer_item_id")
-        if item_id is None:
-            if completion.payload_schema_version >= 3:
-                raise RuntimeError("completed Turn is missing its canonical answer reference")
-            answers = [item for item in self.list_items(turn_id) if item.kind == "agent_message"]
-            if len(answers) != 1:
-                raise RuntimeError("completed Turn has no unique canonical answer")
-            return answers[0]
-        answer = self.read_item(item_id)
-        if (answer.turn_id != turn_id or answer.status != "completed"
-                or answer.kind not in {"agent_message", "model_response"}
-                or answer.payload.get("response_status", "completed") != "completed"):
-            raise RuntimeError("completed Turn has an invalid answer reference")
-        return answer
 
     @_store_operation
     def list_record_tail(
@@ -4965,7 +619,7 @@ class RolloutStore:
         row = self._connection.execute(
             f"""SELECT * FROM rollout_records
                 WHERE record_type = '{record_type}' AND json_extract(payload_json, '$.{key}') = ?
-                {'' if at_record_id is None else 'AND record_id <= ?'}
+                {"" if at_record_id is None else "AND record_id <= ?"}
                 ORDER BY record_id DESC LIMIT 1""",
             (identity,) if at_record_id is None else (identity, at_record_id),
         ).fetchone()
@@ -5017,100 +671,17 @@ class RolloutStore:
         return {str(row["thread_id"]): str(row["canonical_hash"]) for row in rows}
 
     @_store_operation
-    def verify(self) -> VerificationReport:
-        errors: list[str] = []
-        expected = ProjectionState()
-        rows = self._connection.execute("SELECT * FROM rollout_records ORDER BY record_id")
-        record_positions: dict[str, dict[str, int]] = {}
-        chain_hashes: dict[str, str] = {}
-        for row in rows:
-            thread_id = str(row["thread_id"])
-            record = _record_snapshot(row)
-            chain_hashes[thread_id] = _record_prefix_hash(chain_hashes.get(thread_id), record)
-            record_positions[thread_id] = {
-                "applied_thread_sequence": row["thread_sequence"], "applied_record_id": row["record_id"],
-            }
-            payload_json = row["payload_json"]
-            if hashlib.sha256(payload_json.encode()).hexdigest() != row["payload_hash"]:
-                errors.append(f"record {row['record_id']} payload hash mismatch")
-                continue
-            apply_record(
-                expected,
-                record,
-                reducer_version=_REDUCER_VERSION,
-            )
-        # Compare one persisted row at a time, retaining strict canonical JSON
-        # types (True != 1 != 1.0) and detecting missing as well as extra rows.
-        for name, key, row_payload in (
-            ("threads", "thread_id", _thread_row_payload),
-            ("turns", "turn_id", _turn_row_payload),
-            ("items", "item_id", _item_row_payload),
-            ("model_operations", "operation_id", _model_operation_row_payload),
-            ("model_attempts", "attempt_id", _model_attempt_row_payload),
-            ("budget_reservations", "reservation_id", _budget_reservation_row_payload),
-            ("child_budget_allocations", "allocation_id", _child_budget_allocation_row_payload),
-            ("tool_operations", "operation_id", _tool_operation_row_payload),
-            ("interactions", "request_id", _interaction_row_payload),
-            ("approvals", "request_id", _approval_row_payload),
-            ("artifacts", "artifact_id", _artifact_row_payload),
-        ):
-            entities = getattr(expected, name)
-            count, mismatch = 0, False
-            for row in self._connection.execute(f"SELECT * FROM {name}"):
-                count += 1
-                if _canonical_json(entities.get(row[key])) != _canonical_json(row_payload(row)):
-                    mismatch = True
-            if mismatch or count != len(entities):
-                errors.append(f"{name} projection mismatch")
-        errors.extend(self._artifact_integrity_errors(expected))
-        metadata = {row["thread_id"]: row for row in self._connection.execute("SELECT * FROM projection_meta")}
-        expected_metadata = {
-            thread_id: {
-                **record_positions[thread_id],
-                "reducer_version": _REDUCER_VERSION,
-                "canonical_hash": (
-                    _projection_hash(expected, thread_id)
-                    if thread_id in metadata and _metadata_hash_version(metadata[thread_id]) == 1
-                    else chain_hashes[thread_id]
-                ),
-                "hash_version": (
-                    1 if thread_id in metadata and _metadata_hash_version(metadata[thread_id]) == 1 else 2
-                ),
-            }
-            for thread_id in expected.threads
-        }
-        actual_metadata = {
-            row["thread_id"]: {
-                "applied_thread_sequence": row["applied_thread_sequence"],
-                "applied_record_id": row["applied_record_id"],
-                "reducer_version": row["reducer_version"],
-                "canonical_hash": row["canonical_hash"],
-                "hash_version": _metadata_hash_version(row),
-            }
-            for row in metadata.values()
-        }
-        if _canonical_json(expected_metadata) != _canonical_json(actual_metadata):
-            errors.append("projection metadata mismatch")
-        return VerificationReport(valid=not errors, errors=tuple(errors))
+    def verify(self, *, thread_ids: frozenset[str] | None = None) -> VerificationReport:
+        """Independently replay canonical facts and compare projections/blobs."""
+        from agent_runtime.harness.rollout_integrity import verify_store
 
-    def _assert_artifact_integrity(self, turn_id: str) -> None:
-        # Dispatch validates its actual conversation references. A damaged blob
-        # in another Thread is still diagnosed by verify(), without disabling
-        # unrelated work throughout the whole store.
-        artifact_ids = {
-            str(attachment["artifact_id"])
-            for item in self.list_conversation_items(turn_id)
-            for attachment in item.payload.get("attachments", ())
-            if isinstance(attachment, Mapping) and isinstance(attachment.get("artifact_id"), str)
-        }
-        errors = self._artifact_integrity_errors(artifact_ids=artifact_ids)
-        if errors:
-            raise RuntimeError(f"artifact integrity check failed: {errors[0]}")
+        return verify_store(self, thread_ids=thread_ids)
 
-    def _artifact_integrity_errors(
+    def artifact_integrity_errors(
         self,
         state: ProjectionState | None = None,
-        *, artifact_ids: set[str] | None = None,
+        *,
+        artifact_ids: set[str] | None = None,
     ) -> list[str]:
         if state is not None:
             artifacts = state.artifacts
@@ -5122,8 +693,9 @@ class RolloutStore:
         else:
             artifacts = {}
             for artifact_id in sorted(artifact_ids):
-                row = self._connection.execute("SELECT * FROM artifacts WHERE artifact_id = ?",
-                                               (artifact_id,)).fetchone()
+                row = self._connection.execute(
+                    "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+                ).fetchone()
                 if row is None:
                     return [f"unknown artifact reference: {artifact_id}"]
                 artifacts[artifact_id] = _artifact_row_payload(row)
@@ -5171,58 +743,12 @@ class RolloutStore:
                         errors.append(f"artifact attachment metadata mismatch in Item {item['item_id']}")
         return errors
 
-    def _validate_artifact_references(self, payload: Mapping[str, Any]) -> None:
-        attachments = payload.get("attachments", ())
-        if not isinstance(attachments, (list, tuple)):
-            raise RuntimeError("tool result artifact attachments must be a list")
-        for attachment in attachments:
-            if not isinstance(attachment, Mapping):
-                raise RuntimeError("tool result artifact attachment is malformed")
-            artifact_id = attachment.get("artifact_id")
-            if not isinstance(artifact_id, str):
-                raise RuntimeError("tool result references an unknown artifact")
-            try:
-                artifact = self.read_artifact_metadata(artifact_id)
-            except KeyError:
-                raise RuntimeError(f"tool result references unknown artifact: {artifact_id}") from None
-            if attachment.get("media_type") != artifact.media_type or attachment.get("name") != artifact.name:
-                raise RuntimeError("tool result artifact metadata conflicts with durable reference")
-            error = _artifact_blob_error(artifact, self.artifact_blob_path(artifact_id))
-            if error is not None:
-                raise RuntimeError(f"artifact integrity check failed: {error}")
-
     @_store_operation
     def rebuild_projections(self) -> None:
-        """Rebuild projections from verified canonical records in one transaction."""
-        with self._transaction():
-            rows = self._connection.execute("SELECT * FROM rollout_records ORDER BY record_id").fetchall()
-            for row in rows:
-                payload_json = row["payload_json"]
-                if hashlib.sha256(payload_json.encode()).hexdigest() != row["payload_hash"]:
-                    raise RuntimeError(f"cannot rebuild from corrupt record: {row['record_id']}")
-            state = ProjectionState()
-            chain_hashes: dict[str, str] = {}
-            for row in rows:
-                record = _record_snapshot(row)
-                chain_hashes[record.thread_id] = _record_prefix_hash(chain_hashes.get(record.thread_id), record)
-                apply_record(
-                    state,
-                    record,
-                    reducer_version=_REDUCER_VERSION,
-                )
-            self._connection.execute("DELETE FROM projection_meta")
-            self._connection.execute("DELETE FROM child_budget_allocations")
-            self._connection.execute("DELETE FROM budget_reservations")
-            self._connection.execute("DELETE FROM model_attempts")
-            self._connection.execute("DELETE FROM model_operations")
-            self._connection.execute("DELETE FROM approvals")
-            self._connection.execute("DELETE FROM interactions")
-            self._connection.execute("DELETE FROM tool_operations")
-            self._connection.execute("DELETE FROM artifacts")
-            self._connection.execute("DELETE FROM items")
-            self._connection.execute("DELETE FROM turns")
-            self._connection.execute("DELETE FROM threads")
-            self._persist_projection_state(state, chain_hashes=chain_hashes)
+        """Stage canonical replay and atomically publish if the source is unchanged."""
+        from agent_runtime.harness.rollout_integrity import rebuild_store
+
+        rebuild_store(self)
 
     def _upgrade_metadata_hash(self, thread_id: str) -> None:
         """Upgrade one legacy prefix inside the pending business transaction.
@@ -5235,23 +761,27 @@ class RolloutStore:
             return
         if _metadata_hash_version(row) != 1:
             raise RuntimeError("unsupported Rollout metadata hash version")
+        # Legacy migration retains the original full-audit contract. Facts can
+        # reference artifacts in other threads; a thread-only audit is incomplete.
         report = self.verify()
         if not report.valid:
             raise RuntimeError("Rollout projection integrity check failed: " + "; ".join(report.errors))
         digest: str | None = None
         for record_row in self._connection.execute(
-            "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence", (thread_id,),
+            "SELECT * FROM rollout_records WHERE thread_id = ? ORDER BY thread_sequence",
+            (thread_id,),
         ):
             digest = _record_prefix_hash(digest, _record_snapshot(record_row))
         self._connection.execute(
-            "UPDATE projection_meta SET canonical_hash = ?, hash_version = 2 WHERE thread_id = ?", (digest, thread_id),
+            "UPDATE projection_meta SET canonical_hash = ?, hash_version = 2 WHERE thread_id = ?",
+            (digest, thread_id),
         )
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
+    def transaction(self) -> Iterator[None]:
         if threading.get_ident() != self._owner_thread:
             raise RuntimeError("transactions must run as a complete Store operation")
-        self._assert_writable()
+        self.assert_writable()
         if self._pending_transaction_records is not None:
             yield
             return
@@ -5290,7 +820,8 @@ class RolloutStore:
         except sqlite3.Error:
             pass
 
-    def _append_and_reduce(
+    @_store_operation
+    def append_record(
         self,
         *,
         thread_id: str,
@@ -5299,13 +830,8 @@ class RolloutStore:
         producer: str,
         payload: Mapping[str, Any],
     ) -> None:
-        # The canonical completion owns its immutable event metadata. Readers
-        # never need the current Item/operation projection to explain a v3 event.
-        if record_type == "item_completed":
-            start = self.read_event_reference("item_started", str(payload["item_id"]))
-            if start is None:
-                raise RuntimeError("completed internal Item has no durable start")
-            payload = {**start.payload, **payload}
+        if self._pending_transaction_records is None:
+            raise RuntimeError("RolloutRecord appended outside a transaction")
         payload_json = _canonical_json(payload)
         payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
         sequence = self._connection.execute(
@@ -5353,7 +879,10 @@ class RolloutStore:
         pending.append(record)
 
     def _load_projection_state(
-        self, thread_id: str, *, record: RolloutRecord | None = None,
+        self,
+        thread_id: str,
+        *,
+        record: RolloutRecord | None = None,
     ) -> ProjectionState:
         state = ProjectionState()
         thread = self._connection.execute("SELECT * FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
@@ -5365,23 +894,34 @@ class RolloutStore:
             # needs this Turn's existing Items to derive its next sequence.
             for table, key, identities, row_payload in (
                 ("turns", "turn_id", (record.turn_id,), _turn_row_payload),
-                ("items", "item_id", (record.payload.get("item_id"), record.payload.get("answer_item_id")),
-                 _item_row_payload),
                 (
-                    "model_operations", "operation_id", (record.payload.get("operation_id"),),
+                    "items",
+                    "item_id",
+                    (record.payload.get("item_id"), record.payload.get("answer_item_id")),
+                    _item_row_payload,
+                ),
+                (
+                    "model_operations",
+                    "operation_id",
+                    (record.payload.get("operation_id"),),
                     _model_operation_row_payload,
                 ),
                 (
-                    "model_attempts", "attempt_id",
+                    "model_attempts",
+                    "attempt_id",
                     (record.payload.get("attempt_id"), record.payload.get("previous_attempt_id")),
                     _model_attempt_row_payload,
                 ),
                 (
-                    "budget_reservations", "reservation_id", (record.payload.get("reservation_id"),),
+                    "budget_reservations",
+                    "reservation_id",
+                    (record.payload.get("reservation_id"),),
                     _budget_reservation_row_payload,
                 ),
                 (
-                    "child_budget_allocations", "allocation_id", (record.payload.get("allocation_id"),),
+                    "child_budget_allocations",
+                    "allocation_id",
+                    (record.payload.get("allocation_id"),),
                     _child_budget_allocation_row_payload,
                 ),
                 ("tool_operations", "operation_id", (record.payload.get("operation_id"),), _tool_operation_row_payload),
@@ -5411,7 +951,8 @@ class RolloutStore:
                         entities[row[key]] = row_payload(row)
             if record.record_type == "item_started":
                 row = self._connection.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM items WHERE turn_id = ?", (record.turn_id,),
+                    "SELECT COALESCE(MAX(sequence), 0) AS sequence FROM items WHERE turn_id = ?",
+                    (record.turn_id,),
                 ).fetchone()
                 state.item_sequences[str(record.turn_id)] = int(row["sequence"])
             return state
@@ -5453,23 +994,37 @@ class RolloutStore:
         return state
 
     def _persist_projection_state(
-        self, state: ProjectionState, *, changed_sequence: int | None = None,
-        record: RolloutRecord | None = None, chain_hashes: Mapping[str, str] | None = None,
+        self,
+        state: ProjectionState,
+        *,
+        changed_sequence: int | None = None,
+        record: RolloutRecord | None = None,
+        chain_hashes: Mapping[str, str] | None = None,
+        connection: sqlite3.Connection | None = None,
+        positions: Mapping[str, Mapping[str, int]] | None = None,
     ) -> None:
+        connection = self._connection if connection is None else connection
         if changed_sequence is not None:
             # Every changed reducer entity advances to the current record's
             # sequence. Do not UPSERT entities loaded only as dependencies.
             for entities in (
-                state.threads, state.turns, state.items, state.model_operations,
-                state.model_attempts, state.budget_reservations,
-                state.child_budget_allocations, state.tool_operations,
-                state.interactions, state.approvals, state.artifacts,
+                state.threads,
+                state.turns,
+                state.items,
+                state.model_operations,
+                state.model_attempts,
+                state.budget_reservations,
+                state.child_budget_allocations,
+                state.tool_operations,
+                state.interactions,
+                state.approvals,
+                state.artifacts,
             ):
                 for identity in tuple(entities):
                     if entities[identity]["applied_thread_sequence"] != changed_sequence:
                         del entities[identity]
         for thread in state.threads.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO threads (
                     thread_id, workspace, parent_thread_id, fork_turn_id,
@@ -5501,7 +1056,7 @@ class RolloutStore:
                 ),
             )
         for turn in state.turns.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO turns (
                     turn_id, thread_id, status, terminal_reason_code,
@@ -5532,7 +1087,7 @@ class RolloutStore:
                 ),
             )
         for item in state.items.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO items (
                     item_id, thread_id, turn_id, sequence, kind, status, producer,
@@ -5558,7 +1113,7 @@ class RolloutStore:
                 ),
             )
         for artifact in state.artifacts.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO artifacts (
                     artifact_id, thread_id, turn_id, blob_sha256, size_bytes,
@@ -5585,7 +1140,7 @@ class RolloutStore:
                 ),
             )
         for operation in state.model_operations.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO model_operations (
                     operation_id, thread_id, turn_id, status, active_attempt_id,
@@ -5619,7 +1174,7 @@ class RolloutStore:
                 ),
             )
         for attempt in state.model_attempts.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO model_attempts (
                     attempt_id, operation_id, generation, status,
@@ -5649,7 +1204,7 @@ class RolloutStore:
                 ),
             )
         for reservation in state.budget_reservations.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO budget_reservations (
                     reservation_id, thread_id, turn_id, scope_id, operation_id,
@@ -5677,7 +1232,7 @@ class RolloutStore:
                 ),
             )
         for allocation in state.child_budget_allocations.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO child_budget_allocations (
                     allocation_id, thread_id, parent_turn_id, child_turn_id,
@@ -5704,7 +1259,7 @@ class RolloutStore:
                 ),
             )
         for operation in state.tool_operations.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO tool_operations (
                     operation_id, thread_id, turn_id, tool_call_id, tool_name,
@@ -5755,7 +1310,7 @@ class RolloutStore:
                 ),
             )
         for interaction in state.interactions.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO interactions (
                     request_id, thread_id, turn_id, kind, status, version,
@@ -5784,7 +1339,7 @@ class RolloutStore:
                 ),
             )
         for approval in state.approvals.values():
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO approvals (
                     request_id, thread_id, turn_id, operation_id, status,
@@ -5807,28 +1362,28 @@ class RolloutStore:
                 ),
             )
         for thread_id, thread in state.threads.items():
-            position = self._connection.execute(
-                """
-                SELECT record_id, thread_sequence
-                FROM rollout_records
-                WHERE thread_id = ?
-                ORDER BY thread_sequence DESC
-                LIMIT 1
-                """,
-                (thread_id,),
-            ).fetchone()
+            position = (
+                positions[thread_id]
+                if positions is not None
+                else connection.execute(
+                    "SELECT record_id, thread_sequence FROM rollout_records WHERE thread_id = ? "
+                    "ORDER BY thread_sequence DESC LIMIT 1",
+                    (thread_id,),
+                ).fetchone()
+            )
             if position is None:
                 raise RuntimeError(f"projection has no canonical records: {thread_id}")
             if record is not None:
-                metadata = self._connection.execute(
-                    "SELECT canonical_hash FROM projection_meta WHERE thread_id = ?", (thread_id,),
+                metadata = connection.execute(
+                    "SELECT canonical_hash FROM projection_meta WHERE thread_id = ?",
+                    (thread_id,),
                 ).fetchone()
                 digest = _record_prefix_hash(metadata["canonical_hash"] if metadata else None, record)
             elif chain_hashes is not None:
                 digest = chain_hashes[thread_id]
             else:
                 raise RuntimeError("projection persistence requires a canonical prefix hash")
-            self._connection.execute(
+            connection.execute(
                 """
                 INSERT INTO projection_meta (
                     thread_id, applied_thread_sequence, applied_record_id,
@@ -6088,6 +1643,15 @@ class RolloutStore:
             self._connection.execute("ALTER TABLE projection_meta ADD COLUMN hash_version INTEGER NOT NULL DEFAULT 1")
 
 
+def _decoded_row(row: sqlite3.Row) -> Mapping[str, Any]:
+    return MappingProxyType(
+        {
+            (key[:-5] if key.endswith("_json") else key): (json.loads(value) if key.endswith("_json") else value)
+            for key, value in dict(row).items()
+        }
+    )
+
+
 def _metadata_hash_version(row: sqlite3.Row) -> int:
     # Readonly legacy snapshots have never run schema migration.
     if "hash_version" not in row.keys():
@@ -6103,11 +1667,16 @@ def _record_prefix_hash(previous: str | None, record: RolloutRecord) -> str:
     compares all projected rows and validates referenced artifact contents.
     """
     envelope = {
-        "record_id": record.record_id, "record_uuid": record.record_uuid,
-        "thread_id": record.thread_id, "turn_id": record.turn_id,
-        "thread_sequence": record.thread_sequence, "record_type": record.record_type,
-        "producer": record.producer, "payload_schema_version": record.payload_schema_version,
-        "payload_hash": record.payload_hash, "reducer_version": _REDUCER_VERSION,
+        "record_id": record.record_id,
+        "record_uuid": record.record_uuid,
+        "thread_id": record.thread_id,
+        "turn_id": record.turn_id,
+        "thread_sequence": record.thread_sequence,
+        "record_type": record.record_type,
+        "producer": record.producer,
+        "payload_schema_version": record.payload_schema_version,
+        "payload_hash": record.payload_hash,
+        "reducer_version": _REDUCER_VERSION,
     }
     encoded = b"praxis-record-prefix-v2\0" + (previous or "0" * 64).encode("ascii")
     return hashlib.sha256(encoded + b"\0" + _canonical_json(envelope).encode()).hexdigest()
@@ -6155,159 +1724,8 @@ def _canonical_json(value: object) -> str:
     )
 
 
-def _context_durable_state(store: RolloutStore, turn_id: str) -> dict[str, Any]:
-    """Project non-text state that compaction must never silently erase."""
-
-    return {
-        "interactions": [
-            {
-                "request_id": interaction.request_id,
-                "kind": interaction.kind,
-                "status": interaction.status,
-                "version": interaction.version,
-                "operation_id": interaction.operation_id,
-                "request": dict(interaction.request),
-                "response": dict(interaction.response),
-            }
-            for interaction in store.list_interactions(turn_id)
-            if interaction.status != "resolved"
-        ],
-        "approvals": [
-            {
-                "request_id": approval.request_id,
-                "operation_id": approval.operation_id,
-                "status": approval.status,
-                "scope": dict(approval.scope),
-            }
-            for approval in store.list_approvals(turn_id)
-            if approval.status in {"pending", "approved"}
-        ],
-        "tool_operations": [
-            {
-                "operation_id": operation.operation_id,
-                "tool_call_id": operation.tool_call_id,
-                "tool_name": operation.tool_name,
-                "status": operation.status,
-                "effects": list(operation.effects),
-                "resources": [dict(resource) for resource in operation.resources],
-                "requires_reconciliation": operation.requires_reconciliation,
-                "error_code": operation.error_code,
-            }
-            for operation in store.list_tool_operations(turn_id)
-            if operation.status not in {"succeeded", "failed", "denied", "cancelled", "superseded"}
-            or operation.requires_reconciliation
-        ],
-    }
-
-
-def _json_object(value: Mapping[str, Any], *, field: str) -> dict[str, Any]:
-    try:
-        normalized = json.loads(_canonical_json(dict(value)))
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{field} must be JSON-serializable") from exc
-    if not isinstance(normalized, dict):
-        raise TypeError(f"{field} must be an object")
-    return normalized
-
-
-def _string_tuple(values: tuple[str, ...], *, field: str) -> tuple[str, ...]:
-    if any(not isinstance(value, str) or not value for value in values):
-        raise ValueError(f"{field} must contain non-empty strings")
-    return tuple(sorted(set(values)))
-
-
-def _resource_tuple(
-    values: tuple[Mapping[str, Any], ...],
-) -> tuple[dict[str, str], ...]:
-    resources: list[dict[str, str]] = []
-    for value in values:
-        kind = value.get("kind")
-        identity = value.get("identity")
-        access = value.get("access")
-        if (
-            not isinstance(kind, str)
-            or not kind
-            or not isinstance(identity, str)
-            or not identity
-            or access not in {"read", "write"}
-        ):
-            raise ValueError("tool resources require non-empty kind/identity and read/write access")
-        if kind == "filesystem" and not Path(identity).is_absolute():
-            raise ValueError("filesystem resource identity must be absolute")
-        resources.append({"kind": kind, "identity": identity, "access": str(access)})
-    unique = {(item["kind"], item["identity"], item["access"]): item for item in resources}
-    return tuple(unique[key] for key in sorted(unique))
-
-
-def _resource_sets_conflict(
-    left: tuple[Mapping[str, Any], ...],
-    right: tuple[Mapping[str, Any], ...],
-) -> bool:
-    for first in left:
-        for second in right:
-            if first.get("access") == second.get("access") == "read":
-                continue
-            if first.get("kind") != second.get("kind"):
-                continue
-            first_identity = first.get("identity")
-            second_identity = second.get("identity")
-            if not isinstance(first_identity, str) or not isinstance(second_identity, str):
-                raise RuntimeError("durable resource claim is malformed")
-            if first.get("kind") != "filesystem":
-                if first_identity == second_identity:
-                    return True
-                continue
-            first_path = Path(first_identity)
-            second_path = Path(second_identity)
-            if first_path.is_relative_to(second_path) or second_path.is_relative_to(first_path):
-                return True
-    return False
-
-
 def _immutable_object(encoded: str) -> Mapping[str, Any]:
     return MappingProxyType(json.loads(encoded))
-
-
-def _thread_snapshot(row: sqlite3.Row) -> ThreadSnapshot:
-    return ThreadSnapshot(
-        thread_id=row["thread_id"],
-        workspace=row["workspace"],
-        parent_thread_id=row["parent_thread_id"],
-        fork_turn_id=row["fork_turn_id"],
-        active_turn_id=row["active_turn_id"],
-        head_turn_id=row["head_turn_id"],
-        head_version=row["head_version"],
-        settings=MappingProxyType(json.loads(row["settings_json"])),
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _turn_snapshot(row: sqlite3.Row) -> TurnSnapshot:
-    return TurnSnapshot(
-        turn_id=row["turn_id"],
-        thread_id=row["thread_id"],
-        status=row["status"],
-        terminal_reason_code=row["terminal_reason_code"],
-        terminal_message=row["terminal_message"],
-        predecessor_turn_id=row["predecessor_turn_id"],
-        turn_index=row["turn_index"],
-        binding_manifest=_immutable_object(row["binding_manifest_json"]),
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _item_snapshot(row: sqlite3.Row) -> ItemSnapshot:
-    return ItemSnapshot(
-        item_id=row["item_id"],
-        thread_id=row["thread_id"],
-        turn_id=row["turn_id"],
-        sequence=row["sequence"],
-        kind=row["kind"],
-        status=row["status"],
-        producer=row["producer"],
-        payload=_immutable_object(row["payload_json"]),
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
 
 
 def _artifact_snapshot(row: sqlite3.Row) -> ArtifactSnapshot:
@@ -6319,91 +1737,6 @@ def _artifact_snapshot(row: sqlite3.Row) -> ArtifactSnapshot:
         size_bytes=row["size_bytes"],
         media_type=row["media_type"],
         name=row["name"],
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _model_operation_snapshot(row: sqlite3.Row) -> ModelOperationSnapshot:
-    return ModelOperationSnapshot(
-        operation_id=row["operation_id"],
-        thread_id=row["thread_id"],
-        turn_id=row["turn_id"],
-        status=row["status"],
-        active_attempt_id=row["active_attempt_id"],
-        generation=row["generation"],
-        request_hash=row["request_hash"],
-        context_hash=row["context_hash"],
-        tool_hash=row["tool_hash"],
-        wire_hash=row["wire_hash"],
-        request_ref=_immutable_object(row["request_ref_json"]),
-        response_item_id=row["response_item_id"],
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _model_attempt_snapshot(row: sqlite3.Row) -> ModelAttemptSnapshot:
-    return ModelAttemptSnapshot(
-        attempt_id=row["attempt_id"],
-        operation_id=row["operation_id"],
-        generation=row["generation"],
-        status=row["status"],
-        provider_response_id=row["provider_response_id"],
-        usage=_immutable_object(row["usage_json"]),
-        claim_owner=row["claim_owner"],
-        lease_expires_at=row["lease_expires_at"],
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _tool_operation_snapshot(row: sqlite3.Row) -> ToolOperationSnapshot:
-    return ToolOperationSnapshot(
-        operation_id=row["operation_id"],
-        thread_id=row["thread_id"],
-        turn_id=row["turn_id"],
-        tool_call_id=row["tool_call_id"],
-        tool_name=row["tool_name"],
-        arguments_digest=row["arguments_digest"],
-        execution_revision=row["execution_revision"],
-        effects=tuple(json.loads(row["effects_json"])),
-        resources=tuple(MappingProxyType(resource) for resource in json.loads(row["resources_json"])),
-        idempotent=bool(row["idempotent"]),
-        status=row["status"],
-        attempt_count=row["attempt_count"],
-        error_code=row["error_code"],
-        requires_reconciliation=bool(row["requires_reconciliation"]),
-        result_item_id=row["result_item_id"],
-        approval_request_id=row["approval_request_id"],
-        claim_generation=row["claim_generation"],
-        fencing_token=row["fencing_token"],
-        claim_owner=row["claim_owner"],
-        lease_expires_at=row["lease_expires_at"],
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _interaction_snapshot(row: sqlite3.Row) -> InteractionSnapshot:
-    return InteractionSnapshot(
-        request_id=row["request_id"],
-        thread_id=row["thread_id"],
-        turn_id=row["turn_id"],
-        kind=row["kind"],
-        status=row["status"],
-        version=row["version"],
-        operation_id=row["operation_id"],
-        request=_immutable_object(row["request_json"]),
-        response=_immutable_object(row["response_json"]),
-        applied_thread_sequence=row["applied_thread_sequence"],
-    )
-
-
-def _approval_snapshot(row: sqlite3.Row) -> ApprovalSnapshot:
-    return ApprovalSnapshot(
-        request_id=row["request_id"],
-        thread_id=row["thread_id"],
-        turn_id=row["turn_id"],
-        operation_id=row["operation_id"],
-        status=row["status"],
-        scope=_immutable_object(row["scope_json"]),
         applied_thread_sequence=row["applied_thread_sequence"],
     )
 

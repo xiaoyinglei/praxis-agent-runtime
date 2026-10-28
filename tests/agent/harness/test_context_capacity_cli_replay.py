@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from agent_runtime.cli import agent_app
 from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
-from agent_runtime.harness import GatewayHarnessModel, RolloutStore
+from agent_runtime.harness import GatewayHarnessModel, RuntimeState
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMProviderResult, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway
 from tests.agent.harness.test_model_adapter import CharacterAccounting, _resolved_model
@@ -202,7 +202,7 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
     if task == "dialog":
         from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 
-        with RolloutStore(database) as store:
+        with RuntimeState.open_sync(database) as store:
             thread = store.create_thread(workspace=tmp_path)
             previous = store.start_turn(
                 thread_id=thread.thread_id, user_message="Synthetic dialogue", binding_manifest={}
@@ -222,7 +222,7 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         assert not provider.summary_sources
     if task == "code":
         assert (tmp_path / "sample.py").read_text().startswith("VALUE = 17\n# old evidence ")
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         items = store.list_items(turn.turn_id)
         compactions = [item for item in items if item.kind == "context_compaction"]

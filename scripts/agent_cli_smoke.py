@@ -19,7 +19,7 @@ from agent_runtime.cli import (
     _print_chat_help,
     agent_app,
 )
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.recovery import RecoveryPlan
 from agent_runtime.result import AgentPause, AgentToolSummary
 from agent_runtime.streaming.events import (
@@ -125,7 +125,7 @@ def run_smoke() -> CLISmokeResult:
         workspace = root / "workspace"
         workspace.mkdir()
         checkpoint_db = root / "agent.sqlite"
-        with RolloutStore(checkpoint_db) as store:
+        with RuntimeState.open_sync(checkpoint_db) as store:
             thread = store.create_thread(workspace=workspace)
             turn = store.start_turn(
                 thread_id=thread.thread_id,

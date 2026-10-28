@@ -22,8 +22,8 @@ from agent_runtime.harness.protocol import (
     HarnessModelResponse,
     PreparedModelCall,
 )
-from agent_runtime.harness.rollout import RolloutStore
 from agent_runtime.harness.session import TurnExecutor
+from agent_runtime.harness.state import RuntimeState
 from tests.agent.harness.test_model_adapter import (
     CapturingGateway,
     CharacterAccounting,
@@ -73,7 +73,7 @@ class PressureModel:
         )
 
 
-def _prepare(store: RolloutStore, turn_id: str, request_id: str):
+def _prepare(store: RuntimeState, turn_id: str, request_id: str):
     return store.prepare_model_operation(
         turn_id=turn_id,
         request_hash=f"request:{request_id}",
@@ -95,7 +95,7 @@ def test_protected_tail_formula_is_deterministic() -> None:
 def test_normal_remaining_excludes_protected_tail(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -108,7 +108,7 @@ def test_normal_remaining_excludes_protected_tail(tmp_path: Path) -> None:
 def test_dispatch_requires_explicit_access_to_protected_tail(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -137,7 +137,7 @@ def test_session_switches_to_pressure_before_using_protected_tail(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         model = PressureModel()
         session = TurnExecutor(
@@ -183,7 +183,7 @@ def _gateway_model(*, input_tokens: int | None = None, gateway: CapturingGateway
     return model, gateway
 
 
-def _settle_prior_usage(store: RolloutStore, turn_id: str, tokens: int) -> None:
+def _settle_prior_usage(store: RuntimeState, turn_id: str, tokens: int) -> None:
     operation = _prepare(store, turn_id, "prior-work")
     attempt = store.dispatch_model_attempt(
         operation.operation_id,
@@ -201,7 +201,7 @@ def _settle_prior_usage(store: RolloutStore, turn_id: str, tokens: int) -> None:
 
 def test_gateway_session_finishes_with_remaining_budget_from_failed_trial(tmp_path: Path) -> None:
     """The real adapter must fit its wire and reservation, not just signal pressure."""
-    with RolloutStore(tmp_path / "rollout.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -237,7 +237,7 @@ def test_gateway_session_finishes_with_remaining_budget_from_failed_trial(tmp_pa
 def test_pressure_cap_is_remeasured_and_recovers_identical_wire_after_reopen(tmp_path: Path) -> None:
     database = tmp_path / "rollout.sqlite"
     model, gateway = _gateway_model()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -257,7 +257,7 @@ def test_pressure_cap_is_remeasured_and_recovers_identical_wire_after_reopen(tmp
         )
         assert not gateway.requests
 
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner = TurnExecutor(
             thread_id=thread.thread_id, store=store, model=model,
             context_manager=StaticContext(), completion_gate=AcceptAnswer(),
@@ -275,7 +275,7 @@ def test_pressure_cap_is_remeasured_and_recovers_identical_wire_after_reopen(tmp
 
 @pytest.mark.parametrize("budget", [None, 100_000])
 def test_sufficient_budget_keeps_configured_output_ceiling(tmp_path: Path, budget: int | None) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=9_492)
         runner = TurnExecutor(
@@ -291,7 +291,7 @@ def test_sufficient_budget_keeps_configured_output_ceiling(tmp_path: Path, budge
 
 
 def test_input_without_output_headroom_stops_before_provider_io(tmp_path: Path) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=1_000)
         runner = TurnExecutor(
@@ -311,7 +311,7 @@ def test_input_without_output_headroom_stops_before_provider_io(tmp_path: Path) 
 
 
 def test_pressure_keeps_explicit_output_limit_and_joint_summary_plan(tmp_path: Path) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id, user_message="finish",
@@ -333,7 +333,7 @@ def test_pressure_keeps_explicit_output_limit_and_joint_summary_plan(tmp_path: P
 
 
 def test_capped_incomplete_answer_is_not_accepted_as_completion(tmp_path: Path) -> None:
-    with RolloutStore(tmp_path / "rollout.sqlite") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite") as store:
         thread = store.create_thread(workspace=tmp_path)
         model, gateway = _gateway_model(input_tokens=9_492, gateway=MaxTokensGateway())
         runner = TurnExecutor(

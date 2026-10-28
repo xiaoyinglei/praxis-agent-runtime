@@ -25,7 +25,7 @@ from agent_runtime.checkpoints import (
 from agent_runtime.core.messages import tool_result_message
 from agent_runtime.core.runtime_diagnostics import exception_diagnostic
 from agent_runtime.harness.events import commit_and_publish
-from agent_runtime.harness.rollout import ResourceClaimConflictError, RolloutStore
+from agent_runtime.harness.state import ResourceClaimConflictError, RuntimeState
 from agent_runtime.harness.verification import classify_tool_verification
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
@@ -179,7 +179,7 @@ class ToolOrchestrator:
     def __init__(
         self,
         *,
-        store: RolloutStore,
+        store: RuntimeState,
         tools: Mapping[str, Tool],
         execution_context: ToolExecutionContext,
         worker_id: str | None = None,
@@ -289,7 +289,7 @@ class ToolOrchestrator:
         )
 
         def commit() -> None:
-            with self._store._transaction():
+            with self._store.persistence.transaction():
                 self.reconcile(turn_id=turn_id, outcome=ToolReconciliationOutcome(status=status, result=result))
                 origin = metadata.get("runtime_workspace_origin_operation_id")
                 if continuation.terminal and isinstance(origin, str):

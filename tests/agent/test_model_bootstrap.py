@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.agent import Agent
-from agent_runtime.harness import RolloutStore, Session
+from agent_runtime.harness import RuntimeState, Session
 from agent_runtime.models import ModelSessionState, ModelSpec
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
@@ -134,7 +134,7 @@ async def test_resume_bootstraps_only_the_operation_binding_when_prepared(
         "test_marker": "frozen-binding",
     }
 
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(
             workspace=workspace,
         )

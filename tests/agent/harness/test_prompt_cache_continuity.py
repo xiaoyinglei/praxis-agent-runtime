@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest, RolloutStore
+from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest, RuntimeState
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from tests.agent.harness.test_model_adapter import CapturingGateway, _resolved_model
 from tests.agent.harness.test_runtime_efficiency import PlanningModel
@@ -32,7 +32,7 @@ async def test_real_turn_appends_state_and_restores_identical_saved_wire(tmp_pat
     assert "Current advisory plan" in str(wires[-1].messages)
     # Rebuilding a frozen request uses its saved state, regardless of wall clock.
     assert adapter.prepare(model.requests[0]).wire_hash == adapter.prepare(model.requests[0]).wire_hash
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
         updates = [i.payload["request_ref"].get("runtime_context_update")
                    for i in store.list_items(result.turn_id) if i.kind == "model_request"]
         assert len(updates) == len(wires) and updates[0]
@@ -100,7 +100,7 @@ async def test_summary_uses_saved_parent_and_falls_back_when_fork_is_too_large(t
     gateway = BudgetAwareCapturingGateway(max_input_tokens=100000)
     adapter = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(
         gateway=gateway, token_accounting=gateway.token_accounting), instructions=("Static instructions",))
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
         manager = RolloutContextManager(store)
         runner = TurnExecutor(thread_id=result.thread_id, store=store, model=adapter, context_manager=manager,
                               completion_gate=Accept())
@@ -204,7 +204,7 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
         async def agenerate_model_request(self, **kwargs):
             response = await super().agenerate_model_request(**kwargs)
             if len(self.requests) == 1:
-                return replace(response, turn=response.turn.model_copy(update={
+                return replace(response, outputs=(), turn=response.turn.model_copy(update={
                     "text": "", "stop_reason": StopReason.TOOL_USE,
                     "tool_calls": [ToolCall(id="read", name="read_file", input={"path": "source.txt"})]}))
             return response
@@ -235,7 +235,7 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
         assert "Runtime budget status" not in str(after.messages)
         assert "requests_remaining_including_this" not in str(after.messages)
         assert "effective_input_limit" not in str(after.messages)
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
         operations = store.list_model_operations(result.turn_id)
         assert bool(operations[0].request_ref.get("runtime_input_update")) == legacy
         assert "runtime_input_update" not in operations[1].request_ref
@@ -299,14 +299,22 @@ async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tm
     class MisbehavingGateway(CapturingGateway):
         async def agenerate_model_request(self, **kwargs):
             response = await super().agenerate_model_request(**kwargs)
-            return replace(response, turn=response.turn.model_copy(update={"stop_reason": StopReason.TOOL_USE,
-                "tool_calls": [ToolCall(id="forbidden", name="side_effect", input={})]}))
+            return replace(
+                response,
+                outputs=(),
+                turn=response.turn.model_copy(
+                    update={
+                        "stop_reason": StopReason.TOOL_USE,
+                        "tool_calls": [ToolCall(id="forbidden", name="side_effect", input={})],
+                    }
+                ),
+            )
 
     tool = _tool("side_effect")
     gateway = MisbehavingGateway()
     adapter = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=gateway),
                                   instructions=("Summarize only",))
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
         thread = store.create_thread(workspace=tmp_path)
         record = store.start_turn(thread_id=thread.thread_id, user_message="synthetic task",
                                   binding_manifest={"execution_context_policy": CACHE_POLICY})
@@ -332,7 +340,7 @@ def test_new_turn_clears_previous_acceptance_contract(tmp_path):
     from agent_runtime.harness import RolloutContextManager, TurnExecutor
     from tests.agent.harness.test_compaction_consistency import Accept
 
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         record = store.start_turn(thread_id=thread.thread_id, user_message="new task", binding_manifest={})
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=PlanningModel(),

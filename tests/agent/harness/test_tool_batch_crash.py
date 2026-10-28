@@ -10,12 +10,12 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore, Session
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, Session
 from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel, _read_tool
 
 
 class CrashBatchModel(ToolThenAnswerModel):
-    async def dispatch(self, prepared, *, delta_sink=None):
+    async def dispatch(self, prepared, *, event_sink=None):
         if self.requests[-1].step == 1:
             return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
                 HarnessToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
@@ -61,7 +61,7 @@ asyncio.run(main())
         thread_id = (await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)).strip()
         assert (await asyncio.wait_for(asyncio.to_thread(child.stdout.readline), 10)).strip() == "WAITING"
         for _ in range(100):
-            with RolloutStore(database) as store:
+            async with (await RuntimeState.open(database)) as store:
                 operations = store.list_tool_operations()
                 if any(op.tool_call_id == "call-0" and op.result_item_id for op in operations):
                     turn_id = operations[0].turn_id

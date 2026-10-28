@@ -151,6 +151,11 @@ def apply_record(
             attempt["lease_expires_at"] = payload["lease_expires_at"]
             attempt["applied_thread_sequence"] = sequence
             _advance(state, thread_id, _turn_id(record), sequence)
+        case "model_response_started":
+            attempt = state.model_attempts[payload["attempt_id"]]
+            attempt["provider_response_id"] = payload["provider_response_id"]
+            attempt["applied_thread_sequence"] = sequence
+            _advance(state, thread_id, _turn_id(record), sequence)
         case "model_attempt_unknown":
             operation = state.model_operations[payload["operation_id"]]
             attempt = state.model_attempts[payload["attempt_id"]]

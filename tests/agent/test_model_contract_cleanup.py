@@ -59,63 +59,12 @@ def test_old_definition_retains_canonical_bytes_and_revision() -> None:
     assert old.definition_revision == "sha256:d3058f762fecc81539db52249ca5db6a164b49a26d75bc19b27e74f1332e6694"
 
 
-@pytest.mark.parametrize("summary_role", ["context", "assistant"])
-def test_saved_legacy_request_keeps_baseline_wire_hash(summary_role: str) -> None:
-    from dataclasses import replace
-
-    from agent_runtime.harness.model_adapter import GatewayHarnessModel
-    from agent_runtime.harness.protocol import HarnessModelRequest, restore_harness_message
-    from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
-
-    gateway = BudgetAwareCapturingGateway(max_input_tokens=9000)
-    model = GatewayHarnessModel(
-        model_id="deepseek-flash",
-        instructions=("Continue task.",),
-        resolved=replace(
-            _resolved_model(
-                gateway=gateway,
-                token_accounting=gateway.token_accounting,
-                provider="deepseek",
-                model_id="deepseek-flash",
-            ),
-            continuation_summary_role="assistant",
-        ),
-    )
-    # Saved request messages before provenance was introduced. Hashes captured
-    # by executing baseline 86f9220's adapter, not generated from this decoder.
-    messages = (
-        {"role": "user", "content": "Read specs then implement."},
-        {"role": "context", "content": "Context compaction:\nAlready read specs."},
-        {"role": "context", "content": "A new runtime constraint."},
-    )
-    prepared = model.prepare(
-        HarnessModelRequest(
-            thread_id="t",
-            turn_id="u",
-            binding_manifest={},
-            continuation_summary_role=summary_role,
-            messages=tuple(restore_harness_message(message) for message in messages),
-        )
-    )
-    baseline = {
-        "context": (
-            "045901055bc19c4b4cba355d552747dc80e11dab4c66a56338c4aa040ebb4c7d",
-            "wire_3668e150b50420928d5044fc2809bc5673b21248cf505ee77eac79648736a7ca",
-        ),
-        "assistant": (
-            "235bbba41361c24a8c9a824363fc1b5b8bef35f4f1d0a01bfd5efa7b9fb82ca6",
-            "wire_c1bb5bf9b89809a8e49c11be85fcf4f286a6f046ae3823b6a81377ae1f5934e1",
-        ),
-    }
-    assert (prepared.request_hash, prepared.wire_hash) == baseline[summary_role]
-
-
 @pytest.mark.parametrize("provider,model_id", [("deepseek", "deepseek-flash"), ("other", "another")])
 def test_new_context_role_depends_on_provenance_and_configuration(provider: str, model_id: str) -> None:
     from dataclasses import replace
 
     from agent_runtime.harness.model_adapter import GatewayHarnessModel
-    from agent_runtime.harness.protocol import HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness.protocol import HarnessMessage, HarnessModelRequest, restore_harness_message
     from agent_runtime.modeling.openai_wire import serialize_openai_request
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
 
@@ -133,7 +82,10 @@ def test_new_context_role_depends_on_provenance_and_configuration(provider: str,
         messages=(
             HarnessMessage(role="user", content="Continue work."),
             HarnessMessage(role="context", content="Any presentation", context_category="continuation_summary"),
-            HarnessMessage(role="context", content="Context compaction:\nThis is an ordinary constraint."),
+            restore_harness_message({
+                "role": "context",
+                "content": "Context compaction:\nThis is an ordinary constraint.",
+            }),
         ),
     )
     for summary_role, expected in (("context", "user"), ("assistant", "assistant")):

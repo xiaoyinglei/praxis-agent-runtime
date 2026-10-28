@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     HarnessToolCall,
     ItemSnapshot,
     PreparedModelCall,
-    RolloutStore,
+    RuntimeState,
 )
 from agent_runtime.result import AgentResult
 
@@ -57,7 +57,7 @@ class _UpdatePlanThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         step = int(prepared.request_ref["step"])
         if step == 1:
             return HarnessModelResponse(
@@ -96,7 +96,7 @@ async def _run_plan_turn(
         "Make update_plan durable.",
         require_workspace_change=False,
     )
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         items = tuple(store.list_items(result.turn_id))
     return result, items
 
@@ -177,7 +177,7 @@ async def test_failed_turn_projects_the_canonical_plan_not_raw_tool_claims(
         max_turns=1,
         require_workspace_change=False,
     )
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         plan_item = [
             item for item in store.list_items(result.turn_id) if item.kind == "plan_state"
         ][-1]

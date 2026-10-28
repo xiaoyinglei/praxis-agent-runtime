@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
 from tests.agent.harness.test_verification_feedback import _start_changed_turn
@@ -43,7 +43,7 @@ def test_historical_assertion_feedback_explains_missing_targets_and_supported_re
     # Immutable pre-v11 results remain readable by the compatibility gate.
     observation = {"assertions_passed": 1, "assertions_failed": 0, "scope": "entry_script"}
 
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -85,7 +85,7 @@ def test_historical_assertion_feedback_explains_missing_targets_and_supported_re
 def test_missing_verification_does_not_recommend_assertions_without_target_attestation(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         decision = DeliveryCompletionGate(store).evaluate(_proposal(store, turn.turn_id))
         feedback = json.loads(decision.reason)

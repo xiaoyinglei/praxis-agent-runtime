@@ -24,7 +24,7 @@ from agent_runtime.command_cli import commands
 from agent_runtime.connection_manager import connections_command
 from agent_runtime.core.llm_config import ModelProvider
 from agent_runtime.core.llm_registry import UnknownModelIdError
-from agent_runtime.harness import RolloutStore, TurnSnapshot
+from agent_runtime.harness import RuntimeState, TurnSnapshot
 from agent_runtime.harness.ownership import ConversationBusyError
 from agent_runtime.history import ChatSessionSummary, list_chat_sessions, read_chat_messages
 from agent_runtime.knowledge import RAGKnowledgeConfig
@@ -237,7 +237,7 @@ def agent_memory(
     elif action == "configure":
         if use is None and generate is None:
             raise typer.BadParameter("configure requires --use/--no-use or --generate/--no-generate")
-        with RolloutStore(checkpoint_db) as store:
+        with RuntimeState.open_sync(checkpoint_db) as store:
             state = store.read_memory_state(workspace)
         config = MemoryConfig(use_memories=state["use_memories"] if use is None else use,
                               generate_memories=state["generate_memories"] if generate is None else generate)
@@ -943,7 +943,7 @@ async def _select_chat_session(
     database: Path, workspace: Path, *, selector: str, ui: TerminalChatApp | None,
 ) -> ChatSessionSummary | None:
     try:
-        sessions = list_chat_sessions(database, workspace=workspace)
+        sessions = await asyncio.to_thread(list_chat_sessions, database, workspace=workspace)
     except (OSError, ValueError, sqlite3.Error):
         raise click.ClickException("会话数据库不可读取；请检查路径。") from None
     if selector:
@@ -1071,7 +1071,7 @@ async def _chat_facade_loop(
             )
             if selected is None:
                 return False
-            messages = read_chat_messages(
+            messages = await asyncio.to_thread(read_chat_messages,
                 database, thread_id=selected.thread_id, workspace=Path(default_chat_workspace),
             )
             await stack.aclose()
@@ -1114,7 +1114,9 @@ async def _chat_facade_loop(
             if selected_chat is not None:
                 anchor = selected_chat.head_turn_id
                 if anchor is not None:
-                    metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor)
+                    metadata = await asyncio.to_thread(
+                        _cli_turn, facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, anchor,
+                    )
                     facade.knowledge = metadata.runtime.knowledge
             opened = await stack.enter_async_context(facade.session(
                 **({"_frozen_turn_id": frozen_turn_id} if frozen_turn_id is not None else {
@@ -1661,7 +1663,7 @@ async def _chat_facade_loop(
             if selected_chat is not None:
                 # Refresh the durable active slot before opening any resources. Another
                 # process may have started a Turn since the conversation was selected.
-                latest = next((chat for chat in list_chat_sessions(
+                latest = next((chat for chat in await asyncio.to_thread(list_chat_sessions,
                     facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, workspace=Path(default_chat_workspace),
                 ) if chat.thread_id == selected_chat.thread_id), None)
                 if latest is None:
@@ -1695,7 +1697,9 @@ async def _chat_facade_loop(
                             _print_chat_recovery(selected_chat, saved_result)
                             continue
                     if saved_result is not None and saved_action != "abort":
-                        metadata = _cli_turn(facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, saved_result.turn_id)
+                        metadata = await asyncio.to_thread(
+                            _cli_turn, facade.checkpoint_db or DEFAULT_CHECKPOINT_PATH, saved_result.turn_id,
+                        )
                         facade.knowledge = metadata.runtime.knowledge
             if saved_result is None:
                 session = await open_session()
@@ -1744,8 +1748,8 @@ async def _chat_facade_loop(
                     print("\n" + format_usage_summary(result.usage))
                 text_answer = result.pause is not None and result.pause.kind in {"clarification", "choice"}
                 pending_steering = bool(_ui and result.pause and result.pause.kind == "tool_approval"
-                                        and any(facade.input_status(identity) == "pending"
-                                                for identity in _ui._input_receipts))
+                                        and any([await asyncio.to_thread(facade.input_status, identity) == "pending"
+                                                 for identity in _ui._input_receipts]))
                 action = ("continue" if pending_steering
                           else await _handle_ui_pause(result, _ui) if _ui else await _handle_cli_pause(result))
                 if action is None:
@@ -2257,7 +2261,7 @@ def _latest_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db, read_only=True) as store:
+    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"paused", "interrupted", "running"},
@@ -2271,7 +2275,7 @@ def _latest_abortable_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db, read_only=True) as store:
+    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"paused", "interrupted", "running"},
@@ -2285,7 +2289,7 @@ def _latest_completed_cli_turn(
     *,
     workspace_path: Path | None,
 ) -> _CLITurn | None:
-    with RolloutStore(checkpoint_db, read_only=True) as store:
+    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
         turn = _latest_harness_turn(
             store,
             statuses={"completed", "failed", "cancelled"},
@@ -2295,7 +2299,7 @@ def _latest_completed_cli_turn(
 
 
 def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RolloutStore(checkpoint_db, read_only=True) as store:
+    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -2304,7 +2308,7 @@ def _cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
 
 
 def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
-    with RolloutStore(checkpoint_db, read_only=True) as store:
+    with RuntimeState.open_sync(checkpoint_db, read_only=True) as store:
         try:
             turn = store.read_turn(turn_id)
         except KeyError as exc:
@@ -2313,7 +2317,7 @@ def _abortable_cli_turn(checkpoint_db: Path, turn_id: str) -> _CLITurn:
 
 
 def _latest_harness_turn(
-    store: RolloutStore,
+    store: RuntimeState,
     *,
     statuses: set[str],
     workspace_path: Path | None,
@@ -2334,7 +2338,7 @@ def _latest_harness_turn(
     return None
 
 
-def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
+def _project_cli_turn(store: RuntimeState, turn: TurnSnapshot) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
     if "model_alias" in turn.binding_manifest:
         raise RuntimeError("legacy model_alias binding is unsupported")
@@ -2357,7 +2361,7 @@ def _project_cli_turn(store: RolloutStore, turn: TurnSnapshot) -> _CLITurn:
 
 
 def _project_abortable_cli_turn(
-    store: RolloutStore,
+    store: RuntimeState,
     turn: TurnSnapshot,
 ) -> _CLITurn:
     thread = store.read_thread(turn.thread_id)
@@ -2995,7 +2999,7 @@ async def _watch_command(
             if not checkpoint_db.exists():
                 print("当前工作区没有历史会话可续写；用 --thread 指定，或使用 --no-fix。")
                 return 2
-            sessions = list_chat_sessions(checkpoint_db, workspace=workspace)
+            sessions = await asyncio.to_thread(list_chat_sessions, checkpoint_db, workspace=workspace)
             if not sessions:
                 print("当前工作区没有历史会话可续写；用 --thread 指定，或使用 --no-fix。")
                 return 2

@@ -5,7 +5,7 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from agent_runtime.harness.protocol import ModelContextOverflowError
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_compaction_consistency import long_history
@@ -14,7 +14,7 @@ from tests.agent.harness.test_context_capacity_policy import capacity_runner
 
 def test_cumulative_budget_exhaustion_is_not_a_context_window_failure(tmp_path):
     database = tmp_path / "budget.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         runner, turn, gateway = capacity_runner(store, tmp_path, tokens=1000, messages=2000)
         seed(store, turn_id=turn.turn_id, kind="user_message", payload={"text": "task " * 1000})
         result = asyncio.run(runner.run_turn(runner.restore_turn_context(turn.turn_id), start_step=1))
@@ -24,7 +24,7 @@ def test_cumulative_budget_exhaustion_is_not_a_context_window_failure(tmp_path):
         assert "remaining" in terminal.terminal_message
         assert not gateway.requests
         assert store.verify().valid
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.read_turn(turn.turn_id).terminal_reason_code == "model_token_budget_exhausted"
 
 
@@ -36,7 +36,7 @@ def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
         "invalid": "context_summary_invalid",
         "step_budget": "model_step_budget_exhausted",
     }[failure]
-    with RolloutStore(tmp_path / "summary.db") as store:
+    with RuntimeState.open_sync(tmp_path / "summary.db") as store:
         runner, turn, _ = capacity_runner(store, tmp_path, tokens=200000, messages=3)
         long_history(store, turn)
         if failure == "step_budget":
@@ -78,7 +78,7 @@ def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
 def test_changing_compaction_source_is_not_reported_as_window_exhaustion(tmp_path, monkeypatch):
     from agent_runtime.harness.protocol import ContextSourceChangedError
 
-    with RolloutStore(tmp_path / "changing.db") as store:
+    with RuntimeState.open_sync(tmp_path / "changing.db") as store:
         runner, turn, gateway = capacity_runner(store, tmp_path, messages=3)
         long_history(store, turn)
 

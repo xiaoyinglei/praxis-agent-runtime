@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -255,13 +256,13 @@ def test_cli_worktree_list_and_remove(repo: Path, worktrees_root: Path, monkeypa
 
 
 def test_remove_preserves_owned_turn_even_when_forced(repo: Path, worktrees_root: Path) -> None:
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
     from agent_runtime.harness.ownership import execution_owner
 
     manager = _manager(repo, worktrees_root)
     worktree = manager.create("running").worktree
     database = worktree.root / ".praxis" / "checkpoints.sqlite"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=worktree.root)
         store.start_turn(thread_id=thread.thread_id, user_message="running", binding_manifest={"model_id": "test"})
         with execution_owner(database, thread.thread_id):
@@ -295,9 +296,9 @@ async def test_open_session_protects_clean_checkout_until_close(repo: Path, work
         model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
     ):
         with pytest.raises(WorktreeError):
-            manager.remove(worktree.name)
+            (await asyncio.to_thread(manager.remove, worktree.name))
         assert worktree.root.is_dir()
-    assert manager.remove(worktree.name).branch_deleted
+    assert (await asyncio.to_thread(manager.remove, worktree.name)).branch_deleted
 
 
 @pytest.mark.anyio
@@ -316,7 +317,7 @@ async def test_subdirectory_session_with_external_database_protects_checkout(
         model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
     ):
         with pytest.raises(WorktreeError):
-            manager.remove(worktree.name, force=True)
+            (await asyncio.to_thread(manager.remove, worktree.name, force=True))
         assert subdirectory.is_dir()
 
 
@@ -332,7 +333,7 @@ async def test_session_does_not_block_removing_an_idle_sibling_inside_repository
         database=busy.root / ".praxis/checkpoints.sqlite", workspace=busy.root,
         model=WriteThenAnswerModel(), completion_gate=AcceptAnswer(),
     ):
-        assert manager.remove(idle.name).branch_deleted
+        assert (await asyncio.to_thread(manager.remove, idle.name)).branch_deleted
         assert busy.root.is_dir()
 
 
@@ -471,13 +472,13 @@ def test_linked_git_metadata_is_only_mounted_read_only_on_linux(repo: Path, work
 
 
 def test_remove_protects_sdk_store_at_arbitrary_location(repo, tmp_path, monkeypatch):
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     monkeypatch.setenv("PRAXIS_CONFIG_DIR", str(tmp_path / "host-config"))
     manager = WorktreeManager(repo, root=tmp_path / "trees")
     entry = manager.create("registered-store").worktree
     database = entry.root / ".praxis" / "custom-state" / "conversation.db"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=entry.root)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="unfinished", binding_manifest={})
         store.pause_turn(turn_id=turn.turn_id, reason="waiting for user")

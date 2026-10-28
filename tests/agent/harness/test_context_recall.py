@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 
-from agent_runtime.harness import RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RuntimeState, ToolOrchestrator
 from agent_runtime.harness.context_recall import create_context_recall_tool
 from agent_runtime.tools.permissions import ToolExecutionContext
 from agent_runtime.tools.tool import ToolCall, ToolCallOrigin
@@ -17,7 +17,7 @@ def test_tool_recall_returns_content_without_recursive_payload_encoding(tmp_path
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RolloutStore(tmp_path / "content.db") as store:
+    with RuntimeState.open_sync(tmp_path / "content.db") as store:
         _, turn = start(store, tmp_path)
         content = 'RULE: preserve tenant identity.\n{"sample":123456789012345}'
         item = seed(store, turn_id=turn.turn_id, kind="tool_result", payload={
@@ -56,7 +56,7 @@ def _read(store, workspace, turn_id, **arguments):
 
 
 def test_recall_pages_original_payload_through_orchestrator(tmp_path: Path):
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="原始🙂\n" * 2000, binding_manifest={})
         item = store.list_items(turn.turn_id)[0]
@@ -78,7 +78,7 @@ def test_recall_pages_original_payload_through_orchestrator(tmp_path: Path):
 
 
 def test_recall_visibility_respects_fork_and_other_threads(tmp_path: Path):
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         parent = store.create_thread(workspace=tmp_path)
         first = store.start_turn(thread_id=parent.thread_id, user_message="visible", binding_manifest={})
         visible = store.list_items(first.turn_id)[0]
@@ -98,14 +98,14 @@ def test_recall_visibility_respects_fork_and_other_threads(tmp_path: Path):
 
 
 def test_recall_requires_runtime_turn_identity(tmp_path: Path):
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         tool = create_context_recall_tool(store)
         with pytest.raises(RuntimeError, match="Harness Turn"):
             asyncio.run(tool.run(tool.validate_input({"item_id": "anything"})))
 
 
 def test_recall_exposes_chronology_across_turns(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         first = store.start_turn(thread_id=thread.thread_id, user_message="TTL=17", binding_manifest={})
         older = store.list_items(first.turn_id)[0]
@@ -123,14 +123,14 @@ def test_recall_exposes_chronology_across_turns(tmp_path: Path):
     "arguments", [{"offset": -1}, {"max_chars": 0}, {"max_chars": 4001}, {"offset": True}, {"path": "file"}]
 )
 def test_recall_rejects_invalid_pagination(tmp_path: Path, arguments):
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         tool = create_context_recall_tool(store)
         with pytest.raises(ValueError):
             tool.validate_input({"item_id": "item", **arguments})
 
 
 def test_recall_end_offset_and_byte_budget(tmp_path: Path):
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message='\x00🙂"\\' * 4000, binding_manifest={})
         item = store.list_items(turn.turn_id)[0]
@@ -150,7 +150,7 @@ def test_archive_catalog_can_recover_original_without_summary_retaining_ids(tmp_
     from agent_runtime.harness import RolloutContextManager
     from tests.agent.harness.test_compaction_consistency import long_history, start
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
         manager = RolloutContextManager(store)
@@ -170,7 +170,7 @@ def test_history_query_searches_archived_content_without_knowing_item_id(tmp_pat
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         _, turn = start(store, tmp_path)
         seed(
             store,
@@ -203,7 +203,7 @@ def test_history_query_searches_archived_content_without_knowing_item_id(tmp_pat
 def test_history_search_respects_fork_visibility(tmp_path: Path):
     from agent_runtime.harness import RolloutContextManager
 
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         first_thread = store.create_thread(workspace=tmp_path)
         first = store.start_turn(thread_id=first_thread.thread_id, user_message="parent public", binding_manifest={})
         store.complete_turn(turn_id=first.turn_id, answer="visible result " * 1000)
@@ -227,7 +227,7 @@ def test_history_search_respects_fork_visibility(tmp_path: Path):
 
 
 def test_query_finds_detail_between_skipped_pages_and_proves_absence(tmp_path: Path):
-    with RolloutStore(tmp_path / "r.db") as store:
+    with RuntimeState.open_sync(tmp_path / "r.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -250,7 +250,7 @@ def test_archive_search_cursor_crosses_bounded_scan_without_false_absence(tmp_pa
     from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
     from tests.agent.harness.test_compaction_consistency import start
 
-    with RolloutStore(tmp_path / "pages.db") as store:
+    with RuntimeState.open_sync(tmp_path / "pages.db") as store:
         _, turn = start(store, tmp_path)
         for index in range(70):
             seed(
@@ -282,7 +282,7 @@ def test_runtime_verification_is_in_summary_input_and_searchable_archive(tmp_pat
     from agent_runtime.harness import RolloutContextManager
     from tests.agent.harness.test_compaction_consistency import long_history, start
 
-    with RolloutStore(tmp_path / "verification.db") as store:
+    with RuntimeState.open_sync(tmp_path / "verification.db") as store:
         _, turn = start(store, tmp_path)
         _read(store, tmp_path, turn.turn_id, item_id=store.list_items(turn.turn_id)[0].item_id)
         operation = store.list_tool_operations(turn.turn_id)[0]

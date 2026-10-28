@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.verification import assess_tool_verification, classify_tool_verification
 from tests.agent.harness.test_completion_gate import _commit_tool_result, _proposal
@@ -54,7 +54,7 @@ def test_incomplete_or_invalid_execution_is_not_evidence(result: dict) -> None:
     )
 
 
-def _start_changed_turn(store: RolloutStore, workspace: Path):
+def _start_changed_turn(store: RuntimeState, workspace: Path):
     turn = store.start_turn(
         thread_id=store.create_thread(workspace=workspace).thread_id,
         user_message="change and verify",
@@ -75,7 +75,7 @@ def _start_changed_turn(store: RolloutStore, workspace: Path):
 def test_pipeline_feedback_identifies_the_call_and_preserves_the_actual_runner(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -115,7 +115,7 @@ def test_pipeline_feedback_identifies_the_call_and_preserves_the_actual_runner(t
 def test_feedback_reports_the_actual_rejection(tmp_path: Path, command: str, code: str) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -154,7 +154,7 @@ def test_direct_verification_keeps_working(command: str) -> None:
 def test_failed_operations_are_diagnosed_but_never_accepted(tmp_path: Path, exit_code: int) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -188,7 +188,7 @@ def test_shell_substitution_does_not_produce_a_changed_literal_command() -> None
 def test_partial_failed_write_invalidates_earlier_verification(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,
@@ -216,7 +216,7 @@ def test_partial_failed_write_invalidates_earlier_verification(tmp_path: Path) -
 def test_inspection_feedback_describes_attested_scope_without_claiming_file_contents(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         turn = _start_changed_turn(store, workspace)
         _commit_tool_result(
             store,

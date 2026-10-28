@@ -19,7 +19,7 @@ from agent_runtime.harness import (
     HarnessToolCall,
     PreparedModelCall,
     RolloutContextManager,
-    RolloutStore,
+    RuntimeState,
     Session,
     ToolOrchestrator,
 )
@@ -51,7 +51,7 @@ from agent_runtime.tools.tool import (
 
 
 def _read_tool(
-    store: RolloutStore | None = None,
+    store: RuntimeState | None = None,
     workspace: Path | None = None,
 ) -> Tool:
     schema: Mapping[str, JsonValue] = {
@@ -111,7 +111,7 @@ def _read_tool(
 def test_read_only_tool_operation_is_durable_before_runner_io(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -199,7 +199,7 @@ async def test_public_tool_item_starts_only_after_approval_and_fenced_claim(
     )
     dispatcher = TurnEventDispatcher(capacity=16)
     stream = dispatcher.subscribe_controlling()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -296,7 +296,7 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
     )
     dispatcher = TurnEventDispatcher(capacity=1)
     stream = dispatcher.subscribe_controlling()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -326,7 +326,16 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
             orchestrator.execute(turn_id=turn.turn_id, call=call)
         )
 
-        started = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        before_execution = []
+        while True:
+            event = await asyncio.wait_for(stream.receive(), timeout=0.5)
+            if event.type is EventType.ITEM_STARTED:
+                started = event
+                break
+            before_execution.append(event)
+        assert [event.type for event in before_execution] == [EventType.TOOL_OPERATION_UPDATED] * 2
+        assert [event.data["transition"] for event in before_execution] == ["prepared", "status_changed"]
+        assert {event.data["operation_id"] for event in before_execution} == {started.data["operation_id"]}
         await asyncio.sleep(0.05)
 
         assert callback_returns == 1
@@ -334,10 +343,21 @@ async def test_harness_tool_progress_backpressures_runner_through_dispatcher(
 
         first = await asyncio.wait_for(stream.receive(), timeout=0.5)
         second = await asyncio.wait_for(stream.receive(), timeout=0.5)
-        completed = await asyncio.wait_for(stream.receive(), timeout=0.5)
+        after_progress = []
+        while True:
+            event = await asyncio.wait_for(stream.receive(), timeout=0.5)
+            if event.type is EventType.ITEM_COMPLETED:
+                completed = event
+                break
+            after_progress.append(event)
+        assert [event.type for event in after_progress] == [EventType.TOOL_OPERATION_UPDATED]
+        assert after_progress[0].data["transition"] == "outcome_committed"
+        assert after_progress[0].data["status"] == "succeeded"
+        assert after_progress[0].data["operation_id"] == started.data["operation_id"]
         result = await asyncio.wait_for(running, timeout=0.5)
 
         assert result.is_error is False
+        assert callback_returns == 2
         assert [first.data["delta"], second.data["delta"]] == [
             "first:README.md",
             "second:README.md",
@@ -378,7 +398,7 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
     )
     dispatcher = TurnEventDispatcher(capacity=16)
     stream = dispatcher.subscribe_controlling()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -412,6 +432,15 @@ async def test_harness_command_item_receives_stdout_before_completion_and_distin
             public_events.append(stream.receive_nowait())
 
         assert result.is_error is False
+        operation_events = [event for event in public_events if event.type is EventType.TOOL_OPERATION_UPDATED]
+        assert [event.data["transition"] for event in operation_events] == [
+            "prepared", "status_changed", "outcome_committed",
+        ]
+        public_events = [event for event in public_events if event.type in {
+            EventType.ITEM_STARTED, EventType.ITEM_DELTA, EventType.ITEM_COMPLETED,
+        }]
+        assert {event.data["operation_id"] for event in operation_events} == {public_events[0].data["operation_id"]}
+        assert operation_events[-1].data["status"] == "succeeded"
         assert [event.type for event in public_events] == [
             EventType.ITEM_STARTED,
             EventType.ITEM_DELTA,
@@ -439,7 +468,7 @@ async def test_legacy_turn_remains_readable_after_twelve_inspections(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -506,7 +535,7 @@ async def test_read_only_processes_are_not_blocked_by_inspection_counts(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -604,7 +633,7 @@ async def test_turns_without_legacy_delivery_policy_keep_inspection_available(
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -673,7 +702,7 @@ def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
             exposed_tool_names=("read_file",),
         ),
     )
-    with RolloutStore(database) as crashed_process:
+    with RuntimeState.open_sync(database) as crashed_process:
         thread = crashed_process.create_thread(workspace=workspace)
         turn = crashed_process.start_turn(
             thread_id=thread.thread_id,
@@ -692,7 +721,7 @@ def test_recovery_reuses_committed_tool_call_and_reenters_full_preflight(
             },
         )
 
-    with RolloutStore(database) as recovered_process:
+    with RuntimeState.open_sync(database) as recovered_process:
         result = asyncio.run(
             ToolOrchestrator(
                 store=recovered_process,
@@ -762,7 +791,7 @@ def test_normalization_failure_preserves_runner_success_and_never_replays_side_e
             exposed_tool_names=("read_file",),
         ),
     )
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -832,7 +861,7 @@ class ToolThenAnswerModel:
             },
         )
 
-    async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+    async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         if len(self.requests) == 1:
             return HarnessModelResponse(
@@ -957,7 +986,7 @@ async def test_tool_context_pairing_and_provider_request_hash_survive_restart(
             binding_manifest={"model_id": "tool-model"},
         )
     )
-    with RolloutStore(database) as reopened:
+    async with (await RuntimeState.open(database)) as reopened:
         messages_after = RolloutContextManager(reopened).build(result.turn_id)
         prepared_after = provider_model.prepare(
             HarnessModelRequest(
@@ -1020,7 +1049,7 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
             exposed_tool_names=("read_file",),
         ),
     )
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.sqlite3")) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -1065,7 +1094,7 @@ async def test_remote_cancellation_pauses_for_reconciliation_and_cannot_redispat
 async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path, correct_arguments, bad_arguments):
     from agent_runtime.terminal_ui import Conversation, ConversationEventDisplay
     class RepeatingModel(ToolThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             count = len(self.requests)
             if correct_arguments and count == 4:
                 return HarnessModelResponse(text="README was read", provider_response_id=None, usage={})
@@ -1099,7 +1128,7 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
 @pytest.mark.anyio
 async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
     class Model(ToolThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink: object = None):
+        async def dispatch(self, prepared, *, event_sink: object = None):
             count = len(self.requests)
             return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
                 id=f"call-{count}", name="read_file",

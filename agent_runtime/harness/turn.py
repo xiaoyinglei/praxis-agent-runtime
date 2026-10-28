@@ -9,7 +9,7 @@ import json
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import aclosing
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from functools import partial
 from types import MappingProxyType
 from typing import Any
@@ -24,6 +24,12 @@ from agent_runtime.budget import (
 )
 from agent_runtime.budget.pricing import estimated_model_cost_micros
 from agent_runtime.harness.events import commit_and_publish
+from agent_runtime.harness.model_outputs import (
+    complete_model_output,
+    record_model_response_started,
+    require_open_model_output,
+    start_model_output,
+)
 from agent_runtime.harness.protocol import (
     DEFAULT_MAX_STEPS,
     BindingProvider,
@@ -36,7 +42,6 @@ from agent_runtime.harness.protocol import (
     ContextSourceChangedError,
     HarnessMessage,
     HarnessModel,
-    HarnessModelDelta,
     HarnessModelRequest,
     HarnessModelResponse,
     HarnessToolCall,
@@ -47,15 +52,27 @@ from agent_runtime.harness.protocol import (
     PreparedModelCall,
     ToolRouter,
     TurnResult,
+    harness_message_payload,
+    harness_tool_call_payload,
     restore_harness_message,
 )
-from agent_runtime.harness.rollout import ItemSnapshot, ModelOperationSnapshot, RolloutStore, TurnInputChangedError
+from agent_runtime.harness.records import ItemSnapshot, ModelOperationSnapshot
+from agent_runtime.harness.state import RuntimeState, TurnInputChangedError
 from agent_runtime.harness.tool_orchestrator import (
     ToolApprovalInvalidatedError,
     ToolApprovalRequiredError,
     ToolOrchestrator,
 )
 from agent_runtime.modeling.contracts import context_capacity_policy
+from agent_runtime.modeling.events import (
+    ModelEvent,
+    ModelOutputCompleted,
+    ModelOutputDelta,
+    ModelOutputStarted,
+    ModelResponseStarted,
+    ModelStreamState,
+    output_from_payload,
+)
 from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
@@ -142,7 +159,7 @@ class TurnExecutor:
         self,
         *,
         thread_id: str,
-        store: RolloutStore,
+        store: RuntimeState,
         model: HarnessModel,
         context_manager: ContextManager,
         completion_gate: CompletionGate,
@@ -567,7 +584,7 @@ class TurnExecutor:
             "output_token_limit": step.output_token_limit,
             "continuation_summary_role": prepared.request_ref.get("continuation_summary_role", "context"),
             "compaction_plan": dict(step.compaction_plan) if step.compaction_plan is not None else None,
-            "messages": [asdict(message) for message in step.messages],
+            "messages": [harness_message_payload(message) for message in step.messages],
             "tools": [{"name": tool.definition.name, "revision": tool.execution_revision} for tool in step.tools],
             "model_token_budget_remaining": step.model_token_budget_remaining,
             "budget_pressure": step.budget_pressure,
@@ -1060,9 +1077,9 @@ class TurnExecutor:
                 data = json.loads(source)
                 # Reuse every parent message byte for byte. Add only evidence
                 # not already present (including archival bodies after elision).
-                known = {json.dumps(asdict(m), sort_keys=True) for m in original.messages}
+                known = {json.dumps(harness_message_payload(m), sort_keys=True) for m in original.messages}
                 extra = [entry for entry in data.get("history", ()) if json.dumps(
-                    asdict(restore_harness_message(entry)), sort_keys=True,
+                    harness_message_payload(restore_harness_message(entry)), sort_keys=True,
                 ) not in known]
                 data = {**data, "history": extra}
                 instruction = prompt[:prompt.index("\nHISTORY:\n")] + (
@@ -2029,7 +2046,7 @@ class TurnExecutor:
             # The Store observed the claim's real outcome, but provider dispatch
             # has not been called. Release that known unspent reservation.
             def reject_undispatched() -> None:
-                with self._store._transaction():
+                with self._store.persistence.transaction():
                     claimed = self._store.list_model_attempts(operation.operation_id)[-1]
                     if claimed.status == "dispatched" and claimed.claim_owner == self._worker_id:
                         self._store.reject_model_attempt(
@@ -2054,39 +2071,83 @@ class TurnExecutor:
                 reason_code="model_budget_limit_exceeded",
                 message=str(exc),
             )
-        streamed_content: dict[str, list[str]] = {
-            "text": [],
-            "reasoning": [],
-            "plan": [],
-        }
+        stream_state = ModelStreamState()
+        output_item_ids: dict[str, str] = {}
 
-        async def publish_delta(delta: HarnessModelDelta) -> None:
-            streamed_content[delta.channel].append(delta.content)
-            channel = {
-                "text": "agent_message",
-                "reasoning": "reasoning",
-                "plan": "plan",
-            }[delta.channel]
-            item_kind = {
-                "text": TurnItemKind.AGENT_MESSAGE,
-                "reasoning": TurnItemKind.REASONING,
-                "plan": TurnItemKind.PLAN,
-            }[delta.channel]
-            delta_kind = {
-                "text": ItemDeltaKind.TEXT,
-                "reasoning": ItemDeltaKind.REASONING,
-                "plan": ItemDeltaKind.PLAN,
-            }[delta.channel]
-            await self._commit(
-                partial(
-                    self._store.start_model_output_channel,
-                    operation_id=operation.operation_id,
-                    attempt_id=attempt.attempt_id,
-                    generation=attempt.generation,
-                    channel=channel,
+        async def publish_model_event(event: ModelEvent) -> None:
+            stream_state.accept(event)
+            if isinstance(event, ModelResponseStarted):
+                await self._commit(
+                    partial(
+                        record_model_response_started,
+                        self._store,
+                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
+                        generation=attempt.generation,
+                        provider_response_id=event.provider_response_id,
+                    )
                 )
-            )
-            if self._event_dispatcher is not None:
+            elif isinstance(event, ModelOutputStarted):
+                item = await self._commit(
+                    partial(
+                        start_model_output,
+                        self._store,
+                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
+                        generation=attempt.generation,
+                        output=event.output,
+                    )
+                )
+                output_item_ids[event.output.output_id] = item.item_id
+            elif isinstance(event, ModelOutputCompleted):
+                await self._commit(
+                    partial(
+                        complete_model_output,
+                        self._store,
+                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
+                        generation=attempt.generation,
+                        output=event.output,
+                    )
+                )
+            elif isinstance(event, ModelOutputDelta):
+                await self._store.run_async(
+                    partial(
+                        require_open_model_output,
+                        self._store,
+                        operation_id=operation.operation_id,
+                        attempt_id=attempt.attempt_id,
+                        generation=attempt.generation,
+                        output_id=event.output_id,
+                        item_id=output_item_ids[event.output_id],
+                    )
+                )
+                if event.delta_kind == "signature" or self._event_dispatcher is None:
+                    return
+                output = next(output for output in stream_state.outputs if output.output_id == event.output_id)
+                channel = {
+                    "text": "agent_message",
+                    "refusal": "agent_message",
+                    "tool_call": "agent_message",
+                    "reasoning": "reasoning",
+                    "reasoning_summary": "reasoning",
+                    "plan": "plan",
+                }[output.kind]
+                item_kind = {
+                    "text": TurnItemKind.AGENT_MESSAGE,
+                    "refusal": TurnItemKind.REFUSAL,
+                    "tool_call": TurnItemKind.TOOL_CALL,
+                    "reasoning": TurnItemKind.REASONING,
+                    "reasoning_summary": TurnItemKind.REASONING,
+                    "plan": TurnItemKind.PLAN,
+                }[output.kind]
+                delta_kind = {
+                    "text": ItemDeltaKind.TEXT,
+                    "reasoning": ItemDeltaKind.REASONING,
+                    "reasoning_summary": ItemDeltaKind.REASONING,
+                    "plan": ItemDeltaKind.PLAN,
+                    "tool_arguments": ItemDeltaKind.TOOL_ARGUMENTS,
+                }[event.delta_kind]
                 await self._event_dispatcher.emit(
                     item_delta(
                         turn_id=turn_id,
@@ -2094,10 +2155,11 @@ class TurnExecutor:
                             turn_id=turn_id,
                             model_attempt_id=attempt.attempt_id,
                             channel=channel,
+                            output_id=output.output_id,
                         ),
                         item_kind=item_kind,
                         delta_kind=delta_kind,
-                        delta=delta.content,
+                        delta=event.content,
                     )
                 )
 
@@ -2105,8 +2167,19 @@ class TurnExecutor:
         try:
             response = await self._model.dispatch(
                 prepared,
-                delta_sink=(None if operation.request_ref.get("purpose") == "context_summary" else publish_delta),
+                event_sink=(None if operation.request_ref.get("purpose") == "context_summary" else publish_model_event),
             )
+            if stream_state.started:
+                if response.stop_reason is None and stream_state.terminal is not None:
+                    response = replace(response, stop_reason=stream_state.terminal.stop_reason)
+                stream_state.validate_response(
+                    usage=response.usage,
+                    outputs=response.outputs,
+                    provider_response_id=response.provider_response_id,
+                    status=response.status,
+                    incomplete_reason=response.incomplete_reason,
+                    stop_reason=response.stop_reason,
+                )
         except ModelContextOverflowError as exc:
             await self._commit(
                 partial(
@@ -2139,7 +2212,7 @@ class TurnExecutor:
                 reason_code="model_dispatch_preflight_rejected",
                 message=str(exc),
             )
-        except (ModelDispatchCancelledError, EventChannelClosed) as exc:
+        except ModelDispatchCancelledError as exc:
             reason = str(exc).strip() or "provider acknowledged model cancellation"
             await self._commit(
                 partial(
@@ -2155,11 +2228,7 @@ class TurnExecutor:
                     attempt_id=attempt.attempt_id,
                     generation=attempt.generation,
                     reason=reason,
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
+                    outputs=stream_state.outputs,
                 )
             )
             return TurnResult(
@@ -2168,7 +2237,7 @@ class TurnExecutor:
                 answer=None,
                 status="cancelled",
             )
-        except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError) as exc:
+        except (ModelDispatchOutcomeUnknownError, ConnectionError, TimeoutError, EventChannelClosed) as exc:
             await self._commit(
                 partial(
                     self._store.mark_model_attempt_unknown,
@@ -2177,11 +2246,7 @@ class TurnExecutor:
                     generation=attempt.generation,
                     error_type=type(exc).__name__,
                     error_message=(str(exc).strip() or "model dispatch raised without a message"),
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
+                    outputs=stream_state.outputs,
                 )
             )
             return TurnResult(
@@ -2194,7 +2259,7 @@ class TurnExecutor:
             error_type = type(exc).__name__
 
             def record_unknown() -> None:
-                with self._store._transaction():
+                with self._store.persistence.transaction():
                     self._store.request_turn_cancellation(
                         turn_id=turn_id,
                         reason="Turn task cancelled while provider outcome was unknown",
@@ -2204,12 +2269,8 @@ class TurnExecutor:
                         attempt_id=attempt.attempt_id,
                         generation=attempt.generation,
                         error_type=error_type,
+                        outputs=stream_state.outputs,
                         error_message="model dispatch was cancelled after provider I/O began",
-                        channel_content={
-                            "agent_message": "".join(streamed_content["text"]),
-                            "reasoning": "".join(streamed_content["reasoning"]),
-                            "plan": "".join(streamed_content["plan"]),
-                        },
                     )
 
             await self._commit_cancellation(record_unknown)
@@ -2230,11 +2291,7 @@ class TurnExecutor:
                     reason=message,
                     error_type=type(exc).__name__,
                     error_message=message,
-                    channel_content={
-                        "agent_message": "".join(streamed_content["text"]),
-                        "reasoning": "".join(streamed_content["reasoning"]),
-                        "plan": "".join(streamed_content["plan"]),
-                    },
+                    outputs=stream_state.outputs,
                     budget_outcome="unknown",
                 )
             )
@@ -2245,9 +2302,14 @@ class TurnExecutor:
                 message=message,
             )
         dispatch_ms = (time.monotonic() - dispatch_started) * 1000
-        response = replace(response, usage={
-            **response.usage, "latency_ms": dispatch_ms, "model_ms": int(dispatch_ms),
-        })
+        response = replace(
+            response,
+            usage={
+                **response.usage,
+                "latency_ms": dispatch_ms,
+                "model_ms": int(dispatch_ms),
+            },
+        )
         accepted = await self._commit(
             lambda: self._store.complete_model_attempt(
                 operation_id=operation.operation_id,
@@ -2256,25 +2318,13 @@ class TurnExecutor:
                 text=response.text,
                 provider_response_id=response.provider_response_id,
                 usage=response.usage,
-                tool_calls=tuple(
-                    {
-                        "id": call.id,
-                        "name": call.name,
-                        "arguments": dict(call.arguments),
-                        **({"argument_error": call.argument_error} if call.argument_error is not None else {}),
-                    }
-                    for call in response.tool_calls
-                ),
+                tool_calls=tuple(harness_tool_call_payload(call) for call in response.tool_calls),
                 response_status=response.status,
                 incomplete_reason=response.incomplete_reason,
-                reasoning_content=(
-                    response.reasoning_content
-                    if response.reasoning_content is not None
-                    else "".join(streamed_content["reasoning"])
-                ),
-                plan_content=(
-                    response.plan_content if response.plan_content is not None else "".join(streamed_content["plan"])
-                ),
+                outputs=response.outputs,
+                stop_reason=response.stop_reason,
+                reasoning_content=response.reasoning_content,
+                plan_content=response.plan_content,
             )
         )
         if not accepted:
@@ -2757,6 +2807,10 @@ def _response_from_committed_item(item: ItemSnapshot) -> HarnessModelResponse:
         tool_calls=tuple(calls),
         status=response_status,
         incomplete_reason=incomplete_reason,
+        reasoning_content=item.payload.get("reasoning_content"),
+        plan_content=item.payload.get("plan_content"),
+        outputs=tuple(output_from_payload(output) for output in item.payload.get("outputs", ())),
+        stop_reason=item.payload.get("stop_reason"),
     )
 
 

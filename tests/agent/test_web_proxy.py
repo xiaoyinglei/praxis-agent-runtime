@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from agent_runtime import Agent
 from agent_runtime.cli import agent_app
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.tools.web_http import PublicWebClient, PublicWebError
 from tests.agent.test_web_http import _NumericBackend, _SocketStream
 from tests.agent.test_web_product import FetchThenAnswer
@@ -140,7 +140,7 @@ async def test_agent_executor_fetch_uses_proxy_and_records_mode(tmp_path, monkey
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9000")
     result = await agent.run("Read my project", allow_web_tools=True, require_workspace_change=False)
-    with RolloutStore(agent.checkpoint_db) as store:
+    async with (await RuntimeState.open(agent.checkpoint_db)) as store:
         output = next(i.payload for i in store.list_items(result.turn_id) if i.kind == "tool_result")
         assert output["is_error"] is False
         assert output["structured_content"]["connection_mode"] == "trusted_proxy"

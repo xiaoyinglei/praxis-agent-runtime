@@ -4,12 +4,13 @@ from collections.abc import Mapping
 from typing import Any
 from uuid import uuid4
 
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore, _json_object, _store_operation
+from agent_runtime.harness.records import ItemSnapshot
+from agent_runtime.harness.state import RuntimeState, _json_object, _state_operation
 
 
-@_store_operation
+@_state_operation
 def record_migrated_context_item(
-    store: RolloutStore,
+    store: RuntimeState,
     *,
     turn_id: str,
     kind: str,
@@ -39,8 +40,8 @@ def record_migrated_context_item(
         if kind == "model_response"
         else {}
     )
-    with store._transaction():
-        turn = store._connection.execute(
+    with store.persistence.transaction():
+        turn = store.persistence._connection.execute(
             "SELECT thread_id, status FROM turns WHERE turn_id = ?",
             (turn_id,),
         ).fetchone()

@@ -207,7 +207,7 @@ def test_cli_request_settings_commands_use_shared_validator_without_model_io(tmp
 async def test_saved_request_reprepares_with_original_wire_after_live_change(tmp_path):
     from types import SimpleNamespace
 
-    from agent_runtime.harness import RolloutContextManager, RolloutStore, TurnExecutor
+    from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
     from tests.agent.harness.test_thread_manager import AcceptPlainAnswer
 
     plane = _control_plane(tmp_path)
@@ -226,7 +226,7 @@ async def test_saved_request_reprepares_with_original_wire_after_live_change(tmp
         resolved, capabilities=replace(resolved.capabilities, reasoning=plane.catalog.definition("capable").reasoning)
     )
     model = GatewayHarnessModel(model_id="capable", resolved=resolved, instructions=("Work",))
-    with RolloutStore(tmp_path / "rollout.db") as store:
+    async with (await RuntimeState.open(tmp_path / "rollout.db")) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,

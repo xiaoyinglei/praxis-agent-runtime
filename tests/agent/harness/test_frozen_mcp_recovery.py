@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.permission_policy import PermissionPolicy, ToolRule
 from agent_runtime.runtime import mcp
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
@@ -51,7 +51,7 @@ def test_frozen_disabled_mcp_recovers_without_trusting_new_workspace_config(
         assert result.exit_code == 0, result.output or repr(result.exception)
 
     assert target.read_text(encoding="utf-8") == "after"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.read_turn(paused.turn_id).status == "completed"
         assert store.verify().valid
 
@@ -99,7 +99,7 @@ async def test_public_resume_keeps_frozen_mcp_discovery_ceiling(
     paused = await original.run("change value.txt", require_workspace_change=False)
     assert paused.status == "paused"
     assert target.read_text(encoding="utf-8") == "before"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         frozen_policy = store.read_turn(paused.turn_id).binding_manifest["mcp_policy"]
     assert frozen_policy["workspace_discovery_enabled"] is original_enabled
 
@@ -140,7 +140,7 @@ async def test_public_resume_keeps_frozen_mcp_discovery_ceiling(
     assert len(discoveries) == expected_discoveries
     assert len(opened) == expected_discoveries
     assert restarted.enable_workspace_mcp is current_enabled
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         assert store.read_turn(paused.turn_id).binding_manifest["mcp_policy"] == frozen_policy
         assert store.verify().valid
 
@@ -167,7 +167,7 @@ async def test_public_resume_rechecks_current_tool_denial_before_one_time_approv
 
     assert resumed.status == "paused"
     assert target.read_text(encoding="utf-8") == "before"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         [approval] = store.list_approvals(paused.turn_id)
         assert approval.status == "invalidated"
         assert store.verify().valid

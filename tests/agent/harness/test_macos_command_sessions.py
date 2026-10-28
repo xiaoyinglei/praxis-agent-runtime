@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutStore
+from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS Seatbelt")
@@ -95,7 +95,7 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
             *( ["--require-workspace-change"] if write else []),
         ])
         if write:
-            with RolloutStore(database) as store:
+            with RuntimeState.open_sync(database) as store:
                 turn = store.list_turns()[-1]
                 assert turn.status == "paused"
             assert not (workspace / "artifact").exists()
@@ -104,7 +104,7 @@ def test_public_macos_command_lifecycle_approval_and_completion(tmp_path, monkey
         assert result.exit_code == 0, result.output
     if write:
         assert (workspace / "artifact").read_text() == "delayed"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert turn.status == "completed", turn
         outputs = [i.payload for i in store.list_items(turn.turn_id) if i.kind == "tool_result"]
@@ -162,7 +162,7 @@ def test_public_managed_python_script_entry(tmp_path, monkeypatch, entrypoint):
         ])
         assert result.exit_code == 0, result.output
         assert "observed script result" in result.output
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert turn.status == "completed"
         [operation] = store.list_tool_operations(turn.turn_id)
@@ -198,7 +198,7 @@ def test_public_pause_closes_job_and_resume_reads_durable_terminal(tmp_path, mon
     monkeypatch.setattr(agent, "_model_factory", factory)
     result = asyncio.run(agent.run("Run, then edit", allow_execute_tools=True, max_steps=5))
     assert result.status == "paused"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         [terminal] = [i for i in store.list_items(result.turn_id) if i.kind == "tool_continuation"]
         assert terminal.producer == "runtime"
         assert terminal.payload["structured_content"]["status"] == "cancelled"

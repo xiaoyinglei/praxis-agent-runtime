@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.core import runtime_diagnostics
-from agent_runtime.harness import RolloutStore, ToolOrchestrator
+from agent_runtime.harness import RuntimeState, ToolOrchestrator
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 from tests.agent.harness.test_public_result_projection import AcceptPublicAnswer
@@ -48,15 +48,15 @@ def test_exception_diagnostic_is_bounded_and_omits_source_and_locals(
 def test_rollout_read_only_does_not_create_or_modify_database(tmp_path: Path) -> None:
     absent = tmp_path / "absent" / "rollout.sqlite3"
     with pytest.raises((FileNotFoundError, sqlite3.OperationalError)):
-        RolloutStore(absent, read_only=True)
+        RuntimeState.open_sync(absent, read_only=True)
     assert not absent.parent.exists()
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
         thread = store.read_thread(thread.thread_id)
     before = database.read_bytes()
-    with RolloutStore(database, read_only=True) as reader:
+    with RuntimeState.open_sync(database, read_only=True) as reader:
         assert reader.read_thread(thread.thread_id) == thread
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             reader.create_thread(workspace=tmp_path)
@@ -77,7 +77,7 @@ def test_diagnostic_survives_durable_tool_result_and_history_lookup(
         raise LookupError("history-secret-0123456789 unavailable")
 
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id, user_message="read", binding_manifest={"model_id": "test"},
@@ -112,7 +112,7 @@ def test_commit_failure_keeps_diagnostic_without_claiming_durable_result(
     from agent_runtime.harness.tool_orchestrator import ToolResultCommitError
 
     monkeypatch.setenv("TEST_COMMIT_SECRET", "commit-secret-0123456789")
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
         tool = _read_tool()
@@ -149,7 +149,7 @@ async def test_public_session_failure_is_inspectable_without_model_replay(tmp_pa
     from agent_runtime.history import read_history
 
     class DiagnosticModel(PatchThenAnswerModel):
-        async def dispatch(self, prepared: PreparedModelCall, *, delta_sink: object = None) -> HarnessModelResponse:
+        async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
             if prepared.request_ref["request_id"].endswith(":step:1"):
                 return HarnessModelResponse(
                     text="",
@@ -173,7 +173,7 @@ async def test_public_session_failure_is_inspectable_without_model_replay(tmp_pa
         assert result.status == "done", (result.stop_reason, result.diagnostics)
         assert result.tool_calls[0].error_code == "runner_failed"
         assert session.store.verify().valid
-    [row] = read_history(database, turn_id=result.turn_id, tool_call_id="public-failure")
+    [row] = (await asyncio.to_thread(read_history, database, turn_id=result.turn_id, tool_call_id="public-failure"))
     assert row["diagnostic"]["exception_type"] == "ArithmeticError"
     assert row["diagnostic"]["turn_id"] == result.turn_id
     assert row["retryable"] is False
@@ -204,7 +204,7 @@ def test_history_web_details_are_bounded_and_exclude_private_content(tmp_path: P
     from agent_runtime.history import read_history
 
     database = tmp_path / "history.sqlite"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
         item = store.record_tool_result(turn_id=turn.turn_id, operation_id=None, result={
@@ -244,7 +244,7 @@ def test_history_reads_committed_results_from_an_active_wal(tmp_path: Path) -> N
     from agent_runtime.history import list_history_turns, read_history
 
     database = tmp_path / "live.sqlite"
-    with RolloutStore(database) as writer:
+    with RuntimeState.open_sync(database) as writer:
         thread = writer.create_thread(workspace=tmp_path)
         turn = writer.start_turn(thread_id=thread.thread_id, user_message="read", binding_manifest={})
         item = writer.record_tool_result(turn_id=turn.turn_id, operation_id=None, result={

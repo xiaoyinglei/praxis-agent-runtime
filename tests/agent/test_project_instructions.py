@@ -76,7 +76,7 @@ async def test_public_agent_freezes_rules_each_turn_and_reinjects_context(tmp_pa
             self.requests.append(request)
             return super().prepare(request)
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             (tmp_path / "AGENTS.md").write_text("RULE_V2")
             return HarnessModelResponse(text="answer", provider_response_id=None, usage={})
 
@@ -118,7 +118,7 @@ async def test_scoped_rules_are_seen_before_action_and_survive_reopen(tmp_path):
             self.requests.append(request)
             return super().prepare(request)
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step <= 2:
                 return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
@@ -156,7 +156,7 @@ async def test_paging_cannot_hide_the_same_missing_resource(tmp_path):
         def __init__(self):
             self.count = 0
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             self.count += 1
             return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
                 HarnessToolCall(id=f"read-{self.count}", name="read_file",
@@ -187,7 +187,7 @@ async def test_missing_resource_recovery_and_different_resources(tmp_path, repai
             self.requests.append(request)
             return super().prepare(request)
 
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             self.count += 1
             if self.count == 4 and repair:
                 # External recovery is observable through the next successful read.
@@ -224,7 +224,7 @@ async def test_parallel_discovery_respects_combined_byte_limit(tmp_path):
         (tmp_path / name / "file").write_text("data")
 
     class Model(_UpdatePlanThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             if prepared.request_ref["step"] == 1:
                 return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=tuple(
                     HarnessToolCall(id=f"read-{name}", name="read_file", arguments={"path": f"{name}/file"})
@@ -268,7 +268,7 @@ async def test_direct_write_waits_for_scoped_rules(tmp_path):
     target.write_text("value = 1")
 
     class Model(_UpdatePlanThenAnswerModel):
-        async def dispatch(self, prepared, *, delta_sink=None):
+        async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step == 2:
                 assert target.read_text() == "value = 1"

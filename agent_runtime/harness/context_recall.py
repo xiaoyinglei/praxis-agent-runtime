@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, cast
 
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.harness.tool_orchestrator import current_tool_turn_id
 from agent_runtime.tools.tool import (
     CancellationMode,
@@ -59,7 +59,7 @@ def _item_text(kind: str, payload: Mapping[str, Any], *, raw: bool) -> tuple[str
     return json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")), "json_payload"
 
 
-def create_context_recall_tool(store: RolloutStore) -> Tool:
+def create_context_recall_tool(store: RuntimeState) -> Tool:
     """Create a resident read-only tool; never accept caller-provided Turn IDs or paths."""
 
     async def run(arguments: Mapping[str, JsonValue]) -> NormalizedToolOutput:

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from wcwidth import wcswidth
 
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.streaming.events import (
     ItemDeltaKind,
     ItemStatus,
@@ -227,7 +227,7 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
         "metadata": {},
     }
     database = tmp_path / "rollout.sqlite3"
-    with RolloutStore(database) as store:
+    async with (await RuntimeState.open(database)) as store:
         thread = store.create_thread(workspace=tmp_path)
         turn = store.start_turn(
             thread_id=thread.thread_id,
@@ -273,7 +273,7 @@ async def test_renderer_projects_default_and_verbose_results_without_mutation(
     assert "line 0" in verbose_output
     assert "line 11" in verbose_output
     assert "/verbose 查看完整结果" not in verbose_output
-    with RolloutStore(database) as reopened:
+    async with (await RuntimeState.open(database)) as reopened:
         persisted = next(
             item for item in reopened.list_items(turn.turn_id) if item.item_id == stored.item_id
         )
@@ -778,3 +778,15 @@ async def test_context_status_identifies_count_source(source, label, approximate
     }))
     first, _ = display.status_lines("demo")
     assert label in first and ("≈" in first) is approximate
+
+
+@pytest.mark.anyio
+async def test_incomplete_model_attempt_is_visible_without_failing_completed_output(capsys):
+    from agent_runtime.streaming.events import EventType, StreamEvent
+
+    display = TerminalToolEventDisplay(interactive=False)
+    await display.emit(StreamEvent(type=EventType.MODEL_ATTEMPT_UPDATED, turn_id="turn", data={
+        "operation_id": "operation", "attempt_id": "attempt", "generation": 1,
+        "status": "completed", "response_status": "incomplete", "incomplete_reason": "max_output_tokens",
+    }))
+    assert "未完成" in capsys.readouterr().out

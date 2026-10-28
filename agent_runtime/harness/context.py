@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator, Mapping
-from dataclasses import asdict, replace
+from dataclasses import replace
 from typing import Any
 
 from agent_runtime.harness.protocol import (
@@ -14,9 +14,12 @@ from agent_runtime.harness.protocol import (
     ContextSourceChangedError,
     HarnessMessage,
     HarnessToolCall,
+    harness_message_payload,
 )
-from agent_runtime.harness.rollout import ItemSnapshot, RolloutStore
+from agent_runtime.harness.records import ItemSnapshot
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, context_capacity_policy
+from agent_runtime.modeling.events import output_from_payload
 
 
 class RolloutContextManager:
@@ -24,7 +27,7 @@ class RolloutContextManager:
 
     def __init__(
         self,
-        store: RolloutStore,
+        store: RuntimeState,
         *,
         max_item_bytes: int | None = None,
         max_total_bytes: int | None = None,
@@ -294,7 +297,7 @@ class RolloutContextManager:
             if summary_override is not None
             else _json(
                 [
-                    {"item_id": item_id, **asdict(message)}
+                    {"item_id": item_id, **harness_message_payload(message)}
                     for item_id, message in projected[:cut]
                     if item_id not in protected or message.role == "context"
                 ]
@@ -317,9 +320,9 @@ class RolloutContextManager:
             "artifact_refs": artifacts,
             "durable_state": self._store.context_durable_state(turn_id),
             "context_version": max(versions, default=0) + 1,
-            "algorithm_revision": "rollout-compaction-v2" if summary_override is None else (
-                "semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"
-            ),
+            "algorithm_revision": "rollout-compaction-v2"
+            if summary_override is None
+            else ("semantic-compaction-v6" if self.capacity_policy(turn_id) is not None else "semantic-compaction-v4"),
         }
         synthetic = replace(items[-1], item_id="candidate", kind="context_compaction", payload=payload)
         result = tuple(m for _, m in self._project_items((*items, synthetic)))
@@ -332,7 +335,9 @@ class RolloutContextManager:
             )
         if self._store.context_source_revision(turn_id) != revision:
             raise ContextSourceChangedError("Context source changed during compaction planning.")
-        return ContextCompactionCandidate(turn_id, revision, _json(payload), _json([asdict(m) for m in result]))
+        return ContextCompactionCandidate(
+            turn_id, revision, _json(payload), _json([harness_message_payload(m) for m in result])
+        )
 
     def semantic_retained_tail(self, turn_id: str) -> int:
         """Keep the latest completed tool exchange directly usable after compaction."""
@@ -389,7 +394,7 @@ class RolloutContextManager:
         # covered items AND compaction payloads recursively duplicates history.
         # Originals remain in the archive for targeted recall.
         sources = [
-            {"history_index": history_positions[item_id], **asdict(message)}
+            {"history_index": history_positions[item_id], **harness_message_payload(message)}
             for item_id, message in self._projected_messages(turn_id)
             if item_id in covered and (item_id not in protected or message.role != "user")
         ]
@@ -411,16 +416,22 @@ class RolloutContextManager:
             sources = []
             if semantic is not None:
                 sources.append({"history_index": history_positions[semantic.item_id],
-                                **asdict(_compaction_message(semantic.payload))})
+                                **harness_message_payload(_compaction_message(semantic.payload))})
             answer_item_ids = self._accepted_answer_ids(items)
             for item in items:
-                if (item.item_id not in covered or item.item_id in summarized or item.status != "completed"
-                        or item.kind == "context_compaction"):
+                if (
+                    item.item_id not in covered
+                    or item.item_id in summarized
+                    or item.status != "completed"
+                    or item.kind == "context_compaction"
+                ):
                     continue
                 message = _item_message(item, answer_item_ids=answer_item_ids)
                 for entry in (*_request_context_messages(item), *((message,) if message is not None else ())):
                     if item.item_id not in protected or entry.role != "user":
-                        sources.append({"history_index": history_positions[item.item_id], **asdict(entry)})
+                        sources.append(
+                            {"history_index": history_positions[item.item_id], **harness_message_payload(entry)}
+                        )
         sources.extend(
             {
                 "history_index": history_positions[item.item_id],
@@ -557,7 +568,9 @@ class RolloutContextManager:
                 "algorithm_revision": "tool-output-elision-v5",
                 "tool_result_overrides": dict(overrides),
             }
-            yield ContextCompactionCandidate(turn_id, revision, _json(payload), _json([asdict(m) for m in result]))
+            yield ContextCompactionCandidate(
+                turn_id, revision, _json(payload), _json([harness_message_payload(m) for m in result])
+            )
 
     def commit_compaction(self, candidate: ContextCompactionCandidate) -> ItemSnapshot:
         payload = json.loads(candidate.payload_json)
@@ -590,7 +603,7 @@ class RolloutContextManager:
         return _project_items(items, answer_item_ids=self._accepted_answer_ids(items))
 
 
-def validate_tool_history(store: RolloutStore, turn_id: str) -> None:
+def validate_tool_history(store: RuntimeState, turn_id: str) -> None:
     """Check provider message structure without applying an old Turn's capacity limits."""
     projected = RolloutContextManager(store)._project_items(store.list_context_items(turn_id))
     _validate_tool_groups(tuple(message for _, message in projected))
@@ -714,6 +727,7 @@ def _item_message(
     if item.kind == "agent_message" and isinstance(text, str):
         return HarnessMessage(role="assistant", content=text)
     if item.kind == "model_response" and isinstance(text, str):
+        outputs = tuple(output_from_payload(output) for output in item.payload.get("outputs", ()))
         if item.payload.get("response_status") == "incomplete":
             # Do not replay partial assistant text, reasoning, or a tool group
             # for which no execution/result exists. This also survives compaction.
@@ -729,10 +743,11 @@ def _item_message(
                 role="assistant",
                 content=text,
                 reasoning_content=item.payload.get("reasoning_content"),
+                outputs=outputs,
                 tool_calls=tuple(_tool_call(call) for call in calls if isinstance(call, Mapping)),
             )
         if item.item_id in answer_item_ids:
-            return HarnessMessage(role="assistant", content=text)
+            return HarnessMessage(role="assistant", content=text, outputs=outputs)
     if item.kind == "tool_result":
         model_content = item.payload.get("model_content")
         tool_call_id = item.payload.get("tool_call_id")
@@ -774,7 +789,7 @@ def _item_message(
 
 
 def _runtime_preserved_facts(
-    store: RolloutStore,
+    store: RuntimeState,
     *,
     turn_id: str,
     covered_items: tuple[ItemSnapshot, ...],

@@ -34,11 +34,37 @@ Praxis 的公开入口以 CLI 为先，Python SDK 与其共享能力和执行语
 
 工具 runner 的同步函数在阻塞 worker 中执行；依赖调用事件循环的逻辑使用 `async def`。每个 `RolloutStore` 有自己的单一 owner 线程，连接创建、事务、查询、产物写入与校验、关闭都在该线程执行，并保留 SQLite 默认线程亲和检查。async 工具的 Store 回调也必须 await 持久化边界。
 
-同步构造、方法和 `close()` 是明确的 blocking API。异步调用采用 `async with await RolloutStore.open(path) as store`，用 `await store.run_async(store.read_turn, turn_id)` 读取，或用 `capture_mutation_async` 返回真实提交及其记录。多查询帮助函数应作为一个完整闭包交给 owner；不要把连接或 SQLite cursor 交给其他线程。惰性查询用 `iterate` 在 owner 逐项推进，并在 `aclosing` 作用域内使用。
+`RuntimeState` 拥有 Turn、审批、模型操作、工具 claim/fencing、预算和记忆的业务转换；`RolloutStore` 拥有 SQLite 连接、SQL、canonical log、投影写入和 blob I/O。共享值对象在 `harness/records.py`，纯事实重放在 `harness/reducer.py`。业务层不使用 SQL、SQLite Row 或 JSON 列编码；存储层不依赖预算、审批或模型策略。导入约束会检查这个边界。
+
+业务操作使用 `with RuntimeState.open_sync(path) as state` 或 `async with await RuntimeState.open(path) as state`，异步读取用 `await state.run_async(state.read_turn, turn_id)`。`state.persistence` 是实际存储对象；纯维护可以直接打开 `RolloutStore`。两者均无参、非阻塞构造，显式打开，未打开时拒绝操作，关闭可安全重复。同步打开在事件循环线程上立即报错，须改用异步工厂。存储子类必须保持无参、非阻塞构造。
+
+一次业务操作在 owner 内读取受保护状态、检查不变量，并通过 `with state.persistence.transaction()` 决定原子提交范围；跨 Turn、预算或审批的多个事实仍共同提交。存储层追加事实、运行 reducer、写投影，然后 COMMIT；`capture_mutation_async` 返回本次真实提交的记录，通知只从这些记录派生。artifact 安装与引用持有和 GC 相同的写事务边界，顺序仍是 blob fsync/rename 在先、数据库引用提交在后。
+
+同步方法和 `close()` 是明确的 blocking API。多查询帮助函数应作为一个完整闭包交给 owner；不要把连接或 SQLite cursor 交给其他线程。惰性查询用 `iterate` 在 owner 逐项推进，并在 `aclosing` 作用域内使用。`open/open_sync` 的 `max_pending_operations` 缺省为 128，计入正在执行的操作；容量满时 `StoreBusyError` 明确表示此次工作未被接纳。关闭屏障不受容量限制，不丢弃已接纳工作。
 
 Store 只接纳并执行每次操作一次；SQLite 写锁等待也发生在 owner，不在事件循环中轮询或重试业务事务。实时事件在 COMMIT 后投影和通知，canonical log 与 reducer 继续是事实来源。取消等待真实操作结果后才传播，关闭停止接纳并排空已接纳操作；调用方应据持久状态判断结果，不能把取消等同回滚。
 
 线程不能强制取消；执行器会保留所有权直至取得真实终态，并记录超时或取消请求。异步 runner 若正在执行不可中断的变更，应声明 `FINISH_CURRENT` 并自行等待资源终态，不能取消返回后留下后台写入。模型 claim 期间取消且 provider 尚未调用时，记录已知未调用并释放预算；provider I/O 已开始后取消，仍按未知结果保留预算。
+
+## 校验、备份与恢复
+
+正常 `Session.open()` 根据 canonical facts 找出所选会话、fork 祖先、父子预算和附件来源等恢复依赖，在同一个读快照中独立重放、比较投影并校验 blob。新会话不消费其他会话的历史。可变 metadata hash 不作为跳过重放的凭据。legacy v1 hash 首次追加仍在原写事务内完整审计后升级，包含跨线程引用，失败一并回滚；这是旧库一次性迁移成本，日常 v2 追加不做全库审计。也可通过显式重建统一升级旧投影。完整审计用于发现所有会话以及孤儿投影的损坏。
+
+维护入口不调用模型：
+
+```bash
+uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite3
+uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite3 --backup /path/to/new-backup
+uv run python scripts/verify_agent_rollout.py --database /path/to/rollout.sqlite3 --rebuild
+```
+
+普通审计和备份以只读方式打开数据库。`--backup` 仅在同快照审计通过后发布一个新目录，包含 `rollout.sqlite3`、`rollout.sqlite3.artifacts/` 和记录水位 manifest；它校验复制的每个引用 blob，失败不发布，现有目录不覆盖。恢复时将这个目录整体复制到目标位置，以其中数据库作为 checkpoint；数据库及同名 `.artifacts` 目录必须一起保留。工作区身份和历史路径保持原样，备份不意味着允许跨工作区恢复执行。
+
+重建按线程流式重放 canonical log，内存随最大线程历史增长；临时 SQLite 中生成投影，最后持写锁检查 `data_version` 并原子替换。并发提交会使本次重建明确失败，保留原状态；坏 canonical payload 或 blob 不被自动“修复”。重建保留实体首次出现在事实日志中的顺序，不改用户历史排序。canonical envelope hash 根目前仍在可重建 metadata 中，重建不能鉴别一个类型合法的 envelope 变化究竟来自日志篡改还是 metadata 损坏；它不提供防篡改签名或外部信任根。
+
+完整审计仍需读取全部历史和引用 blob，单 owner 内的慢操作仍会阻挡后续操作；接纳容量控制内存积压，不承诺查询抢占或延迟指标。canonical log 暂不做在线截断：fork、预算和附件可能跨线程引用历史，尚无产品层保留期限或丢弃语义；协调备份和可重建投影提供当前本地使用所需的恢复路径，不擅自删除事实或搭建归档服务。
+
+职责划分核对了官方 [Codex 固定源码提交](https://github.com/openai/codex/tree/2cab11ca40aad193382348a7bda46da2fc47596a/codex-rs/core/src/session) 的 Session → LiveThread → recorder → reconstruction 链。Claude 对照使用本地 `brath-claude-code` 的 `276b8e6a0160939c74f04074a5e10ec1ba76982b`，README 自述 2026-03-31 快照、origin 为 Gitee 镜像；其来源和整库可构建性未独立证实，不代表官方版本声明。这里保留本项目事实与投影同事务、提交成功后才通知的更严格契约。
 
 ## 本地检查
 
@@ -69,6 +95,8 @@ PRAXIS_TEST_BROWSER=1 uv run --extra browser pytest -q \
 ```
 
 ## 验证与评估
+
+模型输出、Runtime 事实与 CLI / SDK 通知的边界、恢复语义和专项测试见[事件协议](runtime-events.md)。
 
 下面两个入口只检查仓库维护的场景与历史记录，不调用模型：
 

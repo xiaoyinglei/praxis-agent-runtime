@@ -47,7 +47,7 @@ from agent_runtime.workspace import (
 )
 
 if TYPE_CHECKING:
-    from agent_runtime.harness.rollout import RolloutStore
+    from agent_runtime.harness.state import RuntimeState
 
 logger = logging.getLogger(__name__)
 
@@ -651,7 +651,7 @@ def _numeric(value: object, default: float = 0.0) -> float:
     return default
 
 
-def thread_checkpoint_rows(store: RolloutStore, thread_id: str) -> list[dict[str, object]]:
+def thread_checkpoint_rows(store: RuntimeState, thread_id: str) -> list[dict[str, object]]:
     """Join recorded checkpoint items with their Turns for user-facing listings."""
     rows: list[dict[str, object]] = []
     for turn in store.list_turns(thread_id):

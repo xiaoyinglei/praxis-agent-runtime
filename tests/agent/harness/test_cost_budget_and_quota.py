@@ -17,7 +17,7 @@ from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness.model_adapter import GatewayHarnessModel
 from agent_runtime.harness.protocol import HarnessMessage, HarnessModelRequest
-from agent_runtime.harness.rollout import RolloutStore
+from agent_runtime.harness.state import RuntimeState
 from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import (
@@ -165,7 +165,7 @@ def test_actual_cost_uses_input_rate_for_unconfigured_cache_price() -> None:
 def test_cost_limit_is_enforced_by_durable_budget_state(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(tmp_path / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(
             thread_id=thread.thread_id,

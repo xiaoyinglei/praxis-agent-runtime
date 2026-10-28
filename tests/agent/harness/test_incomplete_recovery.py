@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     HarnessToolCall,
     ModelDispatchCancelledError,
     RolloutEventReader,
-    RolloutStore,
+    RuntimeState,
     TurnExecutor,
 )
 from agent_runtime.streaming.events import EventType, ItemStatus, TurnItemKind
@@ -72,7 +72,7 @@ def test_output_limit_restarts_complete_step_through_public_entrypoints(tmp_path
             "--non-interactive", "--rollout-db", str(database),
         ])
         assert result.exit_code == 0, result.output
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert store.verify().valid
         assert not store.list_tool_operations(turn.turn_id)
@@ -93,7 +93,7 @@ def test_retry_is_bounded_and_only_for_known_output_limit(tmp_path, monkeypatch,
     assert result.status == "failed"
     assert result.answer is None
     assert result.usage.model_calls == expected
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         assert store.read_turn(result.turn_id).terminal_reason_code == "model_response_incomplete"
         assert not store.list_tool_operations(result.turn_id)
         assert store.verify().valid
@@ -115,18 +115,18 @@ def test_retry_spends_an_ordinary_step(tmp_path, monkeypatch):
     result = asyncio.run(agent.run("Explain", max_steps=1))
     assert result.status == "failed"
     assert result.usage.model_calls == 1
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         assert store.read_turn(result.turn_id).terminal_reason_code == "model_step_budget_exhausted"
 
 
 def test_recovery_policy_metadata_does_not_disable_retry(tmp_path, monkeypatch):
-    start = RolloutStore.start_turn
+    start = RuntimeState.start_turn
 
     def with_metadata(store, **kwargs):
         kwargs["binding_manifest"]["model_response_recovery"]["note"] = "diagnostic metadata"
         return start(store, **kwargs)
 
-    monkeypatch.setattr(RolloutStore, "start_turn", with_metadata)
+    monkeypatch.setattr(RuntimeState, "start_turn", with_metadata)
     model = TruncatedThenAnswer()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "run.db", enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", lambda: model)
@@ -138,7 +138,7 @@ def test_recovery_policy_metadata_does_not_disable_retry(tmp_path, monkeypatch):
 def test_legacy_turn_cannot_acquire_retry_policy_on_public_recovery(tmp_path, monkeypatch):
     class Crash(BaseException):
         pass
-    original_start = RolloutStore.start_turn
+    original_start = RuntimeState.start_turn
     original_handle = TurnExecutor._handle_model_response
     def legacy_start(self, **kwargs):
         kwargs["binding_manifest"] = dict(kwargs["binding_manifest"])
@@ -146,16 +146,16 @@ def test_legacy_turn_cannot_acquire_retry_policy_on_public_recovery(tmp_path, mo
         return original_start(self, **kwargs)
     async def crash_handle(self, **kwargs):
         raise Crash()
-    monkeypatch.setattr(RolloutStore, "start_turn", legacy_start)
+    monkeypatch.setattr(RuntimeState, "start_turn", legacy_start)
     monkeypatch.setattr(TurnExecutor, "_handle_model_response", crash_handle)
     database = tmp_path / "run.db"
     agent = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
     monkeypatch.setattr(agent, "_model_factory", TruncatedThenAnswer)
     with pytest.raises(Crash):
         asyncio.run(agent.run("Explain", max_steps=5))
-    monkeypatch.setattr(RolloutStore, "start_turn", original_start)
+    monkeypatch.setattr(RuntimeState, "start_turn", original_start)
     monkeypatch.setattr(TurnExecutor, "_handle_model_response", original_handle)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn = store.list_turns()[-1]
         assert "model_response_recovery" not in turn.binding_manifest
     fresh = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
@@ -191,7 +191,7 @@ def test_restart_between_commits_preserves_retry_limit_and_usage(tmp_path, monke
         asyncio.run(agent.run("Explain", max_steps=5, max_tokens_total=1000))
     monkeypatch.setattr(TurnExecutor, "_handle_model_response", original_handle)
     monkeypatch.setattr(TurnExecutor, "_dispatch_prepared", original_dispatch)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         turn_id = store.list_turns()[-1].turn_id
         assert store.read_budget_state(turn_id).used.total_tokens == 40
     fresh = Agent(workspace_path=tmp_path, checkpoint_db=database, enable_workspace_mcp=False)
@@ -201,7 +201,7 @@ def test_restart_between_commits_preserves_retry_limit_and_usage(tmp_path, monke
     assert result.status == ("failed" if repeat else "done")
     assert result.usage.model_calls == 2
     assert result.usage.total_tokens == (80 if repeat else 51)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert store.read_budget_state(turn_id).limits.tokens == 1000
         assert store.read_turn(turn_id).binding_manifest["model_response_recovery"]["max_retries"] == 1
         assert store.verify().valid
@@ -218,7 +218,7 @@ def test_cancellation_during_retry_does_not_start_a_third_request(tmp_path, monk
     result = asyncio.run(agent.run("Explain", max_steps=5))
     assert result.status == "failed"  # Public facade maps cancellation to failed + stop_reason.
     assert result.stop_reason == "cancelled"
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         assert store.read_turn(result.turn_id).status == "cancelled"
         assert len(store.list_model_operations(result.turn_id)) == 2
         assert store.verify().valid
@@ -252,16 +252,16 @@ def test_successful_side_effect_is_not_replayed_after_truncation(tmp_path, monke
     assert result.status == "done"
     assert result.answer != "discarded partial answer"
     assert (tmp_path / "value.txt").read_text() == "after"
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         assert len(store.list_tool_operations(result.turn_id)) == 1
         assert len(store.list_model_operations(result.turn_id)) == 3
         events = RolloutEventReader(store).read(thread_id=result.thread_id)
         incomplete = [event.event for event in events
-                      if event.event.type == EventType.ITEM_COMPLETED
-                      and event.event.item_kind == TurnItemKind.AGENT_MESSAGE
+                      if event.event.type == EventType.MODEL_ATTEMPT_UPDATED
                       and event.event.data.get("response_status") == "incomplete"]
         assert len(incomplete) == 1
-        assert incomplete[0].status == ItemStatus.FAILED
+        assert incomplete[0].data["status"] == "completed"
+        assert incomplete[0].data["incomplete_reason"] == "max_output_tokens"
         assert store.verify().valid
 
 
@@ -299,7 +299,7 @@ def test_real_streaming_protocol_discards_prefix_and_partial_tool_json(tmp_path)
     model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(
         gateway=gateway, max_output_tokens=128,
     ), instructions=("Answer the user.",))
-    with RolloutStore(tmp_path / "run.db") as store:
+    with RuntimeState.open_sync(tmp_path / "run.db") as store:
         thread = store.create_thread(workspace=tmp_path)
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=model,
                               context_manager=RolloutContextManager(store), completion_gate=AcceptAnswer())
@@ -317,6 +317,10 @@ def test_real_streaming_protocol_discards_prefix_and_partial_tool_json(tmp_path)
         completed = [e.event for e in RolloutEventReader(store).read(thread.thread_id)
                      if e.event.type == EventType.ITEM_COMPLETED
                      and e.event.item_kind == TurnItemKind.AGENT_MESSAGE]
-        assert completed[0].status == ItemStatus.FAILED
+        assert completed[0].status == ItemStatus.SUCCESS
+        attempt_events = [entry.event for entry in RolloutEventReader(store).read(thread.thread_id)
+                          if entry.event.type == EventType.MODEL_ATTEMPT_UPDATED]
+        assert any(event.data.get("response_status") == "incomplete"
+                   and event.data.get("incomplete_reason") == "max_output_tokens" for event in attempt_events)
         assert completed[-1].status == ItemStatus.SUCCESS
         assert store.verify().valid

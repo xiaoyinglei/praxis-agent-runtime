@@ -158,7 +158,7 @@ def test_direct_scenario_uses_public_cli_and_verifies_the_real_workspace_diff(
 def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     tmp_path: Path,
 ) -> None:
-    from agent_runtime.harness import RolloutStore
+    from agent_runtime.harness import RuntimeState
 
     module = _load_module()
     fake_agent = tmp_path / "fake_approval_agent.py"
@@ -166,11 +166,11 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
         "import sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {str(ROOT)!r})\n"
-        "from agent_runtime.harness import RolloutStore\n"
+        "from agent_runtime.harness import RuntimeState\n"
         "checkpoint = Path(sys.argv[sys.argv.index('--checkpoint-db') + 1])\n"
         "if sys.argv[1] == 'run':\n"
         "    assert not Path('approved.txt').exists()\n"
-        "    with RolloutStore(checkpoint) as store:\n"
+        "    with RuntimeState.open_sync(checkpoint) as store:\n"
         "        thread = store.create_thread(workspace=Path.cwd())\n"
         "        turn = store.start_turn(thread_id=thread.thread_id, user_message='write after approval',\n"
         "                                binding_manifest={}, turn_id='turn-approval-1')\n"
@@ -183,7 +183,7 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
         "assert sys.argv[1:3] == ['recover', 'turn-approval-1']\n"
         "assert sys.argv[sys.argv.index('--action') + 1] == 'allow_once'\n"
         "assert not Path('approved.txt').exists()\n"
-        "with RolloutStore(checkpoint) as store:\n"
+        "with RuntimeState.open_sync(checkpoint) as store:\n"
         "    assert len(store.list_turns()) == 1\n"
         "    assert store.read_turn(sys.argv[2]).status == 'paused'\n"
         "    store.resolve_tool_approval(turn_id=sys.argv[2], decision='approve')\n"
@@ -226,7 +226,7 @@ def test_approval_scenario_must_pause_then_resume_the_same_public_turn(
     assert stdout.count("Turn: turn-approval-1") == 2
     assert "状态: paused" in stdout
     assert "状态: done" in stdout
-    with RolloutStore(result_path.parent / "rollout.sqlite3") as store:
+    with RuntimeState.open_sync(result_path.parent / "rollout.sqlite3") as store:
         assert len(store.list_turns()) == 1
         assert store.read_turn("turn-approval-1").status == "completed"
         [approval] = store.list_approvals("turn-approval-1")

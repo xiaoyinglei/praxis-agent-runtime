@@ -1,19 +1,20 @@
 """Durable chat selection/replay is independent from same-Turn task recovery."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
 
 from agent_runtime import cli
-from agent_runtime.harness import RolloutStore
+from agent_runtime.harness import RuntimeState
 from agent_runtime.history import list_chat_sessions, read_chat_messages
 from tests.agent.test_agent_cli_resume import _result
 
 
 def conversation(database, workspace, *, question="first question", answer="saved answer"):
     workspace.mkdir(exist_ok=True)
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(thread_id=thread.thread_id, user_message=question,
                                 binding_manifest={"model_id": "saved-model"})
@@ -22,7 +23,7 @@ def conversation(database, workspace, *, question="first question", answer="save
 
 
 def records(database):
-    with RolloutStore(database, read_only=True) as store:
+    with RuntimeState.open_sync(database, read_only=True) as store:
         return store.list_global_records()
 
 
@@ -31,7 +32,7 @@ def test_chat_list_groups_turns_and_isolates_workspace_without_mutation(tmp_path
     workspace = tmp_path / "workspace"
     thread_id, _ = conversation(database, workspace)
     conversation(database, tmp_path / "other", question="private other workspace")
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         second = store.start_turn(thread_id=thread_id, user_message="second question", binding_manifest={})
         store.complete_turn(turn_id=second.turn_id, answer="second answer")
         child = store.create_thread(workspace=workspace)
@@ -57,7 +58,7 @@ def test_chat_list_groups_turns_and_isolates_workspace_without_mutation(tmp_path
 def test_fork_replay_uses_ancestor_cutoff_and_original_messages(tmp_path):
     database = tmp_path / "state.sqlite"
     thread_id, fork_point = conversation(database, tmp_path / "workspace")
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         later = store.start_turn(thread_id=thread_id, user_message="excluded later question", binding_manifest={})
         store.complete_turn(turn_id=later.turn_id, answer="excluded later answer")
         fork = store.fork_thread(from_turn_id=fork_point)
@@ -78,7 +79,7 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    with RolloutStore(database) as store:
+    with RuntimeState.open_sync(database) as store:
         thread = store.create_thread(workspace=workspace)
         turn = store.start_turn(thread_id=thread.thread_id, user_message="original question", binding_manifest={})
         operation = store.prepare_model_operation(
@@ -113,8 +114,8 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
 async def test_reopen_and_copy_saved_answer_never_open_session(tmp_path, monkeypatch, capsys):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = conversation(database, workspace)
-    before = records(database)
+    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
+    before = (await asyncio.to_thread(records, database))
 
     class Facade:
         checkpoint_db = database
@@ -132,14 +133,14 @@ async def test_reopen_and_copy_saved_answer_never_open_session(tmp_path, monkeyp
     output = capsys.readouterr().out
     assert "first question" in output and output.count("saved answer") == 2
     assert thread_id in output and "模型: saved-model" in output
-    assert records(database) == before
+    assert (await asyncio.to_thread(records, database)) == before
 
 
 @pytest.mark.anyio
 async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monkeypatch):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, previous_turn_id = conversation(database, workspace)
+    thread_id, previous_turn_id = (await asyncio.to_thread(conversation, database, workspace))
     opened = []
 
     class Facade:
@@ -156,7 +157,7 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
             yield self
 
         async def submit(self, task, **options):
-            with RolloutStore(database) as store:
+            async with (await RuntimeState.open(database)) as store:
                 turn = store.start_turn(thread_id=thread_id, user_message=task, binding_manifest={})
                 assert turn.predecessor_turn_id == previous_turn_id
                 assert turn.turn_id != previous_turn_id
@@ -170,7 +171,7 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(commands))
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
     assert len(opened) == 1
-    with RolloutStore(database, read_only=True) as store:
+    async with (await RuntimeState.open(database, read_only=True)) as store:
         assert len(store.list_threads()) == 1
         assert len(store.list_turns(thread_id)) == 2
         assert store.read_turn(previous_turn_id).status == "completed"
@@ -183,10 +184,10 @@ async def test_running_conversation_attempts_owned_recovery_when_user_sends(
 ):
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = conversation(database, workspace)
-    with RolloutStore(database) as store:
+    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
+    async with (await RuntimeState.open(database)) as store:
         running = store.start_turn(thread_id=thread_id, user_message="unfinished", binding_manifest={})
-    before = records(database)
+    before = (await asyncio.to_thread(records, database))
     resumed = []
 
     class Facade:
@@ -222,8 +223,9 @@ async def test_running_conversation_attempts_owned_recovery_when_user_sends(
     output = capsys.readouterr().out
     assert resumed == ["continue with my new requirement"]
     assert "recover " not in output
-    assert list_chat_sessions(database, workspace=workspace)[0].active_turn_id == running.turn_id
-    assert records(database) == before
+    chats = await asyncio.to_thread(list_chat_sessions, database, workspace=workspace)
+    assert chats[0].active_turn_id == running.turn_id
+    assert (await asyncio.to_thread(records, database)) == before
 
 
 @pytest.mark.anyio
@@ -232,11 +234,11 @@ async def test_saved_clarification_continues_in_chat_after_user_reply(tmp_path, 
 
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = conversation(database, workspace)
-    with RolloutStore(database) as store:
+    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
+    async with (await RuntimeState.open(database)) as store:
         turn = store.start_turn(thread_id=thread_id, user_message="original task", binding_manifest={})
         interaction = store.request_clarification(turn_id=turn.turn_id, question="Which destination?")
-    before = records(database)
+    before = (await asyncio.to_thread(records, database))
     recovery = []
 
     class Facade:
@@ -254,9 +256,9 @@ async def test_saved_clarification_continues_in_chat_after_user_reply(tmp_path, 
 
         async def resume(self, turn_id, action, **options):
             # Inspection before the explicit reply has changed no durable facts.
-            assert records(database) == before
+            assert (await asyncio.to_thread(records, database)) == before
             recovery.append((turn_id, action, options["user_input"]))
-            with RolloutStore(database) as store:
+            async with (await RuntimeState.open(database)) as store:
                 store.resolve_clarification(turn_id=turn_id, request_id=interaction.request_id,
                                             response=options["user_input"])
                 store.complete_turn(turn_id=turn_id, answer="continued original task")
@@ -306,8 +308,8 @@ async def test_reopened_reconciliation_reaches_owned_recovery(tmp_path, monkeypa
     from agent_runtime.result import AgentPause
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = conversation(database, workspace)
-    with RolloutStore(database) as store:
+    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
+    async with (await RuntimeState.open(database)) as store:
         turn = store.start_turn(thread_id=thread_id, user_message="interrupted command", binding_manifest={})
         store.pause_turn(turn_id=turn.turn_id, reason="command observation needs recovery")
     calls = []
@@ -352,8 +354,8 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
 
     database = tmp_path / "state.sqlite"
     workspace = tmp_path / "workspace"
-    thread_id, _ = conversation(database, workspace)
-    with RolloutStore(database) as store:
+    thread_id, _ = (await asyncio.to_thread(conversation, database, workspace))
+    async with (await RuntimeState.open(database)) as store:
         old = store.start_turn(thread_id=thread_id, user_message="interrupted operation",
                                binding_manifest={"execution_ownership": OWNERSHIP_REVISION})
         operation = store.prepare_model_operation(
@@ -410,7 +412,7 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
             assert query == "abort" and action == "abort", "New requests must reach Session.submit"
             if reconciled:
                 # A receipt can close the effect between the read and owned abort.
-                with RolloutStore(database) as store:
+                async with (await RuntimeState.open(database)) as store:
                     store.resolve_tool_reconciliation(
                         turn_id=turn_id, status="succeeded", reconciler_revision="independent-receipt-v1",
                         result={"tool_call_id": "write-call", "tool_name": "write_file", "is_error": False,
@@ -437,7 +439,7 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
     await cli._chat_facade_loop(Facade(), max_tokens_total=None, resume_thread_id=thread_id)
     output = capsys.readouterr().out
     assert bool(observed) is (query != "abort")
-    with RolloutStore(database, read_only=True) as store:
+    async with (await RuntimeState.open(database, read_only=True)) as store:
         assert store.verify().valid
         assert store.read_tool_operation("uncertain-write").attempt_count == 1
         turns = store.list_turns(thread_id)
