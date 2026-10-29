@@ -99,7 +99,7 @@ def _request(
         instructions=("Be precise.",),
         frozen_run_context=(ContextBlock("workspace", {"root": "."}),),
         initial_user_task="Use the selected tool.",
-    ).append_message(ModelMessage(role="assistant", content="Prior response."))
+    ).append_message(ModelMessage(role="assistant", body="Prior response."))
     tools = (
         _tool("mcp__zeta__lookup", schema),
         _tool("mcp__alpha__lookup"),
@@ -172,7 +172,7 @@ def test_openai_wire_serializes_later_context_as_user_event() -> None:
         instructions=("Be precise.",),
         initial_user_task="Inspect the repository.",
         transcript=(
-            ModelMessage(role="assistant", content="I will inspect it."),
+            ModelMessage(role="assistant", body="I will inspect it."),
             context_event_message(
                 "runtime_diagnostic",
                 {"detail": "retry with the published schema"},
@@ -204,7 +204,7 @@ def test_openai_wire_round_trips_assistant_reasoning_for_tool_continuation() -> 
         instructions=("Use tools.",),
         initial_user_task="Inspect the repository.",
         transcript=(
-            ModelMessage(
+            ModelMessage.from_parts(
                 role="assistant",
                 content="",
                 reasoning_content="I need to inspect the source first.",
@@ -233,8 +233,8 @@ def test_openai_wire_rejects_non_leading_system_message() -> None:
         instructions=("Be precise.",),
         initial_user_task="Inspect the repository.",
         transcript=(
-            ModelMessage(role="assistant", content="I will inspect it."),
-            ModelMessage(role="system", content="Late system override."),
+            ModelMessage(role="assistant", body="I will inspect it."),
+            ModelMessage(role="system", body="Late system override."),
         ),
     )
     request = build_model_request(
@@ -353,7 +353,7 @@ def test_openai_response_parser_returns_the_provider_neutral_model_turn() -> Non
     assert len(turn.tool_calls) == 1
     assert turn.tool_calls[0].id == "call_1"
     assert turn.tool_calls[0].name == "mcp__zeta__lookup"
-    assert turn.tool_calls[0].input == {"target": 7}
+    assert turn.tool_calls[0].arguments == {"target": 7}
 
 
 def test_openai_response_parser_accepts_mapping_responses_deterministically() -> None:

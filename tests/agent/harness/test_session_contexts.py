@@ -4,7 +4,7 @@ from pathlib import Path
 
 from agent_runtime.harness import (
     DeliveryCompletionGate,
-    HarnessMessage,
+    ModelMessage,
     RolloutContextManager,
     RuntimeState,
     StepContext,
@@ -23,13 +23,13 @@ class _UnusedModel:
 
 class _ChangingRouter:
     def __init__(self) -> None:
-        self.calls: list[tuple[HarnessMessage, ...]] = []
+        self.calls: list[tuple[ModelMessage, ...]] = []
 
     def select(
         self,
         *,
         turn_id: str,
-        messages: tuple[HarnessMessage, ...],
+        messages: tuple[ModelMessage, ...],
     ) -> tuple[()]:
         del turn_id
         self.calls.append(messages)

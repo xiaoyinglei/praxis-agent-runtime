@@ -16,7 +16,7 @@ from agent_runtime.harness import (
     GatewayHarnessModel,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     RolloutContextManager,
     RuntimeState,
@@ -864,19 +864,19 @@ class ToolThenAnswerModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         if len(self.requests) == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="response-tool-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="call-1",
                         name="read_file",
                         arguments={"path": "README.md"},
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="README was read",
             provider_response_id="response-final",
             usage={"input_tokens": 5, "output_tokens": 2},
@@ -1097,11 +1097,19 @@ async def test_identical_invalid_tool_failures_stop_before_step_budget(tmp_path,
         async def dispatch(self, prepared, *, event_sink: object = None):
             count = len(self.requests)
             if correct_arguments and count == 4:
-                return HarnessModelResponse(text="README was read", provider_response_id=None, usage={})
-            return HarnessModelResponse(text="\n\n", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
-                id=f"call-{count}", name="read_file",
-                arguments={"path": "README.md"} if correct_arguments and count == 3 else bad_arguments,
-            ),))
+                return HarnessModelResponse.from_parts(text="README was read", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(
+                text="\n\n",
+                provider_response_id=None,
+                usage={},
+                tool_calls=(
+                    ModelToolCall(
+                        id=f"call-{count}",
+                        name="read_file",
+                        arguments={"path": "README.md"} if correct_arguments and count == 3 else bad_arguments,
+                    ),
+                ),
+            )
 
     model = RepeatingModel()
     display = ConversationEventDisplay(Conversation())
@@ -1130,10 +1138,18 @@ async def test_read_only_calls_do_not_hide_repeated_identical_failure(tmp_path):
     class Model(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             count = len(self.requests)
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(HarnessToolCall(
-                id=f"call-{count}", name="read_file",
-                arguments={} if count % 2 else {"path": "README.md"},
-            ),))
+            return HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id=None,
+                usage={},
+                tool_calls=(
+                    ModelToolCall(
+                        id=f"call-{count}",
+                        name="read_file",
+                        arguments={} if count % 2 else {"path": "README.md"},
+                    ),
+                ),
+            )
     model = Model()
     registry = ToolRegistry()
     registry.register(_read_tool(workspace=tmp_path))

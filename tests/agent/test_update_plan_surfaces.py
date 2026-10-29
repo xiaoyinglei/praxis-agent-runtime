@@ -10,8 +10,8 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ItemSnapshot,
+    ModelToolCall,
     PreparedModelCall,
     RuntimeState,
 )
@@ -60,19 +60,19 @@ class _UpdatePlanThenAnswerModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         step = int(prepared.request_ref["step"])
         if step == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="plan-call",
                 usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="call-update-plan",
                         name="update_plan",
                         arguments=_PLAN_ARGUMENTS,
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="plan verified",
             provider_response_id="plan-answer",
             usage={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5},

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from agent_runtime.harness.protocol import HarnessMessage
+from agent_runtime.harness.protocol import ModelMessage
 from agent_runtime.harness.state import RuntimeState
 from agent_runtime.tools.tool import Tool
 
@@ -19,7 +19,7 @@ class StaticToolRouter:
         self,
         *,
         turn_id: str,
-        messages: tuple[HarnessMessage, ...],
+        messages: tuple[ModelMessage, ...],
     ) -> tuple[Tool, ...]:
         del turn_id
         del messages
@@ -57,7 +57,7 @@ class DurableToolRouter:
         self,
         *,
         turn_id: str,
-        messages: tuple[HarnessMessage, ...],
+        messages: tuple[ModelMessage, ...],
     ) -> tuple[Tool, ...]:
         del messages
         items = self._store.list_context_items(turn_id)

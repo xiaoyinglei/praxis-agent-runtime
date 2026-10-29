@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel, PublicHarnessModel
 
 
@@ -33,8 +33,8 @@ class CheckThenAnswer(PatchThenAnswerModel):
     async def dispatch(self, prepared, **_kwargs):
         calls = ()
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            calls = (HarnessToolCall(id="check", name="run_command", arguments={"command": self.command}),)
-        return HarnessModelResponse(
+            calls = (ModelToolCall(id="check", name="run_command", arguments={"command": self.command}),)
+        return HarnessModelResponse.from_parts(
             text="checked" if not calls else "Run the configured acceptance check.",
             provider_response_id=None,
             usage={"input_tokens": 5, "output_tokens": 3},
@@ -120,11 +120,11 @@ def test_approval_recovery_keeps_the_original_acceptance_contract_and_budget(tmp
             if prepared.request_ref["request_id"].endswith(":step:1"):
                 return await PatchThenAnswerModel.dispatch(self, prepared, **kwargs)
             if prepared.request_ref["request_id"].endswith(":step:2"):
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="Run original acceptance.",
                     provider_response_id=None,
                     usage={"input_tokens": 5, "output_tokens": 3},
-                    tool_calls=(HarnessToolCall(id="verify", name="run_command", arguments={"command": command}),),
+                    tool_calls=(ModelToolCall(id="verify", name="run_command", arguments={"command": command}),),
                 )
             return await super().dispatch(prepared, **kwargs)
 

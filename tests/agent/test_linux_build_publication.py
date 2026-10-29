@@ -286,21 +286,24 @@ def test_public_linux_approval_recovery_publishes_partial_build_as_tool_failure(
     from typer.testing import CliRunner
 
     from agent_runtime import Agent, cli
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
     from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
     class BuildOnce(PatchThenAnswerModel):
         async def dispatch(self, prepared, **kwargs):
             if prepared.request_ref["request_id"].endswith(":step:1"):
-                return HarnessModelResponse(text="", provider_response_id=None,
-                    usage={"input_tokens": 5, "output_tokens": 3}, tool_calls=(HarnessToolCall(
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None,
+                    usage={"input_tokens": 5, "output_tokens": 3}, tool_calls=(ModelToolCall(
                         id="build", name="run_command", arguments={
                             "command": "printf artifact > built; exit 7",
                             "workspace_write": True, "publish_on_failure": True,
                         },
                     ),))
-            return HarnessModelResponse(text="Build failed; partial artifact retained.", provider_response_id=None,
-                                        usage={"input_tokens": 5, "output_tokens": 3})
+            return HarnessModelResponse.from_parts(
+                text="Build failed; partial artifact retained.",
+                provider_response_id=None,
+                usage={"input_tokens": 5, "output_tokens": 3},
+            )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()

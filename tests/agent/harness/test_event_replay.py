@@ -13,6 +13,7 @@ import pytest
 import agent_runtime.harness as harness
 from agent_runtime.harness import RuntimeState
 from agent_runtime.harness.model_outputs import start_model_output
+from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.modeling.events import ModelOutput
 from agent_runtime.streaming import events
 from agent_runtime.streaming import sink as stream_sinks
@@ -330,14 +331,15 @@ def test_reasoning_and_plan_completed_content_replays_after_reopen(
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            text="final answer",
-            provider_response_id="response-1",
-            usage={"input_tokens": 4, "output_tokens": 3},
-            reasoning_content="durable reasoning",
-            plan_content="durable plan",
-            outputs=(ModelOutput("reasoning", "reasoning", "durable reasoning"),
-                     ModelOutput("plan", "plan", "durable plan"),
-                     ModelOutput("text", "text", "final answer")),
+            response=HarnessModelResponse(
+                provider_response_id="response-1",
+                usage={"input_tokens": 4, "output_tokens": 3},
+                outputs=(
+                    ModelOutput("reasoning", "reasoning", "durable reasoning"),
+                    ModelOutput("plan", "plan", "durable plan"),
+                    ModelOutput("text", "text", "final answer"),
+                ),
+            ),
         )
         expected = [
             replay.event

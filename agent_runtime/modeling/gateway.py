@@ -13,7 +13,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult, decode_tool_arguments
+from agent_runtime.core.messages import (
+    StopReason,
+    ToolUseResult,
+    decode_tool_arguments,
+    outputs_from_parts,
+    outputs_tool_calls,
+)
 from agent_runtime.core.model_request import ModelRequest
 from agent_runtime.modeling.contracts import (
     DEFAULT_LLM_STAGE_BUDGETS,
@@ -36,7 +42,7 @@ from agent_runtime.modeling.events import (
     ModelResponseStarted,
     ModelStreamState,
     emit_model_event,
-    output_to_payload,
+    validate_model_outputs,
 )
 from agent_runtime.modeling.local_agent_wire import (
     parse_local_agent_response,
@@ -79,22 +85,56 @@ _DEFAULT_CONTEXT_POLICY = ContextCapacityPolicy()
 
 @dataclass(frozen=True, slots=True)
 class AgentModelResponse:
-    turn: ToolUseResult
+    outputs: tuple[ModelOutput, ...]
+    stop_reason: StopReason
+    raw_stop_reason: str
     usage: LLMUsage
     provider_wire_hash: str
     serializer_revision: str
     wire_kind: str
-    outputs: tuple[ModelOutput, ...] = ()
     provider_response_id: str | None = None
 
     def __post_init__(self) -> None:
-        if not self.outputs:
-            object.__setattr__(self, "outputs", _outputs_from_turn(self.turn))
-        if len({output.output_id for output in self.outputs}) != len(self.outputs):
-            raise ValueError("model output IDs must be unique within a response")
-        text = "".join(output.content for output in self.outputs if output.kind in {"text", "refusal"})
-        reasoning = "".join(output.content for output in self.outputs if output.kind == "reasoning") or None
-        object.__setattr__(self, "turn", self.turn.model_copy(update={"text": text, "reasoning_content": reasoning}))
+        validate_model_outputs(self.outputs)
+        if not isinstance(self.stop_reason, StopReason):
+            raise TypeError("model stop_reason must be a StopReason")
+
+    @property
+    def turn(self) -> ToolUseResult:
+        return ToolUseResult(
+            text="".join(output.content for output in self.outputs if output.kind in {"text", "refusal"}),
+            reasoning_content="".join(output.content for output in self.outputs if output.kind == "reasoning") or None,
+            tool_calls=list(outputs_tool_calls(self.outputs)) if self.stop_reason is StopReason.TOOL_USE else [],
+            stop_reason=self.stop_reason,
+            raw_stop_reason=self.raw_stop_reason,
+        )
+
+    @classmethod
+    def from_turn(
+        cls,
+        *,
+        turn: ToolUseResult,
+        usage: LLMUsage,
+        provider_wire_hash: str,
+        serializer_revision: str,
+        wire_kind: str,
+        provider_response_id: str | None = None,
+    ) -> AgentModelResponse:
+        """Adapt flat provider-parser fields into the canonical output snapshot."""
+        return cls(
+            outputs=outputs_from_parts(
+                text=turn.text,
+                reasoning_content=turn.reasoning_content,
+                tool_calls=tuple(turn.tool_calls),
+            ),
+            stop_reason=turn.stop_reason,
+            raw_stop_reason=turn.raw_stop_reason,
+            usage=usage,
+            provider_wire_hash=provider_wire_hash,
+            serializer_revision=serializer_revision,
+            wire_kind=wire_kind,
+            provider_response_id=provider_response_id,
+        )
 
 
 class TokenAccounting(Protocol):
@@ -332,7 +372,7 @@ class LLMGateway:
             )
             if effective_ledger is not None:
                 await effective_ledger.commit(effective_lease_id, usage.total_tokens)
-            response = AgentModelResponse(
+            response = AgentModelResponse.from_turn(
                 turn=turn,
                 usage=usage,
                 provider_wire_hash=local_wire.provider_wire_hash,
@@ -376,34 +416,9 @@ class LLMGateway:
                 await assembled.accept(chunk)
             if assembled.usage is None or not assembled.state.completed:
                 raise RuntimeError("canonical streaming call ended without a terminal response and usage")
-            stop_reason = assembled.stop_reason
-            normalized_stop = _normalized_stop(stop_reason)
-            calls = [
-                ToolCall(
-                    id=cast(str, output.tool_call_id),
-                    name=cast(str, output.tool_name),
-                    input=output_to_payload(output)["arguments"],
-                    argument_error=output.argument_error,
-                )
-                for output in assembled.state.outputs
-                if output.kind == "tool_call"
-                and output.arguments is not None
-                and normalized_stop is StopReason.TOOL_USE
-            ]
-            turn = ToolUseResult(
-                tool_calls=calls,
-                text="".join(
-                    output.content for output in assembled.state.outputs if output.kind in {"text", "refusal"}
-                ),
-                reasoning_content="".join(
-                    output.content for output in assembled.state.outputs if output.kind == "reasoning"
-                )
-                or None,
-                stop_reason=normalized_stop,
-                raw_stop_reason=stop_reason,
-            )
             return AgentModelResponse(
-                turn=turn,
+                stop_reason=_normalized_stop(assembled.stop_reason),
+                raw_stop_reason=assembled.stop_reason,
                 usage=assembled.usage,
                 provider_wire_hash=wire.provider_wire_hash,
                 serializer_revision=wire.serializer_revision,
@@ -460,7 +475,8 @@ class LLMGateway:
         if effective_ledger is not None:
             await effective_ledger.commit(effective_lease_id, usage.total_tokens)
         return AgentModelResponse(
-            turn=turn,
+            stop_reason=turn.stop_reason,
+            raw_stop_reason=turn.raw_stop_reason,
             usage=usage,
             provider_wire_hash=wire.provider_wire_hash,
             serializer_revision=wire.serializer_revision,
@@ -950,84 +966,36 @@ class LLMGateway:
             # 非流式 provider：先拿完整结果，不伪造 token 时序。
             result = self._invoke_with_tools(messages, tools, kwargs)
             raw = result.value
-            text = ""
-            reasoning_content = ""
-            tool_calls_list: list[dict[str, Any]] = []
-            stop_reason = "end_turn"
-
-            if (isinstance(raw, Mapping) and "choices" in raw) or hasattr(raw, "choices"):
-                turn = parse_openai_response(raw)
-                text = turn.text
-                reasoning_content = turn.reasoning_content or ""
-                stop_reason = (turn.raw_stop_reason or "unknown" if turn.stop_reason is StopReason.INCOMPLETE
-                               else turn.stop_reason.value)
-                tool_calls_list = [
-                    {
-                        "id": call.id,
-                        "function": {
-                            "name": call.name,
-                            "arguments": json.dumps(
-                                call.input,
-                                ensure_ascii=False,
-                                sort_keys=True,
-                                separators=(",", ":"),
-                            ),
-                        },
-                    }
-                    for call in turn.tool_calls
-                ]
-            elif isinstance(raw, dict):
-                choices = raw.get("choices", [])
-                if choices:
-                    message = choices[0].get("message", {})
-                    text = message.get("content", "") or ""
-                    tool_calls_list = message.get("tool_calls", []) or []
-            elif hasattr(raw, "content"):
-                text = str(getattr(raw, "content", ""))
-                tool_calls_list = list(getattr(raw, "tool_calls", []))
-            else:
-                text = str(raw) if raw else ""
-
-            if reasoning_content:
-                if not put(
-                    StreamChunk(
-                        type="thinking_delta",
-                        content=reasoning_content,
-                    )
-                ):
-                    return
-
-            if text:
+            turn = parse_openai_response(raw)
+            outputs = _outputs_from_chat_response(raw, turn)
+            if not put(StreamChunk(
+                type="response_start", provider_response_id=_provider_field(raw, "id"),
+            )):
+                return
+            delta_types = {
+                "text": "text_delta", "reasoning": "thinking_delta", "refusal": "refusal_delta",
+            }
+            for output in outputs:
                 if not put(StreamChunk(
-                    type="text_delta",
-                    content=text,
+                    type="tool_use_start" if output.kind == "tool_call" else "content_block_start",
+                    output_id=output.output_id,
+                    output_kind=output.kind,
+                    tool_id=output.tool_call_id or "",
+                    tool_name=output.tool_name or "",
+                    provider_data=output.provider_data,
                 )):
                     return
-
-            # yield 工具调用
-            for tc in tool_calls_list:
-                tc_id = tc.get("id", f"tc_{uuid4().hex[:12]}")
-                tc_name = tc.get("function", {}).get("name", "") or tc.get("name", "")
-                tc_args = tc.get("function", {}).get("arguments", "{}") or tc.get("input", "{}")
-                if isinstance(tc_args, dict):
-                    tc_args = json.dumps(tc_args)
-
-                if not put(StreamChunk(
-                    type="tool_use_start",
-                    tool_name=tc_name,
-                    tool_id=tc_id,
+                if output.content and not put(StreamChunk(
+                    type="tool_input_delta" if output.kind == "tool_call" else delta_types[output.kind],
+                    output_id=output.output_id,
+                    content=output.content,
                 )):
                     return
-                if not put(StreamChunk(type="tool_input_delta", content=tc_args)):
+                if not put(StreamChunk(type="content_block_stop", output_id=output.output_id)):
                     return
-                if not put(StreamChunk(type="content_block_stop")):
-                    return
-
-            if tool_calls_list:
-                stop_reason = "tool_use"
             put(StreamChunk(
                 type="message_stop",
-                stop_reason=stop_reason,
+                stop_reason=turn.raw_stop_reason,
                 usage=result.usage,
             ))
 
@@ -1114,39 +1082,17 @@ def _outputs_from_chat_response(raw: object, turn: ToolUseResult) -> tuple[Model
     return tuple(outputs)
 
 
-def _outputs_from_turn(turn: ToolUseResult) -> tuple[ModelOutput, ...]:
-    """One aggregate object per available flat field; no invented boundaries."""
-    outputs = []
-    if turn.reasoning_content:
-        outputs.append(ModelOutput("reasoning", "reasoning", turn.reasoning_content))
-    if turn.text:
-        outputs.append(ModelOutput("text", "text", turn.text))
-    for call in turn.tool_calls:
-        outputs.append(
-            ModelOutput(
-                f"tool:{call.id}",
-                "tool_call",
-                json.dumps(call.input, ensure_ascii=False),
-                tool_call_id=call.id,
-                tool_name=call.name,
-                arguments=call.input,
-                argument_error=call.argument_error,
-            )
-        )
-    return tuple(outputs)
-
-
 def _response_terminal(response: AgentModelResponse) -> ModelResponseCompleted:
-    incomplete = response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+    incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
     return ModelResponseCompleted(
         provider_response_id=response.provider_response_id,
         usage=response.usage.model_dump(mode="json"),
-        stop_reason=response.turn.raw_stop_reason or response.turn.stop_reason.value,
+        stop_reason=response.raw_stop_reason or response.stop_reason.value,
         status="incomplete" if incomplete else "completed",
         incomplete_reason=(
             "max_output_tokens"
-            if response.turn.stop_reason is StopReason.MAX_TOKENS
-            else response.turn.raw_stop_reason or "unknown"
+            if response.stop_reason is StopReason.MAX_TOKENS
+            else response.raw_stop_reason or "unknown"
         )
         if incomplete
         else None,

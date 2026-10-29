@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from agent_runtime.tools.web_http import PublicWebClient
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 from tests.agent.test_web_tools import web_tools
@@ -89,11 +89,12 @@ async def test_public_agent_reports_persisted_remaining_budget_and_config(tmp_pa
         async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step <= 3:
-                return HarnessModelResponse(text='', provider_response_id=f'read-{step}', usage={},
-                    tool_calls=(HarnessToolCall(id=f'read-{step}', name='web_fetch', arguments={
+                return HarnessModelResponse.from_parts(text='', provider_response_id=f'read-{step}', usage={},
+                    tool_calls=(ModelToolCall(id=f'read-{step}', name='web_fetch', arguments={
                         'url': f'https://example.com/{step}', 'render': False}),))
-            return HarnessModelResponse(text='Sources read; third source unverified.', provider_response_id='answer',
-                                        usage={})
+            return HarnessModelResponse.from_parts(
+                text="Sources read; third source unverified.", provider_response_id="answer", usage={}
+            )
     database = tmp_path / 'state.sqlite'
     agent = Agent(workspace_path=tmp_path / 'workspace', checkpoint_db=database,
                   enable_workspace_mcp=False, web_limits=WebLimits(turn_requests=2))
@@ -202,13 +203,13 @@ async def test_failure_evidence_is_reused_after_new_process_resume(tmp_path, mon
         async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step in {1, 3}:
-                return HarnessModelResponse(text='', provider_response_id=f'read-{step}', usage={},
-                    tool_calls=(HarnessToolCall(id=f'read-{step}', name='web_fetch', arguments={
+                return HarnessModelResponse.from_parts(text='', provider_response_id=f'read-{step}', usage={},
+                    tool_calls=(ModelToolCall(id=f'read-{step}', name='web_fetch', arguments={
                         'url': 'https://example.com/blocked', 'render': False}),))
             if step == 2:
-                return HarnessModelResponse(text='', provider_response_id='command', usage={},
-                    tool_calls=(HarnessToolCall(id='command', name='run_command', arguments={'command': 'date'}),))
-            return HarnessModelResponse(text='Source access denied; cannot verify facts.',
+                return HarnessModelResponse.from_parts(text='', provider_response_id='command', usage={},
+                    tool_calls=(ModelToolCall(id='command', name='run_command', arguments={'command': 'date'}),))
+            return HarnessModelResponse.from_parts(text='Source access denied; cannot verify facts.',
                                         provider_response_id='answer', usage={})
     database = tmp_path / 'state.sqlite'
     options = dict(workspace_path=tmp_path / 'workspace', checkpoint_db=database, enable_workspace_mcp=False)
@@ -240,11 +241,22 @@ async def test_parallel_batch_consumes_only_available_budget_and_denial_is_not_u
     class ParallelPages(PatchThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             if prepared.request_ref['request_id'].endswith(':step:1'):
-                return HarnessModelResponse(text='', provider_response_id='parallel', usage={}, tool_calls=tuple(
-                    HarnessToolCall(id=f'read-{index}', name='web_fetch', arguments={
-                        'url': f'https://example.com/{index}', 'render': False}) for index in range(3)))
-            return HarnessModelResponse(text='Budget reached; two sources acquired.', provider_response_id='answer',
-                                        usage={})
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id="parallel",
+                    usage={},
+                    tool_calls=tuple(
+                        ModelToolCall(
+                            id=f"read-{index}",
+                            name="web_fetch",
+                            arguments={"url": f"https://example.com/{index}", "render": False},
+                        )
+                        for index in range(3)
+                    ),
+                )
+            return HarnessModelResponse.from_parts(
+                text="Budget reached; two sources acquired.", provider_response_id="answer", usage={}
+            )
     database = tmp_path / 'state.sqlite'
     agent = Agent(workspace_path=tmp_path / 'workspace', checkpoint_db=database, enable_workspace_mcp=False,
                   web_limits=WebLimits(turn_requests=2))
@@ -328,14 +340,14 @@ async def test_invalid_fetch_history_does_not_block_a_later_valid_public_agent_f
         async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref['request_id'].rsplit(':', 1)[-1])
             if step == 1:
-                return HarnessModelResponse(text='', provider_response_id='invalid', usage={}, tool_calls=(
-                    HarnessToolCall(id='invalid', name='web_fetch', arguments={
+                return HarnessModelResponse.from_parts(text='', provider_response_id='invalid', usage={}, tool_calls=(
+                    ModelToolCall(id='invalid', name='web_fetch', arguments={
                         'url': 'https://example.com/invalid', 'render': 'POST'}),))
             if step == 2:
-                return HarnessModelResponse(text='', provider_response_id='valid', usage={}, tool_calls=(
-                    HarnessToolCall(id='valid', name='web_fetch', arguments={
+                return HarnessModelResponse.from_parts(text='', provider_response_id='valid', usage={}, tool_calls=(
+                    ModelToolCall(id='valid', name='web_fetch', arguments={
                         'url': 'https://example.com/valid', 'render': False}),))
-            return HarnessModelResponse(text='Valid source read after rejected input.',
+            return HarnessModelResponse.from_parts(text='Valid source read after rejected input.',
                                         provider_response_id='answer', usage={})
 
     database = tmp_path / 'state.sqlite'

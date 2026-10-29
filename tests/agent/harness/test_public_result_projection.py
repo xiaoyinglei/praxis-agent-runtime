@@ -70,7 +70,7 @@ class PublicAnswerModel:
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="public harness answer",
             provider_response_id="provider-response-1",
             usage={

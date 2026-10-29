@@ -8,10 +8,10 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
 from agent_runtime.harness import (
     GatewayHarnessModel,
-    HarnessMessage,
+    ModelMessage,
     RolloutContextManager,
     RuntimeState,
     ToolOrchestrator,
@@ -54,10 +54,10 @@ class FileWorkflowGateway(CapturingGateway):
         elif count == 1:
             turn = ToolUseResult(
                 tool_calls=[
-                    ToolCall(
+                    ModelToolCall(
                         id="write",
                         name="apply_patch",
-                        input={
+                        arguments={
                             "file_path": self.path,
                             "new_string": self.body,
                         },
@@ -68,7 +68,7 @@ class FileWorkflowGateway(CapturingGateway):
             )
         elif count == 2:
             turn = ToolUseResult(
-                tool_calls=[ToolCall(id="read", name="read_file", input={"path": self.path})],
+                tool_calls=[ModelToolCall(id="read", name="read_file", arguments={"path": self.path})],
                 stop_reason=StopReason.TOOL_USE,
                 raw_stop_reason="tool_calls",
             )
@@ -87,7 +87,7 @@ class FileWorkflowGateway(CapturingGateway):
                 request, provider=kwargs["provider"], supports_native_tools=kwargs["supports_native_tools"]
             )
         )
-        return AgentModelResponse(
+        return AgentModelResponse.from_turn(
             turn=turn,
             usage=normalize_llm_usage(
                 input_tokens=measured,
@@ -240,7 +240,7 @@ def test_output_cap_accounts_for_changed_input_limits_without_provider_io(tmp_pa
         first = runner._model.prepare(step.model_request())
         previous_limits = first.request_ref.get("runtime_input_update")
         if previous_limits is not None:
-            step = replace(step, messages=(*step.messages, HarnessMessage(role="context", content=previous_limits)))
+            step = replace(step, messages=(*step.messages, ModelMessage(role="context", body=previous_limits)))
         prepared = asyncio.run(runner._prepare_step(step))
         assert prepared.resource_request.total_tokens <= 100_000
         assert 0 < prepared.resource_request.output_tokens < 65_536

@@ -13,7 +13,7 @@ from agent_runtime import Agent, cli
 from agent_runtime.harness import (
     CompletionDecision,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     RuntimeState,
     Session,
     TurnExecutor,
@@ -32,10 +32,10 @@ class LoopModel(ToolThenAnswerModel):
         step = self.requests[-1].step
         calls = ()
         if step <= self.invalid_until or step <= self.read_until or step in self.tool_steps:
-            calls = (HarnessToolCall(id=f"read-{step}", name="read_file", arguments=(
+            calls = (ModelToolCall(id=f"read-{step}", name="read_file", arguments=(
                 {} if step <= self.invalid_until else {"path": "source.txt"}
             )),)
-        return HarnessModelResponse(text="" if calls else f"Answer {step}", provider_response_id=None,
+        return HarnessModelResponse.from_parts(text="" if calls else f"Answer {step}", provider_response_id=None,
                                     usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
                                     tool_calls=calls)
 
@@ -120,8 +120,8 @@ async def test_one_batch_gets_one_recovery_grant_even_with_multiple_failures(
             response = await super().dispatch(prepared, **kwargs)
             if response.tool_calls:
                 step = self.requests[-1].step
-                return HarnessModelResponse(text="", provider_response_id=None, usage=response.usage,
-                    tool_calls=tuple(HarnessToolCall(id=f"bad-{step}-{n}", name="read_file", arguments={})
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage=response.usage,
+                    tool_calls=tuple(ModelToolCall(id=f"bad-{step}-{n}", name="read_file", arguments={})
                                      for n in range(3)))
             return response
 
@@ -241,9 +241,9 @@ async def test_incomplete_tool_json_does_not_reset_the_completion_allowance(tmp_
         async def dispatch(self, prepared, **kwargs):
             response = await super().dispatch(prepared, **kwargs)
             if self.requests[-1].step == 9:
-                return HarnessModelResponse(text="", provider_response_id=None, usage=response.usage,
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage=response.usage,
                     status="incomplete", incomplete_reason="max_output_tokens", tool_calls=(
-                        HarnessToolCall(id="partial", name="read_file", arguments={}),
+                        ModelToolCall(id="partial", name="read_file", arguments={}),
                     ))
             return response
 
@@ -274,11 +274,22 @@ async def test_recovery_consumes_a_real_committed_write_without_reexecution(tmp_
         async def dispatch(self, prepared, **kwargs):
             response = await super().dispatch(prepared, **kwargs)
             if self.requests[-1].step == 1:
-                return HarnessModelResponse(text="", provider_response_id=None, usage=response.usage, tool_calls=(
-                    HarnessToolCall(id="patch", name="apply_patch", arguments={
-                        "file_path": "value.txt", "old_string": "before", "new_string": "after",
-                    }),
-                ))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id=None,
+                    usage=response.usage,
+                    tool_calls=(
+                        ModelToolCall(
+                            id="patch",
+                            name="apply_patch",
+                            arguments={
+                                "file_path": "value.txt",
+                                "old_string": "before",
+                                "new_string": "after",
+                            },
+                        ),
+                    ),
+                )
             return response
 
     model = WriteModel()
@@ -401,8 +412,8 @@ async def test_failure_streak_uses_reconciled_outcomes_after_each_reopen(tmp_pat
     class Model(LoopModel):
         async def dispatch(self, prepared, **kwargs):
             step = self.requests[-1].step
-            return HarnessModelResponse(text="done" if step > 4 else "", provider_response_id=None, usage={},
-                tool_calls=() if step > 4 else (HarnessToolCall(
+            return HarnessModelResponse.from_parts(text="done" if step > 4 else "", provider_response_id=None, usage={},
+                tool_calls=() if step > 4 else (ModelToolCall(
                     id=f"remote-{step}", name="read_file", arguments={"path": "same-resource"},
                 ),))
 

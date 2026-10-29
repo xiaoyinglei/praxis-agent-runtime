@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.harness import Session
+from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.harness.state import RuntimeState
 
 
@@ -95,10 +96,10 @@ def test_low_level_recovery_rejects_old_requests_before_mutation_or_preparation(
                              else "agent_step", "step_snapshot": {"step": 1}},
             )
             attempt = state.dispatch_model_attempt(operation.operation_id)
-            state.complete_model_attempt(
-                operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
-                text="old response", provider_response_id="old", usage={},
-            )
+            state.complete_model_attempt(operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(text="old response", provider_response_id="old", usage={}))
         if route == "clarification":
             interaction = state.request_clarification(turn_id=turn.turn_id, question="old question")
         executor = TurnExecutor(
@@ -130,10 +131,10 @@ def test_retained_terminal_history_is_readable_without_enabling_old_execution(tm
                 request_ref={"request_id": "old", "purpose": "agent_step"},
             )
             attempt = state.dispatch_model_attempt(operation.operation_id)
-            state.complete_model_attempt(
-                operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
-                text="old answer", provider_response_id="old", usage={},
-            )
+            state.complete_model_attempt(operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(text="old answer", provider_response_id="old", usage={}))
         receipt = state.receive_turn_input(thread_id=thread.thread_id, turn_id=old.turn_id, text="old supplement")
         state.complete_turn(turn_id=old.turn_id, answer="old answer")
         current = state.start_turn(thread_id=thread.thread_id, user_message="new task", binding_manifest={})

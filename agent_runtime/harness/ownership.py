@@ -10,6 +10,7 @@ from collections.abc import Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from agent_runtime.harness.protocol import restore_model_response
 from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.model_config_io import ensure_durable_directory
 from agent_runtime.user_config import user_config_directory
@@ -141,13 +142,13 @@ def _close_unstarted_calls(store: RuntimeState, turn_id: str) -> None:
     for model in store.list_model_operations(turn_id):
         if model.status != "completed" or model.response_item_id is None:
             continue
-        response = store.read_item(model.response_item_id).payload
-        if response.get("response_status") == "incomplete":
+        response = restore_model_response(store.read_item(model.response_item_id).payload)
+        if response.status == "incomplete":
             continue
-        for call in response.get("tool_calls", ()):
-            if call["id"] in results:
+        for call in response.tool_calls:
+            if call.id in results:
                 continue
-            operation = operations.get(call["id"])
+            operation = operations.get(call.id)
             if operation is not None and operation.result_item_id is not None:
                 continue
             if operation is not None and operation.attempt_count:
@@ -164,9 +165,9 @@ def _close_unstarted_calls(store: RuntimeState, turn_id: str) -> None:
                     store.reject_ready_tool_operation(operation_id=operation.operation_id, error_code="not_executed")
             store.record_tool_result(turn_id=turn_id,
                 operation_id=None if operation is None else operation.operation_id,
-                result={"tool_call_id": call["id"], "tool_name": call["name"], "is_error": True,
+                result={"tool_call_id": call.id, "tool_name": call.name, "is_error": True,
                     "error_code": "not_executed", "error_message": "Execution stopped before this tool started",
                     "model_content": "Tool was not executed: the previous worker stopped before it started.",
                     "content": [{"type": "text", "data": {"text": "操作未执行：原执行进程已停止。"}}],
                     "attachments": []})
-            results.add(call["id"])
+            results.add(call.id)

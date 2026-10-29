@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from agent_runtime import cli
+from agent_runtime.core.messages import ModelToolCall as _ModelToolCall
 from agent_runtime.harness import RuntimeState
+from agent_runtime.harness.protocol import HarnessModelResponse, item_text
 from agent_runtime.history import list_chat_sessions, read_chat_messages
 from tests.agent.test_agent_cli_resume import _result
 
@@ -87,10 +89,11 @@ def test_replay_keeps_original_messages_after_context_compaction_and_reuses_answ
             request_ref={"input_revision": 1, "request_id": "fixture"},
         )
         attempt = store.dispatch_model_attempt(operation.operation_id, now=1)
-        assert store.complete_model_attempt(
-            operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
-            text="final answer", provider_response_id=None, usage={}, now=2,
-        )
+        assert store.complete_model_attempt(operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            now=2,
+            response=HarnessModelResponse.from_parts(text="final answer", provider_response_id=None, usage={}))
         response_item_id = store.list_model_operations(turn.turn_id)[-1].response_item_id
         store.complete_turn(turn_id=turn.turn_id, answer="final answer", source_item_id=response_item_id)
         assert store.read_turn_answer(turn.turn_id).item_id == response_item_id
@@ -161,7 +164,7 @@ async def test_reopened_chat_submits_new_turn_in_original_thread(tmp_path, monke
                 turn = store.start_turn(thread_id=thread_id, user_message=task, binding_manifest={})
                 assert turn.predecessor_turn_id == previous_turn_id
                 assert turn.turn_id != previous_turn_id
-                assert [item.payload.get("text") for item in store.list_context_items(turn.turn_id)] == [
+                assert [item_text(item) for item in store.list_context_items(turn.turn_id)] == [
                     "first question", "saved answer", "follow up",
                 ]
                 store.complete_turn(turn_id=turn.turn_id, answer="new answer")
@@ -364,9 +367,20 @@ async def test_reopened_reconciliation_preserves_new_request_in_owned_followup(
         )
         attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
         assert store.complete_model_attempt(
-            operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
-            text="", provider_response_id=None, usage={},
-            tool_calls=({"id": "write-call", "name": "write_file", "arguments": {"path": "artifact"}},),
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id=None,
+                usage={},
+                tool_calls=tuple(
+                    _ModelToolCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in ({"id": "write-call", "name": "write_file", "arguments": {"path": "artifact"}},)
+                ),
+            ),
         )
         values = dict(turn_id=old.turn_id, operation_id="uncertain-write", tool_call_id="write-call",
                       tool_name="write_file", arguments_digest="args", execution_revision="write-v1",

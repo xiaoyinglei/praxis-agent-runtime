@@ -1,17 +1,34 @@
+
 import json
 from pathlib import Path
 
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall as _CanonicalCall
 from agent_runtime.harness import RolloutContextManager, RuntimeState
+from agent_runtime.harness.protocol import HarnessModelResponse as _CanonicalResponse
+from agent_runtime.harness.protocol import model_response_payload as _response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_compaction_consistency import start
 
 
 def exchange(store, turn_id, call_id, content):
-    seed(store, turn_id=turn_id, kind="model_response", payload={
-        "text": "Read evidence", "tool_calls": [{"id": call_id, "name": "read", "arguments": {}}],
-    })
+    seed(
+        store,
+        turn_id=turn_id,
+        kind="model_response",
+        payload=_response_payload(
+            _CanonicalResponse.from_parts(
+                text="Read evidence",
+                tool_calls=tuple(
+                    _CanonicalCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in [{"id": call_id, "name": "read", "arguments": {}}]
+                ),
+            )
+        ),
+    )
     return seed(store, turn_id=turn_id, kind="tool_result", payload={
         "tool_call_id": call_id, "model_content": content,
     })
@@ -27,7 +44,22 @@ def test_parallel_result_admission_keeps_all_calls_and_archives_originals(tmp_pa
     with RuntimeState.open_sync(path) as store:
         thread, turn = start(store, tmp_path)
         calls = [{"id": str(i), "name": "read", "arguments": {"path": f"{i}.md"}} for i in range(3)]
-        seed(store, turn_id=turn.turn_id, kind="model_response", payload={"text": "Read", "tool_calls": calls})
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="model_response",
+            payload=_response_payload(
+                _CanonicalResponse.from_parts(
+                    text="Read",
+                    tool_calls=tuple(
+                        _CanonicalCall(
+                            id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                        )
+                        for c in calls
+                    ),
+                )
+            ),
+        )
         originals = [seed(store, turn_id=turn.turn_id, kind="tool_result", payload={
             "tool_call_id": str(i), "model_content": f"RULE_{i}: preserve this evidence. " + "sample " * 2000,
         }) for i in range(3)]
@@ -101,8 +133,8 @@ def test_later_batch_admission_preserves_earlier_evidence_prefixes(tmp_path):
         visible = prepared.request_ref["step_snapshot"]["messages"]
         for i in range(3):
             message = next(m for m in visible if m["tool_call_id"] == str(i))
-            assert f"RULE_{i}" in message["content"]
-            assert message["content"].count("Tool result truncated") == 1
+            assert f"RULE_{i}" in message["body"]
+            assert message["body"].count("Tool result truncated") == 1
         assert not gateway.requests
         assert not store.list_model_operations(turn.turn_id)
 
@@ -127,7 +159,7 @@ def test_old_history_is_summarized_instead_of_starving_current_tool_result(tmp_p
         ops = store.list_model_operations(turn.turn_id)
         assert [op.request_ref["purpose"] for op in ops] == ["context_summary", "agent_step"]
         latest = ops[-1].request_ref["step_snapshot"]["messages"]
-        assert next(m for m in latest if m["tool_call_id"] == "current")["content"] == content
+        assert next(m for m in latest if m["tool_call_id"] == "current")["body"] == content
 
 
 def test_new_elision_and_semantic_compaction_do_not_resurrect_old_results(tmp_path: Path):
@@ -218,9 +250,22 @@ def test_zero_retained_tail_is_summarized_without_synthetic_tool_replay(tmp_path
     with RuntimeState.open_sync(database) as store:
         _, turn = start(store, tmp_path)
         long_history(store, turn)
-        seed(store, turn_id=turn.turn_id, kind="model_response", payload={
-            "text": "Read specs",
-            "tool_calls": [{"id": "latest", "name": "read_file", "arguments": {"path": "spec.md"}}]})
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="model_response",
+            payload=_response_payload(
+                _CanonicalResponse.from_parts(
+                    text="Read specs",
+                    tool_calls=tuple(
+                        _CanonicalCall(
+                            id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                        )
+                        for c in [{"id": "latest", "name": "read_file", "arguments": {"path": "spec.md"}}]
+                    ),
+                )
+            ),
+        )
         seed(store, turn_id=turn.turn_id, kind="tool_result", payload={
             "tool_call_id": "latest", "model_content": "SPEC_EVIDENCE " + "data " * 2000})
         manager = RolloutContextManager(store, max_total_bytes=5000)

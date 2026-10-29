@@ -37,7 +37,9 @@ class MemoryModel:
             text = "bad JSON" if self.bad_output else json.dumps({"entries": entries})
         else:
             text = "normal answer"
-        return HarnessModelResponse(text, None, {"input_tokens": 10, "output_tokens": 20})
+        return HarnessModelResponse.from_parts(
+            text=text, provider_response_id=None, usage={"input_tokens": 10, "output_tokens": 20}
+        )
 
 
 def seed(store, workspace, *, text="Use uv for Python commands.", contributes=True):
@@ -125,8 +127,13 @@ async def test_model_cannot_forge_memory_source_ids(tmp_path):
 
     class ForgingModel(MemoryModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(json.dumps({"entries": [{"key": "bad", "title": "bad", "text": "bad",
-                                                                 "source_item_ids": ["unavailable"]}]}), None, {})
+            return HarnessModelResponse.from_parts(
+                text=json.dumps(
+                    {"entries": [{"key": "bad", "title": "bad", "text": "bad", "source_item_ids": ["unavailable"]}]}
+                ),
+                provider_response_id=None,
+                usage={},
+            )
 
     async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         seed(store, tmp_path)
@@ -329,10 +336,10 @@ async def test_later_correction_replaces_the_previous_entry(tmp_path):
             request = self.requests[-1]
             if request.purpose == "memory_extract":
                 data = json.loads(request.messages[-1].content.split("\nDATA:\n", 1)[1])
-                return HarnessModelResponse(json.dumps({"entries": [{
+                return HarnessModelResponse.from_parts(text=json.dumps({"entries": [{
                     "key": "environment", "title": "Command runner", "text": data[0]["payload"]["text"],
                     "source_item_ids": [data[0]["item_id"]],
-                }]}), None, {})
+                }]}), provider_response_id=None, usage={})
             return await super().dispatch(prepared, event_sink=event_sink)
 
     async with (await RuntimeState.open(tmp_path / "r.db")) as store:
@@ -582,7 +589,10 @@ async def test_exhausted_batch_does_not_block_other_sources_or_reset_its_budget(
 
     class InvalidModel(MemoryModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
+            return HarnessModelResponse.from_parts(
+                text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
+            )
+
     async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         blocked, _ = seed(store, tmp_path)
         safe, _ = seed(store, tmp_path, text="later safe convention")
@@ -624,7 +634,9 @@ async def test_exhausted_memory_batch_stays_blocked_but_new_source_revision_can_
 
     class InvalidModel(MemoryModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
+            return HarnessModelResponse.from_parts(
+                text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
+            )
 
     async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         source, _ = seed(store, tmp_path, text="old material " * (5000 if large_old_source else 1))
@@ -667,7 +679,9 @@ async def test_appending_history_cannot_refund_the_same_failed_memory_batch(tmp_
 
     class InvalidModel(MemoryModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse("bad JSON", None, {"input_tokens": 12000, "output_tokens": 0})
+            return HarnessModelResponse.from_parts(
+                text="bad JSON", provider_response_id=None, usage={"input_tokens": 12000, "output_tokens": 0}
+            )
 
     async with (await RuntimeState.open(tmp_path / "r.db")) as store:
         source, _ = seed(store, tmp_path, text="unchanged first batch " * 5000)

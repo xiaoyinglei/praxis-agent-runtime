@@ -39,7 +39,7 @@ def test_available_tokenizer_is_used_without_changing_chunk_counting():
 
 
 def test_adapter_and_gateway_reserve_the_same_serialized_input():
-    from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
     from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
     from agent_runtime.modeling.gateway import LLMGateway, model_request_input_text
     from tests.agent.harness.test_model_adapter import _resolved_model
@@ -57,7 +57,7 @@ def test_adapter_and_gateway_reserve_the_same_serialized_input():
     model = GatewayHarnessModel(model_id="test", resolved=resolved, instructions=("Answer.",))
     prepared = model.prepare(HarnessModelRequest(
         thread_id="thread", turn_id="turn", binding_manifest={},
-        messages=(HarnessMessage(role="user", content='{"中文":1234567890123456789}'),),
+        messages=(ModelMessage(role="user", body='{"中文":1234567890123456789}'),),
     ))
     wire = model_request_input_text(prepared.dispatch_payload.request,
                                     provider=resolved.provider, supports_native_tools=True)
@@ -74,7 +74,7 @@ def test_context_compaction_can_consume_agent_history_without_generic_summary_sp
     """Both frozen policies accept history beyond the generic summarize window."""
     from dataclasses import replace
 
-    from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
     from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMStageBudget
     from agent_runtime.modeling.gateway import LLMGateway
     from tests.agent.harness.test_model_adapter import _resolved_model
@@ -95,7 +95,7 @@ def test_context_compaction_can_consume_agent_history_without_generic_summary_sp
     model = GatewayHarnessModel(model_id="test", resolved=resolved, instructions=("Answer.",))
     prepared = model.prepare(HarnessModelRequest(
         thread_id="thread", turn_id="turn", binding_manifest={}, purpose="context_summary",
-        messages=(HarnessMessage(role="user", content="history " * 3000),),
+        messages=(ModelMessage(role="user", body="history " * 3000),),
     ))
     assert 16000 < prepared.resource_request.input_tokens < 64000
     assert prepared.resource_request.output_tokens == 2048

@@ -12,7 +12,6 @@ from agent_runtime.core.messages import (
     canonical_json_text,
     context_event_message,
     model_message_payload,
-    snapshot_model_message,
     tool_result_message,
 )
 from agent_runtime.core.turn_contracts import ToolManifest, ToolManifestEntry
@@ -180,7 +179,7 @@ class StableModelContext:
         messages: list[ModelMessage] = [
             ModelMessage(
                 role="system",
-                content="\n\n".join(self.instructions),
+                body="\n\n".join(self.instructions),
             )
         ]
         messages.extend(
@@ -193,11 +192,11 @@ class StableModelContext:
             )
             for block in self.frozen_run_context
         )
-        messages.append(ModelMessage(role="user", content=self.initial_user_task))
+        messages.append(ModelMessage(role="user", body=self.initial_user_task))
         return tuple(messages)
 
     def append_message(self, message: ModelMessage) -> StableModelContext:
-        return self._with_transcript((*self.transcript, snapshot_model_message(message)))
+        return self._with_transcript((*self.transcript, message))
 
     def append_tool_result(self, result: ToolResult) -> StableModelContext:
         return self.append_message(tool_result_message(result))
@@ -676,7 +675,9 @@ def _snapshot_messages(
 ) -> tuple[ModelMessage, ...]:
     if isinstance(messages, (str, bytes)) or not isinstance(messages, Sequence):
         raise TypeError(f"{field_name} must be a sequence of ModelMessage values")
-    return tuple(snapshot_model_message(message) for message in messages)
+    if any(not isinstance(message, ModelMessage) for message in messages):
+        raise TypeError(f"{field_name} must contain ModelMessage values")
+    return tuple(messages)
 
 
 def _ordered_tools(tools: Sequence[Tool]) -> tuple[Tool, ...]:

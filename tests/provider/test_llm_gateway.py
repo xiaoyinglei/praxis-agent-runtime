@@ -4,7 +4,7 @@ import asyncio
 import json
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,7 +12,7 @@ import pytest
 from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
-from agent_runtime.core.messages import StopReason
+from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
 from agent_runtime.core.model_request import (
     ModelSettings,
     build_model_request,
@@ -25,8 +25,9 @@ from agent_runtime.modeling.contracts import (
     LLMStageBudget,
     LLMUsage,
 )
-from agent_runtime.modeling.events import ModelEvent, ModelOutputDelta
+from agent_runtime.modeling.events import ModelEvent, ModelOutput, ModelOutputDelta
 from agent_runtime.modeling.gateway import (
+    AgentModelResponse,
     LLMContextOverflowError,
     LLMGateway,
     LLMToolCallValidationError,
@@ -43,6 +44,65 @@ from agent_runtime.tools.tool import (
     json_schema_input,
 )
 from rag.assembly.support import _OpenAICompatibleChatGenerator
+
+
+def test_agent_model_response_has_one_canonical_output_snapshot() -> None:
+    assert "turn" not in {field.name for field in fields(AgentModelResponse)}
+    outputs = (
+        ModelOutput("text:1", "text", "first "),
+        ModelOutput("reasoning:1", "reasoning", "inspect"),
+        ModelOutput("refusal:1", "refusal", "second"),
+        ModelOutput("call:1", "tool_call", tool_call_id="provider-call", tool_name="read_file",
+                    arguments={"path": "README.md"}),
+    )
+    response = AgentModelResponse(
+        outputs=outputs, stop_reason=StopReason.TOOL_USE, raw_stop_reason="tool_calls",
+        usage=LLMUsage(input_tokens=1, output_tokens=1, source="provider"),
+        provider_wire_hash="wire", serializer_revision="revision", wire_kind="openai",
+        provider_response_id="provider-response",
+    )
+
+    assert response.turn.text == "first second"
+    assert response.turn.reasoning_content == "inspect"
+    assert response.turn.tool_calls == [
+        ModelToolCall(id="provider-call", name="read_file", arguments={"path": "README.md"})
+    ]
+    assert response.turn.raw_stop_reason == "tool_calls"
+    response.turn.tool_calls.clear()
+    assert response.turn.tool_calls[0].id == "provider-call"
+    changed = replace(response, outputs=(ModelOutput("other", "text", "replacement"),))
+    assert changed.turn.text == "replacement"
+    assert changed.turn.tool_calls == []
+
+
+@pytest.mark.parametrize("stop_reason", [StopReason.END_TURN, StopReason.MAX_TOKENS, StopReason.INCOMPLETE])
+def test_agent_model_response_retains_unexecuted_output_without_projecting_calls(stop_reason) -> None:
+    output = ModelOutput("call:1", "tool_call", tool_call_id="call", tool_name="read_file", arguments={})
+    response = AgentModelResponse(
+        outputs=(output,), stop_reason=stop_reason, raw_stop_reason="provider-terminal",
+        usage=LLMUsage(input_tokens=1, output_tokens=1, source="provider"),
+        provider_wire_hash="wire", serializer_revision="revision", wire_kind="openai",
+    )
+
+    assert response.outputs == (output,)
+    assert response.turn.tool_calls == []
+    assert response.turn.stop_reason is stop_reason
+
+
+def test_agent_model_response_from_turn_adapts_flat_provider_boundary() -> None:
+    turn = ToolUseResult(
+        text="answer", reasoning_content="inspect", stop_reason=StopReason.TOOL_USE,
+        raw_stop_reason="tool_calls", tool_calls=[ModelToolCall(id="call", name="read_file", arguments={})],
+    )
+    response = AgentModelResponse.from_turn(
+        turn=turn, usage=LLMUsage(input_tokens=1, output_tokens=1, source="provider"),
+        provider_wire_hash="wire", serializer_revision="revision", wire_kind="local",
+        provider_response_id="provider-response",
+    )
+
+    assert response.turn == turn
+    assert [output.kind for output in response.outputs] == ["reasoning", "text", "tool_call"]
+    assert response.provider_response_id == "provider-response"
 
 
 class _WordTokenAccounting:
@@ -1016,6 +1076,37 @@ async def test_streaming_fallback_preserves_reasoning_for_next_tool_turn() -> No
 
     assert result.turn.reasoning_content == "Inspect the source before editing."
     assert result.turn.tool_calls[0].name == "read_file"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", ["tool_calls", "length", "content_filter"])
+async def test_streaming_fallback_preserves_canonical_snapshot_and_terminal_identity(reason) -> None:
+    class Generator:
+        def generate_with_tools(self, **kwargs):
+            return LLMProviderResult(
+                value={
+                    "id": "provider-response",
+                    "choices": [{"finish_reason": reason, "message": {
+                        "content": "prefix", "refusal": "refusal",
+                        "reasoning_content": "inspect", "reasoning_details": [{"type": "opaque"}],
+                        "tool_calls": [{"id": "call", "function": {
+                            "name": "read_file", "arguments": '{"path":',
+                        }}],
+                    }}],
+                },
+                usage=LLMUsage(input_tokens=10, output_tokens=20, source="provider"),
+            )
+
+    gateway = _gateway(Generator(), max_input_tokens=2000, model_context_tokens=4000)
+    kwargs = dict(stage=LLMCallStage.TOOL_DECISION, request=_canonical_request(),
+                  provider="openai-compatible", supports_native_tools=True)
+    snapshot = await gateway.agenerate_model_request(**kwargs)
+    streamed = await gateway.agenerate_model_request(**kwargs, stream=True)
+
+    assert streamed.outputs == snapshot.outputs
+    assert streamed.provider_response_id == snapshot.provider_response_id == "provider-response"
+    assert streamed.raw_stop_reason == snapshot.raw_stop_reason == reason
+    assert streamed.turn == snapshot.turn
 
 
 @pytest.mark.anyio

@@ -17,9 +17,9 @@ from agent_runtime.harness import RolloutContextManager
 from agent_runtime.harness.protocol import (
     CompletionDecision,
     CompletionProposal,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
+    ModelMessage,
     PreparedModelCall,
 )
 from agent_runtime.harness.session import TurnExecutor
@@ -33,8 +33,8 @@ from tests.agent.harness.test_model_adapter import (
 
 
 class StaticContext:
-    def build(self, _turn_id: str) -> tuple[HarnessMessage, ...]:
-        return (HarnessMessage(role="user", content="finish the task"),)
+    def build(self, _turn_id: str) -> tuple[ModelMessage, ...]:
+        return (ModelMessage(role="user", body="finish the task"),)
 
 
 class AcceptAnswer:
@@ -66,7 +66,7 @@ class PressureModel:
         _prepared: PreparedModelCall,
         **_kwargs: object,
     ) -> HarnessModelResponse:
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="final answer",
             provider_response_id="provider-1",
             usage={"input_tokens": 10, "output_tokens": 2},
@@ -193,9 +193,9 @@ def _settle_prior_usage(store: RuntimeState, turn_id: str, tokens: int) -> None:
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
-        text="prior work verified",
-        provider_response_id=None,
-        usage={"input_tokens": tokens, "output_tokens": 0},
+        response=HarnessModelResponse.from_parts(
+            text="prior work verified", provider_response_id=None, usage={"input_tokens": tokens, "output_tokens": 0}
+        ),
     )
 
 

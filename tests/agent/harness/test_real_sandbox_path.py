@@ -12,7 +12,7 @@ from agent_runtime.harness import (
     CompletionProposal,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     Session,
 )
@@ -56,12 +56,12 @@ class SandboxCommandModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="sandbox-tool-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="sandbox-call-1",
                         name="run_command",
                         arguments={
@@ -73,7 +73,7 @@ class SandboxCommandModel:
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="sandbox command verified",
             provider_response_id="sandbox-final",
             usage={"input_tokens": 4, "output_tokens": 2},
@@ -89,12 +89,12 @@ class SandboxWriteModel(SandboxCommandModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="sandbox-write-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="sandbox-write-1",
                         name="run_command",
                         arguments={
@@ -106,7 +106,7 @@ class SandboxWriteModel(SandboxCommandModel):
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="sandbox write verified",
             provider_response_id="sandbox-write-final",
             usage={"input_tokens": 4, "output_tokens": 2},

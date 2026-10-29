@@ -11,10 +11,11 @@ from agent_runtime.harness import (
     CompletionProposal,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     Session,
 )
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.tools.permissions import ToolExecutionContext
 
 
@@ -69,7 +70,7 @@ class ParentChildModel:
         assert isinstance(request, HarnessModelRequest)
         initial = request.messages[0].content
         if initial.startswith("child task"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="child conclusion",
                 provider_response_id="child-response",
                 usage={"input_tokens": 2, "output_tokens": 2},
@@ -78,12 +79,12 @@ class ParentChildModel:
             message for message in request.messages if message.role == "tool"
         ]
         if not tool_messages:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="discover-response",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="discover-task",
                         name="find_tools",
                         arguments={"query": "delegate isolated child task", "limit": 3},
@@ -91,12 +92,12 @@ class ParentChildModel:
                 ),
             )
         if not any("child_turn_id" in message.content for message in tool_messages):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="delegate-response",
                 usage={"input_tokens": 3, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="delegate-task",
                         name="task",
                         arguments={
@@ -108,7 +109,7 @@ class ParentChildModel:
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="parent used child conclusion",
             provider_response_id="parent-response",
             usage={"input_tokens": 5, "output_tokens": 3},
@@ -162,7 +163,7 @@ async def test_subagent_tool_runs_an_independent_durable_thread(tmp_path: Path) 
             "require_workspace_change": False
         }
         assert [
-            item.payload.get("text")
+            item_text(item)
             for item in runtime.store.list_context_items(child_turn_id)
             if item.kind == "user_message"
         ] == [

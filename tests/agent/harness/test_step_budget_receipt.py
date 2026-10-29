@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall
 from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
 
@@ -19,9 +19,9 @@ class ReadingModel(_UpdatePlanThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         step = prepared.request_ref["step"]
         if step == self.finish_at:
-            return HarnessModelResponse(text="finished", provider_response_id=None, usage={})
-        return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-            HarnessToolCall(id=f"read-{step}", name="read_file", arguments={"path": "example.py"}),
+            return HarnessModelResponse.from_parts(text="finished", provider_response_id=None, usage={})
+        return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+            ModelToolCall(id=f"read-{step}", name="read_file", arguments={"path": "example.py"}),
         ))
 
 

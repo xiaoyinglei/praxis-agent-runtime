@@ -102,16 +102,17 @@ class CommandModel:
     """Use the existing deterministic model contract, executing real tool IO."""
 
     def __new__(cls, arguments, tool_name="run_command"):
-        from agent_runtime.harness import HarnessToolCall
+        from agent_runtime.core.messages import outputs_from_parts
+        from agent_runtime.harness import ModelToolCall
         from tests.agent.harness.test_approval_resume import WriteThenAnswerModel
 
         class Model(WriteThenAnswerModel):
             async def dispatch(self, prepared, *, event_sink=None):
                 response = await super().dispatch(prepared, event_sink=event_sink)
                 if response.tool_calls:
-                    return replace(response, outputs=(), tool_calls=(HarnessToolCall(
+                    return replace(response, outputs=outputs_from_parts(tool_calls=(ModelToolCall(
                         id="command-call", name=tool_name, arguments=arguments,
-                    ),))
+                    ),)))
                 return response
 
         return Model()

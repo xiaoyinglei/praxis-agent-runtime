@@ -6,6 +6,7 @@ import pytest
 
 from agent_runtime.core.llm_config import AgentModelsConfig, ModelProvider, ModelSpec
 from agent_runtime.core.llm_registry import ModelRegistry
+from agent_runtime.core.messages import restore_model_message
 from agent_runtime.model_definition import ModelExecutionDefinition, canonical_definition_json
 from agent_runtime.modeling.contracts import LLMCallStage
 
@@ -64,7 +65,10 @@ def test_new_context_role_depends_on_provenance_and_configuration(provider: str,
     from dataclasses import replace
 
     from agent_runtime.harness.model_adapter import GatewayHarnessModel
-    from agent_runtime.harness.protocol import HarnessMessage, HarnessModelRequest, restore_harness_message
+    from agent_runtime.harness.protocol import (
+    HarnessModelRequest,
+    ModelMessage,
+)
     from agent_runtime.modeling.openai_wire import serialize_openai_request
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
 
@@ -80,11 +84,11 @@ def test_new_context_role_depends_on_provenance_and_configuration(provider: str,
         turn_id="u",
         binding_manifest={},
         messages=(
-            HarnessMessage(role="user", content="Continue work."),
-            HarnessMessage(role="context", content="Any presentation", context_category="continuation_summary"),
-            restore_harness_message({
+            ModelMessage(role="user", body="Continue work."),
+            ModelMessage(role="context", body="Any presentation", context_category="continuation_summary"),
+            restore_model_message({
                 "role": "context",
-                "content": "Context compaction:\nThis is an ordinary constraint.",
+                "body": "Context compaction:\nThis is an ordinary constraint.",
             }),
         ),
     )

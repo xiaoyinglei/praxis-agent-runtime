@@ -7,7 +7,7 @@ import httpx
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 
@@ -23,11 +23,11 @@ class FetchThenAnswer(PatchThenAnswerModel):
 
     async def dispatch(self, prepared, *, event_sink: object = None):
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="", provider_response_id="fetch-call", usage={},
-                tool_calls=(HarnessToolCall(id="fetch-1", name=self.tool_name, arguments=self.args),),
+                tool_calls=(ModelToolCall(id="fetch-1", name=self.tool_name, arguments=self.args),),
             )
-        return HarnessModelResponse(text="Research complete", provider_response_id="answer", usage={})
+        return HarnessModelResponse.from_parts(text="Research complete", provider_response_id="answer", usage={})
 
 
 @pytest.mark.anyio
@@ -313,10 +313,10 @@ async def test_product_search_budget_is_persisted_and_credential_is_not(tmp_path
         async def dispatch(self, prepared, *, event_sink: object = None):
             step = int(prepared.request_ref["request_id"].rsplit(":", 1)[-1])
             if step <= 33:
-                return HarnessModelResponse(text="", provider_response_id=f"search-{step}", usage={},
-                    tool_calls=(HarnessToolCall(
+                return HarnessModelResponse.from_parts(text="", provider_response_id=f"search-{step}", usage={},
+                    tool_calls=(ModelToolCall(
                         id=f"search-{step}", name="web_search", arguments={"query": f"docs {step}"}),))
-            return HarnessModelResponse(text="Complete", provider_response_id="answer", usage={})
+            return HarnessModelResponse.from_parts(text="Complete", provider_response_id="answer", usage={})
 
     database = tmp_path / "state.sqlite"
     agent = Agent(workspace_path=tmp_path / "workspace", checkpoint_db=database,

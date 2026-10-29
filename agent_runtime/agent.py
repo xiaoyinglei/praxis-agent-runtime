@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from agent_runtime.approval import MODE_ORDER, ApprovalMode
 from agent_runtime.harness.memory import MemoryConfig
-from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS
+from agent_runtime.harness.protocol import DEFAULT_MAX_STEPS, item_text
 from agent_runtime.knowledge import RAGKnowledgeConfig
 from agent_runtime.models import (
     ModelControlPlane,
@@ -682,7 +682,7 @@ class Agent:
                 raise RuntimeError("turn belongs to a different workspace security domain")
             answer: str | None = None
             if turn.status == "completed":
-                answer = str((await store.run_async(store.read_turn_answer, turn_id)).payload["text"])
+                answer = item_text(await store.run_async(store.read_turn_answer, turn_id))
             pending = await store.run_async(
                 lambda: next(
                     (

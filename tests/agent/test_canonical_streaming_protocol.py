@@ -321,7 +321,7 @@ class _StaticHarnessModel:
         event_sink: ModelEventSink | None = None,
     ) -> HarnessModelResponse:
         del prepared
-        response = HarnessModelResponse(text="canonical answer", provider_response_id="response-v2",
+        response = HarnessModelResponse.from_parts(text="canonical answer", provider_response_id="response-v2",
                                         usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
         if event_sink is not None:
             await emit_response(event_sink, response)

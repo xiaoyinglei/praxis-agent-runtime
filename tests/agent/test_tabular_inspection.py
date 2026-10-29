@@ -184,7 +184,7 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
 
     from agent_runtime import Agent
     from agent_runtime import cli as cli_module
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
     from tests.agent.harness.test_subagent_budget import SmallAnswerModel
 
     class InspectModel(SmallAnswerModel):
@@ -203,18 +203,24 @@ def test_public_entrypoints_preserve_raw_grid_in_model_request(tmp_path, monkeyp
             messages = prepared.dispatch_payload.messages
             results = [m for m in messages if m.role == "tool"]
             if not results:
-                return HarnessModelResponse(text="", provider_response_id="inspect", usage={
+                return HarnessModelResponse.from_parts(text="", provider_response_id="inspect", usage={
                     "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
-                }, tool_calls=(HarnessToolCall(id="inspect-call", name="inspect_data_file",
+                }, tool_calls=(ModelToolCall(id="inspect-call", name="inspect_data_file",
                     arguments={"path": "source.xlsx"}),))
             content = json.loads(results[-1].content)
             self.grid = content["structured_content"]["tables"][0]
             assert self.grid["rows"] == [["Report", ""], ["Unit: USD", ""], ["Item", "Value"], ["A", "7"]]
             assert "headers" not in self.grid
             assert self.grid["row_numbers"] == [1, 2, 3, 4]
-            return HarnessModelResponse(text="Observed raw source cells.", provider_response_id="answer", usage={
-                "input_tokens": 2, "output_tokens": 3, "total_tokens": 5,
-            })
+            return HarnessModelResponse.from_parts(
+                text="Observed raw source cells.",
+                provider_response_id="answer",
+                usage={
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "total_tokens": 5,
+                },
+            )
 
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()

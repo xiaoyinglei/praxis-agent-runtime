@@ -34,7 +34,7 @@ class PlainModel:
         )
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="composed answer",
             provider_response_id="response-composed",
             usage={"input_tokens": 1, "output_tokens": 1},

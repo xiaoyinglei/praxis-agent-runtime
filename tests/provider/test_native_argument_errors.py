@@ -7,7 +7,7 @@ from copy import deepcopy
 
 import pytest
 
-from agent_runtime.core.messages import ModelMessage, snapshot_model_message
+from agent_runtime.core.messages import ModelMessage
 from agent_runtime.modeling.contracts import LLMCallStage, LLMUsage
 from agent_runtime.modeling.openai_wire import parse_openai_response
 from tests.provider.test_llm_gateway import _canonical_request, _gateway
@@ -43,25 +43,23 @@ def test_non_object_or_malformed_native_arguments_have_explicit_error(raw):
     call = native_response(raw).tool_calls[0]
     assert call.argument_error
     assert "JSON" in call.argument_error
-    assert call.input == {"_raw": raw}
+    assert call.arguments == {"_raw": raw}
     for copied in (
         deepcopy(call),
-        snapshot_model_message(
-            ModelMessage(
+        ModelMessage.from_parts(
                 role="assistant",
                 content="",
                 tool_calls=(call,),
-            )
-        ).tool_calls[0],
+            ).tool_calls[0],
     ):
         assert copied.argument_error == call.argument_error
-        assert copied.input == call.input
+        assert copied.arguments == call.arguments
 
 
 def test_large_malformed_arguments_are_not_silently_cut_to_twenty_k():
     raw = '{"file_path":"result.txt","new_string":"' + "x" * 30_000
     call = native_response(raw).tool_calls[0]
-    assert call.input["_raw"] == raw
+    assert call.arguments["_raw"] == raw
     assert "line 1" in call.argument_error
     assert "column" in call.argument_error
 
@@ -69,7 +67,7 @@ def test_large_malformed_arguments_are_not_silently_cut_to_twenty_k():
 def test_valid_raw_named_argument_is_ordinary_business_data():
     call = native_response(json.dumps({"_raw": "business value"})).tool_calls[0]
     assert call.argument_error is None
-    assert call.input == {"_raw": "business value"}
+    assert call.arguments == {"_raw": "business value"}
 
 
 @pytest.mark.anyio
@@ -101,4 +99,4 @@ async def test_streamed_arguments_report_the_same_error_as_nonstreaming():
         stream=True,
     )
     assert result.turn.tool_calls[0].argument_error == native_response(raw).tool_calls[0].argument_error
-    assert result.turn.tool_calls[0].input == {"_raw": raw}
+    assert result.turn.tool_calls[0].arguments == {"_raw": raw}

@@ -13,7 +13,7 @@ from agent_runtime.core.messages import (
     context_event_message,
 )
 from agent_runtime.core.messages import (
-    ToolCall as ModelToolCall,
+    ModelToolCall as ModelToolCall,
 )
 from agent_runtime.core.model_request import (
     ContextBlock,
@@ -332,7 +332,9 @@ def test_tool_result_model_content_is_snapshotted_once_in_the_transcript() -> No
 
 
 def test_skill_activation_appends_a_canonical_event_without_new_revision() -> None:
-    context = _context().append_message(ModelMessage(role="assistant", content="I will load the matching skill."))
+    context = _context().append_message(
+        ModelMessage.from_parts(role="assistant", content="I will load the matching skill.")
+    )
 
     activated = context.append_skill_activation(
         {
@@ -344,7 +346,7 @@ def test_skill_activation_appends_a_canonical_event_without_new_revision() -> No
         }
     )
 
-    assert context.transcript == (ModelMessage(role="assistant", content="I will load the matching skill."),)
+    assert context.transcript == (ModelMessage.from_parts(role="assistant", content="I will load the matching skill."),)
     assert activated.transcript[:-1] == context.transcript
     assert activated.transcript[-1].role == "context"
     event = json.loads(activated.transcript[-1].content)
@@ -356,7 +358,7 @@ def test_skill_activation_appends_a_canonical_event_without_new_revision() -> No
 def test_compaction_closes_the_old_revision_and_creates_a_new_one() -> None:
     context = _context()
     for index in range(3):
-        context = context.append_message(ModelMessage(role="assistant", content=f"turn-{index}"))
+        context = context.append_message(ModelMessage.from_parts(role="assistant", content=f"turn-{index}"))
     old_request = build_model_request(
         request_id="req-before-compact",
         context=context,
@@ -381,7 +383,9 @@ def test_compaction_closes_the_old_revision_and_creates_a_new_one() -> None:
     assert compacted.transcript[-1] == context.transcript[-1]
     assert "context_compaction" in compacted.transcript[0].content
     assert old_request.prompt_revision != new_request.prompt_revision
-    assert context.transcript == tuple(ModelMessage(role="assistant", content=f"turn-{index}") for index in range(3))
+    assert context.transcript == tuple(
+        ModelMessage.from_parts(role="assistant", content=f"turn-{index}") for index in range(3)
+    )
 
 
 def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
@@ -398,10 +402,10 @@ def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
         selected_tools=(_tool("read_file"),),
         settings=_settings(),
         dynamic_tail=(
-            ModelMessage(
+            ModelMessage.from_parts(
                 role="assistant",
                 content="",
-                tool_calls=(ModelToolCall(id="call_1", name="read_file", input=arguments),),
+                tool_calls=(ModelToolCall(id="call_1", name="read_file", arguments=arguments),),
             ),
         ),
     )
@@ -417,7 +421,7 @@ def test_context_and_request_snapshot_caller_owned_mutable_values() -> None:
 def test_direct_stable_context_construction_snapshots_caller_owned_sequences() -> None:
     instructions = ["Stable instruction"]
     blocks = [ContextBlock("workspace", {"paths": ["src"]})]
-    transcript = [ModelMessage(role="assistant", content="Stable turn")]
+    transcript = [ModelMessage.from_parts(role="assistant", content="Stable turn")]
 
     context = StableModelContext(
         instructions=instructions,  # type: ignore[arg-type]
@@ -432,7 +436,7 @@ def test_direct_stable_context_construction_snapshots_caller_owned_sequences() -
 
     assert context.instructions == ("Stable instruction",)
     assert tuple(block.name for block in context.frozen_run_context) == ("workspace",)
-    assert context.transcript == (ModelMessage(role="assistant", content="Stable turn"),)
+    assert context.transcript == (ModelMessage.from_parts(role="assistant", content="Stable turn"),)
 
 
 def test_canonical_message_snapshot_rejects_invalid_role_contracts() -> None:
@@ -440,7 +444,7 @@ def test_canonical_message_snapshot_rejects_invalid_role_contracts() -> None:
         build_stable_context(
             instructions=("Stable instruction",),
             initial_user_task="Inspect the repository.",
-            transcript=(ModelMessage(role="tool", content="result"),),
+            transcript=(ModelMessage(role="tool", body="result"),),
         )
 
     with pytest.raises(ValueError, match="only assistant messages may contain tool calls"):
@@ -448,10 +452,10 @@ def test_canonical_message_snapshot_rejects_invalid_role_contracts() -> None:
             instructions=("Stable instruction",),
             initial_user_task="Inspect the repository.",
             transcript=(
-                ModelMessage(
+                ModelMessage.from_parts(
                     role="user",
                     content="invalid call",
-                    tool_calls=(ModelToolCall(id="call_1", name="read_file", input={}),),
+                    tool_calls=(ModelToolCall(id="call_1", name="read_file", arguments={}),),
                 ),
             ),
         )

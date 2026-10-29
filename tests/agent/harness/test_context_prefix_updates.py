@@ -4,7 +4,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import GatewayHarnessModel, HarnessModelResponse, HarnessToolCall, Session
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelResponse, ModelToolCall, Session
 from agent_runtime.harness.memory import MemoryConfig
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from tests.agent.harness.test_model_adapter import CapturingGateway, _resolved_model
@@ -26,20 +26,20 @@ class Probe(_UpdatePlanThenAnswerModel):
         calls = ()
         first_turn = request.turn_id == self.requests[0].turn_id
         if first_turn and self.mode == "deferred" and request.step == 1:
-            calls = (HarnessToolCall(id="find", name="find_tools", arguments={"query": "read", "limit": 1}),)
+            calls = (ModelToolCall(id="find", name="find_tools", arguments={"query": "read", "limit": 1}),)
         elif (
             first_turn
             and self.mode != "answer"
             and request.step <= (2 if self.mode in {"nested", "nested_changed", "deferred"} else 1)
         ):
             calls = (
-                HarnessToolCall(
+                ModelToolCall(
                     id=f"read-{request.step}",
                     name="read_file",
                     arguments={"path": "pkg/source.txt" if self.mode in {"nested", "nested_changed"} else "source.txt"},
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="" if calls else "answer", provider_response_id=None, usage={}, tool_calls=calls
         )
 
@@ -141,13 +141,13 @@ async def test_memory_revocation_starts_a_new_context_window_and_survives_reopen
         async def dispatch(self, prepared, **kwargs):
             request = self.requests[-1]
             if request.turn_id == self.requests[0].turn_id and request.step == 1:
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="",
                     provider_response_id=None,
                     usage={},
-                    tool_calls=(HarnessToolCall(id="memory-read", name="read_memory", arguments={"key": "secret"}),),
+                    tool_calls=(ModelToolCall(id="memory-read", name="read_memory", arguments={"key": "secret"}),),
                 )
-            return HarnessModelResponse(text="answer", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="answer", provider_response_id=None, usage={})
 
     model = MemoryReader("memory")
     enabled = MemoryConfig(use_memories=True, generate_memories=False)
@@ -244,7 +244,7 @@ async def test_context_updates_survive_saved_request_replay_and_compaction(tmp_p
 
 @pytest.mark.anyio
 async def test_legacy_turn_keeps_its_context_layout(tmp_path):
-    from agent_runtime.harness import HarnessMessage
+    from agent_runtime.harness import ModelMessage
 
     (tmp_path / "AGENTS.md").write_text("legacy rule")
     model = Probe("answer")
@@ -264,7 +264,7 @@ async def test_legacy_turn_keeps_its_context_layout(tmp_path):
             if key != "context_updates"
         }
         legacy = replace(turn, binding_manifest={**turn.binding_manifest, "execution_context_policy": policy})
-        step = executor.capture_step_context(legacy, step=2, messages=(HarnessMessage(role="user", content="task"),))
+        step = executor.capture_step_context(legacy, step=2, messages=(ModelMessage(role="user", body="task"),))
         assert step.messages[0].content.startswith("Cross-chat memory (")
         assert json.loads(step.messages[0].content.split("\n", 1)[1])["version"] == 0
         assert step.messages[1].content.startswith("Project instructions (")

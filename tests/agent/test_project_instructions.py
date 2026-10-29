@@ -78,7 +78,7 @@ async def test_public_agent_freezes_rules_each_turn_and_reinjects_context(tmp_pa
 
         async def dispatch(self, prepared, *, event_sink=None):
             (tmp_path / "AGENTS.md").write_text("RULE_V2")
-            return HarnessModelResponse(text="answer", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="answer", provider_response_id=None, usage={})
 
     model = Model()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "db", enable_workspace_mcp=False)
@@ -102,7 +102,7 @@ async def test_public_agent_freezes_rules_each_turn_and_reinjects_context(tmp_pa
 @pytest.mark.anyio
 async def test_scoped_rules_are_seen_before_action_and_survive_reopen(tmp_path):
     from agent_runtime import Agent
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
     nested = tmp_path / "pkg"
@@ -121,10 +121,10 @@ async def test_scoped_rules_are_seen_before_action_and_survive_reopen(tmp_path):
         async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step <= 2:
-                return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                    HarnessToolCall(id=f"read-{step}", name="read_file", arguments={"path": "pkg/module.py"}),
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                    ModelToolCall(id=f"read-{step}", name="read_file", arguments={"path": "pkg/module.py"}),
                 ))
-            return HarnessModelResponse(text="read", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="read", provider_response_id=None, usage={})
 
     model = Model()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "db", enable_workspace_mcp=False)
@@ -149,7 +149,7 @@ async def test_scoped_rules_are_seen_before_action_and_survive_reopen(tmp_path):
 @pytest.mark.anyio
 async def test_paging_cannot_hide_the_same_missing_resource(tmp_path):
     from agent_runtime import Agent
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
     class Model(_UpdatePlanThenAnswerModel):
@@ -158,8 +158,8 @@ async def test_paging_cannot_hide_the_same_missing_resource(tmp_path):
 
         async def dispatch(self, prepared, *, event_sink=None):
             self.count += 1
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                HarnessToolCall(id=f"read-{self.count}", name="read_file",
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                ModelToolCall(id=f"read-{self.count}", name="read_file",
                                 arguments={"path": "missing.py", "max_lines": self.count}),
             ))
 
@@ -175,7 +175,7 @@ async def test_paging_cannot_hide_the_same_missing_resource(tmp_path):
 @pytest.mark.parametrize("repair", [False, True])
 async def test_missing_resource_recovery_and_different_resources(tmp_path, repair):
     from agent_runtime import Agent
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
     class Model(_UpdatePlanThenAnswerModel):
@@ -193,10 +193,10 @@ async def test_missing_resource_recovery_and_different_resources(tmp_path, repai
                 # External recovery is observable through the next successful read.
                 (tmp_path / "missing.py").write_text("restored")
             if self.count == 5:
-                return HarnessModelResponse(text="finished", provider_response_id=None, usage={})
+                return HarnessModelResponse.from_parts(text="finished", provider_response_id=None, usage={})
             path = "missing.py" if repair else f"missing-{self.count}.py"
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                HarnessToolCall(id=f"read-{self.count}", name="read_file",
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                ModelToolCall(id=f"read-{self.count}", name="read_file",
                                 arguments={"path": path, "max_lines": self.count}),
             ))
 
@@ -215,7 +215,7 @@ async def test_missing_resource_recovery_and_different_resources(tmp_path, repai
 @pytest.mark.anyio
 async def test_parallel_discovery_respects_combined_byte_limit(tmp_path):
     from agent_runtime import Agent
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
     for name in ("a", "b"):
@@ -226,11 +226,11 @@ async def test_parallel_discovery_respects_combined_byte_limit(tmp_path):
     class Model(_UpdatePlanThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink=None):
             if prepared.request_ref["step"] == 1:
-                return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=tuple(
-                    HarnessToolCall(id=f"read-{name}", name="read_file", arguments={"path": f"{name}/file"})
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=tuple(
+                    ModelToolCall(id=f"read-{name}", name="read_file", arguments={"path": f"{name}/file"})
                     for name in ("a", "b")
                 ))
-            return HarnessModelResponse(text="blocked", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="blocked", provider_response_id=None, usage={})
 
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "db", enable_workspace_mcp=False)
     agent._model_factory = Model
@@ -259,7 +259,7 @@ async def test_tool_output_cannot_inject_runtime_instruction_snapshot(tmp_path):
 @pytest.mark.anyio
 async def test_direct_write_waits_for_scoped_rules(tmp_path):
     from agent_runtime import Agent
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
 
     (tmp_path / "pkg").mkdir()
@@ -273,12 +273,12 @@ async def test_direct_write_waits_for_scoped_rules(tmp_path):
             if step == 2:
                 assert target.read_text() == "value = 1"
             if step <= 2:
-                return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                    HarnessToolCall(id=f"patch-{step}", name="apply_patch", arguments={
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                    ModelToolCall(id=f"patch-{step}", name="apply_patch", arguments={
                         "file_path": "pkg/module.py", "old_string": "value = 1", "new_string": "value = 2",
                     }),
                 ))
-            return HarnessModelResponse(text="changed", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="changed", provider_response_id=None, usage={})
 
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "db", enable_workspace_mcp=False)
     agent._model_factory = Model

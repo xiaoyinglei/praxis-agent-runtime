@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
 from agent_runtime.core.llm_registry import ResolvedModel
-from agent_runtime.harness import GatewayHarnessModel, HarnessModelResponse, HarnessToolCall, RolloutContextManager
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelResponse, ModelToolCall, RolloutContextManager
 from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.openai_wire import serialize_openai_request
@@ -19,13 +19,13 @@ from tests.agent.harness.test_tool_orchestrator import ToolThenAnswerModel
 class PublicBatchModel(ToolThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         if not any(m.role == "tool" for m in self.requests[-1].messages):
-            return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=(
-                HarnessToolCall(id="invalid", name="read_file", arguments={}),
-                HarnessToolCall(id="missing", name="read_file", arguments={"path": "absent.txt"}),
-                HarnessToolCall(id="first", name="read_file", arguments={"path": "first.txt"}),
-                HarnessToolCall(id="second", name="read_file", arguments={"path": "second.txt"}),
+            return HarnessModelResponse.from_parts(text="", provider_response_id="batch", usage={}, tool_calls=(
+                ModelToolCall(id="invalid", name="read_file", arguments={}),
+                ModelToolCall(id="missing", name="read_file", arguments={"path": "absent.txt"}),
+                ModelToolCall(id="first", name="read_file", arguments={"path": "first.txt"}),
+                ModelToolCall(id="second", name="read_file", arguments={"path": "second.txt"}),
             ))
-        return HarnessModelResponse(text="Two files inspected; invalid and absent inputs reported.",
+        return HarnessModelResponse.from_parts(text="Two files inspected; invalid and absent inputs reported.",
                                     provider_response_id="done", usage={})
 
 

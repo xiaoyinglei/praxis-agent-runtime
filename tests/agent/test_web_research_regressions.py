@@ -6,6 +6,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall as _CanonicalCall
+from agent_runtime.harness.protocol import HarnessModelResponse as _CanonicalResponse
+from agent_runtime.harness.protocol import model_response_payload as _response_payload
 from agent_runtime.tools.web_content import extract_content
 from tests.agent.test_web_tools import web_tools
 
@@ -111,10 +114,28 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
         if extraction_error:
             from tests.agent.harness.test_tool_result_elision import exchange
             exchange(store, turn.turn_id, 'prior', 'Prior inspection. ' * 3000)
-        seed(store, turn_id=turn.turn_id, kind='model_response', payload={
-            'text': '', 'tool_calls': [{'id': item.payload['tool_call_id'], 'name': 'web_fetch',
-                                     'arguments': {'url': 'https://example.com/doc'}}],
-        })
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="model_response",
+            payload=_response_payload(
+                _CanonicalResponse.from_parts(
+                    text="",
+                    tool_calls=tuple(
+                        _CanonicalCall(
+                            id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                        )
+                        for c in [
+                            {
+                                "id": item.payload["tool_call_id"],
+                                "name": "web_fetch",
+                                "arguments": {"url": "https://example.com/doc"},
+                            }
+                        ]
+                    ),
+                )
+            ),
+        )
         seed(store, turn_id=turn.turn_id, kind='tool_result', payload=dict(item.payload))
         manager = RolloutContextManager(store, max_total_bytes=8000 if extraction_error else 5000)
         if extraction_error:
@@ -131,14 +152,14 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
         if extraction_error:
             visible = str(messages)
             assert expected['source_id'] in visible and expected['error_message'] in visible
-            contexts = [json.loads(m['content'].removeprefix('Context compaction:\n'))
+            contexts = [json.loads(m['body'].removeprefix('Context compaction:\n'))
                         for m in messages if m['role'] == 'context']
             data = next(ref for context in contexts for ref in context.get('artifact_refs', [])
                         if ref.get('source_id') == expected['source_id'])
             assert data['item_id'].startswith('item_')
         else:
             message = next(m for m in messages if m['role'] == 'tool')
-            data = json.loads(message['content'])['structured_content']
+            data = json.loads(message['body'])['structured_content']
         for key in ['source_id', 'url', 'source_truncated', 'content_hash']:
             assert data[key] == expected[key]
         if extraction_error:
@@ -151,7 +172,7 @@ async def test_web_cursor_survives_real_product_output_and_admission(tmp_path, m
             assert data['next_line'] == expected['next_line']
             assert data['visible_end_line'] < expected['next_line']
         if not extraction_error:
-            assert 'item_' in message['content']
+            assert 'item_' in message['body']
         assert data['source_id'].startswith('artifact_')
         assert item.payload == store.read_item(item.item_id).payload
         if extraction_error:

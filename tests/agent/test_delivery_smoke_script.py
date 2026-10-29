@@ -84,11 +84,11 @@ def test_demo_trace_rejects_absolute_paths() -> None:
 async def test_delivery_smoke_explicit_acceptance_rejects_missing_or_unexecuted_checks(scenario):
     module = _load_smoke_module()
     case = module.build_cases()[2]
-    read = module.HarnessToolCall(id='read', name='read_file', arguments={'path': 'pricing.py'})
-    verify = module.HarnessToolCall(id='verify', name='run_command', arguments={'command': module.CHECKOUT_COMMAND})
-    patch = module.HarnessToolCall(id='patch', name='apply_patch', arguments={
+    read = module.ModelToolCall(id='read', name='read_file', arguments={'path': 'pricing.py'})
+    verify = module.ModelToolCall(id='verify', name='run_command', arguments={'command': module.CHECKOUT_COMMAND})
+    patch = module.ModelToolCall(id='patch', name='apply_patch', arguments={
         'file_path': 'pricing.py', 'old_string': module.CHECKOUT_BEFORE, 'new_string': module.CHECKOUT_AFTER})
-    unexecuted = module.HarnessToolCall(id='unchecked', name='execute_python', arguments={
+    unexecuted = module.ModelToolCall(id='unchecked', name='execute_python', arguments={
         'code': 'def never_called():\n    assert False\nprint("no check ran")'})
     calls = {'no_change': (read,), 'verify_before_change': (verify, patch),
              'unreached_assertion': (patch, unexecuted)}[scenario]

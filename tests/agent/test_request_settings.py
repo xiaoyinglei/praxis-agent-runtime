@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from agent_runtime.core.generation_settings import ModelRequestPreferences, ReasoningCapabilities
-from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
 from agent_runtime.model_definition import RequestDefaultsDefinition
 from agent_runtime.modeling.contracts import LLMCallStage
 from agent_runtime.modeling.gateway import LLMGateway
@@ -76,7 +76,7 @@ def test_adapter_freezes_effort_and_requested_effective_output_diagnostics():
     request = HarnessModelRequest(
         thread_id="thread",
         turn_id="turn",
-        messages=(HarnessMessage(role="user", content="Work"),),
+        messages=(ModelMessage(role="user", body="Work"),),
         binding_manifest={
             "request_settings": {
                 "revision": 2,
@@ -291,7 +291,7 @@ def test_settings_precedence_and_thinking_off_are_independent_from_output(effort
     request = HarnessModelRequest(
         thread_id="t",
         turn_id="u",
-        messages=(HarnessMessage(role="user", content="Work"),),
+        messages=(ModelMessage(role="user", body="Work"),),
         binding_manifest={
             "request_settings": {"preferences": {"reasoning_effort": effort, "max_output_tokens": requested}}
         },

@@ -21,8 +21,8 @@ from agent_runtime.harness import (
     ContextCompactionRequiredError,
     ControlPlaneHarnessModel,
     GatewayHarnessModel,
-    HarnessMessage,
     HarnessModelRequest,
+    ModelMessage,
     RolloutContextManager,
     RuntimeState,
     Session,
@@ -83,7 +83,7 @@ class CapturingGateway:
         request = kwargs["request"]
         self.requests.append(request)
         self.stages.append(kwargs["stage"])  # type: ignore[arg-type]
-        return AgentModelResponse(
+        return AgentModelResponse.from_turn(
             turn=ToolUseResult(
                 text="real gateway answer",
                 stop_reason=StopReason.END_TURN,
@@ -124,12 +124,7 @@ async def _stream_gateway_fragments(kwargs, fragments):
     )
     await emit(ModelResponseCompleted(usage=usage.model_dump(mode="json"), stop_reason="stop"))
     return AgentModelResponse(
-        turn=ToolUseResult(
-            text="real gateway answer",
-            reasoning_content="".join(output.content for output in state.outputs if output.kind == "reasoning") or None,
-            stop_reason=StopReason.END_TURN,
-            raw_stop_reason="stop",
-        ),
+        stop_reason=StopReason.END_TURN, raw_stop_reason="stop",
         usage=usage,
         outputs=state.outputs,
         provider_wire_hash=serialize_openai_request(request).provider_wire_hash,
@@ -204,7 +199,7 @@ class MaxTokensGateway(CapturingGateway):
         request = kwargs["request"]
         self.requests.append(request)
         self.stages.append(kwargs["stage"])  # type: ignore[arg-type]
-        return AgentModelResponse(
+        return AgentModelResponse.from_turn(
             turn=ToolUseResult(
                 text="partial answer",
                 stop_reason=StopReason.MAX_TOKENS,
@@ -356,9 +351,9 @@ def test_model_settings_preserve_unknown_model_output_limit() -> None:
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(
-                HarnessMessage(
+                ModelMessage(
                     role="user",
-                    content="hello",
+                    body="hello",
                 ),
             ),
             binding_manifest={
@@ -387,7 +382,7 @@ def test_gateway_adapter_prepares_canonical_wire_before_provider_io() -> None:
     request = HarnessModelRequest(
         thread_id="thread-1",
         turn_id="turn-1",
-        messages=(HarnessMessage(role="user", content="hello"),),
+        messages=(ModelMessage(role="user", body="hello"),),
         binding_manifest={"model_id": "test-model"},
     )
 
@@ -427,7 +422,7 @@ def test_gateway_adapter_returns_known_incomplete_response_on_max_tokens() -> No
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="hello"),),
+            messages=(ModelMessage(role="user", body="hello"),),
             binding_manifest={"model_id": "test-model"},
         )
     )
@@ -651,7 +646,7 @@ async def test_nonstreaming_provider_emits_one_full_delta_without_slicing() -> N
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="answer once"),),
+            messages=(ModelMessage(role="user", body="answer once"),),
             binding_manifest={"model_id": "test-model"},
         )
     )
@@ -683,15 +678,15 @@ def test_gateway_adapter_requests_durable_compaction_before_provider_dispatch() 
         instructions=("Answer the user directly.",),
     )
     messages = (
-        HarnessMessage(role="user", content="fix the package"),
+        ModelMessage(role="user", body="fix the package"),
         *tuple(
-            HarnessMessage(
+            ModelMessage(
                 role="assistant",
-                content=f"exploration-{index}:" + ("x" * 3_000),
+                body=f"exploration-{index}:" + ("x" * 3_000),
             )
             for index in range(8)
         ),
-        HarnessMessage(role="assistant", content="latest finding must survive"),
+        ModelMessage(role="assistant", body="latest finding must survive"),
     )
 
     with pytest.raises(ContextCompactionRequiredError) as raised:
@@ -722,7 +717,7 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="stable initial task"),),
+            messages=(ModelMessage(role="user", body="stable initial task"),),
             binding_manifest={"model_id": "test-model"},
         )
     )
@@ -732,8 +727,8 @@ def test_unchanged_stable_prefix_keeps_identical_provider_wire_bytes() -> None:
             thread_id="thread-1",
             turn_id="turn-1",
             messages=(
-                HarnessMessage(role="user", content="stable initial task"),
-                HarnessMessage(role="assistant", content="dynamic transcript tail"),
+                ModelMessage(role="user", body="stable initial task"),
+                ModelMessage(role="assistant", body="dynamic transcript tail"),
             ),
             binding_manifest={"model_id": "test-model"},
         )
@@ -781,7 +776,7 @@ def test_gateway_adapter_uses_durable_reservation_not_ambient_legacy_ledger() ->
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="hello"),),
+            messages=(ModelMessage(role="user", body="hello"),),
             binding_manifest={"model_id": "test-model"},
             model_token_budget_remaining=10,
         )
@@ -980,7 +975,7 @@ def test_control_plane_adapter_dispatches_the_turns_frozen_model_binding() -> No
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="hello"),),
+            messages=(ModelMessage(role="user", body="hello"),),
             binding_manifest=frozen,
         )
     )
@@ -1079,7 +1074,7 @@ def test_removed_frozen_model_id_resumes_from_trusted_archive(
         HarnessModelRequest(
             thread_id="thread-1",
             turn_id="turn-1",
-            messages=(HarnessMessage(role="user", content="resume"),),
+            messages=(ModelMessage(role="user", body="resume"),),
             binding_manifest=binding,
         )
     )
@@ -1184,7 +1179,7 @@ def test_coding_instructions_include_real_workspace_in_provider_request(tmp_path
     model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
                                 instructions=coding_instructions(tmp_path))
     prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
-                             messages=(HarnessMessage(role="user", content="Explain MoE with Python"),),
+                             messages=(ModelMessage(role="user", body="Explain MoE with Python"),),
                              binding_manifest={"model_id": "test-model"}))
     wire = serialize_openai_request(prepared.dispatch_payload.request)
     text = str(wire)
@@ -1199,7 +1194,7 @@ def test_runtime_clock_is_visible_and_stable_when_repreparing_saved_request():
     model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
                                 instructions=("Answer directly.",))
     request = HarnessModelRequest(thread_id="thread", turn_id="turn",
-                                  messages=(HarnessMessage(role="user", content="Explain yesterday's results."),),
+                                  messages=(ModelMessage(role="user", body="Explain yesterday's results."),),
                                   binding_manifest={"model_id": "test-model", "runtime_clock": clock})
     first = model.prepare(request)
     repeated = model.prepare(request)
@@ -1213,6 +1208,6 @@ def test_legacy_request_does_not_acquire_a_new_clock_when_reprepared():
     model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
                                 instructions=("Answer directly.",))
     prepared = model.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn",
-                             messages=(HarnessMessage(role="user", content="hello"),),
+                             messages=(ModelMessage(role="user", body="hello"),),
                              binding_manifest={"model_id": "test-model"}))
     assert "Current runtime clock facts:" not in str(serialize_openai_request(prepared.dispatch_payload.request))

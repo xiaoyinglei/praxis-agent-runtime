@@ -12,7 +12,9 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.budget import ResourceUsage
+from agent_runtime.core.messages import ModelToolCall as _ModelToolCall
 from agent_runtime.harness import RuntimeState, Session
+from agent_runtime.harness.protocol import HarnessModelResponse
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 
 
@@ -39,7 +41,7 @@ async def test_killed_worker_reopens_immediately_and_applies_followup(tmp_path, 
 import asyncio, sys
 from dataclasses import replace
 from pathlib import Path
-from agent_runtime.harness import Session
+from agent_runtime.harness import HarnessModelResponse, Session
 from agent_runtime.harness import ContextCompactionRequiredError
 from tests.agent.harness.test_process_reopen import ReopenModel
 class Waiting(ReopenModel):
@@ -52,7 +54,8 @@ class Waiting(ReopenModel):
         return super().prepare(request)
     async def dispatch(self, prepared, *, event_sink=None):
         if not self.armed:
-            return replace(await super().dispatch(prepared, event_sink=event_sink), text="previous answer " * 1000)
+            return replace(await super().dispatch(prepared, event_sink=event_sink),
+                           outputs=HarnessModelResponse.from_parts(text="previous answer " * 1000).outputs)
         print("DISPATCHED", flush=True)
         await asyncio.Event().wait()
 async def main():
@@ -174,9 +177,22 @@ async def test_committed_but_unstarted_tool_group_is_closed_without_execution(tm
             tool_hash="t", wire_hash="w",
             request_ref={"input_revision": 1, "request_id": "old-response", "purpose": "agent_step"})
         attempt = session.store.dispatch_model_attempt(operation.operation_id, worker_id="dead")
-        session.store.complete_model_attempt(operation_id=operation.operation_id, attempt_id=attempt.attempt_id,
-            generation=attempt.generation, text="planned tool", provider_response_id="old", usage={},
-            tool_calls=({"id": "never-started", "name": "run_command", "arguments": {"command": "must not run"}},))
+        session.store.complete_model_attempt(
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(
+                text="planned tool",
+                provider_response_id="old",
+                usage={},
+                tool_calls=tuple(
+                    _ModelToolCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in ({"id": "never-started", "name": "run_command", "arguments": {"command": "must not run"}},)
+                ),
+            ),
+        )
         result = await session.submit("change direction")
         assert result.status == "done"
         assert session.store.read_turn(old.turn_id).status == "cancelled"

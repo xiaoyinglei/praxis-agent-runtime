@@ -5,7 +5,7 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from agent_runtime.harness.protocol import ModelContextOverflowError
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_compaction_consistency import long_history
@@ -49,19 +49,20 @@ def test_required_summary_failure_keeps_its_own_cause(tmp_path, failure):
                     request_ref={"input_revision": 1, "purpose": "context_summary", "request_id": f"old-{index}"},
                 )
                 attempt = store.dispatch_model_attempt(op.operation_id, worker_id="test", lease_seconds=60)
-                store.complete_model_attempt(operation_id=op.operation_id, attempt_id=attempt.attempt_id,
-                                             generation=attempt.generation, text="checkpoint", usage={},
-                                             provider_response_id=None)
+                store.complete_model_attempt(operation_id=op.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(text="checkpoint", usage={}, provider_response_id=None))
         else:
             async def dispatch(prepared, **kwargs):
                 assert prepared.request_ref["purpose"] == "context_summary"
                 if failure == "provider_overflow":
                     raise ModelContextOverflowError("Summary input rejected by provider")
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="partial" if failure == "output_limit" else "", provider_response_id=None, usage={},
                     status="incomplete" if failure == "output_limit" else "completed",
                     incomplete_reason="max_output_tokens" if failure == "output_limit" else None,
-                    tool_calls=((HarnessToolCall(id="invalid-tool", name="read_file", arguments={}),)
+                    tool_calls=((ModelToolCall(id="invalid-tool", name="read_file", arguments={}),)
                                 if failure == "invalid" else ()),
                 )
             runner._model.dispatch = dispatch

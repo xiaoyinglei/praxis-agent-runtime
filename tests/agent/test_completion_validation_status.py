@@ -19,7 +19,7 @@ async def test_false_research_answer_ends_without_becoming_validated(tmp_path, m
     class FalseAnswer(PublicHarnessModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             from agent_runtime.harness import HarnessModelResponse
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="The moon is made of cheese.",
                 provider_response_id="false-answer",
                 usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},

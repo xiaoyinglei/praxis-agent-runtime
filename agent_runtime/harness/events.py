@@ -8,6 +8,10 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
+from agent_runtime.core.messages import model_tool_call_payload
+from agent_runtime.harness.protocol import (
+    restore_model_response,
+)
 from agent_runtime.harness.records import RolloutRecord
 from agent_runtime.harness.state import RuntimeState
 from agent_runtime.modeling.contracts import context_capacity_policy
@@ -606,15 +610,16 @@ class RolloutEventReader:
         if kind == "model_output":
             data = _public_output_data(record)
         elif item_kind is TurnItemKind.AGENT_MESSAGE:
+            response = restore_model_response(payload)
             data = {
-                "content": payload.get("text", payload.get("content", "")),
-                "tool_calls": payload.get("tool_calls", ()),
+                "content": response.text,
+                "tool_calls": tuple(model_tool_call_payload(call) for call in response.tool_calls),
             }
-            if payload.get("response_status") == "incomplete":
+            if response.status == "incomplete":
                 status = ItemStatus.FAILED
-                error = f"Incomplete model response: {payload.get('incomplete_reason')}"
+                error = f"Incomplete model response: {response.incomplete_reason}"
                 data["response_status"] = "incomplete"
-                data["incomplete_reason"] = payload.get("incomplete_reason")
+                data["incomplete_reason"] = response.incomplete_reason
         elif kind == "plan_state" and item_kind is TurnItemKind.PLAN:
             plan = payload.get("plan", {})
             if not isinstance(plan, Mapping):
@@ -658,24 +663,6 @@ class RolloutEventReader:
         payload = record.payload
         if record.turn_id is None:
             return
-        if record.record_type in {"model_operation_prepared", "model_retry_prepared"}:
-            attempt_id = payload.get("attempt_id")
-            if not isinstance(attempt_id, str):
-                return
-            persisted = payload.get("public_item_ids")
-            if persisted is None and record.payload_schema_version == 1:
-                return
-            if not isinstance(persisted, Mapping):
-                raise RuntimeError("persisted public Item ID mapping is missing")
-            for persisted_channel in ("agent_message", "reasoning", "plan"):
-                cls._require_public_item_id(
-                    persisted.get(persisted_channel),
-                    derive_model_public_item_id(
-                        turn_id=record.turn_id,
-                        model_attempt_id=attempt_id,
-                        channel=persisted_channel,
-                    ),
-                )
         attempt_id = payload.get("attempt_id")
         channel = payload.get("channel")
         output_id = payload.get("output_id")

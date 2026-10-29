@@ -10,7 +10,7 @@ import yaml
 
 from agent_runtime.core import llm_registry
 from agent_runtime.core.llm_registry import ModelRegistry
-from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
 from agent_runtime.modeling.contracts import LLMCallStage
 from scripts.sync_model_catalog import rendered_configs
 
@@ -82,7 +82,7 @@ def test_registered_model_uses_its_own_capacity_and_wire_settings(model_id, monk
     )
     prepared = model.prepare(HarnessModelRequest(
         thread_id="t", turn_id="u", binding_manifest={},
-        messages=(HarnessMessage(role="user", content="Return the result."),),
+        messages=(ModelMessage(role="user", body="Return the result."),),
     ))
     projection = prepared.request_ref["context_projection"]
     assert projection["model_context_tokens"] == definition.context_window_tokens

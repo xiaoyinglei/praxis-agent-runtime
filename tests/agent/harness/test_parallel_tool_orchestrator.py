@@ -280,7 +280,7 @@ async def test_batch_reads_remain_available_for_all_completion_policies(tmp_path
 @pytest.mark.anyio
 @pytest.mark.parametrize("approval", [False, True])
 async def test_actual_turn_batch_overlap_and_approval_resumes_every_sibling(tmp_path: Path, approval):
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, Session
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, Session
     from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel
 
     started = []
@@ -302,12 +302,12 @@ async def test_actual_turn_batch_overlap_and_approval_resumes_every_sibling(tmp_
     class Model(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink: object = None):
             if len(self.requests) == 1:
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="",
                     provider_response_id="batch",
                     usage={},
                     tool_calls=tuple(
-                        HarnessToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
+                        ModelToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
                     ),
                 )
             assert sorted(started) == ["0", "1", "2"]

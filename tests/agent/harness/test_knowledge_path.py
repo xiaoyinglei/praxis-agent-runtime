@@ -11,7 +11,7 @@ from agent_runtime.harness import (
     CompletionProposal,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     Session,
 )
@@ -45,19 +45,19 @@ class KnowledgeModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="knowledge-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="knowledge-call-1",
                         name="search_knowledge",
                         arguments={"query": "What is the retained fact?", "top_k": 3},
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="The retained fact is grounded.",
             provider_response_id="knowledge-answer",
             usage={"input_tokens": 8, "output_tokens": 4},
@@ -85,12 +85,12 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="find-tools-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="find-tools-1",
                         name="find_tools",
                         arguments={"query": "search knowledge documents", "limit": 1},
@@ -107,7 +107,7 @@ class DiscoveringKnowledgeModel(KnowledgeModel):
                     request_ref={**prepared.request_ref, "request_id": "turn:step:1"},
                 )
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="The retained fact is grounded.",
             provider_response_id="knowledge-answer",
             usage={"input_tokens": 8, "output_tokens": 4},
@@ -206,7 +206,7 @@ async def test_tool_grounding_flags_do_not_judge_the_final_answer(
             response = await super().dispatch(prepared, event_sink=event_sink)
             if response.tool_calls:
                 return response
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="The retained fact is false.", provider_response_id="contradiction",
                 usage={"input_tokens": 8, "output_tokens": 4},
             )

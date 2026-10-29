@@ -8,18 +8,17 @@ from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from typing import Any
 
+from agent_runtime.core.messages import model_message_payload
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextCompactionCandidate,
     ContextSourceChangedError,
-    HarnessMessage,
-    HarnessToolCall,
-    harness_message_payload,
+    ModelMessage,
+    restore_model_response,
 )
 from agent_runtime.harness.records import ItemSnapshot
 from agent_runtime.harness.state import RuntimeState
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, context_capacity_policy
-from agent_runtime.modeling.events import output_from_payload
 
 
 class RolloutContextManager:
@@ -78,7 +77,7 @@ class RolloutContextManager:
             context_version=context_version,
         )
 
-    def build(self, turn_id: str) -> tuple[HarnessMessage, ...]:
+    def build(self, turn_id: str) -> tuple[ModelMessage, ...]:
         return self._validate_budget(
             tuple(message for _, message in self._projected_messages(turn_id)), turn_id=turn_id
         )
@@ -89,13 +88,13 @@ class RolloutContextManager:
                      if item.kind == "plan_state" and item.status == "completed"), None)
 
     def _validate_budget(
-        self, projected: tuple[HarnessMessage, ...], *, turn_id: str | None = None
-    ) -> tuple[HarnessMessage, ...]:
+        self, projected: tuple[ModelMessage, ...], *, turn_id: str | None = None
+    ) -> tuple[ModelMessage, ...]:
         limits = self.limits(turn_id)
-        messages: list[HarnessMessage] = []
+        messages: list[ModelMessage] = []
         total_bytes = 0
 
-        def append(message: HarnessMessage) -> None:
+        def append(message: ModelMessage) -> None:
             nonlocal total_bytes
             item_bytes = _message_size_bytes(message)
             if item_bytes > limits["max_item_bytes"]:
@@ -297,7 +296,7 @@ class RolloutContextManager:
             if summary_override is not None
             else _json(
                 [
-                    {"item_id": item_id, **harness_message_payload(message)}
+                    {"item_id": item_id, **model_message_payload(message)}
                     for item_id, message in projected[:cut]
                     if item_id not in protected or message.role == "context"
                 ]
@@ -336,7 +335,7 @@ class RolloutContextManager:
         if self._store.context_source_revision(turn_id) != revision:
             raise ContextSourceChangedError("Context source changed during compaction planning.")
         return ContextCompactionCandidate(
-            turn_id, revision, _json(payload), _json([harness_message_payload(m) for m in result])
+            turn_id, revision, _json(payload), _json([model_message_payload(m) for m in result])
         )
 
     def semantic_retained_tail(self, turn_id: str) -> int:
@@ -393,8 +392,8 @@ class RolloutContextManager:
         # The projection includes prior committed summaries. Replaying their raw
         # covered items AND compaction payloads recursively duplicates history.
         # Originals remain in the archive for targeted recall.
-        sources = [
-            {"history_index": history_positions[item_id], **harness_message_payload(message)}
+        sources: list[dict[str, Any]] = [
+            {"history_index": history_positions[item_id], **model_message_payload(message)}
             for item_id, message in self._projected_messages(turn_id)
             if item_id in covered and (item_id not in protected or message.role != "user")
         ]
@@ -416,7 +415,7 @@ class RolloutContextManager:
             sources = []
             if semantic is not None:
                 sources.append({"history_index": history_positions[semantic.item_id],
-                                **harness_message_payload(_compaction_message(semantic.payload))})
+                                **model_message_payload(_compaction_message(semantic.payload))})
             answer_item_ids = self._accepted_answer_ids(items)
             for item in items:
                 if (
@@ -430,13 +429,13 @@ class RolloutContextManager:
                 for entry in (*_request_context_messages(item), *((message,) if message is not None else ())):
                     if item.item_id not in protected or entry.role != "user":
                         sources.append(
-                            {"history_index": history_positions[item.item_id], **harness_message_payload(entry)}
+                            {"history_index": history_positions[item.item_id], **model_message_payload(entry)}
                         )
         sources.extend(
             {
                 "history_index": history_positions[item.item_id],
                 "role": "context",
-                "content": _json({"runtime_verification": {
+                "body": _json({"runtime_verification": {
                     key: item.payload[key] for key in ("verification_kind", "verified_resources", "verifier")
                     if key in item.payload
                 }}),
@@ -537,7 +536,7 @@ class RolloutContextManager:
                 continue
             overrides[item_id] = content
             result = tuple(
-                replace(m, content=overrides[source_id]) if source_id in overrides else m for source_id, m in projected
+                replace(m, body=overrides[source_id]) if source_id in overrides else m for source_id, m in projected
             )
             try:
                 self._validate_budget(result, turn_id=turn_id)
@@ -569,7 +568,7 @@ class RolloutContextManager:
                 "tool_result_overrides": dict(overrides),
             }
             yield ContextCompactionCandidate(
-                turn_id, revision, _json(payload), _json([harness_message_payload(m) for m in result])
+                turn_id, revision, _json(payload), _json([model_message_payload(m) for m in result])
             )
 
     def commit_compaction(self, candidate: ContextCompactionCandidate) -> ItemSnapshot:
@@ -589,7 +588,7 @@ class RolloutContextManager:
             capacity_diagnostics=payload.get("capacity_diagnostics"),
         )
 
-    def _projected_messages(self, turn_id: str) -> tuple[tuple[str, HarnessMessage], ...]:
+    def _projected_messages(self, turn_id: str) -> tuple[tuple[str, ModelMessage], ...]:
         return self._project_items(self._store.list_context_items(turn_id))
 
     def _accepted_answer_ids(self, items: tuple[ItemSnapshot, ...]) -> frozenset[str]:
@@ -599,7 +598,7 @@ class RolloutContextManager:
             if self._store.read_turn(turn_id).status == "completed"
         )
 
-    def _project_items(self, items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, HarnessMessage], ...]:
+    def _project_items(self, items: tuple[ItemSnapshot, ...]) -> tuple[tuple[str, ModelMessage], ...]:
         return _project_items(items, answer_item_ids=self._accepted_answer_ids(items))
 
 
@@ -619,7 +618,7 @@ def _unique_json(values: list[Any]) -> list[Any]:
 
 def _project_items(
     items: tuple[ItemSnapshot, ...], *, answer_item_ids: frozenset[str] = frozenset(),
-) -> tuple[tuple[str, HarnessMessage], ...]:
+) -> tuple[tuple[str, ModelMessage], ...]:
     replacements, suppressed = _compaction_projection(items, answer_item_ids=answer_item_ids)
     reconciled = {
         (item.turn_id, result.get("tool_call_id"))
@@ -644,7 +643,7 @@ def _project_items(
         if item.item_id not in suppressed and item.kind == "model_request" and item.producer == "runtime":
             input_update = item.payload.get("request_ref", {}).get("runtime_input_update")
             if isinstance(input_update, str):
-                projected.append((item.item_id, HarnessMessage(role="context", content=input_update)))
+                projected.append((item.item_id, ModelMessage(role="context", body=input_update)))
     # Preserve receive order in the ledger; keep provider tool groups complete.
     ordered = []
     deferred = []
@@ -675,7 +674,7 @@ def _project_items(
     return tuple(ordered)
 
 
-def _tool_safe_boundary(messages: tuple[HarnessMessage, ...], cut: int) -> int:
+def _tool_safe_boundary(messages: tuple[ModelMessage, ...], cut: int) -> int:
     pending: dict[str, int] = {}
     safe = 0
     for index, message in enumerate(messages[:cut]):
@@ -688,7 +687,7 @@ def _tool_safe_boundary(messages: tuple[HarnessMessage, ...], cut: int) -> int:
     return safe
 
 
-def _validate_tool_groups(messages: tuple[HarnessMessage, ...]) -> None:
+def _validate_tool_groups(messages: tuple[ModelMessage, ...]) -> None:
     pending: set[str] = set()
     for message in messages:
         if message.role == "tool":
@@ -706,73 +705,65 @@ def _validate_tool_groups(messages: tuple[HarnessMessage, ...]) -> None:
         raise ContextBudgetExceededError("Context contains an unfinished tool group.")
 
 
-def _request_context_messages(item: ItemSnapshot) -> tuple[HarnessMessage, ...]:
+def _request_context_messages(item: ItemSnapshot) -> tuple[ModelMessage, ...]:
     if item.kind != "model_request" or item.producer != "runtime":
         return ()
-    return tuple(HarnessMessage(role="context", content=update)
+    return tuple(ModelMessage(role="context", body=update)
                  for update in item.payload.get("request_ref", {}).get("context_updates", ())
                  if isinstance(update, str))
 
 
 def _item_message(
     item: ItemSnapshot, *, answer_item_ids: frozenset[str] = frozenset(),
-) -> HarnessMessage | None:
+) -> ModelMessage | None:
     if item.kind == "model_request" and item.producer == "runtime":
         update = item.payload.get("request_ref", {}).get("runtime_context_update")
         if isinstance(update, str):
-            return HarnessMessage(role="context", content=update)
+            return ModelMessage(role="context", body=update)
     text = item.payload.get("text")
     if item.kind == "user_message" and isinstance(text, str):
-        return HarnessMessage(role="user", content=text)
+        return ModelMessage(role="user", body=text)
     if item.kind == "agent_message" and isinstance(text, str):
-        return HarnessMessage(role="assistant", content=text)
-    if item.kind == "model_response" and isinstance(text, str):
-        outputs = tuple(output_from_payload(output) for output in item.payload.get("outputs", ()))
+        return ModelMessage(role="assistant", body=text)
+    if item.kind == "model_response":
+        response = restore_model_response(item.payload)
+        outputs = response.outputs
         if item.payload.get("response_status") == "incomplete":
             # Do not replay partial assistant text, reasoning, or a tool group
             # for which no execution/result exists. This also survives compaction.
-            return HarnessMessage(role="context", content=(
+            return ModelMessage(role="context", body=(
                 "A previous model step was incomplete (output limit or another provider stop). "
                 "Its partial output was discarded; no tools from that step were executed. "
                 "Generate a complete next step from the completed history. Keep it concise; "
                 "do not repeat completed tool actions."
             ))
-        calls = item.payload.get("tool_calls")
-        if isinstance(calls, (list, tuple)) and calls:
-            return HarnessMessage(
-                role="assistant",
-                content=text,
-                reasoning_content=item.payload.get("reasoning_content"),
-                outputs=outputs,
-                tool_calls=tuple(_tool_call(call) for call in calls if isinstance(call, Mapping)),
-            )
-        if item.item_id in answer_item_ids:
-            return HarnessMessage(role="assistant", content=text, outputs=outputs)
+        if response.tool_calls or item.item_id in answer_item_ids:
+            return ModelMessage(role="assistant", body=outputs)
     if item.kind == "tool_result":
         model_content = item.payload.get("model_content")
         tool_call_id = item.payload.get("tool_call_id")
         if isinstance(model_content, str) and isinstance(tool_call_id, str):
-            return HarnessMessage(
+            return ModelMessage(
                 role="tool",
-                content=model_content,
+                body=model_content,
                 tool_call_id=tool_call_id,
             )
     if item.kind == "tool_reconciliation" and item.producer == "reconciler":
         result = item.payload.get("result")
         if isinstance(result, Mapping) and isinstance(result.get("tool_call_id"), str):
             content = result.get("model_content")
-            return HarnessMessage(role="tool", tool_call_id=result["tool_call_id"],
-                                  content=content if isinstance(content, str) else _json(dict(result)))
+            return ModelMessage(role="tool", tool_call_id=result["tool_call_id"],
+                                  body=content if isinstance(content, str) else _json(dict(result)))
     if item.kind in {"completion_feedback", "context_message"} and isinstance(text, str):
-        return HarnessMessage(role="context", content=text)
+        return ModelMessage(role="context", body=text)
     if item.kind == "tool_continuation" and item.producer == "runtime":
-        return HarnessMessage(role="context", content=(
+        return ModelMessage(role="context", body=(
             "The live command owner closed. Confirmed terminal outcome (the process is not reattached):\n"
             + _json(dict(item.payload))
         ))
     if item.kind == "input_file":
         if item.payload.get("storage") == "reference" and isinstance(item.payload.get("path"), str):
-            return HarnessMessage(role="context", content=(
+            return ModelMessage(role="context", body=(
                 f"Attached input file (read-only original, not copied): {_json(item.payload['path'])}. "
                 f"SHA256 at attachment: {item.payload.get('sha256')}. "
                 "This is a live local file reference: read its current contents with file tools; "
@@ -781,9 +772,9 @@ def _item_message(
         workspace_path = item.payload.get("workspace_path")
         sha256 = item.payload.get("sha256")
         if isinstance(workspace_path, str) and isinstance(sha256, str):
-            return HarnessMessage(
+            return ModelMessage(
                 role="context",
-                content=(f"Attached input file available in the workspace: {workspace_path} (sha256={sha256})."),
+                body=(f"Attached input file available in the workspace: {workspace_path} (sha256={sha256})."),
             )
     return None
 
@@ -865,24 +856,14 @@ def _runtime_preserved_facts(
     }
 
 
-def _tool_call(payload: Mapping[str, object]) -> HarnessToolCall:
-    call_id = payload.get("id")
-    name = payload.get("name")
-    arguments = payload.get("arguments")
-    if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
-        raise RuntimeError("committed model tool call is malformed")
-    argument_error = payload.get("argument_error")
-    if argument_error is not None and not isinstance(argument_error, str):
-        raise RuntimeError("committed model tool argument error is malformed")
-    return HarnessToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error)
 
 
 def _compaction_projection(
     items: tuple[ItemSnapshot, ...],
     *,
     answer_item_ids: frozenset[str] = frozenset(),
-) -> tuple[dict[str, HarnessMessage], set[str]]:
-    replacements: dict[str, HarnessMessage] = {}
+) -> tuple[dict[str, ModelMessage], set[str]]:
+    replacements: dict[str, ModelMessage] = {}
     suppressed: set[str] = set()
     visible_ids = {item.item_id for item in items}
     for item in items:
@@ -918,7 +899,7 @@ def _compaction_projection(
                     raise RuntimeError("committed tool result override has no model message")
                 # A later elision must never revive an item already summarized.
                 if target not in suppressed or target in replacements:
-                    replacements[target] = replace(message, content=content)
+                    replacements[target] = replace(message, body=content)
                     suppressed.add(target)
             suppressed.add(item.item_id)
             continue
@@ -953,13 +934,13 @@ def _compaction_projection(
                 message = _item_message(originals[target])
                 if message is None or message.role != "tool":
                     raise RuntimeError("semantic replay requires original tool results")
-                replacements[target] = replace(message, content=content)
+                replacements[target] = replace(message, body=content)
                 suppressed.add(target)
         suppressed.add(item.item_id)
     return replacements, suppressed
 
 
-def _compaction_message(payload: Mapping[str, Any]) -> HarnessMessage:
+def _compaction_message(payload: Mapping[str, Any]) -> ModelMessage:
     projected = {
         "coverage": (
             "This memory replaces an earlier prefix of this conversation, not a sampled search result. "
@@ -988,33 +969,13 @@ def _compaction_message(payload: Mapping[str, Any]) -> HarnessMessage:
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeError("committed context compaction payload is malformed") from exc
-    return HarnessMessage(
-        role="context", content=f"Context compaction:\n{content}", context_category="continuation_summary"
+    return ModelMessage(
+        role="context", body=f"Context compaction:\n{content}", context_category="continuation_summary"
     )
 
 
-def _message_size_bytes(message: HarnessMessage) -> int:
-    payload = {
-        "content": message.content,
-        "role": message.role,
-        "tool_call_id": message.tool_call_id,
-        "tool_calls": [
-            {
-                "arguments": call.arguments,
-                "id": call.id,
-                "name": call.name,
-            }
-            for call in message.tool_calls
-        ],
-    }
-    if message.reasoning_content is not None:
-        payload["reasoning_content"] = message.reasoning_content
-    encoded = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+def _message_size_bytes(message: ModelMessage) -> int:
+    encoded = _json(model_message_payload(message))
     return len(encoded.encode("utf-8"))
 
 

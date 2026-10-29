@@ -16,13 +16,13 @@ from agent_runtime.harness import (
     CompletionProposal,
     ContextCompactionRequiredError,
     GatewayHarnessModel,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ModelDispatchCancelledError,
     ModelDispatchPreflightError,
     ModelEventSink,
+    ModelMessage,
+    ModelToolCall,
     PreparedModelCall,
     RolloutContextManager,
     RuntimeState,
@@ -30,6 +30,7 @@ from agent_runtime.harness import (
     TurnExecutor,
 )
 from agent_runtime.harness.model_outputs import start_model_output
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
 from agent_runtime.modeling.config import GenerationConfig
 from agent_runtime.modeling.contracts import LLMCallStage, LLMStageBudget
@@ -74,7 +75,7 @@ class InspectingModel:
         assert attempt.status == "dispatched"
         assert attempt.claim_owner == "turn-worker-a"
         assert operation.request_hash == prepared.request_hash
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="model answer",
             provider_response_id="response-1",
             usage={"input_tokens": 5, "output_tokens": 2},
@@ -107,7 +108,7 @@ class CompactionRequestingModel(InspectingModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         operation = self._store.list_model_operations()[-1]
         assert operation.status == "dispatched"
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="Summary preserves the architecture boundary."
             if prepared.request_ref.get("purpose") == "context_summary"
             else "model answer",
@@ -131,7 +132,7 @@ class InspectingCompletionGate:
 class OverBudgetAnswerModel(InspectingModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="must not be accepted",
             provider_response_id="response-over-budget",
             usage={"input_tokens": 8, "output_tokens": 3, "total_tokens": 11},
@@ -147,7 +148,7 @@ class PreflightRejectedModel(InspectingModel):
 class IncompleteResponseModel(InspectingModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="partial answer must not be accepted",
             provider_response_id="response-incomplete",
             usage={"input_tokens": 5, "output_tokens": 10, "total_tokens": 15},
@@ -208,7 +209,7 @@ class RetryThenAnswerModel(InspectingModel):
         self.dispatch_count += 1
         if self.dispatch_count == 1:
             raise ConnectionError("first dispatch outcome is unknown")
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="recovered model answer",
             provider_response_id="response-recovered",
             usage={"input_tokens": 4, "output_tokens": 2},
@@ -233,7 +234,7 @@ class StreamingRetryThenAnswerModel(InspectingModel):
         if self.dispatch_count == 1:
             await emit_partial_outputs(event_sink, (ModelOutput("text", "text", content=content),))
             raise ConnectionError("first streamed attempt became uncertain")
-        response = HarnessModelResponse(text=content, provider_response_id="response-recovered",
+        response = HarnessModelResponse.from_parts(text=content, provider_response_id="response-recovered",
                                         usage={"input_tokens": 4, "output_tokens": 2})
         await emit_response(event_sink, response)
         return response
@@ -244,16 +245,16 @@ class ReviseAfterFeedbackModel(InspectingModel):
         del prepared
         request = self.prepared_requests[-1]
         if len(self.prepared_requests) == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="unverified draft",
                 provider_response_id="response-draft",
                 usage={"input_tokens": 3, "output_tokens": 2},
             )
-        assert request.messages[-1] == HarnessMessage(
+        assert request.messages[-1] == ModelMessage(
             role="context",
-            content="verification evidence is missing",
+            body="verification evidence is missing",
         )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="verified final answer",
             provider_response_id="response-final",
             usage={"input_tokens": 6, "output_tokens": 3},
@@ -303,16 +304,16 @@ class AnswerAfterClarificationModel(InspectingModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
         if len(self.prepared_requests) == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="ambiguous draft",
                 provider_response_id="response-ambiguous",
                 usage={"input_tokens": 3, "output_tokens": 2},
             )
-        assert self.prepared_requests[-1].messages[-1] == HarnessMessage(
+        assert self.prepared_requests[-1].messages[-1] == ModelMessage(
             role="user",
-            content="target A",
+            body="target A",
         )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="answer for target A",
             provider_response_id="response-target-a",
             usage={"input_tokens": 6, "output_tokens": 3},
@@ -408,19 +409,19 @@ class ZeroDeltaToolThenAnswerModel:
         del prepared, event_sink
         self.dispatch_count += 1
         if self.dispatch_count == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="response-tool-only",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="call-1",
                         name="read_file",
                         arguments={"path": "README.md"},
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="tool completed",
             provider_response_id="response-final",
             usage={"input_tokens": 4, "output_tokens": 2},
@@ -681,7 +682,7 @@ def test_session_persists_model_transaction_before_provider_io(tmp_path: Path) -
 
         assert result.answer == "model answer"
         assert completion_gate.evaluated is True
-        assert model.prepared_requests[0].messages == (HarnessMessage(role="user", content="answer plainly"),)
+        assert model.prepared_requests[0].messages == (ModelMessage(role="user", body="answer plainly"),)
         assert result.thread_id == thread.thread_id
         assert store.read_turn(result.turn_id).status == "completed"
         [operation] = store.list_model_operations(result.turn_id)
@@ -853,21 +854,23 @@ def test_late_model_attempt_cannot_commit_a_second_response(tmp_path: Path) -> N
             operation_id=operation.operation_id,
             attempt_id=second.attempt_id,
             generation=second.generation,
-            text="new answer",
-            provider_response_id="response-new",
-            usage={"input_tokens": 5, "output_tokens": 2},
+            response=HarnessModelResponse.from_parts(
+                text="new answer", provider_response_id="response-new", usage={"input_tokens": 5, "output_tokens": 2}
+            ),
         )
         assert not store.complete_model_attempt(
             operation_id=operation.operation_id,
             attempt_id=first.attempt_id,
             generation=first.generation,
-            text="late old answer",
-            provider_response_id="response-old",
-            usage={"input_tokens": 5, "output_tokens": 3},
+            response=HarnessModelResponse.from_parts(
+                text="late old answer",
+                provider_response_id="response-old",
+                usage={"input_tokens": 5, "output_tokens": 3},
+            ),
         )
 
         [response] = [item for item in store.list_items(turn.turn_id) if item.kind == "model_response"]
-        assert response.payload["text"] == "new answer"
+        assert item_text(response) == "new answer"
         attempts = store.list_model_attempts(operation.operation_id)
         assert [(attempt.generation, attempt.status) for attempt in attempts] == [
             (1, "abandoned"),
@@ -915,14 +918,15 @@ def test_model_completion_faults_are_atomic_at_every_substep(
                 operation_id=operation.operation_id,
                 attempt_id=attempt.attempt_id,
                 generation=attempt.generation,
-                text="final answer",
-                provider_response_id="response-1",
-                usage={"input_tokens": 4, "output_tokens": 3},
-                reasoning_content="complete reasoning",
-                plan_content="complete plan",
-                outputs=(ModelOutput("reasoning", "reasoning", "complete reasoning"),
-                         ModelOutput("plan", "plan", "complete plan"),
-                         ModelOutput("text", "text", "final answer")),
+                response=HarnessModelResponse(
+                    provider_response_id="response-1",
+                    usage={"input_tokens": 4, "output_tokens": 3},
+                    outputs=(
+                        ModelOutput("reasoning", "reasoning", "complete reasoning"),
+                        ModelOutput("plan", "plan", "complete plan"),
+                        ModelOutput("text", "text", "final answer"),
+                    ),
+                ),
             )
 
         assert store.list_records(thread.thread_id) == records_before
@@ -964,9 +968,11 @@ def test_stale_model_generation_appends_nothing(tmp_path: Path) -> None:
             operation_id=operation.operation_id,
             attempt_id=stale.attempt_id,
             generation=stale.generation,
-            text="stale answer",
-            provider_response_id="response-stale",
-            usage={"input_tokens": 2, "output_tokens": 2},
+            response=HarnessModelResponse.from_parts(
+                text="stale answer",
+                provider_response_id="response-stale",
+                usage={"input_tokens": 2, "output_tokens": 2},
+            ),
         )
 
         assert accepted is False
@@ -1407,7 +1413,7 @@ def test_clarification_response_resumes_the_same_turn_without_granting_permissio
         assert interaction.status == "resolved"
         assert interaction.response == {"text": "target A"}
         assert store.list_approvals(paused.turn_id) == ()
-        assert [item.payload["text"] for item in store.list_items(paused.turn_id) if item.kind == "user_message"] == [
+        assert [item_text(item) for item in store.list_items(paused.turn_id) if item.kind == "user_message"] == [
             "answer the ambiguous task",
             "target A",
         ]
@@ -1555,9 +1561,9 @@ def test_choice_uses_the_durable_interaction_lifecycle_without_granting_permissi
         assert result.status == "completed"
         assert store.read_interaction(choice.request_id).response == {"selection": "staging"}
         assert store.list_approvals(turn.turn_id) == ()
-        assert model.prepared_requests[0].messages[-1] == HarnessMessage(
+        assert model.prepared_requests[0].messages[-1] == ModelMessage(
             role="user",
-            content="staging",
+            body="staging",
         )
         assert store.verify().valid is True
 

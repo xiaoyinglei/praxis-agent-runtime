@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.harness import RolloutEventReader, RuntimeState
+from agent_runtime.harness.model_outputs import complete_model_output, start_model_output
+from agent_runtime.harness.protocol import HarnessModelResponse
+from agent_runtime.modeling.events import ModelOutput
 from agent_runtime.streaming import events as stream_events
-from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 
 
 def _start_turn(store: RuntimeState, workspace: Path) -> tuple[str, str]:
@@ -47,9 +49,11 @@ def _complete_model_response(
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
-        text=text,
-        provider_response_id=f"response-{turn_id}",
-        usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        response=HarnessModelResponse.from_parts(
+            text=text,
+            provider_response_id=f"response-{turn_id}",
+            usage={"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        ),
     )
 
 
@@ -111,8 +115,9 @@ def test_unknown_internal_item_kind_fails_closed(tmp_path: Path) -> None:
             RolloutEventReader(store).read(thread_id)
 
 
+@pytest.mark.parametrize("tampered_record", ["output_start", "output_completion", "plan_completion"])
 def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
-    tmp_path: Path,
+    tmp_path: Path, tampered_record: str,
 ) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -132,15 +137,34 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             for record in store.list_records(thread_id)
             if record.record_type == "model_operation_prepared"
         )
-        first_ids = prepared.payload["public_item_ids"]
-        assert set(first_ids) == {"agent_message", "reasoning", "plan"}
-
-        store.dispatch_model_attempt(
+        assert "public_item_ids" not in prepared.payload
+        outputs = (
+            ModelOutput("reason", "reasoning", content="checked"),
+            ModelOutput("plan", "plan", content="inspect then fix"),
+            ModelOutput("text", "text", content="answer"),
+        )
+        first_attempt = store.dispatch_model_attempt(
             operation.operation_id,
             worker_id="worker-1",
             lease_seconds=1.0,
             now=100.0,
         )
+        for output in outputs:
+            start_model_output(
+                store, operation_id=operation.operation_id, attempt_id=first_attempt.attempt_id,
+                generation=first_attempt.generation, output=output,
+            )
+            complete_model_output(
+                store, operation_id=operation.operation_id, attempt_id=first_attempt.attempt_id,
+                generation=first_attempt.generation, output=output,
+            )
+        first_ids = {
+            record.payload["output_id"]: record.payload["public_item_id"]
+            for record in store.list_records(thread_id)
+            if record.record_type == "item_started" and record.payload.get("kind") == "model_output"
+        }
+        assert set(first_ids) == {"reason", "plan", "text"}
+        assert len(set(first_ids.values())) == len(outputs)
         store.expire_model_attempt_dispatch(
             operation_id=operation.operation_id,
             now=102.0,
@@ -151,10 +175,24 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             for record in store.list_records(thread_id)
             if record.record_type == "model_retry_prepared"
         )
-        retry_ids = retried.payload["public_item_ids"]
-        assert retry.attempt_id != operation.active_attempt_id
+        assert "public_item_ids" not in retried.payload
+        assert retry.attempt_id != first_attempt.attempt_id
+        retry = store.dispatch_model_attempt(operation.operation_id, worker_id="worker-2")
+        assert store.complete_model_attempt(operation_id=operation.operation_id, attempt_id=retry.attempt_id,
+                                            generation=retry.generation, response=HarnessModelResponse(outputs=outputs))
+        retry_ids = {
+            record.payload["output_id"]: record.payload["public_item_id"]
+            for record in store.list_records(thread_id)
+            if record.record_type == "item_started" and record.payload.get("kind") == "model_output"
+            and record.payload["attempt_id"] == retry.attempt_id
+        }
         assert retry_ids.keys() == first_ids.keys()
-        assert all(retry_ids[channel] != first_ids[channel] for channel in first_ids)
+        assert len(set(retry_ids.values())) == len(outputs)
+        assert set(retry_ids.values()).isdisjoint(first_ids.values())
+        for record in store.list_records(thread_id):
+            if record.record_type == "item_completed" and record.payload.get("kind") == "model_output":
+                expected_ids = retry_ids if record.payload["attempt_id"] == retry.attempt_id else first_ids
+                assert record.payload["public_item_id"] == expected_ids[record.payload["output_id"]]
 
         store.record_tool_call(
             turn_id=turn_id,
@@ -226,14 +264,24 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
         )
         plan_public_id = plan_completion.payload["public_item_id"]
         assert plan_public_id
+        selected_record = plan_completion if tampered_record == "plan_completion" else next(
+            record for record in store.list_records(thread_id)
+            if record.record_type == ("item_started" if tampered_record == "output_start" else "item_completed")
+            and record.payload.get("kind") == "model_output" and record.payload["attempt_id"] == retry.attempt_id
+        )
+        original_events = tuple((entry.event.item_id, entry.event.data)
+                                for entry in RolloutEventReader(store).read(thread_id))
 
     with RuntimeState.open_sync(database) as reopened:
         persisted = reopened.list_records(thread_id)
-        assert next(
-            record.payload["public_item_ids"]
+        assert {
+            record.payload["output_id"]: record.payload["public_item_id"]
             for record in persisted
-            if record.record_type == "model_retry_prepared"
-        ) == retry_ids
+            if record.record_type == "item_started" and record.payload.get("kind") == "model_output"
+            and record.payload["attempt_id"] == retry.attempt_id
+        } == retry_ids
+        assert tuple((entry.event.item_id, entry.event.data)
+                     for entry in RolloutEventReader(reopened).read(thread_id)) == original_events
         assert next(
             record.payload["public_item_id"]
             for record in persisted
@@ -248,12 +296,13 @@ def test_public_item_ids_survive_reopen_and_mismatch_fails_closed(
             """
             SELECT record_id, payload_json
             FROM rollout_records
-            WHERE record_type = 'model_retry_prepared'
-            """
+            WHERE record_id = ?
+            """,
+            (selected_record.record_id,),
         ).fetchone()
         assert row is not None
         payload = json.loads(row["payload_json"])
-        payload["public_item_ids"]["agent_message"] = "tampered-public-id"
+        payload["public_item_id"] = "tampered-public-id"
         payload_json = json.dumps(
             payload,
             sort_keys=True,
@@ -530,7 +579,7 @@ def test_transient_deltas_never_enter_rollout_records(tmp_path: Path) -> None:
         )
 
 
-def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
+def test_canonical_history_replays_with_persisted_public_ids(
     tmp_path: Path, monkeypatch,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -538,20 +587,20 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
     database = tmp_path / "rollout.sqlite3"
     with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        _complete_model_response(store, turn_id=turn_id, text="legacy model answer")
+        _complete_model_response(store, turn_id=turn_id, text="canonical model answer")
         store.record_tool_call(
             turn_id=turn_id,
-            tool_call_id="legacy-call",
+            tool_call_id="canonical-call",
             tool_name="read_file",
             arguments={"path": "README.md"},
-            origin={"request_id": "legacy-request"},
+            origin={"request_id": "canonical-request"},
         )
         values = {
             "turn_id": turn_id,
-            "operation_id": "legacy-operation",
-            "tool_call_id": "legacy-call",
+            "operation_id": "canonical-operation",
+            "tool_call_id": "canonical-call",
             "tool_name": "read_file",
-            "arguments_digest": "legacy-arguments",
+            "arguments_digest": "canonical-arguments",
             "execution_revision": "builtin-read-file-v1",
             "idempotent": True,
             "attempt_count": 0,
@@ -561,12 +610,12 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
         store.record_tool_execution_state(status="prepared", **values)
         store.record_tool_execution_state(status="ready", **values)
         claim = store.claim_tool_operation(
-            operation_id="legacy-operation",
-            worker_id="legacy-worker",
+            operation_id="canonical-operation",
+            worker_id="canonical-worker",
             lease_seconds=30.0,
         )
         assert store.commit_tool_operation_outcome(
-            operation_id="legacy-operation",
+            operation_id="canonical-operation",
             claim_generation=claim.claim_generation,
             fencing_token=str(claim.fencing_token),
             status="succeeded",
@@ -576,75 +625,26 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
         )
         store.record_tool_result(
             turn_id=turn_id,
-            operation_id="legacy-operation",
+            operation_id="canonical-operation",
             result={
-                "tool_call_id": "legacy-call",
+                "tool_call_id": "canonical-call",
                 "tool_name": "read_file",
-                "structured_content": {"text": "legacy file"},
+                "structured_content": {"text": "canonical file"},
                 "is_error": False,
                 "content": [],
                 "attachments": [],
             },
         )
 
-        with sqlite3.connect(database) as connection:
-            connection.row_factory = sqlite3.Row
-            rows = connection.execute(
-                "SELECT record_id, record_type, payload_json FROM rollout_records"
-            ).fetchall()
-            for row in rows:
-                payload = json.loads(row["payload_json"])
-                if row["record_type"] in {
-                    "model_operation_prepared",
-                    "model_retry_prepared",
-                }:
-                    payload.pop("public_item_ids", None)
-                if row["record_type"] in {
-                    "model_attempt_completed",
-                    "tool_operation_claimed",
-                    "tool_operation_outcome_committed",
-                }:
-                    payload.pop("public_item_id", None)
-                if row["record_type"] in {"item_started", "item_completed"}:
-                    payload.pop("attempt_id", None)
-                    payload.pop("channel", None)
-                    payload.pop("operation_id", None)
-                    payload.pop("attempt_generation", None)
-                    payload.pop("public_item_id", None)
-                    payload.pop("status", None)
-                    payload.pop("error", None)
-                    payload.pop("tool_name", None)
-                    payload.pop("tool_call_id", None)
-                if row["record_type"] == "item_completed":
-                    payload.pop("kind", None)
-                payload_json = json.dumps(
-                    payload,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                connection.execute(
-                    """
-                    UPDATE rollout_records
-                    SET payload_schema_version = 1,
-                        payload_json = ?, payload_hash = ?
-                    WHERE record_id = ?
-                    """,
-                    (
-                        payload_json,
-                        hashlib.sha256(payload_json.encode()).hexdigest(),
-                        row["record_id"],
-                    ),
-                )
         store.rebuild_projections()
         assert store.verify().valid is True
 
         def no_mutable_operation(*args, **kwargs):
-            pytest.fail("legacy event replay must use canonical facts, not the current operation projection")
+            pytest.fail("canonical event replay must use canonical facts, not the current operation projection")
 
         monkeypatch.setattr(store, "read_tool_operation", no_mutable_operation)
         first_replay = RolloutEventReader(store).read(thread_id)
-        # A fresh reader per record exercises stateless, cross-batch v1 identity
+        # A fresh reader per record exercises stateless, cross-batch identity
         # resolution, rather than relying on a warmed in-memory projection.
         live = tuple(event for record in store.list_records(thread_id)
                      for event in RolloutEventReader(store).project_committed_batch((record,)))
@@ -675,110 +675,42 @@ def test_verified_schema_v1_history_replays_with_deterministic_public_ids(
     }
 
 
-def test_migrated_model_response_projects_one_legacy_message(tmp_path: Path) -> None:
+def test_canonical_model_response_projects_one_message(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     with RuntimeState.open_sync(tmp_path / "rollout.sqlite3") as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        migrated = record_migrated_context_item(
-            store,
-            turn_id=turn_id,
-            kind="model_response",
-            payload={"text": "migrated model answer", "tool_calls": []},
-        )
-
-        migrated_records = [
-            record
-            for record in store.list_records(thread_id)
-            if record.payload.get("item_id") == migrated.item_id
-        ]
-        assert [record.payload.get("public_item_id") for record in migrated_records] == [
-            migrated.item_id,
-            migrated.item_id,
-        ]
-        assert [record.payload.get("public_item_kind") for record in migrated_records] == [
-            "legacy_message",
-            "legacy_message",
-        ]
-
+        _complete_model_response(store, turn_id=turn_id, text="model answer")
+        response = next(item for item in store.list_items(turn_id) if item.kind == "model_response")
+        assert "text" not in response.payload
+        assert "tool_calls" not in response.payload
+        assert response.payload["outputs"][0]["content"] == "model answer"
         replayed = RolloutEventReader(store).read(thread_id)
 
-    legacy = [
-        result.event
-        for result in replayed
-        if result.event.item_kind is not None
-        and result.event.item_kind.value == "legacy_message"
-        and result.event.item_id == migrated.item_id
-    ]
-    assert [event.type.value for event in legacy] == [
-        "item_started",
-        "item_completed",
-    ]
-    assert legacy[-1].data == {"content": "migrated model answer"}
+    messages = [result.event for result in replayed
+                if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"]
+    assert [event.type.value for event in messages] == ["item_started", "item_completed"]
+    assert messages[-1].data["content"] == "model answer"
 
 
-def test_pre_identity_migrated_model_response_upcasts_to_legacy_message(
-    tmp_path: Path,
-) -> None:
+def test_canonical_model_response_preserves_public_identity_after_rebuild(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     database = tmp_path / "rollout.sqlite3"
     with RuntimeState.open_sync(database) as store:
         thread_id, turn_id = _start_turn(store, workspace)
-        migrated = record_migrated_context_item(
-            store,
-            turn_id=turn_id,
-            kind="model_response",
-            payload={"text": "pre-identity migrated answer", "tool_calls": []},
-        )
-
-    with sqlite3.connect(database) as connection:
-        rows = connection.execute(
-            """
-            SELECT record_id, payload_json
-            FROM rollout_records
-            WHERE producer = 'migration'
-            """
-        ).fetchall()
-        for record_id, payload_json in rows:
-            payload = json.loads(payload_json)
-            if payload.get("item_id") != migrated.item_id:
-                continue
-            payload.pop("public_item_id")
-            payload.pop("public_item_kind")
-            rewritten = json.dumps(
-                payload,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            connection.execute(
-                """
-                UPDATE rollout_records
-                SET payload_json = ?, payload_hash = ?
-                WHERE record_id = ?
-                """,
-                (
-                    rewritten,
-                    hashlib.sha256(rewritten.encode()).hexdigest(),
-                    record_id,
-                ),
-            )
+        _complete_model_response(store, turn_id=turn_id, text="canonical persisted answer")
+        first_replay = RolloutEventReader(store).read(thread_id)
 
     with RuntimeState.open_sync(database) as reopened:
         reopened.rebuild_projections()
         assert reopened.verify().valid is True
         replayed = RolloutEventReader(reopened).read(thread_id)
 
-    legacy = [
-        result.event
-        for result in replayed
-        if result.event.item_kind is not None
-        and result.event.item_kind.value == "legacy_message"
-        and result.event.item_id == migrated.item_id
+    assert [(event.cursor, replace(event.event, sequence=0)) for event in replayed] == [
+        (event.cursor, replace(event.event, sequence=0)) for event in first_replay
     ]
-    assert [event.type.value for event in legacy] == [
-        "item_started",
-        "item_completed",
-    ]
-    assert legacy[-1].data == {"content": "pre-identity migrated answer"}
+    messages = [result.event for result in replayed
+                if result.event.item_kind is not None and result.event.item_kind.value == "agent_message"]
+    assert [event.type.value for event in messages] == ["item_started", "item_completed"]
+    assert messages[-1].data["content"] == "canonical persisted answer"
