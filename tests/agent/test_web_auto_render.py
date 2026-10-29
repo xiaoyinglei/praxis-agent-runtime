@@ -5,7 +5,6 @@ import asyncio
 import base64
 import json
 import os
-import sys
 from dataclasses import replace
 
 import httpx
@@ -217,8 +216,8 @@ async def test_cancelled_recovery_keeps_static_evidence(tmp_path, monkeypatch):
 
 
 @pytest.mark.anyio
-@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1' or sys.platform == 'darwin',
-                    reason='Requires real isolated Linux Chromium')
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1',
+                    reason='Requires real Playwright-managed Chromium')
 @pytest.mark.parametrize('path', ['/document', '/redirect'])
 async def test_default_tool_runs_real_browser_without_refetching_document(tmp_path, path):
     requests = []

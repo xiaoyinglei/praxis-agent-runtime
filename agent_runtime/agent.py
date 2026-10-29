@@ -79,11 +79,9 @@ class Agent:
         if web_limits is not None and not isinstance(web_limits, WebLimits):
             raise TypeError("web_limits must be WebLimits or None")
         self.web_limits = web_limits or WebLimits()
-        if web_search_provider is not None:
-            if web_search_provider not in {"deepseek", "brave", "tavily"}:
-                raise ValueError("Web search provider must be deepseek, brave or tavily.")
-            if web_search_key_file is None:
-                raise ValueError("Web search requires a key file for deepseek/brave/tavily.")
+        from agent_runtime.web_config import resolve_web_configuration
+
+        web_configuration = resolve_web_configuration(web_search_provider, web_search_key_file)
         if mcp_config_trust is not None:
             from agent_runtime.runtime.mcp import MCPConfigTrustDecision
 
@@ -107,8 +105,8 @@ class Agent:
         self.memory = memory
         self.enable_workspace_mcp = enable_workspace_mcp
         self.mcp_config_trust = mcp_config_trust
-        self.web_search_key_file = None if web_search_key_file is None else Path(web_search_key_file)
-        self.web_search_provider = web_search_provider
+        self.web_search_key_file = web_configuration.key_file
+        self.web_search_provider = web_configuration.provider
         from agent_runtime.tools.web_http import web_proxy_configuration
 
         self.web_proxy_url, self.web_no_proxy = web_proxy_configuration(web_proxy_url, dict(os.environ))

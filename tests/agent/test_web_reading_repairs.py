@@ -1,10 +1,8 @@
 """Reading fidelity across layouts and browser request origins, without site rules."""
 from __future__ import annotations
 
-import base64
 import importlib
 import os
-import sys
 
 import httpx
 import pytest
@@ -96,7 +94,7 @@ async def test_broker_forwards_only_public_origin_referer():
                                     'resource_type': 'Script',
                                     'referer': 'https://source.example/private/path?secret=hidden#fragment',
                                     'headers': {'Cookie': 'private', 'Authorization': 'private'}})
-        assert base64.b64decode(reply['body']) == b'code'
+        assert reply['body'] == b'code'
         assert requests[0].headers['Referer'] == 'https://source.example/'
         assert 'cookie' not in requests[0].headers and 'authorization' not in requests[0].headers
         assert 'hidden' not in str(requests[0].headers)
@@ -188,8 +186,8 @@ async def test_valid_source_does_not_change_private_resource_failure_into_protoc
         await client.aclose()
 
 
-@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1' or sys.platform == 'darwin',
-                    reason='Explicit Linux Chromium integration run')
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1',
+                    reason='Explicit Chromium integration run')
 @pytest.mark.parametrize('policy', ['strict-origin-when-cross-origin', 'no-referrer'])
 @pytest.mark.parametrize('delivery', ['meta', 'header'])
 def test_real_browser_preserves_origin_and_referrer_policy(policy, delivery):
@@ -227,8 +225,8 @@ def test_real_browser_preserves_origin_and_referrer_policy(policy, delivery):
     asyncio.run(run())
 
 
-@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1' or sys.platform == 'darwin',
-                    reason='Explicit Linux Chromium integration run')
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1',
+                    reason='Explicit Chromium integration run')
 def test_real_browser_applies_redirect_policy_without_duplicate_fetch():
     import asyncio
 

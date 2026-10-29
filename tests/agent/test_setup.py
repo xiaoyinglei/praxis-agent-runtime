@@ -35,7 +35,9 @@ def successful_probe(monkeypatch):
 def test_setup_reuses_existing_environment_and_selects_model(setup_environment, monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "existing-environment-secret")
     definitions = successful_probe(monkeypatch)
-    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="\n")
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp", "--no-web"], input="\n",
+    )
     assert result.exit_code == 0, result.output
     assert definitions[0][1] is ProbeLevel.FULL
     assert "existing-environment-secret" not in result.output
@@ -51,7 +53,9 @@ def test_setup_hidden_key_is_persistent_without_mutating_environment(setup_envir
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     successful_probe(monkeypatch)
     secret = "private-setup-secret"
-    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input=secret + "\n")
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp", "--no-web"], input=secret + "\n",
+    )
     assert result.exit_code == 0, result.output
     assert secret not in result.output
     assert "GROQ_API_KEY" not in os.environ
@@ -77,7 +81,7 @@ def test_failed_probe_preserves_credential_and_selection(setup_environment, monk
 
     monkeypatch.setattr(ModelProbe, "run", fail)
     result = CliRunner().invoke(
-        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="n\n" + entered + "\n"
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp", "--no-web"], input="n\n" + entered + "\n"
     )
     assert result.exit_code != 0
     assert entered not in result.output
@@ -93,7 +97,7 @@ def test_successful_replacement_explains_parent_environment_precedence(setup_env
     monkeypatch.setenv("GROQ_API_KEY", "old-environment-key")
     successful_probe(monkeypatch)
     result = CliRunner().invoke(
-        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="n\nnew-stored-key\n"
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp", "--no-web"], input="n\nnew-stored-key\n"
     )
     assert result.exit_code == 0, result.output
     assert "unset GROQ_API_KEY" in result.output
@@ -117,7 +121,7 @@ def test_custom_setup_uses_real_full_probe_and_survives_fresh_registry(
     state, endpoint = provider_server
     result = CliRunner().invoke(
         agent_app,
-        ["setup", "--model", "probe-model", "--no-mcp"],
+        ["setup", "--model", "probe-model", "--no-mcp", "--no-web"],
         input=f"{endpoint}\n4096\nPRAXIS_MODEL_API_KEY\nprobe-secret\n",
     )
     assert result.exit_code == 0, result.output
@@ -157,7 +161,9 @@ def test_custom_setup_uses_real_full_probe_and_survives_fresh_registry(
 
 def test_setup_cancel_does_not_select_model(setup_environment, monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
-    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="\x03")
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp", "--no-web"], input="\x03",
+    )
     assert result.exit_code != 0
     assert not (setup_environment / ".praxis/model_session.json").exists()
 
@@ -178,7 +184,7 @@ def test_existing_github_connection_is_checked_without_re_registration(setup_env
         return {"connected": True, "tools": ["mcp__github__get_file_contents"], "diagnostics": []}
 
     monkeypatch.setattr(setup_cli, "check_mcp_connection", check)
-    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b"], input="\ny\n")
+    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-web"], input="\ny\n")
     assert result.exit_code == 0, result.output
     assert checked == ["github"]
 
@@ -194,8 +200,79 @@ def test_setup_mcp_failure_does_not_claim_full_success(setup_environment, monkey
         return {"connected": False, "tools": [], "diagnostics": []}
 
     monkeypatch.setattr(setup_cli, "check_mcp_connection", check)
-    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b"], input="\ny\n")
+    result = CliRunner().invoke(agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-web"], input="\ny\n")
     assert result.exit_code != 0
     current = CliRunner().invoke(agent_app, ["model", "current"])
     assert "openai/gpt-oss-120b" in current.output
     assert "GitHub" in result.output
+
+
+def test_first_setup_offers_search_and_reuses_the_official_deepseek_account(setup_environment, monkeypatch):
+    from agent_runtime import Agent
+    from agent_runtime.web_config import load_search_key
+
+    secret = "deepseek-model-and-search-credential"
+    monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
+    successful_probe(monkeypatch)
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "deepseek-flash", "--no-mcp"], input="\n\n\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert "联网搜索" in result.output
+    assert "复用" in result.output and secret not in result.output
+    agent = Agent(workspace_path=setup_environment)
+    assert agent.web_search_provider == "deepseek"
+    assert load_search_key(agent.web_search_key_file, workspace=setup_environment) == secret
+
+
+def test_setup_can_skip_search_without_repeating_the_question(setup_environment, monkeypatch):
+    from agent_runtime.web_config import resolve_web_configuration
+
+    monkeypatch.setenv("GROQ_API_KEY", "existing-environment-secret")
+    successful_probe(monkeypatch)
+    runner = CliRunner()
+    first = runner.invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="\nn\n",
+    )
+    assert first.exit_code == 0, first.output
+    assert "联网搜索" in first.output
+    configuration = resolve_web_configuration()
+    assert configuration.provider is None and configuration.source == "configuration"
+    second = runner.invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="\n",
+    )
+    assert second.exit_code == 0, second.output
+    assert "启用联网搜索" not in second.output
+
+
+def test_non_deepseek_model_gets_a_separate_hidden_search_key(setup_environment, monkeypatch):
+    from agent_runtime.web_config import load_search_key, resolve_web_configuration
+
+    monkeypatch.setenv("GROQ_API_KEY", "existing-groq-credential")
+    successful_probe(monkeypatch)
+    secret = "separate-deepseek-search-credential"
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "openai/gpt-oss-120b", "--no-mcp"], input="\ny\n" + secret + "\n",
+    )
+    assert result.exit_code == 0, result.output
+    configuration = resolve_web_configuration()
+    assert configuration.provider == "deepseek"
+    assert load_search_key(configuration.key_file, workspace=setup_environment) == secret
+    assert secret not in result.output and "existing-groq-credential" not in result.output
+
+
+def test_setup_preserves_existing_search_provider(setup_environment, monkeypatch, tmp_path):
+    from agent_runtime.web_config import resolve_web_configuration, save_web_configuration
+
+    key = tmp_path / "tavily.key"
+    key.write_text("existing-tavily-search-credential")
+    key.chmod(0o600)
+    save_web_configuration("tavily", key, workspace=setup_environment)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "existing-deepseek-credential")
+    successful_probe(monkeypatch)
+    result = CliRunner().invoke(
+        agent_app, ["setup", "--model", "deepseek-flash", "--no-mcp"], input="\n",
+    )
+    assert result.exit_code == 0, result.output
+    assert resolve_web_configuration().provider == "tavily"
+    assert "启用联网搜索" not in result.output

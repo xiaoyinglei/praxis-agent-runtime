@@ -85,8 +85,9 @@ async def test_open_uses_official_fetch_and_find_continues_saved_markdown_withou
         assert len(hits) == len(reservations) == 1
         targets = {target.value for target in tool.resolve_use(args).targets}
         assert targets == {args["url"], "https://api.deepseek.com/v1/tools/fetch"}
-        assert tool.execution_revision == "builtin-public-web-fetch-deepseek-v1"
-        assert "Chromium" not in tool.definition.description
+        assert tool.execution_revision == "builtin-public-web-fetch-deepseek-v2"
+        assert "By default DeepSeek retrieves" in tool.definition.description
+        assert "Explicit render=false" in tool.definition.description
     finally:
         await client.aclose()
 
@@ -135,10 +136,10 @@ async def test_hosted_fetch_budget_and_render_controls_are_checked_before_reques
         result = await ToolExecutor(tools).execute(call("web_fetch", {
             "url": "https://example.com/doc", "render": True,
         }), context=ToolExecutionContext(allow_web_tools=True))
-        assert result.result.error_code == "invalid_arguments" and reservations == []
+        assert result.result.error_code == "web_request_budget_exceeded" and reservations == [True]
         output = await tools["web_fetch"].run({"url": "https://example.com/doc"})
         assert output["error_code"] == "web_request_budget_exceeded" and not output["request_attempted"]
-        assert len(reservations) == 1
+        assert len(reservations) == 2
     finally:
         await client.aclose()
 
@@ -246,7 +247,7 @@ async def test_hosted_sdk_resume_and_new_session_find_keep_snapshot_identity(tmp
         digest = output["content_hash"]
         assert output["request_budget"]["used"] == 1
         operation = store.list_tool_operations(opened.turn_id)[0]
-        assert operation.execution_revision == "builtin-public-web-fetch-deepseek-v1"
+        assert operation.execution_revision == "builtin-public-web-fetch-deepseek-v2"
         assert "fake-deepseek-secret" not in repr(items)
     third = Agent(**options)
     monkeypatch.setattr(third, "_model_factory", lambda: FetchThenAnswer({"source_id": source_id, "find": "Target"}))

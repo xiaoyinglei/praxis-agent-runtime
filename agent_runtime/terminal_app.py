@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from prompt_toolkit.application import Application, get_app, run_in_terminal
+from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application, get_app, in_terminal, run_in_terminal
 from prompt_toolkit.clipboard import ClipboardData
 from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.data_structures import Point
@@ -41,13 +42,16 @@ from rich.markdown import Markdown
 from rich.style import Style as RichStyle
 from rich.text import Text
 from rich.theme import Theme
+from wcwidth import wcswidth
 
 from agent_runtime.approval import APPROVAL_CHOICES, APPROVAL_MODE_NAMES, approval_mode_hint
 from agent_runtime.connection_manager import ConnectionServer
+from agent_runtime.models import ModelSpec
 from agent_runtime.result import AgentPause
 from agent_runtime.terminal_input import _COMPOSER_BINDINGS, CHAT_COMMANDS, BoundedPromptHistory, resolve_pause_choice
 from agent_runtime.terminal_render import display_rows, safe_terminal_text
 from agent_runtime.terminal_ui import Block, Conversation, ConversationEventDisplay
+from agent_runtime.web_config import WebConfiguration
 
 _LINK_ESCAPE = re.compile(r"\x1b\]8;[^\x1b\x07]*(?:\x1b\\|\x07)")
 
@@ -221,8 +225,9 @@ class TerminalChatApp:
         self._selecting = False
         self._highlight_key: object = None
         self._highlighted: StyleAndTextTuples = []
-        # Keep native terminal selection until the user explicitly enables mouse mode.
-        self._mouse_enabled = False
+        # Inline uses native scrollback; fullscreen's alternate screen needs
+        # application mouse events for wheel/trackpad scrolling.
+        self._mouse_enabled = self.fullscreen
         self._model_choices: list[str] = []
         self._model_index = 0
         self._model_pending: asyncio.Future[str | None] | None = None
@@ -259,6 +264,10 @@ class TerminalChatApp:
         @keys.add("f3", filter=Condition(lambda: self.display.connection_required))
         def open_connections(event: KeyPressEvent) -> None:
             self.app.create_background_task(self.open_connections())
+
+        @keys.add("f5", filter=Condition(lambda: self.display.search_configuration_required))
+        def configure_search(event: KeyPressEvent) -> None:
+            self._request_search_setup()
 
         @keys.add("y", filter=approving & ~has_focus(self.editor), eager=True)
         @keys.add("Y", filter=approving & ~has_focus(self.editor), eager=True)
@@ -423,11 +432,11 @@ class TerminalChatApp:
 
         @keys.add("pageup", filter=~approving)
         def page_up(event: KeyPressEvent) -> None:
-            self._move(-max(3, self.app.output.get_size().rows // 2))
+            self._scroll_viewport(-max(3, self.app.output.get_size().rows // 2))
 
         @keys.add("pagedown", filter=~approving)
         def page_down(event: KeyPressEvent) -> None:
-            self._move(max(3, self.app.output.get_size().rows // 2))
+            self._scroll_viewport(max(3, self.app.output.get_size().rows // 2))
 
         @keys.add("c-end")
         def latest(event: KeyPressEvent) -> None:
@@ -489,6 +498,7 @@ class TerminalChatApp:
                             Dimension(min=0, max=max(0, self.app.output.get_size().rows - 8))),
             dont_extend_height=not self.fullscreen,
         )
+        self._body_window = body_window
         approval_panel = HSplit([
             self.approval_body,
             Window(self.approval_buttons, height=lambda: len(self._approval_options(self._approval))
@@ -526,6 +536,10 @@ class TerminalChatApp:
                 ConditionalContainer(
                     Window(FormattedTextControl(self._connection_fragments), height=1),
                     filter=Condition(lambda: self.display.connection_required),
+                ),
+                ConditionalContainer(
+                    Window(FormattedTextControl(self._search_setup_fragments), height=1),
+                    filter=Condition(lambda: self.display.search_configuration_required),
                 ),
                 ConditionalContainer(
                     Window(FormattedTextControl(self._status_fragments), height=2, wrap_lines=False),
@@ -613,12 +627,31 @@ class TerminalChatApp:
         self._follow = False
         self.invalidate()
 
+    def _scroll_viewport(self, amount: int) -> None:
+        """Move visible history immediately, preserving composer focus and text."""
+        revealing_history = not self._show_history and any(block.in_scrollback for block in self.view.blocks)
+        self._show_history = True
+        self.fragments()
+        info = self._body_window.render_info
+        height = (info.window_height if info is not None and info.window_height > 0
+                  else max(1, self.app.output.get_size().rows - 8))
+        last_top = max(0, self._line_count - height)
+        top = last_top if self._follow or revealing_history else self._body_window.vertical_scroll
+        top = max(0, min(top + amount, last_top))
+        # Window keeps its content cursor visible even when the composer has
+        # focus. Clamp that cursor into the new viewport so it cannot snap back.
+        self._row = max(top, min(self._cursor().y, top + height - 1))
+        self._follow = amount > 0 and top == last_top
+        self._show_history = not self._follow
+        self._body_window.vertical_scroll = top
+        self.invalidate()
+
     def _handler(self, block: Block | None, row: int) -> Callable[[MouseEvent], None]:
         def mouse(event: MouseEvent) -> None:
             if event.event_type == MouseEventType.SCROLL_UP:
-                self._move(-3)
+                self._scroll_viewport(-3)
             elif event.event_type == MouseEventType.SCROLL_DOWN:
-                self._move(3)
+                self._scroll_viewport(3)
             elif event.event_type == MouseEventType.MOUSE_DOWN and event.button == MouseButton.LEFT:
                 self._selection_start = self._selection_end = event.position
                 self._selecting = True
@@ -804,6 +837,44 @@ class TerminalChatApp:
             if event.event_type == MouseEventType.MOUSE_UP and event.button == MouseButton.LEFT:
                 self.app.create_background_task(self.open_connections())
         return [("underline", " [ 打开连接管理 · F3 ]  登录或检查连接后，发送下一条消息重试。", click)]
+
+    def _request_search_setup(self) -> None:
+        if self._operation is not None or self._approval is not None:
+            self.status = "请等待本轮结束后设置搜索"
+        elif self._pending is not None and not self._pending.done():
+            self._pending.set_result("/web")
+        self.invalidate()
+
+    def _search_setup_fragments(self) -> StyleAndTextTuples:
+        def click(event: MouseEvent) -> None:
+            if event.event_type == MouseEventType.MOUSE_UP and event.button == MouseButton.LEFT:
+                self._request_search_setup()
+        return [("underline", " [ 设置搜索 · F5 ]  联网搜索未启用；点击设置，无需退出聊天。", click)]
+
+    async def setup_search(
+        self, model: ModelSpec, *, provider: str = "deepseek", key_file: Path | None = None,
+    ) -> WebConfiguration:
+        """Use cancellable native password input outside the transcript."""
+        from agent_runtime.web_cli import reusable_model_search_key, search_setup_key_file
+        from agent_runtime.web_config import install_search_key, save_web_configuration
+
+        workspace = Path(self.workspace)
+        key_file = search_setup_key_file(workspace=workspace, provider=provider, key_file=key_file)
+        if key_file is None:
+            available = await asyncio.to_thread(reusable_model_search_key, provider, model)
+            # Both applications share the terminal input/output. Suspend the
+            # chat reader, then let PromptSession own password input and Ctrl+C.
+            async with in_terminal():
+                prompt: PromptSession[str] = PromptSession(input=self.app.input, output=self.app.output)
+                key = None
+                if available is not None:
+                    answer = await prompt.prompt_async("复用当前 DeepSeek 模型账号的 Key？[Y/n] ")
+                    if answer.strip().casefold() in {"", "y", "yes"}:
+                        key = available
+                if key is None:
+                    key = await prompt.prompt_async(f"{provider} API Key: ", is_password=True)
+            key_file = install_search_key(provider, key, workspace=workspace)
+        return save_web_configuration(provider, key_file, workspace=workspace)
 
     async def open_connections(self) -> None:
         """Human-only action: open the local manager; OAuth still requires a click."""
@@ -1073,7 +1144,20 @@ class TerminalChatApp:
     def _activity_fragments(self) -> StyleAndTextTuples:
         activity = self.status if self._operation and self._operation.cancelling() else self.display.activity_text()
         width = max(1, self.app.output.get_size().columns - 1)
-        return [("class:assistant", display_rows(" ✳ " + activity, width=width)[0])]
+        prefix = " " + self.display.activity_frame() + " "
+        left = prefix + activity
+        right = self.display.runtime_stats()
+        if wcswidth(left) + wcswidth(right) + 2 > width:
+            right = self.display.runtime_stats(compact=True)
+        if wcswidth(prefix) + 8 + wcswidth(right) + 2 > width:
+            right = right.split(" · ", 1)[0]
+        left_width = width - wcswidth(right) - 2
+        if left_width < wcswidth(prefix) + 2:
+            return [("class:assistant", display_rows(left, width=width)[0])]
+        if wcswidth(left) > left_width:
+            left = display_rows(left, width=max(1, left_width - 1))[0] + "…"
+        padding = " " * max(2, width - wcswidth(left) - wcswidth(right))
+        return [("class:assistant", left), ("", padding), ("class:dim", right)]
 
     def _footer(self) -> StyleAndTextTuples:
         if self._model_pending is not None:
@@ -1122,10 +1206,14 @@ class TerminalChatApp:
         self._operation = asyncio.create_task(awaitable)
         self.status = "工作中"
         async def refresh() -> None:
+            next_inputs_refresh = 0.0
+            loop = asyncio.get_running_loop()
             while True:
-                await self._refresh_inputs()
+                if loop.time() >= next_inputs_refresh:
+                    await self._refresh_inputs()
+                    next_inputs_refresh = loop.time() + 1.0
                 self.invalidate()
-                await asyncio.sleep(1)
+                await asyncio.sleep(1 / 6)
         refresh_task = asyncio.create_task(refresh())
         try:
             return await self._operation

@@ -193,7 +193,7 @@ async def test_search_resume_in_new_agent_uses_explicit_external_credential(tmp_
         assert "fake-search-secret-credential" not in repr(store.list_items(resumed.turn_id))
 
 
-def test_cli_resume_forwards_key_file_from_environment(tmp_path, monkeypatch):
+def test_cli_recover_resolves_environment_credentials_through_the_shared_sdk(tmp_path, monkeypatch):
     from typer.testing import CliRunner
 
     from agent_runtime import cli
@@ -206,7 +206,8 @@ def test_cli_resume_forwards_key_file_from_environment(tmp_path, monkeypatch):
             return _result(turn_id=turn_id, answer="resumed")
 
     def create_facade(**kwargs):
-        options.append(kwargs)
+        resolved = Agent(**kwargs)
+        options.append({**kwargs, "web_search_key_file": resolved.web_search_key_file})
         return Facade()
 
     monkeypatch.setattr(cli, "_create_agent_facade", create_facade)

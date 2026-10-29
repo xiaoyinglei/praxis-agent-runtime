@@ -13,6 +13,7 @@ from agent_runtime.terminal_render import (
     TerminalToolEventDisplay,
     bounded_result_lines,
     display_rows,
+    format_usage_summary,
     safe_terminal_text,
     web_error_message,
 )
@@ -200,6 +201,7 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         self._context_detail: Block | None = None
         self.turn_id: str | None = None
         self.connection_required = False
+        self.search_configuration_required = False
         self._new_answer = True
         self._last_activity = clock()
 
@@ -215,6 +217,9 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         super().begin_turn(reset=reset)
         self._activity_status = "等待模型响应"
         self._last_activity = self._clock()
+        # A resumed segment appends its own outcome after its new content. The
+        # pause-time snapshot stays immutable while Turn usage remains cumulative.
+        self._receipt = None
         if reset:
             if self._context_detail is not None:
                 self._context_detail.text = "\n".join(
@@ -223,13 +228,11 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             self.group = None
             self._tool_blocks.clear()
             self._projected.clear()
-            self._receipt = None
             self.turn_id = None
         self.view.invalidate()
 
     def activity_text(self) -> str:
         now = self._clock()
-        elapsed = self._elapsed_seconds + (0.0 if self._started_at is None else now - self._started_at)
         active = len({b.session_id or identity for identity, b in self._tool_blocks.items()
                       if b.operation_status == "running"})
         status = self._activity_status
@@ -240,7 +243,28 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         idle = now - self._last_activity
         if self._started_at is not None and idle >= 15:
             status += f" · 距上次活动 {int(idle)} 秒"
-        return f"{status} · {elapsed:.0f} 秒"
+        return status
+
+    def runtime_stats(self, *, compact: bool = False) -> str:
+        elapsed = max(0.0, self._elapsed_seconds + (
+            0.0 if self._started_at is None else self._clock() - self._started_at))
+        timer = f"{elapsed:.0f} 秒"
+        usage = self._usage
+        if usage is None:
+            return f"{timer} · Token 待报告" + ("" if compact else " · 缓存 未知")
+        cached = "未知" if usage.cache_read_input_tokens is None else f"{usage.cache_read_input_tokens:,}"
+        label = "已报告" if usage.usage_complete else "已报告部分"
+        if compact:
+            return f"{timer} · {label} {self._usage_count_text('total_tokens')} Token · 缓存 {cached}"
+        return (f"{timer} · {label} 输入 {self._usage_count_text('input_tokens')}"
+                f" · 输出 {self._usage_count_text('output_tokens')}"
+                f" · 缓存 {cached}")
+
+    def activity_frame(self) -> str:
+        # A small, fixed-width pulse driven by the same monotonic task clock.
+        frames = ("·", "•", "●", "•")
+        elapsed = self._elapsed_seconds + (0.0 if self._started_at is None else self._clock() - self._started_at)
+        return frames[int(max(0.0, elapsed) * 6) % len(frames)]
 
     async def emit(self, event: StreamEvent) -> None:
         self._last_activity = self._clock()
@@ -351,6 +375,8 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
         code = result.get("error_code")
         if code == "mcp_connection_required":
             self.connection_required = True
+        if code == "web_search_not_configured":
+            self.search_configuration_required = True
         if state == "failed":
             known = {
                 "command_failed": "命令执行失败；Ctrl+O 查看具体原因",
@@ -508,12 +534,15 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
                             preview = safe_terminal_text(value).replace("\n", " ")[:180]
                             block.title = f"● {label} · {preview}"
                             break
+        if self._receipt is None or self._receipt.in_scrollback:
+            self._receipt = self.view._add(Block("receipt"))
+        self._receipt.kind = "receipt"
+        self._receipt.text = format_usage_summary(result.usage) + "\n"
         if result.status == "paused":
+            self._receipt.text = "暂停时，" + self._receipt.text
             self._activity_status = "等待你的确认或回答"
             self.view.invalidate()
             return
-        if self._receipt is None:
-            self._receipt = self.view._add(Block("receipt"))
         if result.stop_reason == "cancelled":
             self._activity_status = "已停止"
             text = "已停止 · 已发生的文件修改不会回滚"
@@ -536,16 +565,18 @@ class ConversationEventDisplay(TerminalToolEventDisplay):
             }
             scope = scopes.get(result.validation_scope or "", result.validation_scope or "未声明范围")
             if result.validation_scope == "workspace_change_recorded":
-                text = "已记录工作区修改 · 未运行任务验收"
+                text = "已记录工作区修改"
             elif result.validation_status == "passed":
                 text = "✓ 已验证 · " + safe_terminal_text(scope)
             elif result.validation_status == "failed":
                 text = "! 验收未通过 · " + safe_terminal_text(scope)
             else:
-                text = "本轮已结束 · 未运行验收"
+                text = ""
         if result.files:
-            text += "\n文件引用：\n" + "\n".join(safe_terminal_text(path) for path in result.files)
-        self._receipt.text = text + "\n"
+            text += ("\n" if text else "") + "文件引用：\n" + "\n".join(
+                safe_terminal_text(path) for path in result.files
+            )
+        self._receipt.text = (text + "\n" if text else "") + format_usage_summary(result.usage) + "\n"
         diagnostics = [f"{d.code}: {d.message}" for d in result.diagnostics]
         if result.stop_reason:
             diagnostics.append("结束原因：" + result.stop_reason)

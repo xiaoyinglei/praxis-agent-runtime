@@ -27,7 +27,12 @@ _PARSER_TIMEOUT_SECONDS = 10.0
 
 
 async def extract_content_async(body: bytes, content_type: str, url: str) -> ExtractedContent:
-    """Parse untrusted document bytes in a killable worker with no inherited secrets."""
+    """Use mature HTML/PyMuPDF parsers in a bounded, killable Python worker.
+
+    CPU, wall time and IPC sizes are bounded on supported POSIX platforms.
+    Linux additionally enforces RLIMIT_AS; macOS has no claimed hard RAM cap.
+    The worker receives no caller secrets in its environment.
+    """
     result = await _parse_in_worker(body, content_type, url)
     return ExtractedContent(**{**result, "links": tuple(result["links"])})
 
@@ -37,8 +42,10 @@ async def _parse_in_worker(
 ) -> dict[str, Any]:
     if len(body) > 2_000_000:
         raise PublicWebError("web_response_too_large", "Document exceeds the parsing byte limit.")
-    if content_type.split(";", 1)[0].strip().lower() == "application/pdf" and sys.platform != "linux":
-        raise PublicWebError("web_content_unsupported", "PDF parsing requires Linux worker memory limits.")
+    payload = json.dumps({"body": base64.b64encode(body).decode(), "content_type": content_type,
+                          "url": url}).encode()
+    if len(payload) > 3_000_000:
+        raise PublicWebError("web_response_too_large", "Document exceeds the parsing input limit.")
     root = str(Path(__file__).resolve().parents[2])
     code = f"import sys; sys.path.insert(0, {root!r}); from agent_runtime.tools.web_content import _worker; _worker()"
     process = await asyncio.create_subprocess_exec(
@@ -46,11 +53,19 @@ async def _parse_in_worker(
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, start_new_session=True,
         env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, cwd="/",
     )
-    payload = json.dumps({"body": base64.b64encode(body).decode(), "content_type": content_type,
-                          "url": url}).encode()
     try:
         async with asyncio.timeout(_PARSER_TIMEOUT_SECONDS):
-            output, _ = await process.communicate(payload)
+            assert process.stdin is not None and process.stdout is not None
+            process.stdin.write(payload)
+            await process.stdin.drain()
+            process.stdin.close()
+            try:
+                output = await process.stdout.readexactly(2_000_001)
+            except asyncio.IncompleteReadError as ended:
+                output = ended.partial
+            if len(output) > 2_000_000:
+                raise PublicWebError("web_content_invalid", "Document parser exceeded its output resource limit.")
+            await process.wait()
         if process.returncode or len(output) > 2_000_000:
             raise PublicWebError("web_content_invalid", "Document parser failed or exceeded its resource limit.")
         result: dict[str, Any] = json.loads(output)
@@ -59,6 +74,8 @@ async def _parse_in_worker(
         return result
     except TimeoutError:
         raise PublicWebError("web_content_timeout", "Document parsing exceeded its time limit.") from None
+    except (BrokenPipeError, ConnectionResetError):
+        raise PublicWebError("web_content_invalid", "Document parser exited before reading its input.") from None
     except (ValueError, KeyError):
         raise PublicWebError("web_content_invalid", "Document parser returned an invalid result.") from None
     finally:

@@ -6,7 +6,7 @@ import sys
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import regex
@@ -15,8 +15,7 @@ from wcwidth import wcswidth
 if TYPE_CHECKING:
     from rich.live import Live
 
-    from agent_runtime.result import AgentUsage
-
+from agent_runtime.result import AgentUsage
 from agent_runtime.streaming.events import (
     EventType,
     ItemDeltaKind,
@@ -38,7 +37,10 @@ def format_usage_summary(usage: AgentUsage) -> str:
     label = "本轮累计 Token" if usage.usage_complete else "本轮已记录 Token（用量不完整）"
     parts = [f"输入 {usage.input_tokens:,}", f"输出 {usage.output_tokens:,}", f"总计 {usage.total_tokens:,}"]
     if usage.cache_read_input_tokens is not None:
-        parts.append(f"缓存命中 {usage.cache_read_input_tokens:,}（计入输入）")
+        rate = f"{usage.cache_read_input_tokens / usage.input_tokens:.1%}，" if usage.input_tokens else ""
+        parts.append(f"缓存命中 {usage.cache_read_input_tokens:,}（{rate}计入输入）")
+    else:
+        parts.append("缓存命中 未报告")
     if usage.reasoning_tokens is not None:
         parts.append(f"推理 {usage.reasoning_tokens:,}（计入输出）")
     return label + ": " + " · ".join(parts)
@@ -47,11 +49,12 @@ def format_usage_summary(usage: AgentUsage) -> str:
 def web_error_message(code: object) -> str:
     """Keep stable technical error codes in the log, with readable terminal summaries."""
     messages = {
+        "web_search_not_configured": "搜索服务未配置；聊天中按 F5 或选择 /web 设置，终端可用 agent setup。",
         "web_search_unconfigured": "搜索服务尚未配置，请联系部署者配置搜索后端。",
         "web_search_blocked": "搜索服务暂时限制访问，请稍后再试。",
         "web_search_invalid_response": "搜索服务返回了无法读取的页面，暂时无法取得搜索结果。",
         "web_content_empty": "正文提取为空；展开记录查看获取方式和资源限制。",
-        "web_content_unsupported": "暂不支持读取此网页的内容格式。",
+        "web_content_unsupported": "当前环境或内容格式不支持读取；展开记录查看具体原因。",
         "web_source_unavailable": "保存的网页记录不可用，请重新打开原始链接。",
         "http_error": "远端返回 HTTP 错误；展开记录查看状态码。",
         "timeout": "联网请求超时，请稍后再试。",
@@ -61,7 +64,7 @@ def web_error_message(code: object) -> str:
         "private_address": "该链接不是可访问的公网地址。",
         "nonpublic_address": "DNS 返回了非公网地址，直连已拦截；请检查 DNS 或配置可信 HTTP 代理。",
         "proxy_connection_failed": "已配置的代理拒绝了连接，请检查代理配置。",
-        "web_browser_unavailable": "浏览器读取不可用，请检查浏览器依赖与隔离环境。",
+        "web_browser_unavailable": "当前环境无法使用浏览器渲染；展开记录查看平台或依赖原因。",
         "web_browser_budget_exceeded": "浏览器加载达到资源上限，请查看加载记录。",
         "web_browser_timeout": "浏览器加载超时，请查看加载记录。",
         "web_browser_failed": "浏览器加载失败，请查看加载记录。",
@@ -382,6 +385,10 @@ class TerminalToolEventDisplay:
         self._request_settings: Mapping[str, object] = {}
         self._context_projection: Mapping[str, object] = {}
         self._usage: AgentUsage | None = None
+        self._model_attempts: dict[tuple[str, str], tuple[str, Mapping[str, object]]] = {}
+        self._usage_baseline: AgentUsage | None = None
+        self._usage_baseline_attempts: dict[tuple[str, str], str] = {}
+        self._usage_reported_fields: set[str] = set()
         self._live: Live | None = None
 
     def activity_text(self) -> str:
@@ -452,11 +459,86 @@ class TerminalToolEventDisplay:
         self._request_settings = {}
         self._context_projection = {}
         self._usage = None
+        self._model_attempts.clear()
+        self._usage_baseline = None
+        self._usage_baseline_attempts.clear()
+        self._usage_reported_fields.clear()
 
     def update_usage(self, usage: AgentUsage) -> None:
         # AgentResult already aggregates durable model attempts, including summaries.
         # Replace the snapshot: pauses, resumes and replay must never add it twice.
         self._usage = usage
+        self._usage_baseline = usage
+        self._usage_baseline_attempts = {key: state for key, (state, _) in self._model_attempts.items()}
+        self._usage_reported_fields = {"input_tokens", "output_tokens", "total_tokens"}
+
+    def _usage_count_text(self, key: str) -> str:
+        if self._usage is None or key not in self._usage_reported_fields:
+            return "待报告"
+        return f"{getattr(self._usage, key):,}"
+
+    def _update_attempt_usage(self, event: StreamEvent) -> None:
+        """Project committed attempt snapshots; result snapshots are checkpoints."""
+        identity = (event.turn_id, str(event.data["attempt_id"]))
+        status = str(event.data.get("status", ""))
+        previous = self._model_attempts.get(identity)
+        if previous is not None and previous[0] == "completed":
+            return
+        raw = event.data.get("usage")
+        usage = raw if isinstance(raw, Mapping) else {}
+        self._model_attempts[identity] = (status, usage)
+        if self._usage_baseline_attempts.get(identity) == "completed":
+            return
+        attempts = [value for key, value in self._model_attempts.items()
+                    if self._usage_baseline_attempts.get(key) != "completed"
+                    and value[0] not in {"prepared", "retry_prepared", "rejected"}]
+        reported = [value for state, value in attempts if state == "completed"]
+
+        def count(value: Mapping[str, object], key: str) -> int | None:
+            number = value.get(key)
+            return number if isinstance(number, int) and not isinstance(number, bool) and number >= 0 else None
+
+        baseline = self._usage_baseline
+        if baseline is None and not any(count(value, key) is not None for value in reported
+                                        for key in ("input_tokens", "output_tokens", "total_tokens")):
+            return
+        base = baseline or AgentUsage()
+        self._usage_reported_fields = {
+            key for key in ("input_tokens", "output_tokens", "total_tokens")
+            if baseline is not None or any(count(value, key) is not None for value in reported)
+        }
+        if any(count(value, "input_tokens") is not None and count(value, "output_tokens") is not None
+               for value in reported):
+            self._usage_reported_fields.add("total_tokens")
+        complete = (base.usage_complete and len(reported) == len(attempts)
+                    and all(count(value, key) is not None for value in reported
+                            for key in ("input_tokens", "output_tokens")))
+
+        def optional_sum(key: str, *aliases: str) -> int | None:
+            values = [next((number for name in (key, *aliases)
+                            if (number := count(value, name)) is not None), None) for value in reported]
+            if baseline is not None:
+                values.insert(0, getattr(baseline, key))
+            if not values or any(value is None for value in values):
+                return None
+            return sum(value for value in values if value is not None)
+
+        self._usage = replace(
+            base,
+            input_tokens=base.input_tokens + sum(count(value, "input_tokens") or 0 for value in reported),
+            output_tokens=base.output_tokens + sum(count(value, "output_tokens") or 0 for value in reported),
+            total_tokens=base.total_tokens + sum(
+                total if (total := count(value, "total_tokens")) is not None else
+                input_count + output_count if (input_count := count(value, "input_tokens")) is not None
+                and (output_count := count(value, "output_tokens")) is not None else 0 for value in reported),
+            cache_read_input_tokens=optional_sum("cache_read_input_tokens", "cached_input_tokens"),
+            cache_write_input_tokens=optional_sum("cache_write_input_tokens", "cache_write_tokens"),
+            reasoning_tokens=optional_sum("reasoning_tokens"),
+            model_calls=base.model_calls + sum(
+                key not in self._usage_baseline_attempts and state not in {"prepared", "retry_prepared", "rejected"}
+                for key, (state, _) in self._model_attempts.items()),
+            usage_complete=complete,
+        )
 
     def update_request_settings(self, snapshot: Mapping[str, object]) -> None:
         defaults = snapshot.get("model_defaults", {})
@@ -518,13 +600,16 @@ class TerminalToolEventDisplay:
         cached = "未知" if usage.cache_read_input_tokens is None else f"{usage.cache_read_input_tokens:,}（输入内）"
         reasoning = "未知" if usage.reasoning_tokens is None else f"{usage.reasoning_tokens:,}（输出内）"
         second = (
-            f"{label} 输入 {usage.input_tokens:,} · 输出 {usage.output_tokens:,} · 总计 {usage.total_tokens:,}"
+            f"{label} 输入 {self._usage_count_text('input_tokens')} · 输出 {self._usage_count_text('output_tokens')}"
+            f" · 总计 {self._usage_count_text('total_tokens')}"
             f" · 缓存 {cached} · 推理 {reasoning}"
         )
         if width is not None and wcswidth(second) > width:
             label = "本轮累计" if usage.usage_complete else "本轮不完整"
-            second = (f"{label}≈ 入{compact_count(usage.input_tokens)} 出{compact_count(usage.output_tokens)} "
-                      f"共{compact_count(usage.total_tokens)} 缓存入{compact_count(usage.cache_read_input_tokens)} "
+            counts = [compact_count(getattr(usage, key)) if key in self._usage_reported_fields else "待报告"
+                      for key in ("input_tokens", "output_tokens", "total_tokens")]
+            second = (f"{label}≈ 入{counts[0]} 出{counts[1]} 共{counts[2]} "
+                      f"缓存入{compact_count(usage.cache_read_input_tokens)} "
                       f"推理出{compact_count(usage.reasoning_tokens)}")
         return first, second
 
@@ -559,6 +644,7 @@ class TerminalToolEventDisplay:
         elif event.type is EventType.PLAN_UPDATED:
             self._render_plan(event)
         elif event.type is EventType.MODEL_ATTEMPT_UPDATED:
+            self._update_attempt_usage(event)
             status = event.data.get("status")
             if event.data.get("response_status") == "incomplete":
                 self._activity_status = "模型输出未完成"
@@ -649,6 +735,10 @@ class TerminalToolEventDisplay:
         self._activity_status = "等待模型"
         if reset:
             self._usage = None
+            self._model_attempts.clear()
+            self._usage_baseline = None
+            self._usage_baseline_attempts.clear()
+            self._usage_reported_fields.clear()
             self._context_projection = {}
             self._context_status = {key: value for key, value in self._context_status.items()
                                     if key == "request_settings"}

@@ -1,14 +1,8 @@
 """Browser boundary tests; real Chromium tests exercise JavaScript separately."""
 
 import asyncio
-import base64
 import importlib
 import os
-import socket
-import subprocess
-import sys
-import uuid
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -32,7 +26,7 @@ def test_broker_preserves_actual_successful_http_status(status):
                 "type": "fetch", "method": "GET", "url": "https://example.com/api", "resource_type": "Fetch",
             })
             assert reply["status"] == status
-            assert base64.b64decode(reply["body"]) == body
+            assert reply["body"] == body
         finally:
             await client.aclose()
 
@@ -55,69 +49,16 @@ def test_missing_optional_renderer_has_explicit_error(monkeypatch):
     asyncio.run(run())
 
 
-def test_macos_unavailable_before_any_http_or_worker(monkeypatch):
-    browser = browser_module()
-    monkeypatch.setattr(browser.sys, "platform", "darwin")
-    monkeypatch.setattr(browser.importlib.util, "find_spec", lambda name: object())
-
-    async def unexpected_worker(*args, **kwargs):
-        pytest.fail("Unsupported macOS renderer must not start a worker")
-
-    monkeypatch.setattr(browser.asyncio, "create_subprocess_exec", unexpected_worker)
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(lambda r: pytest.fail("HTTP must not run")))
-        try:
-            with pytest.raises(PublicWebError) as caught:
-                await browser.render_public_page(client, "https://example.com")
-            assert caught.value.code == "web_browser_unavailable"
-        finally:
-            await client.aclose()
-
-    asyncio.run(run())
-
-
-def test_worker_environment_excludes_credentials(monkeypatch, tmp_path):
+def test_browser_environment_excludes_credentials(monkeypatch, tmp_path):
     browser = browser_module()
     monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setenv("HTTPS_PROXY", "https://u:secret@example.com")
     monkeypatch.setenv("PYTHONPATH", "/untrusted")
-    environment = browser._worker_environment(str(tmp_path))
+    environment = browser._browser_environment(str(tmp_path))
     assert environment["HOME"] == str(tmp_path)
     assert "secret" not in repr(environment)
     assert "PYTHONPATH" not in environment
     assert "HTTPS_PROXY" not in environment
-
-
-def test_linux_probe_accepts_private_namespace_with_loopback_refused(monkeypatch):
-    browser = browser_module()
-    monkeypatch.setattr(browser.sys, "platform", "linux")
-    monkeypatch.setenv("PRAXIS_PARENT_NETNS", "100")
-    original_stat = os.stat
-    monkeypatch.setattr(browser.os, "stat", lambda path, **kwargs:
-                        SimpleNamespace(st_ino=200) if str(path) == "/proc/self/ns/net"
-                        else original_stat(path, **kwargs))
-
-    class Probe:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def settimeout(self, timeout):
-            pass
-
-        def connect(self, target):
-            if target[0] in {"127.0.0.1", "::1"}:
-                raise ConnectionRefusedError(111, "no listener on isolated loopback")
-            raise OSError(101, "isolated namespace has no external route")
-
-    monkeypatch.setattr(browser.socket, "socket", lambda *args: Probe())
-    browser._verify_network_denied()
-    monkeypatch.setenv("PRAXIS_PARENT_NETNS", "200")
-    with pytest.raises(browser._WorkerError):
-        browser._verify_network_denied()
 
 
 def test_broker_counts_redirects_and_decoded_bytes():
@@ -139,7 +80,7 @@ def test_broker_counts_redirects_and_decoded_bytes():
             assert initial.url == "https://example.com/start" and initial.status_code == 302
             assert broker.budget.requests == 1
             final = await broker.reply({"type": "fetch", "method": "GET", "url": "https://example.com/final"})
-            assert base64.b64decode(final['body']) == b'done'
+            assert final['body'] == b'done'
             assert broker.budget.requests == 2
             assert broker.budget.wire_bytes == 4
             assert broker.budget.decoded_bytes == 4
@@ -255,7 +196,7 @@ def test_broker_redirects_before_final_body_and_never_fetches_private_url():
             assert redirect["headers"]["location"] == "https://other.example/final.js"
             assert "body" not in redirect
             final = await broker.reply({"type": "fetch", "method": "GET", "url": "https://other.example/final.js"})
-            assert base64.b64decode(final["body"]) == b"script"
+            assert final["body"] == b"script"
             assert len(seen) == 2
             for method, url in [("POST", "https://example.com"), ("GET", "file:///etc/passwd"),
                                 ("GET", "http://127.0.0.1/secret")]:
@@ -285,7 +226,7 @@ def test_script_response_limit_preserves_default_document_limit(resource_type, e
                 assert caught.value.code == expected
             else:
                 response = await broker.reply(request)
-                assert base64.b64decode(response["body"]) == body
+                assert response["body"] == body
                 assert broker.budget.decoded_bytes == len(body)
             with pytest.raises(PublicWebError) as caught:
                 await client.get("https://example.com/document")
@@ -344,24 +285,19 @@ def test_redirect_cache_does_not_reuse_large_script_as_document():
     asyncio.run(run())
 
 
-def test_byte_and_protocol_limits():
+def test_byte_budget_is_enforced():
     browser = browser_module()
     budget = browser._Budget()
     budget.on_bytes(browser.MAX_NETWORK_BYTES, browser.MAX_NETWORK_BYTES)
     with pytest.raises(PublicWebError) as caught:
         budget.on_bytes(0, 1)
     assert caught.value.code == "web_browser_budget_exceeded"
-    for value in [b"not json\n", b"[]\n", b'{"type":"unknown"}\n']:
-        with pytest.raises(PublicWebError):
-            browser._decode_message(value)
 
 
 def test_render_deadline_includes_initial_http_fetch(monkeypatch):
     browser = browser_module()
     monkeypatch.setattr(browser.importlib.util, "find_spec", lambda name: object())
     monkeypatch.setattr(browser, "RENDER_TIMEOUT_SECONDS", 0.02)
-    monkeypatch.setattr(browser, "_sandbox_command", lambda command, directory: command)
-    monkeypatch.setattr(browser.sys, "platform", "linux")
 
     async def run():
         closed = False
@@ -386,144 +322,7 @@ def test_render_deadline_includes_initial_http_fetch(monkeypatch):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("cancel", [False, True])
-def test_worker_cleanup_on_timeout_and_cancellation(monkeypatch, tmp_path, cancel):
-    browser = browser_module()
-    pid_file = tmp_path / "pid"
-    code = (
-        "import os,time,pathlib; "
-        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
-        "time.sleep(60)"
-    )
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"ok")))
-        broker = browser._Broker(client)
-        initial = await broker.fetch("https://example.com")
-        try:
-            task = asyncio.create_task(browser._serve_worker(
-                [sys.executable, "-I", "-B", "-c", code], {}, broker, initial,
-            ))
-            for _ in range(100):
-                if pid_file.exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert pid_file.exists()
-            pid = int(pid_file.read_text())
-            if cancel:
-                task.cancel()
-                with pytest.raises(asyncio.CancelledError):
-                    await task
-            else:
-                with pytest.raises(TimeoutError):
-                    async with asyncio.timeout(0.02):
-                        await task
-            with pytest.raises(ProcessLookupError):
-                os.kill(pid, 0)
-        finally:
-            await client.aclose()
-
-    asyncio.run(run())
-
-
-@pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Requires process enumeration outside sandbox")
-def test_cleanup_reaps_detached_child_process_group(tmp_path):
-    browser = browser_module()
-    pid_file = tmp_path / "child-pid"
-    child = "import time; time.sleep(60)"
-    code = (
-        "import subprocess,sys,time,pathlib; "
-        f"child=subprocess.Popen([sys.executable,'-I','-B','-c',{child!r}],start_new_session=True); "
-        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid)); time.sleep(60)"
-    )
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"ok")))
-        broker = browser._Broker(client)
-        try:
-            initial = await broker.fetch("https://example.com")
-            task = asyncio.create_task(browser._serve_worker([sys.executable, "-I", "-B", "-c", code], {},
-                                                            broker, initial))
-            for _ in range(100):
-                if pid_file.exists():
-                    break
-                await asyncio.sleep(0.01)
-            assert pid_file.exists()
-            started = asyncio.get_running_loop().time()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-            assert asyncio.get_running_loop().time() - started < 2
-            pid = int(pid_file.read_text())
-            for _ in range(100):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                await asyncio.sleep(0.01)
-            else:
-                pytest.fail("Detached browser descendant survived cancellation")
-        finally:
-            await client.aclose()
-
-    asyncio.run(run())
-
-
-def test_oversized_worker_message_is_rejected_and_worker_closed():
-    browser = browser_module()
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"ok")))
-        broker = browser._Broker(client)
-        try:
-            initial = await broker.fetch("https://example.com")
-            code = f"import sys; sys.stdout.write('x'*{browser._RESULT_LINE_LIMIT + 100}); sys.stdout.flush()"
-            with pytest.raises(PublicWebError) as caught:
-                await browser._serve_worker([sys.executable, "-I", "-B", "-c", code], {}, broker, initial)
-            assert caught.value.code == "web_browser_protocol_error"
-        finally:
-            await client.aclose()
-
-    asyncio.run(run())
-
-
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-def test_os_sandbox_denies_real_ip_sockets(tmp_path):
-    browser = browser_module()
-    listener = socket.socket()
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    port = listener.getsockname()[1]
-    code = (
-        "import socket,os,sys; "
-        "print(os.stat('/proc/self/ns/net').st_ino,flush=True) if sys.platform.startswith('linux') else None; "
-        "s=socket.socket(); s.settimeout(1); "
-        f"s.connect(('127.0.0.1',{port}))"
-    )
-
-    async def run():
-        command = browser._sandbox_command([sys.executable, "-I", "-B", "-c", code], str(tmp_path))
-        process = await asyncio.create_subprocess_exec(*command, stdout=asyncio.subprocess.PIPE,
-                                                       stderr=asyncio.subprocess.PIPE)
-        stdout, stderr = await process.communicate()
-        assert process.returncode != 0
-        # sandbox_apply failures do not prove network denial; run this test outside
-        # an enclosing tool sandbox to obtain the real acceptance evidence.
-        assert b"sandbox_apply" not in stderr
-        if sys.platform.startswith("linux"):
-            assert int(stdout.strip()) != os.stat("/proc/self/ns/net").st_ino
-            assert any(message in stderr for message in [b"Network is unreachable", b"ConnectionRefusedError"])
-        else:
-            assert b"PermissionError" in stderr
-
-    try:
-        asyncio.run(run())
-    finally:
-        listener.close()
-
-
-@pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 def test_real_chromium_observes_actual_no_content_status():
     async def run():
         html = b'''<html><body><p id="result">pending</p><script>
@@ -548,7 +347,6 @@ def test_real_chromium_observes_actual_no_content_status():
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 def test_real_chromium_executes_delayed_fetch_at_redirected_origin():
     browser = browser_module()
     pytest.importorskip("playwright.async_api")
@@ -589,7 +387,6 @@ def test_real_chromium_executes_delayed_fetch_at_redirected_origin():
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 def test_real_chromium_renders_spa_with_33_scripts_and_six_stylesheets():
     browser = browser_module()
     pytest.importorskip("playwright.async_api")
@@ -624,7 +421,6 @@ def test_real_chromium_renders_spa_with_33_scripts_and_six_stylesheets():
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 def test_real_chromium_retains_evidence_after_failed_optional_xhr():
     browser = browser_module()
     pytest.importorskip("playwright.async_api")
@@ -652,7 +448,6 @@ def test_real_chromium_retains_evidence_after_failed_optional_xhr():
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 @pytest.mark.parametrize("cors_allowed", [True, False])
 def test_real_chromium_cross_origin_get_preserves_server_cors(cors_allowed):
     browser = browser_module()
@@ -689,7 +484,6 @@ def test_real_chromium_cross_origin_get_preserves_server_cors(cors_allowed):
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 def test_real_chromium_skips_visual_assets_and_keeps_text_requests(monkeypatch):
     browser = browser_module()
     pytest.importorskip("playwright.async_api")
@@ -738,7 +532,6 @@ def test_real_chromium_skips_visual_assets_and_keeps_text_requests(monkeypatch):
 
 
 @pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1", reason="Explicit OS/browser integration run")
-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS Seatbelt cannot nest Chromium sandbox")
 @pytest.mark.parametrize("script", [
     "fetch('http://127.0.0.1/secret')",
     "fetch('/api', {method:'POST',body:'private'})",
@@ -770,78 +563,6 @@ def test_real_chromium_blocks_disallowed_requests(script):
     asyncio.run(run())
 
 
-@pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1" or sys.platform != "darwin",
-                    reason="Explicit macOS incompatibility validation")
-def test_macos_browser_sandbox_incompatibility_fails_closed():
-    browser = browser_module()
-    pytest.importorskip("playwright.async_api")
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(
-            lambda r: httpx.Response(200, content=b"<p>public page</p>", headers={"Content-Type": "text/html"}),
-        ))
-        try:
-            with pytest.raises(PublicWebError) as caught:
-                await browser.render_public_page(client, "https://example.com")
-            assert caught.value.code == "web_browser_unavailable"
-        finally:
-            await client.aclose()
-
-    asyncio.run(run())
-
-
-@pytest.mark.skipif(os.environ.get("PRAXIS_TEST_BROWSER") != "1" or not sys.platform.startswith("linux"),
-                    reason="Real Linux public-renderer PID namespace validation")
-def test_public_linux_worker_early_exit_kills_detached_descendants(monkeypatch, tmp_path):
-    browser = browser_module()
-    # This fixture validates the actual public subprocess/isolation lifecycle;
-    # its deliberately crashing worker does not import the browser dependency.
-    monkeypatch.setattr(browser.importlib.util, "find_spec", lambda name: object())
-    marker = "praxis-browser-child-" + uuid.uuid4().hex
-    worker = tmp_path / "early_exit_worker.py"
-    worker.write_text(
-        "import os,subprocess,sys,time,pathlib,json\n"
-        "sys.stdin.buffer.readline()\n"
-        "ready=pathlib.Path(os.environ['HOME'])/'child-ready'\n"
-        "code=\"import os,time,pathlib; pathlib.Path(os.environ['HOME']+'/child-ready').write_text('ready'); "
-        "time.sleep(60)\"\n"
-        f"subprocess.Popen([sys.executable,'-I','-B','-c',code,{marker!r}],start_new_session=True)\n"
-        "while not ready.exists(): time.sleep(.01)\n"
-        "print(json.dumps({'type':'fetch','method':'GET','url':'https://example.com/child-started'}),flush=True)\n"
-        "sys.stdin.buffer.readline()\n"
-        "os._exit(0)\n"
-    )
-    monkeypatch.setattr(browser, "__file__", str(worker))
-    monkeypatch.setattr(browser, "RENDER_TIMEOUT_SECONDS", 3)
-
-    def remaining_children():
-        listing = subprocess.run(["/bin/ps", "-axo", "pid=,args="], check=True, capture_output=True, text=True)
-        return [int(line.split(maxsplit=1)[0]) for line in listing.stdout.splitlines() if marker in line]
-
-    async def run():
-        seen = []
-
-        def handler(request):
-            seen.append(str(request.url))
-            return httpx.Response(200, content=b"<p>page</p>", headers={"Content-Type": "text/html"})
-
-        client = PublicWebClient(transport=httpx.MockTransport(handler))
-        started = asyncio.get_running_loop().time()
-        try:
-            with pytest.raises(PublicWebError) as caught:
-                await browser.render_public_page(client, "https://example.com/page")
-            assert caught.value.code == "web_browser_unavailable"
-            assert "https://example.com/child-started" in seen
-            assert asyncio.get_running_loop().time() - started < 2
-            assert remaining_children() == []
-        finally:
-            await client.aclose()
-            for pid in remaining_children():
-                os.kill(pid, 9)
-
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize('code', ['invalid_url', 'nonpublic_address', 'response_too_large',
                                   'web_browser_budget_exceeded'])
 def test_blocked_subresource_preserves_broker_and_records_actual_reason(code):
@@ -869,35 +590,6 @@ def test_blocked_subresource_preserves_broker_and_records_actual_reason(code):
     asyncio.run(run())
 
 
-def test_worker_snapshot_reports_bounded_blocked_actions_and_budget_facts(tmp_path):
-    browser = browser_module()
-    worker = tmp_path / 'worker.py'
-    worker.write_text('''import sys,json,base64
-json.loads(sys.stdin.readline())
-print(json.dumps({'type':'blocked','reason':'method_not_get'}),flush=True)
-print(json.dumps({'type':'result','url':'https://example.com/page',
- 'body':base64.b64encode(b'<main>Evidence</main>').decode(),
- 'load_timeouts':['networkidle']}),flush=True)
-''')
-
-    async def run():
-        client = PublicWebClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b'initial')))
-        broker = browser._Broker(client)
-        try:
-            initial = await broker.fetch('https://example.com/page')
-            result = await browser._serve_worker([sys.executable, str(worker)], {}, broker, initial)
-            assert result.body == b'<main>Evidence</main>'
-            facts = result.render_diagnostics
-            assert facts['blocked_actions'] == {'method_not_get': 1}
-            assert facts['load_timeouts'] == ['networkidle']
-            assert facts['requests'] == 1 and facts['wire_bytes'] == facts['decoded_bytes'] == 7
-            assert facts['dom_bytes'] == len(result.body)
-            assert 'method_not_get' in result.warning
-        finally:
-            await client.aclose()
-    asyncio.run(run())
-
-
 @pytest.mark.parametrize('reason', ['invented', 'POST https://example.com/?secret=value', 'x' * 1024])
 def test_blocked_action_protocol_rejects_unbounded_or_unknown_reasons(reason):
     browser = browser_module()
@@ -906,8 +598,7 @@ def test_blocked_action_protocol_rejects_unbounded_or_unknown_reasons(reason):
     assert caught.value.code == 'web_browser_protocol_error'
 
 
-@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1' or sys.platform == 'darwin',
-                    reason='Explicit Linux Chromium integration run')
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1', reason='Explicit Chromium integration run')
 def test_real_chromium_networkidle_timeout_preserves_acquired_dom():
     browser = browser_module()
     pytest.importorskip('playwright.async_api')
@@ -938,12 +629,9 @@ def test_real_chromium_networkidle_timeout_preserves_acquired_dom():
 def test_browser_failure_reports_actual_budget_facts_without_snapshot(monkeypatch):
     browser = browser_module()
     monkeypatch.setattr(browser.importlib.util, 'find_spec', lambda name: object())
-    monkeypatch.setattr(browser.sys, 'platform', 'linux')
-    monkeypatch.setattr(browser, '_sandbox_command', lambda command, directory: command)
-    monkeypatch.setattr(browser, '_worker_environment', lambda directory: {})
-    async def fail(command, environment, broker, initial, **options):
+    async def fail(broker, initial, **options):
         raise PublicWebError('web_browser_budget_exceeded', 'DOM exceeded its limit.')
-    monkeypatch.setattr(browser, '_serve_worker', fail)
+    monkeypatch.setattr(browser, '_render_with_playwright', fail)
 
     async def run():
         client = PublicWebClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b'page')))
@@ -953,6 +641,223 @@ def test_browser_failure_reports_actual_budget_facts_without_snapshot(monkeypatc
             facts = caught.value.render_diagnostics
             assert facts['requests'] == 1 and facts['wire_bytes'] == facts['decoded_bytes'] == 4
             assert facts['snapshot_available'] is False
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
+def test_missing_managed_executable_has_install_guidance(monkeypatch, tmp_path):
+    pytest.importorskip('playwright.async_api')
+    monkeypatch.setenv('PLAYWRIGHT_BROWSERS_PATH', str(tmp_path / 'missing-managed-browsers'))
+
+    async def run():
+        client = PublicWebClient(transport=httpx.MockTransport(
+            lambda _: httpx.Response(200, content=b'<main>source</main>')))
+        try:
+            with pytest.raises(PublicWebError) as caught:
+                await browser_module().render_public_page(client, 'https://example.com/page')
+            assert caught.value.code == 'web_browser_unavailable'
+            assert 'uv sync --extra browser' in str(caught.value)
+            assert 'uv run python -m playwright install chromium' in str(caught.value)
+            assert caught.value.render_diagnostics['os_network_isolation'] is False
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1', reason='Real managed Chromium integration run')
+@pytest.mark.parametrize('target', ['http://127.0.0.1/secret', 'https://example.com:8443/secret'])
+def test_real_chromium_redirect_target_is_denied_before_transport(target):
+    async def run():
+        seen = []
+        html = b'''<main>retained public evidence</main><script>
+          fetch('/jump').catch(()=>{});
+        </script>'''
+        def handler(request):
+            seen.append(str(request.url))
+            if request.url.path == '/jump':
+                return httpx.Response(302, headers={'location': target})
+            return httpx.Response(200, content=html, headers={'content-type': 'text/html'})
+        client = PublicWebClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await browser_module().render_public_page(client, 'https://example.com/page')
+            assert b'retained public evidence' in result.body
+            assert seen == ['https://example.com/page', 'https://example.com/jump']
+            assert result.render_diagnostics['blocked_actions'] == {'invalid_url': 1}
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1', reason='Real managed Chromium integration run')
+def test_real_chromium_does_not_forward_page_credentials_or_request_headers():
+    async def run():
+        seen = []
+        html = b'''<main>public evidence</main><script>
+          document.cookie='private=value';
+          fetch('/api', {headers:{'Authorization':'Bearer private', 'X-Private':'value'}}).catch(()=>{});
+        </script>'''
+        def handler(request):
+            seen.append(request)
+            assert all(key not in request.headers for key in ['cookie', 'authorization', 'x-private'])
+            return httpx.Response(200, content=html if request.url.path == '/page' else b'ok',
+                                  headers={'content-type': 'text/html' if request.url.path == '/page'
+                                           else 'text/plain'})
+        client = PublicWebClient(transport=httpx.MockTransport(handler))
+        try:
+            result = await browser_module().render_public_page(client, 'https://example.com/page')
+            assert len(seen) == 2
+            assert result.render_diagnostics['browser_mode'] == 'trusted_local_brokered'
+            assert result.render_diagnostics['chromium_sandbox'] is True
+            assert result.render_diagnostics['os_network_isolation'] is False
+        finally:
+            await client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1', reason='Real managed Chromium integration run')
+@pytest.mark.parametrize('cancel', [False, True])
+def test_real_chromium_timeout_and_cancellation_close_context_browser_and_driver(monkeypatch, cancel):
+    api = pytest.importorskip('playwright.async_api')
+    browser = browser_module()
+    original_launch = api.BrowserType.launch
+    original_context = api.Browser.new_context
+    original_playwright = api.async_playwright
+    closed = []
+    launched = []
+    options_seen = []
+
+    async def launch(owner, **options):
+        options_seen.append(options)
+        result = await original_launch(owner, **options)
+        launched.append(result)
+        result.on('disconnected', lambda: closed.append('browser'))
+        return result
+
+    async def new_context(owner, **options):
+        result = await original_context(owner, **options)
+        result.on('close', lambda: closed.append('context'))
+        return result
+
+    def playwright():
+        manager = original_playwright()
+        original_start = manager.start
+        async def start():
+            driver = await original_start()
+            original_stop = driver.stop
+            async def stop():
+                await original_stop()
+                closed.append('driver')
+            driver.stop = stop
+            return driver
+        manager.start = start
+        return manager
+
+    monkeypatch.setattr(api.BrowserType, 'launch', launch)
+    monkeypatch.setattr(api.Browser, 'new_context', new_context)
+    monkeypatch.setattr(api, 'async_playwright', playwright)
+    if not cancel:
+        monkeypatch.setattr(browser, 'RENDER_TIMEOUT_SECONDS', 5)
+        async def stalled_content(owner):
+            await asyncio.sleep(60)
+        monkeypatch.setattr(api.Page, 'content', stalled_content)
+
+    async def run():
+        entered = asyncio.Event()
+        released = asyncio.Event()
+        async def handler(request):
+            if request.url.path == '/hang':
+                entered.set()
+                try:
+                    await asyncio.sleep(60)
+                finally:
+                    released.set()
+            return httpx.Response(200, content=b'<main>evidence</main><script>fetch("/hang")</script>',
+                                  headers={'content-type': 'text/html'})
+        client = PublicWebClient(transport=httpx.MockTransport(handler))
+        task = asyncio.create_task(browser.render_public_page(client, 'https://example.com/page'))
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(PublicWebError) as caught:
+                    await task
+                assert caught.value.code == 'web_browser_timeout'
+            assert released.is_set()
+            assert closed == ['context', 'browser', 'driver']
+            assert launched and all(not item.is_connected() for item in launched)
+            assert options_seen[0]['chromium_sandbox'] is True
+            assert 'channel' not in options_seen[0] and 'executable_path' not in options_seen[0]
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await client.aclose()
+    asyncio.run(run())
+
+
+def test_cancellation_during_playwright_start_stops_the_started_driver(monkeypatch):
+    api = pytest.importorskip('playwright.async_api')
+    original_playwright = api.async_playwright
+
+    async def run():
+        entered = asyncio.Event()
+        drivers = []
+        stopped = []
+        def playwright():
+            manager = original_playwright()
+            original_start = manager.start
+            async def start():
+                driver = await original_start()
+                drivers.append(driver)
+                original_stop = driver.stop
+                async def stop():
+                    await original_stop()
+                    stopped.append(True)
+                driver.stop = stop
+                entered.set()
+                # Exercise cancellation while the owning API is still starting.
+                await asyncio.sleep(0.05)
+                return driver
+            manager.start = start
+            return manager
+        monkeypatch.setattr(api, 'async_playwright', playwright)
+        client = PublicWebClient(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=b'page')))
+        task = asyncio.create_task(browser_module().render_public_page(client, 'https://example.com/page'))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert stopped == [True]
+        finally:
+            for driver in drivers:
+                await driver.stop()
+            await client.aclose()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(os.environ.get('PRAXIS_TEST_BROWSER') != '1', reason='Real managed Chromium integration run')
+def test_real_chromium_reports_unsupported_redirected_script_navigation():
+    async def run():
+        seen = []
+        def handler(request):
+            seen.append(str(request.url))
+            if request.url.path == '/jump':
+                return httpx.Response(302, headers={'location': 'https://final.example/page'})
+            body = b'<main>Final document</main>' if request.url.host == 'final.example' else (
+                b'<main>First document</main><script>setTimeout(()=>location.href="/jump",200)</script>')
+            return httpx.Response(200, content=body, headers={'content-type': 'text/html'})
+        client = PublicWebClient(transport=httpx.MockTransport(handler))
+        try:
+            with pytest.raises(PublicWebError) as caught:
+                await browser_module().render_public_page(client, 'https://example.com/page')
+            assert caught.value.code == 'web_browser_request_blocked'
+            assert caught.value.render_diagnostics['unsupported_features'] == ['redirected_document_navigation']
+            assert seen == ['https://example.com/page', 'https://example.com/jump', 'https://final.example/page']
         finally:
             await client.aclose()
     asyncio.run(run())

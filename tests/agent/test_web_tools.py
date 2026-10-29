@@ -311,16 +311,13 @@ async def test_request_budget_denies_before_network_and_cache_does_not_consume_i
 
 
 @pytest.mark.anyio
-async def test_pdf_worker_requires_linux_memory_limit():
-    import sys
-
+async def test_invalid_pdf_reports_content_error_on_supported_platforms():
     from agent_runtime.tools.web_content import extract_content_async
     from agent_runtime.tools.web_http import PublicWebError
 
-    if sys.platform == "linux":
-        pytest.skip("non-Linux fail-closed check")
-    with pytest.raises(PublicWebError, match="Linux"):
+    with pytest.raises(PublicWebError) as failure:
         await extract_content_async(b"fake pdf", "application/pdf", "https://example.com/doc.pdf")
+    assert failure.value.code == "web_content_invalid"
 
 
 @pytest.mark.anyio
@@ -358,15 +355,11 @@ async def test_parser_timeout_and_cancellation_reap_worker(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_linux_pdf_worker_reads_text_under_resource_limits():
-    import sys
-
+async def test_pdf_worker_reads_text_under_platform_resource_limits():
     import pymupdf
 
     from agent_runtime.tools.web_content import extract_content_async
 
-    if sys.platform != "linux":
-        pytest.skip("Linux worker requires Linux")
     with pymupdf.open() as doc:
         doc.new_page().insert_text((72, 72), "Linux public document")
         data = doc.tobytes()

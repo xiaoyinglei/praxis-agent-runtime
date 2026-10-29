@@ -235,6 +235,95 @@ def _model_spec(model_id: str) -> ModelSpec:
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("original_provider", [None, "tavily"])
+async def test_search_settings_are_local_and_apply_to_the_next_turn_with_existing_history(tmp_path, original_provider):
+    from agent_runtime.terminal_app import TerminalChatApp
+    from agent_runtime.web_config import WebConfiguration
+
+    key = tmp_path / "search.key"
+    opened, closed, submitted = [], [], []
+    results = [_result(), _result()]
+
+    class Session:
+        def __init__(self, index):
+            self.index = index
+        def current_model(self):
+            return _model_spec("test")
+        async def close(self):
+            closed.append(self.index)
+        async def submit(self, query, **kwargs):
+            assert query != "/web", "settings must never reach the model"
+            submitted.append(query)
+            return results[self.index]
+
+    class Facade:
+        workspace_path = tmp_path
+        web_search_provider = original_provider
+        web_search_key_file = key if original_provider else None
+        def current_model(self):
+            return _model_spec("test")
+        @asynccontextmanager
+        async def session(self, **options):
+            opened.append((self.web_search_provider, self.web_search_key_file, options))
+            yield Session(len(opened) - 1)
+
+    class UI(TerminalChatApp):
+        commands = iter(["first", "/web", "search", "/exit"])
+        async def prompt(self, **kwargs):
+            if not opened:
+                assert self.display.search_configuration_required is (original_provider is None)
+            return next(self.commands)
+        async def setup_search(self, model, *, provider="deepseek", key_file=None):
+            assert model.id == "test"
+            assert provider == (original_provider or "deepseek")
+            assert key_file == (key if original_provider else None)
+            return WebConfiguration(provider, key, "configuration")
+
+    facade = Facade()
+    ui = UI(model="test", workspace=str(tmp_path))
+    await cli._chat_facade_loop(facade, max_tokens_total=None, _ui=ui)
+    assert submitted == ["first", "search"]
+    assert closed == [0] and len(opened) == 2
+    assert opened[1][:2] == (original_provider or "deepseek", key)
+    assert opened[1][2]["previous_turn_id"] == results[0].turn_id
+    assert not ui.display.search_configuration_required
+
+
+@pytest.mark.anyio
+async def test_search_setup_preserves_the_latest_session_model_in_a_real_chat(tmp_path, monkeypatch):
+    from agent_runtime import Agent
+    from agent_runtime.terminal_app import TerminalChatApp
+    from agent_runtime.web_config import WebConfiguration
+    from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
+
+    agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "chat.sqlite", model_session_path=None,
+                  enable_workspace_mcp=False)
+    monkeypatch.setattr(agent, "_model_factory", lambda: PublicHarnessModel())
+    selected = []
+    open_session = agent.session
+
+    @asynccontextmanager
+    async def record_session(**options):
+        async with open_session(**options) as session:
+            selected.append(session.current_model().id)
+            yield session
+
+    monkeypatch.setattr(agent, "session", record_session)
+
+    class UI(TerminalChatApp):
+        commands = iter(["/model switch deepseek-flash", "first", "/model switch deepseek-v4-pro",
+                         "/web", "second", "/exit"])
+        async def prompt(self, **kwargs):
+            return next(self.commands)
+        async def setup_search(self, model, **kwargs):
+            assert model.id == "deepseek-v4-pro"
+            return WebConfiguration(None, None, "configuration")
+
+    await cli._chat_facade_loop(agent, max_tokens_total=None, _ui=UI(model="test", workspace=str(tmp_path)))
+    assert selected == ["deepseek-flash", "deepseek-v4-pro"]
+
+
+@pytest.mark.anyio
 async def test_chat_slash_commands_do_not_reach_the_agent(
     tmp_path: Path,
     monkeypatch: MonkeyPatch,

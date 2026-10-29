@@ -56,6 +56,7 @@ from agent_runtime.terminal_render import (
     web_error_message,
 )
 from agent_runtime.tools.web_limits import WebLimits
+from agent_runtime.web_cli import web_app
 from agent_runtime.workspace import DEFAULT_CHECKPOINT_PATH, DEFAULT_MODEL_SESSION_PATH
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ worktree_app = typer.Typer(add_completion=False, no_args_is_help=True)
 agent_app.add_typer(model_app, name="model", help="查看和切换当前模型会话。")
 agent_app.add_typer(mcp_app, name="mcp", help="注册、认证和检查 MCP 连接。")
 agent_app.add_typer(worktree_app, name="worktree", help="管理并行会话的 Git worktree。")
+agent_app.add_typer(web_app, name="web", help="配置和检查搜索与网页读取。")
 agent_app.command("setup")(setup)
 agent_app.command("connections")(connections_command)
 agent_app.command("commands")(commands)
@@ -1046,12 +1048,15 @@ async def _chat_facade_loop(
         chat_approval_mode = "auto"
     if _ui:
         _ui.approval_mode = chat_approval_mode or "历史权限待加载"
+        _ui.display.search_configuration_required = getattr(facade, "web_search_provider", False) is None
     pending_files: list[str] = []
     default_chat_knowledge = getattr(facade, "knowledge", None)
     chat_workspace = default_chat_workspace
     model_id = "历史聊天" if resume_thread_id is not None else facade.current_model().id
     if _ui is None:
         _print_startup_banner(model_id)
+        if getattr(facade, "web_search_provider", False) is None:
+            print("联网搜索未启用；输入 /web 设置搜索（隐藏输入 Key，无需退出聊天）。")
     from contextlib import AsyncExitStack
 
     async with AsyncExitStack() as stack:
@@ -1236,6 +1241,47 @@ async def _chat_facade_loop(
                 return
             if query == "/help":
                 _print_chat_help()
+                continue
+            if query == "/web":
+                from agent_runtime.web_cli import configure_search
+
+                if ((last_result is not None and last_result.status in {"paused", "interrupted"})
+                        or (selected_chat is not None and selected_chat.active_turn_id
+                            and selected_chat.status in {"paused", "interrupted"})):
+                    print("请先处理暂停的任务，或用 /new 开始新聊天后设置搜索。")
+                    continue
+                if _ui is None and not _is_tty(sys.stdin):
+                    print("搜索设置需要交互终端隐藏输入 Key；请在终端运行 agent setup。")
+                    continue
+                try:
+                    current_model = (session or facade).current_model()
+                    provider = facade.web_search_provider or "deepseek"
+                    key_file = facade.web_search_key_file
+                    configuration = (await _ui.setup_search(current_model, provider=provider, key_file=key_file)
+                                     if _ui else await asyncio.to_thread(
+                                         configure_search, workspace=Path(default_chat_workspace), model=current_model,
+                                         provider=provider, key_file=key_file,
+                                     ))
+                    # Tool definitions belong to the next Turn. Reopen idle
+                    # resources while keeping the transcript anchor and model.
+                    if session is not None:
+                        facade.model = current_model.id
+                        facade._followup_model_id = None
+                        previous_turn_id = current_turn_id
+                        await session.close()
+                        session = None
+                    facade.web_search_provider = configuration.provider
+                    facade.web_search_key_file = configuration.key_file
+                    if _ui:
+                        _ui.display.search_configuration_required = configuration.provider is None
+                        _ui.invalidate()
+                    print(f"搜索已配置：{configuration.provider}；下一条消息即可使用，无需重启。")
+                except (EOFError, KeyboardInterrupt, click.Abort):
+                    print("已取消搜索设置，当前聊天未更改。")
+                except (OSError, ValueError) as error:
+                    from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
+
+                    print("搜索设置未完成：" + safe_terminal_text(redact_sensitive_text(error)))
                 continue
             if query == "/attach" or query.startswith("/attach "):
                 raw = query.removeprefix("/attach").strip()
@@ -1715,6 +1761,8 @@ async def _chat_facade_loop(
                 session = await open_session(frozen_turn_id=saved_result.turn_id)
             resume_driver = session if session is not None else facade
             event_display.begin_turn()
+            if saved_result is not None:
+                event_display.update_usage(saved_result.usage)
             try:
                 if saved_result is not None:
                     assert saved_action is not None
@@ -2451,11 +2499,11 @@ def agent_chat(
         str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+        Path | None, typer.Option("--web-search-key-file",
                                   help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+        str | None, typer.Option("--web-search-provider",
                                  help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限策略 JSON/TOML 文件")] = None,
@@ -2647,11 +2695,11 @@ def agent_run(
         str | None, typer.Option("--web-proxy", help="可信 HTTP(S) 网页代理；direct 强制直连；默认读取启动环境"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+        Path | None, typer.Option("--web-search-key-file",
                                   help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+        str | None, typer.Option("--web-search-provider",
                                  help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     web_limits_file: Annotated[
@@ -2789,11 +2837,11 @@ def agent_resume(
         Path | None, typer.Option("--web-limits", envvar="PRAXIS_WEB_LIMITS", help="新 Turn 的有界网页预算 JSON"),
     ] = None,
     web_search_key_file: Annotated[
-        Path | None, typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+        Path | None, typer.Option("--web-search-key-file",
                                  help="工作区外的受保护搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+        str | None, typer.Option("--web-search-provider",
                                  help="deepseek | brave | tavily；默认未配置则搜索不可用；仅提供密钥时用 Brave"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,
@@ -2850,11 +2898,11 @@ def agent_recover(
     ] = None,
     web_search_key_file: Annotated[
         Path | None,
-        typer.Option("--web-search-key-file", envvar="PRAXIS_WEB_SEARCH_KEY_FILE",
+        typer.Option("--web-search-key-file",
                      help="工作区外、仅所有者可读的搜索服务密钥文件"),
     ] = None,
     web_search_provider: Annotated[
-        str | None, typer.Option("--web-search-provider", envvar="PRAXIS_WEB_SEARCH_PROVIDER",
+        str | None, typer.Option("--web-search-provider",
                                  help="deepseek | brave | tavily；恢复时须与原 Turn 的搜索服务一致"),
     ] = None,
     permissions: Annotated[Path | None, typer.Option("--permissions", help="当前权限上限；旧授权不能扩大它")] = None,

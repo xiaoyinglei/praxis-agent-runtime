@@ -163,7 +163,8 @@ def test_result_receipt_never_turns_done_into_verified_or_claims_file_exists():
     display = ConversationEventDisplay(view)
     display.begin_turn()
     display.present_result(result(files=("/not-existing/report.docx",)))
-    assert "未运行验收" in view.plain_text()
+    assert "未运行验收" not in view.plain_text()
+    assert "本轮累计 Token" in view.plain_text()
     assert "已验证" not in view.plain_text() and "已生成" not in view.plain_text()
     display.present_result(
         result(files=("/not-existing/report.docx",), validation_status="passed", validation_scope="acceptance_command")
@@ -327,7 +328,8 @@ def test_recorded_workspace_change_does_not_claim_task_validation():
     display = ConversationEventDisplay(view)
     display.present_result(result(validation_status="passed", validation_scope="workspace_change_recorded"))
     assert "已验证" not in view.plain_text()
-    assert "已记录工作区修改" in view.plain_text() and "未运行任务验收" in view.plain_text()
+    assert "已记录工作区修改" in view.plain_text()
+    assert "未运行任务验收" not in view.plain_text()
 
 
 @pytest.mark.anyio

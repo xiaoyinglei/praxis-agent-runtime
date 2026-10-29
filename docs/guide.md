@@ -43,6 +43,8 @@ uv run agent chat
 
 公开版默认使用 DeepSeek（`deepseek-flash`），首次向导直接进入默认模型的 API Key 输入。内置目录也提供已核验声明的其他服务商型号；安装包不包含开发者的凭据、个人模型注册表或 MLX 模型权重。向导验证失败不会改变当前模型选择，也不会保存本次输入的新 Key。模型验证会调用真实服务，产生实际用量。
 
+模型连接验证后，向导直接提供联网搜索设置，无需另记搜索命令。使用官方 DeepSeek 模型时，可以明确选择复用当前账号 Key；其他模型用户单独隐藏输入 DeepSeek 搜索 Key。已有搜索配置不会被覆盖；选择跳过会保存选择，后续不反复询问。自动化或只配置模型时使用 `agent setup --no-web`，不会更改已有搜索设置。搜索配置步骤不发真实搜索请求，不据此声明账号或服务已验证。
+
 使用目录已有型号时，运行 `agent setup --model MODEL_ID` 隐藏输入对应 Key，不需要手填上下文容量。目录外的服务商或本地模型按下文的 `agent model add` 接入；本地模型服务必须已经启动。
 
 ```bash
@@ -145,9 +147,9 @@ uv run agent run "解释项目入口" --no-require-workspace-change
 uv run agent run "修复失败的边界条件并验证"
 ```
 
-`chat` 默认使用全屏终端界面；`--ui inline` 使用原生滚动历史。操作和简短结果依次显示，当前进度位于输入框上方。Ctrl+O 切换详细记录，可查看参数、长输出、原始错误和用量；再次按下返回，保留输入草稿。Ctrl+J 换行，Ctrl+C 停止当前执行；Esc 优先关闭菜单或详情，执行中可请求停止。停止请求发出后会等待清理结果，结果不确定时会明确提示。默认使用终端原生选择，F2 开启应用鼠标处理，`/copy` 请求复制最近回答。
+`chat` 默认使用全屏终端界面，支持鼠标滚轮和触控板回看历史；PgUp/PgDn 可以在输入时翻页，保留输入焦点和草稿。`--ui inline` 使用原生滚动历史。操作和简短结果依次显示，当前进度位于输入框上方。Ctrl+O 切换详细记录，可查看参数、长输出、原始错误和请求设置；再次按下返回，保留输入草稿。Ctrl+J 换行，Ctrl+C 停止当前执行；Esc 优先关闭菜单或详情，执行中可请求停止。停止请求发出后会等待清理结果，结果不确定时会明确提示。全屏默认开启应用鼠标处理，行内默认使用终端原生选择；F2 切换两种方式，`/copy` 请求复制最近回答。
 
-单步失败会留在对应操作下，不代表整项任务失败；只有实际开始恢复时才显示恢复状态。“本轮已结束”也不代表任务已验收：完成摘要会区分“未运行验收”“已验证”和“验收未通过”，并展示实际验证范围。文件路径仅作为文件引用，不代表内容和排版已经验证。
+单步失败会留在对应操作下，不代表整项任务失败；只有实际开始恢复时才显示恢复状态。普通聊天结束后直接显示本轮用量，不追加“本轮已结束 · 未运行验收”。运行过明确验收时，保留“已验证”或“验收未通过”及实际范围；未验收仍不会被声明为验证通过。文件路径仅作为文件引用，不代表内容和排版已经验证。
 
 同一聊天可以连续追问。执行中直接输入补充要求并按 Enter：输入先持久化，界面显示“补充已接收 · 等待应用”，进入下一次普通模型请求后显示“已应用”。模型正在生成时收到的新要求会阻止旧答复宣布完成；已启动的工具收集真实结果，尚未启动的旧动作不再执行。长工具执行期间补充保持等待应用，需要立即停止时使用 Ctrl+C；已发生的修改不会回滚。
 
@@ -181,7 +183,9 @@ uv run agent recover turn_ID --action continue
 
 需要确认的任务可以在聊天界面中完成审批；非交互运行会暂停并显示恢复入口，不会自动批准。执行步骤预算使用 `--max-steps`；`--rollout-db` 指定完整事件与状态数据库。
 
-每轮结束、失败或暂停等待审批时，默认显示本轮累计输入、输出和总 Token，以及提供方已报告的缓存命中和推理用量。缓存命中已包含在输入中，推理已包含在输出中，不会重复相加。用量包含该 Turn 的摘要和重试请求；恢复后继续累计。连接结果不确定时，已记录的 Token 会标注“用量不完整”。这些字段也可从 SDK 的 `result.usage` 读取。
+每轮结束、失败或暂停等待审批时，默认显示本轮累计输入、输出和总 Token，以及提供方已报告的缓存命中 token 数、命中比例和推理用量，无需开启详情。缓存未报告时明确标记“未报告”，不当作零命中。缓存命中已包含在输入中，推理已包含在输出中，不会重复相加。用量包含该 Turn 的摘要和重试请求；恢复后继续累计。连接结果不确定时，已记录的 Token 会标注“用量不完整”。这些字段也可从 SDK 的 `result.usage` 读取。
+
+任务进行中，输入框上方显示轻量脉冲动画与当前操作，右侧显示本轮耗时、已报告的输入/输出 Token 和缓存命中数；窄终端自动缩减字段。等待用户审批的暂停时间不计入执行耗时。Token 随实际模型请求记录更新，尚未报告时显示“待报告”，不按输出字符估算；恢复同一 Turn 时继续累计，重复事件不重复计数。
 
 ## 并行会话：Worktree 隔离
 
@@ -513,15 +517,29 @@ uv run --extra rag rag --help
 
 ## 公网检索
 
+聊天中尚未启用搜索时，会显示“设置搜索 · F5”入口；可点击或按 F5 打开隐藏输入设置，也可从命令菜单选择 `/web`。Key 不发送给模型、不进入消息或工具参数；保存后下一条消息即可使用，无需重启，现有聊天历史和输入草稿保留。输入时可按 Ctrl+C 取消并返回聊天。执行中的任务不会被切换后端；暂停任务须先处理或开始新聊天。
+
 `web_search` 与 `web_fetch` 默认向 CLI 提供搜索与网页阅读工具。它们只能访问通过检查的公网地址，不向工具开放任意内网。已配置的搜索会把查询发送给所选服务，读取网页会对目标站点发请求。
 
-默认未配置搜索服务或 Key 时，`web_search` 返回 `web_search_not_configured`，不发请求、不消耗网络请求预算；Agent 仍可启动，`web_fetch` 可直接读取已知公网 URL。使用 `--web-search-provider deepseek|brave|tavily` 与 `--web-search-key-file PATH` 配置 API 搜索；密钥文件应位于工作区外，内容为 API Key，权限为 `0600` 或 `0400`。仅提供 Key 时沿用 Brave。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
+默认未配置搜索服务或 Key 时，`web_search` 返回 `web_search_not_configured`，不发请求、不消耗网络请求预算；Agent 仍可启动，`web_fetch` 可直接读取已知公网 URL。首次配置可使用隐藏输入，凭据不进入聊天记录：
+
+```bash
+uv run agent web configure --provider deepseek
+uv run agent web status
+uv run agent web check
+# 实际调用一次搜索和一次读取，可能产生 API 费用：
+uv run agent web check --live
+```
+
+配置保存到用户配置目录的 `web.json`，默认凭据文件为同目录下的 `deepseek.key`；已有密钥可用 `configure --provider deepseek --key-file PATH` 选择。密钥文件必须在工作区外，权限为 `0600` 或 `0400`。新启动的 CLI 和 SDK `Agent()` 自动使用该配置，已经运行的进程需要重启。`check` 默认只检查本地配置，不联网，也不调用聊天模型。
+
+临时覆盖可使用 `--web-search-provider deepseek|brave|tavily` 与 `--web-search-key-file PATH`，或 `PRAXIS_WEB_SEARCH_PROVIDER` / `PRAXIS_WEB_SEARCH_KEY_FILE`。优先级为显式参数、环境变量、保存配置；每层提供完整的服务与凭据组合，不借用下一层的其他服务凭据。仅提供 Key 时沿用 Brave。`--no-web-tools` 关闭默认的公网读取预授权，恢复逐次授权行为。
 
 DeepSeek 使用官方 [Search API](https://api-docs.deepseek.com/api/search/)：`POST https://api.deepseek.com/v1/tools/search`，使用与模型 API 相同的 DeepSeek Key。查询原样发送，最多 128 个 Unicode 字符；日期筛选直接写 `after:2026-10-01` / `before:2026-10-26`，不传 `freshness`。返回来源 URL、标题、短摘要，以及服务商提供的长摘要 `summary` 和发布日期 `published_at`；日期不是本地核实结果，不请求模型生成答案。长摘要按既有结果字节预算输出，超过预算会明确标记 `results_truncated`，不把摘要的典型长度当成接口长度上限。
 
-配置 `deepseek` 后，`web_fetch` 同时使用官方 [Fetch API](https://api-docs.deepseek.com/api/fetch/)：`POST https://api.deepseek.com/v1/tools/fetch`，复用同一份 Key。抓取和正文提取交给 DeepSeek，本地不访问目标站点、不启动 HTML 解析 worker 或 Chromium，也不在服务失败后切回本地抓取。权限检查同时包含目标 URL 和 API 地址。`render` 仅接受默认值 `auto`，表示由服务商控制获取方式；不代表本地已执行 JavaScript。
+配置 `deepseek` 后，`web_fetch` 默认的 `render="auto"` 使用官方 [Fetch API](https://api-docs.deepseek.com/api/fetch/)：`POST https://api.deepseek.com/v1/tools/fetch`，复用同一份 Key。该模式的抓取和正文提取交给 DeepSeek，本地不访问目标站点、不启动解析 worker 或 Chromium；权限检查同时包含目标 URL 和 API 地址。服务失败会返回明确错误，不自动切换后端。`auto` 不代表本地已执行 JavaScript。调用方可显式选择 `render=false` 使用本机 HTTP/PDF 读取，或 `render=true` 使用本机 Playwright；每次选择均经过对应权限、预算与来源记录，服务密钥不会发送给目标站点。
 
-客户端采用 [Codex Web 工具](https://github.com/openai/codex/blob/main/codex-rs/ext/web-search/src/tool.rs) 的 search / open / find 动作组织：`web_search(query=...)` 搜索，`web_fetch(url=...)` 打开正文，`web_fetch(source_id=..., find=...)` 在保存的正文里查找。请求通过现有 Tool/Executor 派发，不运行 Rust 客户端或新增服务端。
+客户端采用 [Codex Web 工具](https://github.com/openai/codex/blob/ddf04ad26789d040f9ef6a96736f76602e35a6cc/codex-rs/ext/web-search/src/tool.rs) 的 search / open / find 动作组织：`web_search(query=...)` 搜索，`web_fetch(url=...)` 打开正文，`web_fetch(source_id=..., find=...)` 在保存的正文里查找。请求通过现有 Tool/Executor 派发，不运行 Rust 客户端或新增服务端。
 
 Fetch 返回的 Markdown 原样保存为有哈希的来源快照；本地复用分页、提纲、链接定位、文字查找和版本比较。`view=raw` 展示实际收到的服务商 JSON，不是目标网页原始 HTML。`network_bytes` 统计本地与 API 间的响应字节，不代表服务商抓取网站的内部流量。Brave、Tavily 与未配置搜索的模式沿用原有直接网页读取方式。
 
@@ -549,7 +567,7 @@ async def main():
 asyncio.run(main())
 ```
 
-恢复未完成 Turn 时，搜索和读取工具须与原执行版本一致，并提供原服务的密钥文件；密钥不会写入 Turn 记录。DeepSeek 搜索的新版本为 `builtin-public-web-search-deepseek-v2`，托管读取为 `builtin-public-web-fetch-deepseek-v1`；旧的直接抓取待执行操作不能静默切成托管获取。Bing HTML 搜索已移除。
+恢复未完成 Turn 时，搜索和读取工具须与原执行版本一致，并提供原服务的密钥文件；密钥不会写入 Turn 记录。DeepSeek 搜索版本为 `builtin-public-web-search-deepseek-v2`，读取为 `builtin-public-web-fetch-deepseek-v2`，直接读取为 `builtin-public-web-v8`；旧版本的待执行操作不能静默切换后端，应启动新 Turn。Bing HTML 搜索已移除。
 
 网页读取保存来源、内容哈希及快照，长内容可以继续读取。成功取得文字不代表已经找到足够证据，HTTP 403、登录墙、内容截断和资源阻断应单独解释。
 
@@ -557,10 +575,15 @@ asyncio.run(main())
 
 ```bash
 uv sync --locked --extra browser --link-mode copy
-uv run --extra browser playwright install --with-deps --only-shell chromium
+uv run --extra browser playwright install chromium
+uv run --extra browser agent chat
 ```
 
-显式渲染沿用同一套 DNS、目标地址、网络权限、请求与字节预算。浏览器不能自行绕过这些边界；当前只允许受约束的 GET 请求，依赖 POST API 的页面可能无法完整读取。
+这里使用 Playwright 配套的独立 Chromium，与系统默认浏览器、用户日常浏览器和登录配置分开。用户使用 Safari、Firefox、Edge 都不影响该后端；缺包或缺浏览器时返回安装指引，普通 HTTP/PDF 读取仍可使用。无需另设浏览器服务；Linux 主机可能还需按 Playwright 指引安装系统依赖。
+
+本机 PDF 使用成熟的 PyMuPDF，在单独 worker 中执行；有输入、输出、CPU 与墙钟时间上限，Linux 另有地址空间上限，不宣称 macOS 有硬内存上限。显式浏览器渲染保留 Chromium 自身沙箱与全新 context，通过统一 HTTP broker 检查 DNS、目标地址、权限、代理和预算。该浏览器后端是 trusted-local，**不提供 OS 级断网隔离保证**。只支持公共 GET，阻止 POST、WebSocket、弹窗与下载；需要这些能力或登录态的页面可能不完整。子资源重定向沿用原请求 URL/origin 语义并记录诊断；JavaScript 发起的文档导航若再次重定向，会明确拒绝，避免返回错误来源语义。
+
+设计对照实际读取了 Codex 上述固定提交的工具、扩展及历史路径，以及本地 Claude Code 历史源码快照 `276b8e6a0160939c74f04074a5e10ec1ba76982b` 的 WebSearch、WebFetch 与通用工具执行链；后者为反编译历史材料，不代表官方当前源码。保留统一工具执行、来源快照、分页、权限与预算，替换手写浏览器协议和平台硬拒绝。Claude 的服务端搜索用于确定服务边界；其 WebFetch 没有原生 PDF 或浏览器兜底，不能作为这些能力已经具备的依据。
 
 ## Python SDK 与扩展
 

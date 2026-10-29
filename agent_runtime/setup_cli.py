@@ -22,6 +22,7 @@ from agent_runtime.model_config_io import validate_user_config_path
 from agent_runtime.model_credentials import credential_directory, resolve_model_credential, save_model_credential
 from agent_runtime.model_probe import ProbeLevel
 from agent_runtime.terminal_render import safe_terminal_text
+from agent_runtime.web_cli import onboard_search
 from agent_runtime.workspace import DEFAULT_MODEL_SESSION_PATH
 
 
@@ -124,8 +125,9 @@ def setup(
         Path, typer.Option("--session-path", help="当前项目的模型选择文件")
     ] = DEFAULT_MODEL_SESSION_PATH,
     no_mcp: Annotated[bool, typer.Option("--no-mcp", help="跳过可选的 GitHub MCP 配置")] = False,
+    no_web: Annotated[bool, typer.Option("--no-web", help="跳过可选的联网搜索配置，不更改已有设置")] = False,
 ) -> None:
-    """首次配置：选择模型、隐藏输入 Key、验证连接，再按需连接 GitHub。"""
+    """首次配置：模型连接、联网搜索，再按需连接 GitHub。"""
     try:
         service = ModelAdminService.from_env(session_path=session_path)
         model_id = _configure_model(service, model)
@@ -133,6 +135,13 @@ def setup(
         typer.echo("模型配置未完成：" + safe_terminal_text(redact_sensitive_text(error)), err=True)
         raise typer.Exit(1) from None
     typer.echo("3/3 可选服务")
+    if not no_web:
+        try:
+            refreshed = ModelAdminService.from_env(workspace=service.workspace, session_path=service.session_path)
+            onboard_search(workspace=service.workspace, model=refreshed.current())
+        except (OSError, ValueError, RuntimeError) as error:
+            typer.echo("模型已配置；联网搜索未完成：" + safe_terminal_text(redact_sensitive_text(error)), err=True)
+            raise typer.Exit(1) from None
     if not no_mcp and typer.confirm("连接只读 GitHub MCP？", default=False):
         try:
             connections = mcp_admin.mcp_connections()

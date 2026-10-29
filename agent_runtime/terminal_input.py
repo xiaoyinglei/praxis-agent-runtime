@@ -30,6 +30,7 @@ CHAT_COMMANDS = {
     "/effort": "查看或设置模型支持的思考强度；default 重置，off 关闭（需要模型支持）",
     "/output": "查看或设置单次输出额度；正整数或 default；包含思考 token",
     "/model": "选择模型；也支持 current、list、switch <id>",
+    "/web": "设置联网搜索，隐藏输入 API Key；当前聊天立即生效（未配置时也可按 F5）",
     "/permissions": "选择审批模式（也可按 F4）；mode ask|auto|full；grants 查看授权；revoke 撤销；show 查看权限",
     "/rewind": "查看检查点并回滚工作区文件；/rewind <序号|ID> 选择；回滚前会先保存当前状态",
     "/commit": "把工作区变更提交到仓库的 praxis/* 分支；/commit <说明> 指定提交说明",

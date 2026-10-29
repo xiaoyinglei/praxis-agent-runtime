@@ -205,6 +205,7 @@ async def test_arrow_selection_and_enter_work_when_mouse_is_disabled(mode):
     selected = []
     with create_pipe_input() as pipe:
         ui = TerminalChatApp(model="fake", workspace="/tmp", ui_mode=mode, input=pipe, output=DummyOutput())
+        ui._mouse_enabled = False  # Explicit native-selection mode, independently of each mode's default.
 
         async def conversation():
             selected.append(await ui.choose_approval(pause()))
