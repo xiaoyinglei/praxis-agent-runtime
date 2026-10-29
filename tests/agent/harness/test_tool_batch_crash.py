@@ -10,17 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, Session
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState, Session
 from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel, _read_tool
 
 
 class CrashBatchModel(ToolThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         if self.requests[-1].step == 1:
-            return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
-                HarnessToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
+            return HarnessModelResponse.from_parts(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
+                ModelToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
             ))
-        return HarnessModelResponse(text="README was read", provider_response_id="done", usage={})
+        return HarnessModelResponse.from_parts(text="README was read", provider_response_id="done", usage={})
 
 
 @pytest.mark.anyio

@@ -63,7 +63,7 @@ def test_old_definition_roundtrip_preserves_canonical_bytes_and_integer_cap():
 
 
 def prepared_request(window, size, cap=None, output=32768, input_limit=None):
-    from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
     from tests.agent.harness.test_model_adapter import _resolved_model
 
     model_gateway = gateway(window, cap)
@@ -79,7 +79,7 @@ def prepared_request(window, size, cap=None, output=32768, input_limit=None):
             thread_id="thread",
             turn_id="turn",
             binding_manifest={},
-            messages=(HarnessMessage(role="user", content="x" * size),),
+            messages=(ModelMessage(role="user", body="x" * size),),
             input_token_limit=input_limit,
         )
     )
@@ -212,12 +212,14 @@ def capacity_runner(store, path, *, tokens=200000, window=1048576, messages=3, s
     if summary is not None:
         from dataclasses import replace
 
+        from agent_runtime.harness import HarnessModelResponse
+
         original = model.dispatch
 
         async def dispatch(prepared, **kwargs):
             response = await original(prepared, **kwargs)
             return (
-                replace(response, text=summary, outputs=())
+                replace(response, outputs=HarnessModelResponse.from_parts(text=summary).outputs)
                 if prepared.request_ref.get("purpose") == "context_summary"
                 else response
             )
@@ -397,7 +399,7 @@ def test_large_window_summary_leaves_respect_frozen_materialization_guard(tmp_pa
         ]
         assert len(summaries) > 1  # capacity alone could admit the whole history
         assert all(
-            len(message["content"].encode("utf-8")) <= 5000
+            len(message["body"].encode("utf-8")) <= 5000
             for op in summaries
             for message in op.request_ref["step_snapshot"]["messages"]
         )
@@ -492,7 +494,7 @@ def test_capacity_and_compaction_are_visible_in_replayed_events(tmp_path):
         assert budget.data["budget_status"]["cost_remaining_micros"] == "unset"
         assert "agent_steps_remaining" in budget.data["budget_status"]
         message = store.list_model_operations(turn.turn_id)[-1].request_ref["step_snapshot"]["messages"][-1]
-        assert "Runtime budget status:" in message["content"]
+        assert "Runtime budget status:" in message["body"]
 
 
 def test_terminal_displays_capacity_and_compaction_tokens_without_cost(capsys):

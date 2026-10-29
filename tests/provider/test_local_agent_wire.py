@@ -88,7 +88,7 @@ def _request(
         instructions=("Be precise and return one response envelope.",),
         frozen_run_context=(ContextBlock("workspace", {"root": "."}),),
         initial_user_task="Read README.md and summarize it.",
-    ).append_message(ModelMessage(role="assistant", content="I will inspect it."))
+    ).append_message(ModelMessage(role="assistant", body="I will inspect it."))
     return build_model_request(
         request_id="req-local-wire",
         context=context,

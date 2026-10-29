@@ -174,7 +174,7 @@ async def test_readonly_tool_policy_cannot_mutate_memory(tmp_path):
 
 @pytest.mark.anyio
 async def test_empty_memory_exposes_version_through_read_for_first_explicit_write(tmp_path):
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, Session
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, Session
     from agent_runtime.harness.memory import MemoryConfig
     from agent_runtime.tools.permissions import ToolExecutionContext
     from tests.agent.test_update_plan_surfaces import _UpdatePlanThenAnswerModel
@@ -190,17 +190,17 @@ async def test_empty_memory_exposes_version_through_read_for_first_explicit_writ
         async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step == 1:
-                call = HarnessToolCall(id="read", name="read_memory", arguments={})
+                call = ModelToolCall(id="read", name="read_memory", arguments={})
             elif step == 2:
                 detail = next(m.content for m in reversed(self.requests[-1].messages) if m.role == "tool")
                 # Tool results use the normal ACI envelope; the version is not
                 # a volatile navigation field in every model request.
                 version = json.loads(json.loads(detail)["content"][0]["data"]["text"])["version"]
-                call = HarnessToolCall(id="write", name="manage_memory", arguments={
+                call = ModelToolCall(id="write", name="manage_memory", arguments={
                     "action": "remember", "key": "runner", "text": "Use uv.", "expected_version": version})
             else:
-                return HarnessModelResponse(text="remembered", provider_response_id=None, usage={})
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(call,))
+                return HarnessModelResponse.from_parts(text="remembered", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(call,))
 
     model = Model()
     async with await Session.open(

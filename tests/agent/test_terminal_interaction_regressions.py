@@ -122,7 +122,7 @@ async def test_real_chat_loop_outputs_turn_usage_without_verbose_or_acceptance_n
 
     class CachedAnswer(SteeringModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(text="a normal chat answer", provider_response_id=None, usage={
+            return HarnessModelResponse.from_parts(text="a normal chat answer", provider_response_id=None, usage={
                 "input_tokens": 1000, "output_tokens": 200, "total_tokens": 1200, "cache_read_input_tokens": 800,
             })
 

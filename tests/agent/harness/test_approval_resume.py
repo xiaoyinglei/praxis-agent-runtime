@@ -13,7 +13,7 @@ from agent_runtime.harness import (
     CompletionProposal,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     RolloutEventReader,
     RuntimeState,
@@ -79,19 +79,19 @@ class WriteThenAnswerModel:
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         request_id = prepared.request_ref["request_id"]
         if isinstance(request_id, str) and request_id.endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="response-write-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="write-call-1",
                         name="write_file",
                         arguments={"path": "approved.txt", "text": "approved content"},
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="file written",
             provider_response_id="response-final",
             usage={"input_tokens": 5, "output_tokens": 2},

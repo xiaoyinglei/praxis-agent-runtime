@@ -56,7 +56,7 @@ class SmallAnswerModel(FixedBindingProvider):
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="child answer",
             provider_response_id="child-response",
             usage={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
@@ -72,7 +72,7 @@ class BlockingAnswerModel(SmallAnswerModel):
         del prepared
         self.started.set()
         await self.release.wait()
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="child answer",
             provider_response_id="child-response",
             usage={"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},

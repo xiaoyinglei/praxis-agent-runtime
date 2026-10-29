@@ -16,8 +16,7 @@ from agent_runtime.budget.pricing import (
     estimated_model_cost_micros,
 )
 from agent_runtime.core.llm_registry import ResolvedModel
-from agent_runtime.core.messages import ModelMessage, StopReason
-from agent_runtime.core.messages import ToolCall as ModelToolCall
+from agent_runtime.core.messages import StopReason
 from agent_runtime.core.model_request import (
     ContextBlock,
     ModelRequest,
@@ -30,13 +29,13 @@ from agent_runtime.core.model_request import (
 from agent_runtime.harness.protocol import (
     ContextBudgetExceededError,
     ContextCompactionRequiredError,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
     ModelContextOverflowError,
     ModelDispatchCancelledError,
     ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
+    ModelMessage,
     PreparedModelCall,
 )
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, context_capacity_policy
@@ -55,7 +54,7 @@ from agent_runtime.modeling.local_agent_wire import render_local_agent_request
 from agent_runtime.modeling.openai_wire import serialize_openai_request, stable_prompt_cache_key
 from agent_runtime.modeling.quota import ProviderQuotaPreflightError
 from agent_runtime.models import ModelControlPlane
-from agent_runtime.tools.tool import JsonValue, _thaw_json
+from agent_runtime.tools.tool import JsonValue
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +157,7 @@ class GatewayHarnessModel:
             ),
             initial_user_task=first.content,
             transcript=(*messages[first_user_index + 1 :], *(
-                tuple(ModelMessage(role="context", content=cast(str, block.content)) for block in clock_blocks)
+                tuple(ModelMessage(role="context", body=cast(str, block.content)) for block in clock_blocks)
                 if dynamic_context else ()
             )),
         )
@@ -360,24 +359,27 @@ class GatewayHarnessModel:
                 raise RuntimeError("model stream output snapshots disagree with the terminal response")
             if stream_state.provider_response_id != response.provider_response_id:
                 raise RuntimeError("model stream response identity disagrees with the terminal response")
-        incomplete = response.turn.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
+        turn = response.turn
+        incomplete = response.stop_reason in {StopReason.MAX_TOKENS, StopReason.INCOMPLETE}
         if not incomplete:
-            if response.turn.stop_reason is StopReason.TOOL_USE and not response.turn.tool_calls:
+            if response.stop_reason is StopReason.TOOL_USE and not turn.tool_calls:
                 raise RuntimeError("tool-use stop reason did not include tool calls")
-            if response.turn.stop_reason is StopReason.END_TURN and response.turn.tool_calls:
+            if response.stop_reason is StopReason.END_TURN and any(
+                output.kind == "tool_call" for output in response.outputs
+            ):
                 raise RuntimeError("end-turn response unexpectedly included tool calls")
-            if not response.turn.text.strip() and not response.turn.tool_calls:
+            if not turn.text.strip() and not turn.tool_calls:
                 raise RuntimeError("model returned neither text nor tool calls")
         result = HarnessModelResponse(
             provider_response_id=response.provider_response_id,
             usage=_priced_usage_payload(response.usage.model_dump(mode="json"), resolved),
             outputs=response.outputs,
-            stop_reason=response.turn.raw_stop_reason or response.turn.stop_reason.value,
+            stop_reason=response.raw_stop_reason or response.stop_reason.value,
             status="incomplete" if incomplete else "completed",
             incomplete_reason=(
                 "max_output_tokens"
-                if response.turn.stop_reason is StopReason.MAX_TOKENS
-                else response.turn.raw_stop_reason or "unknown"
+                if response.stop_reason is StopReason.MAX_TOKENS
+                else response.raw_stop_reason or "unknown"
             )
             if incomplete
             else None,
@@ -534,7 +536,7 @@ def _is_uncertain_transport_failure(error: BaseException) -> bool:
 
 
 def _model_messages(
-    messages: tuple[HarnessMessage, ...],
+    messages: tuple[ModelMessage, ...],
     *,
     continuation_summary_role: str = "context",
 ) -> tuple[ModelMessage, ...]:
@@ -545,29 +547,14 @@ def _model_messages(
     for message in messages:
         if message.role not in {"user", "assistant", "tool", "context"}:
             raise ValueError(f"unsupported Harness message role: {message.role}")
-        role = message.role
+        role: str = message.role
         if has_user and role == "context" and message.context_category == "continuation_summary":
             # Provenance chooses the context fragment; the frozen model binding
             # chooses its wire role independently of content and identity.
             role = continuation_summary_role
         has_user = has_user or message.role == "user"
         converted.append(
-            ModelMessage(
-                role=role,  # type: ignore[arg-type]
-                content=message.content,
-                reasoning_content=message.reasoning_content,
-                outputs=message.outputs,
-                tool_calls=tuple(
-                    ModelToolCall(
-                        id=call.id,
-                        name=call.name,
-                        input=cast(dict[str, Any], _thaw_json(call.arguments)),
-                        argument_error=call.argument_error,
-                    )
-                    for call in message.tool_calls
-                ),
-                tool_call_id=message.tool_call_id,
-            )
+            message if role == message.role else replace(message, role=cast(Any, role), context_category=None)
         )
     return tuple(converted)
 
@@ -823,7 +810,7 @@ def _budgeted_request(
             context = build_stable_context(
                 instructions=context.instructions, frozen_run_context=context.frozen_run_context,
                 initial_user_task=context.initial_user_task,
-                transcript=(*context.transcript, ModelMessage(role="context", content=input_status)),
+                transcript=(*context.transcript, ModelMessage(role="context", body=input_status)),
             )
     if input_token_limit is not None:
         max_input_tokens = min(max_input_tokens, input_token_limit)

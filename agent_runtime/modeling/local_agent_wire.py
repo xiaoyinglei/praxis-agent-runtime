@@ -8,8 +8,8 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.core.messages import (
+    ModelToolCall,
     StopReason,
-    ToolCall,
     ToolUseResult,
     canonical_json_text,
     model_message_payload,
@@ -23,6 +23,7 @@ from agent_runtime.core.model_request import (
     tool_definition_payload,
 )
 from agent_runtime.modeling.contracts import LLMUsage, normalize_llm_usage
+from agent_runtime.modeling.events import output_to_payload
 from agent_runtime.tools.tool import JsonValue
 
 LOCAL_AGENT_WIRE_REVISION = "local-agent-flat-json-v1"
@@ -98,7 +99,16 @@ def render_local_agent_request(
     if not isinstance(request, ModelRequest):
         raise TypeError("request must be a ModelRequest")
     tools_json = canonical_json_text(tuple(tool_definition_payload(tool) for tool in request.tools))
-    messages_json = canonical_json_text(tuple(model_message_payload(message) for message in request.messages))
+    messages = []
+    for message in request.messages:
+        payload = dict(model_message_payload(message))
+        if message.role == "assistant":
+            payload["body"] = tuple(
+                {key: value for key, value in output.items() if key != "provider_data"}
+                for output in (output_to_payload(output) for output in message.outputs)
+            )
+        messages.append(payload)
+    messages_json = canonical_json_text(tuple(messages))
     tool_choice_json = canonical_json_text(tool_choice_payload(request.tool_choice))
     response_schema_json = canonical_json_text(
         {
@@ -190,10 +200,10 @@ def parse_local_agent_response(raw: str | Mapping[str, object]) -> ToolUseResult
     else:
         raise TypeError("local agent response must be JSON text or an object")
     calls = [
-        ToolCall(
+        ModelToolCall(
             id=call.id,
             name=call.name,
-            input=dict(call.arguments),
+            arguments=dict(call.arguments),
         )
         for call in envelope.tool_calls
     ]

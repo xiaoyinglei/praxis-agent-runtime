@@ -390,7 +390,7 @@ async def test_cancellation_during_model_claim_does_not_invent_provider_io(tmp_p
 async def test_tool_loop_public_entries_use_async_store_boundary(tmp_path, monkeypatch, entry):
     from agent_runtime import Agent
     from agent_runtime.cli import _run_facade_command
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall
     from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel, PublicHarnessModel
 
     (tmp_path / "present.txt").write_text("evidence")
@@ -400,11 +400,11 @@ async def test_tool_loop_public_entries_use_async_store_boundary(tmp_path, monke
 
         async def dispatch(self, prepared, *, event_sink=None):
             if prepared.request_ref["request_id"].endswith(":step:1"):
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="",
                     provider_response_id="read-response",
                     usage={"input_tokens": 2, "output_tokens": 1},
-                    tool_calls=(HarnessToolCall(id="read", name="read_file", arguments={"path": "present.txt"}),),
+                    tool_calls=(ModelToolCall(id="read", name="read_file", arguments={"path": "present.txt"}),),
                 )
             return await super().dispatch(prepared, event_sink=event_sink)
 

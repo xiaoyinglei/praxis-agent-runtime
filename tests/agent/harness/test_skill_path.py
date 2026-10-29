@@ -11,7 +11,7 @@ from agent_runtime.harness import (
     CompletionProposal,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelToolCall,
     PreparedModelCall,
     Session,
 )
@@ -91,7 +91,7 @@ class SkillAssetModel:
             message for message in request.messages if message.role == "tool"
         ]
         if not tool_messages:
-            call = HarnessToolCall(
+            call = ModelToolCall(
                 id="invoke-skill",
                 name="invoke_skill",
                 arguments={"name": "project:test-skill"},
@@ -99,7 +99,7 @@ class SkillAssetModel:
         elif not any(
             "workspace_path" in message.content for message in tool_messages
         ):
-            call = HarnessToolCall(
+            call = ModelToolCall(
                 id="materialize-skill",
                 name="materialize_skill_asset",
                 arguments={
@@ -108,12 +108,12 @@ class SkillAssetModel:
                 },
             )
         else:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="skill asset materialized with explicit approval",
                 provider_response_id="skill-final",
                 usage={"input_tokens": 5, "output_tokens": 3},
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="",
             provider_response_id=f"response-{call.id}",
             usage={"input_tokens": 2, "output_tokens": 1},

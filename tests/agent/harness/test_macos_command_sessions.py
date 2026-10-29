@@ -9,7 +9,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime import Agent, cli
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(sys.platform != "darwin", reason="requires real macOS Seatbelt")
@@ -29,23 +29,23 @@ class SessionCommandModel(PatchThenAnswerModel):
         request = prepared.dispatch_payload
         results = [json.loads(m.content)["structured_content"] for m in request.messages if m.role == "tool"]
         if not results:
-            call = HarnessToolCall(id="launch", name="run_command", arguments={
+            call = ModelToolCall(id="launch", name="run_command", arguments={
                 "command": self.command, "working_dir": ".", "timeout_seconds": None,
                 "yield_time_seconds": 0.01, "workspace_write": self.write,
             })
         elif results[-1]["status"] == "running":
             if self.premature and self.final_attempts == 0:
                 self.final_attempts += 1
-                return HarnessModelResponse(text="premature answer", provider_response_id=None,
+                return HarnessModelResponse.from_parts(text="premature answer", provider_response_id=None,
                                             usage={"input_tokens": 3, "output_tokens": 3})
-            call = HarnessToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
+            call = ModelToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
                 "session_id": results[0]["session_id"], "action": "wait", "wait_seconds": 3,
             })
         else:
             assert results[-1]["exit_code"] == 0, results[-1]
-            return HarnessModelResponse(text="observed terminal result", provider_response_id=None,
+            return HarnessModelResponse.from_parts(text="observed terminal result", provider_response_id=None,
                                         usage={"input_tokens": 3, "output_tokens": 3})
-        return HarnessModelResponse(text="", provider_response_id=None, tool_calls=(call,),
+        return HarnessModelResponse.from_parts(text="", provider_response_id=None, tool_calls=(call,),
                                     usage={"input_tokens": 3, "output_tokens": 3})
 
 
@@ -137,10 +137,10 @@ def test_public_managed_python_script_entry(tmp_path, monkeypatch, entrypoint):
                 output = results[-1]["structured_content"]
                 assert output["stdout"] == "script-checked\n"
                 assert output["verification"] is None
-                return HarnessModelResponse(text="observed script result", provider_response_id=None,
+                return HarnessModelResponse.from_parts(text="observed script result", provider_response_id=None,
                                             usage={"input_tokens": 3, "output_tokens": 3})
-            return HarnessModelResponse(text="", provider_response_id=None,
-                tool_calls=(HarnessToolCall("script", "execute_python", {"script_path": "scripts/check.py"}),),
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None,
+                tool_calls=(ModelToolCall("script", "execute_python", {"script_path": "scripts/check.py"}),),
                 usage={"input_tokens": 3, "output_tokens": 3})
 
     def configure(agent):
@@ -178,15 +178,18 @@ def test_public_pause_closes_job_and_resume_reads_durable_terminal(tmp_path, mon
             if not outputs:
                 return await super().dispatch(prepared, **kwargs)
             if len(outputs) == 1:
-                return HarnessModelResponse(text="", provider_response_id=None,
-                    usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(HarnessToolCall(
+                return HarnessModelResponse.from_parts(text="", provider_response_id=None,
+                    usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(ModelToolCall(
                         id="patch", name="apply_patch", arguments={
                             "file_path": "source", "old_string": "before", "new_string": "after",
                         },
                     ),))
             assert any("Confirmed terminal outcome" in m.content for m in request.messages if m.role == "context")
-            return HarnessModelResponse(text="The command was cancelled at pause; the approved edit completed.",
-                                        provider_response_id=None, usage={"input_tokens": 3, "output_tokens": 3})
+            return HarnessModelResponse.from_parts(
+                text="The command was cancelled at pause; the approved edit completed.",
+                provider_response_id=None,
+                usage={"input_tokens": 3, "output_tokens": 3},
+            )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -218,8 +221,8 @@ async def test_abort_live_session_cancels_job_and_allows_next_command(tmp_path, 
         async def dispatch(self, prepared, **kwargs):
             if not any(m.role == "tool" for m in prepared.dispatch_payload.messages):
                 return await super().dispatch(prepared, **kwargs)
-            return HarnessModelResponse(text="", provider_response_id=None,
-                usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(HarnessToolCall(
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None,
+                usage={"input_tokens": 3, "output_tokens": 3}, tool_calls=(ModelToolCall(
                     id="patch", name="apply_patch", arguments={
                         "file_path": "source", "old_string": "before", "new_string": "after",
                     },

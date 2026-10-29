@@ -108,6 +108,18 @@ class ModelOutput:
         object.__setattr__(self, "provider_data", _snapshot(self.provider_data))
 
 
+def validate_model_outputs(outputs: tuple[ModelOutput, ...]) -> tuple[ModelOutput, ...]:
+    """Validate a complete ordered snapshot without projecting or copying it."""
+    if not isinstance(outputs, tuple) or any(not isinstance(output, ModelOutput) for output in outputs):
+        raise TypeError("model outputs must be a tuple of ModelOutput values")
+    if len({output.output_id for output in outputs}) != len(outputs):
+        raise ValueError("model output IDs must be unique within a response")
+    call_ids = [output.tool_call_id for output in outputs if output.kind == "tool_call"]
+    if len(set(call_ids)) != len(call_ids):
+        raise ValueError("model tool call IDs must be unique within a response")
+    return outputs
+
+
 def output_to_payload(output: ModelOutput) -> dict[str, Any]:
     return {
         "output_id": output.output_id,

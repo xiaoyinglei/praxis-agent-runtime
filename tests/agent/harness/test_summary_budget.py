@@ -3,8 +3,16 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessMessage, HarnessModelRequest, RolloutContextManager, RuntimeState, TurnExecutor
-from agent_runtime.harness.protocol import ContextBudgetExceededError
+from agent_runtime.core.messages import ModelToolCall
+from agent_runtime.harness import (
+    HarnessModelRequest,
+    HarnessModelResponse,
+    ModelMessage,
+    RolloutContextManager,
+    RuntimeState,
+    TurnExecutor,
+)
+from agent_runtime.harness.protocol import ContextBudgetExceededError, model_response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
@@ -36,7 +44,7 @@ def test_summary_output_limit_controls_reservation_and_wire():
         HarnessModelRequest(
             thread_id="thread",
             turn_id="turn",
-            messages=(HarnessMessage(role="user", content="Summarize history."),),
+            messages=(ModelMessage(role="user", body="Summarize history."),),
             binding_manifest={},
             purpose="context_summary",
             output_token_limit=37,
@@ -88,7 +96,7 @@ def test_request_input_limit_can_only_reduce_provider_limit():
             HarnessModelRequest(
                 thread_id="thread",
                 turn_id="turn",
-                messages=(HarnessMessage(role="user", content="history " * 20),),
+                messages=(ModelMessage(role="user", body="history " * 20),),
                 binding_manifest={},
                 input_token_limit=10,
             )
@@ -136,7 +144,7 @@ def test_model_request_rejects_invalid_output_limits(limit):
             HarnessModelRequest(
                 thread_id="thread",
                 turn_id="turn",
-                messages=(HarnessMessage(role="user", content="history"),),
+                messages=(ModelMessage(role="user", body="history"),),
                 binding_manifest={},
                 output_token_limit=limit,
             )
@@ -288,13 +296,13 @@ def test_configured_summary_role_is_frozen_for_restart(
         context = replace(
             runner.capture_step_context(runner.restore_turn_context(turn.turn_id), step=1),
             messages=(
-                HarnessMessage(role="user", content="Read specs then implement."),
-                HarnessMessage(
+                ModelMessage(role="user", body="Read specs then implement."),
+                ModelMessage(
                     role="context",
-                    content="Memory with arbitrary presentation.",
+                    body="Memory with arbitrary presentation.",
                     context_category="continuation_summary",
                 ),
-                HarnessMessage(role="context", content="A new runtime constraint."),
+                ModelMessage(role="context", body="A new runtime constraint."),
             ),
         )
         prepared = asyncio.run(runner._prepare_step(context))
@@ -314,7 +322,6 @@ def test_configured_summary_role_is_frozen_for_restart(
 
 
 def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unseen_input(tmp_path: Path):
-    from agent_runtime.harness import HarnessModelResponse
 
     with RuntimeState.open_sync(tmp_path / "tail-budget.db") as store:
         thread, turn = start(store, tmp_path)
@@ -323,7 +330,14 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={"text": "read", "tool_calls": [{"id": "last", "name": "read", "arguments": {}}]},
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='read',
+                    tool_calls=(
+                        ModelToolCall(id='last', name='read', arguments={}),
+                    ),
+                )
+            ),
         )
         seed(
             store,
@@ -339,8 +353,8 @@ def test_oversized_summary_with_tail_reuses_same_generation_without_losing_unsee
             dispatched.append(prepared)
             summary = prepared.request_ref["purpose"] == "context_summary"
             if summary:
-                assert "TAIL_EVIDENCE" in prepared.request_ref["step_snapshot"]["messages"][0]["content"]
-            return HarnessModelResponse(
+                assert "TAIL_EVIDENCE" in prepared.request_ref["step_snapshot"]["messages"][0]["body"]
+            return HarnessModelResponse.from_parts(
                 text=("TAIL_EVIDENCE summarized. " + "s" * 2450) if summary else "done",
                 provider_response_id=None,
                 usage={"input_tokens": 1, "output_tokens": 1},

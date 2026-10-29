@@ -5,18 +5,21 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall
+from agent_runtime.core.messages import ModelToolCall as _ModelToolCall
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
     ContextBudgetExceededError,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
+    ModelMessage,
     PreparedModelCall,
     RolloutContextManager,
     RuntimeState,
     TurnExecutor,
 )
+from agent_runtime.harness.protocol import model_response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item
 
 
@@ -40,9 +43,9 @@ def test_context_manager_builds_followup_from_thread_history(tmp_path: Path) -> 
         messages = RolloutContextManager(store).build(second.turn_id)
 
         assert messages == (
-            HarnessMessage(role="user", content="first question"),
-            HarnessMessage(role="assistant", content="first answer"),
-            HarnessMessage(role="user", content="follow up"),
+            ModelMessage(role="user", body="first question"),
+            ModelMessage(role="assistant", body=HarnessModelResponse.from_parts(text="first answer").outputs),
+            ModelMessage(role="user", body="follow up"),
         )
         assert store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
 
@@ -107,16 +110,14 @@ def test_context_manager_counts_tool_arguments_toward_the_item_limit(
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={
-                "text": "",
-                "tool_calls": [
-                    {
-                        "id": "call-1",
-                        "name": "read_file",
-                        "arguments": {"path": "x" * 500},
-                    }
-                ],
-            },
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='call-1', name='read_file', arguments={'path': 'x' * 500}),
+                    ),
+                )
+            ),
         )
 
         with pytest.raises(ContextBudgetExceededError, match="single Item"):
@@ -218,7 +219,7 @@ def test_compaction_replaces_a_committed_prefix_without_deleting_rollout_history
         compacted_payload = json.loads(projected[0].content.removeprefix("Context compaction:\n"))
         assert compacted_payload["summary"].startswith("The old exchange")
         assert compacted_payload["preserved_facts"] == preserved_facts
-        assert projected[1] == HarnessMessage(role="user", content="current question")
+        assert projected[1] == ModelMessage(role="user", body="current question")
         assert "old question" not in tuple(message.content for message in projected)
         assert "old answer" not in tuple(message.content for message in projected)
 
@@ -320,10 +321,21 @@ def test_tool_followup_preserves_reasoning_through_durable_context(tmp_path: Pat
         )
         attempt = store.dispatch_model_attempt(operation.operation_id, worker_id="test", lease_seconds=30)
         store.complete_model_attempt(
-            operation_id=operation.operation_id, attempt_id=attempt.attempt_id,
-            generation=attempt.generation, text="", provider_response_id=None, usage={},
-            reasoning_content="Inspect the selected file.",
-            tool_calls=({"id": "call", "name": "read_file", "arguments": {"path": "main.py"}},),
+            operation_id=operation.operation_id,
+            attempt_id=attempt.attempt_id,
+            generation=attempt.generation,
+            response=HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id=None,
+                usage={},
+                reasoning_content="Inspect the selected file.",
+                tool_calls=tuple(
+                    _ModelToolCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in ({"id": "call", "name": "read_file", "arguments": {"path": "main.py"}},)
+                ),
+            ),
         )
     with RuntimeState.open_sync(db) as store:
         messages = RolloutContextManager(store).build(turn.turn_id)

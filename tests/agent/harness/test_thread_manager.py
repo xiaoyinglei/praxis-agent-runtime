@@ -9,13 +9,14 @@ import pytest
 from agent_runtime.harness import (
     CompletionDecision,
     CompletionProposal,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
+    ModelMessage,
     PreparedModelCall,
     RuntimeState,
     Session,
 )
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.modeling.events import ModelOutput
 
 
@@ -46,7 +47,7 @@ class EchoHistoryModel:
         )
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text=f"answer-{len(self.requests)}",
             provider_response_id=f"response-{len(self.requests)}",
             usage={"input_tokens": len(self.requests[-1].messages), "output_tokens": 1},
@@ -93,10 +94,10 @@ async def test_session_creates_distinct_turns_with_fresh_bindings_and_shared_his
             "agent_steps_remaining"] > 0
         assert model.requests[1].messages == (
             *model.requests[0].messages,
-            HarnessMessage(
-                role="assistant", content="answer-1", outputs=(ModelOutput("text", "text", content="answer-1"),),
+            ModelMessage(
+                role="assistant",  body=(ModelOutput("text", "text", content="answer-1"),),
             ),
-            HarnessMessage(role="user", content="second"),
+            ModelMessage(role="user", body="second"),
         )
         assert session.store.read_turn(second.turn_id).predecessor_turn_id == first.turn_id
         assert session.store.read_turn(first.turn_id).binding_manifest["model_id"] == "model-v1"
@@ -137,10 +138,10 @@ async def test_opening_from_non_head_turn_forks_with_exact_history(tmp_path: Pat
             assert branch.store.read_thread(branch.thread_id).fork_turn_id == first.turn_id
             assert model.requests[2].messages == (
                 *model.requests[0].messages,
-                HarnessMessage(
-                    role="assistant", content="answer-1", outputs=(ModelOutput("text", "text", content="answer-1"),),
+                ModelMessage(
+                    role="assistant",  body=(ModelOutput("text", "text", content="answer-1"),),
                 ),
-                HarnessMessage(role="user", content="branch"),
+                ModelMessage(role="user", body="branch"),
             )
             assert source.store.read_thread(source.thread_id).head_turn_id == second.turn_id
 
@@ -188,7 +189,7 @@ def test_fork_from_non_head_turn_has_an_exact_history_cutoff(tmp_path: Path) -> 
         )
 
         context = store.list_context_items(branch.turn_id)
-        assert [item.payload.get("text") for item in context] == [
+        assert [item_text(item) for item in context] == [
             "source-one",
             "answer-one",
             "branch-only",

@@ -253,7 +253,7 @@ async def test_session_cancellation_records_the_real_git_commit(workspace, tmp_p
     import subprocess
 
     from agent_runtime.core.model_request import toolset_revision_for_tools
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, PreparedModelCall, Session
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, PreparedModelCall, Session
 
     root = workspace.root
     for args in (("init", "-b", "main"), ("config", "user.name", "Test"),
@@ -276,9 +276,9 @@ async def test_session_cancellation_records_the_real_git_commit(workspace, tmp_p
                     "request_id": "delivery-test", "toolset_revision": toolset_revision_for_tools(request.tools),
                     "exposed_tool_names": [tool.definition.name for tool in request.tools]})
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="", provider_response_id="delivery-response", usage={"input_tokens": 1, "output_tokens": 1},
-                tool_calls=(HarnessToolCall(id="commit-call", name="commit_changes",
+                tool_calls=(ModelToolCall(id="commit-call", name="commit_changes",
                                            arguments={"message": "settled in session"}),),
             )
         def ensure_available(self, binding, **kwargs):

@@ -1,3 +1,4 @@
+
 """Controlled public CLI evidence with synthetic provider and real local tools."""
 
 from __future__ import annotations
@@ -10,8 +11,9 @@ import pytest
 from typer.testing import CliRunner
 
 from agent_runtime.cli import agent_app
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
 from agent_runtime.harness import GatewayHarnessModel, RuntimeState
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMCallStage, LLMProviderResult, LLMStageBudget
 from agent_runtime.modeling.gateway import LLMGateway
 from tests.agent.harness.test_model_adapter import CharacterAccounting, _resolved_model
@@ -35,7 +37,7 @@ class SyntheticProvider:
                                 {
                                     "id": call.id,
                                     "type": "function",
-                                    "function": {"name": call.name, "arguments": json.dumps(call.input)},
+                                    "function": {"name": call.name, "arguments": json.dumps(dict(call.arguments))},
                                 }
                                 for call in turn.tool_calls
                             ],
@@ -82,7 +84,7 @@ class SyntheticProvider:
                 raw_stop_reason="synthetic",
                 text="Explicitly recheck the same saved evidence.",
                 stop_reason=StopReason.TOOL_USE,
-                tool_calls=[ToolCall(id=f"fetch-{self.agent_calls}", name="web_fetch", input=arguments)],
+                tool_calls=[ModelToolCall(id=f"fetch-{self.agent_calls}", name="web_fetch", arguments=arguments)],
             )
         if self.task == "code" and self.agent_calls <= 3:
             name = "apply_patch" if self.agent_calls == 2 else "read_file"
@@ -97,7 +99,7 @@ class SyntheticProvider:
                 raw_stop_reason="synthetic",
                 text="Apply and recheck the synthetic change.",
                 stop_reason=StopReason.TOOL_USE,
-                tool_calls=[ToolCall(id=f"file-{self.agent_calls}", name=name, input=arguments)],
+                tool_calls=[ModelToolCall(id=f"file-{self.agent_calls}", name=name, arguments=arguments)],
             )
         expected = f"GOLD_{self.task.upper() if self.task != 'code' else 'CODE'}_FACT=17"
         if self.task == "dialog":
@@ -230,7 +232,7 @@ def test_public_cli_controlled_context_replay(tmp_path, monkeypatch, task, mode)
         if mode == "capacity":
             assert all(item.payload["algorithm_revision"] == "semantic-compaction-v6" for item in compactions)
         accepted = store.read_turn_answer(turn.turn_id)
-        answer = accepted.payload["text"]
+        answer = item_text(accepted)
         assert accepted.kind == "model_response"
         assert not any(item.kind == "agent_message" for item in items)
         assert (answer == expected) == preserves_fact

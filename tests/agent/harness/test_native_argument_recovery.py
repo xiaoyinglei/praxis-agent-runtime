@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from agent_runtime.core.messages import StopReason, ToolCall, ToolUseResult
+from agent_runtime.core.messages import ModelToolCall, StopReason, ToolUseResult
 from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
 from agent_runtime.modeling.contracts import normalize_llm_usage
 from agent_runtime.modeling.gateway import AgentModelResponse, model_request_input_text
@@ -31,10 +31,10 @@ class CorrectedArgumentsGateway(FileWorkflowGateway):
             assert not (self.workspace / "result.txt").exists()
             turn = ToolUseResult(
                 tool_calls=[
-                    ToolCall(
+                    ModelToolCall(
                         id="corrected",
                         name="apply_patch",
-                        input={
+                        arguments={
                             "file_path": "result.txt",
                             "new_string": self.body,
                         },
@@ -45,7 +45,7 @@ class CorrectedArgumentsGateway(FileWorkflowGateway):
             )
         elif count == 3:
             turn = ToolUseResult(
-                tool_calls=[ToolCall(id="read", name="read_file", input={"path": "result.txt"})],
+                tool_calls=[ModelToolCall(id="read", name="read_file", arguments={"path": "result.txt"})],
                 stop_reason=StopReason.TOOL_USE,
                 raw_stop_reason="tool_calls",
             )
@@ -62,7 +62,7 @@ class CorrectedArgumentsGateway(FileWorkflowGateway):
                 request, provider=kwargs["provider"], supports_native_tools=kwargs["supports_native_tools"]
             )
         )
-        return AgentModelResponse(
+        return AgentModelResponse.from_turn(
             turn=turn,
             usage=normalize_llm_usage(
                 input_tokens=measured,

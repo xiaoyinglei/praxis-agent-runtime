@@ -7,6 +7,9 @@ import json
 import httpx
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall as _CanonicalCall
+from agent_runtime.harness.protocol import HarnessModelResponse as _CanonicalResponse
+from agent_runtime.harness.protocol import model_response_payload as _response_payload
 from agent_runtime.tools.executor import ToolExecutor
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.test_web_tools import call, web_tools
@@ -182,10 +185,22 @@ def test_compaction_model_projection_preserves_execution_facts(tmp_path, error):
                'results': [{'url': 'https://docs.python.org', 'title': 'Python', 'snippet': 'Reference'}]})
     with RuntimeState.open_sync(tmp_path / 'r.db') as store:
         _, turn = start(store, tmp_path)
-        seed(store, turn_id=turn.turn_id, kind='model_response', payload={
-            'text': 'Investigation history. ' * 2000,
-            'tool_calls': [{'id': 'web', 'name': 'web_fetch' if error else 'web_search', 'arguments': {}}],
-        })
+        seed(
+            store,
+            turn_id=turn.turn_id,
+            kind="model_response",
+            payload=_response_payload(
+                _CanonicalResponse.from_parts(
+                    text="Investigation history. " * 2000,
+                    tool_calls=tuple(
+                        _CanonicalCall(
+                            id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                        )
+                        for c in [{"id": "web", "name": "web_fetch" if error else "web_search", "arguments": {}}]
+                    ),
+                )
+            ),
+        )
         item = seed(store, turn_id=turn.turn_id, kind='tool_result', payload={
             'tool_call_id': 'web', 'is_error': error, 'structured_content': source,
             'model_content': json.dumps({'is_error': error, 'structured_content': source}),

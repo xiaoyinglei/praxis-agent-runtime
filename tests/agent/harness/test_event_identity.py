@@ -7,6 +7,7 @@ import pytest
 from agent_runtime import Agent
 from agent_runtime.harness import RolloutContextManager, RolloutEventReader, RuntimeState
 from agent_runtime.harness import rollout as rollout_module
+from agent_runtime.harness.protocol import item_text
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
 from agent_runtime.history import read_chat_messages
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -98,7 +99,7 @@ def test_fork_and_compaction_keep_the_accepted_output_as_the_original_item(tmp_p
         candidate = manager._candidate(current.turn_id, 1, summary_override="previous question and accepted answer",
                                        require_reduction=False)
         manager.commit_compaction(candidate)
-        assert store.read_item(source).payload["text"] == "accepted answer"
+        assert item_text(store.read_item(source)) == "accepted answer"
         assert store.read_turn_answer(first.turn_id).item_id == source
         assert store.verify().valid
 

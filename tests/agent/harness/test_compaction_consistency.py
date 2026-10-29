@@ -6,14 +6,17 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall
 from agent_runtime.harness import (
     CompletionDecision,
     GatewayHarnessModel,
     HarnessModelRequest,
+    HarnessModelResponse,
     RolloutContextManager,
     RuntimeState,
     TurnExecutor,
 )
+from agent_runtime.harness.protocol import model_response_payload
 from tests.agent.harness.legacy_fixtures import record_migrated_context_item as seed
 from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
 
@@ -80,13 +83,15 @@ def test_durable_boundary_preserves_tool_group(tmp_path: Path):
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={
-                "text": "",
-                "tool_calls": [
-                    {"id": "a", "name": "read", "arguments": {}},
-                    {"id": "b", "name": "read", "arguments": {}},
-                ],
-            },
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='a', name='read', arguments={}),
+                        ModelToolCall(id='b', name='read', arguments={}),
+                    ),
+                )
+            ),
         )
         for call in ("a", "b"):
             seed(
@@ -224,12 +229,14 @@ def test_candidate_messages_do_not_share_mutable_tool_arguments(tmp_path: Path):
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={
-                "text": "",
-                "tool_calls": [
-                    {"id": "a", "name": "read", "arguments": {"paths": ["safe"]}},
-                ],
-            },
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='a', name='read', arguments={'paths': ['safe']}),
+                    ),
+                )
+            ),
         )
         seed(store, turn_id=turn.turn_id, kind="tool_result", payload={"tool_call_id": "a", "model_content": "ok"})
         candidate = next(
@@ -240,8 +247,9 @@ def test_candidate_messages_do_not_share_mutable_tool_arguments(tmp_path: Path):
             if any(m.tool_calls for m in c.messages)
         )
         call = next(c for m in candidate.messages for c in m.tool_calls)
-        call.arguments["paths"].append("changed")
-        assert next(c for m in candidate.messages for c in m.tool_calls).arguments["paths"] == ["safe"]
+        with pytest.raises(AttributeError):
+            call.arguments["paths"].append("changed")
+        assert next(c for m in candidate.messages for c in m.tool_calls).arguments["paths"] == ("safe",)
 
 
 @pytest.mark.parametrize("limits", [{"max_messages": 5}, {"max_item_bytes": 1800}, {"max_total_bytes": 6000}])
@@ -357,12 +365,14 @@ def test_uncertain_tool_group_is_not_covered(tmp_path: Path):
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={
-                "text": "",
-                "tool_calls": [
-                    {"id": "a", "name": "write", "arguments": {}},
-                ],
-            },
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='a', name='write', arguments={}),
+                    ),
+                )
+            ),
         )
         seed(
             store,
@@ -413,12 +423,14 @@ def test_retained_successful_tool_result_is_not_clipped(tmp_path: Path):
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={
-                "text": "",
-                "tool_calls": [
-                    {"id": "a", "name": "read", "arguments": {}},
-                ],
-            },
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='a', name='read', arguments={}),
+                    ),
+                )
+            ),
         )
         content = "successful file content\n" * 1000
         seed(store, turn_id=turn.turn_id, kind="tool_result", payload={"tool_call_id": "a", "model_content": content})
@@ -564,7 +576,14 @@ def test_summary_input_includes_recent_exchange_even_when_replayed_verbatim(tmp_
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={"text": "read current", "tool_calls": [{"id": "recent", "name": "read", "arguments": {}}]},
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='read current',
+                    tool_calls=(
+                        ModelToolCall(id='recent', name='read', arguments={}),
+                    ),
+                )
+            ),
         )
         seed(
             store,

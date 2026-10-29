@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest, RuntimeState
+from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage, RuntimeState
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from tests.agent.harness.test_model_adapter import CapturingGateway, _resolved_model
 from tests.agent.harness.test_runtime_efficiency import PlanningModel
@@ -54,14 +54,14 @@ def test_summary_fork_preserves_messages_tools_and_generation_mode(effort):
     adapter = GatewayHarnessModel(model_id="test-model", resolved=resolved,
                                   instructions=("Static instructions",))
     parent = HarnessModelRequest(thread_id="thread", turn_id="turn", messages=(
-        HarnessMessage(role="context", content="Project rules"),
-        HarnessMessage(role="user", content="Synthetic task"),
-        HarnessMessage(role="assistant", content="Evidence"),
+        ModelMessage(role="context", body="Project rules"),
+        ModelMessage(role="user", body="Synthetic task"),
+        ModelMessage(role="assistant", body="Evidence"),
     ), tools=(_tool("zeta"), _tool("alpha")), binding_manifest={"execution_context_policy": CACHE_POLICY,
         "request_settings": {"preferences": {"reasoning_effort": effort}}})
     before = adapter.prepare(parent).dispatch_payload.request
     summary = replace(parent, purpose="context_summary", messages=(*parent.messages,
-        HarnessMessage(role="user", content="Summarize the history. Do not call tools.")),
+        ModelMessage(role="user", body="Summarize the history. Do not call tools.")),
         binding_manifest={**parent.binding_manifest, "summary_cache_fork": True})
     prepared = adapter.prepare(summary)
     after = prepared.dispatch_payload.request
@@ -79,7 +79,7 @@ def test_unmarked_internal_requests_still_reject_tools():
                                   instructions=("Static instructions",))
     with pytest.raises(ValueError, match="must not expose tools"):
         adapter.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn", purpose="context_summary",
-            messages=(HarnessMessage(role="user", content="summary"),), tools=(_tool("alpha"),),
+            messages=(ModelMessage(role="user", body="summary"),), tools=(_tool("alpha"),),
             binding_manifest={}))
 
 
@@ -124,7 +124,7 @@ async def test_summary_uses_saved_parent_and_falls_back_when_fork_is_too_large(t
         fallback_prompt = fallback_binding.pop("summary_fork_fallback")
         fallback_binding.pop("summary_cache_fork")
         fallback = replace(step, binding_manifest=fallback_binding, tools=(),
-                           messages=(HarnessMessage(role="user", content=fallback_prompt),))
+                           messages=(ModelMessage(role="user", body=fallback_prompt),))
         fallback_size = (await runner._prepare_step(fallback)).resource_request.input_tokens
         assert fallback_size < fork_prepared.resource_request.input_tokens
         admitted = await runner._prepare_step(replace(step, input_token_limit=fallback_size))
@@ -147,9 +147,9 @@ def test_declared_cache_parameters_reach_gateway_with_stable_routing_key():
     resolved.capabilities = replace(resolved.capabilities, supported_cache_parameters=("prompt_cache_key",))
     adapter = GatewayHarnessModel(model_id="test-model", resolved=resolved, instructions=("Static instructions",))
     first = adapter.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn", messages=(
-        HarnessMessage(role="user", content="Task"),), binding_manifest={"execution_context_policy": CACHE_POLICY}))
+        ModelMessage(role="user", body="Task"),), binding_manifest={"execution_context_policy": CACHE_POLICY}))
     request = first.dispatch_payload.request
-    later = replace(request, messages=(*request.messages, ModelMessage(role="user", content="Update")),
+    later = replace(request, messages=(*request.messages, ModelMessage(role="user", body="Update")),
                     prompt_revision="dynamic-revision")
     wire = serialize_openai_request(request)
     assert wire.payload["prompt_cache_key"] == serialize_openai_request(later).payload["prompt_cache_key"]
@@ -157,7 +157,7 @@ def test_declared_cache_parameters_reach_gateway_with_stable_routing_key():
     assert "prompt_cache_retention" not in wire.payload
     # Legacy bindings do not gain new provider parameters on replay.
     old = adapter.prepare(HarnessModelRequest(thread_id="thread", turn_id="turn", messages=(
-        HarnessMessage(role="user", content="Task"),), binding_manifest={}))
+        ModelMessage(role="user", body="Task"),), binding_manifest={}))
     assert "prompt_cache_key" not in serialize_openai_request(old.dispatch_payload.request).payload
 
     from agent_runtime.modeling.contracts import LLMCallStage
@@ -184,7 +184,7 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
     from types import SimpleNamespace
 
     from agent_runtime import Agent
-    from agent_runtime.core.messages import StopReason, ToolCall
+    from agent_runtime.core.messages import ModelToolCall, StopReason
     from agent_runtime.harness import RolloutContextManager, TurnExecutor
     from agent_runtime.harness.services import SessionBindingProvider
     from tests.agent.harness.test_compaction_consistency import Accept
@@ -204,9 +204,12 @@ async def test_capacity_metadata_keeps_full_prefix_and_saved_replay(tmp_path, mo
         async def agenerate_model_request(self, **kwargs):
             response = await super().agenerate_model_request(**kwargs)
             if len(self.requests) == 1:
-                return replace(response, outputs=(), turn=response.turn.model_copy(update={
-                    "text": "", "stop_reason": StopReason.TOOL_USE,
-                    "tool_calls": [ToolCall(id="read", name="read_file", input={"path": "source.txt"})]}))
+                from agent_runtime.core.messages import outputs_from_parts
+
+                return replace(response, stop_reason=StopReason.TOOL_USE, raw_stop_reason="tool_calls",
+                               outputs=outputs_from_parts(tool_calls=(
+                                   ModelToolCall(id="read", name="read_file", arguments={"path": "source.txt"}),
+                               )))
             return response
 
     (tmp_path / "source.txt").write_text("synthetic source")
@@ -291,7 +294,7 @@ defaults:
 
 @pytest.mark.anyio
 async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tmp_path):
-    from agent_runtime.core.messages import StopReason, ToolCall
+    from agent_runtime.core.messages import ModelToolCall, StopReason
     from agent_runtime.harness import ContextBudgetExceededError, RolloutContextManager, TurnExecutor
     from agent_runtime.harness.turn import StepContext
     from tests.agent.harness.test_compaction_consistency import Accept
@@ -299,16 +302,12 @@ async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tm
     class MisbehavingGateway(CapturingGateway):
         async def agenerate_model_request(self, **kwargs):
             response = await super().agenerate_model_request(**kwargs)
-            return replace(
-                response,
-                outputs=(),
-                turn=response.turn.model_copy(
-                    update={
-                        "stop_reason": StopReason.TOOL_USE,
-                        "tool_calls": [ToolCall(id="forbidden", name="side_effect", input={})],
-                    }
-                ),
-            )
+            from agent_runtime.core.messages import outputs_from_parts
+
+            return replace(response, stop_reason=StopReason.TOOL_USE, raw_stop_reason="tool_calls",
+                           outputs=outputs_from_parts(text=response.turn.text, tool_calls=(
+                               ModelToolCall(id="forbidden", name="side_effect", arguments={}),
+                           )))
 
     tool = _tool("side_effect")
     gateway = MisbehavingGateway()
@@ -323,7 +322,7 @@ async def test_summary_rejects_provider_tool_calls_and_keeps_original_history(tm
         turn = runner.restore_turn_context(record.turn_id)
         fork = StepContext(turn=turn, step=1, input_revision=store.user_input_revision(record.turn_id),
             binding_manifest={**turn.binding_manifest, "summary_cache_fork": True},
-            messages=(HarnessMessage(role="user", content="Summarize only. Do not call tools."),),
+            messages=(ModelMessage(role="user", body="Summarize only. Do not call tools."),),
             tools=(tool,), model_token_budget_remaining=None, purpose="context_summary", request_id="summary-test")
         runner._summary_step = lambda *args, **kwargs: fork
         with pytest.raises(ContextBudgetExceededError, match="contain no tool calls"):
@@ -346,9 +345,9 @@ def test_new_turn_clears_previous_acceptance_contract(tmp_path):
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=PlanningModel(),
                               context_manager=RolloutContextManager(store), completion_gate=Accept())
         marker = "Runtime state update (changed fields; latest value wins):\n"
-        previous = HarnessMessage(role="context", content=marker + json.dumps({
+        previous = ModelMessage(role="context", body=marker + json.dumps({
             "acceptance_contract": {"acceptance_command": "previous-turn-command"},
         }))
         _, update = runner._append_runtime_state(runner.restore_turn_context(record.turn_id),
-            (HarnessMessage(role="user", content="old task"), previous), step=1, pressure=False, clock={})
+            (ModelMessage(role="user", body="old task"), previous), step=1, pressure=False, clock={})
         assert json.loads(update[len(marker):].split("\n", 1)[0])["acceptance_contract"] is None

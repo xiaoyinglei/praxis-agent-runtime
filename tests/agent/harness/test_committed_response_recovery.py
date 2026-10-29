@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_runtime.core.messages import ModelToolCall as _ModelToolCall
 from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     CompletionDecision,
@@ -101,7 +102,7 @@ class AnswerAfterRecovery:
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="Recovered tool call was consumed exactly once.",
             provider_response_id="response-after-recovery",
             usage={"input_tokens": 5, "output_tokens": 3},
@@ -166,15 +167,22 @@ def test_fresh_runner_consumes_committed_tool_call_without_replaying_model(
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            text="",
-            provider_response_id="response-with-tool-call",
-            usage={"input_tokens": 3, "output_tokens": 1},
-            tool_calls=(
-                {
-                    "id": "call-1",
-                    "name": "read_file",
-                    "arguments": {"path": "README.md"},
-                },
+            response=HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id="response-with-tool-call",
+                usage={"input_tokens": 3, "output_tokens": 1},
+                tool_calls=tuple(
+                    _ModelToolCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in (
+                        {
+                            "id": "call-1",
+                            "name": "read_file",
+                            "arguments": {"path": "README.md"},
+                        },
+                    )
+                ),
             ),
         )
         assert crashed_process.list_tool_operations(turn.turn_id) == ()
@@ -279,15 +287,22 @@ def test_missing_tool_result_after_runner_success_pauses_for_reconciliation(
             operation_id=model_operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            text="",
-            provider_response_id="response-with-tool-call",
-            usage={"input_tokens": 3, "output_tokens": 1},
-            tool_calls=(
-                {
-                    "id": "call-1",
-                    "name": "read_file",
-                    "arguments": {"path": "README.md"},
-                },
+            response=HarnessModelResponse.from_parts(
+                text="",
+                provider_response_id="response-with-tool-call",
+                usage={"input_tokens": 3, "output_tokens": 1},
+                tool_calls=tuple(
+                    _ModelToolCall(
+                        id=c["id"], name=c["name"], arguments=c["arguments"], argument_error=c.get("argument_error")
+                    )
+                    for c in (
+                        {
+                            "id": "call-1",
+                            "name": "read_file",
+                            "arguments": {"path": "README.md"},
+                        },
+                    )
+                ),
             ),
         )
         with pytest.raises(RuntimeError, match="injected crash"):

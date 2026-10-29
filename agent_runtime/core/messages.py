@@ -11,7 +11,13 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
-from agent_runtime.modeling.events import ModelOutput, output_to_payload
+from agent_runtime.modeling.events import (
+    ModelOutput,
+    ModelOutputKind,
+    output_from_payload,
+    output_to_payload,
+    validate_model_outputs,
+)
 from agent_runtime.tools.tool import JsonValue, _thaw_json, json_schema_output
 
 if TYPE_CHECKING:
@@ -33,34 +39,41 @@ class StopReason(StrEnum):
 
 
 @dataclass(frozen=True)
-class ToolCall:
+class ModelToolCall:
     """A single tool invocation requested by the model.
 
     ``id`` is model-provided or fallback-generated (``tc_<hex>``).
-    ``input`` is already parsed into a dict — never a JSON string.
+    ``arguments`` is an immutable parsed JSON object.
     """
 
     id: str
     name: str
-    input: dict[str, Any]
+    arguments: Mapping[str, Any]
     argument_error: str | None = None
 
     @classmethod
-    def create(cls, name: str, input: dict[str, Any]) -> ToolCall:
-        return cls(id=f"tc_{uuid4().hex[:12]}", name=name, input=input)
+    def create(cls, name: str, arguments: Mapping[str, Any]) -> ModelToolCall:
+        return cls(id=f"tc_{uuid4().hex[:12]}", name=name, arguments=arguments)
 
-    def __deepcopy__(self, memo: dict[int, object]) -> ToolCall:
-        frozen_input = json_schema_output(None, self.input)
-        if not isinstance(frozen_input, Mapping):
+    def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id or not isinstance(self.name, str) or not self.name:
+            raise ValueError("model tool-call id and name must be non-empty strings")
+        frozen = json_schema_output(None, self.arguments)
+        if not isinstance(frozen, Mapping):
             raise TypeError("model tool-call input must be an object")
-        copied = ToolCall(
-            id=self.id,
-            name=self.name,
-            input=cast(dict[str, Any], frozen_input),
-            argument_error=self.argument_error,
-        )
-        memo[id(self)] = copied
-        return copied
+        object.__setattr__(self, "arguments", frozen)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> ModelToolCall:
+        return self
+
+
+def model_tool_call_payload(call: ModelToolCall) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "name": call.name,
+        "arguments": _thaw_json(call.arguments),
+        "argument_error": call.argument_error,
+    }
 
 
 def decode_tool_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
@@ -83,94 +96,142 @@ def decode_tool_arguments(raw: object) -> tuple[dict[str, Any], str | None]:
 # ── Model message ──
 
 
-@dataclass(frozen=True)
-class ModelMessage:
-    """A single message in the agent conversation.
+def outputs_from_parts(
+    *,
+    text: str = "",
+    tool_calls: tuple[ModelToolCall, ...] = (),
+    reasoning_content: str | None = None,
+    plan_content: str | None = None,
+) -> tuple[ModelOutput, ...]:
+    """Build ordered blocks at a flat protocol or synthetic-model boundary."""
+    outputs = []
+    parts: tuple[tuple[ModelOutputKind, str | None], ...] = (
+        ("reasoning", reasoning_content),
+        ("plan", plan_content),
+        ("text", text),
+    )
+    for kind, content in parts:
+        if content is not None and not isinstance(content, str):
+            raise TypeError(f"model {kind} content must be a string or None")
+        if content:
+            outputs.append(ModelOutput(output_id=kind, kind=kind, content=content))
+    for call in tool_calls:
+        outputs.append(
+            ModelOutput(
+                output_id=f"tool:{call.id}",
+                kind="tool_call",
+                tool_call_id=call.id,
+                tool_name=call.name,
+                arguments=call.arguments,
+                argument_error=call.argument_error,
+                content=canonical_json_text(call.arguments),
+            )
+        )
+    return validate_model_outputs(tuple(outputs))
 
-    Roles:
-    - ``system``: generated each turn by AgentMessageAssembler, never stored
-    - ``user``: task or user input
-    - ``assistant``: model response, optionally with tool_calls
-    - ``tool``: tool result, requires ``tool_call_id``
-    - ``context``: an appended canonical context event
+
+def outputs_tool_calls(outputs: tuple[ModelOutput, ...]) -> tuple[ModelToolCall, ...]:
+    return tuple(
+        ModelToolCall(
+            id=cast(str, output.tool_call_id),
+            name=cast(str, output.tool_name),
+            arguments=cast(dict[str, Any], output.arguments),
+            argument_error=output.argument_error,
+        )
+        for output in outputs
+        if output.kind == "tool_call" and output.arguments is not None
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ModelMessage:
+    """One immutable history message, shared by Runtime and model adapters.
+
+    Assistant bodies are ordered output blocks. Other roles carry text. Flat
+    views are computed, never stored alongside the authoritative body.
     """
 
     role: Literal["system", "user", "assistant", "tool", "context"]
-    content: str
-    reasoning_content: str | None = None
-    tool_calls: tuple[ToolCall, ...] = ()
-    tool_call_id: str | None = None  # required when role="tool"
-    outputs: tuple[ModelOutput, ...] = ()
+    body: str | tuple[ModelOutput, ...]
+    tool_call_id: str | None = None
+    context_category: Literal["continuation_summary"] | None = None
 
+    def __post_init__(self) -> None:
+        if self.role not in {"system", "user", "assistant", "tool", "context"}:
+            raise ValueError(f"unsupported model message role: {self.role}")
+        if self.role == "assistant":
+            body = outputs_from_parts(text=self.body) if isinstance(self.body, str) else self.body
+            object.__setattr__(self, "body", validate_model_outputs(body))
+        elif not isinstance(self.body, str):
+            raise ValueError("only assistant messages may contain model output blocks")
+        if self.role == "tool":
+            if not isinstance(self.tool_call_id, str) or not self.tool_call_id:
+                raise ValueError("tool messages require tool_call_id")
+        elif self.tool_call_id is not None:
+            raise ValueError("tool_call_id is only valid for tool messages")
+        if self.context_category is not None and (
+            self.role != "context" or self.context_category != "continuation_summary"
+        ):
+            raise ValueError("continuation_summary provenance requires a context message")
 
-# ── Tool use result ──
+    @classmethod
+    def from_parts(
+        cls,
+        *,
+        role: Literal["system", "user", "assistant", "tool", "context"],
+        content: str = "",
+        tool_calls: tuple[ModelToolCall, ...] = (),
+        reasoning_content: str | None = None,
+        tool_call_id: str | None = None,
+        context_category: Literal["continuation_summary"] | None = None,
+    ) -> ModelMessage:
+        if role != "assistant" and (tool_calls or reasoning_content is not None):
+            raise ValueError("only assistant messages may contain tool calls or reasoning_content")
+        body = (
+            outputs_from_parts(text=content, tool_calls=tool_calls, reasoning_content=reasoning_content)
+            if role == "assistant"
+            else content
+        )
+        return cls(role=role, body=body, tool_call_id=tool_call_id, context_category=context_category)
+
+    @property
+    def outputs(self) -> tuple[ModelOutput, ...]:
+        return self.body if isinstance(self.body, tuple) else ()
+
+    @property
+    def content(self) -> str:
+        if isinstance(self.body, str):
+            return self.body
+        return "".join(output.content for output in self.body if output.kind in {"text", "refusal"})
+
+    @property
+    def reasoning_content(self) -> str | None:
+        return "".join(output.content for output in self.outputs if output.kind == "reasoning") or None
+
+    @property
+    def tool_calls(self) -> tuple[ModelToolCall, ...]:
+        return outputs_tool_calls(self.outputs)
 
 
 class ToolUseResult(BaseModel):
-    """Model output after a turn.  The loop kernel uses ``stop_reason``
-    (the normalized enum) for control flow. ``raw_stop_reason`` preserves
-    provider terminal metadata; it does not authorize Runtime execution."""
+    """Flat wire parser result; converted to output blocks at the gateway."""
 
-    tool_calls: list[ToolCall] = Field(default_factory=list)
+    tool_calls: list[ModelToolCall] = Field(default_factory=list)
     text: str = ""
     reasoning_content: str | None = None
     stop_reason: StopReason
-    raw_stop_reason: str  # debug / logging only
+    raw_stop_reason: str
 
 
-def snapshot_model_message(message: ModelMessage) -> ModelMessage:
-    """Detach one canonical message from caller-owned argument mappings."""
-
-    if not isinstance(message, ModelMessage):
-        raise TypeError("message must be a ModelMessage")
-    if message.role not in {"system", "user", "assistant", "tool", "context"}:
-        raise ValueError(f"unsupported model message role: {message.role}")
-    if not isinstance(message.content, str):
-        raise TypeError("model message content must be a string")
-    if message.reasoning_content is not None:
-        if not isinstance(message.reasoning_content, str):
-            raise TypeError("model message reasoning_content must be a string or None")
-        if message.role != "assistant":
-            raise ValueError(
-                "reasoning_content is only valid for assistant messages"
-            )
-    if message.tool_calls and message.role != "assistant":
-        raise ValueError("only assistant messages may contain tool calls")
-    if message.outputs and message.role != "assistant":
-        raise ValueError("only assistant messages may contain model outputs")
-    if not isinstance(message.outputs, tuple) or any(not isinstance(output, ModelOutput) for output in message.outputs):
-        raise TypeError("message outputs must be a tuple of ModelOutput values")
-    if message.role == "tool":
-        if not isinstance(message.tool_call_id, str) or not message.tool_call_id:
-            raise ValueError("tool messages require tool_call_id")
-    elif message.tool_call_id is not None:
-        raise ValueError("tool_call_id is only valid for tool messages")
-    calls: list[ToolCall] = []
-    for call in message.tool_calls:
-        if not isinstance(call, ToolCall):
-            raise TypeError("message tool_calls must contain ToolCall values")
-        if not isinstance(call.id, str) or not call.id:
-            raise ValueError("model tool-call id must be a non-empty string")
-        if not isinstance(call.name, str) or not call.name:
-            raise ValueError("model tool-call name must be a non-empty string")
-        frozen_input = json_schema_output(None, call.input)
-        if not isinstance(frozen_input, Mapping):
-            raise TypeError("model tool-call input must be an object")
-        calls.append(
-            ToolCall(
-                id=call.id,
-                name=call.name,
-                input=cast(dict[str, Any], frozen_input),
-                argument_error=call.argument_error,
-            )
-        )
+def restore_model_message(payload: Mapping[str, Any]) -> ModelMessage:
+    """Read the canonical message body."""
+    raw_body = payload["body"]
+    body = raw_body if isinstance(raw_body, str) else tuple(output_from_payload(p) for p in raw_body)
     return ModelMessage(
-        role=message.role,
-        content=message.content,
-        reasoning_content=message.reasoning_content,
-        tool_calls=tuple(calls),
-        tool_call_id=message.tool_call_id,
-        outputs=message.outputs,
+        role=payload["role"],
+        body=body,
+        tool_call_id=payload.get("tool_call_id"),
+        context_category=payload.get("context_category"),
     )
 
 
@@ -187,7 +248,7 @@ def context_event_message(
         raise TypeError("context event payload must be an object")
     return ModelMessage(
         role="context",
-        content=canonical_json_text(
+        body=canonical_json_text(
             {
                 "event_type": event_type,
                 "payload": frozen_payload,
@@ -206,7 +267,7 @@ def tool_result_message(result: ToolResult) -> ModelMessage:
     payload = tool_result_payload(result)
     return ModelMessage(
         role="tool",
-        content=canonical_json_text(payload),
+        body=canonical_json_text(payload),
         tool_call_id=result.tool_call_id,
     )
 
@@ -214,12 +275,27 @@ def tool_result_message(result: ToolResult) -> ModelMessage:
 def tool_result_payload(result: ToolResult) -> Mapping[str, JsonValue]:
     """Build the same model envelope for budget admission and transcript insertion."""
     structured = result.structured_content
-    if (result.tool_name == "web_fetch" and not result.is_error and isinstance(structured, Mapping)
-            and isinstance(structured.get("source_id"), str)):
-        runtime_fields = {"network_bytes", "cache_hit", "connection_mode", "failure_stage",
-                          "extraction_method", "error_code", "error_message", "raw_body_base64"}
-        structured = {key: value for key, value in structured.items() if key not in runtime_fields
-                      and (value is not None or key in {"next_line", "next_link", "next_section"})}
+    if (
+        result.tool_name == "web_fetch"
+        and not result.is_error
+        and isinstance(structured, Mapping)
+        and isinstance(structured.get("source_id"), str)
+    ):
+        runtime_fields = {
+            "network_bytes",
+            "cache_hit",
+            "connection_mode",
+            "failure_stage",
+            "extraction_method",
+            "error_code",
+            "error_message",
+            "raw_body_base64",
+        }
+        structured = {
+            key: value
+            for key, value in structured.items()
+            if key not in runtime_fields and (value is not None or key in {"next_line", "next_link", "next_section"})
+        }
         return {"structured_content": structured, "is_error": False, "truncated": result.truncated}
     return {
         "content": tuple(
@@ -239,29 +315,17 @@ def tool_result_payload(result: ToolResult) -> Mapping[str, JsonValue]:
 
 
 def model_message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
-    """Return the canonical JSON value for one snapshotted message."""
-
-    snapshotted = snapshot_model_message(message)
-    payload: dict[str, JsonValue] = {
-        "role": snapshotted.role,
-        "content": snapshotted.content,
-        "tool_calls": tuple(
-            {
-                "id": call.id,
-                "name": call.name,
-                "arguments": json_schema_output(None, call.input),
-            }
-            for call in snapshotted.tool_calls
-        ),
-        "tool_call_id": snapshotted.tool_call_id,
+    """Serialize the one authoritative body, including private replay metadata."""
+    if not isinstance(message, ModelMessage):
+        raise TypeError("message must be a ModelMessage")
+    return {
+        "role": message.role,
+        "body": message.body
+        if isinstance(message.body, str)
+        else cast(JsonValue, tuple(output_to_payload(output) for output in message.body)),
+        "tool_call_id": message.tool_call_id,
+        "context_category": message.context_category,
     }
-    if snapshotted.reasoning_content is not None:
-        payload["reasoning_content"] = snapshotted.reasoning_content
-    if snapshotted.outputs:
-        payload["outputs"] = json_schema_output(
-            None, cast(JsonValue, [output_to_payload(output) for output in snapshotted.outputs])
-        )
-    return payload
 
 
 def canonical_json_text(value: JsonValue) -> str:
@@ -275,14 +339,15 @@ def canonical_json_text(value: JsonValue) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
 __all__ = [
     "ModelMessage",
     "StopReason",
-    "ToolCall",
+    "ModelToolCall",
     "ToolUseResult",
     "canonical_json_text",
     "context_event_message",
     "model_message_payload",
-    "snapshot_model_message",
     "tool_result_message",
 ]

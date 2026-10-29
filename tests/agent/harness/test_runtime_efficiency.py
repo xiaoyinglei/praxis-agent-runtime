@@ -6,10 +6,10 @@ import pytest
 from agent_runtime import Agent
 from agent_runtime.harness import (
     GatewayHarnessModel,
-    HarnessMessage,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
+    ModelMessage,
+    ModelToolCall,
 )
 from agent_runtime.modeling.openai_wire import serialize_openai_request
 from tests.agent.harness.test_model_adapter import CapturingGateway, _resolved_model
@@ -22,9 +22,9 @@ def test_clock_changes_preserve_system_project_and_history_prefix():
     model = GatewayHarnessModel(model_id="test-model", resolved=_resolved_model(gateway=CapturingGateway()),
                                 instructions=("Static instructions",))
     request = HarnessModelRequest(thread_id="thread", turn_id="turn", messages=(
-        HarnessMessage(role="context", content="Project rules"),
-        HarnessMessage(role="user", content="Implement a change"),
-        HarnessMessage(role="assistant", content="Prior work"),
+        ModelMessage(role="context", body="Project rules"),
+        ModelMessage(role="user", body="Implement a change"),
+        ModelMessage(role="assistant", body="Prior work"),
     ), binding_manifest={"execution_context_policy": POLICY, "runtime_clock": {"current_time": "2032-01-01"}})
     first = model.prepare(request).dispatch_payload.request
     second = model.prepare(replace(request, binding_manifest={**request.binding_manifest,
@@ -47,16 +47,16 @@ class PlanningModel(_UpdatePlanThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         step = prepared.request_ref["step"]
         if step in (1, 3) and (step == 1 or self.reconcile):
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                HarnessToolCall(id=f"plan-{step}", name="update_plan", arguments={"plan": [
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                ModelToolCall(id=f"plan-{step}", name="update_plan", arguments={"plan": [
                     {"step": "Inspect source", "status": "in_progress" if step == 1 else "completed"},
                 ]}),
             ))
         if step == 2:
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(
-                HarnessToolCall(id="inspect", name="read_file", arguments={"path": "source.txt"}),
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(
+                ModelToolCall(id="inspect", name="read_file", arguments={"path": "source.txt"}),
             ))
-        return HarnessModelResponse(text="Verified source.", provider_response_id=None, usage={})
+        return HarnessModelResponse.from_parts(text="Verified source.", provider_response_id=None, usage={})
 
 
 @pytest.mark.anyio
@@ -126,20 +126,20 @@ async def test_permission_failure_identity_survives_tool_and_argument_changes(tm
         async def dispatch(self, prepared, *, event_sink=None):
             step = prepared.request_ref["step"]
             if step == 5:
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="Resource denied; no changes made.", provider_response_id=None, usage={},
                 )
             path = f"protected/{'same' if same_resource else step}.py"
             if step % 2:
-                call = HarnessToolCall(id=f"write-{step}", name="apply_patch", arguments={
+                call = ModelToolCall(id=f"write-{step}", name="apply_patch", arguments={
                     "file_path": path, "new_string": f"value = {step}",
                 })
             else:
-                call = HarnessToolCall(id=f"write-{step}", name="execute_python", arguments={
+                call = ModelToolCall(id=f"write-{step}", name="execute_python", arguments={
                     "code": f"pass # attempt {step}", "working_dir": ".", "workspace_write": True,
                     "output_paths": [path],
                 })
-            return HarnessModelResponse(text="", provider_response_id=None, usage={}, tool_calls=(call,))
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None, usage={}, tool_calls=(call,))
 
     model = Model()
     agent = Agent(workspace_path=tmp_path, checkpoint_db=tmp_path / "rollout.db", enable_workspace_mcp=False,
@@ -241,9 +241,16 @@ def test_incomplete_summary_preserves_originals_and_only_blocks_required_compact
         async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref["purpose"] == "context_summary":
                 summary_calls.append(prepared.request_ref["request_id"])
-                return HarnessModelResponse(text="INCOMPLETE_NOT_MEMORY", provider_response_id=None, usage={},
-                                            status="incomplete", incomplete_reason="max_output_tokens")
-            return HarnessModelResponse(text="Completed from original evidence", provider_response_id=None, usage={})
+                return HarnessModelResponse.from_parts(
+                    text="INCOMPLETE_NOT_MEMORY",
+                    provider_response_id=None,
+                    usage={},
+                    status="incomplete",
+                    incomplete_reason="max_output_tokens",
+                )
+            return HarnessModelResponse.from_parts(
+                text="Completed from original evidence", provider_response_id=None, usage={}
+            )
 
         model.dispatch = dispatch
         runner = TurnExecutor(thread_id=thread.thread_id, store=store, model=model,
@@ -275,7 +282,7 @@ def test_failed_optional_compaction_state_survives_restart_and_resets_with_windo
         model, _ = model_for(100000)
 
         async def dispatch(prepared, *, event_sink=None):
-            return HarnessModelResponse(text="partial", provider_response_id=None, usage={},
+            return HarnessModelResponse.from_parts(text="partial", provider_response_id=None, usage={},
                                         status="incomplete", incomplete_reason="max_output_tokens")
 
         model.dispatch = dispatch

@@ -77,10 +77,10 @@ def test_response_cannot_finish_with_open_outputs_or_continue_after_terminal() -
 
 
 def test_response_projections_are_detached_from_mutable_constructor_inputs() -> None:
-    from agent_runtime.harness.protocol import HarnessModelResponse, HarnessToolCall
+    from agent_runtime.harness.protocol import HarnessModelResponse, ModelToolCall
 
     arguments = {"path": "a.py"}
-    response = HarnessModelResponse(tool_calls=(HarnessToolCall("call", "read_file", arguments),))
+    response = HarnessModelResponse.from_parts(tool_calls=(ModelToolCall("call", "read_file", arguments),))
     arguments["path"] = "changed.py"
     assert response.tool_calls[0].arguments["path"] == "a.py"
     with pytest.raises(TypeError):

@@ -5,7 +5,8 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RolloutContextManager, Session
+from agent_runtime.core.messages import outputs_from_parts
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RolloutContextManager, Session
 from agent_runtime.tools.permissions import ToolExecutionContext
 from tests.agent.harness.test_public_agent_cutover import PublicHarnessModel
 from tests.agent.harness.test_session import ZeroDeltaToolThenAnswerModel, _read_file_tool
@@ -25,8 +26,8 @@ class SteeringModel(PublicHarnessModel):
         if len(self.requests) == 1:
             self.started.set()
             await self.release.wait()
-            return HarnessModelResponse(text="old answer", provider_response_id=None, usage={})
-        return HarnessModelResponse(text="updated answer", provider_response_id=None, usage={})
+            return HarnessModelResponse.from_parts(text="old answer", provider_response_id=None, usage={})
+        return HarnessModelResponse.from_parts(text="updated answer", provider_response_id=None, usage={})
 
 
 @pytest.mark.anyio
@@ -115,10 +116,10 @@ class ToolSteeringModel(ZeroDeltaToolThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         response = await super().dispatch(prepared, event_sink=event_sink)
         if response.tool_calls:
-            response = replace(response, outputs=(), tool_calls=(
+            response = replace(response, outputs=outputs_from_parts(tool_calls=(
                 response.tool_calls[0],
-                HarnessToolCall(id="call-2", name="read_file", arguments={"path": "second.txt"}),
-            ))
+                ModelToolCall(id="call-2", name="read_file", arguments={"path": "second.txt"}),
+            )))
         return response
 
 
@@ -196,7 +197,7 @@ async def test_input_in_final_decision_callback_blocks_old_completion(tmp_path):
 
     class FinalModel(SteeringModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(text="first" if len(self.requests) == 1 else "updated",
+            return HarnessModelResponse.from_parts(text="first" if len(self.requests) == 1 else "updated",
                                         provider_response_id=None, usage={})
 
     model = FinalModel()
@@ -377,9 +378,10 @@ async def test_streaming_input_prevents_old_tools_and_preserves_complete_context
             if response.tool_calls:
                 response = replace(
                     response,
-                    text="old streamed plan" if streaming else response.text,
-                    outputs=(),
-                    tool_calls=tuple(replace(response.tool_calls[0], id=f"call-{index}") for index in range(3)),
+                    outputs=outputs_from_parts(
+                        text="old streamed plan" if streaming else response.text,
+                        tool_calls=tuple(replace(response.tool_calls[0], id=f"call-{index}") for index in range(3)),
+                    ),
                 )
             if streaming:
                 for output in response.outputs:
@@ -475,7 +477,7 @@ async def test_external_input_during_context_capture_is_not_falsely_acknowledged
                       if operation.status == "completed"]
         assert dispatched
         assert all(
-            "requirement during capture" in [m["content"] for m in operation.request_ref["step_snapshot"]["messages"]]
+            "requirement during capture" in [m["body"] for m in operation.request_ref["step_snapshot"]["messages"]]
             for operation in dispatched
         )
 

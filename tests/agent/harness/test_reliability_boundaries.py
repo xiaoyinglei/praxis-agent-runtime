@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, TurnExecutor
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState, TurnExecutor
 from agent_runtime.harness import rollout as rollout_module
 from agent_runtime.harness.events import RolloutEventReader
 from agent_runtime.harness.tool_orchestrator import ToolOrchestrator
@@ -177,11 +177,20 @@ async def test_live_projection_matches_replay_across_tool_commits_and_reopened_t
                 request_ref={"input_revision": 1, "request_id": "model-request"},
             ))
             attempt = await executor._commit(lambda: store.dispatch_model_attempt(operation.operation_id))
-            await executor._commit(lambda: store.complete_model_attempt(
-                operation_id=operation.operation_id, attempt_id=attempt.attempt_id, generation=attempt.generation,
-                text="answer", provider_response_id="response", usage={"input_tokens": 1, "output_tokens": 1},
-                reasoning_content="inspect the file", plan_content="read then answer",
-            ))
+            await executor._commit(
+                lambda: store.complete_model_attempt(
+                    operation_id=operation.operation_id,
+                    attempt_id=attempt.attempt_id,
+                    generation=attempt.generation,
+                    response=HarnessModelResponse.from_parts(
+                        text="answer",
+                        provider_response_id="response",
+                        usage={"input_tokens": 1, "output_tokens": 1},
+                        reasoning_content="inspect the file",
+                        plan_content="read then answer",
+                    ),
+                )
+            )
             orchestrator = ToolOrchestrator(
                 store=store, tools={"read_file": _read_tool(workspace=tmp_path)},
                 execution_context=ToolExecutionContext(workspace_root=tmp_path, cwd=tmp_path),
@@ -265,10 +274,10 @@ async def test_public_agent_large_file_output_survives_next_dispatch_and_reopen(
     class ReadThenAnswer(PatchThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink=None):
             first = prepared.request_ref["request_id"].endswith(":step:1")
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="" if first else "file inspected", provider_response_id="read" if first else "answer",
                 usage={"input_tokens": 2, "output_tokens": 1},
-                tool_calls=(HarnessToolCall(id="read-large", name="read_file", arguments={
+                tool_calls=(ModelToolCall(id="read-large", name="read_file", arguments={
                     "path": "large.txt", "max_bytes": 1000000,
                 }),) if first else (),
             )

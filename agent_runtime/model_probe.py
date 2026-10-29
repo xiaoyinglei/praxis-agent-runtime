@@ -204,7 +204,7 @@ class ModelProbe:
             )
         await _safe_phase(
             "tool_call",
-            lambda: asyncio.to_thread(tool.validate_input, calls[0].input),
+            lambda: asyncio.to_thread(tool.validate_input, calls[0].arguments),
             definition=definition,
         )
 

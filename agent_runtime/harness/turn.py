@@ -23,6 +23,7 @@ from agent_runtime.budget import (
     normal_token_remaining,
 )
 from agent_runtime.budget.pricing import estimated_model_cost_micros
+from agent_runtime.core.messages import model_message_payload, restore_model_message
 from agent_runtime.harness.events import commit_and_publish
 from agent_runtime.harness.model_outputs import (
     complete_model_output,
@@ -40,21 +41,20 @@ from agent_runtime.harness.protocol import (
     ContextCompactionCandidate,
     ContextManager,
     ContextSourceChangedError,
-    HarnessMessage,
     HarnessModel,
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ModelContextOverflowError,
     ModelDispatchCancelledError,
     ModelDispatchOutcomeUnknownError,
     ModelDispatchPreflightError,
+    ModelMessage,
+    ModelToolCall,
     PreparedModelCall,
     ToolRouter,
     TurnResult,
-    harness_message_payload,
-    harness_tool_call_payload,
-    restore_harness_message,
+    item_text,
+    restore_model_response,
 )
 from agent_runtime.harness.records import ItemSnapshot, ModelOperationSnapshot
 from agent_runtime.harness.state import RuntimeState, TurnInputChangedError
@@ -71,7 +71,6 @@ from agent_runtime.modeling.events import (
     ModelOutputStarted,
     ModelResponseStarted,
     ModelStreamState,
-    output_from_payload,
 )
 from agent_runtime.runtime_clock import capture_runtime_clock
 from agent_runtime.streaming.events import (
@@ -119,7 +118,7 @@ class StepContext:
     turn: TurnContext
     step: int
     binding_manifest: Mapping[str, Any]
-    messages: tuple[HarnessMessage, ...]
+    messages: tuple[ModelMessage, ...]
     tools: tuple[Tool, ...]
     model_token_budget_remaining: int | None
     input_revision: int
@@ -248,7 +247,7 @@ class TurnExecutor:
         *,
         step: int,
         budget_pressure: bool | None = None,
-        messages: tuple[HarnessMessage, ...] | None = None,
+        messages: tuple[ModelMessage, ...] | None = None,
     ) -> StepContext:
         if turn_context.thread_id != self.thread_id:
             raise RuntimeError("Turn belongs to a different Session")
@@ -270,12 +269,12 @@ class TurnExecutor:
         execution_policy = turn_context.binding_manifest.get("execution_context_policy", {})
         append_context = execution_policy.get("context_updates") == "append-v1"
         if not append_context and project_instructions is not None and project_instructions["entries"]:
-            messages = (HarnessMessage(role="context", content=instruction_context(project_instructions)), *messages)
+            messages = (ModelMessage(role="context", body=instruction_context(project_instructions)), *messages)
         snapshot = turn_context.binding_manifest.get("memory_snapshot")
         if not append_context and snapshot is not None:
             from agent_runtime.harness.memory import memory_navigation
 
-            messages = (HarnessMessage(role="context", content=memory_navigation(snapshot)), *messages)
+            messages = (ModelMessage(role="context", body=memory_navigation(snapshot)), *messages)
         context_updates: tuple[str, ...] = ()
         if append_context:
             messages, context_updates = self._append_context_updates(messages, project_instructions, snapshot)
@@ -290,7 +289,7 @@ class TurnExecutor:
                 if plan is not None:
                     from agent_runtime.planning import model_visible_plan
 
-                    messages = (*messages, HarnessMessage(role="context", content=(
+                    messages = (*messages, ModelMessage(role="context", body=(
                         "Current advisory plan (canonical runtime state):\n"
                         + json.dumps(model_visible_plan(plan.payload["plan"]), ensure_ascii=False, sort_keys=True)
                         + "\nKeep this plan current as phases finish or constraints change. "
@@ -299,7 +298,7 @@ class TurnExecutor:
         if pressure and not append_state:
             messages = (
                 *messages,
-                HarnessMessage(role="context", content=(
+                ModelMessage(role="context", body=(
                     "Resource budget is running low. Prioritize remaining required actions and verification. "
                     "Report unfinished work honestly if the limit is reached."
                     if runtime_capacity else _BUDGET_PRESSURE_MESSAGE)),
@@ -307,8 +306,8 @@ class TurnExecutor:
         completion = turn_context.binding_manifest.get("completion_policy", {})
         if (not append_state and completion.get("revision") == "completion-v2"
                 and completion.get("acceptance_command")):
-            messages = (*messages, HarnessMessage(
-                role="context", content=(
+            messages = (*messages, ModelMessage(
+                role="context", body=(
                     "User-configured acceptance contract (immutable for this Turn):\n"
                     + json.dumps(dict(completion), ensure_ascii=False, sort_keys=True)
                     + "\nRun acceptance_command exactly via run_command in the workspace root. "
@@ -320,12 +319,12 @@ class TurnExecutor:
         step_policy = turn_context.binding_manifest.get("step_budget_policy") == {"revision": "pressure-v1"}
         if (not append_state and not runtime_capacity
                 and (context_capacity_policy(turn_context.binding_manifest) is not None or step_policy)):
-            messages = (*messages, HarnessMessage(role="context", content="Runtime budget status:\n" +
+            messages = (*messages, ModelMessage(role="context", body="Runtime budget status:\n" +
                          json.dumps(self._budget_status(turn_context), sort_keys=True)))
         if step_policy and not append_state:
             remaining_steps = min(self._max_steps, turn_context.binding_manifest["model_step_budget"]) - step + 1
             if remaining_steps <= 2:
-                messages = (*messages, HarnessMessage(role="context", content=(
+                messages = (*messages, ModelMessage(role="context", body=(
                     f"Step budget is nearly exhausted: {remaining_steps} request(s) remaining including this one. "
                     "Converge using existing evidence. Return a final answer when justified; state any unfinished "
                     "work and blockers honestly. Do not claim unperformed verification or extend the budget."
@@ -399,10 +398,10 @@ class TurnExecutor:
 
     @staticmethod
     def _append_context_updates(
-        messages: tuple[HarnessMessage, ...],
+        messages: tuple[ModelMessage, ...],
         instructions: Mapping[str, Any] | None,
         memory: Mapping[str, Any] | None,
-    ) -> tuple[tuple[HarnessMessage, ...], tuple[str, ...]]:
+    ) -> tuple[tuple[ModelMessage, ...], tuple[str, ...]]:
         """Diff the visible baseline, including after compaction, without writing it.
 
         Updates become history only when the model request is committed. They
@@ -424,12 +423,12 @@ class TurnExecutor:
                              if message.role == "context" and message.content.startswith(marker)), None)
             if content is not None and content != previous and (meaningful or previous is not None):
                 updates.append(content)
-        return (*messages, *(HarnessMessage(role="context", content=update) for update in updates)), tuple(updates)
+        return (*messages, *(ModelMessage(role="context", body=update) for update in updates)), tuple(updates)
 
     def _append_runtime_state(
-        self, turn: TurnContext, messages: tuple[HarnessMessage, ...], *,
+        self, turn: TurnContext, messages: tuple[ModelMessage, ...], *,
         step: int, pressure: bool, clock: Mapping[str, Any],
-    ) -> tuple[tuple[HarnessMessage, ...], str | None]:
+    ) -> tuple[tuple[ModelMessage, ...], str | None]:
         """Append changed facts; old updates are projected from durable request Items.
 
         Compaction removes old updates with the rest of covered history. Rebuild
@@ -483,7 +482,7 @@ class TurnExecutor:
             if completion.get("acceptance_command"):
                 update += (" Run acceptance_contract.acceptance_command exactly via run_command in the workspace "
                            "root after the latest change, subject to normal permissions and approval.")
-        return (*messages, HarnessMessage(role="context", content=update)), update
+        return (*messages, ModelMessage(role="context", body=update)), update
 
     def _budget_status(self, turn: TurnContext) -> dict[str, Any]:
         state = self._store.read_budget_state(turn.turn_id)
@@ -510,7 +509,7 @@ class TurnExecutor:
             fallback = binding.pop("summary_fork_fallback")
             binding.pop("summary_cache_fork")
             return replace(fork, binding_manifest=binding,
-                           messages=(HarnessMessage(role="user", content=fallback),), tools=())
+                           messages=(ModelMessage(role="user", body=fallback),), tools=())
 
         if policy is not None and step.purpose == "context_summary":
             # A large token window does not authorize an unbounded history
@@ -586,7 +585,7 @@ class TurnExecutor:
             "output_token_limit": step.output_token_limit,
             "continuation_summary_role": prepared.request_ref.get("continuation_summary_role", "context"),
             "compaction_plan": dict(step.compaction_plan) if step.compaction_plan is not None else None,
-            "messages": [harness_message_payload(message) for message in step.messages],
+            "messages": [model_message_payload(message) for message in step.messages],
             "tools": [{"name": tool.definition.name, "revision": tool.execution_revision} for tool in step.tools],
             "model_token_budget_remaining": step.model_token_budget_remaining,
             "budget_pressure": step.budget_pressure,
@@ -632,7 +631,7 @@ class TurnExecutor:
             raise RuntimeError("model operation has no durable Step snapshot")
         # Rebuild the original request, never recapture current Session settings.
         messages = tuple(
-            restore_harness_message(item)
+            restore_model_message(item)
             for item in snapshot["messages"]
         )
         tools = (
@@ -683,7 +682,7 @@ class TurnExecutor:
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
-                    answer=str(answer.payload["text"]),
+                    answer=item_text(answer),
                     status="completed",
                 )
             if turn.status == "running" and decision == "approve":
@@ -858,7 +857,7 @@ class TurnExecutor:
                 for tool_operation in self._store.list_tool_operations(turn_id)
             }
         )
-        pending_calls: list[HarnessToolCall] = []
+        pending_calls: list[ModelToolCall] = []
         committed_results = await self._store.run_async(
             lambda: {
                 item.payload.get("tool_call_id")
@@ -938,12 +937,10 @@ class TurnExecutor:
             handled = await self._handle_model_response(
                 thread_id=turn.thread_id,
                 turn_id=turn_id,
-                response=HarnessModelResponse(
-                    text=response.text,
-                    provider_response_id=response.provider_response_id,
-                    usage=response.usage,
-                    tool_calls=tuple(pending_calls),
-                ),
+                response=replace(response, outputs=tuple(
+                    output for output in response.outputs
+                    if output.kind != "tool_call" or output.tool_call_id in {call.id for call in pending_calls}
+                )),
                 prepared=prepared,
             )
             if handled is not None:
@@ -985,7 +982,7 @@ class TurnExecutor:
                 return TurnResult(
                     thread_id=turn.thread_id,
                     turn_id=turn_id,
-                    answer=str(answer.payload["text"]),
+                    answer=item_text(answer),
                     status="completed",
                 )
             raise RuntimeError(f"resolved {interaction.kind} is already being processed")
@@ -1057,7 +1054,7 @@ class TurnExecutor:
             identity += f":context-capacity-v2:{plan['summary_input_limit']}"
         digest = hashlib.sha256(identity.encode()).hexdigest()
         binding = turn.binding_manifest
-        messages: tuple[HarnessMessage, ...] = (HarnessMessage(role="user", content=prompt),)
+        messages: tuple[ModelMessage, ...] = (ModelMessage(role="user", body=prompt),)
         tools: tuple[Tool, ...] = ()
         summary_role = None
         # Only a complete source can fork the parent. Tree fragments and merges
@@ -1072,13 +1069,13 @@ class TurnExecutor:
                 input_update = parent.request_ref.get("runtime_input_update")
                 if isinstance(input_update, str):
                     original = replace(original, messages=(*original.messages,
-                                       HarnessMessage(role="context", content=input_update)))
+                                       ModelMessage(role="context", body=input_update)))
                 data = json.loads(source)
                 # Reuse every parent message byte for byte. Add only evidence
                 # not already present (including archival bodies after elision).
-                known = {json.dumps(harness_message_payload(m), sort_keys=True) for m in original.messages}
+                known = {json.dumps(model_message_payload(m), sort_keys=True) for m in original.messages}
                 extra = [entry for entry in data.get("history", ()) if json.dumps(
-                    harness_message_payload(restore_harness_message(entry)), sort_keys=True,
+                    model_message_payload(restore_model_message(entry)), sort_keys=True,
                 ) not in known]
                 data = {**data, "history": extra}
                 instruction = prompt[:prompt.index("\nHISTORY:\n")] + (
@@ -1088,7 +1085,7 @@ class TurnExecutor:
                 )
                 binding = {**original.binding_manifest, "summary_cache_fork": True,
                            "summary_fork_fallback": prompt}
-                messages = (*original.messages, HarnessMessage(role="user", content=instruction))
+                messages = (*original.messages, ModelMessage(role="user", body=instruction))
                 tools = original.tools
                 summary_role = original.continuation_summary_role
                 digest = hashlib.sha256((identity + parent.request_hash).encode()).hexdigest()
@@ -1159,8 +1156,9 @@ class TurnExecutor:
                         f"Previously incomplete summary cannot be reused: {item.payload.get('incomplete_reason')}.",
                         reason_code="context_summary_incomplete",
                     )
-                answer = item.payload.get("text", "")
-                if not isinstance(answer, str) or not answer.strip() or item.payload.get("tool_calls"):
+                cached_response = restore_model_response(item.payload)
+                answer = cached_response.text
+                if not answer.strip() or cached_response.tool_calls:
                     raise ContextBudgetExceededError("Summary must be nonempty and contain no tool calls.",
                                                      reason_code="context_summary_invalid")
                 # Cached content must satisfy the new byte bound and admission
@@ -2316,16 +2314,7 @@ class TurnExecutor:
                 operation_id=operation.operation_id,
                 attempt_id=attempt.attempt_id,
                 generation=attempt.generation,
-                text=response.text,
-                provider_response_id=response.provider_response_id,
-                usage=response.usage,
-                tool_calls=tuple(harness_tool_call_payload(call) for call in response.tool_calls),
-                response_status=response.status,
-                incomplete_reason=response.incomplete_reason,
-                outputs=response.outputs,
-                stop_reason=response.stop_reason,
-                reasoning_content=response.reasoning_content,
-                plan_content=response.plan_content,
+                response=response,
             )
         )
         if not accepted:
@@ -2435,7 +2424,8 @@ class TurnExecutor:
                for i in items):
             return None  # A committed recovery grant belongs to this batch, not a new attempt.
         call_ids = await self._store.run_async(
-            lambda: {call["id"] for call in self._store.read_item(source_item_id).payload.get("tool_calls", ())}
+            lambda: {call.id for call in restore_model_response(
+                self._store.read_item(source_item_id).payload).tool_calls}
         )
         failure = await self._store.run_async(
             lambda: next(
@@ -2716,7 +2706,7 @@ class TurnExecutor:
                 continue
             if item.kind == "user_message" or (
                 item.kind == "model_response" and item.payload.get("response_status", "completed") == "completed"
-                and item.payload.get("tool_calls")
+                and restore_model_response(item.payload).tool_calls
             ):
                 break
             if item.kind == "completion_decision" and item.payload.get("action") == "continue":
@@ -2728,16 +2718,11 @@ def _feedback_reason_code(payload: Mapping[str, Any]) -> str | None:
     code = payload.get("reason_code")
     if isinstance(code, str):
         return code
-    # Read the structured field from old records; rendered text is not identity.
-    try:
-        legacy = json.loads(payload.get("text", ""))
-    except (ValueError, TypeError):
-        return None
-    return legacy.get("reason_code") if isinstance(legacy, dict) else None
+    return None
 
 
 def _aci_tool_call(
-    call: HarnessToolCall,
+    call: ModelToolCall,
     request_ref: Mapping[str, Any],
 ) -> ToolCall:
     request_id = request_ref.get("request_id")
@@ -2766,46 +2751,7 @@ def _aci_tool_call(
 def _response_from_committed_item(item: ItemSnapshot) -> HarnessModelResponse:
     if item.kind != "model_response" or item.status != "completed":
         raise RuntimeError("canonical model response Item is malformed")
-    text = item.payload.get("text")
-    provider_response_id = item.payload.get("provider_response_id")
-    usage = item.payload.get("usage")
-    raw_calls = item.payload.get("tool_calls", ())
-    response_status = item.payload.get("response_status", "completed")
-    incomplete_reason = item.payload.get("incomplete_reason")
-    if (
-        not isinstance(text, str)
-        or (provider_response_id is not None and not isinstance(provider_response_id, str))
-        or not isinstance(usage, Mapping)
-        or not isinstance(raw_calls, (list, tuple))
-        or response_status not in {"completed", "incomplete"}
-        or (incomplete_reason is not None and not isinstance(incomplete_reason, str))
-    ):
-        raise RuntimeError("canonical model response payload is malformed")
-    calls: list[HarnessToolCall] = []
-    for raw_call in raw_calls:
-        if not isinstance(raw_call, Mapping):
-            raise RuntimeError("canonical model tool call is malformed")
-        call_id = raw_call.get("id")
-        name = raw_call.get("name")
-        arguments = raw_call.get("arguments")
-        if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, Mapping):
-            raise RuntimeError("canonical model tool call is malformed")
-        argument_error = raw_call.get("argument_error")
-        if argument_error is not None and not isinstance(argument_error, str):
-            raise RuntimeError("canonical model tool argument error is malformed")
-        calls.append(HarnessToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error))
-    return HarnessModelResponse(
-        text=text,
-        provider_response_id=provider_response_id,
-        usage=usage,
-        tool_calls=tuple(calls),
-        status=response_status,
-        incomplete_reason=incomplete_reason,
-        reasoning_content=item.payload.get("reasoning_content"),
-        plan_content=item.payload.get("plan_content"),
-        outputs=tuple(output_from_payload(output) for output in item.payload.get("outputs", ())),
-        stop_reason=item.payload.get("stop_reason"),
-    )
+    return restore_model_response(item.payload)
 
 
 def _split_summary_history(text: str) -> tuple[str, str]:
@@ -2818,7 +2764,8 @@ def _split_summary_history(text: str) -> tuple[str, str]:
         pending: set[str] = set()
         boundaries = []
         for index, message in enumerate(history):
-            pending.update(call["id"] for call in message.get("tool_calls", ()))
+            restored = restore_model_message(message)
+            pending.update(call.id for call in restored.tool_calls)
             if message.get("role") == "tool":
                 pending.discard(message.get("tool_call_id"))
             if not pending and index + 1 < len(history):

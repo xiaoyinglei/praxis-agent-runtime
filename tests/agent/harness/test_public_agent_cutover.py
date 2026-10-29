@@ -13,8 +13,8 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ModelDispatchCancelledError,
+    ModelToolCall,
     PreparedModelCall,
     RolloutEventReader,
     RuntimeState,
@@ -57,7 +57,7 @@ class PublicHarnessModel:
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="answer from replacement harness",
             provider_response_id="public-response",
             usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
@@ -100,7 +100,7 @@ def assert_answer_event_contract(events: list[StreamEvent]) -> None:
 class IncompletePublicHarnessModel(PublicHarnessModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         del prepared
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="partial public answer",
             provider_response_id="response-incomplete",
             usage={"input_tokens": 8, "output_tokens": 32, "total_tokens": 40},
@@ -292,12 +292,12 @@ class PatchThenAnswerModel:
 
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="patch-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="patch-1",
                         name="apply_patch",
                         arguments={
@@ -308,7 +308,7 @@ class PatchThenAnswerModel:
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="patched through replacement harness",
             provider_response_id="patch-answer",
             usage={"input_tokens": 3, "output_tokens": 2},
@@ -318,12 +318,12 @@ class PatchThenAnswerModel:
 class DestructivePythonThenAnswerModel(PatchThenAnswerModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="python-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="python-1",
                         name="execute_python",
                         arguments={
@@ -334,7 +334,7 @@ class DestructivePythonThenAnswerModel(PatchThenAnswerModel):
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="changed through managed Python",
             provider_response_id="python-answer",
             usage={"input_tokens": 3, "output_tokens": 2},
@@ -383,7 +383,7 @@ class BlockingPublicModel(PublicHarnessModel):
         del prepared
         self.dispatch_started.set()
         await self.release_dispatch.wait()
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="live stream answer",
             provider_response_id="live-stream-response",
             usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
@@ -415,7 +415,7 @@ class BlockingResumeModel(PatchThenAnswerModel):
             return await super().dispatch(prepared)
         self.resume_dispatch_started.set()
         await self.release_resume_dispatch.wait()
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="resumed live",
             provider_response_id="resume-live-response",
             usage={"input_tokens": 3, "output_tokens": 2},
@@ -425,12 +425,12 @@ class BlockingResumeModel(PatchThenAnswerModel):
 class PlanThenAnswerModel(PatchThenAnswerModel):
     async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
         if prepared.request_ref["request_id"].endswith(":step:1"):
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="",
                 provider_response_id="plan-call",
                 usage={"input_tokens": 2, "output_tokens": 1},
                 tool_calls=(
-                    HarnessToolCall(
+                    ModelToolCall(
                         id="plan-1",
                         name="update_plan",
                         arguments={
@@ -451,7 +451,7 @@ class PlanThenAnswerModel(PatchThenAnswerModel):
                     ),
                 ),
             )
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="planned answer",
             provider_response_id="planned-answer",
             usage={"input_tokens": 3, "output_tokens": 2},
@@ -821,9 +821,12 @@ async def test_original_attachment_is_readable_by_real_tools_and_live_deny_revok
                 "exposed_tool_names": [tool.definition.name for tool in request.tools]})
         async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
-                return HarnessModelResponse(text="", provider_response_id="read-response", usage={}, tool_calls=(
-                    HarnessToolCall(id="read-original", name="read_file", arguments={"path": str(first)}),
-                ))
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id="read-response",
+                    usage={},
+                    tool_calls=(ModelToolCall(id="read-original", name="read_file", arguments={"path": str(first)}),),
+                )
             return await super().dispatch(prepared, event_sink=event_sink)
     model = ReadingModel()
     agent = Agent(checkpoint_db=tmp_path / "read.sqlite3", workspace_path=workspace)

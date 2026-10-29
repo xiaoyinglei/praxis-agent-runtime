@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime import Agent
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
 pytestmark = pytest.mark.skipif(
@@ -37,23 +37,23 @@ class WaitRecoveryModel(PatchThenAnswerModel):
         if terminal and terminal[-1].get("status") in {"completed", "cancelled"}:
             if terminal[-1]["status"] == "completed":
                 assert terminal[-1]["stdout"] == "READYDONE", terminal[-1]
-            return HarnessModelResponse(text="Observed original command", provider_response_id=None,
+            return HarnessModelResponse.from_parts(text="Observed original command", provider_response_id=None,
                                         usage={"input_tokens": 3, "output_tokens": 3})
         if not outputs:
-            call = HarnessToolCall(id="launch", name="run_command", arguments={
+            call = ModelToolCall(id="launch", name="run_command", arguments={
                 "command": ("printf x >> counter; printf READY; "
                             "while [ ! -f release ]; do sleep 0.05; done; printf DONE"),
                 "workspace_write": True, "timeout_seconds": None, "yield_time_seconds": 0.01,
             })
         elif outputs[-1].get("status") == "running":
-            call = HarnessToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
+            call = ModelToolCall(id="wait-" + str(request.step), name="manage_command", arguments={
                 "session_id": outputs[0]["session_id"], "action": "wait", "wait_seconds": 3,
             })
         else:
             assert outputs[-1]["stdout"] == "READYDONE", outputs[-1]
-            return HarnessModelResponse(text="Observed original command", provider_response_id=None,
+            return HarnessModelResponse.from_parts(text="Observed original command", provider_response_id=None,
                                         usage={"input_tokens": 3, "output_tokens": 3})
-        return HarnessModelResponse(text="", provider_response_id=None, tool_calls=(call,),
+        return HarnessModelResponse.from_parts(text="", provider_response_id=None, tool_calls=(call,),
                                     usage={"input_tokens": 3, "output_tokens": 3})
 
 

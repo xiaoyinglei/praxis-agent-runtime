@@ -10,8 +10,8 @@ from agent_runtime import Agent, cli
 from agent_runtime.budget import ResourceUsage
 from agent_runtime.harness import (
     HarnessModelResponse,
-    HarnessToolCall,
     ModelDispatchCancelledError,
+    ModelToolCall,
     RolloutEventReader,
     RuntimeState,
     TurnExecutor,
@@ -35,18 +35,18 @@ class TruncatedThenAnswer(PublicHarnessModel):
 
     async def dispatch(self, prepared, **kwargs):
         if self.repeat or prepared.request_ref["step"] == 1:
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="", provider_response_id=None,
                 usage={"input_tokens": 8, "output_tokens": 32, "reasoning_tokens": 32, "total_tokens": 40},
                 status="incomplete", incomplete_reason=self.reason, tool_calls=self.calls,
             )
-        return HarnessModelResponse(text="complete answer", provider_response_id=None,
+        return HarnessModelResponse.from_parts(text="complete answer", provider_response_id=None,
                                     usage={"input_tokens": 8, "output_tokens": 3, "total_tokens": 11})
 
 
 @pytest.mark.parametrize("entrypoint", ["sdk", "cli"])
 def test_output_limit_restarts_complete_step_through_public_entrypoints(tmp_path, monkeypatch, entrypoint):
-    model = TruncatedThenAnswer(calls=(HarnessToolCall(
+    model = TruncatedThenAnswer(calls=(ModelToolCall(
         id="discarded", name="apply_patch", arguments={"patch": "must never run"},
     ),))
     database = tmp_path / "rollout.db"
@@ -230,11 +230,11 @@ def test_successful_side_effect_is_not_replayed_after_truncation(tmp_path, monke
     class PatchTruncateAnswer(PatchThenAnswerModel):
         async def dispatch(self, prepared, **kwargs):
             if prepared.request_ref["request_id"].endswith(":step:2"):
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="discarded partial answer", provider_response_id=None,
                     usage={"input_tokens": 3, "output_tokens": 20, "total_tokens": 23},
                     status="incomplete", incomplete_reason="max_output_tokens",
-                    tool_calls=(HarnessToolCall(id="must-not-run", name="apply_patch", arguments={
+                    tool_calls=(ModelToolCall(id="must-not-run", name="apply_patch", arguments={
                         "file_path": "value.txt", "old_string": "after", "new_string": "wrong",
                     }),),
                 )

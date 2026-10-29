@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState, ToolOrchestrator
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState, ToolOrchestrator
 from agent_runtime.harness.completion import DeliveryCompletionGate
 from agent_runtime.harness.tool_router import StaticToolRouter
 from agent_runtime.tools.permissions import ToolExecutionContext
@@ -104,7 +104,7 @@ def test_long_context_compaction_keeps_post_change_gate_and_frozen_budget(tmp_pa
         operations = reopened.list_model_operations(turn.turn_id)
         assert any(op.request_ref["purpose"] == "context_summary" for op in operations)
         final_messages = operations[-1].request_ref["step_snapshot"]["messages"]
-        assert any("Keep the public async API unchanged." in msg["content"] for msg in final_messages)
+        assert any("Keep the public async API unchanged." in msg["body"] for msg in final_messages)
         assert reopened.verify().valid
 
 
@@ -132,18 +132,18 @@ def test_repeated_real_file_tool_results_keep_an_affordable_summary_escape_path(
             nonlocal calls
             usage = {"input_tokens": prepared.resource_request.input_tokens, "output_tokens": 50}
             if prepared.request_ref.get("purpose") == "context_summary":
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="Preserve objective and evidence. Continue the remaining reads.",
                     usage=usage,
                     provider_response_id=None,
                 )
             calls += 1
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="Read more evidence." if calls <= 6 else "Finished inspecting all evidence.",
                 usage=usage,
                 provider_response_id=None,
                 tool_calls=(
-                    HarnessToolCall(id=f"read-{calls}", name="read_file", arguments={"path": f"{calls - 1}.txt"}),
+                    ModelToolCall(id=f"read-{calls}", name="read_file", arguments={"path": f"{calls - 1}.txt"}),
                 )
                 if calls <= 6
                 else (),

@@ -7,7 +7,7 @@ import pytest
 
 from agent_runtime import Agent
 from agent_runtime.cli import _display_agent_result
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, RuntimeState
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, RuntimeState
 from agent_runtime.result import AgentUsage
 from tests.agent.harness.test_public_agent_cutover import PatchThenAnswerModel
 
@@ -16,13 +16,13 @@ class ReadTwiceThenAnswer(PatchThenAnswerModel):
     async def dispatch(self, prepared, *, event_sink=None):
         await asyncio.sleep(0.003)
         first = prepared.request_ref["request_id"].endswith(":step:1")
-        return HarnessModelResponse(
+        return HarnessModelResponse.from_parts(
             text="" if first else "Read the existing file and observed the missing file error.",
             provider_response_id="reads" if first else "answer",
             usage={"input_tokens": 4, "output_tokens": 3, "total_tokens": 7},
             tool_calls=(
-                HarnessToolCall(id="read-ok", name="read_file", arguments={"path": "present.txt"}),
-                HarnessToolCall(id="read-failed", name="read_file", arguments={"path": "missing.txt"}),
+                ModelToolCall(id="read-ok", name="read_file", arguments={"path": "present.txt"}),
+                ModelToolCall(id="read-failed", name="read_file", arguments={"path": "missing.txt"}),
             ) if first else (),
         )
 
@@ -274,7 +274,7 @@ async def test_explicit_unknown_cache_usage_does_not_become_legacy_zero(tmp_path
 
     class UnknownCache(PublicHarnessModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(text="answer", provider_response_id=None, usage={
+            return HarnessModelResponse.from_parts(text="answer", provider_response_id=None, usage={
                 "input_tokens": 4, "output_tokens": 3, "cached_input_tokens": 0,
                 "cache_read_input_tokens": None,
             })
@@ -340,7 +340,7 @@ async def test_incomplete_output_and_its_retry_are_both_in_the_usage_summary(tmp
 
     class Truncated(PublicHarnessModel):
         async def dispatch(self, prepared, *, event_sink=None):
-            return HarnessModelResponse(text="", provider_response_id=None,
+            return HarnessModelResponse.from_parts(text="", provider_response_id=None,
                                         status="incomplete", incomplete_reason="max_output_tokens",
                                         usage={"input_tokens": 100, "output_tokens": 32,
                                                "total_tokens": 132, "reasoning_tokens": 32})

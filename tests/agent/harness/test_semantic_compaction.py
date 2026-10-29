@@ -4,7 +4,9 @@ import asyncio
 import json
 from pathlib import Path
 
-from agent_runtime.harness import RolloutContextManager, RuntimeState, TurnExecutor
+from agent_runtime.core.messages import ModelToolCall
+from agent_runtime.harness import HarnessModelResponse, RolloutContextManager, RuntimeState, TurnExecutor
+from agent_runtime.harness.protocol import model_response_payload
 from tests.agent.harness.test_compaction_consistency import Accept, long_history, model_for, start
 
 
@@ -47,7 +49,7 @@ def test_full_history_is_chunked_and_internal_summaries_are_durable(tmp_path: Pa
         internal = [op for op in operations if op.request_ref.get("purpose") == "context_summary"]
         assert len(internal) > 1
         fragments = [
-            op.request_ref["step_snapshot"]["messages"][0]["content"].split("HISTORY:\n", 1)[1] for op in internal
+            op.request_ref["step_snapshot"]["messages"][0]["body"].split("HISTORY:\n", 1)[1] for op in internal
         ]
         original_history = json.loads(source)["history"]
         actual_history = [entry for text in fragments
@@ -76,7 +78,14 @@ def test_latest_tool_evidence_survives_semantic_compaction_verbatim(tmp_path: Pa
             store,
             turn_id=turn.turn_id,
             kind="model_response",
-            payload={"text": "", "tool_calls": [{"id": "read-a", "name": "read_context", "arguments": {}}]},
+            payload=model_response_payload(
+                HarnessModelResponse.from_parts(
+                    text='',
+                    tool_calls=(
+                        ModelToolCall(id='read-a', name='read_context', arguments={}),
+                    ),
+                )
+            ),
         )
         seed(
             store,
@@ -330,10 +339,14 @@ def test_old_tool_outputs_are_archived_before_spending_a_summary_call(tmp_path: 
                 store,
                 turn_id=turn.turn_id,
                 kind="model_response",
-                payload={
-                    "text": f"finding {index}",
-                    "tool_calls": [{"id": str(index), "name": "read", "arguments": {}}],
-                },
+                payload=model_response_payload(
+                    HarnessModelResponse.from_parts(
+                        text=f'finding {index}',
+                        tool_calls=(
+                            ModelToolCall(id=str(index), name='read', arguments={}),
+                        ),
+                    )
+                ),
             )
             seed(
                 store,
@@ -377,7 +390,7 @@ def test_incomplete_summary_never_commits_a_context_transition(tmp_path: Path):
         async def dispatch(prepared, *, event_sink=None):
             assert prepared.request_ref["purpose"] == "context_summary"
             assert event_sink is None
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="cut off",
                 provider_response_id="partial",
                 usage={},
@@ -408,8 +421,8 @@ def test_oversized_generated_summary_is_rejected_without_length_ladder(tmp_path:
 
         async def dispatch(prepared, *, event_sink=None):
             if prepared.request_ref["purpose"] == "context_summary":
-                summaries.append(prepared.request_ref["step_snapshot"]["messages"][0]["content"])
-                return HarnessModelResponse(
+                summaries.append(prepared.request_ref["step_snapshot"]["messages"][0]["body"])
+                return HarnessModelResponse.from_parts(
                     text="Long narrative. " * 500
                     if len(summaries) == 1
                     else "Decision kept; work and verification pending.",
@@ -432,7 +445,7 @@ def test_oversized_generated_summary_is_rejected_without_length_ladder(tmp_path:
 def test_summary_disables_explicit_thinking_without_changing_agent_settings():
     from dataclasses import replace
 
-    from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
     from agent_runtime.model_definition import ProviderOptionsDefinition, ThinkingOptionsDefinition
     from tests.agent.harness.test_model_adapter import BudgetAwareCapturingGateway, _resolved_model
 
@@ -446,7 +459,7 @@ def test_summary_disables_explicit_thinking_without_changing_agent_settings():
     )
     model = GatewayHarnessModel(model_id="test", resolved=resolved, instructions=("Work.",))
     request = HarnessModelRequest(
-        thread_id="t", turn_id="u", messages=(HarnessMessage(role="user", content="History"),), binding_manifest={}
+        thread_id="t", turn_id="u", messages=(ModelMessage(role="user", body="History"),), binding_manifest={}
     )
     summary = model.prepare(replace(request, purpose="context_summary", request_id="summary"))
     normal = model.prepare(request)

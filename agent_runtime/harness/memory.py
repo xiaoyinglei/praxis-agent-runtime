@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
 from agent_runtime.harness.memory_identity import MemoryClaim, thread_in_memory_scope, thread_memory_scope
-from agent_runtime.harness.protocol import BoundHarnessModel
+from agent_runtime.harness.protocol import BoundHarnessModel, item_text
 from agent_runtime.harness.state import RuntimeState, _state_operation
 from agent_runtime.tools.tool import (
     CancellationMode,
@@ -361,7 +361,7 @@ async def update_memory(
                 previous_turn = await store.run_async(store.read_turn, previous_id)
                 if (previous_turn.status == "completed"
                         and previous_turn.binding_manifest.get("maintenance_purpose") == "memory_extract"):
-                    answers = [(await store.run_async(store.read_turn_answer, previous_id)).payload["text"]]
+                    answers = [item_text(await store.run_async(store.read_turn_answer, previous_id))]
                     if answers:
                         try:
                             cached = validate(answers[-1], "memory_extract")

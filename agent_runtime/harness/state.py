@@ -28,7 +28,13 @@ from agent_runtime.budget import (
 from agent_runtime.budget import (
     reserve as reserve_budget,
 )
-from agent_runtime.harness.protocol import ContextSourceChangedError
+from agent_runtime.harness.protocol import (
+    ContextSourceChangedError,
+    HarnessModelResponse,
+    item_text,
+    model_response_payload,
+    restore_model_response,
+)
 from agent_runtime.harness.records import (
     ApprovalSnapshot,
     ArtifactGCReport,
@@ -53,7 +59,7 @@ from agent_runtime.harness.records import (
     _turn_snapshot,
 )
 from agent_runtime.harness.rollout import RolloutStore
-from agent_runtime.modeling.events import ModelOutput, output_to_payload
+from agent_runtime.modeling.events import ModelOutput
 from agent_runtime.planning import PlanStep
 from agent_runtime.streaming.events import (
     derive_model_public_item_id,
@@ -858,8 +864,8 @@ class RuntimeState:
                     source.turn_id != turn_id
                     or source.kind != "model_response"
                     or source.status != "completed"
-                    or source.payload.get("text") != answer
-                    or source.payload.get("response_status", "completed") != "completed"
+                    or item_text(source) != answer
+                    or restore_model_response(source.payload).status != "completed"
                 ):
                     raise ValueError("accepted answer requires the matching completed response from this Turn")
                 item_id = source_item_id
@@ -1159,10 +1165,11 @@ class RuntimeState:
                 for item in visible_items:
                     if item.item_id not in preserved_item_ids:
                         continue
-                    if item.kind == "model_response" and item.payload.get("tool_calls"):
+                    calls = restore_model_response(item.payload).tool_calls if item.kind == "model_response" else ()
+                    if calls:
                         if pending:
                             raise ValueError("preserved tool exchanges must be complete")
-                        pending.update((item.turn_id, call["id"]) for call in item.payload["tool_calls"])
+                        pending.update((item.turn_id, call.id) for call in calls)
                     elif item.kind == "tool_result":
                         key = (item.turn_id, item.payload.get("tool_call_id"))
                         if key not in pending:
@@ -1684,10 +1691,6 @@ class RuntimeState:
                         "operation_id": operation_id,
                         "attempt_id": attempt_id,
                         "generation": 1,
-                        "public_item_ids": _model_public_item_ids(
-                            turn_id=turn_id,
-                            attempt_id=attempt_id,
-                        ),
                         **hashes,
                         "request_ref": frozen_ref,
                     },
@@ -1914,8 +1917,8 @@ class RuntimeState:
                 producer="recovery",
             )
             self._close_started_model_outputs(
-                operation=operation, attempt_id=str(attempt["attempt_id"]),
-                status="outcome_unknown", error="model dispatch lease expired", channel_content={},
+                attempt_id=str(attempt["attempt_id"]),
+                status="outcome_unknown", error="model dispatch lease expired",
             )
             turn = self.persistence.first("turns", where={"turn_id": operation["turn_id"]})
             if turn is not None and turn["status"] == "running":
@@ -1941,14 +1944,12 @@ class RuntimeState:
         generation: int,
         error_type: str | None = None,
         error_message: str | None = None,
-        channel_content: Mapping[str, str] | None = None,
         outputs: tuple[ModelOutput, ...] = (),
     ) -> ModelAttemptSnapshot:
         if error_type is not None and (not isinstance(error_type, str) or not error_type.strip()):
             raise ValueError("model dispatch error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model dispatch error_message must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
         with self.persistence.transaction():
             operation = self.persistence.first("model_operations", where={"operation_id": operation_id})
             if operation is None:
@@ -1981,11 +1982,9 @@ class RuntimeState:
                 outcome="unknown",
             )
             self._close_started_model_outputs(
-                operation=operation,
                 attempt_id=attempt_id,
                 status="outcome_unknown",
                 error=(error_message.strip()[:2_000] if error_message is not None else "model outcome is unknown"),
-                channel_content=frozen_channel_content,
                 outputs=outputs,
             )
             turn = self.persistence.first("turns", where={"turn_id": operation["turn_id"]})
@@ -2013,7 +2012,6 @@ class RuntimeState:
         reason: str,
         error_type: str | None = None,
         error_message: str | None = None,
-        channel_content: Mapping[str, str] | None = None,
         outputs: tuple[ModelOutput, ...] = (),
         budget_outcome: str = "released",
     ) -> ModelAttemptSnapshot:
@@ -2025,7 +2023,6 @@ class RuntimeState:
             raise ValueError("model rejection error_type must be non-empty")
         if error_message is not None and (not isinstance(error_message, str) or not error_message.strip()):
             raise ValueError("model rejection error_message must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
         with self.persistence.transaction():
             operation = self.persistence.first("model_operations", where={"operation_id": operation_id})
             if operation is None:
@@ -2059,11 +2056,9 @@ class RuntimeState:
                 outcome=budget_outcome,
             )
             self._close_started_model_outputs(
-                operation=operation,
                 attempt_id=attempt_id,
                 status="failed",
                 error=(error_message.strip()[:2_000] if error_message is not None else reason.strip()[:2_000]),
-                channel_content=frozen_channel_content,
                 outputs=outputs,
             )
         return self.list_model_attempts(operation_id)[-1]
@@ -2071,72 +2066,14 @@ class RuntimeState:
     def _close_started_model_outputs(
         self,
         *,
-        operation: Mapping[str, Any],
         attempt_id: str,
         status: str,
         error: str,
-        channel_content: Mapping[str, str],
         outputs: tuple[ModelOutput, ...] = (),
     ) -> None:
         from agent_runtime.harness.model_outputs import close_model_outputs
 
         close_model_outputs(self, attempt_id=attempt_id, status=status, error=error, partial_outputs=outputs)
-        if status not in {"failed", "cancelled", "outcome_unknown"}:
-            raise ValueError("model Item terminal status is unsupported")
-        started = self.persistence.rows(
-            "rollout_records",
-            where={"turn_id": operation["turn_id"], "record_type": "item_started"},
-            payload_fields={
-                "attempt_id": attempt_id,
-                "channel": (
-                    "agent_message",
-                    "reasoning",
-                    "plan",
-                ),
-            },
-            order_by="record_id",
-        )
-        seen_channels: set[str] = set()
-        for row in started:
-            start_payload = row["payload"]
-            channel = str(start_payload["channel"])
-            if channel in seen_channels:
-                raise RuntimeError(f"model {channel} channel has duplicate durable starts")
-            seen_channels.add(channel)
-            item_id = str(start_payload["item_id"])
-            completed = self.persistence.first(
-                "rollout_records",
-                where={"turn_id": operation["turn_id"], "record_type": "item_completed"},
-                payload_fields={"item_id": item_id},
-                limit=1,
-            )
-            if completed is not None:
-                continue
-            content = channel_content.get(channel, "")
-            item_payload: dict[str, Any]
-            if channel == "agent_message":
-                item_payload = {"text": content, "tool_calls": ()}
-            else:
-                item_payload = {"content": content}
-            self._append_and_reduce(
-                thread_id=str(operation["thread_id"]),
-                turn_id=str(operation["turn_id"]),
-                record_type="item_completed",
-                producer="model",
-                payload={
-                    "item_id": item_id,
-                    "attempt_id": attempt_id,
-                    "channel": channel,
-                    "public_item_id": derive_model_public_item_id(
-                        turn_id=str(operation["turn_id"]),
-                        model_attempt_id=attempt_id,
-                        channel=channel,
-                    ),
-                    "status": status,
-                    "error": error,
-                    "payload": item_payload,
-                },
-            )
 
     @_state_operation
     def cancel_model_attempt(
@@ -2146,12 +2083,10 @@ class RuntimeState:
         attempt_id: str,
         generation: int,
         reason: str,
-        channel_content: Mapping[str, str] | None = None,
         outputs: tuple[ModelOutput, ...] = (),
     ) -> ModelAttemptSnapshot:
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("model cancellation reason must be non-empty")
-        frozen_channel_content = _model_channel_content(channel_content)
         with self.persistence.transaction():
             operation = self.persistence.first("model_operations", where={"operation_id": operation_id})
             if operation is None:
@@ -2182,11 +2117,9 @@ class RuntimeState:
                 outcome="unknown",
             )
             self._close_started_model_outputs(
-                operation=operation,
                 attempt_id=attempt_id,
                 status="cancelled",
                 error=reason.strip()[:2_000],
-                channel_content=frozen_channel_content,
                 outputs=outputs,
             )
             self._append_and_reduce(
@@ -2225,10 +2158,6 @@ class RuntimeState:
                     "previous_attempt_id": operation["active_attempt_id"],
                     "attempt_id": attempt_id,
                     "generation": generation,
-                    "public_item_ids": _model_public_item_ids(
-                        turn_id=str(operation["turn_id"]),
-                        attempt_id=attempt_id,
-                    ),
                 },
             )
             turn = self.persistence.first("turns", where={"turn_id": operation["turn_id"]})
@@ -2253,39 +2182,13 @@ class RuntimeState:
         operation_id: str,
         attempt_id: str,
         generation: int,
-        text: str,
-        provider_response_id: str | None,
-        usage: Mapping[str, Any],
-        tool_calls: tuple[Mapping[str, Any], ...] = (),
-        response_status: str = "completed",
-        incomplete_reason: str | None = None,
-        reasoning_content: str | None = None,
-        plan_content: str | None = None,
-        outputs: tuple[ModelOutput, ...] | None = None,
-        stop_reason: str | None = None,
+        response: HarnessModelResponse,
         now: float | None = None,
     ) -> bool:
-        if not isinstance(text, str):
-            raise TypeError("model response text must be a string")
-        frozen_tool_calls = tuple(_json_object(call, field="model tool call") for call in tool_calls)
-        if response_status not in {"completed", "incomplete"}:
-            raise ValueError("model response status is unsupported")
-        if response_status == "completed" and incomplete_reason is not None:
-            raise ValueError("completed model response cannot have an incomplete reason")
-        if response_status == "incomplete" and (
-            not isinstance(incomplete_reason, str) or not incomplete_reason.strip()
-        ):
-            raise ValueError("incomplete model response requires a reason")
-        if response_status == "completed" and not text.strip() and not frozen_tool_calls:
+        if response.status == "completed" and not response.text.strip() and not response.tool_calls:
             raise ValueError("model response must contain text or tool calls")
-        for channel, content in (
-            ("reasoning", reasoning_content),
-            ("plan", plan_content),
-        ):
-            if content is not None and not isinstance(content, str):
-                raise TypeError(f"model {channel} content must be a string or None")
-        frozen_usage = _json_object(usage, field="usage")
-        response_item_id: str | None = None
+        response_payload = model_response_payload(response)
+        frozen_usage = _json_object(response.usage, field="usage")
         observed_at = time.time() if now is None else float(now)
         with self.persistence.transaction():
             operation = self.persistence.first("model_operations", where={"operation_id": operation_id})
@@ -2307,55 +2210,24 @@ class RuntimeState:
             if not is_current:
                 return False
             internal_summary = operation["request_ref"].get("purpose") == "context_summary"
-            if outputs is not None and not internal_summary:
+            if not internal_summary:
                 from agent_runtime.harness.model_outputs import finish_model_outputs
 
                 finish_model_outputs(
                     self, operation_id=operation_id, attempt_id=attempt_id,
-                    generation=generation, outputs=outputs,
+                    generation=generation, outputs=response.outputs,
                 )
-            started_channels = self.persistence.rows(
-                "rollout_records",
-                where={"turn_id": operation["turn_id"], "record_type": "item_started"},
-                payload_fields={
-                    "attempt_id": attempt_id,
-                    "channel": (
-                        "agent_message",
-                        "reasoning",
-                        "plan",
-                    ),
-                },
-                order_by="record_id",
-            )
-            started_by_channel: dict[str, Mapping[str, Any]] = {}
-            for row in started_channels:
-                payload = row["payload"]
-                channel = str(payload["channel"])
-                if channel in started_by_channel:
-                    raise RuntimeError(f"model {channel} channel has duplicate durable starts")
-                started_by_channel[channel] = payload
-            if internal_summary and started_by_channel:
-                raise RuntimeError("context summary must not have public output channels")
-            started_response = started_by_channel.get("agent_message")
-            if started_response is not None:
-                response_item_id = str(started_response["item_id"])
-            else:
-                response_item_id = f"item_{uuid4().hex}"
+            response_item_id = f"item_{uuid4().hex}"
             public_item_id = derive_model_public_item_id(
                 turn_id=str(operation["turn_id"]),
                 model_attempt_id=attempt_id,
                 channel="agent_message",
             )
-            public_metadata = (
-                {}
-                if internal_summary
-                else {
-                    "channel": "agent_message",
-                    "public_item_id": public_item_id,
-                }
-            )
-            if outputs is not None:
-                public_metadata["output_protocol"] = "model-outputs-v1"
+            public_metadata = {} if internal_summary else {
+                "channel": "agent_message",
+                "public_item_id": public_item_id,
+                "output_protocol": "model-outputs-v1",
+            }
             self._append_and_reduce(
                 thread_id=operation["thread_id"],
                 turn_id=operation["turn_id"],
@@ -2366,12 +2238,12 @@ class RuntimeState:
                     "attempt_id": attempt_id,
                     "generation": generation,
                     "observed_at": observed_at,
-                    "provider_response_id": provider_response_id,
+                    "provider_response_id": response.provider_response_id,
                     "usage": frozen_usage,
                     "response_item_id": response_item_id,
-                    "response_status": response_status,
-                    "incomplete_reason": incomplete_reason,
-                    "stop_reason": stop_reason,
+                    "response_status": response.status,
+                    "incomplete_reason": response.incomplete_reason,
+                    "stop_reason": response.stop_reason,
                     **({} if internal_summary else {"public_item_id": public_item_id}),
                 },
             )
@@ -2381,25 +2253,21 @@ class RuntimeState:
                 outcome="settled",
                 usage=frozen_usage,
             )
-            if started_response is None:
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="item_started",
-                    producer="model",
-                    payload={
-                        "item_id": response_item_id,
-                        "kind": "context_summary_response" if internal_summary else "model_response",
-                        "attempt_id": attempt_id,
-                        **public_metadata,
-                    },
-                )
+            self._append_and_reduce(
+                thread_id=operation["thread_id"],
+                turn_id=operation["turn_id"],
+                record_type="item_started",
+                producer="model",
+                payload={
+                    "item_id": response_item_id,
+                    "kind": "context_summary_response" if internal_summary else "model_response",
+                    "attempt_id": attempt_id,
+                    **public_metadata,
+                },
+            )
             result_order = (
                 self.read_turn(str(operation["turn_id"]))
-                .binding_manifest.get(
-                    "execution_context_policy",
-                    {},
-                )
+                .binding_manifest.get("execution_context_policy", {})
                 .get("tool_result_order")
             )
             self._append_and_reduce(
@@ -2412,46 +2280,11 @@ class RuntimeState:
                     "attempt_id": attempt_id,
                     **public_metadata,
                     "payload": {
-                        "text": text,
-                        "tool_calls": frozen_tool_calls,
+                        **response_payload,
                         **({"tool_result_order": "call-v1"} if result_order == "call-v1" else {}),
-                        "provider_response_id": provider_response_id,
-                        "usage": frozen_usage,
-                        "response_status": response_status,
-                        "incomplete_reason": incomplete_reason,
-                        "stop_reason": stop_reason,
-                        **({"outputs": [output_to_payload(output) for output in outputs],
-                            "output_protocol": "model-outputs-v1"} if outputs is not None else {}),
-                        **({"reasoning_content": reasoning_content} if reasoning_content else {}),
-                        **({"plan_content": plan_content} if plan_content else {}),
                     },
                 },
             )
-            for channel, content in (
-                ("reasoning", reasoning_content),
-                ("plan", plan_content),
-            ):
-                started = started_by_channel.get(channel)
-                if started is None:
-                    continue
-                public_channel_item_id = derive_model_public_item_id(
-                    turn_id=str(operation["turn_id"]),
-                    model_attempt_id=attempt_id,
-                    channel=channel,
-                )
-                self._append_and_reduce(
-                    thread_id=operation["thread_id"],
-                    turn_id=operation["turn_id"],
-                    record_type="item_completed",
-                    producer="model",
-                    payload={
-                        "item_id": str(started["item_id"]),
-                        "attempt_id": attempt_id,
-                        "channel": channel,
-                        "public_item_id": public_channel_item_id,
-                        "payload": {"content": content or ""},
-                    },
-                )
         return True
 
     @_state_operation
@@ -4538,24 +4371,17 @@ class RuntimeState:
 
     @_state_operation
     def read_turn_answer(self, turn_id: str) -> ItemSnapshot:
-        """Resolve the accepted output identity; old Turns retain their original answer Item."""
+        """Resolve the accepted output identity."""
         completion = self.read_turn_completion(turn_id)
         if completion is None:
             raise RuntimeError("Turn has no committed answer")
-        item_id = completion.payload.get("answer_item_id")
-        if item_id is None:
-            if completion.payload_schema_version >= 3:
-                raise RuntimeError("completed Turn is missing its canonical answer reference")
-            answers = [item for item in self.list_items(turn_id) if item.kind == "agent_message"]
-            if len(answers) != 1:
-                raise RuntimeError("completed Turn has no unique canonical answer")
-            return answers[0]
+        item_id = completion.payload["answer_item_id"]
         answer = self.read_item(item_id)
         if (
             answer.turn_id != turn_id
             or answer.status != "completed"
             or answer.kind not in {"agent_message", "model_response"}
-            or answer.payload.get("response_status", "completed") != "completed"
+            or (answer.kind == "model_response" and restore_model_response(answer.payload).status != "completed")
         ):
             raise RuntimeError("completed Turn has an invalid answer reference")
         return answer
@@ -4609,31 +4435,6 @@ def _validate_resource_usage_input(resource: str, initial_used: int) -> None:
         raise ValueError("initial resource usage must be a non-negative integer")
 
 
-def _model_public_item_ids(*, turn_id: str, attempt_id: str) -> dict[str, str]:
-    return {
-        channel: derive_model_public_item_id(
-            turn_id=turn_id,
-            model_attempt_id=attempt_id,
-            channel=channel,
-        )
-        for channel in ("agent_message", "reasoning", "plan")
-    }
-
-
-def _model_channel_content(
-    content: Mapping[str, str] | None,
-) -> dict[str, str]:
-    if content is None:
-        return {}
-    allowed = {"agent_message", "reasoning", "plan"}
-    frozen: dict[str, str] = {}
-    for channel, value in content.items():
-        if channel not in allowed:
-            raise ValueError(f"unsupported model output channel: {channel}")
-        if not isinstance(value, str):
-            raise TypeError(f"model {channel} content must be a string")
-        frozen[channel] = value
-    return frozen
 
 
 class ResourceClaimConflictError(RuntimeError):

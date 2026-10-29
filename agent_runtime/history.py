@@ -9,6 +9,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from agent_runtime.core.runtime_diagnostics import redact_sensitive_text
+from agent_runtime.harness.protocol import item_text, restore_model_response
 from agent_runtime.harness.records import ItemSnapshot
 from agent_runtime.harness.state import RuntimeState
 
@@ -60,9 +61,8 @@ def read_chat_messages(
 ) -> tuple[tuple[str, str], ...]:
     """Replay saved human/assistant text, including fork ancestors and no tool results.
 
-    Original Items survive context compaction. Pre-v3 runtime answers can be
-    aliases of model output; compatibility deduplication is limited to those Turns.
-    Incomplete output is not presented as a finished assistant answer.
+    Original Items survive context compaction. Incomplete output is not
+    presented as a finished assistant answer.
     """
     with RuntimeState.open_sync(database, read_only=True) as store:
         thread = store.read_thread(thread_id)
@@ -72,19 +72,16 @@ def read_chat_messages(
         if anchor is None:
             return ()
         items = store.list_conversation_items(anchor)
-        final_answers = {item.turn_id: item.payload.get("text") for item in items
-                         if item.kind == "agent_message" and item.status == "completed"}
-        legacy_turns = {turn_id for turn_id in final_answers
-                        if (completion := store.read_turn_completion(turn_id)) is not None
-                        and completion.payload_schema_version < 3}
         committed_responses = {operation.response_item_id: operation for turn_id in {item.turn_id for item in items}
                                for operation in store.list_model_operations(turn_id)
                                if operation.status == "completed"
                                and operation.request_ref.get("purpose") != "context_summary"}
         messages = []
         for item in items:
-            text = item.payload.get("text")
-            if item.status != "completed" or not isinstance(text, str) or not text.strip():
+            if item.status != "completed":
+                continue
+            text = item_text(item)
+            if not text.strip():
                 continue
             if item.kind == "user_message":
                 messages.append(("user", text))
@@ -96,16 +93,14 @@ def read_chat_messages(
             elif item.kind == "agent_message":
                 messages.append(("answer", text))
             elif item.kind == "model_response":
-                if item.item_id not in committed_responses or item.payload.get("response_status") == "incomplete":
-                    continue
-                if (item.turn_id in legacy_turns and not item.payload.get("tool_calls")
-                        and text == final_answers.get(item.turn_id)):
+                response = restore_model_response(item.payload)
+                if item.item_id not in committed_responses or response.status == "incomplete":
                     continue
                 operation = committed_responses[item.item_id]
                 # Reading retained facts grants no execution authority. Only
                 # explicit valid revisions participate in supersession filtering.
                 revision = operation.request_ref.get("input_revision")
-                if (not item.payload.get("tool_calls") and type(revision) is int and revision > 0
+                if (not response.tool_calls and type(revision) is int and revision > 0
                         and revision < store.user_input_revision(item.turn_id)):
                     continue  # Retained in the ledger, superseded as a completion.
                 messages.append(("answer", text))

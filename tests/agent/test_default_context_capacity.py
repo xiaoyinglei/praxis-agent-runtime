@@ -42,7 +42,7 @@ def test_project_catalog_uses_model_capacity_without_default_input_cap(project_r
 
 
 def test_project_catalog_admits_complete_request_above_64k(project_registry):
-    from agent_runtime.harness import GatewayHarnessModel, HarnessMessage, HarnessModelRequest
+    from agent_runtime.harness import GatewayHarnessModel, HarnessModelRequest, ModelMessage
 
     model = GatewayHarnessModel(
         model_id="deepseek-flash",
@@ -54,7 +54,7 @@ def test_project_catalog_admits_complete_request_above_64k(project_registry):
             thread_id="thread",
             turn_id="turn",
             binding_manifest={},
-            messages=(HarnessMessage(role="user", content="x " * 70000),),
+            messages=(ModelMessage(role="user", body="x " * 70000),),
         )
     )
     projection = prepared.request_ref["context_projection"]
@@ -70,8 +70,8 @@ def test_explicit_user_yaml_input_cap_still_combines_with_model_capacity(tmp_pat
     from agent_runtime.harness import (
         ContextCompactionRequiredError,
         GatewayHarnessModel,
-        HarnessMessage,
         HarnessModelRequest,
+        ModelMessage,
     )
 
     data = yaml.safe_load(ModelRegistry._BUNDLED_CONFIG_PATH.read_text())
@@ -95,7 +95,7 @@ def test_explicit_user_yaml_input_cap_still_combines_with_model_capacity(tmp_pat
                 thread_id="thread",
                 turn_id="turn",
                 binding_manifest={},
-                messages=(HarnessMessage(role="user", content="x " * 70000),),
+                messages=(ModelMessage(role="user", body="x " * 70000),),
             )
         )
     assert rejected.value.max_input_tokens == 64000

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.budget import BudgetLimitExceededError, ReservationStatus, ResourceUsage
+from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.harness.state import RuntimeState
 
 
@@ -78,9 +79,11 @@ def test_completed_attempt_settles_actual_usage(tmp_path: Path) -> None:
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
-        text="done",
-        provider_response_id="provider_1",
-        usage={"input_tokens": 18, "output_tokens": 4, "total_tokens": 22},
+        response=HarnessModelResponse.from_parts(
+            text="done",
+            provider_response_id="provider_1",
+            usage={"input_tokens": 18, "output_tokens": 4, "total_tokens": 22},
+        ),
     )
 
     assert accepted is True
@@ -104,9 +107,9 @@ def test_actual_usage_is_not_truncated_to_reservation(tmp_path: Path) -> None:
         operation_id=operation.operation_id,
         attempt_id=attempt.attempt_id,
         generation=attempt.generation,
-        text="done",
-        provider_response_id=None,
-        usage={"input_tokens": 25, "output_tokens": 10},
+        response=HarnessModelResponse.from_parts(
+            text="done", provider_response_id=None, usage={"input_tokens": 25, "output_tokens": 10}
+        ),
     )
 
     state = store.read_budget_state(turn_id)

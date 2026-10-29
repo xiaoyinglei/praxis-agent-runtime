@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, Session
+from agent_runtime.harness import HarnessModelResponse, ModelToolCall, Session
 from agent_runtime.tools.tool import InterruptBehavior, ResolvedToolUse, ToolEffect, ToolTarget
 from tests.agent.harness.test_parallel_tool_orchestrator import _setup
 from tests.agent.harness.test_tool_orchestrator import AcceptToolAnswer, ToolThenAnswerModel, _read_tool
@@ -127,9 +127,9 @@ async def test_provider_group_uses_frozen_order_while_ledger_keeps_completion_or
     class Model(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink=None):
             if len(self.requests) == 1:
-                return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=(
-                    HarnessToolCall(id="slow", name="read_file", arguments={"path": "0"}),
-                    HarnessToolCall(id="fast", name="read_file", arguments={"path": "1"}),
+                return HarnessModelResponse.from_parts(text="", provider_response_id="batch", usage={}, tool_calls=(
+                    ModelToolCall(id="slow", name="read_file", arguments={"path": "0"}),
+                    ModelToolCall(id="fast", name="read_file", arguments={"path": "1"}),
                 ))
             return await super().dispatch(prepared)
 
@@ -209,10 +209,15 @@ async def test_cancel_and_reopen_retains_results_without_repeating_approved_or_f
     class Model(ToolThenAnswerModel):
         async def dispatch(self, prepared, *, event_sink=None):
             if self.requests[-1].step == 1:
-                return HarnessModelResponse(text="", provider_response_id="batch", usage={}, tool_calls=tuple(
-                    HarnessToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
-                ))
-            return HarnessModelResponse(text="README was read", provider_response_id="done", usage={})
+                return HarnessModelResponse.from_parts(
+                    text="",
+                    provider_response_id="batch",
+                    usage={},
+                    tool_calls=tuple(
+                        ModelToolCall(id=f"call-{i}", name="read_file", arguments={"path": str(i)}) for i in range(3)
+                    ),
+                )
+            return HarnessModelResponse.from_parts(text="README was read", provider_response_id="done", usage={})
 
     database = tmp_path / "session.db"
     tool = replace(_read_tool(workspace=tmp_path), run=run, concurrency_safe=False,

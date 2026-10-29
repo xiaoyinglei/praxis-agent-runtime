@@ -539,7 +539,9 @@ def apply_record(
                 answer = state.items.get(identity) if isinstance(identity, str) else None
                 if (answer is None or answer["turn_id"] != turn_id or answer["status"] != "completed"
                         or answer["kind"] not in {"model_response", "agent_message"}
-                        or not isinstance(answer["payload"].get("text"), str)
+                        or (answer["kind"] == "agent_message" and not isinstance(answer["payload"].get("text"), str))
+                        or (answer["kind"] == "model_response" and not isinstance(
+                            answer["payload"].get("outputs"), (list, tuple)))
                         or answer["payload"].get("response_status", "completed") != "completed"):
                     raise ValueError("Turn completion requires a committed answer Item from this Turn")
             turn = state.turns[turn_id]

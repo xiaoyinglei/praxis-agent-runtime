@@ -16,7 +16,7 @@ from agent_runtime.budget.pricing import (
 from agent_runtime.core.llm_registry import ResolvedModel
 from agent_runtime.core.messages import StopReason, ToolUseResult
 from agent_runtime.harness.model_adapter import GatewayHarnessModel
-from agent_runtime.harness.protocol import HarnessMessage, HarnessModelRequest
+from agent_runtime.harness.protocol import HarnessModelRequest, ModelMessage
 from agent_runtime.harness.state import RuntimeState
 from agent_runtime.model_definition import ModelCapabilities, RequestDefaultsDefinition
 from agent_runtime.modeling.config import GenerationConfig
@@ -58,7 +58,7 @@ class CapturingGateway:
     async def agenerate_model_request(self, **kwargs: object) -> AgentModelResponse:
         request = kwargs["request"]
         self.requests.append(request)
-        return AgentModelResponse(
+        return AgentModelResponse.from_turn(
             turn=ToolUseResult(
                 text="done",
                 stop_reason=StopReason.END_TURN,
@@ -213,7 +213,7 @@ def test_adapter_records_reserved_and_actual_versioned_cost() -> None:
         HarnessModelRequest(
             thread_id="thread",
             turn_id="turn",
-            messages=(HarnessMessage(role="user", content="hello"),),
+            messages=(ModelMessage(role="user", body="hello"),),
             binding_manifest={"model_cost_budget_total_micros": 1_000_000},
         )
     )
@@ -236,7 +236,7 @@ def test_cost_limited_turn_rejects_unknown_pricing_before_provider_io() -> None:
             HarnessModelRequest(
                 thread_id="thread",
                 turn_id="turn",
-                messages=(HarnessMessage(role="user", content="hello"),),
+                messages=(ModelMessage(role="user", body="hello"),),
                 binding_manifest={"model_cost_budget_total_micros": 1000},
             )
         )

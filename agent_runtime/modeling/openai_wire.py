@@ -5,12 +5,11 @@ from dataclasses import dataclass
 
 from agent_runtime.core.messages import (
     ModelMessage,
+    ModelToolCall,
     StopReason,
-    ToolCall,
     ToolUseResult,
     canonical_json_text,
     decode_tool_arguments,
-    snapshot_model_message,
 )
 from agent_runtime.core.model_request import (
     ModelRequest,
@@ -181,7 +180,7 @@ def parse_openai_response(response: object) -> ToolUseResult:
         raw_calls = ()
     if not isinstance(raw_calls, Sequence) or isinstance(raw_calls, (str, bytes)):
         raise ValueError("message tool_calls must be a sequence")
-    calls: list[ToolCall] = []
+    calls: list[ModelToolCall] = []
     for index, raw_call in enumerate(raw_calls, start=1):
         function = _field(raw_call, "function", default=None)
         if function is None:
@@ -194,7 +193,7 @@ def parse_openai_response(response: object) -> ToolUseResult:
         call_id = _field(raw_call, "id", default=None)
         if not isinstance(call_id, str) or not call_id:
             call_id = f"call_{index}"
-        calls.append(ToolCall(id=call_id, name=name, input=arguments, argument_error=argument_error))
+        calls.append(ModelToolCall(id=call_id, name=name, arguments=arguments, argument_error=argument_error))
 
     content = _field(message, "content", default="")
     if content is None:
@@ -269,7 +268,7 @@ def _message_payloads(
     leading_system_content: list[str] = []
     conversation_started = False
     for raw_message in messages:
-        message = snapshot_model_message(raw_message)
+        message = raw_message
         if not conversation_started and message.role in {"system", "context"}:
             leading_system_content.append(message.content)
             continue
@@ -299,7 +298,6 @@ def _message_payloads(
 
 
 def _message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
-    message = snapshot_model_message(message)
     if message.role in {"system", "user"}:
         return {"role": message.role, "content": message.content}
     if message.role == "assistant":
@@ -316,7 +314,7 @@ def _message_payload(message: ModelMessage) -> Mapping[str, JsonValue]:
                     "type": "function",
                     "function": {
                         "name": call.name,
-                        "arguments": canonical_json_text(json_schema_output(None, call.input)),
+                        "arguments": canonical_json_text(json_schema_output(None, call.arguments)),
                     },
                 }
                 for call in message.tool_calls

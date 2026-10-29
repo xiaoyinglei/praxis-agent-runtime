@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from agent_runtime.harness import RolloutEventReader, RuntimeState
+from agent_runtime.harness.protocol import HarnessModelResponse
 from agent_runtime.harness.records import RolloutRecord
 from agent_runtime.streaming.events import EventType, StreamEvent, derive_model_public_item_id
 
@@ -160,13 +161,14 @@ def test_incomplete_response_remains_visible_without_invalidating_completed_outp
             operation_id=operation.operation_id,
             attempt_id=attempt.attempt_id,
             generation=attempt.generation,
-            text="partial answer",
-            provider_response_id="response-1",
-            usage={"output_tokens": 10},
-            outputs=(ModelOutput("output-1", "text", content="partial answer"),),
-            response_status="incomplete",
-            incomplete_reason="max_output_tokens",
-            stop_reason="length",
+            response=HarnessModelResponse(
+                provider_response_id="response-1",
+                usage={"output_tokens": 10},
+                outputs=(ModelOutput("output-1", "text", content="partial answer"),),
+                status="incomplete",
+                incomplete_reason="max_output_tokens",
+                stop_reason="length",
+            ),
         )
         events = RolloutEventReader(state).read(thread.thread_id)
         completed_attempt = [
@@ -200,12 +202,6 @@ def test_runtime_model_attempt_notifications_do_not_leak_provider_request(reader
                     "operation_id": "op-1",
                     "attempt_id": "attempt-1",
                     "generation": 1,
-                    "public_item_ids": {
-                        channel: derive_model_public_item_id(
-                            turn_id="turn-1", model_attempt_id="attempt-1", channel=channel
-                        )
-                        for channel in ("agent_message", "reasoning", "plan")
-                    },
                     "request_ref": {"messages": "private prompt", "api_key": "secret"},
                 },
             ),
@@ -229,11 +225,6 @@ def test_runtime_model_attempt_notifications_do_not_leak_provider_request(reader
 )
 def test_all_model_attempt_transitions_are_visible(reader, record_type, status) -> None:
     payload = {"operation_id": "op-1", "attempt_id": "attempt-1", "generation": 2, "previous_attempt_id": "attempt-0"}
-    if record_type == "model_retry_prepared":
-        payload["public_item_ids"] = {
-            channel: derive_model_public_item_id(turn_id="turn-1", model_attempt_id="attempt-1", channel=channel)
-            for channel in ("agent_message", "reasoning", "plan")
-        }
     event = reader.project_committed_batch((record(record_type, payload),))[0].event
     assert event.type.value == "model_attempt_updated"
     assert event.data["status"] == status

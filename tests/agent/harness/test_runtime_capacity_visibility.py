@@ -1,7 +1,7 @@
 """Capacity accounting stays outside the model conversation for new Turns."""
 from dataclasses import replace
 
-from agent_runtime.harness import HarnessMessage, HarnessModelRequest, RuntimeState
+from agent_runtime.harness import HarnessModelRequest, ModelMessage, RuntimeState
 from agent_runtime.modeling.contracts import ContextCapacityPolicy, LLMStageBudget
 from agent_runtime.modeling.gateway import model_request_input_text
 from tests.agent.harness.test_affordable_tool_continuation import file_runner
@@ -19,7 +19,7 @@ def test_output_reservation_changes_metadata_without_changing_input(tmp_path):
 
         gateway.effective_stage_budget = budget
         request = HarnessModelRequest(
-            thread_id="thread", turn_id="turn", messages=(HarnessMessage(role="user", content="Inspect data"),),
+            thread_id="thread", turn_id="turn", messages=(ModelMessage(role="user", body="Inspect data"),),
             binding_manifest={"execution_context_policy": POLICY,
                               "context_capacity_policy": ContextCapacityPolicy().model_dump()},
         )
@@ -46,7 +46,7 @@ def test_runtime_only_warns_when_actionable_state_changes(tmp_path):
         runner, turn, _ = file_runner(store, tmp_path)
         context = runner.restore_turn_context(turn.turn_id)
         context = replace(context, binding_manifest={**context.binding_manifest, "execution_context_policy": POLICY})
-        messages = (HarnessMessage(role="user", content="Complete and verify the task"),)
+        messages = (ModelMessage(role="user", body="Complete and verify the task"),)
         clock = {"date": "2026-10-20"}
         messages, initial = runner._append_runtime_state(context, messages, step=1, pressure=False, clock=clock)
         assert "Runtime budget status" not in initial

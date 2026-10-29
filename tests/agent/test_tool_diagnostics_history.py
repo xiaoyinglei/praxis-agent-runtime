@@ -145,18 +145,18 @@ def test_commit_failure_keeps_diagnostic_without_claiming_durable_result(
 
 @pytest.mark.anyio
 async def test_public_session_failure_is_inspectable_without_model_replay(tmp_path: Path) -> None:
-    from agent_runtime.harness import HarnessModelResponse, HarnessToolCall, PreparedModelCall, Session
+    from agent_runtime.harness import HarnessModelResponse, ModelToolCall, PreparedModelCall, Session
     from agent_runtime.history import read_history
 
     class DiagnosticModel(PatchThenAnswerModel):
         async def dispatch(self, prepared: PreparedModelCall, *, event_sink: object = None) -> HarnessModelResponse:
             if prepared.request_ref["request_id"].endswith(":step:1"):
-                return HarnessModelResponse(
+                return HarnessModelResponse.from_parts(
                     text="",
-                    tool_calls=(HarnessToolCall(id="public-failure", name="read_file", arguments={"path": "x"}),),
+                    tool_calls=(ModelToolCall(id="public-failure", name="read_file", arguments={"path": "x"}),),
                     provider_response_id="failure-call", usage={"input_tokens": 1, "output_tokens": 1},
                 )
-            return HarnessModelResponse(
+            return HarnessModelResponse.from_parts(
                 text="read failed", provider_response_id="failure-answer",
                 usage={"input_tokens": 1, "output_tokens": 1},
             )

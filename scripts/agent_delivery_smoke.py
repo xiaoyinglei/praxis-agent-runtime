@@ -18,8 +18,8 @@ from agent_runtime.core.model_request import toolset_revision_for_tools
 from agent_runtime.harness import (
     HarnessModelRequest,
     HarnessModelResponse,
-    HarnessToolCall,
     ModelEventSink,
+    ModelToolCall,
     PreparedModelCall,
 )
 from agent_runtime.result import AgentResult
@@ -151,26 +151,26 @@ class _SmokeModel:
             return _response(text="4", step=step)
         if self.case.name == "checkout_demo":
             calls = {
-                1: HarnessToolCall(id="checkout-read", name="read_file", arguments={"path": "pricing.py"}),
-                2: HarnessToolCall(
+                1: ModelToolCall(id="checkout-read", name="read_file", arguments={"path": "pricing.py"}),
+                2: ModelToolCall(
                     id="checkout-reproduce", name="run_command", arguments={"command": CHECKOUT_COMMAND},
                 ),
-                3: HarnessToolCall(id="checkout-patch", name="apply_patch", arguments={
+                3: ModelToolCall(id="checkout-patch", name="apply_patch", arguments={
                     "file_path": "pricing.py", "old_string": CHECKOUT_BEFORE, "new_string": CHECKOUT_AFTER,
                 }),
-                4: HarnessToolCall(id="checkout-verify", name="run_command", arguments={"command": CHECKOUT_COMMAND}),
+                4: ModelToolCall(id="checkout-verify", name="run_command", arguments={"command": CHECKOUT_COMMAND}),
             }
             call = calls.get(step)
             if call is not None:
                 return _response(text="", step=step, tool_calls=(call,))
             return _response(text="折扣计算已修复，三项测试通过。", step=step)
         calls = {
-            1: HarnessToolCall(
+            1: ModelToolCall(
                 id="demo-read-before",
                 name="read_file",
                 arguments={"path": "fixture.py"},
             ),
-            2: HarnessToolCall(
+            2: ModelToolCall(
                 id="demo-patch",
                 name="apply_patch",
                 arguments={
@@ -179,7 +179,7 @@ class _SmokeModel:
                     "new_string": "after",
                 },
             ),
-            3: HarnessToolCall(
+            3: ModelToolCall(
                 id="demo-read-after",
                 name="read_file",
                 arguments={"path": "fixture.py"},
@@ -195,9 +195,9 @@ def _response(
     *,
     text: str,
     step: int,
-    tool_calls: tuple[HarnessToolCall, ...] = (),
+    tool_calls: tuple[ModelToolCall, ...] = (),
 ) -> HarnessModelResponse:
-    return HarnessModelResponse(
+    return HarnessModelResponse.from_parts(
         text=text,
         provider_response_id=f"smoke-response-{step}",
         usage={"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},

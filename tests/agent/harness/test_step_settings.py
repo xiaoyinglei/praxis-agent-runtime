@@ -40,7 +40,7 @@ class ChangingModel:
         if self.unknown_once:
             self.unknown_once = False
             raise ConnectionError("outcome unknown")
-        return HarnessModelResponse(text="answer", provider_response_id=None, usage={})
+        return HarnessModelResponse.from_parts(text="answer", provider_response_id=None, usage={})
 
 
 class ContinueOnce:
